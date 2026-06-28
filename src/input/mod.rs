@@ -502,21 +502,25 @@ impl State {
                     }
                 }
 
-                // GNOME "overlay key": a lone Super tap toggles the Activities
-                // overview. Mirrors mutter's process_special_modifier_key — arm on a
-                // bare Super press, cancel the moment any other key participates, and
-                // fire on the matching Super release.
-                // FIXME: to fully match mutter, also cancel on pointer button /
-                // scroll / touch, skip arming while a client inhibits shortcuts, and
-                // honor the `org.gnome.mutter overlay-key` setting (default Super_L).
+                // GNOME "overlay key": a lone tap of the configured overlay key
+                // (`org.gnome.mutter overlay-key`, default Super_L) toggles the
+                // Activities overview. Mirrors mutter's process_special_modifier_key
+                // — arm on a bare overlay-key press, cancel the moment any other key
+                // participates, and fire on the matching release.
+                // FIXME: to fully match mutter, also skip arming while a client
+                // inhibits shortcuts. The overlay key is read from the inspectable
+                // gnome_settings model; live dconf/GSettings ingestion is still TODO.
+                // The "no other modifiers" check ignores Super itself, which is right
+                // for the Super_L/Super_R settings but approximate for other keys.
                 if pressed {
-                    let bare_super = raw == Some(Keysym::Super_L)
+                    let is_overlay_key = raw.is_some()
+                        && this.niri.gnome_settings.overlay_key == raw
                         && !mods.ctrl
                         && !mods.shift
                         && !mods.alt
                         && !mods.iso_level3_shift
                         && !mods.iso_level5_shift;
-                    this.niri.overlay_key_armed = bare_super.then_some(key_code);
+                    this.niri.overlay_key_armed = is_overlay_key.then_some(key_code);
                 } else if this.niri.overlay_key_armed.take() == Some(key_code) {
                     this.do_action(Action::ToggleOverview, false);
                     return FilterResult::Intercept(None);

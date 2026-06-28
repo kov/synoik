@@ -11,12 +11,14 @@
 
 use niri_config::Action;
 use smithay::backend::input::ButtonState;
+use smithay::input::keyboard::Keysym;
 
 use super::*;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_A: u32 = 30;
 const KEY_LEFTMETA: u32 = 125;
+const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
 
 /// The overview opens and closes through the action-dispatch path, and
@@ -141,5 +143,50 @@ fn super_then_click_does_not_toggle_overview() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "a click between Super press and release must cancel the tap"
+    );
+}
+
+/// The overlay key honors `org.gnome.mutter overlay-key`: setting it to `None`
+/// (mutter's empty-string "disabled") means a Super tap does nothing.
+#[test]
+fn overlay_key_setting_can_disable() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().gnome_settings.overlay_key = None;
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a disabled overlay key must not open the overview"
+    );
+}
+
+/// The overlay key is rebindable: pointing the setting at `Super_R` makes the
+/// right Super the trigger, and the (now non-overlay) left Super inert.
+#[test]
+fn overlay_key_setting_rebinds() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().gnome_settings.overlay_key = Some(Keysym::Super_R);
+
+    // Left Super is no longer the overlay key.
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "left Super must be inert once the overlay key is Super_R"
+    );
+
+    // Right Super now toggles the overview.
+    f.key_press(KEY_RIGHTMETA);
+    f.key_release(KEY_RIGHTMETA);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a right Super tap must open the overview when it is the overlay key"
     );
 }

@@ -128,6 +128,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
+use crate::gnome::GnomeSettings;
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
@@ -323,12 +324,16 @@ pub struct Niri {
     pub single_pixel_buffer_state: SinglePixelBufferState,
 
     pub seat: Seat<State>,
+
+    /// Inspectable model of the GNOME settings the compositor honors.
+    pub gnome_settings: GnomeSettings,
+
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
-    /// GNOME "overlay key" candidate: set to the keycode of a Super key that was
-    /// pressed on its own. A matching release with no intervening input toggles
-    /// the overview; any other key (or pointer activity) clears it. Mirrors
-    /// mutter's `overlay_key_only_pressed`.
+    /// GNOME "overlay key" candidate: set to the keycode of the overlay key (by
+    /// default Super) that was pressed on its own. A matching release with no
+    /// intervening input toggles the overview; any other key (or pointer
+    /// activity) clears it. Mirrors mutter's `overlay_key_only_pressed`.
     pub overlay_key_armed: Option<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
@@ -2567,6 +2572,7 @@ impl Niri {
             ext_data_control_state,
             popups: PopupManager::default(),
             popup_grab: None,
+            gnome_settings: GnomeSettings::default(),
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
             suppressed_buttons: HashSet::new(),
