@@ -753,6 +753,13 @@ impl State {
 
         let mut state = Self { backend, niri };
 
+        // Pull in the GNOME settings we honor (overlay-key, …) from the live
+        // GSettings/dconf backend — the same store gnome-shell uses. Headless test
+        // instances keep the defaults and drive the model directly instead.
+        if !headless {
+            state.niri.gnome_settings = GnomeSettings::from_gsettings();
+        }
+
         // Load the xkb_file config option if set by the user.
         state.load_xkb_file();
         // Initialize some IPC server state.

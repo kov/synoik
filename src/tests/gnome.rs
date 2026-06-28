@@ -108,6 +108,23 @@ fn super_tap_toggles_overview() {
     );
 }
 
+/// GNOME's default overlay-key is `"Super"`, meaning *either* Super. So a lone
+/// right-Super tap opens the overview too, with no setting change.
+#[test]
+fn right_super_tap_toggles_overview_by_default() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_RIGHTMETA);
+    f.key_release(KEY_RIGHTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a lone right Super tap opens the overview by default"
+    );
+}
+
 /// Using Super as a modifier (Super+key) must *not* trigger the overlay key:
 /// once another key participates, the press is no longer a lone tap.
 #[test]
@@ -152,7 +169,7 @@ fn super_then_click_does_not_toggle_overview() {
 fn overlay_key_setting_can_disable() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.overlay_key = None;
+    f.niri().gnome_settings.overlay_keys.clear();
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
@@ -170,7 +187,7 @@ fn overlay_key_setting_can_disable() {
 fn overlay_key_setting_rebinds() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.overlay_key = Some(Keysym::Super_R);
+    f.niri().gnome_settings.overlay_keys = vec![Keysym::Super_R];
 
     // Left Super is no longer the overlay key.
     f.key_press(KEY_LEFTMETA);

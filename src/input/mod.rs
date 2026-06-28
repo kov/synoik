@@ -513,8 +513,8 @@ impl State {
                 // The "no other modifiers" check ignores Super itself, which is right
                 // for the Super_L/Super_R settings but approximate for other keys.
                 if pressed {
-                    let is_overlay_key = raw.is_some()
-                        && this.niri.gnome_settings.overlay_key == raw
+                    let is_overlay_key = raw
+                        .is_some_and(|raw| this.niri.gnome_settings.overlay_keys.contains(&raw))
                         && !mods.ctrl
                         && !mods.shift
                         && !mods.alt
