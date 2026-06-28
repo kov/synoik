@@ -10,12 +10,14 @@
 //! contract before we reshape it toward GNOME's Activities overview (Experiment 1).
 
 use niri_config::Action;
+use smithay::backend::input::ButtonState;
 
 use super::*;
 
-/// Linux evdev keycodes (`input-event-codes.h`) for the keys these tests press.
+/// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_A: u32 = 30;
 const KEY_LEFTMETA: u32 = 125;
+const BTN_LEFT: u32 = 0x110;
 
 /// The overview opens and closes through the action-dispatch path, and
 /// `is_overview_open()` reflects every transition.
@@ -120,5 +122,24 @@ fn super_plus_key_does_not_toggle_overview() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "Super+key must not trigger the overlay key"
+    );
+}
+
+/// Pointer activity between the Super press and release cancels the tap, so the
+/// overview must not open (mutter clears `overlay_key_only_pressed` on a click).
+#[test]
+fn super_then_click_does_not_toggle_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a click between Super press and release must cancel the tap"
     );
 }

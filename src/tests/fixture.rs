@@ -7,8 +7,8 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
 use smithay::backend::input::{
-    Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
-    UnusedEvent,
+    ButtonState, Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState,
+    KeyboardKeyEvent, Keycode, PointerButtonEvent, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -114,17 +114,34 @@ impl Fixture {
     }
 
     fn key_event(&mut self, evdev_code: u32, state: KeyState) {
-        let time = self.next_input_time;
-        self.next_input_time += 1;
-
         let event = InputEvent::<TestInputBackend>::Keyboard {
             event: TestKeyboardKeyEvent {
-                time: u64::from(time) * 1000, // micros, as libinput reports
+                time: self.next_input_micros(),
                 key_code: Keycode::new(evdev_code + 8),
                 state,
             },
         };
         self.niri_state().process_input_event(event);
+    }
+
+    /// Inject a pointer button event through the real input pipeline.
+    ///
+    /// `button_code` is a Linux `BTN_*` evdev code (e.g. `BTN_LEFT`).
+    pub fn pointer_button(&mut self, button_code: u32, state: ButtonState) {
+        let event = InputEvent::<TestInputBackend>::PointerButton {
+            event: TestPointerButtonEvent {
+                time: self.next_input_micros(),
+                button_code,
+                state,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    fn next_input_micros(&mut self) -> u64 {
+        let time = self.next_input_time;
+        self.next_input_time += 1;
+        u64::from(time) * 1000 // micros, as libinput reports
     }
 
     pub fn add_output(&mut self, n: u8, size: (u16, u16)) {
@@ -215,7 +232,10 @@ impl Device for TestInputDevice {
     }
 
     fn has_capability(&self, capability: DeviceCapability) -> bool {
-        matches!(capability, DeviceCapability::Keyboard)
+        matches!(
+            capability,
+            DeviceCapability::Keyboard | DeviceCapability::Pointer
+        )
     }
 
     fn usb_id(&self) -> Option<(u32, u32)> {
@@ -257,13 +277,39 @@ impl KeyboardKeyEvent<TestInputBackend> for TestKeyboardKeyEvent {
     }
 }
 
+pub struct TestPointerButtonEvent {
+    time: u64,
+    button_code: u32,
+    state: ButtonState,
+}
+
+impl Event<TestInputBackend> for TestPointerButtonEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
+    fn button_code(&self) -> u32 {
+        self.button_code
+    }
+
+    fn state(&self) -> ButtonState {
+        self.state
+    }
+}
+
 impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
     type KeyboardKeyEvent = TestKeyboardKeyEvent;
+    type PointerButtonEvent = TestPointerButtonEvent;
 
     type PointerAxisEvent = UnusedEvent;
-    type PointerButtonEvent = UnusedEvent;
     type PointerMotionEvent = UnusedEvent;
     type PointerMotionAbsoluteEvent = UnusedEvent;
 

@@ -147,6 +147,14 @@ impl State {
         let hide_exit_confirm_dialog =
             self.niri.exit_confirm_dialog.is_open() && should_hide_exit_confirm_dialog(&event);
 
+        // GNOME overlay key: pointer button, scroll, and touch begin/end cancel a
+        // pending Super tap, matching mutter's meta_keybindings_process_event (it
+        // clears overlay_key_only_pressed for exactly these event types). Plain
+        // pointer motion deliberately does not cancel it.
+        if event_cancels_overlay_key(&event) {
+            self.niri.overlay_key_armed = None;
+        }
+
         let mut consumed_by_a11y = false;
         use InputEvent::*;
         match event {
@@ -4620,6 +4628,19 @@ fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
         modifiers |= Modifiers::ISO_LEVEL5_SHIFT;
     }
     modifiers
+}
+
+/// Whether this event cancels a pending GNOME overlay-key (Super) tap. Mirrors
+/// the event types mutter resets `overlay_key_only_pressed` on: pointer button,
+/// scroll, and touch begin/end (not motion).
+fn event_cancels_overlay_key<I: InputBackend>(event: &InputEvent<I>) -> bool {
+    matches!(
+        event,
+        InputEvent::PointerButton { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TouchDown { .. }
+            | InputEvent::TouchUp { .. }
+    )
 }
 
 fn should_activate_monitors<I: InputBackend>(event: &InputEvent<I>) -> bool {
