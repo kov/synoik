@@ -13,6 +13,10 @@ use niri_config::Action;
 
 use super::*;
 
+/// Linux evdev keycodes (`input-event-codes.h`) for the keys these tests press.
+const KEY_A: u32 = 30;
+const KEY_LEFTMETA: u32 = 125;
+
 /// The overview opens and closes through the action-dispatch path, and
 /// `is_overview_open()` reflects every transition.
 ///
@@ -66,4 +70,55 @@ fn toggle_overview_flips_state() {
     f.niri_state().do_action(Action::ToggleOverview, false);
     f.niri_complete_animations();
     assert!(!f.niri().layout.is_overview_open(), "second toggle closes");
+}
+
+/// GNOME's "overlay key": tapping Super on its own — pressed and released with
+/// nothing in between — toggles the Activities overview. This is the first
+/// genuinely GNOME-distinct behavior (niri has no overlay key), and it pins
+/// mutter's `process_special_modifier_key` semantics: arm on a bare Super press,
+/// fire on the matching release.
+#[test]
+fn super_tap_toggles_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "overview must start closed"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a lone Super tap opens the overview"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a second Super tap closes it"
+    );
+}
+
+/// Using Super as a modifier (Super+key) must *not* trigger the overlay key:
+/// once another key participates, the press is no longer a lone tap.
+#[test]
+fn super_plus_key_does_not_toggle_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "Super+key must not trigger the overlay key"
+    );
 }

@@ -325,6 +325,11 @@ pub struct Niri {
     pub seat: Seat<State>,
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
+    /// GNOME "overlay key" candidate: set to the keycode of a Super key that was
+    /// pressed on its own. A matching release with no intervening input toggles
+    /// the overview; any other key (or pointer activity) clears it. Mirrors
+    /// mutter's `overlay_key_only_pressed`.
+    pub overlay_key_armed: Option<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
@@ -2563,6 +2568,7 @@ impl Niri {
             popups: PopupManager::default(),
             popup_grab: None,
             suppressed_keys: HashSet::new(),
+            overlay_key_armed: None,
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),

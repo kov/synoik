@@ -494,6 +494,26 @@ impl State {
                     }
                 }
 
+                // GNOME "overlay key": a lone Super tap toggles the Activities
+                // overview. Mirrors mutter's process_special_modifier_key — arm on a
+                // bare Super press, cancel the moment any other key participates, and
+                // fire on the matching Super release.
+                // FIXME: to fully match mutter, also cancel on pointer button /
+                // scroll / touch, skip arming while a client inhibits shortcuts, and
+                // honor the `org.gnome.mutter overlay-key` setting (default Super_L).
+                if pressed {
+                    let bare_super = raw == Some(Keysym::Super_L)
+                        && !mods.ctrl
+                        && !mods.shift
+                        && !mods.alt
+                        && !mods.iso_level3_shift
+                        && !mods.iso_level5_shift;
+                    this.niri.overlay_key_armed = bare_super.then_some(key_code);
+                } else if this.niri.overlay_key_armed.take() == Some(key_code) {
+                    this.do_action(Action::ToggleOverview, false);
+                    return FilterResult::Intercept(None);
+                }
+
                 if this.niri.exit_confirm_dialog.is_open() && pressed {
                     if raw == Some(Keysym::Return) {
                         info!("quitting after confirming exit dialog");

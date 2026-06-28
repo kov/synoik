@@ -6,6 +6,10 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
+use smithay::backend::input::{
+    Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
+    UnusedEvent,
+};
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
@@ -16,6 +20,8 @@ pub struct Fixture {
     pub event_loop: EventLoop<'static, State>,
     pub handle: LoopHandle<'static, State>,
     pub state: State,
+    /// Monotonic timestamp (ms) handed to each synthesized input event.
+    next_input_time: u32,
 }
 
 pub struct State {
@@ -51,6 +57,7 @@ impl Fixture {
             event_loop,
             handle,
             state,
+            next_input_time: 0,
         }
     }
 
@@ -87,6 +94,37 @@ impl Fixture {
         niri.clock.set_complete_instantly(true);
         niri.advance_animations();
         niri.clock.set_complete_instantly(false);
+    }
+
+    /// Inject a key press through the real input pipeline (`process_input_event`).
+    ///
+    /// `evdev_code` is a Linux `KEY_*` evdev keycode (e.g. `KEY_LEFTMETA`); it is
+    /// translated to the X11 keycode space (evdev + 8) that the keyboard expects,
+    /// then mapped to a keysym by the seat's xkb keymap, exactly as a libinput
+    /// event would be.
+    pub fn key_press(&mut self, evdev_code: u32) {
+        self.key_event(evdev_code, KeyState::Pressed);
+    }
+
+    /// Inject a key release through the real input pipeline. See [`key_press`].
+    ///
+    /// [`key_press`]: Self::key_press
+    pub fn key_release(&mut self, evdev_code: u32) {
+        self.key_event(evdev_code, KeyState::Released);
+    }
+
+    fn key_event(&mut self, evdev_code: u32, state: KeyState) {
+        let time = self.next_input_time;
+        self.next_input_time += 1;
+
+        let event = InputEvent::<TestInputBackend>::Keyboard {
+            event: TestKeyboardKeyEvent {
+                time: u64::from(time) * 1000, // micros, as libinput reports
+                key_code: Keycode::new(evdev_code + 8),
+                state,
+            },
+        };
+        self.niri_state().process_input_event(event);
     }
 
     pub fn add_output(&mut self, n: u8, size: (u16, u16)) {
@@ -151,4 +189,104 @@ impl State {
     pub fn client(&mut self, id: ClientId) -> &mut Client {
         self.clients.iter_mut().find(|c| c.id == id).unwrap()
     }
+}
+
+/// A minimal [`InputBackend`] for feeding synthesized events into the compositor
+/// from headless tests. Only the event types we actually inject are real; the
+/// rest are [`UnusedEvent`].
+pub struct TestInputBackend;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TestInputDevice;
+
+impl crate::input::backend_ext::NiriInputDevice for TestInputDevice {
+    fn output(&self, _state: &crate::niri::State) -> Option<Output> {
+        None
+    }
+}
+
+impl Device for TestInputDevice {
+    fn id(&self) -> String {
+        String::from("test input device")
+    }
+
+    fn name(&self) -> String {
+        String::from("test input device")
+    }
+
+    fn has_capability(&self, capability: DeviceCapability) -> bool {
+        matches!(capability, DeviceCapability::Keyboard)
+    }
+
+    fn usb_id(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    fn syspath(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+pub struct TestKeyboardKeyEvent {
+    time: u64,
+    key_code: Keycode,
+    state: KeyState,
+}
+
+impl Event<TestInputBackend> for TestKeyboardKeyEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl KeyboardKeyEvent<TestInputBackend> for TestKeyboardKeyEvent {
+    fn key_code(&self) -> Keycode {
+        self.key_code
+    }
+
+    fn state(&self) -> KeyState {
+        self.state
+    }
+
+    fn count(&self) -> u32 {
+        1
+    }
+}
+
+impl InputBackend for TestInputBackend {
+    type Device = TestInputDevice;
+
+    type KeyboardKeyEvent = TestKeyboardKeyEvent;
+
+    type PointerAxisEvent = UnusedEvent;
+    type PointerButtonEvent = UnusedEvent;
+    type PointerMotionEvent = UnusedEvent;
+    type PointerMotionAbsoluteEvent = UnusedEvent;
+
+    type GestureSwipeBeginEvent = UnusedEvent;
+    type GestureSwipeUpdateEvent = UnusedEvent;
+    type GestureSwipeEndEvent = UnusedEvent;
+    type GesturePinchBeginEvent = UnusedEvent;
+    type GesturePinchUpdateEvent = UnusedEvent;
+    type GesturePinchEndEvent = UnusedEvent;
+    type GestureHoldBeginEvent = UnusedEvent;
+    type GestureHoldEndEvent = UnusedEvent;
+
+    type TouchDownEvent = UnusedEvent;
+    type TouchUpEvent = UnusedEvent;
+    type TouchMotionEvent = UnusedEvent;
+    type TouchCancelEvent = UnusedEvent;
+    type TouchFrameEvent = UnusedEvent;
+    type TabletToolAxisEvent = UnusedEvent;
+    type TabletToolProximityEvent = UnusedEvent;
+    type TabletToolTipEvent = UnusedEvent;
+    type TabletToolButtonEvent = UnusedEvent;
+
+    type SwitchToggleEvent = UnusedEvent;
+
+    type SpecialEvent = UnusedEvent;
 }
