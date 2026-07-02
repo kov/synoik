@@ -72,6 +72,39 @@ This is the way to test the overlay key and anything input- or display-specific.
 4. Quit the compositor (its configured quit bind, default `Super+Shift+E`), then
    switch back to your GNOME session: **Ctrl+Alt+F1** (or F2).
 
+## Full GNOME session (our compositor in place of gnome-shell)
+
+The closest thing to the endgame: a complete GNOME session — gnome-session,
+the `gsd-*` daemons, portals — where only the shell binary is ours. It runs as
+a dedicated test user (`gsrs`), so your own session and dconf stay untouched.
+
+How it works: GDM's "GNOME" session starts the systemd user target
+`gnome-session@gnome.target`, which requires `org.gnome.Shell@user.service`
+(`ExecStart=/usr/bin/gnome-shell --mode=user`, `Type=notify`). A per-user
+drop-in overrides `ExecStart` to our binary; `--session` mode already
+sd_notifies readiness, so the unit contract holds.
+
+```sh
+cargo build --release
+sudo scripts/install-test-session.sh   # one-time: creates user "gsrs", installs
+                                       # /usr/local/bin/gnome-shell-rs + the override
+```
+
+To run: switch user (lock screen → the other user), log in as `gsrs` choosing
+the regular **GNOME** session. GDM gives it its own VT; **Ctrl+Alt+F\<n\>**
+flips between it and your session. To iterate: rebuild, rerun the script, log
+`gsrs` out and back in.
+
+If the compositor dies, the unit's `OnFailure=` drops that session back to
+GDM; yours is unaffected. Undo with
+`sudo scripts/install-test-session.sh --uninstall`.
+
+Expectations: this exercises the Phase 1 contract surface (STRATEGY.md §3.8).
+Display config and most gsd daemons should come up (niri implements the core
+`org.gnome.Mutter.*` names); media keys won't work yet (gsd-media-keys needs
+`org.gnome.Shell` `GrabAccelerator`); there is no panel or GNOME chrome. The
+gaps you hit here are, in effect, the Phase 1 worklist.
+
 ## How GNOME settings feed in
 
 On startup the compositor reads the settings it honors from the **same
