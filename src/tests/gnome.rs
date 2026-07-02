@@ -12,6 +12,7 @@
 use niri_config::Action;
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
+use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
@@ -19,6 +20,7 @@ use super::*;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_A: u32 = 30;
+const KEY_LEFTSHIFT: u32 = 42;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
@@ -183,6 +185,56 @@ fn super_then_click_does_not_toggle_overview() {
     );
 }
 
+/// The overlay key's client-visible wire contract, as mutter implements it:
+/// the arming Super *press* is delivered to the focused client (mutter
+/// propagates it), but the *release* that fires the overlay key is not
+/// (mutter returns CLUTTER_EVENT_STOP for it). A canceled tap delivers both.
+/// Clients cope with the missing release because focus moves to the overview,
+/// and a keyboard leave releases all keys client-side.
+#[test]
+fn overlay_key_firing_release_is_not_sent_to_the_client() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    // A canceled tap (Super+A): the client sees all four key events.
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_LEFTMETA, WlKeyState::Pressed),
+            (KEY_A, WlKeyState::Pressed),
+            (KEY_A, WlKeyState::Released),
+            (KEY_LEFTMETA, WlKeyState::Released),
+        ],
+        "a canceled tap must deliver both Super key events to the client"
+    );
+
+    // A firing tap: the press is delivered, the release is swallowed.
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the lone tap must have fired"
+    );
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_LEFTMETA, WlKeyState::Pressed)],
+        "a firing tap must deliver the Super press but swallow the release"
+    );
+}
+
 /// The overlay key honors `org.gnome.mutter overlay-key`: setting it to `None`
 /// (mutter's empty-string "disabled") means a Super tap does nothing.
 #[test]
@@ -198,6 +250,83 @@ fn overlay_key_setting_can_disable() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "a disabled overlay key must not open the overview"
+    );
+}
+
+/// Pointer *motion* between the Super press and release does NOT cancel the
+/// tap. This is deliberate in mutter: `meta_keybindings_process_event` resets
+/// the pending tap on button, scroll, and touch begin/end events only — so
+/// wiggling the mouse while tapping Super still opens the overview.
+#[test]
+fn super_tap_with_pointer_motion_still_toggles() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_motion(5.0, 5.0);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "pointer motion must not cancel a pending Super tap"
+    );
+}
+
+/// A scroll between the Super press and release cancels the tap (mutter's
+/// CLUTTER_SCROLL arm).
+#[test]
+fn super_then_scroll_does_not_toggle_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.scroll_wheel();
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a scroll between Super press and release must cancel the tap"
+    );
+}
+
+/// A touch tap between the Super press and release cancels the tap (mutter's
+/// CLUTTER_TOUCH_BEGIN/END arms).
+#[test]
+fn super_then_touch_does_not_toggle_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.touch_down(100.0, 100.0);
+    f.touch_up();
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a touch between Super press and release must cancel the tap"
+    );
+}
+
+/// Super tapped while a real modifier is held is not a lone tap: mutter only
+/// arms when no non-ignored modifier is active in the press's modifier state
+/// (`process_special_modifier_key`), so Shift+Super does nothing.
+#[test]
+fn shift_held_super_tap_does_not_toggle_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTSHIFT);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "Super tapped with Shift held must not trigger the overlay key"
     );
 }
 

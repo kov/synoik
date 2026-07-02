@@ -7,8 +7,10 @@ use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
 use smithay::backend::input::{
-    ButtonState, Device, DeviceCapability, Event, InputBackend, InputEvent, KeyState,
-    KeyboardKeyEvent, Keycode, PointerButtonEvent, UnusedEvent,
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
+    DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
+    TouchSlot, TouchUpEvent, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -138,6 +140,53 @@ impl Fixture {
         self.niri_state().process_input_event(event);
     }
 
+    /// Inject relative pointer motion through the real input pipeline.
+    pub fn pointer_motion(&mut self, dx: f64, dy: f64) {
+        let event = InputEvent::<TestInputBackend>::PointerMotion {
+            event: TestPointerMotionEvent {
+                time: self.next_input_micros(),
+                dx,
+                dy,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    /// Inject one vertical wheel notch (a discrete scroll) through the real
+    /// input pipeline.
+    pub fn scroll_wheel(&mut self) {
+        let event = InputEvent::<TestInputBackend>::PointerAxis {
+            event: TestPointerAxisEvent {
+                time: self.next_input_micros(),
+                v120: 120.0,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    /// Inject a touch-down at `(x, y)` through the real input pipeline.
+    pub fn touch_down(&mut self, x: f64, y: f64) {
+        let event = InputEvent::<TestInputBackend>::TouchDown {
+            event: TestTouchDownEvent {
+                time: self.next_input_micros(),
+                x,
+                y,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    /// Inject a touch-up (for the single test slot) through the real input
+    /// pipeline.
+    pub fn touch_up(&mut self) {
+        let event = InputEvent::<TestInputBackend>::TouchUp {
+            event: TestTouchUpEvent {
+                time: self.next_input_micros(),
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
     fn next_input_micros(&mut self) -> u64 {
         let time = self.next_input_time;
         self.next_input_time += 1;
@@ -234,7 +283,7 @@ impl Device for TestInputDevice {
     fn has_capability(&self, capability: DeviceCapability) -> bool {
         matches!(
             capability,
-            DeviceCapability::Keyboard | DeviceCapability::Pointer
+            DeviceCapability::Keyboard | DeviceCapability::Pointer | DeviceCapability::Touch
         )
     }
 
@@ -303,14 +352,149 @@ impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
     }
 }
 
+pub struct TestPointerMotionEvent {
+    time: u64,
+    dx: f64,
+    dy: f64,
+}
+
+impl Event<TestInputBackend> for TestPointerMotionEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl PointerMotionEvent<TestInputBackend> for TestPointerMotionEvent {
+    fn delta_x(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y(&self) -> f64 {
+        self.dy
+    }
+
+    fn delta_x_unaccel(&self) -> f64 {
+        self.dx
+    }
+
+    fn delta_y_unaccel(&self) -> f64 {
+        self.dy
+    }
+}
+
+/// A discrete (wheel) scroll of `v120 / 120` notches on the vertical axis.
+pub struct TestPointerAxisEvent {
+    time: u64,
+    v120: f64,
+}
+
+impl Event<TestInputBackend> for TestPointerAxisEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl PointerAxisEvent<TestInputBackend> for TestPointerAxisEvent {
+    fn amount(&self, _axis: Axis) -> Option<f64> {
+        None
+    }
+
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
+        Some(match axis {
+            Axis::Vertical => self.v120,
+            Axis::Horizontal => 0.0,
+        })
+    }
+
+    fn source(&self) -> AxisSource {
+        AxisSource::Wheel
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
+    }
+}
+
+pub struct TestTouchDownEvent {
+    time: u64,
+    x: f64,
+    y: f64,
+}
+
+impl Event<TestInputBackend> for TestTouchDownEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl TouchEvent<TestInputBackend> for TestTouchDownEvent {
+    fn slot(&self) -> TouchSlot {
+        TouchSlot::from(Some(0))
+    }
+}
+
+impl AbsolutePositionEvent<TestInputBackend> for TestTouchDownEvent {
+    fn x(&self) -> f64 {
+        self.x
+    }
+
+    fn y(&self) -> f64 {
+        self.y
+    }
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        self.x
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        self.y
+    }
+}
+
+impl TouchDownEvent<TestInputBackend> for TestTouchDownEvent {}
+
+pub struct TestTouchUpEvent {
+    time: u64,
+}
+
+impl Event<TestInputBackend> for TestTouchUpEvent {
+    fn time(&self) -> u64 {
+        self.time
+    }
+
+    fn device(&self) -> TestInputDevice {
+        TestInputDevice
+    }
+}
+
+impl TouchEvent<TestInputBackend> for TestTouchUpEvent {
+    fn slot(&self) -> TouchSlot {
+        TouchSlot::from(Some(0))
+    }
+}
+
+impl TouchUpEvent<TestInputBackend> for TestTouchUpEvent {}
+
 impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
     type KeyboardKeyEvent = TestKeyboardKeyEvent;
     type PointerButtonEvent = TestPointerButtonEvent;
+    type PointerAxisEvent = TestPointerAxisEvent;
+    type PointerMotionEvent = TestPointerMotionEvent;
 
-    type PointerAxisEvent = UnusedEvent;
-    type PointerMotionEvent = UnusedEvent;
     type PointerMotionAbsoluteEvent = UnusedEvent;
 
     type GestureSwipeBeginEvent = UnusedEvent;
@@ -322,8 +506,9 @@ impl InputBackend for TestInputBackend {
     type GestureHoldBeginEvent = UnusedEvent;
     type GestureHoldEndEvent = UnusedEvent;
 
-    type TouchDownEvent = UnusedEvent;
-    type TouchUpEvent = UnusedEvent;
+    type TouchDownEvent = TestTouchDownEvent;
+    type TouchUpEvent = TestTouchUpEvent;
+
     type TouchMotionEvent = UnusedEvent;
     type TouchCancelEvent = UnusedEvent;
     type TouchFrameEvent = UnusedEvent;

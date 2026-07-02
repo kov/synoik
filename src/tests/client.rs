@@ -33,6 +33,7 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
@@ -62,6 +63,10 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub seat: Option<WlSeat>,
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+
+    pub keyboard: Option<WlKeyboard>,
+    /// `wl_keyboard.key` events received, as `(evdev code, state)`.
+    pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -191,6 +196,8 @@ impl Client {
             viewporter: None,
             seat: None,
             shortcuts_inhibit_manager: None,
+            keyboard: None,
+            key_events: Vec::new(),
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -249,6 +256,21 @@ impl Client {
 
     pub fn release_shortcuts_inhibitor(&mut self, surface: &WlSurface) {
         self.state.release_shortcuts_inhibitor(surface);
+    }
+
+    /// Start receiving `wl_keyboard` events; they accumulate in
+    /// [`take_key_events`].
+    ///
+    /// [`take_key_events`]: Self::take_key_events
+    pub fn get_keyboard(&mut self) {
+        let seat = self.state.seat.clone().unwrap();
+        self.state.keyboard = Some(seat.get_keyboard(&self.qh, ()));
+    }
+
+    /// Drain the `wl_keyboard.key` events received so far, as
+    /// `(evdev code, state)`.
+    pub fn take_key_events(&mut self) -> Vec<(u32, wl_keyboard::KeyState)> {
+        std::mem::take(&mut self.state.key_events)
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -828,6 +850,35 @@ impl Dispatch<WlSeat, ()> for State {
         match event {
             wl_seat::Event::Capabilities { .. } => (),
             wl_seat::Event::Name { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlKeyboard,
+        event: <WlKeyboard as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap { .. } => (),
+            wl_keyboard::Event::Enter { .. } => (),
+            wl_keyboard::Event::Leave { .. } => (),
+            wl_keyboard::Event::Key {
+                key,
+                state: key_state,
+                ..
+            } => {
+                state
+                    .key_events
+                    .push((key, key_state.into_result().unwrap()));
+            }
+            wl_keyboard::Event::Modifiers { .. } => (),
+            wl_keyboard::Event::RepeatInfo { .. } => (),
             _ => unreachable!(),
         }
     }
