@@ -754,10 +754,22 @@ impl State {
         let mut state = Self { backend, niri };
 
         // Pull in the GNOME settings we honor (overlay-key, …) from the live
-        // GSettings/dconf backend — the same store gnome-shell uses. Headless test
-        // instances keep the defaults and drive the model directly instead.
+        // GSettings/dconf backend — the same store gnome-shell uses — and keep the
+        // model current as keys change. Headless test instances keep the defaults
+        // and drive the model directly instead.
         if !headless {
-            state.niri.gnome_settings = GnomeSettings::from_gsettings();
+            let (initial, rx) = crate::gnome::load_and_watch_gsettings();
+            state.niri.gnome_settings = initial;
+            state
+                .niri
+                .event_loop
+                .insert_source(rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(settings) = event {
+                        debug!("GNOME settings changed: {settings:?}");
+                        state.niri.gnome_settings = settings;
+                    }
+                })
+                .unwrap();
         }
 
         // Load the xkb_file config option if set by the user.

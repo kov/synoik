@@ -122,9 +122,10 @@ gsettings get org.gnome.mutter overlay-key      # e.g. 'Super'
 gsettings set org.gnome.mutter overlay-key 'Menu'
 ```
 
-changes are picked up on the **next start** of the compositor (live
-change-signal subscription is a TODO). Note dconf is shared with your real GNOME
-session, so a change affects both.
+changes are picked up **live** by a change subscription
+(`gnome::load_and_watch_gsettings`, a dedicated glib-loop thread bridged into
+calloop). Note dconf is shared with your real GNOME session, so a change
+affects both.
 
 ## Inspecting / driving a running instance (IPC)
 
