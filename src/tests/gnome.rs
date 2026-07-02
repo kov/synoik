@@ -12,7 +12,9 @@
 use niri_config::Action;
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
+use wayland_client::protocol::wl_surface::WlSurface;
 
+use super::client::ClientId;
 use super::*;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
@@ -20,6 +22,24 @@ const KEY_A: u32 = 30;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
+
+/// Map a client window; as the only (newly mapped) window it takes keyboard
+/// focus, which per-focused-surface state like keyboard-shortcuts-inhibit
+/// applies to.
+fn map_focused_window(f: &mut Fixture, id: ClientId) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
 
 /// The overview opens and closes through the action-dispatch path, and
 /// `is_overview_open()` reflects every transition.
@@ -178,6 +198,42 @@ fn overlay_key_setting_can_disable() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "a disabled overlay key must not open the overview"
+    );
+}
+
+/// A client holding an active keyboard-shortcuts-inhibit on the focused window
+/// disables the overlay key: mutter checks the inhibitor when arming
+/// (`process_overlay_key`), so Super passes through to e.g. a VM viewer or
+/// remote-desktop client instead of opening the overview. Releasing the
+/// inhibitor restores the overlay key.
+#[test]
+fn shortcuts_inhibit_disables_overlay_key() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    f.client(id).inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "the overlay key must be inert while the focused window inhibits shortcuts"
+    );
+
+    f.client(id).release_shortcuts_inhibitor(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "releasing the inhibitor must restore the overlay key"
     );
 }
 

@@ -10,6 +10,10 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
+use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
+    self, ZwpKeyboardShortcutsInhibitorV1,
+};
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -30,6 +34,7 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -55,6 +60,8 @@ pub struct State {
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub seat: Option<WlSeat>,
+    pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -68,6 +75,7 @@ pub struct Window {
     pub xdg_surface: XdgSurface,
     pub xdg_toplevel: XdgToplevel,
     pub viewport: WpViewport,
+    pub shortcuts_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     pub pending_configure: Configure,
     pub configures_received: Vec<(u32, Configure)>,
     pub close_requested: bool,
@@ -181,6 +189,8 @@ impl Client {
             layer_shell: None,
             spbm: None,
             viewporter: None,
+            seat: None,
+            shortcuts_inhibit_manager: None,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -233,6 +243,14 @@ impl Client {
         self.state.layer(surface)
     }
 
+    pub fn inhibit_shortcuts(&mut self, surface: &WlSurface) {
+        self.state.inhibit_shortcuts(surface);
+    }
+
+    pub fn release_shortcuts_inhibitor(&mut self, surface: &WlSurface) {
+        self.state.release_shortcuts_inhibitor(surface);
+    }
+
     pub fn output(&mut self, name: &str) -> WlOutput {
         self.state
             .outputs
@@ -263,6 +281,7 @@ impl State {
             xdg_surface,
             xdg_toplevel,
             viewport,
+            shortcuts_inhibitor: None,
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
@@ -318,6 +337,18 @@ impl State {
             .iter_mut()
             .find(|w| w.surface == *surface)
             .unwrap()
+    }
+
+    pub fn inhibit_shortcuts(&mut self, surface: &WlSurface) {
+        let manager = self.shortcuts_inhibit_manager.clone().unwrap();
+        let seat = self.seat.clone().unwrap();
+        let inhibitor = manager.inhibit_shortcuts(surface, &seat, &self.qh, ());
+        self.window(surface).shortcuts_inhibitor = Some(inhibitor);
+    }
+
+    pub fn release_shortcuts_inhibitor(&mut self, surface: &WlSurface) {
+        let inhibitor = self.window(surface).shortcuts_inhibitor.take().unwrap();
+        inhibitor.destroy();
     }
 }
 
@@ -522,6 +553,15 @@ impl Dispatch<WlRegistry, ()> for State {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
                     state.outputs.insert(output, String::new());
+                } else if interface == WlSeat::interface().name {
+                    let version = min(version, WlSeat::interface().version);
+                    state.seat = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpKeyboardShortcutsInhibitManagerV1::interface().name {
+                    let version = min(
+                        version,
+                        ZwpKeyboardShortcutsInhibitManagerV1::interface().version,
+                    );
+                    state.shortcuts_inhibit_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -773,5 +813,52 @@ impl Dispatch<WpViewport, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSeat,
+        event: <WlSeat as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_seat::Event::Capabilities { .. } => (),
+            wl_seat::Event::Name { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ZwpKeyboardShortcutsInhibitManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpKeyboardShortcutsInhibitManagerV1,
+        _event: <ZwpKeyboardShortcutsInhibitManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpKeyboardShortcutsInhibitorV1,
+        event: <ZwpKeyboardShortcutsInhibitorV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => (),
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => (),
+            _ => unreachable!(),
+        }
     }
 }

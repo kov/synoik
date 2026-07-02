@@ -506,15 +506,18 @@ impl State {
                 // (`org.gnome.mutter overlay-key`, default Super_L) toggles the
                 // Activities overview. Mirrors mutter's process_special_modifier_key
                 // — arm on a bare overlay-key press, cancel the moment any other key
-                // participates, and fire on the matching release.
-                // FIXME: to fully match mutter, also skip arming while a client
-                // inhibits shortcuts. The overlay key is read from the inspectable
-                // gnome_settings model; live dconf/GSettings ingestion is still TODO.
-                // The "no other modifiers" check ignores Super itself, which is right
-                // for the Super_L/Super_R settings but approximate for other keys.
+                // participates, and fire on the matching release. A client with an
+                // active keyboard-shortcuts-inhibit prevents arming, but only arming:
+                // mutter (process_overlay_key) also skips the check for a tap already
+                // in flight, so it still completes.
+                // The overlay key is read from the inspectable gnome_settings model;
+                // live dconf/GSettings ingestion is still TODO. The "no other
+                // modifiers" check ignores Super itself, which is right for the
+                // Super_L/Super_R settings but approximate for other keys.
                 if pressed {
                     let is_overlay_key = raw
                         .is_some_and(|raw| this.niri.gnome_settings.overlay_keys.contains(&raw))
+                        && !is_inhibiting_shortcuts
                         && !mods.ctrl
                         && !mods.shift
                         && !mods.alt
