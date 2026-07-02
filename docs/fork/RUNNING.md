@@ -4,6 +4,13 @@ The headless conformance corpus (`cargo test -p niri`, see `src/tests/gnome.rs`)
 is the primary loop. This doc covers running the *real* compositor when you want
 to see a change on screen.
 
+> **If the `egl_*` tests segfault** (crash in `__nptl_deallocate_tsd` at thread
+> exit): that's a Mesa bug hit when GL is zink-on-venus (e.g. this dev VM) — the
+> venus ICD's `vn_tls_free` TLS destructor dangles after `eglTerminate` unloads
+> `libvulkan_virtio.so`. Minimal repro: `scratch/egl-tsd-repro.c` (untracked).
+> Until Mesa fixes it, pin the ICD:
+> `LD_PRELOAD=/usr/lib64/libvulkan_virtio.so cargo test -p niri`
+
 ## Backends, and which one you get
 
 The backend is chosen automatically at startup (`src/niri.rs`, `State::new`):
