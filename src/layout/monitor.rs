@@ -1432,7 +1432,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// In GNOME windowing mode, the overview spreads each workspace's windows
     /// into picker slots (gnome-shell's window picker); this is how far along
     /// that spread is, if it's on at all.
-    pub(super) fn expose_progress(&self) -> Option<f64> {
+    pub fn expose_progress(&self) -> Option<f64> {
         if self.options.layout.windowing_mode != WindowingMode::Floating {
             return None;
         }

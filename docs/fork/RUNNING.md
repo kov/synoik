@@ -236,6 +236,18 @@ the overview; clicking the empty area of the active workspace leaves it
 (gnome-shell's Workspace click rules). The mouse wheel — either axis —
 scrolls through workspaces while the overview is open.
 
+The **wallpaper** comes from `org.gnome.desktop.background`: `picture-uri`
+(or `picture-uri-dark` when `org.gnome.desktop.interface color-scheme` is
+`prefer-dark`) is decoded (PNG/JPEG/WebP via the image crate, GNOME's stock
+JPEG XL backgrounds via jxl-oxide) and drawn behind every workspace in GNOME
+windowing mode, live-updating with the settings. In the overview the
+workspace previews get gnome-shell's 30px rounded corners, growing with the
+open transition (`BACKGROUND_CORNER_RADIUS_PIXELS`). Divergences for now:
+every `picture-options` mode draws as `zoom` (cover + center crop, the
+default), SVG wallpapers aren't decoded, and `primary-color` isn't used as
+the no-picture fill — the configured solid background color backs those
+cases instead.
+
 Not yet ported: preview chrome (title, close button, app icon), the
 workspace thumbnails strip, app grid, and search.
 

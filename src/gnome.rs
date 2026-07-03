@@ -6,6 +6,7 @@
 //! state flows through here as one inspectable struct rather than being scattered
 //! across the input/render code.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gio::glib;
@@ -43,6 +44,8 @@ pub struct GnomeSettings {
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles (sides) or maximizes (top) it.
     pub edge_tiling: bool,
+    /// `org.gnome.desktop.background`: the wallpaper GNOME would draw.
+    pub background: BackgroundSettings,
 }
 
 impl Default for GnomeSettings {
@@ -54,8 +57,42 @@ impl Default for GnomeSettings {
             disable_command_line: false,
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
+            background: BackgroundSettings::default(),
         }
     }
+}
+
+/// The wallpaper settings from `org.gnome.desktop.background`, already
+/// resolved down to what the compositor needs to draw.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackgroundSettings {
+    /// The picture to draw: `picture-uri` or `picture-uri-dark` (selected by
+    /// `org.gnome.desktop.interface color-scheme`, like gnome-shell's
+    /// `Background._loadBackground`), converted to a local path. `None` when
+    /// the URI is empty/non-local or `picture-options` is `none`.
+    pub picture: Option<PathBuf>,
+    /// `picture-options`: how the picture is fit to the screen.
+    pub options: BackgroundOptions,
+}
+
+/// `org.gnome.desktop.background picture-options`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundOptions {
+    /// Don't draw the picture at all.
+    None,
+    /// Tile at native size.
+    Wallpaper,
+    /// Center at native size.
+    Centered,
+    /// Fit inside the screen, keeping aspect (letterboxed).
+    Scaled,
+    /// Stretch to the screen, ignoring aspect.
+    Stretched,
+    /// Cover the screen, keeping aspect (center-cropped). The GNOME default.
+    #[default]
+    Zoom,
+    /// One picture spanned across all monitors.
+    Spanned,
 }
 
 /// `org.gnome.desktop.wm.preferences focus-new-windows`.
@@ -94,6 +131,35 @@ impl GnomeSettings {
         if settings_has_key(lockdown, "disable-command-line") {
             self.disable_command_line = lockdown.boolean("disable-command-line");
         }
+    }
+
+    fn load_background(&mut self, background: &gio::Settings, interface: Option<&gio::Settings>) {
+        // gnome-shell picks the dark variant whenever color-scheme is
+        // prefer-dark (js/ui/background.js, `_loadBackground`).
+        let prefer_dark = interface
+            .filter(|s| settings_has_key(s, "color-scheme"))
+            .is_some_and(|s| s.string("color-scheme") == "prefer-dark");
+
+        let uri_key = if prefer_dark && settings_has_key(background, "picture-uri-dark") {
+            "picture-uri-dark"
+        } else {
+            "picture-uri"
+        };
+        if !settings_has_key(background, uri_key) {
+            return;
+        }
+        let uri = background.string(uri_key);
+
+        let options = if settings_has_key(background, "picture-options") {
+            parse_picture_options(background.string("picture-options").as_str())
+        } else {
+            BackgroundOptions::default()
+        };
+
+        self.background = BackgroundSettings {
+            picture: resolve_picture_uri(uri.as_str(), options),
+            options,
+        };
     }
 
     fn load_wm_preferences(&mut self, wm: &gio::Settings) {
@@ -508,6 +574,8 @@ struct Stores {
     wm_preferences: Option<gio::Settings>,
     shell: Option<gio::Settings>,
     lockdown: Option<gio::Settings>,
+    background: Option<gio::Settings>,
+    interface: Option<gio::Settings>,
 }
 
 impl Stores {
@@ -521,6 +589,8 @@ impl Stores {
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences"),
             shell: gsettings("org.gnome.shell"),
             lockdown: gsettings("org.gnome.desktop.lockdown"),
+            background: gsettings("org.gnome.desktop.background"),
+            interface: gsettings("org.gnome.desktop.interface"),
         }
     }
 
@@ -536,6 +606,8 @@ impl Stores {
             &self.wm_preferences,
             &self.shell,
             &self.lockdown,
+            &self.background,
+            &self.interface,
         ]
         .into_iter()
         .flatten()
@@ -559,6 +631,9 @@ impl Stores {
         }
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
+        }
+        if let Some(background) = &self.background {
+            settings.load_background(background, self.interface.as_ref());
         }
         settings
     }
@@ -757,9 +832,76 @@ fn parse_overlay_key(name: &str) -> Result<Vec<Keysym>, &str> {
     }
 }
 
+/// Parse a `picture-options` value; an unrecognized one falls back to the
+/// schema default (`zoom`) with a warning, like a fresh GNOME install shows.
+fn parse_picture_options(value: &str) -> BackgroundOptions {
+    match value {
+        "none" => BackgroundOptions::None,
+        "wallpaper" => BackgroundOptions::Wallpaper,
+        "centered" => BackgroundOptions::Centered,
+        "scaled" => BackgroundOptions::Scaled,
+        "stretched" => BackgroundOptions::Stretched,
+        "zoom" => BackgroundOptions::Zoom,
+        "spanned" => BackgroundOptions::Spanned,
+        other => {
+            warn!("ignoring unrecognized picture-options {other:?}; using zoom");
+            BackgroundOptions::Zoom
+        }
+    }
+}
+
+/// Resolve a `picture-uri` value to the local file to decode. `None` (no
+/// picture) when the URI is empty, isn't a local `file://` URI, or the
+/// options say not to draw it.
+fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf> {
+    if uri.is_empty() || options == BackgroundOptions::None {
+        return None;
+    }
+    match glib::filename_from_uri(uri) {
+        Ok((path, _host)) => Some(path),
+        Err(err) => {
+            warn!("ignoring non-local background picture-uri {uri:?}: {err}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_uri_resolves_to_local_path() {
+        assert_eq!(
+            resolve_picture_uri(
+                "file:///usr/share/backgrounds/gnome/adwaita-l.jxl",
+                BackgroundOptions::Zoom,
+            ),
+            Some(PathBuf::from("/usr/share/backgrounds/gnome/adwaita-l.jxl"))
+        );
+        // URI-encoding is decoded on the way.
+        assert_eq!(
+            resolve_picture_uri(
+                "file:///home/user/my%20wallpaper.png",
+                BackgroundOptions::Zoom
+            ),
+            Some(PathBuf::from("/home/user/my wallpaper.png"))
+        );
+    }
+
+    #[test]
+    fn picture_uri_rejects_empty_remote_and_none_options() {
+        assert_eq!(resolve_picture_uri("", BackgroundOptions::Zoom), None);
+        assert_eq!(
+            resolve_picture_uri("https://example.com/wall.png", BackgroundOptions::Zoom),
+            None
+        );
+        // picture-options=none means "no picture", whatever the URI says.
+        assert_eq!(
+            resolve_picture_uri("file:///tmp/wall.png", BackgroundOptions::None),
+            None
+        );
+    }
 
     #[test]
     fn parse_overlay_key_bare_super_is_both() {
@@ -974,6 +1116,8 @@ mod tests {
                 wm_preferences: None,
                 shell: None,
                 lockdown: None,
+                background: None,
+                interface: None,
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -1067,6 +1211,8 @@ mod tests {
                         wm_preferences: None,
                         shell: Some(shell),
                         lockdown: None,
+                        background: None,
+                        interface: None,
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);

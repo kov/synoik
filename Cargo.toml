@@ -71,7 +71,9 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 gio = "0.22.8"
 git-version = "0.3.9"
 glam = "0.32.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 input = { version = "0.10.0", features = ["libinput_1_21"] }
+jxl-oxide = { version = "0.12.6", features = ["image"] }
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.185"
 libdisplay-info = "0.3.0"

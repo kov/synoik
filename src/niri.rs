@@ -17,7 +17,7 @@ use niri_config::debug::PreviewRender;
 use niri_config::output::MaxBpc;
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
-    WorkspaceReference, Xkb,
+    WindowingMode, WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
@@ -157,6 +157,7 @@ use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureBuffer;
@@ -184,6 +185,7 @@ use crate::utils::{
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform, write_png_rgba8, xwayland,
 };
+use crate::wallpaper::Wallpaper;
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
@@ -330,6 +332,9 @@ pub struct Niri {
     pub gnome_settings: GnomeSettings,
     /// Writes settings back to the GSettings store; `None` when headless.
     pub gnome_settings_writer: Option<GnomeSettingsWriter>,
+    /// The decoded `org.gnome.desktop.background` picture, drawn as the
+    /// workspace background in GNOME windowing mode.
+    pub wallpaper: Wallpaper,
     /// Live `org.gnome.Shell` accelerator grabs (gsd-media-keys et al.), in
     /// grab order — the input path takes the first match.
     pub accel_grabs: Vec<AccelGrab>,
@@ -788,6 +793,10 @@ impl State {
                 .set_gnome_edge_tiling(state.niri.gnome_settings.edge_tiling);
             state
                 .niri
+                .wallpaper
+                .update(&state.niri.gnome_settings.background);
+            state
+                .niri
                 .event_loop
                 .insert_source(rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(settings) = event {
@@ -796,6 +805,8 @@ impl State {
                             .niri
                             .layout
                             .set_gnome_edge_tiling(settings.edge_tiling);
+                        state.niri.wallpaper.update(&settings.background);
+                        state.niri.queue_redraw_all();
                         state.niri.gnome_settings = settings;
                     }
                 })
@@ -2707,6 +2718,7 @@ impl Niri {
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
+            wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),
             next_accel_grab_action: 100,
@@ -4468,6 +4480,14 @@ impl Niri {
         let mon = self.layout.monitor_for_output(output).unwrap();
         let zoom = mon.overview_zoom();
 
+        // In GNOME windowing mode the org.gnome.desktop.background wallpaper
+        // backs every workspace. In the overview its corners round like
+        // gnome-shell's (BACKGROUND_CORNER_RADIUS_PIXELS = 30, growing with
+        // the transition); the radius is in pre-zoom workspace units, so
+        // divide out the zoom to land at 30 on screen.
+        let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
+        let wallpaper_radius = mon.expose_progress().map_or(0., |p| 30. * p) / zoom;
+
         // Get layer-shell elements.
         let layer_map = layer_map_for_output(output);
 
@@ -4549,7 +4569,19 @@ impl Niri {
             push_normal_from_layer!(Layer::Background);
 
             // We don't expect more than one workspace when render_above_top_layer().
-            if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
+            if let Some((ws, geo)) = mon.workspaces_with_render_geo().next() {
+                if gnome_mode {
+                    if let Some(elem) = self.wallpaper.render(
+                        ctx.renderer.as_gles_renderer(),
+                        ws.view_size(),
+                        0.,
+                        output_scale,
+                    ) {
+                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
+                            push(elem.into());
+                        }
+                    }
+                }
                 push(ws.render_background().into());
             }
         } else {
@@ -4595,7 +4627,23 @@ impl Niri {
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
-                process!(geo)(ws.render_background());
+                let mut wallpapered = false;
+                if gnome_mode {
+                    if let Some(elem) = self.wallpaper.render(
+                        ctx.renderer.as_gles_renderer(),
+                        ws.view_size(),
+                        wallpaper_radius,
+                        output_scale,
+                    ) {
+                        process!(geo)(elem);
+                        wallpapered = true;
+                    }
+                }
+                // The solid color would poke out of the wallpaper's rounded
+                // corners, so it only backs workspaces without one.
+                if !wallpapered {
+                    process!(geo)(ws.render_background());
+                }
             }
         }
 
@@ -6741,6 +6789,9 @@ niri_render_elements! {
         >>>,
         RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             SolidColorRenderElement
+        >>>,
+        RelocatedRoundedTexture = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            RoundedTextureRenderElement
         >>>,
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
