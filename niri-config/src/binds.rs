@@ -366,6 +366,10 @@ pub enum Action {
     OpenOverview,
     CloseOverview,
     ShowRunDialog,
+    /// Notify a grabbed accelerator (org.gnome.Shell GrabAccelerator); the
+    /// argument is the grab's action id. Internal, not bindable from config.
+    #[knuffel(skip)]
+    ActivateAcceleratorGrab(u32),
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),
     #[knuffel(skip)]

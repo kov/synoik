@@ -107,9 +107,10 @@ unaffected either way. Undo everything with
 
 Expectations: this exercises the Phase 1 contract surface (STRATEGY.md §3.8).
 Display config and most gsd daemons should come up (niri implements the core
-`org.gnome.Mutter.*` names); media keys won't work yet (gsd-media-keys needs
-`org.gnome.Shell` `GrabAccelerator`); there is no panel or GNOME chrome. The
-gaps you hit here are, in effect, the Phase 1 worklist.
+`org.gnome.Mutter.*` names, and `org.gnome.Shell` accelerator grabs — so
+gsd-media-keys' volume/brightness/media keys work, though without OSD popups
+until `ShowOSD` exists); there is no panel or GNOME chrome. The gaps you hit
+here are, in effect, the Phase 1 worklist.
 
 ## How GNOME settings feed in
 

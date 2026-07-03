@@ -514,6 +514,31 @@ pub struct Accel {
 /// (0x29) plus the xkb keycode offset (mutter: `get_above_tab_keycode`).
 const ABOVE_TAB_KEYCODE: u32 = 0x29 + 8;
 
+/// A live external accelerator grab (`org.gnome.Shell` `GrabAccelerator`),
+/// mirroring mutter's `MetaKeyGrab`: gsd-media-keys and friends register
+/// their key combos here and get an `AcceleratorActivated` D-Bus signal when
+/// one fires, instead of the compositor acting on the key itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccelGrab {
+    /// The dynamic action id handed back to the grabber; nonzero.
+    pub action: u32,
+    pub accel: Accel,
+    /// `Shell.ActionMode` bitmask: when the grab may fire. We only
+    /// distinguish "usable while locked" (LOCK_SCREEN | UNLOCK_SCREEN).
+    pub mode_flags: u32,
+    /// `MetaKeyBindingFlags`: NON_MASKABLE and IGNORE_AUTOREPEAT are honored.
+    pub grab_flags: u32,
+    /// Unique D-Bus name of the grabber, for unicast signals and cleanup.
+    pub owner: String,
+}
+
+impl AccelGrab {
+    pub const MODE_LOCK_SCREEN: u32 = 1 << 2;
+    pub const MODE_UNLOCK_SCREEN: u32 = 1 << 3;
+    pub const FLAG_NON_MASKABLE: u32 = 1 << 3;
+    pub const FLAG_IGNORE_AUTOREPEAT: u32 = 1 << 4;
+}
+
 /// Parse one accelerator string with mutter's grammar (`meta_parse_accelerator`
 /// in `meta-accel-parse.c`):
 ///
@@ -526,7 +551,7 @@ const ABOVE_TAB_KEYCODE: u32 = 0x29 + 8;
 ///   string `Above_Tab`, or a keysym name resolved case-insensitively with an `XF86` prefix retry
 ///   (so `AudioPlay` works);
 /// - an unresolvable key → `Err(())`.
-fn parse_accelerator(accel: &str) -> Result<Option<Accel>, ()> {
+pub(crate) fn parse_accelerator(accel: &str) -> Result<Option<Accel>, ()> {
     if accel.is_empty() || accel == "disabled" {
         return Ok(None);
     }

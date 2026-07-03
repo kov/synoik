@@ -47,7 +47,7 @@ use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
-use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding};
+use crate::gnome::{Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding};
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
@@ -603,6 +603,14 @@ impl State {
                     this.niri.screenshot_ui.set_space_down(pressed);
                 }
 
+                // A grabbed accelerator's release notifies the grabber; the
+                // release itself stays suppressed through the normal path.
+                if !pressed {
+                    if let Some(action) = this.niri.accel_grab_release_pending.remove(&key_code) {
+                        this.niri.emit_accelerator_signal(action, false);
+                    }
+                }
+
                 let res = {
                     let config = this.niri.config.borrow();
                     let mru_is_open = this.niri.window_mru_ui.is_open();
@@ -613,6 +621,7 @@ impl State {
                         &mut this.niri.suppressed_keys,
                         bindings,
                         &this.niri.gnome_settings.keybindings,
+                        &this.niri.accel_grabs,
                         mru_is_open,
                         mod_key,
                         key_code,
@@ -649,6 +658,15 @@ impl State {
 
         if !pressed {
             return;
+        }
+
+        // Remember which key fired a grabbed accelerator, so its release can
+        // send AcceleratorDeactivated (mutter's external-grab handler is
+        // TRIGGER_RELEASE: press activates, release deactivates).
+        if let Action::ActivateAcceleratorGrab(action) = bind.action {
+            self.niri
+                .accel_grab_release_pending
+                .insert(event.key_code(), action);
         }
 
         self.handle_bind(bind.clone());
@@ -2386,6 +2404,9 @@ impl State {
                 }
                 self.niri.run_dialog.open();
                 self.niri.queue_redraw_all();
+            }
+            Action::ActivateAcceleratorGrab(action) => {
+                self.niri.emit_accelerator_signal(action, true);
             }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
@@ -4504,6 +4525,7 @@ fn should_intercept_key<'a>(
     suppressed_keys: &mut HashSet<Keycode>,
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
+    accel_grabs: &[AccelGrab],
     mru_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
@@ -4525,6 +4547,7 @@ fn should_intercept_key<'a>(
     let mut final_bind = find_bind(
         bindings,
         gnome_keybindings,
+        accel_grabs,
         mru_is_open,
         mod_key,
         key_code,
@@ -4593,6 +4616,7 @@ fn should_intercept_key<'a>(
 fn find_bind<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
+    accel_grabs: &[AccelGrab],
     mru_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
@@ -4643,8 +4667,48 @@ fn find_bind<'a>(
         return Some(bind);
     }
 
+    // External accelerator grabs live in the same table in mutter, after the
+    // builtins (a conflicting grab is refused at grab time). They also don't
+    // fire while the switcher's grab is up.
+    if !mru_is_open {
+        if let Some(bind) = find_accel_grab_bind(accel_grabs, key_code, raw, mods) {
+            return Some(bind);
+        }
+    }
+
     let trigger = Trigger::Keysym(raw?);
     find_configured_bind(bindings, mod_key, trigger, mods)
+}
+
+/// Match an `org.gnome.Shell` accelerator grab (gsd-media-keys et al.),
+/// synthesized into a bind whose action notifies the grabber over D-Bus.
+fn find_accel_grab_bind(
+    accel_grabs: &[AccelGrab],
+    key_code: Keycode,
+    raw: Option<Keysym>,
+    mods: ModifiersState,
+) -> Option<Bind> {
+    let grab = accel_grabs
+        .iter()
+        .find(|g| accel_matches(&g.accel, key_code, raw, mods))?;
+
+    Some(Bind {
+        key: Key {
+            // Not entirely correct but it doesn't matter in how we currently use it.
+            trigger: Trigger::Keysym(raw.unwrap_or(Keysym::NoSymbol)),
+            modifiers: Modifiers::empty(),
+        },
+        action: Action::ActivateAcceleratorGrab(grab.action),
+        repeat: grab.grab_flags & AccelGrab::FLAG_IGNORE_AUTOREPEAT == 0,
+        cooldown: None,
+        // Volume/brightness keys are grabbed with lock-screen modes; honor
+        // that so they keep working on the lock screen like in GNOME.
+        allow_when_locked: grab.mode_flags
+            & (AccelGrab::MODE_LOCK_SCREEN | AccelGrab::MODE_UNLOCK_SCREEN)
+            != 0,
+        allow_inhibiting: grab.grab_flags & AccelGrab::FLAG_NON_MASKABLE == 0,
+        hotkey_overlay_title: None,
+    })
 }
 
 /// Find a GNOME keybinding (`org.gnome.desktop.wm.keybindings`, read through
@@ -5472,6 +5536,7 @@ mod tests {
                 suppr,
                 &bindings.0,
                 &[],
+                &[],
                 false,
                 comp_mod,
                 close_key_code,
@@ -5490,6 +5555,7 @@ mod tests {
             should_intercept_key(
                 suppr,
                 &bindings.0,
+                &[],
                 &[],
                 false,
                 comp_mod,

@@ -128,7 +128,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
-use crate::gnome::{GnomeSettings, GnomeSettingsWriter};
+use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
@@ -330,6 +330,15 @@ pub struct Niri {
     pub gnome_settings: GnomeSettings,
     /// Writes settings back to the GSettings store; `None` when headless.
     pub gnome_settings_writer: Option<GnomeSettingsWriter>,
+    /// Live `org.gnome.Shell` accelerator grabs (gsd-media-keys et al.), in
+    /// grab order — the input path takes the first match.
+    pub accel_grabs: Vec<AccelGrab>,
+    /// Keys currently held that fired a grab, so the release can send
+    /// `AcceleratorDeactivated` to the grabber.
+    pub accel_grab_release_pending: HashMap<Keycode, u32>,
+    /// The next grab's action id (mutter hands out ids past its builtin
+    /// keybinding actions and never reuses them; the base is arbitrary).
+    pub next_accel_grab_action: u32,
 
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
@@ -2271,6 +2280,87 @@ impl State {
         self.set_xkb_config(xkb.to_xkb_config());
         self.ipc_keyboard_layouts_changed();
     }
+
+    #[cfg(feature = "dbus")]
+    pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToNiri) {
+        use crate::dbus::gnome_shell::GnomeShellToNiri;
+        match msg {
+            GnomeShellToNiri::Grab {
+                accelerator,
+                mode_flags,
+                grab_flags,
+                sender,
+                reply,
+            } => {
+                let action = self.grab_accelerator(&accelerator, mode_flags, grab_flags, sender);
+                let _ = reply.send_blocking(action);
+            }
+            GnomeShellToNiri::Ungrab {
+                action,
+                sender,
+                reply,
+            } => {
+                let _ = reply.send_blocking(self.ungrab_accelerator(action, &sender));
+            }
+            GnomeShellToNiri::SenderVanished(name) => {
+                self.niri.accel_grabs.retain(|g| g.owner != name);
+            }
+        }
+    }
+
+    /// Register an external accelerator grab, mirroring
+    /// `meta_display_grab_accelerator`: an unparseable accelerator or one that
+    /// already resolves to an existing keybinding or grab is refused with 0
+    /// (first grabber wins), otherwise the new dynamic action id is returned.
+    pub fn grab_accelerator(
+        &mut self,
+        accelerator: &str,
+        mode_flags: u32,
+        grab_flags: u32,
+        sender: String,
+    ) -> u32 {
+        let Ok(Some(accel)) = crate::gnome::parse_accelerator(accelerator) else {
+            warn!("refusing to grab unparseable accelerator {accelerator:?}");
+            return 0;
+        };
+
+        let keybinding_accels = self
+            .niri
+            .gnome_settings
+            .keybindings
+            .iter()
+            .flat_map(|kb| &kb.accels);
+        let grab_accels = self.niri.accel_grabs.iter().map(|g| &g.accel);
+        if keybinding_accels.chain(grab_accels).any(|e| *e == accel) {
+            debug!("refusing conflicting accelerator grab {accelerator:?} for {sender}");
+            return 0;
+        }
+
+        let action = self.niri.next_accel_grab_action;
+        self.niri.next_accel_grab_action += 1;
+        debug!("grabbed accelerator {accelerator:?} for {sender}: action {action}");
+        self.niri.accel_grabs.push(AccelGrab {
+            action,
+            accel,
+            mode_flags,
+            grab_flags,
+            owner: sender,
+        });
+        action
+    }
+
+    /// Remove an accelerator grab. Grabbers can only ungrab their own
+    /// actions, like gnome-shell; returns whether a grab was removed.
+    pub fn ungrab_accelerator(&mut self, action: u32, sender: &str) -> bool {
+        let grabs = &mut self.niri.accel_grabs;
+        let index = grabs
+            .iter()
+            .position(|g| g.action == action && g.owner == sender);
+        if let Some(index) = index {
+            grabs.remove(index);
+        }
+        index.is_some()
+    }
 }
 
 impl Niri {
@@ -2604,6 +2694,9 @@ impl Niri {
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
+            accel_grabs: Vec::new(),
+            accel_grab_release_pending: HashMap::new(),
+            next_accel_grab_action: 100,
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
             suppressed_buttons: HashSet::new(),
@@ -6238,6 +6331,57 @@ impl Niri {
             warn!("error spawning a thread to send MonitorsChanged: {err:?}");
         }
     }
+
+    /// Send `AcceleratorActivated`/`AcceleratorDeactivated` for a grabbed
+    /// accelerator, unicast to the grabbing client like gnome-shell does. The
+    /// parameters dict carries `timestamp` and `action-mode`.
+    #[cfg(feature = "dbus")]
+    pub fn emit_accelerator_signal(&self, action: u32, activated: bool) {
+        use std::collections::HashMap;
+
+        use zbus::names::BusName;
+        use zbus::zvariant::Value;
+
+        let Some(grab) = self.accel_grabs.iter().find(|g| g.action == action) else {
+            return;
+        };
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_gnome_shell.clone()) else {
+            return;
+        };
+
+        let mut parameters = HashMap::new();
+        let timestamp = get_monotonic_time().as_millis() as u32;
+        parameters.insert("timestamp", Value::from(timestamp));
+        // Shell.ActionMode: NORMAL or LOCK_SCREEN is all we distinguish.
+        let action_mode: u32 = if self.is_locked() { 1 << 2 } else { 1 };
+        parameters.insert("action-mode", Value::from(action_mode));
+
+        let name = if activated {
+            "AcceleratorActivated"
+        } else {
+            "AcceleratorDeactivated"
+        };
+        let destination = match BusName::try_from(grab.owner.clone()) {
+            Ok(destination) => destination,
+            Err(err) => {
+                warn!("invalid grab owner name {:?}: {err:?}", grab.owner);
+                return;
+            }
+        };
+        let res = async_io::block_on(conn.inner().emit_signal(
+            Some(destination),
+            "/org/gnome/Shell",
+            "org.gnome.Shell",
+            name,
+            &(action, parameters),
+        ));
+        if let Err(err) = res {
+            warn!("error emitting {name}: {err:?}");
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn emit_accelerator_signal(&self, _action: u32, _activated: bool) {}
 
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {

@@ -884,6 +884,81 @@ fn run_dialog_lockdown_disables() {
     );
 }
 
+/// `org.gnome.Shell` accelerator grabs (what gsd-media-keys uses for
+/// volume/media keys): a grabbed combo never reaches the focused client, a
+/// conflicting grab is refused with 0 (mutter's first-grabber-wins), only the
+/// owner can ungrab, and after ungrabbing the combo flows to the client
+/// again.
+#[test]
+fn accelerator_grabs_intercept_conflict_and_ungrab() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    let action = f
+        .niri_state()
+        .grab_accelerator("<Super>z", 1, 0, ":1.10".to_owned());
+    assert_ne!(action, 0, "a free combo must be grabbable");
+
+    assert_eq!(
+        f.niri_state()
+            .grab_accelerator("<Super>z", 1, 0, ":1.11".to_owned()),
+        0,
+        "a combo held by another grab must be refused"
+    );
+    assert_eq!(
+        f.niri_state()
+            .grab_accelerator("<Alt>F4", 1, 0, ":1.11".to_owned()),
+        0,
+        "a combo held by a GNOME keybinding must be refused"
+    );
+    assert_eq!(
+        f.niri_state()
+            .grab_accelerator("no such key", 1, 0, ":1.11".to_owned()),
+        0,
+        "an unparseable accelerator must be refused"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id)
+            .take_key_events()
+            .iter()
+            .any(|(key, _)| *key == KEY_Z),
+        "a grabbed accelerator must not reach the client"
+    );
+    assert!(
+        f.niri().accel_grab_release_pending.is_empty(),
+        "the release must have cleared the pending deactivation"
+    );
+
+    assert!(
+        !f.niri_state().ungrab_accelerator(action, ":1.11"),
+        "only the owner may ungrab"
+    );
+    assert!(f.niri_state().ungrab_accelerator(action, ":1.10"));
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id)
+            .take_key_events()
+            .iter()
+            .any(|(key, state)| *key == KEY_Z && *state == WlKeyState::Pressed),
+        "after ungrabbing, the combo must reach the client again"
+    );
+}
+
 /// The overlay key is rebindable: pointing the setting at `Super_R` makes the
 /// right Super the trigger, and the (now non-overlay) left Super inert.
 #[test]
