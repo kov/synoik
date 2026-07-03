@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, Workspace as WorkspaceConfig,
+    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, WindowingMode,
+    Workspace as WorkspaceConfig,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
@@ -1717,7 +1718,22 @@ impl<W: LayoutElement> Workspace<W> {
         let visible = self.is_floating_visible();
         let floating = floating.map(move |(tile, pos)| (tile, pos, visible));
 
-        floating.chain(scrolling)
+        // Front-to-back, consistent with the render order.
+        if self.scrolling_renders_on_top() {
+            Box::new(scrolling.chain(floating)) as Box<dyn Iterator<Item = _>>
+        } else {
+            Box::new(floating.chain(scrolling))
+        }
+    }
+
+    /// GNOME windowing: the focused window is effectively topmost (mutter
+    /// raises on click and on activation), so when the active window lives
+    /// in the scrolling layer (a maximized or fullscreen window), that layer
+    /// covers the floating one. Focus-follows-mouse activation
+    /// ([`FloatingActive::NoButRaised`]) deliberately keeps floating on top.
+    pub fn scrolling_renders_on_top(&self) -> bool {
+        self.options.layout.windowing_mode == WindowingMode::Floating
+            && matches!(self.floating_is_active, FloatingActive::No)
     }
 
     pub fn tiles_with_render_positions_mut(
@@ -1881,6 +1897,12 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
         // This logic is consistent with tiles_with_render_positions().
+        if self.scrolling_renders_on_top() {
+            if let Some(rv) = self.scrolling.window_under(pos) {
+                return Some(rv);
+            }
+        }
+
         if self.is_floating_visible() {
             if let Some(rv) = self
                 .floating
@@ -1891,6 +1913,9 @@ impl<W: LayoutElement> Workspace<W> {
             }
         }
 
+        if self.scrolling_renders_on_top() {
+            return None;
+        }
         self.scrolling.window_under(pos)
     }
 

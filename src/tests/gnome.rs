@@ -1465,3 +1465,75 @@ fn oversized_window_auto_maximizes_with_clamped_restore() {
         "the auto-maximize restore size must be clamped ({expected}), got: {configures}"
     );
 }
+
+/// GNOME stacking: mutter raises on click/activation, so the focused window
+/// stays visually topmost even though maximizing moves it into the scrolling
+/// layer, which niri renders below the floating one. Switching back to a
+/// floating window puts the floating layer back on top.
+#[test]
+fn active_maximized_window_covers_floating() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let first = map_window_sized(&mut f, id, (800, 600), None);
+    let first_id = f.niri().layout.focus().unwrap().id();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second_id = f.niri().layout.focus().unwrap().id();
+    f.double_roundtrip(id);
+
+    let window_pos = |f: &mut Fixture, wanted| {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        let (_, pos, _) = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == wanted)
+            .unwrap();
+        (pos.x, pos.y)
+    };
+    let window_under = |f: &mut Fixture, pos: (f64, f64)| {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        ws.window_under(pos.into()).map(|(w, _)| w.id())
+    };
+
+    // Click the first window: GNOME activates and raises it.
+    let (x, y) = window_pos(&mut f, first_id);
+    f.pointer_motion(x + 20., y + 20.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), first_id);
+
+    // Maximize it and ack the full-size configure.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&first);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    // The maximized window is active: it must cover the floating window,
+    // map order notwithstanding.
+    let (sx, sy) = window_pos(&mut f, second_id);
+    let over_second = (sx + 400., sy + 300.);
+    assert_eq!(
+        window_under(&mut f, over_second),
+        Some(first_id),
+        "the active maximized window must cover unfocused floating windows"
+    );
+
+    // Alt+Tab back to the floating window: floating is on top again.
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), second_id);
+    assert_eq!(
+        window_under(&mut f, over_second),
+        Some(second_id),
+        "activating a floating window must put the floating layer back on top"
+    );
+}

@@ -1736,7 +1736,12 @@ impl<W: LayoutElement> Monitor<W> {
 
             let xray_pos = XrayPos::new(geo.loc, zoom);
 
-            ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
+            // First pushed = topmost.
+            if ws.scrolling_renders_on_top() {
+                ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
+            } else {
+                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
+            }
 
             if let Some(loc) = insert_hint_render_loc {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
@@ -1745,7 +1750,11 @@ impl<W: LayoutElement> Monitor<W> {
                 }
             }
 
-            ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
+            if ws.scrolling_renders_on_top() {
+                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
+            } else {
+                ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
+            }
         }
     }
 
