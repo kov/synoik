@@ -1809,3 +1809,84 @@ fn overview_spreads_windows_into_picker_slots() {
         "clicking a preview must activate that window"
     );
 }
+
+/// GNOME (40+) overview geometry: workspaces form a horizontal row with the
+/// active one centered at 85% of the monitor (gnome-shell WorkspacesView).
+/// The picker slot of a lone window pins both the workspace scale and its
+/// centering.
+#[test]
+fn overview_workspace_is_centered_at_gnome_scale() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    // Workspace-local slot (see expose::tests): (580, 255) 760 × 570, then
+    // through zoom 0.85 with the workspace centered at (144, 81).
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    assert_pos_eq(
+        (rect.loc.x, rect.loc.y),
+        (144. + 580. * 0.85, 81. + 255. * 0.85),
+        "picker slot must reflect the centered 0.85-scale workspace",
+    );
+    assert!(
+        (rect.size.w - 760. * 0.85).abs() <= 1. && (rect.size.h - 570. * 0.85).abs() <= 1.,
+        "picker slot size must scale by the workspace zoom, got {rect:?}"
+    );
+}
+
+/// GNOME overview click semantics (gnome-shell Workspace click): clicking a
+/// neighbor workspace (peeking at the screen edge of the horizontal row)
+/// switches to it and stays in the overview; clicking the empty area of the
+/// active workspace leaves the overview.
+#[test]
+fn overview_click_neighbor_switches_and_stays() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    // The trailing empty workspace peeks at the right edge of the row
+    // (active workspace spans 144..1776, the neighbor starts at 1856).
+    f.pointer_motion(1900., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "clicking a neighbor workspace must not leave the overview"
+    );
+    let active = f.niri().layout.active_workspace().unwrap().id();
+    assert_ne!(
+        active, ws1_id,
+        "clicking a neighbor workspace must switch to it"
+    );
+
+    // Clicking the empty area of the (now centered) active workspace leaves
+    // the overview.
+    f.pointer_motion(-940., 0.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "clicking the active workspace's empty area must leave the overview"
+    );
+    assert_eq!(
+        f.niri().layout.active_workspace().unwrap().id(),
+        active,
+        "leaving the overview must keep the clicked workspace active"
+    );
+}

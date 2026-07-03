@@ -3170,10 +3170,26 @@ impl State {
                 .then(|| self.niri.workspace_under_cursor(false))
                 .flatten()
             {
-                let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                let ws_id = ws.id();
+                let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
 
                 self.niri.layout.focus_output(&output);
-                self.niri.layout.toggle_overview_to_workspace(ws_idx);
+
+                // GNOME (gnome-shell Workspace click): clicking the empty
+                // active workspace leaves the overview; clicking another
+                // workspace switches to it and stays in the overview.
+                let gnome_mode = self.niri.config.borrow().layout.windowing_mode
+                    == niri_config::WindowingMode::Floating;
+                let is_active = self
+                    .niri
+                    .layout
+                    .active_workspace()
+                    .is_some_and(|active| active.id() == ws_id);
+                if gnome_mode && !is_active {
+                    self.niri.layout.switch_workspace(ws_idx);
+                } else {
+                    self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                }
 
                 // FIXME: granular.
                 self.niri.queue_redraw_all();
@@ -3304,14 +3320,32 @@ impl State {
                 if ticks != 0 {
                     let (bind_left, bind_right) =
                         if should_handle_in_overview && modifiers.is_empty() {
+                            // In GNOME windowing mode the overview workspaces
+                            // form a horizontal row: horizontal wheel scrolls
+                            // through them (gnome-shell handleWorkspaceScroll).
+                            let gnome_mode = self.niri.config.borrow().layout.windowing_mode
+                                == niri_config::WindowingMode::Floating;
+                            let (action_left, action_right, cooldown) = if gnome_mode {
+                                (
+                                    Action::FocusWorkspaceUpUnderMouse,
+                                    Action::FocusWorkspaceDownUnderMouse,
+                                    Some(Duration::from_millis(50)),
+                                )
+                            } else {
+                                (
+                                    Action::FocusColumnLeftUnderMouse,
+                                    Action::FocusColumnRightUnderMouse,
+                                    None,
+                                )
+                            };
                             let bind_left = Some(Bind {
                                 key: Key {
                                     trigger: Trigger::WheelScrollLeft,
                                     modifiers: Modifiers::empty(),
                                 },
-                                action: Action::FocusColumnLeftUnderMouse,
+                                action: action_left,
                                 repeat: true,
-                                cooldown: None,
+                                cooldown,
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
@@ -3321,9 +3355,9 @@ impl State {
                                     trigger: Trigger::WheelScrollRight,
                                     modifiers: Modifiers::empty(),
                                 },
-                                action: Action::FocusColumnRightUnderMouse,
+                                action: action_right,
                                 repeat: true,
-                                cooldown: None,
+                                cooldown,
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
@@ -3873,10 +3907,25 @@ impl State {
                         .then(|| self.niri.workspace_under(false, pos))
                         .flatten()
                     {
-                        let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                        let ws_id = ws.id();
+                        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
 
                         self.niri.layout.focus_output(&output);
-                        self.niri.layout.toggle_overview_to_workspace(ws_idx);
+
+                        // Same GNOME semantics as the pointer path: only the
+                        // active workspace's empty area leaves the overview.
+                        let gnome_mode = self.niri.config.borrow().layout.windowing_mode
+                            == niri_config::WindowingMode::Floating;
+                        let is_active = self
+                            .niri
+                            .layout
+                            .active_workspace()
+                            .is_some_and(|active| active.id() == ws_id);
+                        if gnome_mode && !is_active {
+                            self.niri.layout.switch_workspace(ws_idx);
+                        } else {
+                            self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                        }
 
                         // FIXME: granular.
                         self.niri.queue_redraw_all();

@@ -228,9 +228,15 @@ clicks hit the slots, and clicking a preview activates that window and
 leaves the overview. Scrolling mode keeps niri's zoomed-strip overview
 untouched.
 
+The workspaces form a **horizontal row** (GNOME 40+): the active one
+centered at 85% of the monitor, neighbors peeking at the screen edges with
+GNOME's spacing. Clicking a neighbor workspace switches to it and stays in
+the overview; clicking the empty area of the active workspace leaves it
+(gnome-shell's Workspace click rules). The mouse wheel — either axis —
+scrolls through workspaces while the overview is open.
+
 Not yet ported: preview chrome (title, close button, app icon), the
-horizontal workspace row + thumbnails strip, app grid, and search. The
-workspace strip is still niri's vertical one.
+workspace thumbnails strip, app grid, and search.
 
 ## How GNOME settings feed in
 

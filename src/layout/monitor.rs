@@ -1152,16 +1152,35 @@ impl<W: LayoutElement> Monitor<W> {
                     let gap = self.workspace_gap(zoom);
 
                     let hint_gap = round_logical_in_physical(scale, gap * 0.1);
-                    let hint_height = gap - hint_gap * 2.;
+                    let hint_thickness = gap - hint_gap * 2.;
 
                     let next_ws_geo = self.workspaces_render_geo().nth(ws_idx).unwrap();
-                    let hint_width = round_logical_in_physical(scale, next_ws_geo.size.w * 0.75);
-                    let hint_x =
-                        round_logical_in_physical(scale, (next_ws_geo.size.w - hint_width) / 2.);
-
-                    let hint_loc_diff = Point::from((-hint_x, hint_height + hint_gap));
+                    // A bar across the gap: horizontal strips get a vertical
+                    // bar, vertical strips a horizontal one.
+                    let (hint_loc_diff, hint_size) = if self.workspaces_horizontal() {
+                        let hint_length =
+                            round_logical_in_physical(scale, next_ws_geo.size.h * 0.75);
+                        let hint_y = round_logical_in_physical(
+                            scale,
+                            (next_ws_geo.size.h - hint_length) / 2.,
+                        );
+                        (
+                            Point::from((hint_thickness + hint_gap, -hint_y)),
+                            Size::from((hint_thickness, hint_length)),
+                        )
+                    } else {
+                        let hint_length =
+                            round_logical_in_physical(scale, next_ws_geo.size.w * 0.75);
+                        let hint_x = round_logical_in_physical(
+                            scale,
+                            (next_ws_geo.size.w - hint_length) / 2.,
+                        );
+                        (
+                            Point::from((-hint_x, hint_thickness + hint_gap)),
+                            Size::from((hint_length, hint_thickness)),
+                        )
+                    };
                     let hint_loc = next_ws_geo.loc - hint_loc_diff;
-                    let hint_size = Size::from((hint_width, hint_height));
 
                     // Sometimes the hint ends up 1 px wider than necessary and/or 1 px
                     // narrower than necessary. The values here seem correct. Might have to do with
@@ -1362,15 +1381,42 @@ impl<W: LayoutElement> Monitor<W> {
         ws_size.to_physical_precise_ceil(scale).to_logical(scale)
     }
 
+    /// GNOME (40+) arranges the overview workspaces in a horizontal row with
+    /// the active one centered (gnome-shell `WorkspacesView`); niri's
+    /// overview is a vertical strip. Applies to all workspace-strip geometry.
+    pub(super) fn workspaces_horizontal(&self) -> bool {
+        self.options.layout.windowing_mode == WindowingMode::Floating
+    }
+
     fn workspace_gap(&self, zoom: f64) -> f64 {
         let scale = self.scale.fractional_scale();
-        let gap = self.view_size.h * 0.1 * zoom;
+        let gap = if self.workspaces_horizontal() {
+            // gnome-shell `_getSpacing`: the leftover space, clamped to
+            // WORKSPACE_MIN_SPACING..WORKSPACE_MAX_SPACING (24..80).
+            (self.view_size.w * (1. - zoom) / 2.).clamp(24., 80.)
+        } else {
+            self.view_size.h * 0.1 * zoom
+        };
         round_logical_in_physical_max1(scale, gap)
     }
 
     fn workspace_size_with_gap(&self, zoom: f64) -> Size<f64, Logical> {
         let gap = self.workspace_gap(zoom);
-        self.workspace_size(zoom) + Size::from((0., gap))
+        if self.workspaces_horizontal() {
+            self.workspace_size(zoom) + Size::from((gap, 0.))
+        } else {
+            self.workspace_size(zoom) + Size::from((0., gap))
+        }
+    }
+
+    /// The strip-axis extent of one workspace plus the gap.
+    fn workspace_extent_with_gap(&self, zoom: f64) -> f64 {
+        let size = self.workspace_size_with_gap(zoom);
+        if self.workspaces_horizontal() {
+            size.w
+        } else {
+            size.h
+        }
     }
 
     pub fn overview_zoom(&self) -> f64 {
@@ -1467,15 +1513,15 @@ impl<W: LayoutElement> Monitor<W> {
                 // - first_y = -switch_anim.value() * from_height + to * (from_height - current_height)
                 let from = progress_anim.from();
                 let from_zoom = compute_overview_zoom(&self.options, Some(from));
-                let from_ws_height_with_gap = self.workspace_size_with_gap(from_zoom).h;
+                let from_ws_extent_with_gap = self.workspace_extent_with_gap(from_zoom);
 
                 let zoom = self.overview_zoom();
-                let ws_height_with_gap = self.workspace_size_with_gap(zoom).h;
+                let ws_extent_with_gap = self.workspace_extent_with_gap(zoom);
 
-                let first_ws_y = -switch_anim.value() * from_ws_height_with_gap
-                    + switch_anim.to() * (from_ws_height_with_gap - ws_height_with_gap);
+                let first_ws_pos = -switch_anim.value() * from_ws_extent_with_gap
+                    + switch_anim.to() * (from_ws_extent_with_gap - ws_extent_with_gap);
 
-                return -first_ws_y / ws_height_with_gap;
+                return -first_ws_pos / ws_extent_with_gap;
             }
         };
 
@@ -1489,23 +1535,28 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
+        let horizontal = self.workspaces_horizontal();
 
         let ws_size = self.workspace_size(zoom);
-        let gap = self.workspace_gap(zoom);
-        let ws_height_with_gap = ws_size.h + gap;
+        let ws_extent_with_gap = self.workspace_extent_with_gap(zoom);
 
         let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
         let static_offset = static_offset
             .to_physical_precise_round(scale)
             .to_logical(scale);
 
-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
-        let first_ws_y = round_logical_in_physical(scale, first_ws_y);
+        let first_ws_pos = -self.workspace_render_idx() * ws_extent_with_gap;
+        let first_ws_pos = round_logical_in_physical(scale, first_ws_pos);
 
         // Return position for one-past-last workspace too.
         (0..=self.workspaces.len()).map(move |idx| {
-            let y = first_ws_y + idx as f64 * ws_height_with_gap;
-            let loc = Point::from((0., y)) + static_offset;
+            let pos = first_ws_pos + idx as f64 * ws_extent_with_gap;
+            let loc = if horizontal {
+                Point::from((pos, 0.))
+            } else {
+                Point::from((0., pos))
+            };
+            let loc = loc + static_offset;
 
             // Even though all components that go into loc are rounded to physical pixels, the
             // floating point addition may lose precision. This can result for example in the
@@ -1555,11 +1606,20 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> Option<(&Workspace<W>, Rectangle<f64, Logical>)> {
+        let horizontal = self.workspaces_horizontal();
         let (ws, geo) = self.workspaces_with_render_geo().find_map(|(ws, geo)| {
-            // Extend width to entire output.
-            let loc = Point::from((0., geo.loc.y));
-            let size = Size::from((self.view_size.w, geo.size.h));
-            let bounds = Rectangle::new(loc, size);
+            // Extend the cross axis to the entire output.
+            let bounds = if horizontal {
+                Rectangle::new(
+                    Point::from((geo.loc.x, 0.)),
+                    Size::from((geo.size.w, self.view_size.h)),
+                )
+            } else {
+                Rectangle::new(
+                    Point::from((0., geo.loc.y)),
+                    Size::from((self.view_size.w, geo.size.h)),
+                )
+            };
 
             bounds.contains(pos_within_output).then_some((ws, geo))
         })?;
@@ -1609,6 +1669,26 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> (InsertWorkspace, Rectangle<f64, Logical>) {
+        let horizontal = self.workspaces_horizontal();
+
+        // Strip-axis coordinates: where the pointer is, and a rect's span.
+        let pos = if horizontal {
+            pos_within_output.x
+        } else {
+            pos_within_output.y
+        };
+        let span = move |geo: Rectangle<f64, Logical>| {
+            if horizontal {
+                (geo.loc.x, geo.loc.x + geo.size.w)
+            } else {
+                (geo.loc.y, geo.loc.y + geo.size.h)
+            }
+        };
+        let contains = move |geo: Rectangle<f64, Logical>| {
+            let (start, end) = span(geo);
+            start <= pos && pos < end
+        };
+
         let mut iter = self.workspaces_with_render_geo_idx();
 
         let dummy = Rectangle::default();
@@ -1616,14 +1696,10 @@ impl<W: LayoutElement> Monitor<W> {
         // Monitors always have at least one workspace.
         let ((idx, ws), geo) = iter.next().unwrap();
 
-        // Check if above first.
-        if pos_within_output.y < geo.loc.y {
+        // Check if before first.
+        if pos < span(geo).0 {
             return (InsertWorkspace::NewAt(idx), dummy);
         }
-
-        let contains = move |geo: Rectangle<f64, Logical>| {
-            geo.loc.y <= pos_within_output.y && pos_within_output.y < geo.loc.y + geo.size.h
-        };
 
         // Check first.
         if contains(geo) {
@@ -1633,10 +1709,16 @@ impl<W: LayoutElement> Monitor<W> {
         let mut last_geo = geo;
         let mut last_idx = idx;
         for ((idx, ws), geo) in iter {
-            // Check gap above.
-            let gap_loc = Point::from((last_geo.loc.x, last_geo.loc.y + last_geo.size.h));
-            let gap_size = Size::from((geo.size.w, geo.loc.y - gap_loc.y));
-            let gap_geo = Rectangle::new(gap_loc, gap_size);
+            // Check the gap before this workspace.
+            let gap_geo = if horizontal {
+                let gap_loc = Point::from((last_geo.loc.x + last_geo.size.w, last_geo.loc.y));
+                let gap_size = Size::from((geo.loc.x - gap_loc.x, geo.size.h));
+                Rectangle::new(gap_loc, gap_size)
+            } else {
+                let gap_loc = Point::from((last_geo.loc.x, last_geo.loc.y + last_geo.size.h));
+                let gap_size = Size::from((geo.size.w, geo.loc.y - gap_loc.y));
+                Rectangle::new(gap_loc, gap_size)
+            };
             if contains(gap_geo) {
                 return (InsertWorkspace::NewAt(idx), dummy);
             }
@@ -1650,7 +1732,7 @@ impl<W: LayoutElement> Monitor<W> {
             last_idx = idx;
         }
 
-        // Anything below.
+        // Anything past the last one.
         (InsertWorkspace::NewAt(last_idx + 1), dummy)
     }
 

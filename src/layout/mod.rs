@@ -5162,9 +5162,20 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
     }
 }
 
+/// How large the active workspace is in the GNOME overview's window-picker
+/// state: gnome-shell fits it between the search entry and the dash, which
+/// works out to roughly this fraction of the monitor. We have no top/bottom
+/// chrome yet, so the fraction is fixed here.
+const GNOME_OVERVIEW_WORKSPACE_SCALE: f64 = 0.85;
+
 fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
-    // Clamp to some sane values.
-    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+    let zoom = if options.layout.windowing_mode == WindowingMode::Floating {
+        // GNOME's overview geometry is by design, not configuration.
+        GNOME_OVERVIEW_WORKSPACE_SCALE
+    } else {
+        // Clamp to some sane values.
+        options.overview.zoom.clamp(0.0001, 0.75)
+    };
 
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)
