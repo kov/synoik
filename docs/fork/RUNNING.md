@@ -229,8 +229,9 @@ leaves the overview. Scrolling mode keeps niri's zoomed-strip overview
 untouched.
 
 The workspaces form a **horizontal row** (GNOME 40+): the active one
-centered at 85% of the monitor, neighbors peeking at the screen edges with
-GNOME's spacing. Clicking a neighbor workspace switches to it and stays in
+centered at 80% of the monitor, and the neighbor workspaces peeking in at
+the screen edges (gnome-shell keeps the inter-workspace spacing at its
+minimum precisely so the side margins show them). Clicking a neighbor workspace switches to it and stays in
 the overview; clicking the empty area of the active workspace leaves it
 (gnome-shell's Workspace click rules). The mouse wheel — either axis —
 scrolls through workspaces while the overview is open.

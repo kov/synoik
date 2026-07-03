@@ -1827,15 +1827,15 @@ fn overview_workspace_is_centered_at_gnome_scale() {
     f.niri_complete_animations();
 
     // Workspace-local slot (see expose::tests): (580, 255) 760 × 570, then
-    // through zoom 0.85 with the workspace centered at (144, 81).
+    // through zoom 0.8 with the workspace centered at (192, 108).
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (144. + 580. * 0.85, 81. + 255. * 0.85),
-        "picker slot must reflect the centered 0.85-scale workspace",
+        (192. + 580. * 0.8, 108. + 255. * 0.8),
+        "picker slot must reflect the centered 0.8-scale workspace",
     );
     assert!(
-        (rect.size.w - 760. * 0.85).abs() <= 1. && (rect.size.h - 570. * 0.85).abs() <= 1.,
+        (rect.size.w - 760. * 0.8).abs() <= 1. && (rect.size.h - 570. * 0.8).abs() <= 1.,
         "picker slot size must scale by the workspace zoom, got {rect:?}"
     );
 }
@@ -1856,9 +1856,11 @@ fn overview_click_neighbor_switches_and_stays() {
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
-    // The trailing empty workspace peeks at the right edge of the row
-    // (active workspace spans 144..1776, the neighbor starts at 1856).
-    f.pointer_motion(1900., 540.);
+    // The trailing empty workspace peeks at the right edge of the row:
+    // the active workspace spans 192..1728, spacing clamps to 24, so the
+    // neighbor is visible from 1752 on (gnome-shell keeps the spacing at
+    // its minimum exactly so neighbors peek in).
+    f.pointer_motion(1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();

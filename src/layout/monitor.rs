@@ -1391,9 +1391,14 @@ impl<W: LayoutElement> Monitor<W> {
     fn workspace_gap(&self, zoom: f64) -> f64 {
         let scale = self.scale.fractional_scale();
         let gap = if self.workspaces_horizontal() {
-            // gnome-shell `_getSpacing`: the leftover space, clamped to
-            // WORKSPACE_MIN_SPACING..WORKSPACE_MAX_SPACING (24..80).
-            (self.view_size.w * (1. - zoom) / 2.).clamp(24., 80.)
+            // gnome-shell `_getSpacing`: `availableSpace - workspaceWidth*0.4`
+            // clamped to WORKSPACE_MIN_SPACING..WORKSPACE_MAX_SPACING (24..80).
+            // On any normal aspect ratio that clamps to the minimum, which is
+            // the point: the side margins stay free so the neighbor
+            // workspaces peek in at the screen edges.
+            let ws_width = self.view_size.w * zoom;
+            let available = (self.view_size.w - ws_width) / 2.;
+            (available - ws_width * 0.4).clamp(24., 80.)
         } else {
             self.view_size.h * 0.1 * zoom
         };
