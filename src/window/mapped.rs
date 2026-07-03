@@ -193,6 +193,13 @@ pub struct Mapped {
 
     /// Most recent monotonic time when the window had the focus.
     focus_timestamp: Option<Duration>,
+
+    /// Most recent monotonic time when the user interacted with the window.
+    ///
+    /// mutter's `net_wm_user_time`: the reference clock for focus-stealing
+    /// prevention. `None` means the user never interacted with it, which
+    /// makes newer windows always win.
+    user_time: Option<Duration>,
 }
 
 niri_render_elements! {
@@ -308,6 +315,7 @@ impl Mapped {
             is_pending_maximized: false,
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
+            user_time: None,
         };
 
         rv.is_maximized = rv.sizing_mode().is_maximized();
@@ -563,6 +571,18 @@ impl Mapped {
 
     pub fn set_focus_timestamp(&mut self, timestamp: Duration) {
         self.focus_timestamp.replace(timestamp);
+    }
+
+    pub fn user_time(&self) -> Option<Duration> {
+        self.user_time
+    }
+
+    /// Records a user interaction with this window, like mutter's
+    /// `meta_window_set_user_time`: the time only moves forward.
+    pub fn bump_user_time(&mut self, time: Duration) {
+        if self.user_time.is_none_or(|current| current < time) {
+            self.user_time = Some(time);
+        }
     }
 
     pub fn send_frame<T, F>(

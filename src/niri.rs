@@ -339,6 +339,10 @@ pub struct Niri {
     /// The next grab's action id (mutter hands out ids past its builtin
     /// keybinding actions and never reuses them; the base is arbitrary).
     pub next_accel_grab_action: u32,
+    /// Most recent monotonic time of a real user input event (key or button
+    /// press): mutter's `display->last_user_time`, the reference clock for
+    /// focus-stealing prevention.
+    pub last_user_action_time: Option<Duration>,
 
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
@@ -2698,6 +2702,7 @@ impl Niri {
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),
             next_accel_grab_action: 100,
+            last_user_action_time: None,
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
             suppressed_buttons: HashSet::new(),

@@ -9,15 +9,20 @@
 //! The first entries are *characterization* tests that pin the inherited niri overview
 //! contract before we reshape it toward GNOME's Activities overview (Experiment 1).
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use niri_config::{Action, Config};
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
+use smithay::utils::user_data::UserDataMap;
+use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
-use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction};
+use crate::gnome::{Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction};
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_ESC: u32 = 1;
@@ -1159,5 +1164,131 @@ fn placement_cascades_when_nothing_fits() {
         focused_window_pos(&mut f),
         (100., 100.),
         "each occupied slot steps the cascade another 50px",
+    );
+}
+
+/// New windows without launch information take focus (mutter's
+/// `intervening_user_event_occurred`: no timestamps at all means no
+/// intervening event, i.e. smart mode allows the focus change).
+#[test]
+fn new_window_without_launch_time_takes_focus() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (100, 100), None);
+    let a_id = f.niri().layout.focus().unwrap().id();
+
+    // Interacting with the focused window must not block a token-less window:
+    // with no launch time there is nothing to compare against.
+    tap(&mut f, KEY_A);
+
+    let _b = map_window_sized(&mut f, id, (100, 100), None);
+    let b_id = f.niri().layout.focus().unwrap().id();
+    assert_ne!(
+        a_id, b_id,
+        "a new window with no launch information must take focus"
+    );
+}
+
+/// A window whose launch (activation-token mint) predates the last user
+/// interaction with the focused window is denied focus, marked urgent, and
+/// stacked below the focus window (mutter `meta_window_show`).
+#[test]
+fn stale_launch_denied_focus_and_marked_urgent() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (100, 100), None);
+    let a_id = f.niri().layout.focus().unwrap().id();
+
+    // Start mapping B; its launch token is minted now.
+    let window = f.client(id).create_window();
+    let b_surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    {
+        let niri = f.niri();
+        assert_eq!(niri.unmapped_windows.len(), 1);
+        let unmapped = niri.unmapped_windows.values_mut().next().unwrap();
+        unmapped.activation_token_data = Some(XdgActivationTokenData {
+            client_id: None,
+            serial: None,
+            app_id: None,
+            surface: None,
+            timestamp: Instant::now(),
+            user_data: Arc::new(UserDataMap::new()),
+        });
+    }
+
+    // The user keeps typing into A after the launch.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    tap(&mut f, KEY_A);
+
+    // B maps: taking focus now would be a steal.
+    let window = f.client(id).window(&b_surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    let niri = f.niri();
+    assert_eq!(
+        niri.layout.focus().unwrap().id(),
+        a_id,
+        "focus must stay on the interacted-with window"
+    );
+
+    let ws = niri.layout.active_workspace().unwrap();
+    let b = ws.windows().find(|w| w.id() != a_id).unwrap();
+    assert!(
+        b.is_urgent(),
+        "the denied window must be marked urgent (demands attention)"
+    );
+
+    let top = ws.tiles_with_render_positions().next().unwrap().0;
+    assert_eq!(
+        top.window().id(),
+        a_id,
+        "the denied window must stack below the focus window"
+    );
+}
+
+/// `focus-new-windows "strict"`: no new window takes focus — except
+/// transients of the focused window (mutter `window_state_on_map`).
+#[test]
+fn strict_focus_new_windows_denies_all_but_transients() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().gnome_settings.focus_new_windows = FocusNewWindows::Strict;
+    let id = f.add_client();
+
+    // The first window still becomes active: niri ties workspace state to
+    // focus with nothing else focused. (mutter would literally leave it
+    // unfocused; accepted divergence.)
+    let a = map_window_sized(&mut f, id, (600, 400), None);
+    let a_id = f.niri().layout.focus().unwrap().id();
+
+    let _b = map_window_sized(&mut f, id, (100, 100), None);
+    {
+        let niri = f.niri();
+        assert_eq!(
+            niri.layout.focus().unwrap().id(),
+            a_id,
+            "strict mode must deny focus to a new non-transient window"
+        );
+        let ws = niri.layout.active_workspace().unwrap();
+        let b = ws.windows().find(|w| w.id() != a_id).unwrap();
+        assert!(b.is_urgent(), "the denied window must be marked urgent");
+    }
+
+    let _c = map_window_sized(&mut f, id, (200, 100), Some(&a));
+    assert_ne!(
+        f.niri().layout.focus().unwrap().id(),
+        a_id,
+        "a transient of the focused window must take focus even in strict mode"
     );
 }

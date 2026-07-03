@@ -2276,6 +2276,24 @@ impl<W: LayoutElement> Layout<W> {
         self.focus_with_output().map(|(win, _out)| win)
     }
 
+    pub fn focus_mut(&mut self) -> Option<&mut W> {
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            return Some(move_.tile.window_mut());
+        }
+
+        let MonitorSet::Normal {
+            monitors,
+            active_monitor_idx,
+            ..
+        } = &mut self.monitor_set
+        else {
+            return None;
+        };
+
+        let mon = &mut monitors[*active_monitor_idx];
+        mon.active_workspace().active_window_mut()
+    }
+
     pub fn focus_with_output(&self) -> Option<(&W, &Output)> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             return Some((move_.tile.window(), &move_.output));

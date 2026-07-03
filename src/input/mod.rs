@@ -427,6 +427,15 @@ impl State {
 
         if pressed {
             self.hide_cursor_if_needed();
+
+            // A key press is a real user interaction: advance the
+            // focus-stealing-prevention clocks (mutter's `last_user_time` and
+            // the focused window's `net_wm_user_time`).
+            let now = get_monotonic_time();
+            self.niri.last_user_action_time = Some(now);
+            if let Some(mapped) = self.niri.layout.focus_mut() {
+                mapped.bump_user_time(now);
+            }
         }
 
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
@@ -3145,6 +3154,15 @@ impl State {
         self.update_pointer_contents();
 
         if ButtonState::Pressed == button_state {
+            // A button press is a real user interaction: advance the
+            // focus-stealing-prevention clocks. This runs after
+            // click-to-focus, so the stamp lands on the newly focused window.
+            let now = get_monotonic_time();
+            self.niri.last_user_action_time = Some(now);
+            if let Some(mapped) = self.niri.layout.focus_mut() {
+                mapped.bump_user_time(now);
+            }
+
             let layer_under = self.niri.pointer_contents.layer.clone();
             self.niri.focus_layer_surface_if_on_demand(layer_under);
         }

@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 
+use niri_config::WindowingMode;
 use niri_ipc::PositionChange;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
@@ -19,11 +20,12 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{delegate_compositor, delegate_shm};
 
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
+use crate::gnome::FocusNewWindows;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
-use crate::utils::{is_mapped, send_scale_transform};
+use crate::utils::{get_monotonic_time, is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
 impl CompositorHandler for State {
@@ -145,13 +147,12 @@ impl CompositorHandler for State {
                         )
                     };
 
+                    let windowing_mode = self.niri.config.borrow().layout.windowing_mode;
+
                     // The GTK about dialog sets min/max size after the initial configure but
                     // before mapping, so we need to compute open_floating at the last possible
                     // moment, that is here.
-                    let is_floating = rules.compute_open_floating(
-                        toplevel,
-                        self.niri.config.borrow().layout.windowing_mode,
-                    );
+                    let is_floating = rules.compute_open_floating(toplevel, windowing_mode);
 
                     // Figure out if we should activate the window.
                     let activate = rules.open_focused.map(|focus| {
@@ -161,23 +162,97 @@ impl CompositorHandler for State {
                             ActivateWindow::No
                         }
                     });
-                    let activate = activate.unwrap_or_else(|| {
-                        // Check the token timestamp again in case the window took a while between
-                        // requesting activation and mapping.
-                        let token = activation_token_data.filter(|token| {
-                            token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
-                        });
-                        if token.is_some() {
-                            ActivateWindow::Yes
-                        } else {
-                            let config = self.niri.config.borrow();
-                            if config.debug.strict_new_window_focus_policy {
+
+                    // Whether GNOME focus-stealing prevention denied the focus; the
+                    // window is marked urgent after mapping.
+                    let mut denied_focus_steal = false;
+
+                    let activate = match activate {
+                        Some(activate) => activate,
+                        None if windowing_mode == WindowingMode::Floating => {
+                            // GNOME focus-stealing prevention (mutter's
+                            // window_state_on_map + intervening_user_event_occurred).
+                            //
+                            // Transients of the focused window always take focus. In
+                            // strict mode nothing else does. In smart mode (the GNOME
+                            // default), the window takes focus unless its launch — the
+                            // activation token's mint time, which mutter carries as the
+                            // startup-sequence timestamp — predates the last user
+                            // interaction with the focused window.
+                            let transient_of_focus = {
+                                let focus_surface = self
+                                    .niri
+                                    .layout
+                                    .focus()
+                                    .map(|mapped| mapped.toplevel().wl_surface().clone());
+                                let mut found = false;
+                                if let Some(focus_surface) = focus_surface {
+                                    let mut parent = toplevel.parent();
+                                    while let Some(p) = parent {
+                                        if p == focus_surface {
+                                            found = true;
+                                            break;
+                                        }
+                                        parent = self
+                                            .niri
+                                            .layout
+                                            .find_window_and_output(&p)
+                                            .and_then(|(mapped, _)| mapped.toplevel().parent());
+                                    }
+                                }
+                                found
+                            };
+
+                            let focus_user_time = self
+                                .niri
+                                .layout
+                                .focus()
+                                .and_then(|mapped| mapped.user_time());
+
+                            if transient_of_focus {
+                                ActivateWindow::Yes
+                            } else if self.niri.gnome_settings.focus_new_windows
+                                == FocusNewWindows::Strict
+                            {
+                                denied_focus_steal = self.niri.layout.focus().is_some();
                                 ActivateWindow::No
                             } else {
-                                ActivateWindow::Smart
+                                let launch_time = activation_token_data.as_ref().map(|token| {
+                                    get_monotonic_time().saturating_sub(token.timestamp.elapsed())
+                                });
+                                match (launch_time, focus_user_time) {
+                                    // The launch predates the last interaction with the
+                                    // focused window: taking focus would be a steal.
+                                    (Some(launch), Some(user_time)) if launch < user_time => {
+                                        denied_focus_steal = true;
+                                        ActivateWindow::No
+                                    }
+                                    // No launch time, no interaction with the focused
+                                    // window, or a fresh launch: focus is fine.
+                                    _ => ActivateWindow::Yes,
+                                }
                             }
                         }
-                    });
+                        None => {
+                            // niri's policy for the scrolling mode.
+                            //
+                            // Check the token timestamp again in case the window took a
+                            // while between requesting activation and mapping.
+                            let token = activation_token_data.filter(|token| {
+                                token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
+                            });
+                            if token.is_some() {
+                                ActivateWindow::Yes
+                            } else {
+                                let config = self.niri.config.borrow();
+                                if config.debug.strict_new_window_focus_policy {
+                                    ActivateWindow::No
+                                } else {
+                                    ActivateWindow::Smart
+                                }
+                            }
+                        }
+                    };
 
                     let parent = toplevel
                         .parent()
@@ -235,6 +310,19 @@ impl CompositorHandler for State {
                         }
                     } else {
                         error!("layout is missing the window that we just added");
+                    }
+
+                    if denied_focus_steal {
+                        // The window wanted focus but taking it would have been a
+                        // steal: mark it demands-attention (urgent) so the shell can
+                        // surface it, like mutter's meta_window_show. (mutter only
+                        // marks when the denied window overlaps the focus window; we
+                        // skip that test.)
+                        if let Some((mapped, _)) =
+                            self.niri.layout.find_window_and_output_mut(surface)
+                        {
+                            mapped.set_urgent(true);
+                        }
                     }
 
                     if let Some(output) = output {

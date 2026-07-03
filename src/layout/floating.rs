@@ -405,7 +405,22 @@ impl<W: LayoutElement> FloatingSpace<W> {
     }
 
     pub fn add_tile(&mut self, tile: Tile<W>, activate: bool) {
-        self.add_tile_at(0, tile, activate);
+        let mut idx = 0;
+
+        // GNOME windowing: a window that opens without taking focus must not
+        // cover the focused window either — stack it just below (mutter's
+        // meta_window_stack_just_below in meta_window_show).
+        if !activate && self.options.layout.windowing_mode == WindowingMode::Floating {
+            if let Some(active_idx) = self
+                .active_window_id
+                .as_ref()
+                .and_then(|id| self.idx_of(id))
+            {
+                idx = active_idx + 1;
+            }
+        }
+
+        self.add_tile_at(idx, tile, activate);
     }
 
     fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {

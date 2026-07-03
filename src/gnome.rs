@@ -37,6 +37,9 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
     /// dialog refuses to open (gnome-shell's `RunDialog.open`).
     pub disable_command_line: bool,
+    /// `org.gnome.desktop.wm.preferences focus-new-windows`: whether new
+    /// windows may take focus on map.
+    pub focus_new_windows: FocusNewWindows,
 }
 
 impl Default for GnomeSettings {
@@ -46,8 +49,19 @@ impl Default for GnomeSettings {
             keybindings: default_keybindings(),
             command_history: Vec::new(),
             disable_command_line: false,
+            focus_new_windows: FocusNewWindows::Smart,
         }
     }
+}
+
+/// `org.gnome.desktop.wm.preferences focus-new-windows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusNewWindows {
+    /// New windows take focus unless an intervening user interaction with the
+    /// focused window makes that a focus steal. The GNOME default.
+    Smart,
+    /// New windows never take focus unless transient for the focused window.
+    Strict,
 }
 
 impl GnomeSettings {
@@ -72,6 +86,17 @@ impl GnomeSettings {
     fn load_lockdown(&mut self, lockdown: &gio::Settings) {
         if settings_has_key(lockdown, "disable-command-line") {
             self.disable_command_line = lockdown.boolean("disable-command-line");
+        }
+    }
+
+    fn load_wm_preferences(&mut self, wm: &gio::Settings) {
+        if settings_has_key(wm, "focus-new-windows") {
+            let value = wm.string("focus-new-windows");
+            match value.as_str() {
+                "smart" => self.focus_new_windows = FocusNewWindows::Smart,
+                "strict" => self.focus_new_windows = FocusNewWindows::Strict,
+                other => warn!("ignoring unrecognized focus-new-windows {other:?}"),
+            }
         }
     }
 
@@ -399,6 +424,7 @@ impl GnomeSettingsWriter {
 struct Stores {
     mutter: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
+    wm_preferences: Option<gio::Settings>,
     shell: Option<gio::Settings>,
     lockdown: Option<gio::Settings>,
 }
@@ -410,6 +436,7 @@ impl Stores {
         Self {
             mutter: gsettings("org.gnome.mutter"),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings"),
+            wm_preferences: gsettings("org.gnome.desktop.wm.preferences"),
             shell: gsettings("org.gnome.shell"),
             lockdown: gsettings("org.gnome.desktop.lockdown"),
         }
@@ -423,6 +450,7 @@ impl Stores {
         [
             &self.mutter,
             &self.wm_keybindings,
+            &self.wm_preferences,
             &self.shell,
             &self.lockdown,
         ]
@@ -438,6 +466,9 @@ impl Stores {
         }
         if let Some(wm) = &self.wm_keybindings {
             settings.load_wm_keybindings(wm);
+        }
+        if let Some(wm) = &self.wm_preferences {
+            settings.load_wm_preferences(wm);
         }
         if let Some(shell) = &self.shell {
             settings.load_shell(shell);
@@ -855,6 +886,7 @@ mod tests {
                     None,
                 )),
                 wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
+                wm_preferences: None,
                 shell: None,
                 lockdown: None,
             });
@@ -946,6 +978,7 @@ mod tests {
                     STORES.set(Some(Rc::new(Stores {
                         mutter: None,
                         wm_keybindings: None,
+                        wm_preferences: None,
                         shell: Some(shell),
                         lockdown: None,
                     })));

@@ -821,10 +821,33 @@ impl XdgActivationHandler for State {
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        if token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT {
+        let gnome_mode =
+            self.niri.config.borrow().layout.windowing_mode == niri_config::WindowingMode::Floating;
+
+        // In the GNOME windowing mode the gate is mutter's
+        // (meta_window_activate_full): an activation whose launch time — the
+        // token's mint time — predates the last real user interaction is a
+        // focus steal and pulses urgency instead. There is no wall-clock
+        // timeout. The scrolling mode keeps niri's timeout policy.
+        let fresh = if gnome_mode {
+            true
+        } else {
+            token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
+        };
+
+        if fresh {
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&surface) {
                 let window = mapped.window.clone();
-                if token_data.user_data.get::<UrgentOnlyMarker>().is_some() {
+
+                let stale_for_gnome = gnome_mode && {
+                    let launch = crate::utils::get_monotonic_time()
+                        .saturating_sub(token_data.timestamp.elapsed());
+                    self.niri
+                        .last_user_action_time
+                        .is_some_and(|last_action| launch < last_action)
+                };
+
+                if token_data.user_data.get::<UrgentOnlyMarker>().is_some() || stale_for_gnome {
                     mapped.set_urgent(true);
                     self.niri.queue_redraw_all();
                 } else {

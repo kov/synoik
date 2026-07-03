@@ -181,6 +181,15 @@ layout {
 (The matching GNOME-side setting is deferred; the switch lives in the niri
 config for now.)
 
+Focus follows GNOME's stealing-prevention rules in this mode (mutter
+`window.c` / `meta-wayland-activation.c`): a window whose launch — its
+xdg-activation token — predates your last interaction with the focused
+window does *not* take focus; it opens below the focused window and is
+marked urgent (demands attention; visible in Alt-Tab, `is_urgent` over
+IPC). Transients of the focused window always take focus, and token-less
+windows always may. `org.gnome.desktop.wm.preferences focus-new-windows`
+(`smart`/`strict`) is honored live.
+
 ## How GNOME settings feed in
 
 On startup the compositor reads the settings it honors from the **same
