@@ -66,6 +66,7 @@ pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
+pub mod synthetic;
 pub mod touch_overview_grab;
 pub mod touch_resize_grab;
 

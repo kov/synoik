@@ -119,6 +119,75 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Inject synthetic input events through the real input pipeline.
+    ///
+    /// The events go through the same code path as hardware input: keyboard
+    /// state, binds, grabs and focus all behave exactly as if the keys were
+    /// physically pressed. Mainly useful for driving a `--headless` instance,
+    /// which has no input devices, but works on any backend.
+    ///
+    /// Events are processed in order; on a resolution error (unknown key or
+    /// button name) processing stops, so earlier events in the batch have
+    /// already been applied.
+    InjectInput {
+        /// The events to inject, in order.
+        events: Vec<InjectedEvent>,
+    },
+}
+
+/// A synthetic input event for [`Request::InjectInput`].
+///
+/// Keys are given as a Linux evdev keycode in decimal (e.g. `"125"` for
+/// `KEY_LEFTMETA`), or as an XKB keysym name (case-insensitive, e.g.
+/// `"Super_L"`, `"F2"`, `"a"`) which is resolved to a keycode through the
+/// running instance's active keymap and layout.
+///
+/// Buttons are given as `"left"`, `"middle"`, `"right"`, or a Linux evdev
+/// `BTN_*` code in decimal.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum InjectedEvent {
+    /// Press (and hold) a key.
+    KeyPress {
+        /// The key to press.
+        key: String,
+    },
+    /// Release a held key.
+    KeyRelease {
+        /// The key to release.
+        key: String,
+    },
+    /// Type a string of text as key presses resolved through the keymap.
+    ///
+    /// Characters reachable on shift level 0 or 1 of the active layout are
+    /// supported (a shift press is synthesized as needed); anything else is a
+    /// resolution error.
+    Text {
+        /// The text to type.
+        text: String,
+    },
+    /// Move the pointer by a relative delta in logical pixels.
+    PointerMotion {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// Press (and hold) a pointer button.
+    ButtonPress {
+        /// The button to press.
+        button: String,
+    },
+    /// Release a held pointer button.
+    ButtonRelease {
+        /// The button to release.
+        button: String,
+    },
+    /// Scroll the vertical wheel by whole notches (positive scrolls down).
+    Scroll {
+        /// The number of notches.
+        notches: f64,
+    },
 }
 
 /// Reply from niri to client.

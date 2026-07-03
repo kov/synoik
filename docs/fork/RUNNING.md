@@ -32,18 +32,37 @@ over IPC — the same `niri msg` surface as any other instance:
 export NIRI_SOCKET=…   # printed at startup ("IPC listening on: …")
 niri msg action spawn -- kitty
 niri msg windows
-niri msg action show-run-dialog
 niri msg event-stream
 niri msg action quit --skip-confirmation
 ```
+
+Keyboard-driven paths work too: `niri msg input` injects synthetic events
+through the **real input pipeline** (`src/input/synthetic.rs`), so binds,
+grabs, modality and focus behave exactly as if the keys were pressed:
+
+```sh
+niri msg input key Super          # tap the overlay key → overview toggles
+niri msg input key Alt+F2         # combo: press in order, release reversed
+niri msg input text 'kitty'       # type into whatever is focused
+niri msg input key Return
+niri msg input key-press Alt      # hold…
+niri msg input key Tab            #   Alt+Tab MRU switch
+niri msg input key-release Alt    # …commit on release
+niri msg input pointer-motion 200 300; niri msg input click; niri msg input scroll 1
+```
+
+Keys are evdev keycodes in decimal (`125`), XKB keysym names
+(case-insensitive: `Super_L`, `F2`, `a`), or the shorthands
+`alt`/`ctrl`/`shift`/`super`; names resolve through the instance's active
+keymap, and unresolvable keys come back as errors. Injection works on any
+backend, not just headless — handy for poking a nested instance past the
+host compositor's grabs.
 
 This is the way to exercise compositor behavior from a shell (or an agent)
 without a Wayland session, a free VT, or fighting the host compositor for
 keys. It reads and watches the real GSettings store like any non-test
 instance; point `GSETTINGS_BACKEND=keyfile` + a scratch `XDG_CONFIG_HOME` at
-it for isolation. Keyboard-driven paths (the actual key *press*) still need a
-nested/TTY run or the conformance tests — headless has no input devices, so
-behavior is reached via `niri msg action …` instead. Don't pass `--session`.
+it for isolation. Don't pass `--session`.
 
 ## Nested (quick, for most things)
 
@@ -71,15 +90,17 @@ press never reaches the nested window. Two consequences:
 - The GNOME **overlay key** (Super-tap → overview) therefore can't be exercised
   nested under GNOME.
 
-To test the overlay key specifically, use the **TTY** path below. To test the
-overview *behavior* while nested, drive it over IPC instead of the keyboard:
+To test the overlay key specifically, use the **TTY** path below, or inject
+the key press over IPC — it takes the real overlay-key code path, host grabs
+notwithstanding:
 
 ```sh
 NIRI_SOCKET=$(ls -t $XDG_RUNTIME_DIR/niri.*.sock | head -1) \
-  cargo run -- msg action toggle-overview
+  cargo run -- msg input key Super
 ```
 
-(The running instance also prints its socket path on startup.)
+(The running instance also prints its socket path on startup. See the
+Headless section for the full `niri msg input` surface.)
 
 ## TTY (faithful: real Super, real KMS)
 
@@ -173,8 +194,8 @@ history, shared with gnome-shell via `org.gnome.shell command-history`.
 Tab completion, Ctrl+Enter (run in terminal), the open-a-file-path fallback.
 
 Since a nested session can't see Alt+F2 (the host GNOME grabs it — same Super
-caveat as above), open it over IPC when nested:
-`niri msg action show-run-dialog`.
+caveat as above), open it over IPC when nested: `niri msg input key Alt+F2`
+(or `niri msg action show-run-dialog`).
 
 ## Inspecting / driving a running instance (IPC)
 

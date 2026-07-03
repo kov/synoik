@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, OutputAction};
+use niri_ipc::{Action, InjectedEvent, OutputAction};
 
 use crate::utils::version;
 
@@ -108,6 +108,16 @@ pub enum Msg {
         #[command(subcommand)]
         action: OutputAction,
     },
+    /// Inject synthetic input events through the real input pipeline.
+    ///
+    /// The events behave exactly like hardware input: binds, grabs and focus
+    /// all react as if the keys were physically pressed. Mainly useful for
+    /// driving a `--headless` instance, which has no input devices.
+    Input {
+        /// The input event to inject.
+        #[command(subcommand)]
+        input: InputCmd,
+    },
     /// Start continuously receiving events from the compositor.
     EventStream,
     /// Print the version of the running niri instance.
@@ -118,6 +128,105 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+}
+
+/// One `niri msg input` invocation, turned into a batch of [`InjectedEvent`]s.
+///
+/// Keys are Linux evdev keycodes in decimal (e.g. `125` for `KEY_LEFTMETA`)
+/// or XKB keysym names (case-insensitive: `Super_L`, `F2`, `a`), resolved
+/// through the running instance's active keymap. Buttons are `left`,
+/// `middle`, `right`, or an evdev `BTN_*` code in decimal.
+#[derive(Subcommand)]
+pub enum InputCmd {
+    /// Tap a key or a combo: press, then release in reverse order.
+    ///
+    /// A combo is keys joined with `+`, e.g. `Alt+F2` or `Super_L+Tab`.
+    Key {
+        /// The key or `+`-joined combo to tap.
+        combo: String,
+    },
+    /// Press and hold a key (release it later with key-release).
+    KeyPress {
+        /// The key to press.
+        key: String,
+    },
+    /// Release a held key.
+    KeyRelease {
+        /// The key to release.
+        key: String,
+    },
+    /// Type a string of text.
+    Text {
+        /// The text to type.
+        text: String,
+    },
+    /// Move the pointer by a relative delta in logical pixels.
+    PointerMotion {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// Click: press, then release a pointer button.
+    Click {
+        /// The button to click.
+        #[arg(default_value = "left")]
+        button: String,
+    },
+    /// Press and hold a pointer button (release it later with button-release).
+    ButtonPress {
+        /// The button to press.
+        button: String,
+    },
+    /// Release a held pointer button.
+    ButtonRelease {
+        /// The button to release.
+        button: String,
+    },
+    /// Scroll the vertical wheel by whole notches (positive scrolls down).
+    Scroll {
+        /// The number of notches.
+        notches: f64,
+    },
+}
+
+impl InputCmd {
+    /// The injection events this command stands for, in order.
+    pub fn to_events(&self) -> Vec<InjectedEvent> {
+        match self {
+            InputCmd::Key { combo } => {
+                let keys: Vec<&str> = combo.split('+').collect();
+                let presses = keys.iter().map(|key| InjectedEvent::KeyPress {
+                    key: (*key).to_owned(),
+                });
+                let releases = keys.iter().rev().map(|key| InjectedEvent::KeyRelease {
+                    key: (*key).to_owned(),
+                });
+                presses.chain(releases).collect()
+            }
+            InputCmd::KeyPress { key } => vec![InjectedEvent::KeyPress { key: key.clone() }],
+            InputCmd::KeyRelease { key } => vec![InjectedEvent::KeyRelease { key: key.clone() }],
+            InputCmd::Text { text } => vec![InjectedEvent::Text { text: text.clone() }],
+            InputCmd::PointerMotion { dx, dy } => {
+                vec![InjectedEvent::PointerMotion { dx: *dx, dy: *dy }]
+            }
+            InputCmd::Click { button } => vec![
+                InjectedEvent::ButtonPress {
+                    button: button.clone(),
+                },
+                InjectedEvent::ButtonRelease {
+                    button: button.clone(),
+                },
+            ],
+            InputCmd::ButtonPress { button } => vec![InjectedEvent::ButtonPress {
+                button: button.clone(),
+            }],
+            InputCmd::ButtonRelease { button } => vec![InjectedEvent::ButtonRelease {
+                button: button.clone(),
+            }],
+            InputCmd::Scroll { notches } => vec![InjectedEvent::Scroll { notches: *notches }],
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]

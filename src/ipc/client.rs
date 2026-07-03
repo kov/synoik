@@ -49,6 +49,9 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::Input { input } => Request::InjectInput {
+            events: input.to_events(),
+        },
     };
 
     let mut socket = Socket::connect().context("error connecting to the niri socket")?;
@@ -318,6 +321,11 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             }
         }
         Msg::Action { .. } => {
+            let Response::Handled = response else {
+                bail!("unexpected response: expected Handled, got {response:?}");
+            };
+        }
+        Msg::Input { .. } => {
             let Response::Handled = response else {
                 bail!("unexpected response: expected Handled, got {response:?}");
             };

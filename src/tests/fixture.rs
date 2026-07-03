@@ -6,16 +6,16 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
-use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
-    DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchDownEvent, TouchEvent,
-    TouchSlot, TouchUpEvent, UnusedEvent,
-};
+use smithay::backend::input::{ButtonState, InputEvent, KeyState, Keycode};
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
 use super::server::Server;
+use crate::input::synthetic::{
+    SyntheticInputBackend, SyntheticKeyboardKeyEvent, SyntheticPointerAxisEvent,
+    SyntheticPointerButtonEvent, SyntheticPointerMotionEvent, SyntheticTouchDownEvent,
+    SyntheticTouchUpEvent,
+};
 use crate::niri::{NewClient, Niri};
 
 pub struct Fixture {
@@ -116,8 +116,8 @@ impl Fixture {
     }
 
     fn key_event(&mut self, evdev_code: u32, state: KeyState) {
-        let event = InputEvent::<TestInputBackend>::Keyboard {
-            event: TestKeyboardKeyEvent {
+        let event = InputEvent::<SyntheticInputBackend>::Keyboard {
+            event: SyntheticKeyboardKeyEvent {
                 time: self.next_input_micros(),
                 key_code: Keycode::new(evdev_code + 8),
                 state,
@@ -130,8 +130,8 @@ impl Fixture {
     ///
     /// `button_code` is a Linux `BTN_*` evdev code (e.g. `BTN_LEFT`).
     pub fn pointer_button(&mut self, button_code: u32, state: ButtonState) {
-        let event = InputEvent::<TestInputBackend>::PointerButton {
-            event: TestPointerButtonEvent {
+        let event = InputEvent::<SyntheticInputBackend>::PointerButton {
+            event: SyntheticPointerButtonEvent {
                 time: self.next_input_micros(),
                 button_code,
                 state,
@@ -142,8 +142,8 @@ impl Fixture {
 
     /// Inject relative pointer motion through the real input pipeline.
     pub fn pointer_motion(&mut self, dx: f64, dy: f64) {
-        let event = InputEvent::<TestInputBackend>::PointerMotion {
-            event: TestPointerMotionEvent {
+        let event = InputEvent::<SyntheticInputBackend>::PointerMotion {
+            event: SyntheticPointerMotionEvent {
                 time: self.next_input_micros(),
                 dx,
                 dy,
@@ -155,8 +155,8 @@ impl Fixture {
     /// Inject one vertical wheel notch (a discrete scroll) through the real
     /// input pipeline.
     pub fn scroll_wheel(&mut self) {
-        let event = InputEvent::<TestInputBackend>::PointerAxis {
-            event: TestPointerAxisEvent {
+        let event = InputEvent::<SyntheticInputBackend>::PointerAxis {
+            event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: 120.0,
             },
@@ -166,8 +166,8 @@ impl Fixture {
 
     /// Inject a touch-down at `(x, y)` through the real input pipeline.
     pub fn touch_down(&mut self, x: f64, y: f64) {
-        let event = InputEvent::<TestInputBackend>::TouchDown {
-            event: TestTouchDownEvent {
+        let event = InputEvent::<SyntheticInputBackend>::TouchDown {
+            event: SyntheticTouchDownEvent {
                 time: self.next_input_micros(),
                 x,
                 y,
@@ -179,8 +179,8 @@ impl Fixture {
     /// Inject a touch-up (for the single test slot) through the real input
     /// pipeline.
     pub fn touch_up(&mut self) {
-        let event = InputEvent::<TestInputBackend>::TouchUp {
-            event: TestTouchUpEvent {
+        let event = InputEvent::<SyntheticInputBackend>::TouchUp {
+            event: SyntheticTouchUpEvent {
                 time: self.next_input_micros(),
             },
         };
@@ -255,269 +255,4 @@ impl State {
     pub fn client(&mut self, id: ClientId) -> &mut Client {
         self.clients.iter_mut().find(|c| c.id == id).unwrap()
     }
-}
-
-/// A minimal [`InputBackend`] for feeding synthesized events into the compositor
-/// from headless tests. Only the event types we actually inject are real; the
-/// rest are [`UnusedEvent`].
-pub struct TestInputBackend;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TestInputDevice;
-
-impl crate::input::backend_ext::NiriInputDevice for TestInputDevice {
-    fn output(&self, _state: &crate::niri::State) -> Option<Output> {
-        None
-    }
-}
-
-impl Device for TestInputDevice {
-    fn id(&self) -> String {
-        String::from("test input device")
-    }
-
-    fn name(&self) -> String {
-        String::from("test input device")
-    }
-
-    fn has_capability(&self, capability: DeviceCapability) -> bool {
-        matches!(
-            capability,
-            DeviceCapability::Keyboard | DeviceCapability::Pointer | DeviceCapability::Touch
-        )
-    }
-
-    fn usb_id(&self) -> Option<(u32, u32)> {
-        None
-    }
-
-    fn syspath(&self) -> Option<std::path::PathBuf> {
-        None
-    }
-}
-
-pub struct TestKeyboardKeyEvent {
-    time: u64,
-    key_code: Keycode,
-    state: KeyState,
-}
-
-impl Event<TestInputBackend> for TestKeyboardKeyEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl KeyboardKeyEvent<TestInputBackend> for TestKeyboardKeyEvent {
-    fn key_code(&self) -> Keycode {
-        self.key_code
-    }
-
-    fn state(&self) -> KeyState {
-        self.state
-    }
-
-    fn count(&self) -> u32 {
-        1
-    }
-}
-
-pub struct TestPointerButtonEvent {
-    time: u64,
-    button_code: u32,
-    state: ButtonState,
-}
-
-impl Event<TestInputBackend> for TestPointerButtonEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
-    fn button_code(&self) -> u32 {
-        self.button_code
-    }
-
-    fn state(&self) -> ButtonState {
-        self.state
-    }
-}
-
-pub struct TestPointerMotionEvent {
-    time: u64,
-    dx: f64,
-    dy: f64,
-}
-
-impl Event<TestInputBackend> for TestPointerMotionEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl PointerMotionEvent<TestInputBackend> for TestPointerMotionEvent {
-    fn delta_x(&self) -> f64 {
-        self.dx
-    }
-
-    fn delta_y(&self) -> f64 {
-        self.dy
-    }
-
-    fn delta_x_unaccel(&self) -> f64 {
-        self.dx
-    }
-
-    fn delta_y_unaccel(&self) -> f64 {
-        self.dy
-    }
-}
-
-/// A discrete (wheel) scroll of `v120 / 120` notches on the vertical axis.
-pub struct TestPointerAxisEvent {
-    time: u64,
-    v120: f64,
-}
-
-impl Event<TestInputBackend> for TestPointerAxisEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl PointerAxisEvent<TestInputBackend> for TestPointerAxisEvent {
-    fn amount(&self, _axis: Axis) -> Option<f64> {
-        None
-    }
-
-    fn amount_v120(&self, axis: Axis) -> Option<f64> {
-        Some(match axis {
-            Axis::Vertical => self.v120,
-            Axis::Horizontal => 0.0,
-        })
-    }
-
-    fn source(&self) -> AxisSource {
-        AxisSource::Wheel
-    }
-
-    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
-        AxisRelativeDirection::Identical
-    }
-}
-
-pub struct TestTouchDownEvent {
-    time: u64,
-    x: f64,
-    y: f64,
-}
-
-impl Event<TestInputBackend> for TestTouchDownEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl TouchEvent<TestInputBackend> for TestTouchDownEvent {
-    fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
-    }
-}
-
-impl AbsolutePositionEvent<TestInputBackend> for TestTouchDownEvent {
-    fn x(&self) -> f64 {
-        self.x
-    }
-
-    fn y(&self) -> f64 {
-        self.y
-    }
-
-    fn x_transformed(&self, _width: i32) -> f64 {
-        self.x
-    }
-
-    fn y_transformed(&self, _height: i32) -> f64 {
-        self.y
-    }
-}
-
-impl TouchDownEvent<TestInputBackend> for TestTouchDownEvent {}
-
-pub struct TestTouchUpEvent {
-    time: u64,
-}
-
-impl Event<TestInputBackend> for TestTouchUpEvent {
-    fn time(&self) -> u64 {
-        self.time
-    }
-
-    fn device(&self) -> TestInputDevice {
-        TestInputDevice
-    }
-}
-
-impl TouchEvent<TestInputBackend> for TestTouchUpEvent {
-    fn slot(&self) -> TouchSlot {
-        TouchSlot::from(Some(0))
-    }
-}
-
-impl TouchUpEvent<TestInputBackend> for TestTouchUpEvent {}
-
-impl InputBackend for TestInputBackend {
-    type Device = TestInputDevice;
-
-    type KeyboardKeyEvent = TestKeyboardKeyEvent;
-    type PointerButtonEvent = TestPointerButtonEvent;
-    type PointerAxisEvent = TestPointerAxisEvent;
-    type PointerMotionEvent = TestPointerMotionEvent;
-
-    type PointerMotionAbsoluteEvent = UnusedEvent;
-
-    type GestureSwipeBeginEvent = UnusedEvent;
-    type GestureSwipeUpdateEvent = UnusedEvent;
-    type GestureSwipeEndEvent = UnusedEvent;
-    type GesturePinchBeginEvent = UnusedEvent;
-    type GesturePinchUpdateEvent = UnusedEvent;
-    type GesturePinchEndEvent = UnusedEvent;
-    type GestureHoldBeginEvent = UnusedEvent;
-    type GestureHoldEndEvent = UnusedEvent;
-
-    type TouchDownEvent = TestTouchDownEvent;
-    type TouchUpEvent = TestTouchUpEvent;
-
-    type TouchMotionEvent = UnusedEvent;
-    type TouchCancelEvent = UnusedEvent;
-    type TouchFrameEvent = UnusedEvent;
-    type TabletToolAxisEvent = UnusedEvent;
-    type TabletToolProximityEvent = UnusedEvent;
-    type TabletToolTipEvent = UnusedEvent;
-    type TabletToolButtonEvent = UnusedEvent;
-
-    type SwitchToggleEvent = UnusedEvent;
-
-    type SpecialEvent = UnusedEvent;
 }

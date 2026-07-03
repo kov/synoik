@@ -455,6 +455,22 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
         }
+        Request::InjectInput { events } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let mut result = Ok(());
+                for event in &events {
+                    result = crate::input::synthetic::inject(state, event);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                let _ = tx.send_blocking(result);
+            });
+            let result = rx.recv().await;
+            result.map_err(|_| String::from("error injecting input"))??;
+            Response::Handled
+        }
     };
 
     Ok(response)
