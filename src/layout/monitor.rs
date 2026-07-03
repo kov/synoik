@@ -1798,11 +1798,22 @@ impl<W: LayoutElement> Monitor<W> {
         // rendering for maximized GTK windows.
         //
         // FIXME: use proper bounds after fixing the Crop element.
+        //
+        // The exact crop goes on the axis the workspaces join on, so a window
+        // poking out of one workspace doesn't draw over its neighbor.
         let crop_bounds = if self.workspace_switch.is_some() || self.overview_progress.is_some() {
-            Rectangle::new(
-                Point::from((-i32::MAX / 2, 0)),
-                Size::from((i32::MAX, height)),
-            )
+            if self.workspaces_horizontal() {
+                let width = (self.view_size.w * scale).ceil() as i32;
+                Rectangle::new(
+                    Point::from((0, -i32::MAX / 2)),
+                    Size::from((width, i32::MAX)),
+                )
+            } else {
+                Rectangle::new(
+                    Point::from((-i32::MAX / 2, 0)),
+                    Size::from((i32::MAX, height)),
+                )
+            }
         } else {
             Rectangle::new(
                 Point::from((-i32::MAX / 2, -i32::MAX / 2)),

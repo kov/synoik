@@ -461,6 +461,13 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    /// Whether to re-maximize the window when dropped in the overview.
+    ///
+    /// Picking up a maximized window unmaximizes it like any interactive
+    /// move, but a GNOME overview drag is gnome-shell's WindowPreview drag:
+    /// it only moves the window between workspaces, so the drop restores the
+    /// state.
+    pub(self) remaximize: bool,
 }
 
 #[derive(Debug)]
@@ -3983,6 +3990,7 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
                 let is_edge_tiled = tile.window().edge_tiled_side().is_some();
+                let is_maximized = tile.window().pending_sizing_mode().is_maximized();
 
                 // Put it back to be able to easily return.
                 self.interactive_move = Some(InteractiveMoveState::Starting {
@@ -3998,7 +4006,13 @@ impl<W: LayoutElement> Layout<W> {
                 // (meta-window-drag.c, update_move). In GNOME windowing mode
                 // the scrolling layer holds the maximized/fullscreen windows.
                 let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
-                let started = if !is_floating {
+                // In the overview the drag grabs a picker preview, which
+                // starts moving right away — there's nothing to shake loose
+                // from (gnome-shell's WindowPreview drags).
+                let in_expose = gnome_mode && self.overview_open;
+                let started = if in_expose {
+                    true
+                } else if !is_floating {
                     if gnome_mode {
                         pointer_delta.y.abs() >= crate::gnome::SHAKE_THRESHOLD
                     } else {
@@ -4105,6 +4119,7 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
+                    remaximize: in_expose && is_maximized,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4251,6 +4266,11 @@ impl<W: LayoutElement> Layout<W> {
         // Dropping on a screen edge tiles/maximizes (mutter edge tiling), but
         // not from within the overview.
         let edge_tiling = self.gnome_edge_tiling && !self.overview_open;
+        // A GNOME overview drag is gnome-shell's WindowPreview drag: the
+        // preview's location isn't the window's, so dropping moves the window
+        // between workspaces but never repositions it on its desktop.
+        let keep_position =
+            self.overview_open && self.options.layout.windowing_mode == WindowingMode::Floating;
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -4367,26 +4387,32 @@ impl<W: LayoutElement> Layout<W> {
                     InsertPosition::Floating => {
                         let tile_render_loc = move_.tile_render_location(zoom);
 
+                        let remaximize = move_.remaximize;
                         let mut tile = move_.tile;
-                        tile.floating_pos = None;
 
-                        match insert_ws {
-                            InsertWorkspace::Existing(_) => {
-                                if let Some(offset) = offset {
-                                    let pos = (tile_render_loc - offset).downscale(zoom);
-                                    let pos =
-                                        mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
-                                    tile.floating_pos = Some(pos);
-                                } else {
-                                    error!(
-                                        "offset unset for inserting a floating tile \
-                                         to existing workspace"
-                                    );
+                        // The tile still carries its pre-drag position in
+                        // floating_pos; a picker drop keeps it.
+                        if !keep_position {
+                            tile.floating_pos = None;
+
+                            match insert_ws {
+                                InsertWorkspace::Existing(_) => {
+                                    if let Some(offset) = offset {
+                                        let pos = (tile_render_loc - offset).downscale(zoom);
+                                        let pos = mon.workspaces[ws_idx]
+                                            .floating_logical_to_size_frac(pos);
+                                        tile.floating_pos = Some(pos);
+                                    } else {
+                                        error!(
+                                            "offset unset for inserting a floating tile \
+                                             to existing workspace"
+                                        );
+                                    }
                                 }
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                // When putting a floating tile on a new workspace, we don't really
-                                // have a good pre-existing position.
+                                InsertWorkspace::NewAt(_) => {
+                                    // When putting a floating tile on a new workspace, we don't
+                                    // really have a good pre-existing position.
+                                }
                             }
                         }
 
@@ -4409,6 +4435,15 @@ impl<W: LayoutElement> Layout<W> {
                             move_.is_full_width,
                             true,
                         );
+
+                        if keep_position && remaximize {
+                            let ws = mon
+                                .workspaces
+                                .iter_mut()
+                                .find(|ws| ws.id() == ws_id)
+                                .unwrap();
+                            ws.set_maximized(&win_id, true);
+                        }
                     }
                     InsertPosition::EdgeTile(target) => {
                         // Dropped on a screen edge: commit the tile/maximize.

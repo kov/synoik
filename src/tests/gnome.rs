@@ -1892,3 +1892,168 @@ fn overview_click_neighbor_switches_and_stays() {
         "leaving the overview must keep the clicked workspace active"
     );
 }
+
+/// An overview drag is gnome-shell's WindowPreview drag: the preview's
+/// location isn't the window's, so dropping it back on its own workspace
+/// must not reposition the window on the desktop.
+#[test]
+fn overview_drag_within_workspace_keeps_desktop_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    let original_pos = focused_window_pos(&mut f);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    // Drag the preview towards the workspace's top-left corner and drop it.
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    f.pointer_motion(rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(-400., -300.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "dropping a preview must not leave the overview"
+    );
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        original_pos,
+        "a drop on the window's own workspace must not move it on the desktop",
+    );
+}
+
+/// Dropping a preview on a neighbor workspace peeking at the screen edge
+/// moves the window there and nothing else: it keeps its desktop position
+/// (not flush against the neighbor's left edge) and the overview stays open.
+#[test]
+fn overview_drag_to_neighbor_keeps_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    let original_pos = focused_window_pos(&mut f);
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    // Drag the preview onto the trailing workspace peeking at the right
+    // screen edge (visible from 1752 on; see the neighbor click test).
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    f.pointer_motion(grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(1800. - grab.0, 540. - grab.1 - 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "dropping a preview on a neighbor must not leave the overview"
+    );
+
+    let niri = f.niri();
+    let (_, _, ws) = niri
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .expect("the window must still be mapped somewhere");
+    assert_ne!(
+        ws.id(),
+        ws1_id,
+        "dropping on the neighbor's peeking edge must move the window there"
+    );
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().window == win)
+        .unwrap();
+    assert_pos_eq(
+        (pos.x, pos.y),
+        original_pos,
+        "the window must keep its desktop position on the new workspace",
+    );
+}
+
+/// A maximized window's preview picks up immediately — mutter's 48px
+/// shake-loose is for dragging the real window, not the picker — and a drop
+/// re-maximizes it on the target workspace (gnome-shell moves the window
+/// between workspaces without changing its state).
+#[test]
+fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+
+    // Maximize and ack the full-size configure.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // A 20px drag is well under the 48px shake threshold, yet the preview
+    // must already be moving (picked out of its workspace).
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    f.pointer_motion(grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 20.);
+    assert!(
+        f.niri()
+            .layout
+            .workspaces()
+            .all(|(_, _, ws)| !ws.has_window(&win)),
+        "a preview pick-up must not need mutter's shake-loose threshold"
+    );
+
+    // Drop it on the neighbor workspace peeking at the right edge.
+    f.pointer_motion(1800. - grab.0, 540. - grab.1 - 20.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized"),
+        "the drop must re-maximize the window on the target workspace, got: {configures}"
+    );
+
+    let niri = f.niri();
+    let (_, _, ws) = niri
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .unwrap();
+    assert_ne!(
+        ws.id(),
+        ws1_id,
+        "the drop must move the window to the neighbor workspace"
+    );
+}

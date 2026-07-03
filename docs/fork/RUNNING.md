@@ -236,6 +236,17 @@ the overview; clicking the empty area of the active workspace leaves it
 (gnome-shell's Workspace click rules). The mouse wheel — either axis —
 scrolls through workspaces while the overview is open.
 
+**Dragging a preview** is gnome-shell's WindowPreview drag, not a window
+move: it picks up immediately (no shake-loose threshold, even for a
+maximized window), and dropping it — on its own workspace, a neighbor's
+peeking edge, or the gap between workspaces (which inserts a new one) —
+only changes which workspace holds the window. The window keeps its
+position on the desktop, a maximized window is re-maximized on the target,
+and the overview stays open. Windows poking past their workspace's edge
+are clipped to it in the overview and during workspace switches, so they
+don't draw over the neighbor. Divergence: dragging an edge-tiled window's
+preview untiles it to its restore rect (GNOME keeps it tiled).
+
 The **wallpaper** comes from `org.gnome.desktop.background`: `picture-uri`
 (or `picture-uri-dark` when `org.gnome.desktop.interface color-scheme` is
 `prefer-dark`) is decoded (PNG/JPEG/WebP via the image crate, GNOME's stock
