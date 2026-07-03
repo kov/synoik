@@ -27,6 +27,18 @@ pub enum Backend {
     Headless(Headless),
 }
 
+/// Which backend to start the compositor with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMode {
+    /// Winit when nested inside a session, TTY on a bare VT.
+    Auto,
+    /// Headless: no display or input devices, driven over IPC.
+    Headless,
+    /// Headless for the in-process test fixture: additionally skips external
+    /// integrations (GSettings/dconf) to keep tests hermetic.
+    HeadlessTest,
+}
+
 #[derive(PartialEq, Eq)]
 pub enum RenderResult {
     /// The frame was submitted to the backend for presentation.

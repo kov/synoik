@@ -4,6 +4,7 @@ use calloop::EventLoop;
 use niri_config::Config;
 use smithay::reexports::wayland_server::Display;
 
+use crate::backend::BackendMode;
 use crate::niri::State;
 
 pub struct Server {
@@ -21,7 +22,7 @@ impl Server {
             handle.clone(),
             event_loop.get_signal(),
             display,
-            true,
+            BackendMode::HeadlessTest,
             false,
             false,
         )

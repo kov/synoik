@@ -117,7 +117,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
+use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty, Winit};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -732,7 +732,7 @@ impl State {
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
-        headless: bool,
+        mode: BackendMode,
         create_wayland_socket: bool,
         is_session_instance: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -744,16 +744,17 @@ impl State {
             || env::var_os("WAYLAND_SOCKET").is_some()
             || env::var_os("DISPLAY").is_some();
 
-        let mut backend = if headless {
-            let headless = Headless::new();
-            Backend::Headless(headless)
-        } else if has_display {
-            let winit = Winit::new(config.clone(), event_loop.clone())?;
-            Backend::Winit(winit)
-        } else {
-            let tty = Tty::new(config.clone(), event_loop.clone())
-                .context("error initializing the TTY backend")?;
-            Backend::Tty(tty)
+        let mut backend = match mode {
+            BackendMode::Headless | BackendMode::HeadlessTest => Backend::Headless(Headless::new()),
+            BackendMode::Auto if has_display => {
+                let winit = Winit::new(config.clone(), event_loop.clone())?;
+                Backend::Winit(winit)
+            }
+            BackendMode::Auto => {
+                let tty = Tty::new(config.clone(), event_loop.clone())
+                    .context("error initializing the TTY backend")?;
+                Backend::Tty(tty)
+            }
         };
 
         let mut niri = Niri::new(
@@ -773,7 +774,7 @@ impl State {
         // GSettings/dconf backend — the same store gnome-shell uses — and keep the
         // model current as keys change. Headless test instances keep the defaults
         // and drive the model directly instead.
-        if !headless {
+        if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
             state.niri.gnome_settings_writer = Some(writer);

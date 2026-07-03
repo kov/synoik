@@ -12,10 +12,38 @@ The backend is chosen automatically at startup (`src/niri.rs`, `State::new`):
 |---|---|---|
 | Started inside a Wayland/X11 session (`WAYLAND_DISPLAY`/`DISPLAY` set) | **Winit** | a single nested window |
 | Started on a bare VT (no display) | **Tty** | real KMS/DRM, your actual session |
-| Tests | **Headless** | no GPU, no display |
+| `--headless` flag, and tests | **Headless** | no display or input devices |
 
 So from inside your GNOME session, `cargo run` already opens a nested window —
 nothing special required.
+
+## Headless (drive it entirely over IPC)
+
+```sh
+cargo run -- --headless
+```
+
+starts the real compositor with no display and no input devices: one virtual
+1920×1080 output, a Wayland socket real clients can connect to, and a
+surfaceless-EGL renderer so GL clients actually draw. Everything is driven
+over IPC — the same `niri msg` surface as any other instance:
+
+```sh
+export NIRI_SOCKET=…   # printed at startup ("IPC listening on: …")
+niri msg action spawn -- kitty
+niri msg windows
+niri msg action show-run-dialog
+niri msg event-stream
+niri msg action quit --skip-confirmation
+```
+
+This is the way to exercise compositor behavior from a shell (or an agent)
+without a Wayland session, a free VT, or fighting the host compositor for
+keys. It reads and watches the real GSettings store like any non-test
+instance; point `GSETTINGS_BACKEND=keyfile` + a scratch `XDG_CONFIG_HOME` at
+it for isolation. Keyboard-driven paths (the actual key *press*) still need a
+nested/TTY run or the conformance tests — headless has no input devices, so
+behavior is reached via `niri msg action …` instead. Don't pass `--session`.
 
 ## Nested (quick, for most things)
 

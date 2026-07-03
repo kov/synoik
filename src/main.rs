@@ -15,6 +15,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use directories::ProjectDirs;
+use niri::backend::BackendMode;
 use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
 use niri::dbus;
@@ -174,16 +175,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Increase the buffer size so that it's harder to crash a frozen client with a 1000 Hz mouse.
     set_default_max_buffer_size(&display, 1024 * 1024);
 
+    let mode = if cli.headless {
+        BackendMode::Headless
+    } else {
+        BackendMode::Auto
+    };
     let mut state = State::new(
         config,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        mode,
         true,
         cli.session,
     )
     .unwrap();
+
+    if cli.headless {
+        // A renderer lets clients actually draw (and screencasting work), but
+        // isn't required for driving the compositor logic over IPC.
+        if let Err(err) = state.backend.headless().add_renderer() {
+            warn!("error creating headless renderer, running without one: {err:?}");
+        }
+        let niri = &mut state.niri;
+        state.backend.headless().add_output(niri, 1, (1920, 1080));
+    }
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();

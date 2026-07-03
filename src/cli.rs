@@ -26,6 +26,15 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Run with a headless backend: no display or input devices, one virtual
+    /// output.
+    ///
+    /// The compositor is fully driveable over IPC (`niri msg`), which is the
+    /// point: it allows exercising the real compositor — spawning clients,
+    /// invoking actions, watching the event stream — without a Wayland
+    /// session or a free VT.
+    #[arg(long)]
+    pub headless: bool,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,
