@@ -181,6 +181,16 @@ layout {
 (The matching GNOME-side setting is deferred; the switch lives in the niri
 config for now.)
 
+GNOME's window keys work on the floating layer: **Super+Left/Right**
+edge-tiles to half the work area and toggles back (`toggle-tiled-left/right`
+from `org.gnome.mutter.keybindings`), **Super+Up** maximizes, **Super+Down**
+unmaximizes or untiles (`maximize`/`unmaximize` from
+`org.gnome.desktop.wm.keybindings`) — restore geometry follows mutter's
+`saved_rect` rules, including through tile→maximize chains. Windows covering
+more than 80% of the work area **auto-maximize on map** with a clamped
+restore size (mutter `place.c`). All of it is IPC-drivable:
+`niri msg action toggle-tiled-left` / `maximize` / `unmaximize`.
+
 Focus follows GNOME's stealing-prevention rules in this mode (mutter
 `window.c` / `meta-wayland-activation.c`): a window whose launch — its
 xdg-activation token — predates your last interaction with the focused

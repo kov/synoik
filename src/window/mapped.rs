@@ -22,6 +22,7 @@ use smithay::wayland::shell::xdg::{
 use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
+use crate::gnome::TileSide;
 use crate::handlers::KdeDecorationsModeState;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
@@ -200,6 +201,10 @@ pub struct Mapped {
     /// prevention. `None` means the user never interacted with it, which
     /// makes newer windows always win.
     user_time: Option<Duration>,
+
+    /// Which half of the work area the window is edge-tiled to (GNOME
+    /// Super+Left/Right), if any.
+    edge_tiled_side: Option<TileSide>,
 }
 
 niri_render_elements! {
@@ -316,6 +321,7 @@ impl Mapped {
             uncommitted_maximized: Vec::new(),
             focus_timestamp: None,
             user_time: None,
+            edge_tiled_side: None,
         };
 
         rv.is_maximized = rv.sizing_mode().is_maximized();
@@ -611,7 +617,38 @@ impl Mapped {
     }
 
     pub fn update_tiled_state(&self, prefer_no_csd: bool) {
+        // Edge tiling owns the tiled states while active.
+        if self.edge_tiled_side.is_some() {
+            self.send_edge_tiled_states();
+            return;
+        }
         update_tiled_state(self.toplevel(), prefer_no_csd, self.rules.tiled_state);
+    }
+
+    /// Sets the xdg tiled states for the current edge-tile side, mirroring
+    /// mutter: a side tile is tiled top/bottom and toward its edge, but NOT
+    /// maximized (only both-direction maximization sets Maximized).
+    fn send_edge_tiled_states(&self) {
+        let side = self.edge_tiled_side;
+        self.toplevel().with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::TiledLeft);
+            state.states.unset(xdg_toplevel::State::TiledRight);
+            state.states.unset(xdg_toplevel::State::TiledTop);
+            state.states.unset(xdg_toplevel::State::TiledBottom);
+            match side {
+                Some(TileSide::Left) => {
+                    state.states.set(xdg_toplevel::State::TiledTop);
+                    state.states.set(xdg_toplevel::State::TiledBottom);
+                    state.states.set(xdg_toplevel::State::TiledLeft);
+                }
+                Some(TileSide::Right) => {
+                    state.states.set(xdg_toplevel::State::TiledTop);
+                    state.states.set(xdg_toplevel::State::TiledBottom);
+                    state.states.set(xdg_toplevel::State::TiledRight);
+                }
+                None => {}
+            }
+        });
     }
 
     pub fn is_windowed_fullscreen(&self) -> bool {
@@ -1368,6 +1405,23 @@ impl LayoutElement for Mapped {
 
     fn is_child_of(&self, parent: &Self) -> bool {
         self.toplevel().parent().as_ref() == Some(parent.toplevel().wl_surface())
+    }
+
+    fn edge_tiled_side(&self) -> Option<TileSide> {
+        self.edge_tiled_side
+    }
+
+    fn set_edge_tiled(&mut self, side: Option<TileSide>) {
+        if self.edge_tiled_side == side {
+            return;
+        }
+        self.edge_tiled_side = side;
+        self.send_edge_tiled_states();
+
+        // Untiling restores the regular (decoration-driven) tiled states.
+        if side.is_none() {
+            update_tiled_state(self.toplevel(), false, self.rules.tiled_state);
+        }
     }
 
     fn refresh(&self) {

@@ -16,6 +16,7 @@ use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
 };
 use crate::animation::{Animation, Clock};
+use crate::gnome::TileSide;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
@@ -1029,6 +1030,114 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         self.move_to(idx, pos, animate);
+    }
+
+    /// Tiles the window to the given half of the work area, or untiles it if
+    /// already tiled there (GNOME Super+Left/Right; mutter's
+    /// `handle_toggle_tiled`).
+    pub fn toggle_tiled(&mut self, id: Option<&W::Id>, side: TileSide) {
+        let Some(id) = id.or(self.active_window_id.as_ref()).cloned() else {
+            return;
+        };
+        let Some(idx) = self.idx_of(&id) else {
+            return;
+        };
+
+        if self.tiles[idx].window().edge_tiled_side() == Some(side) {
+            self.untile(idx);
+        } else {
+            self.tile_to(idx, side);
+        }
+    }
+
+    /// Untiles the window if it is edge-tiled, restoring its saved geometry
+    /// (mutter's `meta_window_untile`).
+    pub fn untile_window(&mut self, id: &W::Id) {
+        let Some(idx) = self.idx_of(id) else {
+            return;
+        };
+        if self.tiles[idx].window().edge_tiled_side().is_some() {
+            self.untile(idx);
+        }
+    }
+
+    /// Clears the edge-tile state without issuing a resize and returns the
+    /// saved pre-tile geometry. For handing the window to a state that owns
+    /// the next configure (e.g. maximize), so the eventual restore lands on
+    /// the pre-tile rect like mutter's `saved_rect`.
+    #[allow(clippy::type_complexity)]
+    pub fn take_tile_restore(
+        &mut self,
+        id: &W::Id,
+    ) -> Option<(Option<Size<i32, Logical>>, Option<Point<f64, SizeFrac>>)> {
+        let idx = self.idx_of(id)?;
+        let tile = &mut self.tiles[idx];
+        tile.window().edge_tiled_side()?;
+        tile.window_mut().set_edge_tiled(None);
+        Some((
+            tile.tiled_restore_size.take(),
+            tile.tiled_restore_pos.take(),
+        ))
+    }
+
+    /// mutter's tile geometry (`meta_window_get_tile_area` with the default
+    /// 0.5 fraction): half the work area wide, full height, snapped to the
+    /// side's edge.
+    fn tile_to(&mut self, idx: usize, side: TileSide) {
+        let area = self.working_area;
+        let current_pos = self.data[idx].logical_pos;
+
+        let tile = &mut self.tiles[idx];
+
+        // First tile from floating: save the restore rect (mutter's
+        // `meta_window_save_rect`). Re-tiling to the other side keeps it.
+        if tile.window().edge_tiled_side().is_none() {
+            let win = tile.window();
+            let size = win.expected_size().unwrap_or_else(|| win.size());
+            tile.tiled_restore_size = Some(size);
+            tile.tiled_restore_pos = Some(Data::logical_to_size_frac_in_working_area(
+                area,
+                current_pos,
+            ));
+        }
+
+        let tile_width = (area.size.w / 2.).round();
+        let win_width = tile.window_width_for_tile_width(tile_width);
+        let win_height = tile.window_height_for_tile_height(area.size.h);
+
+        let win = tile.window_mut();
+        let min_size = win.min_size();
+        let max_size = win.max_size();
+        let win_width = ensure_min_max_size(win_width.round() as i32, min_size.w, max_size.w);
+        let win_height = ensure_min_max_size(win_height.round() as i32, min_size.h, max_size.h);
+        win.request_size_once(Size::from((win_width, win_height)), true);
+        win.set_edge_tiled(Some(side));
+
+        let x = match side {
+            TileSide::Left => area.loc.x,
+            TileSide::Right => area.loc.x + area.size.w - tile_width,
+        };
+        self.move_to(idx, Point::from((x, area.loc.y)), true);
+    }
+
+    fn untile(&mut self, idx: usize) {
+        let tile = &mut self.tiles[idx];
+        tile.window_mut().set_edge_tiled(None);
+
+        let size = tile.tiled_restore_size.take().unwrap_or_default();
+        let restore_pos = tile.tiled_restore_pos.take();
+
+        let win = tile.window_mut();
+        let min_size = win.min_size();
+        let max_size = win.max_size();
+        let w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+        let h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+        win.request_size_once(Size::from((w, h)), true);
+
+        if let Some(pos) = restore_pos {
+            let pos = self.scale_by_working_area(pos);
+            self.move_to(idx, pos, true);
+        }
     }
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {

@@ -28,6 +28,7 @@ use super::{
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
+use crate::gnome::TileSide;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -1257,8 +1258,12 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) {
         let mut restore_to_floating = false;
+        // Like maximize: fullscreening an edge-tiled window carries the
+        // pre-tile rect as the restore rect.
+        let mut tiled_restore = None;
         if self.floating.has_window(window) {
             if is_fullscreen {
+                tiled_restore = self.floating.take_tile_restore(window);
                 restore_to_floating = true;
                 self.toggle_window_floating(Some(window));
             } else {
@@ -1308,6 +1313,14 @@ impl<W: LayoutElement> Workspace<W> {
             .unwrap();
         if was_normal && !tile.window().pending_sizing_mode().is_normal() {
             tile.restore_to_floating = restore_to_floating;
+            if let Some((size, pos)) = tiled_restore {
+                if size.is_some() {
+                    tile.floating_window_size = size;
+                }
+                if pos.is_some() {
+                    tile.floating_pos = pos;
+                }
+            }
         }
     }
 
@@ -1320,15 +1333,120 @@ impl<W: LayoutElement> Workspace<W> {
         self.set_fullscreen(window, !current);
     }
 
+    /// Tiles the window to the given half of the work area, or untiles it if
+    /// already tiled there (GNOME Super+Left/Right).
+    pub fn toggle_tiled(&mut self, window: Option<&W::Id>, side: TileSide) {
+        let id = window
+            .or_else(|| self.active_window().map(|win| win.id()))
+            .cloned();
+        let Some(id) = id else {
+            return;
+        };
+
+        if self.floating.has_window(&id) {
+            self.floating.toggle_tiled(Some(&id), side);
+            return;
+        }
+
+        // A maximized window tiles from its maximized state (mutter clears
+        // the maximization and tiles). Ours lives in the scrolling layout:
+        // bring it back to floating, then tile. (mutter would remember to
+        // restore to maximized on untile — saved_maximize — which we don't.)
+        let is_maximized_floater = self
+            .scrolling
+            .tiles()
+            .find(|tile| tile.window().id() == &id)
+            .is_some_and(|tile| {
+                tile.window().pending_sizing_mode().is_maximized() && tile.restore_to_floating
+            });
+        if is_maximized_floater {
+            self.set_maximized(&id, false);
+            if self.floating.has_window(&id) {
+                self.floating.toggle_tiled(Some(&id), side);
+            }
+        }
+    }
+
+    /// mutter's map-time auto-maximize (place.c): a window covering more
+    /// than 80% of the work area opens maximized. The restore size is
+    /// clamped to sqrt(0.8) of the work area per dimension, aspect
+    /// preserved (mutter clamps in set_unmaximize_flags instead; same
+    /// outcome for this path).
+    pub fn auto_maximize_if_too_big(&mut self, window: &W::Id) -> bool {
+        const MAX_UNMAXIMIZED_WINDOW_AREA: f64 = 0.8;
+
+        if !self.floating.has_window(window) {
+            return false;
+        }
+        let area = self.floating.working_area();
+
+        let tile = self
+            .floating
+            .tiles_mut()
+            .find(|tile| tile.window().id() == window)
+            .unwrap();
+        let win = tile.window();
+        let size = win.size();
+        let min_size = win.min_size();
+        let max_size = win.max_size();
+
+        // mutter's has_maximize_func: skip windows that cannot cover the
+        // work area.
+        if (max_size.w > 0 && f64::from(max_size.w) < area.size.w)
+            || (max_size.h > 0 && f64::from(max_size.h) < area.size.h)
+        {
+            return false;
+        }
+
+        let win_area = f64::from(size.w) * f64::from(size.h);
+        if win_area <= area.size.w * area.size.h * MAX_UNMAXIMIZED_WINDOW_AREA {
+            return false;
+        }
+
+        let factor = MAX_UNMAXIMIZED_WINDOW_AREA.sqrt();
+        let scale = f64::min(
+            area.size.w * factor / f64::from(size.w),
+            area.size.h * factor / f64::from(size.h),
+        )
+        .min(1.);
+        let mut restore = Size::from((
+            (f64::from(size.w) * scale).round() as i32,
+            (f64::from(size.h) * scale).round() as i32,
+        ));
+        restore.w = restore.w.max(min_size.w);
+        restore.h = restore.h.max(min_size.h);
+
+        self.set_maximized(window, true);
+
+        // Clamp the restore size on the (now scrolling) tile; the move above
+        // stored the live near-work-area size.
+        if let Some(tile) = self
+            .scrolling
+            .tiles_mut()
+            .find(|tile| tile.window().id() == window)
+        {
+            tile.floating_window_size = Some(restore);
+        }
+        true
+    }
+
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
         let mut restore_to_floating = false;
+        // The pre-tile rect of an edge-tiled window; it becomes the maximize
+        // restore rect (mutter's saved_rect flows from tile to maximize).
+        // Applied after the move to the scrolling layout, which stores the
+        // live (tiled) geometry as the floating restore.
+        let mut tiled_restore = None;
         if self.floating.has_window(window) {
             if maximize {
+                tiled_restore = self.floating.take_tile_restore(window);
                 restore_to_floating = true;
                 self.toggle_window_floating(Some(window));
             } else {
-                // Floating windows are never maximized, so this is an unmaximize request for an
-                // already unmaximized window.
+                // Floating windows are never maximized; but an edge-tiled one
+                // counts as maximized for mutter's handle_unmaximize, which
+                // untiles it.
+                self.floating.untile_window(window);
                 return;
             }
         } else if !maximize {
@@ -1367,6 +1485,14 @@ impl<W: LayoutElement> Workspace<W> {
             .unwrap();
         if was_normal && !tile.window().pending_sizing_mode().is_normal() {
             tile.restore_to_floating = restore_to_floating;
+            if let Some((size, pos)) = tiled_restore {
+                if size.is_some() {
+                    tile.floating_window_size = size;
+                }
+                if pos.is_some() {
+                    tile.floating_pos = pos;
+                }
+            }
         }
     }
 

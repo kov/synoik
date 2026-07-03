@@ -100,25 +100,48 @@ impl GnomeSettings {
         }
     }
 
-    fn load_wm_keybindings(&mut self, wm: &gio::Settings) {
-        self.keybindings = adopted_wm_keybindings()
-            .into_iter()
-            .map(|(key, action, defaults)| {
-                // Guard against schema drift: a missing key keeps our built-in
-                // default rather than aborting inside gio.
-                let values = if settings_has_key(wm, &key) {
-                    wm.strv(&key).iter().map(|s| s.to_string()).collect()
-                } else {
-                    warn!("org.gnome.desktop.wm.keybindings has no {key:?}; using our default");
-                    defaults
-                };
-                GnomeKeybinding {
-                    action,
-                    accels: parse_accels(&key, values),
-                }
-            })
-            .collect();
+    /// (Re-)builds the keybinding list from both adopted tables, reading each
+    /// from its store where open and falling back to our built-in defaults.
+    fn load_keybindings(
+        &mut self,
+        wm: Option<&gio::Settings>,
+        mutter_keybindings: Option<&gio::Settings>,
+    ) {
+        let mut keybindings = read_keybinding_table(wm, adopted_wm_keybindings());
+        keybindings.extend(read_keybinding_table(
+            mutter_keybindings,
+            adopted_mutter_keybindings(),
+        ));
+        self.keybindings = keybindings;
     }
+}
+
+/// Reads one adopted-keybindings table, one entry per settings key in table
+/// order, from its store where open (a missing key falls back to our
+/// built-in default rather than aborting inside gio).
+fn read_keybinding_table(
+    store: Option<&gio::Settings>,
+    table: Vec<(String, GnomeKeyAction, Vec<String>)>,
+) -> Vec<GnomeKeybinding> {
+    table
+        .into_iter()
+        .map(|(key, action, defaults)| {
+            let values = match store {
+                Some(store) if settings_has_key(store, &key) => {
+                    store.strv(&key).iter().map(|s| s.to_string()).collect()
+                }
+                Some(_) => {
+                    warn!("keybindings schema has no {key:?}; using our default");
+                    defaults
+                }
+                None => defaults,
+            };
+            GnomeKeybinding {
+                action,
+                accels: parse_accels(&key, values),
+            }
+        })
+        .collect()
 }
 
 fn settings_has_key(settings: &gio::Settings, key: &str) -> bool {
@@ -169,6 +192,21 @@ pub enum GnomeKeyAction {
     /// onto the window MRU switcher over all workspaces (no app grouping —
     /// accepted divergence for now).
     SwitchApplications { backward: bool },
+    /// `maximize`: maximize the focused window.
+    Maximize,
+    /// `unmaximize`: unmaximize the focused window; a tiled window untiles.
+    Unmaximize,
+    /// `toggle-tiled-left` / `-right` (`org.gnome.mutter.keybindings`): tile
+    /// the focused window to the given half of the work area, or untile it if
+    /// already tiled there.
+    ToggleTiled(TileSide),
+}
+
+/// Which half of the work area a window is tiled to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileSide {
+    Left,
+    Right,
 }
 
 /// The `org.gnome.desktop.wm.keybindings` keys we honor, with GNOME's default
@@ -191,6 +229,12 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
         ),
         ("close".to_owned(), Close, strs(&["<Alt>F4"])),
         ("toggle-fullscreen".to_owned(), ToggleFullscreen, strs(&[])),
+        ("maximize".to_owned(), Maximize, strs(&["<Super>Up"])),
+        (
+            "unmaximize".to_owned(),
+            Unmaximize,
+            strs(&["<Super>Down", "<Alt>F5"]),
+        ),
         (
             "switch-to-workspace-left".to_owned(),
             SwitchToWorkspacePrevious,
@@ -301,13 +345,9 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
 }
 
 fn default_keybindings() -> Vec<GnomeKeybinding> {
-    adopted_wm_keybindings()
-        .into_iter()
-        .map(|(key, action, defaults)| GnomeKeybinding {
-            action,
-            accels: parse_accels(&key, defaults),
-        })
-        .collect()
+    let mut keybindings = read_keybinding_table(None, adopted_wm_keybindings());
+    keybindings.extend(read_keybinding_table(None, adopted_mutter_keybindings()));
+    keybindings
 }
 
 /// Parse a settings key's accelerator array, mirroring mutter's
@@ -418,11 +458,30 @@ impl GnomeSettingsWriter {
     }
 }
 
+/// The `org.gnome.mutter.keybindings` keys we honor, with their schema
+/// defaults (this schema ships with mutter, so the defaults are authoritative
+/// in the reference checkout).
+fn adopted_mutter_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
+    vec![
+        (
+            "toggle-tiled-left".to_owned(),
+            GnomeKeyAction::ToggleTiled(TileSide::Left),
+            vec!["<Super>Left".to_owned()],
+        ),
+        (
+            "toggle-tiled-right".to_owned(),
+            GnomeKeyAction::ToggleTiled(TileSide::Right),
+            vec!["<Super>Right".to_owned()],
+        ),
+    ]
+}
+
 /// The GSettings stores feeding [`GnomeSettings`]. Any change to any of them
 /// re-reads the whole model — settings churn is rare and the read is cheap,
 /// and one code path means one behavior to test.
 struct Stores {
     mutter: Option<gio::Settings>,
+    mutter_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
     shell: Option<gio::Settings>,
@@ -435,6 +494,7 @@ impl Stores {
     fn open() -> Self {
         Self {
             mutter: gsettings("org.gnome.mutter"),
+            mutter_keybindings: gsettings("org.gnome.mutter.keybindings"),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings"),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences"),
             shell: gsettings("org.gnome.shell"),
@@ -449,6 +509,7 @@ impl Stores {
     fn all(&self) -> impl Iterator<Item = &gio::Settings> {
         [
             &self.mutter,
+            &self.mutter_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
             &self.shell,
@@ -464,9 +525,10 @@ impl Stores {
         if let Some(mutter) = &self.mutter {
             settings.load_mutter(mutter);
         }
-        if let Some(wm) = &self.wm_keybindings {
-            settings.load_wm_keybindings(wm);
-        }
+        settings.load_keybindings(
+            self.wm_keybindings.as_ref(),
+            self.mutter_keybindings.as_ref(),
+        );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);
         }
@@ -885,6 +947,7 @@ mod tests {
                     Some(&backend),
                     None,
                 )),
+                mutter_keybindings: None,
                 wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
                 wm_preferences: None,
                 shell: None,
@@ -977,6 +1040,7 @@ mod tests {
                     let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
                     STORES.set(Some(Rc::new(Stores {
                         mutter: None,
+                        mutter_keybindings: None,
                         wm_keybindings: None,
                         wm_preferences: None,
                         shell: Some(shell),

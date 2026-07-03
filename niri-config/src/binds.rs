@@ -366,6 +366,10 @@ pub enum Action {
     OpenOverview,
     CloseOverview,
     ShowRunDialog,
+    Maximize,
+    Unmaximize,
+    ToggleTiledLeft,
+    ToggleTiledRight,
     /// Notify a grabbed accelerator (org.gnome.Shell GrabAccelerator); the
     /// argument is the grab's action id. Internal, not bindable from config.
     #[knuffel(skip)]
@@ -706,6 +710,10 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
             niri_ipc::Action::ShowRunDialog {} => Self::ShowRunDialog,
+            niri_ipc::Action::Maximize {} => Self::Maximize,
+            niri_ipc::Action::Unmaximize {} => Self::Unmaximize,
+            niri_ipc::Action::ToggleTiledLeft {} => Self::ToggleTiledLeft,
+            niri_ipc::Action::ToggleTiledRight {} => Self::ToggleTiledRight,
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

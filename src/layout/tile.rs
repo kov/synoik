@@ -75,6 +75,15 @@ pub struct Tile<W: LayoutElement> {
     /// the window starts out in the tiling layout.
     pub(super) floating_pos: Option<Point<f64, SizeFrac>>,
 
+    /// The window size to restore when untiling (mutter's `saved_rect`).
+    ///
+    /// Kept separately from `floating_window_size`, which tracks the live
+    /// floating geometry and gets overwritten while tiled.
+    pub(super) tiled_restore_size: Option<Size<i32, Logical>>,
+
+    /// The position to restore when untiling (mutter's `saved_rect`).
+    pub(super) tiled_restore_pos: Option<Point<f64, SizeFrac>>,
+
     /// Currently selected preset width index when this tile is floating.
     pub(super) floating_preset_width_idx: Option<usize>,
 
@@ -198,6 +207,8 @@ impl<W: LayoutElement> Tile<W> {
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
+            tiled_restore_size: None,
+            tiled_restore_pos: None,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
             open_animation: None,

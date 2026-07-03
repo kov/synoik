@@ -985,6 +985,16 @@ pub enum Action {
     CloseOverview {},
     /// Open the GNOME run dialog (Alt+F2).
     ShowRunDialog {},
+    /// Maximize the focused window (GNOME semantics: occupies the work area).
+    Maximize {},
+    /// Unmaximize the focused window; a half-tiled window untiles.
+    Unmaximize {},
+    /// Tile the focused window to the left half of the work area, or untile
+    /// it if already tiled left (GNOME Super+Left).
+    ToggleTiledLeft {},
+    /// Tile the focused window to the right half of the work area, or untile
+    /// it if already tiled right (GNOME Super+Right).
+    ToggleTiledRight {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

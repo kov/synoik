@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use insta::assert_snapshot;
 use niri_config::{Action, Config};
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
@@ -43,6 +44,7 @@ const KEY_LEFTALT: u32 = 56;
 const KEY_F2: u32 = 60;
 const KEY_F4: u32 = 62;
 const KEY_UP: u32 = 103;
+const KEY_LEFT: u32 = 105;
 const KEY_DOWN: u32 = 108;
 const KEY_PAGEDOWN: u32 = 109;
 const KEY_LEFTMETA: u32 = 125;
@@ -1290,5 +1292,176 @@ fn strict_focus_new_windows_denies_all_but_transients() {
         f.niri().layout.focus().unwrap().id(),
         a_id,
         "a transient of the focused window must take focus even in strict mode"
+    );
+}
+
+/// `toggle-tiled-left` (default `<Super>Left`, org.gnome.mutter.keybindings):
+/// tiles the window to the left half of the work area — half width, full
+/// height, xdg tiled states but NOT maximized — and pressing it again
+/// untiles, restoring the saved pre-tile geometry (mutter
+/// handle_toggle_tiled / meta_window_untile).
+#[test]
+fn super_left_tiles_and_toggles() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let original_pos = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Tile left.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_LEFT);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    assert_snapshot!(
+        f.client(id).window(&surface).format_recent_configures(),
+        @"size: 960 × 1080, bounds: 1920 × 1080, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
+    );
+
+    // The client commits the tiled size; the tile sits at the left edge.
+    let window = f.client(id).window(&surface);
+    window.set_size(960, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (0., 0.),
+        "a left-tiled window must sit at the work-area origin",
+    );
+
+    // Toggle again: untile, restoring the saved geometry.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_LEFT);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    assert_snapshot!(
+        f.client(id).window(&surface).format_recent_configures(),
+        @"size: 800 × 600, bounds: 1920 × 1080, states: [Activated]"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        original_pos,
+        "untiling must restore the saved position",
+    );
+}
+
+/// `maximize` (default `<Super>Up`) maximizes; `unmaximize` (`<Super>Down`)
+/// restores the floating geometry. A window maximized from a tile restores
+/// to the pre-tile rect (mutter carries saved_rect from tile to maximize).
+#[test]
+fn super_up_maximizes_super_down_restores() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let original_pos = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Tile left first, then maximize from the tile.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_LEFT);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(960, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized"),
+        "maximize must send the xdg Maximized state, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Unmaximize: back to floating at the pre-tile size and position.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_DOWN);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 800 × 600") && !configures.contains("Maximized"),
+        "unmaximize must restore the pre-tile size, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        original_pos,
+        "unmaximizing a window maximized from a tile must restore the pre-tile position",
+    );
+}
+
+/// mutter's auto-maximize: a window covering more than 80% of the work area
+/// opens maximized; unmaximizing restores a size clamped to sqrt(0.8) of the
+/// work area, aspect preserved (place.c / window.c).
+#[test]
+fn oversized_window_auto_maximizes_with_clamped_restore() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // 1800×1000 = 1.8M > 0.8 * 1920×1080 ≈ 1.66M.
+    let surface = map_window_sized(&mut f, id, (1800, 1000), None);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized"),
+        "an oversized window must auto-maximize on map, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_DOWN);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    // scale = min(1920·√0.8/1800, 1080·√0.8/1000) ≈ 0.954 → 1717×954.
+    let factor = 0.8f64.sqrt();
+    let scale = f64::min(1920. * factor / 1800., 1080. * factor / 1000.);
+    let expected = format!(
+        "size: {} × {}",
+        (1800. * scale).round() as i32,
+        (1000. * scale).round() as i32
+    );
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains(&expected),
+        "the auto-maximize restore size must be clamped ({expected}), got: {configures}"
     );
 }

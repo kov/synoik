@@ -47,7 +47,9 @@ use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
-use crate::gnome::{Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding};
+use crate::gnome::{
+    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, TileSide,
+};
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
@@ -1789,6 +1791,38 @@ impl State {
             }
             Action::MaximizeColumn => {
                 self.niri.layout.toggle_full_width();
+            }
+            Action::Maximize => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.set_maximized(&window, true);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::Unmaximize => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.set_maximized(&window, false);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleTiledLeft => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.toggle_tiled(&window, TileSide::Left);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleTiledRight => {
+                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                if let Some(window) = focus {
+                    self.niri.layout.toggle_tiled(&window, TileSide::Right);
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
             }
             Action::MaximizeWindowToEdges => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
@@ -4827,6 +4861,10 @@ fn accel_matches(
 fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
+        GnomeKeyAction::Maximize => Action::Maximize,
+        GnomeKeyAction::Unmaximize => Action::Unmaximize,
+        GnomeKeyAction::ToggleTiled(TileSide::Left) => Action::ToggleTiledLeft,
+        GnomeKeyAction::ToggleTiled(TileSide::Right) => Action::ToggleTiledRight,
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {

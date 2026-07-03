@@ -325,6 +325,14 @@ impl CompositorHandler for State {
                         }
                     }
 
+                    // GNOME auto-maximize (mutter place.c): a first-shown window
+                    // covering more than 80% of the work area opens maximized.
+                    // Transients are left alone.
+                    if windowing_mode == WindowingMode::Floating && is_floating && parent.is_none()
+                    {
+                        self.niri.layout.auto_maximize_if_too_big(&window);
+                    }
+
                     if let Some(output) = output {
                         self.niri.layout.start_open_animation_for_window(&window);
 

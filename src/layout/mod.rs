@@ -56,6 +56,7 @@ pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
+use crate::gnome::TileSide;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
@@ -317,6 +318,15 @@ pub trait LayoutElement {
     }
 
     fn is_child_of(&self, parent: &Self) -> bool;
+
+    /// Which half of the work area this window is edge-tiled to (GNOME
+    /// Super+Left/Right), if any.
+    fn edge_tiled_side(&self) -> Option<TileSide> {
+        None
+    }
+
+    /// Marks the window as edge-tiled and updates its xdg tiled states.
+    fn set_edge_tiled(&mut self, _side: Option<TileSide>) {}
 
     fn rules(&self) -> &ResolvedWindowRules;
 
@@ -3588,6 +3598,34 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
         }
+    }
+
+    /// Tiles the window to the given half of the work area, or untiles it if
+    /// already tiled there (GNOME Super+Left/Right).
+    pub fn toggle_tiled(&mut self, id: &W::Id, side: TileSide) {
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == id {
+                return;
+            }
+        }
+
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                ws.toggle_tiled(Some(id), side);
+                return;
+            }
+        }
+    }
+
+    /// mutter's map-time auto-maximize: maximizes the window if it covers
+    /// more than 80% of the work area.
+    pub fn auto_maximize_if_too_big(&mut self, id: &W::Id) -> bool {
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                return ws.auto_maximize_if_too_big(id);
+            }
+        }
+        false
     }
 
     pub fn toggle_maximized(&mut self, id: &W::Id) {
