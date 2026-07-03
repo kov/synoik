@@ -103,8 +103,13 @@ flips between it and your session. To iterate: just rebuild and log `gsrs` out
 and back in — the session always runs whatever is currently in `target/debug`,
 no reinstall step.
 
-If the compositor dies, the unit's `OnFailure=` drops that session back to
-GDM; yours is unaffected. Undo with
+Leaving the session: quitting the compositor (`Super+Shift+E` or
+`Ctrl+Alt+Delete`) **is** logging out — the drop-in adds
+`OnSuccess=gnome-session-shutdown.target`, so a clean quit tears the whole
+GNOME session down to GDM, the same as `OnFailure=` does when it crashes.
+(Without that, a clean exit leaves a headless gnome-session running, and
+every later GDM login re-joins it: a black VT.) Your own session is
+unaffected either way. Undo everything with
 `sudo scripts/install-test-session.sh --uninstall`.
 
 Expectations: this exercises the Phase 1 contract surface (STRATEGY.md §3.8).

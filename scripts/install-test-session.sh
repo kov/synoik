@@ -77,6 +77,14 @@ fi
 
 mkdir -p "$dropin_dir"
 cat > "$dropin_dir/override.conf" <<EOF
+[Unit]
+# The stock unit only tears the session down on *failure* (a real gnome-shell
+# never exits cleanly mid-session). Our compositor has a quit action, and a
+# clean exit would otherwise leave a headless gnome-session running that every
+# later GDM login silently re-joins (black VT). Tear down either way.
+OnSuccess=gnome-session-shutdown.target
+OnSuccessJobMode=replace-irreversibly
+
 [Service]
 ExecStart=
 ExecStart=$bin --session
