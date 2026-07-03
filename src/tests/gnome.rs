@@ -1750,3 +1750,62 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
         "the shaken-loose window must land floating"
     );
 }
+
+/// The overview is GNOME's window picker (Experiment 1): windows spread into
+/// slots computed by gnome-shell's layout strategy (`src/layout/expose.rs`),
+/// hit-testing follows the slots, and clicking a preview activates that
+/// window and leaves the overview.
+#[test]
+fn overview_spreads_windows_into_picker_slots() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first_id = f.niri().layout.focus().unwrap().id();
+    let first_win = f.niri().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    let second_win = f.niri().layout.focus().unwrap().window.clone();
+
+    // A lone Super tap opens the picker.
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(f.niri().layout.is_overview_open());
+
+    // Every window has a picker slot, and slots don't overlap.
+    let first_rect = f
+        .niri()
+        .layout
+        .expose_target_rect(&first_win)
+        .expect("windows must have picker slots in the overview");
+    let second_rect = f.niri().layout.expose_target_rect(&second_win).unwrap();
+    let disjoint = first_rect.loc.x + first_rect.size.w <= second_rect.loc.x
+        || second_rect.loc.x + second_rect.size.w <= first_rect.loc.x
+        || first_rect.loc.y + first_rect.size.h <= second_rect.loc.y
+        || second_rect.loc.y + second_rect.size.h <= first_rect.loc.y;
+    assert!(
+        disjoint,
+        "picker slots must not overlap: {first_rect:?} {second_rect:?}"
+    );
+
+    // Click the unfocused window's preview: it activates and the overview
+    // closes (gnome-shell's Main.activateWindow on 'selected').
+    f.pointer_motion(
+        first_rect.loc.x + first_rect.size.w / 2.,
+        first_rect.loc.y + first_rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "clicking a preview must leave the overview"
+    );
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        first_id,
+        "clicking a preview must activate that window"
+    );
+}

@@ -3,7 +3,7 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{CornerRadius, LayoutPart};
+use niri_config::{CornerRadius, LayoutPart, WindowingMode};
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -1378,6 +1378,18 @@ impl<W: LayoutElement> Monitor<W> {
         compute_overview_zoom(&self.options, progress)
     }
 
+    /// In GNOME windowing mode, the overview spreads each workspace's windows
+    /// into picker slots (gnome-shell's window picker); this is how far along
+    /// that spread is, if it's on at all.
+    pub(super) fn expose_progress(&self) -> Option<f64> {
+        if self.options.layout.windowing_mode != WindowingMode::Floating {
+            return None;
+        }
+        let progress = self.overview_progress.as_ref()?;
+        let progress = progress.clamped_value().clamp(0., 1.);
+        (progress > 0.).then_some(progress)
+    }
+
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
@@ -1568,7 +1580,13 @@ impl<W: LayoutElement> Monitor<W> {
         if self.overview_progress.is_some() {
             let zoom = self.overview_zoom();
             let pos_within_workspace = (pos_within_output - geo.loc).downscale(zoom);
-            let (win, hit) = ws.window_under(pos_within_workspace)?;
+            // In GNOME windowing mode the overview spreads windows into
+            // picker slots; hit-test those.
+            let (win, hit) = if self.expose_progress().is_some() {
+                ws.window_under_expose(pos_within_workspace)?
+            } else {
+                ws.window_under(pos_within_workspace)?
+            };
             // During the overview animation, we cannot do input hits because we cannot really
             // represent scaled windows properly.
             Some((win, hit.to_activate()))
@@ -1748,6 +1766,14 @@ impl<W: LayoutElement> Monitor<W> {
                         }
                     }
                 };
+            }
+
+            // In GNOME windowing mode the overview renders the window picker
+            // instead of the layers at their layout positions.
+            if let Some(progress) = self.expose_progress() {
+                push_hint!();
+                ws.render_expose(ctx.r(), xray_pos, progress, push!());
+                continue;
             }
 
             // First pushed = topmost. The scrolling insert hint goes between

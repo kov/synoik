@@ -78,6 +78,7 @@ use crate::utils::{
 use crate::window::ResolvedWindowRules;
 
 pub mod closing_window;
+pub mod expose;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
@@ -5135,6 +5136,23 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn is_overview_open(&self) -> bool {
         self.overview_open
+    }
+
+    /// The overview picker slot of a window, in output coordinates — where
+    /// the window's preview sits on screen in the GNOME overview.
+    pub fn expose_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.monitors().find_map(|mon| {
+            mon.expose_progress()?;
+            let zoom = mon.overview_zoom();
+            let (ws, geo) = mon
+                .workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(window))?;
+            let slot = ws.expose_slot(window)?;
+            Some(Rectangle::new(
+                geo.loc + slot.loc.upscale(zoom),
+                slot.size.upscale(zoom),
+            ))
+        })
     }
 }
 

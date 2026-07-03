@@ -8,6 +8,7 @@ use niri_config::{
     Workspace as WorkspaceConfig,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
@@ -23,9 +24,9 @@ use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
-use super::tile::{Tile, TileRenderSnapshot};
+use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::{
-    ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
+    expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
@@ -144,10 +145,18 @@ impl WorkspaceId {
     }
 }
 
+/// Picker layout: (tile, current rect, slot rect), workspace coordinates.
+type ExposeLayout<'a, W> = Vec<(
+    &'a Tile<W>,
+    Rectangle<f64, Logical>,
+    Rectangle<f64, Logical>,
+)>;
+
 niri_render_elements! {
     WorkspaceRenderElement<R> => {
         Scrolling = ScrollingSpaceRenderElement<R>,
         Floating = FloatingSpaceRenderElement<R>,
+        Expose = RescaleRenderElement<TileRenderElement<R>>,
     }
 }
 
@@ -1798,6 +1807,86 @@ impl<W: LayoutElement> Workspace<W> {
             .render(ctx, xray_pos, view_rect, floating_focus_ring, &mut |elem| {
                 push(elem.into())
             });
+    }
+
+    /// The GNOME overview window picker ("exposé"): every tile with its
+    /// current rect and its picker slot, both in workspace coordinates.
+    ///
+    /// Slots come from gnome-shell's layout strategy (see [`expose`]), over
+    /// the working area, front-to-back like
+    /// [`Self::tiles_with_render_positions`].
+    fn expose_layout(&self) -> ExposeLayout<'_, W> {
+        let tiles: Vec<_> = self
+            .tiles_with_render_positions()
+            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
+            .collect();
+        let rects: Vec<_> = tiles.iter().map(|(_, rect)| *rect).collect();
+        let area = self.floating.working_area();
+        let slots = expose::compute_slots(self.view_size.h, area, &rects);
+        tiles
+            .into_iter()
+            .zip(slots)
+            .map(|((tile, rect), slot)| (tile, rect, slot))
+            .collect()
+    }
+
+    /// The picker slot of one window, in workspace coordinates.
+    pub(super) fn expose_slot(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.expose_layout()
+            .into_iter()
+            .find(|(tile, _, _)| tile.window().id() == window)
+            .map(|(_, _, slot)| slot)
+    }
+
+    /// Renders the workspace as the GNOME overview window picker: each tile
+    /// at its slot, interpolated from its real rect by `progress`.
+    pub fn render_expose<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        xray_pos: XrayPos,
+        progress: f64,
+        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+    ) {
+        let scale = self.scale().fractional_scale();
+        for (tile, rect, slot) in self.expose_layout() {
+            let target_scale = slot.size.w / rect.size.w;
+            let tile_scale = 1. + (target_scale - 1.) * progress;
+            let pos = Point::from((
+                rect.loc.x + (slot.loc.x - rect.loc.x) * progress,
+                rect.loc.y + (slot.loc.y - rect.loc.y) * progress,
+            ));
+            // Round to physical pixels.
+            let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+
+            let xray_pos = xray_pos.offset(pos);
+            tile.render(ctx.r(), pos, xray_pos, false, &mut |elem| {
+                push(
+                    RescaleRenderElement::from_element(
+                        elem,
+                        pos.to_physical_precise_round(scale),
+                        tile_scale,
+                    )
+                    .into(),
+                )
+            });
+        }
+    }
+
+    /// Hit test for the exposé picker: slots, front-to-back. Activation hits
+    /// only — real input can't be routed to a scaled window.
+    pub(super) fn window_under_expose(&self, pos: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        self.expose_layout()
+            .into_iter()
+            .find_map(|(tile, _, slot)| {
+                slot.contains(pos).then(|| {
+                    (
+                        tile.window(),
+                        HitType::Activate {
+                            is_tab_indicator: false,
+                        },
+                    )
+                })
+            })
     }
 
     pub fn render_shadow<R: NiriRenderer>(

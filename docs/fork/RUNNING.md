@@ -216,6 +216,22 @@ IPC). Transients of the focused window always take focus, and token-less
 windows always may. `org.gnome.desktop.wm.preferences focus-new-windows`
 (`smart`/`strict`) is honored live.
 
+## The overview: GNOME's window picker
+
+In floating (GNOME) windowing mode, the overview spreads each workspace's
+windows into **picker slots** instead of showing them at their layout
+positions — gnome-shell's `UnalignedLayoutStrategy` ported to
+`src/layout/expose.rs` (row packing that keeps previews near their real
+windows, small windows enlarged up to 1.5×, everything capped at 95% of
+natural size). The spread animates with the overview open/close progress,
+clicks hit the slots, and clicking a preview activates that window and
+leaves the overview. Scrolling mode keeps niri's zoomed-strip overview
+untouched.
+
+Not yet ported: preview chrome (title, close button, app icon), the
+horizontal workspace row + thumbnails strip, app grid, and search. The
+workspace strip is still niri's vertical one.
+
 ## How GNOME settings feed in
 
 On startup the compositor reads the settings it honors from the **same
