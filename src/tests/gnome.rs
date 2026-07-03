@@ -9,7 +9,7 @@
 //! The first entries are *characterization* tests that pin the inherited niri overview
 //! contract before we reshape it toward GNOME's Activities overview (Experiment 1).
 
-use niri_config::Action;
+use niri_config::{Action, Config};
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
@@ -17,10 +17,20 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
+use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction};
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_A: u32 = 30;
+const KEY_W: u32 = 17;
+const KEY_1: u32 = 2;
+const KEY_2: u32 = 3;
+const KEY_LEFTCTRL: u32 = 29;
 const KEY_LEFTSHIFT: u32 = 42;
+const KEY_LEFTALT: u32 = 56;
+const KEY_F4: u32 = 62;
+const KEY_UP: u32 = 103;
+const KEY_DOWN: u32 = 108;
+const KEY_PAGEDOWN: u32 = 109;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
@@ -363,6 +373,284 @@ fn shortcuts_inhibit_disables_overlay_key() {
     assert!(
         f.niri().layout.is_overview_open(),
         "releasing the inhibitor must restore the overlay key"
+    );
+}
+
+/// The GNOME `close` keybinding (`org.gnome.desktop.wm.keybindings`, default
+/// `<Alt>F4`) asks the focused window to close, through the same xdg-toplevel
+/// close event any close request uses.
+#[test]
+fn alt_f4_requests_close_on_the_focused_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "<Alt>F4 must request the focused window to close"
+    );
+}
+
+/// The numbered workspace switches (`switch-to-workspace-N`, default
+/// `<Super>N` in the GNOME session) focus that workspace.
+#[test]
+fn super_number_switches_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Mapping a window gives the monitor an occupied workspace plus the
+    // trailing empty one, so there is a workspace 2 to go to.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        0
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_2);
+    f.key_release(KEY_2);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        1,
+        "<Super>2 must focus the second workspace"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "using Super as a modifier must not have fired the overlay key"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_1);
+    f.key_release(KEY_1);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        0,
+        "<Super>1 must focus the first workspace again"
+    );
+}
+
+/// The directional workspace switches: GNOME's horizontal row and the legacy
+/// vertical axis both map onto niri's workspace column, so `<Control><Alt>Down`
+/// (switch-to-workspace-down) goes to the next workspace and `<Control><Alt>Up`
+/// back to the previous one.
+#[test]
+fn ctrl_alt_arrows_switch_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+
+    f.key_press(KEY_LEFTCTRL);
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        1,
+        "<Control><Alt>Down must focus the next workspace"
+    );
+
+    f.key_press(KEY_UP);
+    f.key_release(KEY_UP);
+    f.key_release(KEY_LEFTALT);
+    f.key_release(KEY_LEFTCTRL);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        0,
+        "<Control><Alt>Up must focus the previous workspace"
+    );
+}
+
+/// `move-to-workspace-right` (default `<Super><Shift>Page_Down`) carries the
+/// focused window along to the next workspace. Two windows are needed to
+/// observe it: with just one, niri's dynamic workspaces garbage-collect the
+/// emptied origin, putting the window back at index 0.
+#[test]
+fn super_shift_page_down_moves_window_to_next_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _first = map_focused_window(&mut f, id);
+    let _second = map_focused_window(&mut f, id);
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_PAGEDOWN);
+    f.key_release(KEY_PAGEDOWN);
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let monitor = f.niri().layout.active_monitor_ref().unwrap();
+    assert_eq!(
+        monitor.active_workspace_idx(),
+        1,
+        "the move must follow the window to the next workspace"
+    );
+    assert_eq!(
+        monitor.active_workspace_ref().windows().count(),
+        1,
+        "the moved window must be on the next workspace"
+    );
+}
+
+/// The keybindings honor the settings model: rebinding `close` makes the old
+/// accelerator inert and the new one live, with no compositor restart. This
+/// pins the seam the live GSettings subscription feeds.
+#[test]
+fn keybindings_follow_the_settings_model() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    let close = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter_mut()
+        .find(|kb| kb.action == GnomeKeyAction::Close)
+        .unwrap();
+    close.accels = vec![Accel {
+        trigger: AccelTrigger::Keysym(Keysym::w),
+        mods: AccelMods::SUPER,
+    }];
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id).window(&surface).close_requested,
+        "the default accelerator must be inert after a rebind"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_W);
+    f.key_release(KEY_W);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "the rebound accelerator must request the close"
+    );
+}
+
+/// A keyboard-shortcuts-inhibitor on the focused window masks the GNOME
+/// keybindings, like every mutter binding not flagged NON_MASKABLE; releasing
+/// it restores them.
+#[test]
+fn shortcuts_inhibit_masks_gnome_keybindings() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    f.client(id).inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id).window(&surface).close_requested,
+        "<Alt>F4 must reach the client, not close it, while shortcuts are inhibited"
+    );
+
+    f.client(id).release_shortcuts_inhibitor(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "releasing the inhibitor must restore the keybinding"
+    );
+}
+
+/// GNOME keybindings take precedence over binds from the niri config file:
+/// the GSettings store is the keybinding config of a GNOME session, so a
+/// conflicting config bind must lose.
+#[test]
+fn gnome_keybindings_beat_niri_config_binds() {
+    let mut config = Config::default();
+    config.binds.0.push(niri_config::Bind {
+        key: niri_config::Key {
+            trigger: niri_config::Trigger::Keysym(Keysym::F4),
+            modifiers: niri_config::Modifiers::ALT,
+        },
+        action: Action::ToggleOverview,
+        repeat: true,
+        cooldown: None,
+        allow_when_locked: false,
+        allow_inhibiting: true,
+        hotkey_overlay_title: None,
+    });
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "the GNOME close binding must win the conflict"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "the conflicting niri config bind must not have fired"
     );
 }
 

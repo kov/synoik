@@ -7,6 +7,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
+    WorkspaceReference,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -46,6 +47,7 @@ use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
+use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding};
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
@@ -577,6 +579,7 @@ impl State {
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
                         bindings,
+                        &this.niri.gnome_settings.keybindings,
                         mod_key,
                         key_code,
                         modified,
@@ -4436,6 +4439,7 @@ impl State {
 fn should_intercept_key<'a>(
     suppressed_keys: &mut HashSet<Keycode>,
     bindings: impl IntoIterator<Item = &'a Bind>,
+    gnome_keybindings: &[GnomeKeybinding],
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -4455,7 +4459,9 @@ fn should_intercept_key<'a>(
 
     let mut final_bind = find_bind(
         bindings,
+        gnome_keybindings,
         mod_key,
+        key_code,
         modified,
         raw,
         mods,
@@ -4517,9 +4523,12 @@ fn should_intercept_key<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_bind<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
+    gnome_keybindings: &[GnomeKeybinding],
     mod_key: ModKey,
+    key_code: Keycode,
     modified: Keysym,
     raw: Option<Keysym>,
     mods: ModifiersState,
@@ -4559,8 +4568,115 @@ fn find_bind<'a>(
         });
     }
 
+    // GNOME keybindings resolve before niri's configured binds: in a GNOME
+    // session the GSettings store is the user's keybinding config, and mutter
+    // processes it before anything else sees the key. The niri config stays
+    // underneath as a fallback.
+    if let Some(bind) = find_gnome_bind(gnome_keybindings, key_code, raw, mods) {
+        return Some(bind);
+    }
+
     let trigger = Trigger::Keysym(raw?);
     find_configured_bind(bindings, mod_key, trigger, mods)
+}
+
+/// Find a GNOME keybinding (`org.gnome.desktop.wm.keybindings`, read through
+/// the live `gnome_settings` model) matching this key event, synthesized into
+/// the equivalent niri bind.
+fn find_gnome_bind(
+    keybindings: &[GnomeKeybinding],
+    key_code: Keycode,
+    raw: Option<Keysym>,
+    mods: ModifiersState,
+) -> Option<Bind> {
+    let keybinding = keybindings.iter().find(|kb| {
+        kb.accels
+            .iter()
+            .any(|accel| accel_matches(accel, key_code, raw, mods))
+    })?;
+    let action = action_for_gnome(keybinding.action)?;
+
+    // Mutter flags the workspace switches META_KEY_BINDING_IGNORE_AUTOREPEAT.
+    let repeat = !matches!(
+        keybinding.action,
+        GnomeKeyAction::SwitchToWorkspace(_)
+            | GnomeKeyAction::SwitchToWorkspacePrevious
+            | GnomeKeyAction::SwitchToWorkspaceNext
+            | GnomeKeyAction::MoveToWorkspace(_)
+            | GnomeKeyAction::MoveToWorkspacePrevious
+            | GnomeKeyAction::MoveToWorkspaceNext
+    );
+
+    Some(Bind {
+        key: Key {
+            // Not entirely correct but it doesn't matter in how we currently use it.
+            trigger: Trigger::Keysym(raw.unwrap_or(Keysym::NoSymbol)),
+            modifiers: Modifiers::empty(),
+        },
+        action,
+        repeat,
+        cooldown: None,
+        allow_when_locked: false,
+        // GNOME bindings are maskable: mutter suppresses everything not
+        // NON_MASKABLE while the focused window inhibits shortcuts.
+        allow_inhibiting: true,
+        hotkey_overlay_title: None,
+    })
+}
+
+/// Whether an accelerator matches this key event. Mirrors mutter's matching:
+/// Caps/Num/Scroll Lock never participate (`ModifiersState` already keeps
+/// locks out of ctrl/alt/shift/logo), and the virtual META/HYPER modifiers
+/// match their conventional homes (the Alt and Super keys) rather than going
+/// through the keymap's modmap. Accelerators demanding the raw MOD2/MOD3
+/// masks never match — we don't track those as modifiers.
+fn accel_matches(
+    accel: &Accel,
+    key_code: Keycode,
+    raw: Option<Keysym>,
+    mods: ModifiersState,
+) -> bool {
+    let trigger_matches = match accel.trigger {
+        AccelTrigger::Keysym(keysym) => raw == Some(keysym),
+        AccelTrigger::Keycode(keycode) => key_code.raw() == keycode,
+    };
+    if !trigger_matches {
+        return false;
+    }
+
+    if accel.mods.intersects(AccelMods::MOD2 | AccelMods::MOD3) {
+        return false;
+    }
+
+    let want = |m: AccelMods| accel.mods.intersects(m);
+    mods.ctrl == want(AccelMods::CONTROL)
+        && mods.shift == want(AccelMods::SHIFT)
+        && mods.alt == want(AccelMods::MOD1 | AccelMods::META)
+        && mods.logo == want(AccelMods::SUPER | AccelMods::HYPER | AccelMods::MOD4)
+        && mods.iso_level3_shift == want(AccelMods::MOD5)
+        && !mods.iso_level5_shift
+}
+
+/// The niri action implementing a GNOME keybinding action, or `None` for
+/// actions adopted in the settings model but not implemented yet (their keys
+/// stay with the client). Workspace indices are 1-based on both sides.
+fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
+    Some(match action {
+        // Implemented by the upcoming run dialog; until then unbound.
+        GnomeKeyAction::PanelRunDialog => return None,
+        GnomeKeyAction::Close => Action::CloseWindow,
+        GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
+        GnomeKeyAction::SwitchToWorkspace(n) => {
+            Action::FocusWorkspace(WorkspaceReference::Index(n))
+        }
+        GnomeKeyAction::SwitchToWorkspacePrevious => Action::FocusWorkspaceUp,
+        GnomeKeyAction::SwitchToWorkspaceNext => Action::FocusWorkspaceDown,
+        GnomeKeyAction::MoveToWorkspace(n) => {
+            Action::MoveWindowToWorkspace(WorkspaceReference::Index(n), true)
+        }
+        GnomeKeyAction::MoveToWorkspacePrevious => Action::MoveWindowToWorkspaceUp(true),
+        GnomeKeyAction::MoveToWorkspaceNext => Action::MoveWindowToWorkspaceDown(true),
+    })
 }
 
 fn find_configured_bind<'a>(
@@ -5257,6 +5373,7 @@ mod tests {
             should_intercept_key(
                 suppr,
                 &bindings.0,
+                &[],
                 comp_mod,
                 close_key_code,
                 close_keysym,
@@ -5274,6 +5391,7 @@ mod tests {
             should_intercept_key(
                 suppr,
                 &bindings.0,
+                &[],
                 comp_mod,
                 Keycode::from(Keysym::l.raw() + 8),
                 Keysym::l,

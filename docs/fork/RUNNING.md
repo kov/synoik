@@ -121,12 +121,19 @@ GSettings/dconf store gnome-shell uses** (`src/gnome.rs`, `GnomeSettings`). So:
 ```sh
 gsettings get org.gnome.mutter overlay-key      # e.g. 'Super'
 gsettings set org.gnome.mutter overlay-key 'Menu'
+gsettings set org.gnome.desktop.wm.keybindings close "['<Super>q']"
 ```
 
 changes are picked up **live** by a change subscription
 (`gnome::load_and_watch_gsettings`, a dedicated glib-loop thread bridged into
 calloop). Note dconf is shared with your real GNOME session, so a change
 affects both.
+
+GNOME keybindings (`org.gnome.desktop.wm.keybindings`: close, workspace
+switch/move, …) resolve **before** binds from the niri config file — in a
+GNOME session, GSettings *is* the keybinding config; the niri config stays
+underneath as a fallback. The adopted subset lives in
+`gnome::adopted_wm_keybindings`.
 
 ## Inspecting / driving a running instance (IPC)
 
