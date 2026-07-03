@@ -199,9 +199,11 @@ window "shakes it loose" only after 48px of vertical movement (an edge-tiled
 one after 48px on either axis), popping out at the restore size under the
 pointer. Gated on `org.gnome.mutter edge-tiling`, honored live — note the
 schema default is `false` and GNOME sessions enable it via a
-`[org.gnome.mutter:GNOME]` session override, which we inherit through gio:
-outside a GNOME-branded session (e.g. bare headless), set it explicitly or
-export `XDG_CURRENT_DESKTOP=GNOME`. To drag over IPC:
+`[org.gnome.mutter:GNOME]` session override, which we inherit through gio.
+`--session` presents as GNOME (it keeps the `XDG_CURRENT_DESKTOP` the
+session manager set, falling back to `GNOME`), so the full-session flow
+gets it automatically; bare headless runs have no desktop set, so set the
+key explicitly or export `XDG_CURRENT_DESKTOP=GNOME`. To drag over IPC:
 `niri msg input button-press left`, `pointer-motion …`, `button-release
 left` with `key-press super` held.
 

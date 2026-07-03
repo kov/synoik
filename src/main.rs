@@ -91,8 +91,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Set the current desktop for xdg-desktop-portal.
-        env::set_var("XDG_CURRENT_DESKTOP", "niri");
+        // The current desktop drives xdg-desktop-portal backend selection and
+        // gio's per-session GSettings defaults (e.g. `[org.gnome.mutter:GNOME]`
+        // enables edge-tiling). Keep whatever the session manager set — GDM
+        // exports the session file's DesktopNames, "GNOME" for the GNOME
+        // session we replace gnome-shell in — and present as GNOME otherwise.
+        if env::var_os("XDG_CURRENT_DESKTOP").is_none() {
+            env::set_var("XDG_CURRENT_DESKTOP", "GNOME");
+        }
         // Ensure the session type is set to Wayland for xdg-autostart and Qt apps.
         env::set_var("XDG_SESSION_TYPE", "wayland");
     }
