@@ -465,13 +465,12 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
-    /// Maximized/edge-tiled state to reapply when dropped in the overview.
+    /// On-screen size of the window's picker preview when it was picked up
+    /// in the GNOME overview.
     ///
-    /// Picking up a maximized or edge-tiled window restores it like any
-    /// interactive move, but a GNOME overview drag is gnome-shell's
-    /// WindowPreview drag: it only moves the window between workspaces, so
-    /// the drop puts the state back.
-    pub(self) reapply_on_drop: Option<EdgeTileTarget>,
+    /// The dragged tile keeps rendering at this footprint: gnome-shell drags
+    /// the preview, never resizing the real window.
+    pub(self) expose_pickup_size: Option<Size<f64, Logical>>,
 }
 
 #[derive(Debug)]
@@ -619,6 +618,19 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 }
 
 impl<W: LayoutElement> InteractiveMoveData<W> {
+    /// Extra render scale that fits the dragged tile into the picker-preview
+    /// footprint it had when picked up in the GNOME overview.
+    fn expose_extra_scale(&self, zoom: f64) -> f64 {
+        let Some(pickup) = self.expose_pickup_size else {
+            return 1.;
+        };
+        let size = self.tile.tile_size();
+        if size.w <= 0. || size.h <= 0. {
+            return 1.;
+        }
+        f64::min(pickup.w / (size.w * zoom), pickup.h / (size.h * zoom))
+    }
+
     fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         let window_size = self.tile.window_size();
@@ -626,9 +638,10 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
             window_size.w * self.pointer_ratio_within_window.0,
             window_size.h * self.pointer_ratio_within_window.1,
         ));
+        let render_scale = zoom * self.expose_extra_scale(zoom);
         let pos = self.pointer_pos_within_output
             - (pointer_offset_within_window + self.tile.window_loc() - self.tile.render_offset())
-                .upscale(zoom);
+                .upscale(render_scale);
         // Round to physical pixels.
         pos.to_physical_precise_round(scale).to_logical(scale)
     }
@@ -1182,6 +1195,7 @@ impl<W: LayoutElement> Layout<W> {
                         // Unlock the view on the workspaces.
                         for ws in self.workspaces_mut() {
                             ws.dnd_scroll_gesture_end();
+                            ws.unfreeze_expose();
                         }
 
                         return Some(RemovedTile {
@@ -2464,7 +2478,12 @@ impl<W: LayoutElement> Layout<W> {
                 }
                 InteractiveMoveState::Moving(move_) => {
                     assert_eq!(self.clock, move_.tile.clock);
-                    assert!(move_.tile.window().pending_sizing_mode().is_normal());
+                    // A GNOME overview drag carries the window state
+                    // untouched, so the tile may still be maximized,
+                    // fullscreen or edge-tiled mid-move.
+                    if self.options.layout.windowing_mode != WindowingMode::Floating {
+                        assert!(move_.tile.window().pending_sizing_mode().is_normal());
+                    }
 
                     move_.tile.verify_invariants();
 
@@ -2667,10 +2686,15 @@ impl<W: LayoutElement> Layout<W> {
             move_.tile.advance_animations();
 
             if dnd_scroll.is_none() {
+                // In GNOME mode a non-floating tile in flight is an overview
+                // drag carrying a maximized window; the workspace views
+                // shouldn't pan under it.
+                let is_scrolling = !move_.is_floating
+                    && self.options.layout.windowing_mode != WindowingMode::Floating;
                 dnd_scroll = Some((
                     move_.output.clone(),
                     move_.pointer_pos_within_output,
-                    !move_.is_floating,
+                    is_scrolling,
                 ));
             }
         }
@@ -3939,13 +3963,33 @@ impl<W: LayoutElement> Layout<W> {
 
         let tile_pos = ws_geo.loc + tile_offset.upscale(zoom);
 
-        let pointer_offset_within_window =
-            start_pos_within_output - tile_pos - window_offset.upscale(zoom);
-        let window_size = tile.window_size().upscale(zoom);
-        let pointer_ratio_within_window = (
-            f64::clamp(pointer_offset_within_window.x / window_size.w, 0., 1.),
-            f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),
-        );
+        // In the GNOME overview the grab is on the picker preview, so the
+        // grab point is measured against the preview's slot on screen, not
+        // the window's real rect.
+        let expose_slot = mon
+            .expose_progress()
+            .is_some()
+            .then(|| ws.expose_slot(&window_id))
+            .flatten()
+            .map(|slot| {
+                Rectangle::new(ws_geo.loc + slot.loc.upscale(zoom), slot.size.upscale(zoom))
+            });
+
+        let pointer_ratio_within_window = if let Some(slot) = expose_slot {
+            let offset = start_pos_within_output - slot.loc;
+            (
+                f64::clamp(offset.x / slot.size.w, 0., 1.),
+                f64::clamp(offset.y / slot.size.h, 0., 1.),
+            )
+        } else {
+            let pointer_offset_within_window =
+                start_pos_within_output - tile_pos - window_offset.upscale(zoom);
+            let window_size = tile.window_size().upscale(zoom);
+            (
+                f64::clamp(pointer_offset_within_window.x / window_size.w, 0., 1.),
+                f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),
+            )
+        };
 
         self.interactive_move = Some(InteractiveMoveState::Starting {
             window_id,
@@ -4022,9 +4066,7 @@ impl<W: LayoutElement> Layout<W> {
                     })
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
-                let edge_tiled_side = tile.window().edge_tiled_side();
-                let is_edge_tiled = edge_tiled_side.is_some();
-                let is_maximized = tile.window().pending_sizing_mode().is_maximized();
+                let is_edge_tiled = tile.window().edge_tiled_side().is_some();
 
                 // Put it back to be able to easily return.
                 self.interactive_move = Some(InteractiveMoveState::Starting {
@@ -4075,19 +4117,32 @@ impl<W: LayoutElement> Layout<W> {
                 // FIXME: when and if the layout code knows about monitor positions, this will be
                 // potentially animatable.
                 let mut tile_pos = None;
+                let mut expose_pickup_size = None;
                 if let Some((mon, (ws, ws_geo))) = self.monitors().find_map(|mon| {
                     mon.workspaces_with_render_geo()
                         .find(|(ws, _)| ws.has_window(window))
                         .map(|rv| (mon, rv))
                 }) {
                     if mon.output() == &output {
-                        let (_, tile_offset, _) = ws
-                            .tiles_with_render_positions()
-                            .find(|(tile, _, _)| tile.window().id() == window)
-                            .unwrap();
-
                         let zoom = mon.overview_zoom();
-                        tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+
+                        // In the overview the tile renders as its picker
+                        // preview; the drag continues from the slot, at the
+                        // slot's size.
+                        let expose_slot = (in_expose && mon.expose_progress().is_some())
+                            .then(|| ws.expose_slot(window))
+                            .flatten();
+                        if let Some(slot) = expose_slot {
+                            tile_pos = Some((ws_geo.loc + slot.loc.upscale(zoom), zoom));
+                            expose_pickup_size = Some(slot.size.upscale(zoom));
+                        } else {
+                            let (_, tile_offset, _) = ws
+                                .tiles_with_render_positions()
+                                .find(|(tile, _, _)| tile.window().id() == window)
+                                .unwrap();
+
+                            tile_pos = Some((ws_geo.loc + tile_offset.upscale(zoom), zoom));
+                        }
                     }
                 }
 
@@ -4095,14 +4150,25 @@ impl<W: LayoutElement> Layout<W> {
                 // in the middle of interactive_move_update() and the confusion that causes.
                 self.interactive_move = None;
 
-                // Unset fullscreen before removing the tile. This will restore its size properly,
-                // and move it to floating if needed, so we don't have to deal with that here.
                 let ws = self
                     .workspaces_mut()
                     .find(|ws| ws.has_window(&window_id))
                     .unwrap();
-                ws.set_fullscreen(window, false);
-                ws.set_maximized(window, false);
+                if in_expose {
+                    // gnome-shell's WindowPreview drag never touches the real
+                    // window: no unmaximize/untile until the drop (the tile
+                    // carries its state and restore rects along), and the
+                    // source desktop's picker layout stays frozen so the
+                    // remaining previews hold their slots (workspace.js
+                    // layout_frozen).
+                    ws.freeze_expose();
+                } else {
+                    // Unset fullscreen before removing the tile. This will restore its size
+                    // properly, and move it to floating if needed, so we don't have to deal with
+                    // that here.
+                    ws.set_fullscreen(window, false);
+                    ws.set_maximized(window, false);
+                }
 
                 let RemovedTile {
                     mut tile,
@@ -4153,15 +4219,7 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
-                    reapply_on_drop: in_expose
-                        .then(|| {
-                            if is_maximized {
-                                Some(EdgeTileTarget::Maximize)
-                            } else {
-                                edge_tiled_side.map(EdgeTileTarget::Tile)
-                            }
-                        })
-                        .flatten(),
+                    expose_pickup_size,
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4289,6 +4347,11 @@ impl<W: LayoutElement> Layout<W> {
             mon.dnd_scroll_gesture_end();
         }
 
+        // The drop lets the picker layouts recompute (frozen at pickup).
+        for ws in self.workspaces_mut() {
+            ws.unfreeze_expose();
+        }
+
         // Unlock the view on the workspaces.
         if !move_.is_floating {
             for ws in self.workspaces_mut() {
@@ -4337,7 +4400,9 @@ impl<W: LayoutElement> Layout<W> {
                             let pos_within_workspace =
                                 (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                             let ws = &mut mon.workspaces[ws_idx];
-                            let position = if move_.is_floating {
+                            // A picker drop re-adds the tile with its state
+                            // untouched, whichever layer it came from.
+                            let position = if move_.is_floating || keep_position {
                                 let target = edge_tiling
                                     .then(|| ws.edge_tile_target(pos_within_workspace))
                                     .flatten();
@@ -4349,7 +4414,7 @@ impl<W: LayoutElement> Layout<W> {
                             (position, Some(geo.loc))
                         }
                         InsertWorkspace::NewAt(_) => {
-                            let position = if move_.is_floating {
+                            let position = if move_.is_floating || keep_position {
                                 InsertPosition::Floating
                             } else {
                                 InsertPosition::NewColumn(0)
@@ -4367,7 +4432,7 @@ impl<W: LayoutElement> Layout<W> {
                     let ws = &mon.workspaces[0];
                     let ws_geo = mon.workspaces_render_geo().next().unwrap();
 
-                    let position = if move_.is_floating {
+                    let position = if move_.is_floating || keep_position {
                         InsertPosition::Floating
                     } else {
                         ws.scrolling_insert_position(Point::from((0., 0.)))
@@ -4429,7 +4494,6 @@ impl<W: LayoutElement> Layout<W> {
                     InsertPosition::Floating => {
                         let tile_render_loc = move_.tile_render_location(zoom);
 
-                        let reapply_on_drop = move_.reapply_on_drop;
                         let mut tile = move_.tile;
 
                         // The tile still carries its pre-drag position in
@@ -4459,11 +4523,19 @@ impl<W: LayoutElement> Layout<W> {
                         }
 
                         // Set the floating size so it takes into account any window resizing that
-                        // took place during the move.
-                        if let Some(size) = tile.window().expected_size() {
-                            tile.floating_window_size = Some(size);
+                        // took place during the move. Not on a picker drop: the window state was
+                        // never touched, and for a maximized or edge-tiled window
+                        // floating_window_size holds the restore size.
+                        if !keep_position {
+                            if let Some(size) = tile.window().expected_size() {
+                                tile.floating_window_size = Some(size);
+                            }
                         }
 
+                        // A tile carrying maximized/fullscreen state lands
+                        // back in the scrolling layout (see
+                        // Workspace::add_tile), so a picker drop restores the
+                        // window wholesale on the target desktop.
                         let ws_id = mon.workspaces[ws_idx].id();
                         mon.add_tile(
                             tile,
@@ -4477,22 +4549,6 @@ impl<W: LayoutElement> Layout<W> {
                             move_.is_full_width,
                             true,
                         );
-
-                        if keep_position {
-                            if let Some(target) = reapply_on_drop {
-                                let ws = mon
-                                    .workspaces
-                                    .iter_mut()
-                                    .find(|ws| ws.id() == ws_id)
-                                    .unwrap();
-                                match target {
-                                    EdgeTileTarget::Tile(side) => {
-                                        ws.toggle_tiled(Some(&win_id), side)
-                                    }
-                                    EdgeTileTarget::Maximize => ws.set_maximized(&win_id, true),
-                                }
-                            }
-                        }
                     }
                     InsertPosition::EdgeTile(target) => {
                         // Dropped on a screen edge: commit the tile/maximize.
@@ -5044,8 +5100,11 @@ impl<W: LayoutElement> Layout<W> {
 
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
         let zoom = self.overview_zoom();
+        // In the GNOME overview the drag carries the picker preview: the
+        // tile keeps the on-screen footprint it was picked up at.
+        let render_scale = zoom * move_.expose_extra_scale(zoom);
         let pos_in_backdrop = move_.tile_render_location(zoom);
-        let xray_pos = XrayPos::new(pos_in_backdrop, zoom);
+        let xray_pos = XrayPos::new(pos_in_backdrop, render_scale);
 
         move_
             .tile
@@ -5053,7 +5112,7 @@ impl<W: LayoutElement> Layout<W> {
                 push(RescaleRenderElement::from_element(
                     elem,
                     pos_in_backdrop.to_physical_precise_round(scale),
-                    zoom,
+                    render_scale,
                 ));
             });
     }
@@ -5066,6 +5125,12 @@ impl<W: LayoutElement> Layout<W> {
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            if !self.overview_open {
+                // The overview closed mid-drag: drop the picker-preview
+                // footprint and render the window at its real size.
+                move_.expose_pickup_size = None;
+            }
+
             let win = move_.tile.window_mut();
 
             win.set_active_in_column(true);

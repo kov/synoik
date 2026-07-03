@@ -112,6 +112,10 @@ pub struct Workspace<W: LayoutElement> {
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
+    /// Picker slots held in place while an overview drag is in flight
+    /// (gnome-shell's frozen workspace layout), keyed by window.
+    expose_frozen: Option<FrozenExposeSlots<W>>,
+
     /// Unique ID of this workspace.
     id: WorkspaceId,
 }
@@ -151,6 +155,9 @@ type ExposeLayout<'a, W> = Vec<(
     Rectangle<f64, Logical>,
     Rectangle<f64, Logical>,
 )>;
+
+/// Frozen picker slots, keyed by window.
+type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>;
 
 niri_render_elements! {
     WorkspaceRenderElement<R> => {
@@ -281,6 +288,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
+            expose_frozen: None,
             id: WorkspaceId::next(),
         }
     }
@@ -345,6 +353,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
+            expose_frozen: None,
             id: WorkspaceId::next(),
         }
     }
@@ -1820,6 +1829,30 @@ impl<W: LayoutElement> Workspace<W> {
             .tiles_with_render_positions()
             .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
             .collect();
+
+        // While frozen (an overview drag is in flight), the remaining tiles
+        // keep their captured slots and the dragged window's slot stays
+        // vacant. A window the freeze doesn't know about falls back to a
+        // fresh layout, like gnome-shell unfreezing on window-added.
+        if let Some(frozen) = &self.expose_frozen {
+            let slots: Option<Vec<_>> = tiles
+                .iter()
+                .map(|(tile, _)| {
+                    frozen
+                        .iter()
+                        .find(|(id, _)| id == tile.window().id())
+                        .map(|(_, slot)| *slot)
+                })
+                .collect();
+            if let Some(slots) = slots {
+                return tiles
+                    .into_iter()
+                    .zip(slots)
+                    .map(|((tile, rect), slot)| (tile, rect, slot))
+                    .collect();
+            }
+        }
+
         let rects: Vec<_> = tiles.iter().map(|(_, rect)| *rect).collect();
         let area = self.floating.working_area();
         let slots = expose::compute_slots(self.view_size.h, area, &rects);
@@ -1828,6 +1861,23 @@ impl<W: LayoutElement> Workspace<W> {
             .zip(slots)
             .map(|((tile, rect), slot)| (tile, rect, slot))
             .collect()
+    }
+
+    /// Holds the current picker slots in place until [`Self::unfreeze_expose`].
+    ///
+    /// gnome-shell freezes the workspace layout while a preview drag is in
+    /// flight so the other previews don't shuffle into the gap.
+    pub(super) fn freeze_expose(&mut self) {
+        let frozen = self
+            .expose_layout()
+            .into_iter()
+            .map(|(tile, _, slot)| (tile.window().id().clone(), slot))
+            .collect();
+        self.expose_frozen = Some(frozen);
+    }
+
+    pub(super) fn unfreeze_expose(&mut self) {
+        self.expose_frozen = None;
     }
 
     /// The picker slot of one window, in workspace coordinates.

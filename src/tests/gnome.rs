@@ -10,12 +10,13 @@
 //! contract before we reshape it toward GNOME's Activities overview (Experiment 1).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use insta::assert_snapshot;
 use niri_config::{Action, Config};
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
 use smithay::utils::user_data::UserDataMap;
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
@@ -2213,8 +2214,8 @@ fn thumbnail_gap_drop_inserts_workspace() {
     );
 }
 
-/// An edge-tiled window's preview drag re-tiles it on the drop workspace:
-/// the overview drag moves the window between workspaces, nothing else
+/// An edge-tiled window's preview drag never touches the window: no
+/// configure in flight, and it is still edge-tiled on the drop workspace
 /// (like the maximized case below).
 #[test]
 fn overview_drag_of_edge_tiled_window_stays_tiled() {
@@ -2241,9 +2242,9 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     f.niri_complete_animations();
     let _ = f.client(id).window(&surface).recent_configures();
 
-    // Drag the preview onto the trailing workspace's peeking edge. The
-    // pick-up untiles to the restore size, like any interactive move; the
-    // roundtrip flushes that configure so the re-tile one is observable.
+    // Drag the preview onto the trailing workspace's peeking edge. The real
+    // window is never touched (gnome-shell drags the preview), so the client
+    // must not see any untile/resize along the way.
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
@@ -2255,11 +2256,13 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     f.niri_complete_animations();
     f.double_roundtrip(id);
 
-    let configures = f.client(id).window(&surface).format_recent_configures();
-    assert!(
-        configures.contains("TiledLeft"),
-        "the drop must re-tile the window on the target workspace, got: {configures}"
-    );
+    for configure in f.client(id).window(&surface).recent_configures() {
+        assert_eq!(
+            configure.size,
+            (960, 1080),
+            "an overview drag must never resize the tiled window, got: {configure}"
+        );
+    }
 
     let niri = f.niri();
     let (_, _, ws) = niri
@@ -2281,9 +2284,9 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
 }
 
 /// A maximized window's preview picks up immediately — mutter's 48px
-/// shake-loose is for dragging the real window, not the picker — and a drop
-/// re-maximizes it on the target workspace (gnome-shell moves the window
-/// between workspaces without changing its state).
+/// shake-loose is for dragging the real window, not the picker — and the
+/// window stays maximized the whole way: gnome-shell drags the preview, so
+/// the client never sees an unmaximize/resize.
 #[test]
 fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     let mut f = Fixture::new();
@@ -2330,11 +2333,17 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     f.niri_complete_animations();
     f.double_roundtrip(id);
 
-    let configures = f.client(id).window(&surface).format_recent_configures();
-    assert!(
-        configures.contains("Maximized"),
-        "the drop must re-maximize the window on the target workspace, got: {configures}"
-    );
+    for configure in f.client(id).window(&surface).recent_configures() {
+        assert_eq!(
+            configure.size,
+            (1920, 1080),
+            "an overview drag must never resize the maximized window, got: {configure}"
+        );
+        assert!(
+            configure.states.contains(&xdg_toplevel::State::Maximized),
+            "the window must stay maximized through the drag, got: {configure}"
+        );
+    }
 
     let niri = f.niri();
     let (_, _, ws) = niri
@@ -2346,5 +2355,152 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
         ws.id(),
         ws1_id,
         "the drop must move the window to the neighbor workspace"
+    );
+    let mapped = ws.windows().next().unwrap();
+    assert!(
+        crate::layout::LayoutElement::pending_sizing_mode(mapped).is_maximized(),
+        "the window must still be maximized after the overview drag"
+    );
+}
+
+/// While a preview drag is in flight, the source desktop's picker layout is
+/// frozen (gnome-shell's layout_frozen): the remaining previews hold their
+/// slots — the dragged window leaves a gap — until the drop.
+#[test]
+fn overview_drag_freezes_the_other_previews() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.niri().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let slot_a = f.niri().layout.expose_target_rect(&win_a).unwrap();
+
+    // Pick up B's preview and move it away from its slot.
+    let rect = f.niri().layout.expose_target_rect(&win_b).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 100.);
+
+    assert_eq!(
+        f.niri().layout.expose_target_rect(&win_a),
+        Some(slot_a),
+        "the other previews must hold their slots while the drag is in flight"
+    );
+
+    // Drop B on the trailing workspace: A, now alone, re-layouts.
+    pointer_motion_to(&mut f, 1800., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_ne!(
+        f.niri().layout.expose_target_rect(&win_a),
+        Some(slot_a),
+        "the drop must let the source desktop's picker layout recompute"
+    );
+}
+
+/// Dragging a preview against a screen edge snaps one desktop at a time:
+/// the switch happens right away (after the anti-flicker delay), then a
+/// grace period has to pass before the next snap while the pointer stays on
+/// the edge. No GNOME counterpart — the behavior is by design (continuous
+/// panning would make aiming at a desktop impossible).
+#[test]
+fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Three populated desktops (plus the trailing empty) so there are two
+    // snaps to make from the first.
+    let (win_a, _win_b) = setup_two_desktops_in_overview(&mut f, id);
+    {
+        tap(&mut f, KEY_LEFTMETA);
+        f.niri_complete_animations();
+        let _c = map_window_sized(&mut f, id, (500, 400), None);
+        let win_c = f.niri().layout.focus().unwrap().window.clone();
+        tap(&mut f, KEY_LEFTMETA);
+        f.niri_complete_animations();
+        let rect = f.niri().layout.expose_target_rect(&win_c).unwrap();
+        let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+        pointer_motion_to(&mut f, grab.0, grab.1);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_motion(0., 10.);
+        let (tx, ty) = thumbnail_center(&mut f, 2);
+        pointer_motion_to(&mut f, tx, ty);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.niri_complete_animations();
+        f.double_roundtrip(id);
+    }
+    assert!(f.niri().layout.is_overview_open());
+
+    let active_idx = |f: &mut Fixture| {
+        let active = f.niri().layout.active_workspace().unwrap().id();
+        f.niri()
+            .layout
+            .workspaces()
+            .position(|(_, _, ws)| ws.id() == active)
+            .unwrap()
+    };
+    assert_eq!(active_idx(&mut f), 0, "the drags must not have switched");
+
+    // Pick up A's preview and hold it against the right screen edge,
+    // driving the DnD scroll by hand with a pinned clock.
+    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    assert!(
+        f.niri()
+            .layout
+            .workspaces()
+            .all(|(_, _, ws)| !ws.has_window(&win_a)),
+        "the preview must be picked up before it reaches the edge"
+    );
+    pointer_motion_to(&mut f, 1919., 540.);
+
+    let base = f.niri().clock.now_unadjusted() + Duration::from_millis(200);
+    let at = |f: &mut Fixture, offset_ms: u64| {
+        let mut clock = f.niri().clock.clone();
+        clock.set_unadjusted(base + Duration::from_millis(offset_ms));
+        f.niri().layout.advance_animations();
+    };
+
+    // The first frame on the edge arms the anti-flicker delay (100ms); the
+    // next one past it snaps — once, no matter how many frames pass within
+    // the grace period.
+    at(&mut f, 0);
+    assert_eq!(active_idx(&mut f), 0, "the anti-flicker delay must hold");
+    at(&mut f, 150);
+    assert_eq!(active_idx(&mut f), 1, "entering the edge must snap once");
+    at(&mut f, 300);
+    at(&mut f, 700);
+    assert_eq!(
+        active_idx(&mut f),
+        1,
+        "the next snap must wait out the grace period"
+    );
+
+    // Past the 750ms grace: the second snap.
+    at(&mut f, 950);
+    assert_eq!(
+        active_idx(&mut f),
+        2,
+        "staying on the edge must snap again after the grace period"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the edge snaps must not leave the overview"
     );
 }

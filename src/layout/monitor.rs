@@ -50,6 +50,13 @@ const WORKSPACE_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
 /// This constant is tied to the default dnd-edge-workspace-switch max-speed setting.
 const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 
+/// Grace period between DnD edge-scroll snaps in GNOME mode.
+///
+/// GNOME has no counterpart for this affordance; 750 ms is its usual
+/// "the pointer is still interacting, hold off" delay (gnome-shell's
+/// WINDOW_REPOSITIONING_DELAY).
+const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
+
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
     /// Output for this monitor.
@@ -135,6 +142,9 @@ pub struct WorkspaceSwitchGesture {
     //
     // If `None` then the scroll delta is currently zero.
     dnd_nonzero_start_time: Option<Duration>,
+    // When the last GNOME-mode DnD edge snap switched workspaces; the next
+    // snap waits out [`WORKSPACE_DND_EDGE_SNAP_GRACE`] from here.
+    dnd_snap_last_switch: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +260,13 @@ impl WorkspaceSwitch {
     fn is_animation_ongoing(&self) -> bool {
         match self {
             WorkspaceSwitch::Animation(_) => true,
-            WorkspaceSwitch::Gesture(gesture) => gesture.animation.is_some(),
+            // A DnD scroll with the pointer in the trigger zone
+            // (dnd_nonzero_start_time) counts as ongoing: its delay and
+            // snap-grace timers are evaluated frame by frame, so frames must
+            // keep coming while the pointer sits still on the edge.
+            WorkspaceSwitch::Gesture(gesture) => {
+                gesture.animation.is_some() || gesture.dnd_nonzero_start_time.is_some()
+            }
         }
     }
 }
@@ -2221,6 +2237,7 @@ impl<W: LayoutElement> Monitor<W> {
             is_clamped: !self.overview_open,
             dnd_last_event_time: None,
             dnd_nonzero_start_time: None,
+            dnd_snap_last_switch: None,
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
     }
@@ -2253,6 +2270,7 @@ impl<W: LayoutElement> Monitor<W> {
             is_clamped: false,
             dnd_last_event_time: Some(self.clock.now_unadjusted()),
             dnd_nonzero_start_time: None,
+            dnd_snap_last_switch: None,
         };
         self.workspace_switch = Some(WorkspaceSwitch::Gesture(gesture));
     }
@@ -2312,12 +2330,11 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
         let zoom = self.overview_zoom();
 
+        let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+
         // In GNOME windowing mode the desktop's screen edges belong to edge
-        // tiling; the DnD edge scroll only runs in the overview (gnome-shell
-        // autoscrolls its WorkspacesView the same way).
-        if self.options.layout.windowing_mode == WindowingMode::Floating
-            && self.overview_progress.is_none()
-        {
+        // tiling; the DnD edge scroll only runs in the overview.
+        if gnome_mode && self.overview_progress.is_none() {
             return false;
         }
 
@@ -2390,6 +2407,35 @@ impl<W: LayoutElement> Monitor<W> {
         // monitors.
         let delay = Duration::from_millis(u64::from(config.delay_ms));
         if now.saturating_sub(nonzero_start) < delay {
+            return true;
+        }
+
+        // In GNOME mode, snap one workspace at a time instead of panning:
+        // switch right away on entering the trigger zone, then wait out a
+        // grace period before snapping again while the pointer stays there.
+        if gnome_mode {
+            let due = match gesture.dnd_snap_last_switch {
+                None => true,
+                Some(last) => now.saturating_sub(last) >= WORKSPACE_DND_EDGE_SNAP_GRACE,
+            };
+            if !due {
+                return true;
+            }
+
+            let target = if delta < 0. {
+                self.active_workspace_idx.checked_sub(1)
+            } else {
+                Some(self.active_workspace_idx + 1).filter(|idx| *idx < self.workspaces.len())
+            };
+            let Some(target) = target else {
+                // Nothing beyond this end.
+                return true;
+            };
+
+            gesture.dnd_snap_last_switch = Some(now);
+            // activate_workspace() animates within the ongoing DnD gesture,
+            // so the gesture (and this snap state) survives the switch.
+            self.activate_workspace(target);
             return true;
         }
 
