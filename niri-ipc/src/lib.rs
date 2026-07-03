@@ -914,6 +914,8 @@ pub enum Action {
     OpenOverview {},
     /// Close the Overview.
     CloseOverview {},
+    /// Open the GNOME run dialog (Alt+F2).
+    ShowRunDialog {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

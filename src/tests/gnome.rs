@@ -20,13 +20,21 @@ use super::*;
 use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction};
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
-const KEY_A: u32 = 30;
-const KEY_W: u32 = 17;
+const KEY_ESC: u32 = 1;
 const KEY_1: u32 = 2;
 const KEY_2: u32 = 3;
+const KEY_W: u32 = 17;
+const KEY_E: u32 = 18;
+const KEY_R: u32 = 19;
+const KEY_T: u32 = 20;
+const KEY_U: u32 = 22;
+const KEY_ENTER: u32 = 28;
 const KEY_LEFTCTRL: u32 = 29;
+const KEY_A: u32 = 30;
 const KEY_LEFTSHIFT: u32 = 42;
+const KEY_Z: u32 = 44;
 const KEY_LEFTALT: u32 = 56;
+const KEY_F2: u32 = 60;
 const KEY_F4: u32 = 62;
 const KEY_UP: u32 = 103;
 const KEY_DOWN: u32 = 108;
@@ -34,6 +42,12 @@ const KEY_PAGEDOWN: u32 = 109;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
+
+/// Tap a key: press and release.
+fn tap(f: &mut Fixture, key: u32) {
+    f.key_press(key);
+    f.key_release(key);
+}
 
 /// Map a client window; as the only (newly mapped) window it takes keyboard
 /// focus, which per-focused-surface state like keyboard-shortcuts-inhibit
@@ -651,6 +665,172 @@ fn gnome_keybindings_beat_niri_config_binds() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "the conflicting niri config bind must not have fired"
+    );
+}
+
+/// `panel-run-dialog` (default `<Alt>F2`) opens the run dialog, and it is
+/// modal: keys typed into it never reach the focused client (gnome-shell
+/// holds a modal grab while it's up).
+#[test]
+fn alt_f2_opens_run_dialog_and_swallows_keys() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F2);
+    f.key_release(KEY_LEFTALT);
+    assert!(
+        f.niri().run_dialog.is_open(),
+        "<Alt>F2 must open the run dialog"
+    );
+
+    tap(&mut f, KEY_Z);
+    assert_eq!(
+        f.niri().run_dialog.entry(),
+        "z",
+        "typing must edit the entry"
+    );
+
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_LEFTALT, WlKeyState::Pressed),
+            (KEY_LEFTALT, WlKeyState::Released),
+        ],
+        "only the bare Alt of the opening chord may reach the client"
+    );
+}
+
+/// Escape pressed *and* released on the dialog closes it (gnome-shell pairs
+/// the press and release before closing).
+#[test]
+fn run_dialog_escape_closes() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    assert!(f.niri().run_dialog.is_open());
+
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.niri().run_dialog.is_open(),
+        "an Escape tap must close the run dialog"
+    );
+}
+
+/// An unknown command shows "Command not found" in-dialog and keeps the
+/// dialog open with the entry intact — and still enters the history
+/// (gnome-shell's `_run` records the attempt before trying it).
+#[test]
+fn run_dialog_unknown_command_shows_error_and_stays_open() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_ENTER);
+
+    assert!(
+        f.niri().run_dialog.is_open(),
+        "a failed command must keep the dialog open"
+    );
+    assert_eq!(
+        f.niri().run_dialog.entry(),
+        "zz",
+        "the entry must be intact"
+    );
+    assert_eq!(
+        f.niri().run_dialog.error(),
+        Some("Command not found"),
+        "the error must show in-dialog"
+    );
+    assert_eq!(
+        f.niri().gnome_settings.command_history,
+        vec!["zz".to_owned()],
+        "even a failed command enters the history"
+    );
+
+    // Enter on an empty entry is also an error (the tokenizer rejects it),
+    // not a close; and empty input never enters the history.
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    tap(&mut f, KEY_ENTER);
+    assert!(f.niri().run_dialog.is_open());
+    assert_eq!(
+        f.niri().gnome_settings.command_history,
+        vec!["zz".to_owned()]
+    );
+}
+
+/// A valid command spawns and closes the dialog, entering the history; Up
+/// then recalls it (gnome-shell's HistoryManager).
+#[test]
+fn run_dialog_runs_command_and_records_history() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    for key in [KEY_T, KEY_R, KEY_U, KEY_E] {
+        tap(&mut f, key);
+    }
+    tap(&mut f, KEY_ENTER);
+
+    assert!(
+        !f.niri().run_dialog.is_open(),
+        "a successful run must close the dialog"
+    );
+    assert_eq!(
+        f.niri().gnome_settings.command_history,
+        vec!["true".to_owned()]
+    );
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    assert_eq!(
+        f.niri().run_dialog.entry(),
+        "",
+        "the entry must open cleared"
+    );
+    tap(&mut f, KEY_UP);
+    assert_eq!(
+        f.niri().run_dialog.entry(),
+        "true",
+        "Up must recall the last history entry"
+    );
+    tap(&mut f, KEY_DOWN);
+    assert_eq!(
+        f.niri().run_dialog.entry(),
+        "",
+        "Down past the end must clear the entry again"
+    );
+}
+
+/// `org.gnome.desktop.lockdown disable-command-line` disables the run dialog
+/// entirely (gnome-shell's `RunDialog.open` refuses).
+#[test]
+fn run_dialog_lockdown_disables() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().gnome_settings.disable_command_line = true;
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F2);
+    f.key_release(KEY_LEFTALT);
+    assert!(
+        !f.niri().run_dialog.is_open(),
+        "the lockdown key must disable the run dialog"
+    );
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    assert!(
+        !f.niri().run_dialog.is_open(),
+        "the lockdown applies to the action itself, not just the keybinding"
     );
 }
 

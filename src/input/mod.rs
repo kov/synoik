@@ -52,6 +52,7 @@ use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
+use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
@@ -542,6 +543,37 @@ impl State {
                     return FilterResult::Intercept(None);
                 }
 
+                // The run dialog is modal: while open, every key goes to it
+                // and none reach the clients (gnome-shell holds a modal grab).
+                if this.niri.run_dialog.is_open() {
+                    let text = modified
+                        .key_char()
+                        .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                    let outcome = this.niri.run_dialog.handle_key(
+                        raw,
+                        text,
+                        pressed,
+                        &this.niri.gnome_settings.command_history,
+                    );
+                    match outcome {
+                        KeyOutcome::Handled => {}
+                        KeyOutcome::Close => this.niri.run_dialog.close(),
+                        KeyOutcome::Run(input) => this.run_dialog_execute(&input),
+                    }
+                    this.niri.queue_redraw_all();
+
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // Release of a key pressed before the dialog opened;
+                        // the client saw the press, give it the release.
+                        return FilterResult::Forward;
+                    }
+                }
+
                 // Check if all modifiers were released while the MRU UI was open. If so, close the
                 // UI (which will also transfer the focus to the current MRU UI selection).
                 if this.niri.window_mru_ui.is_open() && !pressed && modifiers.is_empty() {
@@ -709,6 +741,26 @@ impl State {
                 self.do_action(bind.action, bind.allow_when_locked);
             }
         }
+    }
+
+    /// Execute a run dialog command line, mirroring gnome-shell's `_run`: the
+    /// input enters the history whether or not it runs (persisted to
+    /// GSettings), then either spawns and closes the dialog, or shows the
+    /// error in-dialog and leaves it open.
+    fn run_dialog_execute(&mut self, input: &str) {
+        let trimmed = run_dialog::history_add(&mut self.niri.gnome_settings.command_history, input);
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.set_command_history(self.niri.gnome_settings.command_history.clone());
+        }
+
+        match run_dialog::resolve_command_line(&trimmed) {
+            Ok(argv) => {
+                spawn(argv, None);
+                self.niri.run_dialog.close();
+            }
+            Err(message) => self.niri.run_dialog.set_error(message),
+        }
+        self.niri.queue_redraw_all();
     }
 
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
@@ -2322,6 +2374,16 @@ impl State {
                 if self.niri.layout.close_overview() {
                     self.niri.queue_redraw_all();
                 }
+            }
+            Action::ShowRunDialog => {
+                // gnome-shell refuses to open the run dialog when the lockdown
+                // key is set (`RunDialog.open`), and outside the unlocked user
+                // session (`sessionMode.hasRunDialog`).
+                if self.niri.gnome_settings.disable_command_line || self.niri.is_locked() {
+                    return;
+                }
+                self.niri.run_dialog.open();
+                self.niri.queue_redraw_all();
             }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
@@ -4662,8 +4724,7 @@ fn accel_matches(
 /// stay with the client). Workspace indices are 1-based on both sides.
 fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
-        // Implemented by the upcoming run dialog; until then unbound.
-        GnomeKeyAction::PanelRunDialog => return None,
+        GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {

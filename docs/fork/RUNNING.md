@@ -130,16 +130,31 @@ calloop). Note dconf is shared with your real GNOME session, so a change
 affects both.
 
 GNOME keybindings (`org.gnome.desktop.wm.keybindings`: close, workspace
-switch/move, …) resolve **before** binds from the niri config file — in a
-GNOME session, GSettings *is* the keybinding config; the niri config stays
-underneath as a fallback. The adopted subset lives in
+switch/move, panel-run-dialog, …) resolve **before** binds from the niri
+config file — in a GNOME session, GSettings *is* the keybinding config; the
+niri config stays underneath as a fallback. The adopted subset lives in
 `gnome::adopted_wm_keybindings`.
+
+## The run dialog (Alt+F2)
+
+**Alt+F2** opens the GNOME run dialog (`src/ui/run_dialog.rs`): type a
+command, Enter runs it (shell quoting honored, but no pipes/expansion — it's
+an argv split + PATH search, exactly gnome-shell's `trySpawnCommandLine`);
+errors show in-dialog and keep it open; Escape closes; Up/Down walk the
+history, shared with gnome-shell via `org.gnome.shell command-history`.
+`org.gnome.desktop.lockdown disable-command-line` disables it. Not yet ported:
+Tab completion, Ctrl+Enter (run in terminal), the open-a-file-path fallback.
+
+Since a nested session can't see Alt+F2 (the host GNOME grabs it — same Super
+caveat as above), open it over IPC when nested:
+`niri msg action show-run-dialog`.
 
 ## Inspecting / driving a running instance (IPC)
 
 ```sh
 niri msg outputs           # or: windows, workspaces, overview-state
 niri msg action toggle-overview
+niri msg action show-run-dialog
 niri msg event-stream      # live event feed
 ```
 

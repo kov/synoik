@@ -128,7 +128,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
-use crate::gnome::GnomeSettings;
+use crate::gnome::{GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
@@ -171,6 +171,7 @@ use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
+use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
@@ -327,6 +328,8 @@ pub struct Niri {
 
     /// Inspectable model of the GNOME settings the compositor honors.
     pub gnome_settings: GnomeSettings,
+    /// Writes settings back to the GSettings store; `None` when headless.
+    pub gnome_settings_writer: Option<GnomeSettingsWriter>,
 
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
@@ -400,6 +403,7 @@ pub struct Niri {
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
+    pub run_dialog: RunDialog,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -530,6 +534,7 @@ pub enum KeyboardFocus {
     LockScreen { surface: Option<WlSurface> },
     ScreenshotUi,
     ExitConfirmDialog,
+    RunDialog,
     Overview,
     Mru,
 }
@@ -679,6 +684,7 @@ impl KeyboardFocus {
             KeyboardFocus::LockScreen { surface } => surface.as_ref(),
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
+            KeyboardFocus::RunDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -691,6 +697,7 @@ impl KeyboardFocus {
             KeyboardFocus::LockScreen { surface } => surface,
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
+            KeyboardFocus::RunDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -758,8 +765,9 @@ impl State {
         // model current as keys change. Headless test instances keep the defaults
         // and drive the model directly instead.
         if !headless {
-            let (initial, rx) = crate::gnome::load_and_watch_gsettings();
+            let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
+            state.niri.gnome_settings_writer = Some(writer);
             state
                 .niri
                 .event_loop
@@ -1063,6 +1071,7 @@ impl State {
         let location = pointer.current_location();
 
         if !self.niri.exit_confirm_dialog.is_open()
+            && !self.niri.run_dialog.is_open()
             && !self.niri.is_locked()
             && !self.niri.screenshot_ui.is_open()
         {
@@ -1173,6 +1182,8 @@ impl State {
         // Compute the current focus.
         let focus = if self.niri.exit_confirm_dialog.is_open() {
             KeyboardFocus::ExitConfirmDialog
+        } else if self.niri.run_dialog.is_open() {
+            KeyboardFocus::RunDialog
         } else if self.niri.is_locked() {
             KeyboardFocus::LockScreen {
                 surface: self.niri.lock_surface_focus(),
@@ -2592,6 +2603,7 @@ impl Niri {
             popups: PopupManager::default(),
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
+            gnome_settings_writer: None,
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
             suppressed_buttons: HashSet::new(),
@@ -2643,6 +2655,7 @@ impl Niri {
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
+            run_dialog: RunDialog::new(),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -3247,7 +3260,11 @@ impl Niri {
         extended_bounds: bool,
         pos: Point<f64, Logical>,
     ) -> Option<(Output, &Workspace<Mapped>)> {
-        if self.exit_confirm_dialog.is_open() || self.is_locked() || self.screenshot_ui.is_open() {
+        if self.exit_confirm_dialog.is_open()
+            || self.run_dialog.is_open()
+            || self.is_locked()
+            || self.screenshot_ui.is_open()
+        {
             return None;
         }
 
@@ -3281,6 +3298,7 @@ impl Niri {
     /// region.
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
         if self.exit_confirm_dialog.is_open()
+            || self.run_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             || self.window_mru_ui.is_open()
@@ -3336,7 +3354,7 @@ impl Niri {
         // The ordering here must be consistent with the ordering in render() so that input is
         // consistent with the visuals.
 
-        if self.exit_confirm_dialog.is_open() {
+        if self.exit_confirm_dialog.is_open() || self.run_dialog.is_open() {
             return rv;
         } else if self.is_locked() {
             let Some(state) = self.output_state.get(output) else {
@@ -4027,6 +4045,7 @@ impl Niri {
             KeyboardFocus::LockScreen { .. } => true,
             KeyboardFocus::ScreenshotUi => true,
             KeyboardFocus::ExitConfirmDialog => true,
+            KeyboardFocus::RunDialog => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Mru => true,
         };
@@ -4266,6 +4285,10 @@ impl Niri {
 
         // Next, the exit confirm dialog.
         self.exit_confirm_dialog
+            .render(ctx.renderer, output, &mut |elem| push(elem.into()));
+
+        // Next, the run dialog.
+        self.run_dialog
             .render(ctx.renderer, output, &mut |elem| push(elem.into()));
 
         // Next, the config error notification too.
@@ -6567,6 +6590,7 @@ niri_render_elements! {
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
+        RunDialog = RunDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,

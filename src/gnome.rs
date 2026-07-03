@@ -31,6 +31,12 @@ pub struct GnomeSettings {
     /// [`adopted_wm_keybindings`] for the subset). One entry per adopted
     /// settings key, in table order — the input path returns the first match.
     pub keybindings: Vec<GnomeKeybinding>,
+    /// `org.gnome.shell command-history`: the run dialog's persisted history,
+    /// oldest first. gnome-shell caps it at 512 entries.
+    pub command_history: Vec<String>,
+    /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
+    /// dialog refuses to open (gnome-shell's `RunDialog.open`).
+    pub disable_command_line: bool,
 }
 
 impl Default for GnomeSettings {
@@ -38,6 +44,8 @@ impl Default for GnomeSettings {
         Self {
             overlay_keys: vec![Keysym::Super_L, Keysym::Super_R],
             keybindings: default_keybindings(),
+            command_history: Vec::new(),
+            disable_command_line: false,
         }
     }
 }
@@ -51,14 +59,29 @@ impl GnomeSettings {
         }
     }
 
+    fn load_shell(&mut self, shell: &gio::Settings) {
+        if settings_has_key(shell, "command-history") {
+            self.command_history = shell
+                .strv("command-history")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+    }
+
+    fn load_lockdown(&mut self, lockdown: &gio::Settings) {
+        if settings_has_key(lockdown, "disable-command-line") {
+            self.disable_command_line = lockdown.boolean("disable-command-line");
+        }
+    }
+
     fn load_wm_keybindings(&mut self, wm: &gio::Settings) {
-        let schema = wm.settings_schema();
         self.keybindings = adopted_wm_keybindings()
             .into_iter()
             .map(|(key, action, defaults)| {
                 // Guard against schema drift: a missing key keeps our built-in
                 // default rather than aborting inside gio.
-                let values = if schema.as_ref().is_some_and(|s| s.has_key(&key)) {
+                let values = if settings_has_key(wm, &key) {
                     wm.strv(&key).iter().map(|s| s.to_string()).collect()
                 } else {
                     warn!("org.gnome.desktop.wm.keybindings has no {key:?}; using our default");
@@ -71,6 +94,12 @@ impl GnomeSettings {
             })
             .collect();
     }
+}
+
+fn settings_has_key(settings: &gio::Settings, key: &str) -> bool {
+    settings
+        .settings_schema()
+        .is_some_and(|schema| schema.has_key(key))
 }
 
 /// One GNOME keybinding we honor: a semantic action and the accelerators
@@ -257,16 +286,22 @@ fn parse_accels(key: &str, values: impl IntoIterator<Item = String>) -> Vec<Acce
 /// is the defaults and the channel stays silent.
 ///
 /// [`MainContext`]: glib::MainContext
-pub fn load_and_watch_gsettings() -> (GnomeSettings, calloop::channel::Channel<GnomeSettings>) {
+pub fn load_and_watch_gsettings() -> (
+    GnomeSettings,
+    calloop::channel::Channel<GnomeSettings>,
+    GnomeSettingsWriter,
+) {
     let (tx, rx) = calloop::channel::channel();
     let (init_tx, init_rx) = std::sync::mpsc::channel();
+    let ctx = glib::MainContext::new();
+    let writer = GnomeSettingsWriter { ctx: ctx.clone() };
 
     std::thread::Builder::new()
         .name("gsettings-watch".to_owned())
         .spawn(move || {
-            let ctx = glib::MainContext::new();
             ctx.with_thread_default(|| {
                 let stores = Rc::new(Stores::open());
+                STORES.set(Some(stores.clone()));
 
                 // Subscribe before the initial read so no change can fall
                 // between them; a racing change just re-arrives via `tx`.
@@ -287,7 +322,46 @@ pub fn load_and_watch_gsettings() -> (GnomeSettings, calloop::channel::Channel<G
         warn!("GSettings watcher thread died during startup; using GNOME defaults");
         GnomeSettings::default()
     });
-    (initial, rx)
+    (initial, rx, writer)
+}
+
+thread_local! {
+    /// The watcher thread's stores, for [`GnomeSettingsWriter`] closures. The
+    /// stores are not `Send`, so a write request can't carry them — it finds
+    /// them here after hopping onto the watcher thread.
+    static STORES: std::cell::Cell<Option<Rc<Stores>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Writes settings back to the GSettings store, from any thread.
+///
+/// Like every touch of the store, writes must happen on the watcher thread
+/// (see [`load_and_watch_gsettings`]); this hops there via the glib main
+/// context. A successful write comes back around through the change
+/// subscription, updating the model like any external change.
+#[derive(Clone)]
+pub struct GnomeSettingsWriter {
+    ctx: glib::MainContext,
+}
+
+impl GnomeSettingsWriter {
+    /// Persist the run dialog's command history to `org.gnome.shell
+    /// command-history`.
+    pub fn set_command_history(&self, history: Vec<String>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(shell) = &s.shell {
+                    if settings_has_key(shell, "command-history") {
+                        let history: Vec<&str> = history.iter().map(String::as_str).collect();
+                        if let Err(err) = shell.set_strv("command-history", history) {
+                            warn!("error writing org.gnome.shell command-history: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
 }
 
 /// The GSettings stores feeding [`GnomeSettings`]. Any change to any of them
@@ -296,6 +370,8 @@ pub fn load_and_watch_gsettings() -> (GnomeSettings, calloop::channel::Channel<G
 struct Stores {
     mutter: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
+    shell: Option<gio::Settings>,
+    lockdown: Option<gio::Settings>,
 }
 
 impl Stores {
@@ -305,15 +381,24 @@ impl Stores {
         Self {
             mutter: gsettings("org.gnome.mutter"),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings"),
+            shell: gsettings("org.gnome.shell"),
+            lockdown: gsettings("org.gnome.desktop.lockdown"),
         }
     }
 
     fn any(&self) -> bool {
-        self.mutter.is_some() || self.wm_keybindings.is_some()
+        self.all().next().is_some()
     }
 
     fn all(&self) -> impl Iterator<Item = &gio::Settings> {
-        [&self.mutter, &self.wm_keybindings].into_iter().flatten()
+        [
+            &self.mutter,
+            &self.wm_keybindings,
+            &self.shell,
+            &self.lockdown,
+        ]
+        .into_iter()
+        .flatten()
     }
 
     /// GNOME's defaults overlaid with the live values of every open store.
@@ -324,6 +409,12 @@ impl Stores {
         }
         if let Some(wm) = &self.wm_keybindings {
             settings.load_wm_keybindings(wm);
+        }
+        if let Some(shell) = &self.shell {
+            settings.load_shell(shell);
+        }
+        if let Some(lockdown) = &self.lockdown {
+            settings.load_lockdown(lockdown);
         }
         settings
     }
@@ -710,6 +801,8 @@ mod tests {
                     None,
                 )),
                 wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
+                shell: None,
+                lockdown: None,
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -762,5 +855,83 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// [`GnomeSettingsWriter`] hops onto the watcher thread and lands the
+    /// write in the store. This drives the real writer against a dedicated
+    /// thread running a glib loop, with a memory backend standing in for
+    /// dconf, and reads the value back from that same thread.
+    #[test]
+    fn writer_persists_command_history() {
+        // The schema comes from the host system; skip where not installed.
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let Some(shell_schema) = source.lookup("org.gnome.shell", true) else {
+            return;
+        };
+        if !shell_schema.has_key("command-history") {
+            return;
+        }
+
+        let ctx = glib::MainContext::new();
+        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
+
+        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn({
+            let ctx = ctx.clone();
+            move || {
+                ctx.with_thread_default(|| {
+                    // SettingsSchema is not Send; look it up again here.
+                    let shell_schema = gio::SettingsSchemaSource::default()
+                        .unwrap()
+                        .lookup("org.gnome.shell", true)
+                        .unwrap();
+                    let backend = gio::memory_settings_backend_new();
+                    let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
+                    STORES.set(Some(Rc::new(Stores {
+                        mutter: None,
+                        wm_keybindings: None,
+                        shell: Some(shell),
+                        lockdown: None,
+                    })));
+
+                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
+                    loop_tx.send(main_loop.clone()).unwrap();
+                    main_loop.run();
+                })
+                .unwrap();
+            }
+        });
+        let main_loop = loop_rx.recv().unwrap();
+
+        writer.set_command_history(vec!["echo hi".to_owned()]);
+
+        // Invokes run in order, so this reads back after the write landed.
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        ctx.invoke(move || {
+            STORES.with(|stores| {
+                let s = stores.take().unwrap();
+                let history: Vec<String> = s
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .strv("command-history")
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                read_tx.send(history).unwrap();
+                stores.set(Some(s));
+            });
+        });
+
+        assert_eq!(
+            read_rx.recv().unwrap(),
+            vec!["echo hi".to_owned()],
+            "the write must land in the store via the watcher thread"
+        );
+
+        main_loop.quit();
+        watcher.join().unwrap();
     }
 }
