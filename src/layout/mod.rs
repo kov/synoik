@@ -39,7 +39,8 @@ use std::time::Duration;
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
 use niri_config::utils::MergeWith as _;
 use niri_config::{
-    Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
+    Config, CornerRadius, LayoutPart, PresetSize, WindowingMode, Workspace as WorkspaceConfig,
+    WorkspaceReference,
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
@@ -56,7 +57,7 @@ pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
-use crate::gnome::TileSide;
+use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
@@ -374,6 +375,10 @@ pub struct Layout<W: LayoutElement> {
     overview_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
+    /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
+    /// edge tiles/maximizes it (GNOME windowing mode only). Pushed in from the
+    /// GSettings model.
+    gnome_edge_tiling: bool,
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -713,6 +718,7 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            gnome_edge_tiling: true,
             options: Rc::new(options),
         }
     }
@@ -738,8 +744,14 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            gnome_edge_tiling: true,
             options: opts,
         }
+    }
+
+    /// Pushes `org.gnome.mutter edge-tiling` in from the GSettings model.
+    pub fn set_gnome_edge_tiling(&mut self, edge_tiling: bool) {
+        self.gnome_edge_tiling = edge_tiling;
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
@@ -2883,6 +2895,10 @@ impl<W: LayoutElement> Layout<W> {
 
         let _span = tracy_client::span!("Layout::update_insert_hint::update");
 
+        // Dropping on a screen edge tiles/maximizes (mutter edge tiling), but
+        // not when dragging within the overview.
+        let edge_tiling = self.gnome_edge_tiling && !self.overview_open;
+
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
@@ -2896,7 +2912,10 @@ impl<W: LayoutElement> Layout<W> {
                     let pos_within_workspace =
                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                     let position = if move_.is_floating {
-                        InsertPosition::Floating
+                        let target = edge_tiling
+                            .then(|| ws.edge_tile_target(pos_within_workspace))
+                            .flatten();
+                        target.map_or(InsertPosition::Floating, InsertPosition::EdgeTile)
                     } else {
                         ws.scrolling_insert_position(pos_within_workspace)
                     };
@@ -3962,6 +3981,7 @@ impl<W: LayoutElement> Layout<W> {
                     })
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
+                let is_edge_tiled = tile.window().edge_tiled_side().is_some();
 
                 // Put it back to be able to easily return.
                 self.interactive_move = Some(InteractiveMoveState::Starting {
@@ -3970,7 +3990,26 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                 });
 
-                if !is_floating && sq_dist < INTERACTIVE_MOVE_START_THRESHOLD {
+                // mutter shakes a maximized window loose after shake_threshold
+                // px of *vertical* movement (dragging along the top edge keeps
+                // it maximized, e.g. towards another monitor), and an
+                // edge-tiled one after that much movement on either axis
+                // (meta-window-drag.c, update_move). In GNOME windowing mode
+                // the scrolling layer holds the maximized/fullscreen windows.
+                let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+                let started = if !is_floating {
+                    if gnome_mode {
+                        pointer_delta.y.abs() >= crate::gnome::SHAKE_THRESHOLD
+                    } else {
+                        sq_dist >= INTERACTIVE_MOVE_START_THRESHOLD
+                    }
+                } else if gnome_mode && is_edge_tiled {
+                    f64::max(pointer_delta.x.abs(), pointer_delta.y.abs())
+                        >= crate::gnome::SHAKE_THRESHOLD
+                } else {
+                    true
+                };
+                if !started {
                     return true;
                 }
 
@@ -4208,6 +4247,9 @@ impl<W: LayoutElement> Layout<W> {
 
         // Dragging in the overview shouldn't switch the workspace and so on.
         let allow_to_activate_workspace = !self.overview_open;
+        // Dropping on a screen edge tiles/maximizes (mutter edge tiling), but
+        // not from within the overview.
+        let edge_tiling = self.gnome_edge_tiling && !self.overview_open;
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -4215,58 +4257,62 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
-                let (mon, insert_ws, position, offset, zoom) =
-                    if let Some(mon) = monitors.iter_mut().find(|mon| mon.output == move_.output) {
-                        let zoom = mon.overview_zoom();
+                let (mon, insert_ws, position, offset, zoom) = if let Some(mon) =
+                    monitors.iter_mut().find(|mon| mon.output == move_.output)
+                {
+                    let zoom = mon.overview_zoom();
 
-                        let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                        let (position, offset) = match insert_ws {
-                            InsertWorkspace::Existing(ws_id) => {
-                                let ws_idx = mon
-                                    .workspaces
-                                    .iter_mut()
-                                    .position(|ws| ws.id() == ws_id)
-                                    .unwrap();
+                    let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
+                    let (position, offset) = match insert_ws {
+                        InsertWorkspace::Existing(ws_id) => {
+                            let ws_idx = mon
+                                .workspaces
+                                .iter_mut()
+                                .position(|ws| ws.id() == ws_id)
+                                .unwrap();
 
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    let pos_within_workspace =
-                                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                                    let ws = &mut mon.workspaces[ws_idx];
-                                    ws.scrolling_insert_position(pos_within_workspace)
-                                };
+                            let pos_within_workspace =
+                                (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                            let ws = &mut mon.workspaces[ws_idx];
+                            let position = if move_.is_floating {
+                                let target = edge_tiling
+                                    .then(|| ws.edge_tile_target(pos_within_workspace))
+                                    .flatten();
+                                target.map_or(InsertPosition::Floating, InsertPosition::EdgeTile)
+                            } else {
+                                ws.scrolling_insert_position(pos_within_workspace)
+                            };
 
-                                (position, Some(geo.loc))
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    InsertPosition::NewColumn(0)
-                                };
+                            (position, Some(geo.loc))
+                        }
+                        InsertWorkspace::NewAt(_) => {
+                            let position = if move_.is_floating {
+                                InsertPosition::Floating
+                            } else {
+                                InsertPosition::NewColumn(0)
+                            };
 
-                                (position, None)
-                            }
-                        };
-
-                        (mon, insert_ws, position, offset, zoom)
-                    } else {
-                        let mon = &mut monitors[*active_monitor_idx];
-                        let zoom = mon.overview_zoom();
-                        // No point in trying to use the pointer position on the wrong output.
-                        let ws = &mon.workspaces[0];
-                        let ws_geo = mon.workspaces_render_geo().next().unwrap();
-
-                        let position = if move_.is_floating {
-                            InsertPosition::Floating
-                        } else {
-                            ws.scrolling_insert_position(Point::from((0., 0.)))
-                        };
-
-                        let insert_ws = InsertWorkspace::Existing(ws.id());
-                        (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                            (position, None)
+                        }
                     };
+
+                    (mon, insert_ws, position, offset, zoom)
+                } else {
+                    let mon = &mut monitors[*active_monitor_idx];
+                    let zoom = mon.overview_zoom();
+                    // No point in trying to use the pointer position on the wrong output.
+                    let ws = &mon.workspaces[0];
+                    let ws_geo = mon.workspaces_render_geo().next().unwrap();
+
+                    let position = if move_.is_floating {
+                        InsertPosition::Floating
+                    } else {
+                        ws.scrolling_insert_position(Point::from((0., 0.)))
+                    };
+
+                    let insert_ws = InsertWorkspace::Existing(ws.id());
+                    (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                };
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
@@ -4362,6 +4408,37 @@ impl<W: LayoutElement> Layout<W> {
                             move_.is_full_width,
                             true,
                         );
+                    }
+                    InsertPosition::EdgeTile(target) => {
+                        // Dropped on a screen edge: commit the tile/maximize.
+                        // mutter uses the pre-drag geometry as the restore rect
+                        // (end_grab_op: saved_rect = initial_window_pos); the
+                        // tile still carries it in floating_pos and
+                        // floating_window_size, so add it back as floating
+                        // untouched and tile/maximize from there.
+                        let ws_id = mon.workspaces[ws_idx].id();
+                        mon.add_tile(
+                            move_.tile,
+                            MonitorAddWindowTarget::Workspace {
+                                id: ws_id,
+                                column_idx: None,
+                            },
+                            ActivateWindow::Yes,
+                            allow_to_activate_workspace,
+                            move_.width,
+                            move_.is_full_width,
+                            true,
+                        );
+
+                        let ws = mon
+                            .workspaces
+                            .iter_mut()
+                            .find(|ws| ws.id() == ws_id)
+                            .unwrap();
+                        match target {
+                            EdgeTileTarget::Tile(side) => ws.toggle_tiled(Some(&win_id), side),
+                            EdgeTileTarget::Maximize => ws.set_maximized(&win_id, true),
+                        }
                     }
                 }
 

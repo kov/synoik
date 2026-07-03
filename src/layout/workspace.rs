@@ -29,7 +29,7 @@ use super::{
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
-use crate::gnome::TileSide;
+use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -2016,7 +2016,57 @@ impl<W: LayoutElement> Workspace<W> {
         &self,
         position: InsertPosition,
     ) -> Option<Rectangle<f64, Logical>> {
+        if let InsertPosition::EdgeTile(target) = position {
+            return Some(self.edge_tile_area(target));
+        }
         self.scrolling.insert_hint_area(position)
+    }
+
+    /// The edge zone under `pos`, if dropping a dragged window there should
+    /// tile or maximize it.
+    ///
+    /// mutter `meta-window-drag.c`, `update_move_maybe_tile`: a band of
+    /// `shake_threshold` px (drag threshold 8 × 6 = 48) at the left/right
+    /// work-area edge tiles to that half; the strip between the monitor's top
+    /// edge and the work area's top (deliberately the *outside* edge, so
+    /// windows can still be placed near the top) maximizes.
+    pub(super) fn edge_tile_target(&self, pos: Point<f64, Logical>) -> Option<EdgeTileTarget> {
+        if self.options.layout.windowing_mode != WindowingMode::Floating {
+            return None;
+        }
+
+        use crate::gnome::SHAKE_THRESHOLD;
+        let area = self.floating.working_area();
+        if pos.x < area.loc.x + SHAKE_THRESHOLD {
+            Some(EdgeTileTarget::Tile(TileSide::Left))
+        } else if pos.x >= area.loc.x + area.size.w - SHAKE_THRESHOLD {
+            Some(EdgeTileTarget::Tile(TileSide::Right))
+        } else if pos.y <= area.loc.y {
+            Some(EdgeTileTarget::Maximize)
+        } else {
+            None
+        }
+    }
+
+    /// The area an edge drop would give the window (mutter's
+    /// `meta_window_get_tile_area`): half the work area for the sides, all of
+    /// it for maximize.
+    fn edge_tile_area(&self, target: EdgeTileTarget) -> Rectangle<f64, Logical> {
+        let area = self.floating.working_area();
+        match target {
+            EdgeTileTarget::Tile(side) => {
+                let width = (area.size.w / 2.).round();
+                let x = match side {
+                    TileSide::Left => area.loc.x,
+                    TileSide::Right => area.loc.x + area.size.w - width,
+                };
+                Rectangle::new(
+                    Point::from((x, area.loc.y)),
+                    Size::from((width, area.size.h)),
+                )
+            }
+            EdgeTileTarget::Maximize => area,
+        }
     }
 
     pub fn view_offset_gesture_begin(&mut self, is_touchpad: bool) {

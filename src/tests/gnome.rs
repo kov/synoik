@@ -1537,3 +1537,216 @@ fn active_maximized_window_covers_floating() {
         "activating a floating window must put the floating layer back on top"
     );
 }
+
+/// Super+drag the focused window: grab it at `grab_offset` from its current
+/// position, drag so the pointer lands on `drop_pos`, and drop it there.
+fn super_drag_to(f: &mut Fixture, id: ClientId, grab_offset: (f64, f64), drop_pos: (f64, f64)) {
+    let (x, y) = focused_window_pos(f);
+    let grab = (x + grab_offset.0, y + grab_offset.1);
+    f.pointer_motion(grab.0, grab.1);
+
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // First a small motion so the grab recognizes a move (8px), then to the
+    // target: the drop position is where the last motion left the pointer.
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(drop_pos.0 - grab.0, drop_pos.1 - grab.1 - 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+}
+
+/// Dragging a window into the 48px band at a side of the work area tiles it
+/// to that half (mutter `meta-window-drag.c`, `update_move_maybe_tile`), and
+/// untiling restores the pre-drag rect (`end_grab_op` passes the pre-drag
+/// geometry as the saved rect).
+#[test]
+fn drag_to_left_edge_tiles() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let original_pos = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    super_drag_to(&mut f, id, (100., 100.), (20., 500.));
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("TiledLeft") && configures.contains("size: 960 × 1080"),
+        "dropping in the left edge band must tile left, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(960, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (0., 0.),
+        "the tiled window must sit at the left work-area edge",
+    );
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Untile: back to the pre-drag rect, not the drop position.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_DOWN);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 800 × 600"),
+        "untiling must restore the pre-drag size, got: {configures}"
+    );
+    let window = f.client(id).window(&surface);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        original_pos,
+        "untiling must restore the pre-drag position",
+    );
+}
+
+/// Dragging a window to the top edge of the screen maximizes it on drop
+/// (mutter tiles it `META_TILE_MAXIMIZED`).
+#[test]
+fn drag_to_top_edge_maximizes() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let original_pos = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    super_drag_to(&mut f, id, (100., 100.), (960., 0.));
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized"),
+        "dropping on the top edge must maximize, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Unmaximize: back to the pre-drag rect.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_DOWN);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 800 × 600") && !configures.contains("Maximized"),
+        "unmaximizing must restore the pre-drag size, got: {configures}"
+    );
+    let window = f.client(id).window(&surface);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        original_pos,
+        "unmaximizing must restore the pre-drag position",
+    );
+}
+
+/// `org.gnome.mutter edge-tiling` off disables drag-to-edge tiling: the drop
+/// is an ordinary floating move.
+#[test]
+fn edge_tiling_can_be_disabled() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.niri().layout.set_gnome_edge_tiling(false);
+    super_drag_to(&mut f, id, (100., 100.), (20., 500.));
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("TiledLeft"),
+        "with edge-tiling off an edge drop must not tile, got: {configures}"
+    );
+    let niri = f.niri();
+    let focused = niri.layout.focus().unwrap().window.clone();
+    let ws = niri.layout.active_workspace().unwrap();
+    assert!(
+        ws.is_floating(&focused),
+        "with edge-tiling off the window must stay floating"
+    );
+}
+
+/// mutter's shake-loose: a maximized window stays maximized while the drag
+/// moves less than shake_threshold (48px) vertically, then pops out with the
+/// restore size and follows the pointer (meta-window-drag.c, update_move).
+#[test]
+fn dragging_maximized_window_shakes_loose_after_threshold() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Grab it and drag: sideways and a little down — still maximized.
+    f.pointer_motion(960., 100.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(100., 0.);
+    f.pointer_motion(0., 30.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("size: 800 × 600"),
+        "a small drag must not shake the window loose, got: {configures}"
+    );
+
+    // Past 48px of vertical movement it pops out at the restore size.
+    f.pointer_motion(0., 30.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 800 × 600") && !configures.contains("Maximized"),
+        "crossing the shake threshold must unmaximize to the restore size, got: {configures}"
+    );
+
+    // Drop it in the middle of the screen: an ordinary floating move.
+    f.pointer_motion(0., 400.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    let niri = f.niri();
+    let focused = niri.layout.focus().unwrap().window.clone();
+    let ws = niri.layout.active_workspace().unwrap();
+    assert!(
+        ws.is_floating(&focused),
+        "the shaken-loose window must land floating"
+    );
+}

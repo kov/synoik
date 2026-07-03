@@ -40,6 +40,9 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.wm.preferences focus-new-windows`: whether new
     /// windows may take focus on map.
     pub focus_new_windows: FocusNewWindows,
+    /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
+    /// edge tiles (sides) or maximizes (top) it.
+    pub edge_tiling: bool,
 }
 
 impl Default for GnomeSettings {
@@ -50,6 +53,7 @@ impl Default for GnomeSettings {
             command_history: Vec::new(),
             disable_command_line: false,
             focus_new_windows: FocusNewWindows::Smart,
+            edge_tiling: true,
         }
     }
 }
@@ -70,6 +74,9 @@ impl GnomeSettings {
         match parse_overlay_key(overlay_key.as_str()) {
             Ok(keys) => self.overlay_keys = keys,
             Err(name) => warn!("ignoring unrecognized org.gnome.mutter overlay-key {name:?}"),
+        }
+        if settings_has_key(mutter, "edge-tiling") {
+            self.edge_tiling = mutter.boolean("edge-tiling");
         }
     }
 
@@ -208,6 +215,21 @@ pub enum TileSide {
     Left,
     Right,
 }
+
+/// What dropping a dragged window on a screen edge does (mutter
+/// `meta-window-drag.c`, `update_move_maybe_tile`): the side bands tile, the
+/// band above the work area maximizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeTileTarget {
+    Tile(TileSide),
+    Maximize,
+}
+
+/// mutter's "shake threshold" (`meta-window-drag.c`): the default mouse
+/// drag-threshold (8) × DRAG_THRESHOLD_TO_SHAKE_THRESHOLD_FACTOR (6). Both the
+/// width of the edge-tile drop zones and how far a drag must travel vertically
+/// to shake a maximized window loose.
+pub const SHAKE_THRESHOLD: f64 = 48.;
 
 /// The `org.gnome.desktop.wm.keybindings` keys we honor, with GNOME's default
 /// accelerators for each. The defaults are the GNOME session's effective ones

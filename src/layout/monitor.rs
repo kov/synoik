@@ -19,6 +19,7 @@ use super::workspace::{
 };
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
+use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -131,6 +132,8 @@ pub(super) enum InsertPosition {
     NewColumn(usize),
     InColumn(usize, usize),
     Floating,
+    /// Floating, but dropped on a screen edge: tile or maximize (GNOME).
+    EdgeTile(EdgeTileTarget),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1736,23 +1739,38 @@ impl<W: LayoutElement> Monitor<W> {
 
             let xray_pos = XrayPos::new(geo.loc, zoom);
 
-            // First pushed = topmost.
+            macro_rules! push_hint {
+                () => {
+                    if let Some(loc) = insert_hint_render_loc {
+                        if loc.workspace == InsertWorkspace::Existing(ws.id()) {
+                            self.insert_hint_element
+                                .render(ctx.renderer, loc.location, push!());
+                        }
+                    }
+                };
+            }
+
+            // First pushed = topmost. The scrolling insert hint goes between
+            // the floating and scrolling layers; the edge-tile preview goes
+            // above both, just below the dragged window (mutter's TilePreview
+            // sits directly below the window actor). Same when the scrolling
+            // layer renders on top: the hint must not hide under it.
+            let hint_above_all = ws.scrolling_renders_on_top()
+                || self
+                    .insert_hint
+                    .as_ref()
+                    .is_some_and(|hint| matches!(hint.position, InsertPosition::EdgeTile(_)));
+            if hint_above_all {
+                push_hint!();
+            }
             if ws.scrolling_renders_on_top() {
                 ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
+                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
             } else {
                 ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
-            }
-
-            if let Some(loc) = insert_hint_render_loc {
-                if loc.workspace == InsertWorkspace::Existing(ws.id()) {
-                    self.insert_hint_element
-                        .render(ctx.renderer, loc.location, push!());
+                if !hint_above_all {
+                    push_hint!();
                 }
-            }
-
-            if ws.scrolling_renders_on_top() {
-                ws.render_floating(ctx.r(), xray_pos, focus_ring, push!());
-            } else {
                 ws.render_scrolling(ctx.r(), xray_pos, focus_ring, push!());
             }
         }

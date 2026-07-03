@@ -191,6 +191,20 @@ more than 80% of the work area **auto-maximize on map** with a clamped
 restore size (mutter `place.c`). All of it is IPC-drivable:
 `niri msg action toggle-tiled-left` / `maximize` / `unmaximize`.
 
+Dragging works like mutter too (`meta-window-drag.c`): **drop a window in
+the 48px band at a side of the work area to tile it** to that half (with a
+tile preview while hovering the band), **drop it on the top edge to
+maximize**; the restore rect is the pre-drag geometry. Dragging a maximized
+window "shakes it loose" only after 48px of vertical movement (an edge-tiled
+one after 48px on either axis), popping out at the restore size under the
+pointer. Gated on `org.gnome.mutter edge-tiling`, honored live — note the
+schema default is `false` and GNOME sessions enable it via a
+`[org.gnome.mutter:GNOME]` session override, which we inherit through gio:
+outside a GNOME-branded session (e.g. bare headless), set it explicitly or
+export `XDG_CURRENT_DESKTOP=GNOME`. To drag over IPC:
+`niri msg input button-press left`, `pointer-motion …`, `button-release
+left` with `key-press super` held.
+
 Focus follows GNOME's stealing-prevention rules in this mode (mutter
 `window.c` / `meta-wayland-activation.c`): a window whose launch — its
 xdg-activation token — predates your last interaction with the focused

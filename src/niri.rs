@@ -784,10 +784,18 @@ impl State {
             state.niri.gnome_settings_writer = Some(writer);
             state
                 .niri
+                .layout
+                .set_gnome_edge_tiling(state.niri.gnome_settings.edge_tiling);
+            state
+                .niri
                 .event_loop
                 .insert_source(rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(settings) = event {
                         debug!("GNOME settings changed: {settings:?}");
+                        state
+                            .niri
+                            .layout
+                            .set_gnome_edge_tiling(settings.edge_tiling);
                         state.niri.gnome_settings = settings;
                     }
                 })
