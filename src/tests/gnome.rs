@@ -23,6 +23,7 @@ use crate::gnome::{Accel, AccelMods, AccelTrigger, GnomeKeyAction};
 const KEY_ESC: u32 = 1;
 const KEY_1: u32 = 2;
 const KEY_2: u32 = 3;
+const KEY_TAB: u32 = 15;
 const KEY_W: u32 = 17;
 const KEY_E: u32 = 18;
 const KEY_R: u32 = 19;
@@ -665,6 +666,55 @@ fn gnome_keybindings_beat_niri_config_binds() {
     assert!(
         !f.niri().layout.is_overview_open(),
         "the conflicting niri config bind must not have fired"
+    );
+}
+
+/// GNOME's `switch-windows` (default `<Alt>Tab`) cycles windows: holding Alt
+/// and tapping Tab opens the switcher, releasing Alt commits, and focus lands
+/// on the previously-used window. A second Alt+Tab returns to the first.
+/// (Mapped onto niri's window MRU switcher; GNOME's app-grouped
+/// `switch-applications` on `<Super>Tab` goes to the same switcher spanning
+/// all workspaces — accepted divergence: no app grouping.)
+#[test]
+fn alt_tab_switches_to_previous_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _first = map_focused_window(&mut f, id);
+    let _second = map_focused_window(&mut f, id);
+    let second_focused = f.niri().layout.focus().unwrap().id();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    assert!(
+        f.niri().window_mru_ui.is_open(),
+        "Alt+Tab must open the window switcher"
+    );
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    // Let the focus change go through a refresh cycle, like in a real event
+    // loop iteration, so the MRU bookkeeping sees it.
+    f.double_roundtrip(id);
+
+    assert!(
+        !f.niri().window_mru_ui.is_open(),
+        "releasing Alt must commit and close the switcher"
+    );
+    let now_focused = f.niri().layout.focus().unwrap().id();
+    assert_ne!(
+        now_focused, second_focused,
+        "Alt+Tab must move focus to the previous window"
+    );
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        second_focused,
+        "a second Alt+Tab must switch back"
     );
 }
 

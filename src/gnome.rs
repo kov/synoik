@@ -135,6 +135,15 @@ pub enum GnomeKeyAction {
     MoveToWorkspacePrevious,
     /// `move-to-workspace-right` and `-down`.
     MoveToWorkspaceNext,
+    /// `switch-windows` / `switch-windows-backward`: cycle windows of the
+    /// current workspace (GNOME's window switcher is per-workspace by
+    /// default).
+    SwitchWindows { backward: bool },
+    /// `switch-applications` / `switch-applications-backward`: GNOME's
+    /// Alt-Tab. GNOME groups by application and spans workspaces; we map it
+    /// onto the window MRU switcher over all workspaces (no app grouping —
+    /// accepted divergence for now).
+    SwitchApplications { backward: bool },
 }
 
 /// The `org.gnome.desktop.wm.keybindings` keys we honor, with GNOME's default
@@ -216,6 +225,26 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             "move-to-workspace-down".to_owned(),
             MoveToWorkspaceNext,
             strs(&["<Control><Shift><Alt>Down"]),
+        ),
+        (
+            "switch-windows".to_owned(),
+            SwitchWindows { backward: false },
+            strs(&["<Alt>Tab"]),
+        ),
+        (
+            "switch-windows-backward".to_owned(),
+            SwitchWindows { backward: true },
+            strs(&["<Alt><Shift>Tab"]),
+        ),
+        (
+            "switch-applications".to_owned(),
+            SwitchApplications { backward: false },
+            strs(&["<Super>Tab"]),
+        ),
+        (
+            "switch-applications-backward".to_owned(),
+            SwitchApplications { backward: true },
+            strs(&["<Shift><Super>Tab"]),
         ),
     ];
 

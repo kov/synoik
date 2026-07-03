@@ -6,8 +6,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
-    WorkspaceReference,
+    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, MruFilter, MruScope,
+    SwitchBinds, Trigger, WorkspaceReference,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -605,6 +605,7 @@ impl State {
 
                 let res = {
                     let config = this.niri.config.borrow();
+                    let mru_is_open = this.niri.window_mru_ui.is_open();
                     let bindings =
                         make_binds_iter(&config, &mut this.niri.window_mru_ui, modifiers);
 
@@ -612,6 +613,7 @@ impl State {
                         &mut this.niri.suppressed_keys,
                         bindings,
                         &this.niri.gnome_settings.keybindings,
+                        mru_is_open,
                         mod_key,
                         key_code,
                         modified,
@@ -4502,6 +4504,7 @@ fn should_intercept_key<'a>(
     suppressed_keys: &mut HashSet<Keycode>,
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
+    mru_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -4522,6 +4525,7 @@ fn should_intercept_key<'a>(
     let mut final_bind = find_bind(
         bindings,
         gnome_keybindings,
+        mru_is_open,
         mod_key,
         key_code,
         modified,
@@ -4589,6 +4593,7 @@ fn should_intercept_key<'a>(
 fn find_bind<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
+    mru_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -4634,7 +4639,7 @@ fn find_bind<'a>(
     // session the GSettings store is the user's keybinding config, and mutter
     // processes it before anything else sees the key. The niri config stays
     // underneath as a fallback.
-    if let Some(bind) = find_gnome_bind(gnome_keybindings, key_code, raw, mods) {
+    if let Some(bind) = find_gnome_bind(gnome_keybindings, mru_is_open, key_code, raw, mods) {
         return Some(bind);
     }
 
@@ -4647,6 +4652,7 @@ fn find_bind<'a>(
 /// the equivalent niri bind.
 fn find_gnome_bind(
     keybindings: &[GnomeKeybinding],
+    mru_is_open: bool,
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
@@ -4656,6 +4662,19 @@ fn find_gnome_bind(
             .iter()
             .any(|accel| accel_matches(accel, key_code, raw, mods))
     })?;
+
+    // The window switcher is modal (GNOME holds a grab while it's up; niri
+    // disables the general binds): only the switch actions themselves keep
+    // resolving so further taps continue cycling.
+    if mru_is_open
+        && !matches!(
+            keybinding.action,
+            GnomeKeyAction::SwitchWindows { .. } | GnomeKeyAction::SwitchApplications { .. }
+        )
+    {
+        return None;
+    }
+
     let action = action_for_gnome(keybinding.action)?;
 
     // Mutter flags the workspace switches META_KEY_BINDING_IGNORE_AUTOREPEAT.
@@ -4737,7 +4756,25 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         }
         GnomeKeyAction::MoveToWorkspacePrevious => Action::MoveWindowToWorkspaceUp(true),
         GnomeKeyAction::MoveToWorkspaceNext => Action::MoveWindowToWorkspaceDown(true),
+        GnomeKeyAction::SwitchWindows { backward } => Action::MruAdvance {
+            direction: mru_direction(backward),
+            scope: Some(MruScope::Workspace),
+            filter: Some(MruFilter::All),
+        },
+        GnomeKeyAction::SwitchApplications { backward } => Action::MruAdvance {
+            direction: mru_direction(backward),
+            scope: Some(MruScope::All),
+            filter: Some(MruFilter::All),
+        },
     })
+}
+
+fn mru_direction(backward: bool) -> MruDirection {
+    if backward {
+        MruDirection::Backward
+    } else {
+        MruDirection::Forward
+    }
 }
 
 fn find_configured_bind<'a>(
@@ -5435,6 +5472,7 @@ mod tests {
                 suppr,
                 &bindings.0,
                 &[],
+                false,
                 comp_mod,
                 close_key_code,
                 close_keysym,
@@ -5453,6 +5491,7 @@ mod tests {
                 suppr,
                 &bindings.0,
                 &[],
+                false,
                 comp_mod,
                 Keycode::from(Keysym::l.raw() + 8),
                 Keysym::l,
