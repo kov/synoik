@@ -3411,6 +3411,40 @@ impl Niri {
         self.workspace_under(extended_bounds, pos)
     }
 
+    /// The workspace whose overview strip thumbnail is under the cursor.
+    pub fn thumbnail_workspace_under_cursor(&self) -> Option<(Output, &Workspace<Mapped>)> {
+        let pos = self.seat.get_pointer().unwrap().current_location();
+        self.thumbnail_workspace_under(pos)
+    }
+
+    /// The workspace whose overview strip thumbnail is under the position.
+    pub fn thumbnail_workspace_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Output, &Workspace<Mapped>)> {
+        if self.exit_confirm_dialog.is_open()
+            || self.run_dialog.is_open()
+            || self.is_locked()
+            || self.screenshot_ui.is_open()
+        {
+            return None;
+        }
+
+        let (output, pos_within_output) = self.output_under(pos)?;
+
+        if self.is_sticky_obscured_under(output, pos_within_output) {
+            return None;
+        }
+        if self.is_layout_obscured_under(output, pos_within_output) {
+            return None;
+        }
+
+        let ws = self
+            .layout
+            .thumbnail_workspace_under(output, pos_within_output)?;
+        Some((output.clone(), ws))
+    }
+
     /// Returns the window under the position to be activated.
     ///
     /// The cursor may be inside the window's activation region, but not within the window's input
@@ -4592,6 +4626,11 @@ impl Niri {
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+
+            // The overview workspace thumbnails strip, above the workspaces.
+            mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| {
+                push(elem.into())
+            });
 
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {

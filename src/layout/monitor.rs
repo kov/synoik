@@ -8,10 +8,12 @@ use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
+use super::focus_ring::FocusRing;
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
+use super::thumbnails::{self, Strip};
 use super::tile::Tile;
 use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
@@ -23,6 +25,7 @@ use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::xray::XrayPos;
@@ -32,6 +35,7 @@ use crate::utils::transaction::Transaction;
 use crate::utils::{
     output_size, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
+use crate::wallpaper::Wallpaper;
 
 /// Amount of touchpad movement to scroll the height of one workspace.
 const WORKSPACE_GESTURE_MOVEMENT: f64 = 300.;
@@ -77,6 +81,9 @@ pub struct Monitor<W: LayoutElement> {
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
     insert_hint_render_loc: Option<InsertHintRenderLoc>,
+    /// The active-workspace ring on the overview thumbnails strip
+    /// (gnome-shell's `.workspace-thumbnail-indicator`).
+    thumb_indicator: FocusRing,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -190,9 +197,12 @@ niri_render_elements! {
     MonitorInnerRenderElement<R> => {
         Workspace = CropRenderElement<WorkspaceRenderElement<R>>,
         InsertHint = CropRenderElement<InsertHintRenderElement>,
-        UncroppedInsertHint = InsertHintRenderElement,
+        // Insert hint between workspaces, and the thumbnail-strip indicator.
+        Ring = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
+        // The wallpaper in a workspace thumbnail.
+        RoundedTexture = RoundedTextureRenderElement,
     }
 }
 
@@ -341,6 +351,7 @@ impl<W: LayoutElement> Monitor<W> {
             previous_workspace_id: None,
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
+            thumb_indicator: FocusRing::new(thumbnail_indicator_config()),
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
@@ -1093,6 +1104,22 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool) {
+        if let Some(strip) = self.thumbnail_strip() {
+            let rect = self.thumbnail_indicator_rect(&strip);
+            let scale = self.scale.fractional_scale();
+            let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
+            self.thumb_indicator.update_render_elements(
+                rect.size,
+                true,
+                true,
+                false,
+                view_rect,
+                CornerRadius::from(12.),
+                scale,
+                1.,
+            );
+        }
+
         let mut insert_hint_ws_geo = None;
         let insert_hint_ws_id = self
             .insert_hint
@@ -1441,6 +1468,65 @@ impl<W: LayoutElement> Monitor<W> {
         (progress > 0.).then_some(progress)
     }
 
+    /// Whether the overview shows the workspace thumbnails strip: GNOME's
+    /// dynamic workspaces show it only once a second desktop is populated
+    /// (more workspaces than the threshold, counting the trailing empty).
+    pub fn thumbnails_visible(&self) -> bool {
+        self.expose_progress().is_some()
+            && self.workspaces.len() > thumbnails::NUM_WORKSPACES_THRESHOLD
+    }
+
+    /// The thumbnails strip at its resting position, laid out in the band
+    /// above the zoomed-out workspace row.
+    pub fn thumbnail_strip(&self) -> Option<Strip> {
+        if !self.thumbnails_visible() {
+            return None;
+        }
+        let top_band = self.view_size.h * (1. - super::GNOME_OVERVIEW_WORKSPACE_SCALE) / 2.;
+        Some(thumbnails::strip_geometry(
+            self.view_size,
+            top_band,
+            self.workspaces.len(),
+        ))
+    }
+
+    /// The strip slides in from above the screen with the overview
+    /// transition (gnome-shell translates its box in and out).
+    fn thumbnail_slide_offset(&self, strip: &Strip, progress: f64) -> f64 {
+        let bounds = strip.bounds();
+        let extent = bounds.loc.y + bounds.size.h + thumbnails::INDICATOR_WIDTH;
+        -extent * (1. - progress)
+    }
+
+    /// The thumbnail rect the active-workspace indicator wraps,
+    /// interpolated between the two nearest thumbnails while the view moves
+    /// (gnome-shell tracks the scroll adjustment).
+    fn thumbnail_indicator_rect(&self, strip: &Strip) -> Rectangle<f64, Logical> {
+        let last = (strip.thumbs.len() - 1) as f64;
+        let idx = self.workspace_render_idx().clamp(0., last);
+        let (lo, hi) = (idx.floor() as usize, idx.ceil() as usize);
+        let t = idx.fract();
+        let a = strip.thumbs[lo];
+        let b = strip.thumbs[hi];
+        Rectangle::new(
+            Point::from((
+                a.loc.x + (b.loc.x - a.loc.x) * t,
+                a.loc.y + (b.loc.y - a.loc.y) * t,
+            )),
+            a.size,
+        )
+    }
+
+    /// The workspace whose strip thumbnail is under the position.
+    pub fn thumbnail_workspace_under(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<&Workspace<W>> {
+        let strip = self.thumbnail_strip()?;
+        let idx = strip.thumb_under(pos_within_output)?;
+        Some(&self.workspaces[idx])
+    }
+
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
@@ -1674,6 +1760,24 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         pos_within_output: Point<f64, Logical>,
     ) -> (InsertWorkspace, Rectangle<f64, Logical>) {
+        // The thumbnails strip takes drops too: onto a thumbnail, or into a
+        // gap to insert a workspace there (gnome-shell's ThumbnailsBox
+        // acceptDrop).
+        if let Some(strip) = self.thumbnail_strip() {
+            match strip.drop_target(pos_within_output) {
+                Some(thumbnails::DropTarget::Workspace(idx)) => {
+                    return (
+                        InsertWorkspace::Existing(self.workspaces[idx].id()),
+                        strip.thumbs[idx],
+                    );
+                }
+                Some(thumbnails::DropTarget::NewAt(idx)) => {
+                    return (InsertWorkspace::NewAt(idx), Rectangle::default());
+                }
+                None => (),
+            }
+        }
+
         let horizontal = self.workspaces_horizontal();
 
         // Strip-axis coordinates: where the pointer is, and a rect's span.
@@ -1768,12 +1872,122 @@ impl<W: LayoutElement> Monitor<W> {
 
         self.insert_hint_element
             .render(renderer, render_loc.location, &mut |elem| {
-                let elem = MonitorInnerRenderElement::UncroppedInsertHint(elem);
+                let elem = MonitorInnerRenderElement::Ring(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
                 let elem =
                     RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
                 push(elem);
             });
+    }
+
+    /// Renders the overview workspace thumbnails strip: each workspace in
+    /// miniature (windows at their real positions over the wallpaper), the
+    /// active one wrapped by the indicator ring.
+    pub fn render_thumbnails<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        wallpaper: Option<&Wallpaper>,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let Some(strip) = self.thumbnail_strip() else {
+            return;
+        };
+        let Some(progress) = self.expose_progress() else {
+            return;
+        };
+        let _span = tracy_client::span!("Monitor::render_thumbnails");
+
+        let scale = self.scale.fractional_scale();
+        let slide = Point::from((0., self.thumbnail_slide_offset(&strip, progress)));
+
+        // First pushed = topmost: the indicator ring sits above the
+        // thumbnails (gnome-shell keeps it as the top sibling).
+        let indicator_loc = self.thumbnail_indicator_rect(&strip).loc + slide;
+        self.thumb_indicator
+            .render(ctx.renderer, indicator_loc, &mut |elem| {
+                let elem = MonitorInnerRenderElement::Ring(elem);
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                let elem =
+                    RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
+                push(elem);
+            });
+
+        // Clip each miniature to its workspace.
+        let crop_bounds = Rectangle::from_size(self.view_size).to_physical_precise_round(scale);
+
+        for (ws, thumb) in zip(&self.workspaces, &strip.thumbs) {
+            let thumb = Rectangle::new(thumb.loc + slide, thumb.size);
+            let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
+            let xray_pos = XrayPos::new(thumb.loc, strip.scale);
+
+            macro_rules! push_thumb {
+                () => {{
+                    &mut |elem| {
+                        if let Some(elem) =
+                            CropRenderElement::from_element(elem, scale, crop_bounds)
+                        {
+                            let elem = MonitorInnerRenderElement::from(elem);
+                            let elem = RescaleRenderElement::from_element(
+                                elem,
+                                Point::from((0, 0)),
+                                strip.scale,
+                            );
+                            let elem = RelocateRenderElement::from_element(
+                                elem,
+                                thumb_loc_physical,
+                                Relocate::Relative,
+                            );
+                            push(elem);
+                        }
+                    }
+                }};
+            }
+
+            // Same layer order as the workspace itself.
+            if ws.scrolling_renders_on_top() {
+                ws.render_scrolling(ctx.r(), xray_pos, false, push_thumb!());
+                ws.render_floating(ctx.r(), xray_pos, false, push_thumb!());
+            } else {
+                ws.render_floating(ctx.r(), xray_pos, false, push_thumb!());
+                ws.render_scrolling(ctx.r(), xray_pos, false, push_thumb!());
+            }
+
+            // The wallpaper behind, rounded like the thumbnail (half the
+            // indicator's radius, per the shell theme); the solid color
+            // backs workspaces without one.
+            let mut wallpapered = false;
+            if let Some(wallpaper) = wallpaper {
+                let radius = 6. / strip.scale;
+                if let Some(elem) = wallpaper.render(
+                    ctx.renderer.as_gles_renderer(),
+                    ws.view_size(),
+                    radius,
+                    Scale::from(scale * strip.scale),
+                ) {
+                    let elem = MonitorInnerRenderElement::RoundedTexture(elem);
+                    let elem =
+                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), strip.scale);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        thumb_loc_physical,
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                    wallpapered = true;
+                }
+            }
+            if !wallpapered {
+                let elem = MonitorInnerRenderElement::SolidColor(ws.render_background());
+                let elem =
+                    RescaleRenderElement::from_element(elem, Point::from((0, 0)), strip.scale);
+                let elem = RelocateRenderElement::from_element(
+                    elem,
+                    thumb_loc_physical,
+                    Relocate::Relative,
+                );
+                push(elem);
+            }
+        }
     }
 
     pub fn render_workspaces<R: NiriRenderer>(
@@ -2313,5 +2527,20 @@ impl<W: LayoutElement> Monitor<W> {
             assert_abs_diff_eq!(pos.x, rounded_pos.x, epsilon = 1e-5);
             assert_abs_diff_eq!(pos.y, rounded_pos.y, epsilon = 1e-5);
         }
+    }
+}
+
+/// The thumbnails-strip active-workspace ring: a 3px border in GNOME's
+/// default accent blue (the shell theme's `-st-accent-color`).
+fn thumbnail_indicator_config() -> niri_config::FocusRing {
+    niri_config::FocusRing {
+        off: false,
+        width: thumbnails::INDICATOR_WIDTH,
+        active_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
+        inactive_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
+        urgent_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
+        active_gradient: None,
+        inactive_gradient: None,
+        urgent_gradient: None,
     }
 }

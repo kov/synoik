@@ -3167,7 +3167,13 @@ impl State {
                 // FIXME: granular.
                 self.niri.queue_redraw_all();
             } else if let Some((output, ws)) = is_overview_open
-                .then(|| self.niri.workspace_under_cursor(false))
+                .then(|| {
+                    // A strip thumbnail counts as its workspace: gnome-shell's
+                    // WorkspaceThumbnail.activate has the same click rules.
+                    self.niri
+                        .thumbnail_workspace_under_cursor()
+                        .or_else(|| self.niri.workspace_under_cursor(false))
+                })
                 .flatten()
             {
                 let ws_id = ws.id();
@@ -3904,7 +3910,11 @@ impl State {
                         // FIXME: granular.
                         self.niri.queue_redraw_all();
                     } else if let Some((output, ws)) = is_overview_open
-                        .then(|| self.niri.workspace_under(false, pos))
+                        .then(|| {
+                            self.niri
+                                .thumbnail_workspace_under(pos)
+                                .or_else(|| self.niri.workspace_under(false, pos))
+                        })
                         .flatten()
                     {
                         let ws_id = ws.id();

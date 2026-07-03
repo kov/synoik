@@ -1989,6 +1989,216 @@ fn overview_drag_to_neighbor_keeps_position() {
     );
 }
 
+/// Two populated desktops with the overview open: window A stays on the
+/// first workspace, window B is dragged to the trailing one (leaving a new
+/// trailing empty third). Returns (A's window, B's window).
+fn setup_two_desktops_in_overview(
+    f: &mut Fixture,
+    id: ClientId,
+) -> (smithay::desktop::Window, smithay::desktop::Window) {
+    let _a = map_window_sized(f, id, (800, 600), None);
+    let win_a = f.niri().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(f, id, (640, 480), None);
+    let win_b = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    // Drag B's preview onto the trailing workspace peeking at the right.
+    let rect = f.niri().layout.expose_target_rect(&win_b).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    f.pointer_motion(grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(1800. - grab.0, 540. - grab.1 - 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    (win_a, win_b)
+}
+
+/// Absolute pointer motion: `Fixture::pointer_motion` takes deltas.
+fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
+    let cur = f.niri().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(x - cur.x, y - cur.y);
+}
+
+/// The center of the given strip thumbnail, for pointer input.
+fn thumbnail_center(f: &mut Fixture, idx: usize) -> (f64, f64) {
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let strip = mon
+        .expect("workspaces must be on a monitor")
+        .thumbnail_strip()
+        .expect("the thumbnails strip must be visible");
+    let rect = strip.thumbs[idx];
+    (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.)
+}
+
+/// gnome-shell's ThumbnailsBox visibility rule with dynamic workspaces: the
+/// strip appears only once there are more than two workspaces, i.e. once a
+/// second desktop is populated.
+#[test]
+fn thumbnail_strip_appears_once_second_desktop_is_populated() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let visible = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnails_visible()
+    };
+    assert!(
+        !visible(&mut f),
+        "one populated desktop must not show the thumbnails strip"
+    );
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    assert!(
+        visible(&mut f),
+        "a second populated desktop must bring up the thumbnails strip"
+    );
+}
+
+/// Clicking a strip thumbnail follows gnome-shell's
+/// WorkspaceThumbnail.activate: a non-active workspace switches and stays in
+/// the overview; the active one leaves the overview.
+#[test]
+fn thumbnail_click_switches_workspace_and_stays() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+
+    // Click the second desktop's thumbnail: switch, stay in the overview.
+    let (x, y) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, x, y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "clicking a non-active thumbnail must stay in the overview"
+    );
+    let active = f.niri().layout.active_workspace().unwrap().id();
+    assert_ne!(active, ws1_id, "clicking a thumbnail must switch to it");
+
+    // Click it again (now active): leave the overview.
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "clicking the active thumbnail must leave the overview"
+    );
+    assert_eq!(f.niri().layout.active_workspace().unwrap().id(), active);
+}
+
+/// Dropping a window preview on a strip thumbnail moves the window to that
+/// workspace, keeping its desktop position (gnome-shell's
+/// WorkspaceThumbnail.acceptDrop → moveWindowToMonitorAndWorkspace).
+#[test]
+fn thumbnail_drop_moves_window_keeping_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let (win_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let original_pos = focused_window_pos(&mut f);
+
+    // Drag A's preview onto the second desktop's thumbnail.
+    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    let (tx, ty) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, tx, ty);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "dropping on a thumbnail must not leave the overview"
+    );
+
+    let niri = f.niri();
+    let (_, _, ws) = niri
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win_a))
+        .unwrap();
+    assert_ne!(
+        ws.id(),
+        ws1_id,
+        "dropping on a thumbnail must move the window to that workspace"
+    );
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().window == win_a)
+        .unwrap();
+    assert_pos_eq(
+        (pos.x, pos.y),
+        original_pos,
+        "the window must keep its desktop position on the thumbnail's workspace",
+    );
+}
+
+/// Dropping a window preview into the gap between two thumbnails inserts a
+/// new workspace there and moves the window onto it (gnome-shell's
+/// drop-placeholder path: Main.wm.insertWorkspace).
+#[test]
+fn thumbnail_gap_drop_inserts_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let (win_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    let workspace_count = |f: &mut Fixture| f.niri().layout.workspaces().count();
+    assert_eq!(workspace_count(&mut f), 3);
+
+    // Drag A's preview into the gap between the first two thumbnails.
+    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    let (t1x, t1y) = thumbnail_center(&mut f, 1);
+    let (t0x, _) = thumbnail_center(&mut f, 0);
+    let gap = ((t0x + t1x) / 2., t1y);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, gap.0, gap.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        workspace_count(&mut f),
+        4,
+        "dropping into a thumbnail gap must insert a workspace"
+    );
+    let niri = f.niri();
+    let (_, ws_idx, _) = niri
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win_a))
+        .unwrap();
+    assert_eq!(
+        ws_idx, 1,
+        "the window must land on the workspace inserted at the gap"
+    );
+}
+
 /// A maximized window's preview picks up immediately — mutter's 48px
 /// shake-loose is for dragging the real window, not the picker — and a drop
 /// re-maximizes it on the target workspace (gnome-shell moves the window

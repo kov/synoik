@@ -87,6 +87,7 @@ pub mod opening_window;
 pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
+pub mod thumbnails;
 pub mod tile;
 pub mod workspace;
 
@@ -2408,6 +2409,15 @@ impl<W: LayoutElement> Layout<W> {
         } else {
             mon.workspace_under_narrow(pos_within_output)
         }
+    }
+
+    pub fn thumbnail_workspace_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<&Workspace<W>> {
+        let mon = self.monitor_for_output(output)?;
+        mon.thumbnail_workspace_under(pos_within_output)
     }
 
     pub fn overview_zoom(&self) -> f64 {

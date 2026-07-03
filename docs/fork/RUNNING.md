@@ -259,8 +259,22 @@ default), SVG wallpapers aren't decoded, and `primary-color` isn't used as
 the no-picture fill — the configured solid background color backs those
 cases instead.
 
-Not yet ported: preview chrome (title, close button, app icon), the
-workspace thumbnails strip, app grid, and search.
+The **thumbnails strip** (gnome-shell's ThumbnailsBox) appears above the
+workspace row once a second desktop is populated (dynamic workspaces with
+more than two workspaces, counting the trailing empty one), sliding in with
+the overview transition. Each thumbnail is the workspace at 5% scale —
+wallpaper and windows at their real positions — with the active one wrapped
+in an accent-blue indicator ring that tracks workspace switches. Clicks
+follow the same rules as the workspaces (non-active switches and stays,
+active leaves); dragging a window preview onto a thumbnail moves the window
+to that workspace, and dropping it into the gap between two thumbnails
+inserts a new workspace there (gnome-shell's drop placeholder, minus the
+placeholder visual for now).
+
+Not yet ported: preview chrome (title, close button, app icon), the app
+grid, and search. Overview drag niceties still to do: a visual affordance
+for the new-workspace drop zones (GNOME's placeholder), and auto-scrolling
+the workspace row when dragging near the screen edges.
 
 ## How GNOME settings feed in
 
