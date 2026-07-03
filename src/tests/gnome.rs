@@ -2178,6 +2178,20 @@ fn thumbnail_gap_drop_inserts_workspace() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     pointer_motion_to(&mut f, gap.0, gap.1);
+
+    // While hovering the gap, the strip makes room for the drop placeholder
+    // (gnome-shell's placeholder affordance). The insert hint updates on
+    // render; drive that like a frame would.
+    f.niri().layout.update_render_elements(None);
+    {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert!(
+            strip.placeholder.is_some(),
+            "hovering a thumbnail gap must show the drop placeholder"
+        );
+    }
+
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
     f.double_roundtrip(id);
@@ -2196,6 +2210,73 @@ fn thumbnail_gap_drop_inserts_workspace() {
     assert_eq!(
         ws_idx, 1,
         "the window must land on the workspace inserted at the gap"
+    );
+}
+
+/// An edge-tiled window's preview drag re-tiles it on the drop workspace:
+/// the overview drag moves the window between workspaces, nothing else
+/// (like the maximized case below).
+#[test]
+fn overview_drag_of_edge_tiled_window_stays_tiled() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+
+    // Tile left and ack the half-width configure.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_LEFT);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(960, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Drag the preview onto the trailing workspace's peeking edge. The
+    // pick-up untiles to the restore size, like any interactive move; the
+    // roundtrip flushes that configure so the re-tile one is observable.
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.double_roundtrip(id);
+    pointer_motion_to(&mut f, 1800., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("TiledLeft"),
+        "the drop must re-tile the window on the target workspace, got: {configures}"
+    );
+
+    let niri = f.niri();
+    let (_, _, ws) = niri
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .unwrap();
+    assert_ne!(
+        ws.id(),
+        ws1_id,
+        "the drop must move the window to the neighbor workspace"
+    );
+    let mapped = ws.windows().next().unwrap();
+    assert_eq!(
+        crate::layout::LayoutElement::edge_tiled_side(mapped),
+        Some(crate::gnome::TileSide::Left),
+        "the window must still be edge-tiled after the overview drag"
     );
 }
 

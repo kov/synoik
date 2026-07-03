@@ -26,6 +26,10 @@ pub const INDICATOR_WIDTH: f64 = 3.;
 /// (`WORKSPACE_CUT_SIZE`).
 pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 
+/// The width of the new-workspace drop placeholder (the theme's
+/// `.placeholder`).
+pub const PLACEHOLDER_WIDTH: f64 = 18.;
+
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {
@@ -33,13 +37,21 @@ pub struct Strip {
     pub scale: f64,
     /// Per-workspace thumbnail rects, in view coordinates, workspace order.
     pub thumbs: Vec<Rectangle<f64, Logical>>,
+    /// The new-workspace drop placeholder, when a drag hovers a gap.
+    pub placeholder: Option<Rectangle<f64, Logical>>,
 }
 
 /// Lays out the strip: each thumbnail is the workspace at 5% scale (smaller
 /// if the row wouldn't fit the view width), the row horizontally centered,
 /// and vertically centered in the `top_band` tall margin above the workspace
-/// row.
-pub fn strip_geometry(view_size: Size<f64, Logical>, top_band: f64, n: usize) -> Strip {
+/// row. A `placeholder` index makes room for the new-workspace drop
+/// placeholder before that thumbnail (gnome-shell's drop placeholder).
+pub fn strip_geometry(
+    view_size: Size<f64, Logical>,
+    top_band: f64,
+    n: usize,
+    placeholder: Option<usize>,
+) -> Strip {
     // gnome-shell's get_preferred_height: the scale shrinks below the cap
     // when n thumbnails plus spacing exceed the available width.
     let avail = view_size.w - SPACING * 2.;
@@ -52,19 +64,36 @@ pub fn strip_geometry(view_size: Size<f64, Logical>, top_band: f64, n: usize) ->
     let thumb_w = (thumb_h * (view_size.w / view_size.h)).round();
     let thumb = Size::from((thumb_w, thumb_h));
 
-    let total_w = thumb_w * n as f64 + SPACING * (n - 1) as f64;
+    let extra = placeholder.map_or(0., |_| PLACEHOLDER_WIDTH + SPACING);
+    let total_w = thumb_w * n as f64 + SPACING * (n - 1) as f64 + extra;
     let x0 = ((view_size.w - total_w) / 2.).round();
     let y = ((top_band - thumb_h) / 2.).round();
 
-    let thumbs = (0..n)
-        .map(|i| Rectangle::new(Point::from((x0 + (thumb_w + SPACING) * i as f64, y)), thumb))
-        .collect();
+    let mut x = x0;
+    let mut placeholder_rect = None;
+    let mut place = |i: usize, x: &mut f64| {
+        if placeholder == Some(i) {
+            placeholder_rect = Some(Rectangle::new(
+                Point::from((*x, y)),
+                Size::from((PLACEHOLDER_WIDTH, thumb_h)),
+            ));
+            *x += PLACEHOLDER_WIDTH + SPACING;
+        }
+    };
+    let mut thumbs = Vec::with_capacity(n);
+    for i in 0..n {
+        place(i, &mut x);
+        thumbs.push(Rectangle::new(Point::from((x, y)), thumb));
+        x += thumb_w + SPACING;
+    }
+    place(n, &mut x);
 
     Strip {
         // The exact scale the rounded thumbnail size implies, so contents
         // fill it precisely.
         scale: thumb_h / view_size.h,
         thumbs,
+        placeholder: placeholder_rect,
     }
 }
 
@@ -73,9 +102,15 @@ impl Strip {
     pub fn bounds(&self) -> Rectangle<f64, Logical> {
         let first = self.thumbs[0];
         let last = self.thumbs[self.thumbs.len() - 1];
+        let mut x0 = first.loc.x;
+        let mut x1 = last.loc.x + last.size.w;
+        if let Some(rect) = self.placeholder {
+            x0 = x0.min(rect.loc.x);
+            x1 = x1.max(rect.loc.x + rect.size.w);
+        }
         Rectangle::new(
-            first.loc,
-            Size::from((last.loc.x + last.size.w - first.loc.x, first.size.h)),
+            Point::from((x0, first.loc.y)),
+            Size::from((x1 - x0, first.size.h)),
         )
     }
 
@@ -135,7 +170,7 @@ mod tests {
     #[test]
     fn three_thumbnails_at_the_gnome_cap() {
         // 5% of 1080 = 54 tall, 96 wide; row of three centered.
-        let strip = strip_geometry(view(), 108., 3);
+        let strip = strip_geometry(view(), 108., 3, None);
         assert_eq!(strip.scale, 54. / 1080.);
         let expected_x0 = (1920. - (96. * 3. + 8. * 2.)) / 2.;
         assert_eq!(
@@ -147,9 +182,36 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_spreads_the_thumbnails_apart() {
+        let at_rest = strip_geometry(view(), 108., 3, None);
+        let strip = strip_geometry(view(), 108., 3, Some(1));
+
+        let rect = strip
+            .placeholder
+            .expect("placeholder rect must be laid out");
+        assert_eq!(rect.size, Size::from((PLACEHOLDER_WIDTH, 54.)));
+        // It sits between the first two thumbnails, with normal spacing.
+        assert_eq!(rect.loc.x, strip.thumbs[0].loc.x + 96. + SPACING);
+        assert_eq!(
+            strip.thumbs[1].loc.x,
+            rect.loc.x + PLACEHOLDER_WIDTH + SPACING
+        );
+        // The row stays centered: it grew by the placeholder plus one gap.
+        assert_eq!(
+            strip.thumbs[0].loc.x,
+            at_rest.thumbs[0].loc.x - (PLACEHOLDER_WIDTH + SPACING) / 2.,
+        );
+
+        // A pointer over the placeholder still maps to the same insertion
+        // point, so the hover is stable.
+        let center = Point::from((rect.loc.x + rect.size.w / 2., 40.));
+        assert_eq!(strip.drop_target(center), Some(DropTarget::NewAt(1)));
+    }
+
+    #[test]
     fn many_thumbnails_shrink_to_fit() {
         let n = 25;
-        let strip = strip_geometry(view(), 108., n);
+        let strip = strip_geometry(view(), 108., n, None);
         assert!(strip.scale < MAX_THUMBNAIL_SCALE);
         let bounds = strip.bounds();
         assert!(bounds.loc.x >= 0. && bounds.loc.x + bounds.size.w <= 1920.);
@@ -157,7 +219,7 @@ mod tests {
 
     #[test]
     fn drop_targets_split_thumbs_and_gaps() {
-        let strip = strip_geometry(view(), 108., 3);
+        let strip = strip_geometry(view(), 108., 3, None);
         let y = 40.;
         let first = strip.thumbs[0];
         let second = strip.thumbs[1];

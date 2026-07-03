@@ -46,6 +46,10 @@ pub struct GnomeSettings {
     pub edge_tiling: bool,
     /// `org.gnome.desktop.background`: the wallpaper GNOME would draw.
     pub background: BackgroundSettings,
+    /// `org.gnome.desktop.interface accent-color`, resolved to RGB with
+    /// gnome-shell's palette (st-theme-context.c). Drives accent-colored
+    /// chrome like the overview thumbnail indicator.
+    pub accent_color: [u8; 3],
 }
 
 impl Default for GnomeSettings {
@@ -58,9 +62,13 @@ impl Default for GnomeSettings {
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
             background: BackgroundSettings::default(),
+            accent_color: ACCENT_BLUE,
         }
     }
 }
+
+/// GNOME's default accent (st-theme-context.c `ACCENT_COLOR_BLUE`).
+pub const ACCENT_BLUE: [u8; 3] = [0x35, 0x84, 0xe4];
 
 /// The wallpaper settings from `org.gnome.desktop.background`, already
 /// resolved down to what the compositor needs to draw.
@@ -160,6 +168,16 @@ impl GnomeSettings {
             picture: resolve_picture_uri(uri.as_str(), options),
             options,
         };
+    }
+
+    fn load_interface(&mut self, interface: &gio::Settings) {
+        if settings_has_key(interface, "accent-color") {
+            let value = interface.string("accent-color");
+            match parse_accent_color(value.as_str()) {
+                Some(rgb) => self.accent_color = rgb,
+                None => warn!("ignoring unrecognized accent-color {value:?}"),
+            }
+        }
     }
 
     fn load_wm_preferences(&mut self, wm: &gio::Settings) {
@@ -635,6 +653,9 @@ impl Stores {
         if let Some(background) = &self.background {
             settings.load_background(background, self.interface.as_ref());
         }
+        if let Some(interface) = &self.interface {
+            settings.load_interface(interface);
+        }
         settings
     }
 
@@ -850,6 +871,23 @@ fn parse_picture_options(value: &str) -> BackgroundOptions {
     }
 }
 
+/// gnome-shell's accent palette (st-theme-context.c `ACCENT_COLOR_*`),
+/// keyed by the `org.gnome.desktop.interface accent-color` enum values.
+fn parse_accent_color(name: &str) -> Option<[u8; 3]> {
+    Some(match name {
+        "blue" => ACCENT_BLUE,
+        "teal" => [0x21, 0x90, 0xa4],
+        "green" => [0x3a, 0x94, 0x4a],
+        "yellow" => [0xc8, 0x88, 0x00],
+        "orange" => [0xed, 0x5b, 0x00],
+        "red" => [0xe6, 0x2d, 0x42],
+        "pink" => [0xd5, 0x61, 0x99],
+        "purple" => [0x91, 0x41, 0xac],
+        "slate" => [0x6f, 0x83, 0x96],
+        _ => return None,
+    })
+}
+
 /// Resolve a `picture-uri` value to the local file to decode. `None` (no
 /// picture) when the URI is empty, isn't a local `file://` URI, or the
 /// options say not to draw it.
@@ -869,6 +907,15 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accent_colors_follow_the_shell_palette() {
+        // st-theme-context.c ACCENT_COLOR_*.
+        assert_eq!(parse_accent_color("blue"), Some([0x35, 0x84, 0xe4]));
+        assert_eq!(parse_accent_color("teal"), Some([0x21, 0x90, 0xa4]));
+        assert_eq!(parse_accent_color("slate"), Some([0x6f, 0x83, 0x96]));
+        assert_eq!(parse_accent_color("chartreuse"), None);
+    }
 
     #[test]
     fn picture_uri_resolves_to_local_path() {

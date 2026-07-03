@@ -793,6 +793,10 @@ impl State {
                 .set_gnome_edge_tiling(state.niri.gnome_settings.edge_tiling);
             state
                 .niri
+                .layout
+                .set_gnome_accent_color(state.niri.gnome_settings.accent_color);
+            state
+                .niri
                 .wallpaper
                 .update(&state.niri.gnome_settings.background);
             state
@@ -805,6 +809,10 @@ impl State {
                             .niri
                             .layout
                             .set_gnome_edge_tiling(settings.edge_tiling);
+                        state
+                            .niri
+                            .layout
+                            .set_gnome_accent_color(settings.accent_color);
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.queue_redraw_all();
                         state.niri.gnome_settings = settings;

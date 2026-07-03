@@ -84,6 +84,9 @@ pub struct Monitor<W: LayoutElement> {
     /// The active-workspace ring on the overview thumbnails strip
     /// (gnome-shell's `.workspace-thumbnail-indicator`).
     thumb_indicator: FocusRing,
+    /// The strip's new-workspace drop placeholder pill (gnome-shell's
+    /// `.placeholder`).
+    thumb_placeholder: FocusRing,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -154,6 +157,9 @@ pub(super) struct InsertHint {
     pub workspace: InsertWorkspace,
     pub position: InsertPosition,
     pub corner_radius: CornerRadius,
+    /// Whether the hover is on the thumbnails strip (renders the strip's
+    /// drop placeholder rather than the between-workspaces bar).
+    pub via_strip: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,7 +357,8 @@ impl<W: LayoutElement> Monitor<W> {
             previous_workspace_id: None,
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
-            thumb_indicator: FocusRing::new(thumbnail_indicator_config()),
+            thumb_indicator: FocusRing::new(thumbnail_indicator_config(crate::gnome::ACCENT_BLUE)),
+            thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
@@ -1118,6 +1125,20 @@ impl<W: LayoutElement> Monitor<W> {
                 scale,
                 1.,
             );
+
+            if let Some(rect) = strip.placeholder {
+                let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
+                self.thumb_placeholder.update_render_elements(
+                    rect.size,
+                    true,
+                    false,
+                    false,
+                    view_rect,
+                    CornerRadius::from((thumbnails::PLACEHOLDER_WIDTH / 2.) as f32),
+                    scale,
+                    1.,
+                );
+            }
         }
 
         let mut insert_hint_ws_geo = None;
@@ -1174,6 +1195,12 @@ impl<W: LayoutElement> Monitor<W> {
                     }
                 }
                 InsertWorkspace::NewAt(ws_idx) => {
+                    if hint.via_strip {
+                        // The strip renders its drop placeholder instead of
+                        // the between-workspaces bar.
+                        return;
+                    }
+
                     let scale = self.scale.fractional_scale();
                     let zoom = self.overview_zoom();
                     let gap = self.workspace_gap(zoom);
@@ -1217,12 +1244,15 @@ impl<W: LayoutElement> Monitor<W> {
                     // the previous one).
                     let view_rect = Rectangle::new(hint_loc_diff, next_ws_geo.size);
 
-                    self.insert_hint_element.update_render_elements(
-                        hint_size,
-                        view_rect,
-                        CornerRadius::default(),
-                        scale,
-                    );
+                    // In GNOME windowing mode the bar reads as a drop
+                    // placeholder: give it the pill shape.
+                    let radius = if self.options.layout.windowing_mode == WindowingMode::Floating {
+                        CornerRadius::from((hint_size.w.min(hint_size.h) / 2.) as f32)
+                    } else {
+                        CornerRadius::default()
+                    };
+                    self.insert_hint_element
+                        .update_render_elements(hint_size, view_rect, radius, scale);
                     self.insert_hint_render_loc = Some(InsertHintRenderLoc {
                         workspace: hint.workspace,
                         location: hint_loc,
@@ -1476,17 +1506,28 @@ impl<W: LayoutElement> Monitor<W> {
             && self.workspaces.len() > thumbnails::NUM_WORKSPACES_THRESHOLD
     }
 
-    /// The thumbnails strip at its resting position, laid out in the band
-    /// above the zoomed-out workspace row.
+    /// The thumbnails strip, laid out in the band above the zoomed-out
+    /// workspace row. While a drag hovers one of its gaps, the strip makes
+    /// room for the new-workspace drop placeholder there.
     pub fn thumbnail_strip(&self) -> Option<Strip> {
         if !self.thumbnails_visible() {
             return None;
         }
+        let placeholder = self.insert_hint.as_ref().and_then(|hint| {
+            if !hint.via_strip {
+                return None;
+            }
+            match hint.workspace {
+                InsertWorkspace::NewAt(idx) => Some(idx),
+                InsertWorkspace::Existing(_) => None,
+            }
+        });
         let top_band = self.view_size.h * (1. - super::GNOME_OVERVIEW_WORKSPACE_SCALE) / 2.;
         Some(thumbnails::strip_geometry(
             self.view_size,
             top_band,
             self.workspaces.len(),
+            placeholder,
         ))
     }
 
@@ -1525,6 +1566,13 @@ impl<W: LayoutElement> Monitor<W> {
         let strip = self.thumbnail_strip()?;
         let idx = strip.thumb_under(pos_within_output)?;
         Some(&self.workspaces[idx])
+    }
+
+    /// Recolors the accent-colored overview chrome (`org.gnome.desktop.interface
+    /// accent-color`).
+    pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
+        self.thumb_indicator
+            .update_config(thumbnail_indicator_config(accent));
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -1912,6 +1960,21 @@ impl<W: LayoutElement> Monitor<W> {
                 push(elem);
             });
 
+        // The new-workspace drop placeholder, while a drag hovers a gap.
+        if let Some(rect) = strip.placeholder {
+            self.thumb_placeholder
+                .render(ctx.renderer, rect.loc + slide, &mut |elem| {
+                    let elem = MonitorInnerRenderElement::Ring(elem);
+                    let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        Point::default(),
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                });
+        }
+
         // Clip each miniature to its workspace.
         let crop_bounds = Rectangle::from_size(self.view_size).to_physical_precise_round(scale);
 
@@ -2249,6 +2312,17 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
         let zoom = self.overview_zoom();
 
+        // In GNOME windowing mode the desktop's screen edges belong to edge
+        // tiling; the DnD edge scroll only runs in the overview (gnome-shell
+        // autoscrolls its WorkspacesView the same way).
+        if self.options.layout.windowing_mode == WindowingMode::Floating
+            && self.overview_progress.is_none()
+        {
+            return false;
+        }
+
+        let horizontal = self.workspaces_horizontal();
+
         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
             return false;
         };
@@ -2261,25 +2335,33 @@ impl<W: LayoutElement> Monitor<W> {
         let config = &self.options.gestures.dnd_edge_workspace_switch;
         let trigger_height = config.trigger_height;
 
-        // Restrict the scrolling horizontally to the strip of workspaces to avoid unwanted trigger
-        // after using the hot corner or during horizontal scroll.
-        let width = self.view_size.w * zoom;
-        let x = pos.x - (self.view_size.w - width) / 2.;
+        // The trigger zones sit at the ends of the axis the workspaces are
+        // laid out on. Restrict the cross axis to the strip of workspaces to
+        // avoid unwanted trigger after using the hot corner or during
+        // cross-axis scroll; consider the working area on the main axis so
+        // layer-shell docks and such don't prevent scrolling.
+        let (main, extent, cross, cross_extent) = if horizontal {
+            let cross_extent = self.view_size.h * zoom;
+            let cross = pos.y - (self.view_size.h - cross_extent) / 2.;
+            let main = pos.x - self.working_area.loc.x;
+            (main, self.working_area.size.w, cross, cross_extent)
+        } else {
+            let cross_extent = self.view_size.w * zoom;
+            let cross = pos.x - (self.view_size.w - cross_extent) / 2.;
+            let main = pos.y - self.working_area.loc.y;
+            (main, self.working_area.size.h, cross, cross_extent)
+        };
 
-        // Consider the working area so layer-shell docks and such don't prevent scrolling.
-        let y = pos.y - self.working_area.loc.y;
-        let height = self.working_area.size.h;
+        let main = main.clamp(0., extent);
+        let trigger_height = trigger_height.clamp(0., extent / 2.);
 
-        let y = y.clamp(0., height);
-        let trigger_height = trigger_height.clamp(0., height / 2.);
-
-        let delta = if x < 0. || width <= x {
-            // Outside the bounds horizontally.
+        let delta = if cross < 0. || cross_extent <= cross {
+            // Outside the bounds on the cross axis.
             0.
-        } else if y < trigger_height {
-            -(trigger_height - y)
-        } else if height - y < trigger_height {
-            trigger_height - (height - y)
+        } else if main < trigger_height {
+            -(trigger_height - main)
+        } else if extent - main < trigger_height {
+            trigger_height - (extent - main)
         } else {
             0.
         };
@@ -2530,15 +2612,32 @@ impl<W: LayoutElement> Monitor<W> {
     }
 }
 
-/// The thumbnails-strip active-workspace ring: a 3px border in GNOME's
-/// default accent blue (the shell theme's `-st-accent-color`).
-fn thumbnail_indicator_config() -> niri_config::FocusRing {
+/// The strip's drop placeholder: a translucent pill marking where the new
+/// workspace goes (gnome-shell's workspace-placeholder asset).
+fn thumbnail_placeholder_config() -> niri_config::FocusRing {
+    let color = niri_config::Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x66);
+    niri_config::FocusRing {
+        off: false,
+        width: 0.,
+        active_color: color,
+        inactive_color: color,
+        urgent_color: color,
+        active_gradient: None,
+        inactive_gradient: None,
+        urgent_gradient: None,
+    }
+}
+
+/// The thumbnails-strip active-workspace ring: a 3px border in the system
+/// accent color (the shell theme's `-st-accent-color`).
+fn thumbnail_indicator_config(accent: [u8; 3]) -> niri_config::FocusRing {
+    let color = niri_config::Color::from_rgba8_unpremul(accent[0], accent[1], accent[2], 0xff);
     niri_config::FocusRing {
         off: false,
         width: thumbnails::INDICATOR_WIDTH,
-        active_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
-        inactive_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
-        urgent_color: niri_config::Color::from_rgba8_unpremul(0x35, 0x84, 0xe4, 0xff),
+        active_color: color,
+        inactive_color: color,
+        urgent_color: color,
         active_gradient: None,
         inactive_gradient: None,
         urgent_gradient: None,

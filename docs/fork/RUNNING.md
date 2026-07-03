@@ -244,8 +244,8 @@ only changes which workspace holds the window. The window keeps its
 position on the desktop, a maximized window is re-maximized on the target,
 and the overview stays open. Windows poking past their workspace's edge
 are clipped to it in the overview and during workspace switches, so they
-don't draw over the neighbor. Divergence: dragging an edge-tiled window's
-preview untiles it to its restore rect (GNOME keeps it tiled).
+don't draw over the neighbor. An edge-tiled or maximized window keeps that
+state through the drag: the drop re-applies it on the target workspace.
 
 The **wallpaper** comes from `org.gnome.desktop.background`: `picture-uri`
 (or `picture-uri-dark` when `org.gnome.desktop.interface color-scheme` is
@@ -268,13 +268,19 @@ in an accent-blue indicator ring that tracks workspace switches. Clicks
 follow the same rules as the workspaces (non-active switches and stays,
 active leaves); dragging a window preview onto a thumbnail moves the window
 to that workspace, and dropping it into the gap between two thumbnails
-inserts a new workspace there (gnome-shell's drop placeholder, minus the
-placeholder visual for now).
+inserts a new workspace there — the strip spreads apart around a
+translucent placeholder pill while the drag hovers the gap (gnome-shell's
+drop placeholder). The between-workspaces drop zone in the main row shows a
+matching pill-shaped bar. Holding a dragged window near the left or right
+screen edge auto-scrolls the workspace row (gnome-shell's overview
+autoscroll); on the desktop the screen edges keep belonging to edge
+tiling. Dragging an edge-tiled or maximized window's preview re-applies
+that state on the drop workspace. The indicator ring and other accent
+chrome follow `org.gnome.desktop.interface accent-color` (the shell's
+palette), updating live.
 
 Not yet ported: preview chrome (title, close button, app icon), the app
-grid, and search. Overview drag niceties still to do: a visual affordance
-for the new-workspace drop zones (GNOME's placeholder), and auto-scrolling
-the workspace row when dragging near the screen edges.
+grid, and search.
 
 ## How GNOME settings feed in
 

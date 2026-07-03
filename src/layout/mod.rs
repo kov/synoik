@@ -381,6 +381,9 @@ pub struct Layout<W: LayoutElement> {
     /// edge tiles/maximizes it (GNOME windowing mode only). Pushed in from the
     /// GSettings model.
     gnome_edge_tiling: bool,
+    /// `org.gnome.desktop.interface accent-color`, resolved to RGB. Pushed in
+    /// from the GSettings model; colors the overview thumbnail indicator.
+    gnome_accent_color: [u8; 3],
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -462,13 +465,13 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
     pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
-    /// Whether to re-maximize the window when dropped in the overview.
+    /// Maximized/edge-tiled state to reapply when dropped in the overview.
     ///
-    /// Picking up a maximized window unmaximizes it like any interactive
-    /// move, but a GNOME overview drag is gnome-shell's WindowPreview drag:
-    /// it only moves the window between workspaces, so the drop restores the
-    /// state.
-    pub(self) remaximize: bool,
+    /// Picking up a maximized or edge-tiled window restores it like any
+    /// interactive move, but a GNOME overview drag is gnome-shell's
+    /// WindowPreview drag: it only moves the window between workspaces, so
+    /// the drop puts the state back.
+    pub(self) reapply_on_drop: Option<EdgeTileTarget>,
 }
 
 #[derive(Debug)]
@@ -728,6 +731,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
+            gnome_accent_color: crate::gnome::ACCENT_BLUE,
             options: Rc::new(options),
         }
     }
@@ -754,6 +758,7 @@ impl<W: LayoutElement> Layout<W> {
             overview_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
+            gnome_accent_color: crate::gnome::ACCENT_BLUE,
             options: opts,
         }
     }
@@ -761,6 +766,14 @@ impl<W: LayoutElement> Layout<W> {
     /// Pushes `org.gnome.mutter edge-tiling` in from the GSettings model.
     pub fn set_gnome_edge_tiling(&mut self, edge_tiling: bool) {
         self.gnome_edge_tiling = edge_tiling;
+    }
+
+    /// Pushes the resolved `accent-color` in from the GSettings model.
+    pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
+        self.gnome_accent_color = accent;
+        for mon in self.monitors_mut() {
+            mon.set_gnome_accent_color(accent);
+        }
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
@@ -840,6 +853,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_gnome_accent_color(self.gnome_accent_color);
                 monitors.push(monitor);
 
                 MonitorSet::Normal {
@@ -861,6 +875,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_gnome_accent_color(self.gnome_accent_color);
 
                 MonitorSet::Normal {
                     monitors: vec![monitor],
@@ -2919,6 +2934,12 @@ impl<W: LayoutElement> Layout<W> {
 
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
+            // Note: the hint was cleared above, so this hit-tests the strip
+            // at rest; hovering the (wider) placeholder area keeps mapping
+            // to the same gap, so the hover is stable.
+            let via_strip = mon
+                .thumbnail_strip()
+                .is_some_and(|strip| strip.drop_target(move_.pointer_pos_within_output).is_some());
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
             match insert_ws {
                 InsertWorkspace::Existing(ws_id) => {
@@ -2948,6 +2969,7 @@ impl<W: LayoutElement> Layout<W> {
                         workspace: insert_ws,
                         position,
                         corner_radius,
+                        via_strip,
                     });
                 }
                 InsertWorkspace::NewAt(_) => {
@@ -2960,6 +2982,7 @@ impl<W: LayoutElement> Layout<W> {
                         workspace: insert_ws,
                         position,
                         corner_radius: CornerRadius::default(),
+                        via_strip,
                     });
                 }
             }
@@ -3999,7 +4022,8 @@ impl<W: LayoutElement> Layout<W> {
                     })
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
-                let is_edge_tiled = tile.window().edge_tiled_side().is_some();
+                let edge_tiled_side = tile.window().edge_tiled_side();
+                let is_edge_tiled = edge_tiled_side.is_some();
                 let is_maximized = tile.window().pending_sizing_mode().is_maximized();
 
                 // Put it back to be able to easily return.
@@ -4129,7 +4153,15 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_ratio_within_window,
                     output_config,
                     workspace_config,
-                    remaximize: in_expose && is_maximized,
+                    reapply_on_drop: in_expose
+                        .then(|| {
+                            if is_maximized {
+                                Some(EdgeTileTarget::Maximize)
+                            } else {
+                                edge_tiled_side.map(EdgeTileTarget::Tile)
+                            }
+                        })
+                        .flatten(),
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -4397,7 +4429,7 @@ impl<W: LayoutElement> Layout<W> {
                     InsertPosition::Floating => {
                         let tile_render_loc = move_.tile_render_location(zoom);
 
-                        let remaximize = move_.remaximize;
+                        let reapply_on_drop = move_.reapply_on_drop;
                         let mut tile = move_.tile;
 
                         // The tile still carries its pre-drag position in
@@ -4446,13 +4478,20 @@ impl<W: LayoutElement> Layout<W> {
                             true,
                         );
 
-                        if keep_position && remaximize {
-                            let ws = mon
-                                .workspaces
-                                .iter_mut()
-                                .find(|ws| ws.id() == ws_id)
-                                .unwrap();
-                            ws.set_maximized(&win_id, true);
+                        if keep_position {
+                            if let Some(target) = reapply_on_drop {
+                                let ws = mon
+                                    .workspaces
+                                    .iter_mut()
+                                    .find(|ws| ws.id() == ws_id)
+                                    .unwrap();
+                                match target {
+                                    EdgeTileTarget::Tile(side) => {
+                                        ws.toggle_tiled(Some(&win_id), side)
+                                    }
+                                    EdgeTileTarget::Maximize => ws.set_maximized(&win_id, true),
+                                }
+                            }
                         }
                     }
                     InsertPosition::EdgeTile(target) => {
