@@ -10,22 +10,27 @@
 # requires the "user" instance). The unit is Type=notify, which our binary
 # satisfies (sd_notify READY on startup). See docs/fork/RUNNING.md.
 #
+# The override points straight at the binary in this repo's target directory,
+# so iterating is just: rebuild, log the test user out and back in — no
+# reinstall needed.
+#
 # Usage:
-#   cargo build --release                       # as your normal user, first
+#   cargo build                                 # as your normal user, first
 #   sudo scripts/install-test-session.sh        # install/update
 #   sudo scripts/install-test-session.sh --uninstall
 #
 # Env knobs:
 #   TEST_USER=gsrs      test account to create/configure (default: gsrs)
-#   PROFILE=release     which build to install (default: release)
+#   PROFILE=debug       which build the session runs (default: debug)
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+repo="$(pwd -P)"
 
 user="${TEST_USER:-gsrs}"
-profile="${PROFILE:-release}"
-bin=/usr/local/bin/gnome-shell-rs
+profile="${PROFILE:-debug}"
+bin="$repo/target/$profile/niri"
 dropin_dir="/home/$user/.config/systemd/user/org.gnome.Shell@user.service.d"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -34,17 +39,20 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -f "$dropin_dir/override.conf" "$bin"
+    rm -f "$dropin_dir/override.conf"
     rmdir --parents --ignore-fail-on-non-empty "$dropin_dir" 2>/dev/null || true
-    echo "Removed $bin and the org.gnome.Shell override for '$user'."
+    echo "Removed the org.gnome.Shell override for '$user'."
     echo "The account is left in place; remove it with: userdel -r $user"
     exit 0
 fi
 
-src="target/$profile/niri"
-if [ ! -e "$src" ]; then
-    echo "error: $src not found — build it first (as your normal user):" >&2
-    echo "  cargo build --release" >&2
+if [ ! -e "$bin" ]; then
+    echo "error: $bin not found — build it first (as your normal user):" >&2
+    if [ "$profile" = debug ]; then
+        echo "  cargo build" >&2
+    else
+        echo "  cargo build --profile $profile" >&2
+    fi
     exit 1
 fi
 
@@ -54,9 +62,17 @@ if ! id "$user" >/dev/null 2>&1; then
     passwd "$user"
 fi
 
-install -m755 "$src" "$bin"
-if command -v restorecon >/dev/null 2>&1; then
-    restorecon "$bin"
+# The unit runs as $user, which must be able to traverse into the repo and
+# exec the binary. Home dirs are sometimes 0700; fail early and say what to fix.
+if ! runuser -u "$user" -- test -x "$bin"; then
+    echo "error: user '$user' cannot execute $bin." >&2
+    echo "Grant traversal along the path, e.g.:" >&2
+    d="$(dirname "$bin")"
+    while [ "$d" != "/" ]; do
+        echo "  setfacl -m u:$user:--x $d" >&2
+        d="$(dirname "$d")"
+    done
+    exit 1
 fi
 
 mkdir -p "$dropin_dir"
@@ -68,11 +84,12 @@ EOF
 chown -R "$user:$user" "/home/$user/.config"
 
 echo
-echo "Installed $bin and the org.gnome.Shell override for '$user'."
+echo "Installed the org.gnome.Shell override for '$user':"
+echo "  ExecStart=$bin --session"
 echo
 echo "To try it: switch user (lock screen → other user), log in as '$user'"
 echo "choosing the regular \"GNOME\" session. GDM gives it its own VT;"
 echo "Ctrl+Alt+F<n> flips between it and your session."
 echo
-echo "After a rebuild, rerun this script (or just: sudo install -m755 $src $bin)"
-echo "and log '$user' out and back in."
+echo "To iterate: rebuild, then log '$user' out and back in — the session"
+echo "always runs whatever is currently at $bin."

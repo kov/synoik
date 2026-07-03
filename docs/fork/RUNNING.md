@@ -88,19 +88,20 @@ a dedicated test user (`gsrs`), so your own session and dconf stay untouched.
 How it works: GDM's "GNOME" session starts the systemd user target
 `gnome-session@gnome.target`, which requires `org.gnome.Shell@user.service`
 (`ExecStart=/usr/bin/gnome-shell --mode=user`, `Type=notify`). A per-user
-drop-in overrides `ExecStart` to our binary; `--session` mode already
-sd_notifies readiness, so the unit contract holds.
+drop-in overrides `ExecStart` to point **straight at the binary in this repo's
+`target/debug`** (set `PROFILE=release` for the release build); `--session`
+mode already sd_notifies readiness, so the unit contract holds.
 
 ```sh
-cargo build --release
-sudo scripts/install-test-session.sh   # one-time: creates user "gsrs", installs
-                                       # /usr/local/bin/gnome-shell-rs + the override
+cargo build
+sudo scripts/install-test-session.sh   # one-time: creates user "gsrs" + the override
 ```
 
 To run: switch user (lock screen → the other user), log in as `gsrs` choosing
 the regular **GNOME** session. GDM gives it its own VT; **Ctrl+Alt+F\<n\>**
-flips between it and your session. To iterate: rebuild, rerun the script, log
-`gsrs` out and back in.
+flips between it and your session. To iterate: just rebuild and log `gsrs` out
+and back in — the session always runs whatever is currently in `target/debug`,
+no reinstall step.
 
 If the compositor dies, the unit's `OnFailure=` drops that session back to
 GDM; yours is unaffected. Undo with
