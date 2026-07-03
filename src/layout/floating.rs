@@ -3,7 +3,7 @@ use std::iter::zip;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
-use niri_config::{PresetSize, RelativeTo};
+use niri_config::{PresetSize, RelativeTo, WindowingMode};
 use niri_ipc::{PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
@@ -447,7 +447,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         let pos = self.stored_or_default_tile_pos(&tile).unwrap_or_else(|| {
-            center_preferring_top_left_in_area(self.working_area, tile.tile_size())
+            if self.options.layout.windowing_mode == WindowingMode::Floating {
+                self.place_new_tile(&tile)
+            } else {
+                center_preferring_top_left_in_area(self.working_area, tile.tile_size())
+            }
         });
 
         let data = Data::new(self.working_area, &tile, pos);
@@ -463,7 +467,17 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let above_pos = self.data[idx].logical_pos;
         let above_size = self.data[idx].size;
         let tile_size = tile.tile_size();
-        let pos = above_pos + (above_size.to_point() - tile_size.to_point()).downscale(2.);
+        let pos = if self.options.layout.windowing_mode == WindowingMode::Floating {
+            // mutter's transient placement: centered horizontally, vertically
+            // at the top-biased third (place.c meta_window_place).
+            above_pos
+                + Point::from((
+                    (above_size.w - tile_size.w) / 2.,
+                    (above_size.h - tile_size.h) / 3.,
+                ))
+        } else {
+            above_pos + (above_size.to_point() - tile_size.to_point()).downscale(2.)
+        };
         let pos = self.clamp_within_working_area(pos, tile_size);
         tile.floating_pos = Some(self.logical_to_size_frac(pos));
 
@@ -1271,6 +1285,131 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let height = resolve(height, self.working_area.size.h);
 
         Size::from((width, height))
+    }
+
+    /// Places a tile with no stored or rule-given position, GNOME style.
+    ///
+    /// Reproduces mutter's `meta_window_place()` (`src/core/place.c`) with
+    /// the default preferences (`center-new-windows` and
+    /// `attach-modal-dialogs` off) and LTR text direction: transients center
+    /// on their parent, everything else tries first-fit and falls back to
+    /// cascading. Window types that xdg-shell doesn't have (splash, utility,
+    /// docks) are out; the constraint-pipeline clamping is approximated by
+    /// [`Data`]'s mutter-derived off-screen limits.
+    fn place_new_tile(&self, tile: &Tile<W>) -> Point<f64, Logical> {
+        let size = tile.tile_size();
+
+        // Transient windows center horizontally on their parent, vertically
+        // with twice as much space below as above (place.c "chosen to be the
+        // same as the placement of the child within the parent's frame").
+        let win = tile.window();
+        for (other, data) in self.tiles.iter().zip(&self.data) {
+            if win.is_child_of(other.window()) {
+                let x = data.logical_pos.x + (data.size.w - size.w) / 2.;
+                let y = data.logical_pos.y + (data.size.h - size.h) / 3.;
+                return Point::from((x, y));
+            }
+        }
+
+        self.find_first_fit(size)
+            .unwrap_or_else(|| self.find_next_cascade(size))
+    }
+
+    /// mutter's `find_first_fit()`: the first candidate position where the
+    /// window fits inside the work area without overlapping any existing
+    /// window.
+    ///
+    /// Candidates, in order: the "centered tile" slot, then below each
+    /// existing window (top-most/left-most first), then to the right of each
+    /// (left-most/top-most first).
+    fn find_first_fit(&self, size: Size<f64, Logical>) -> Option<Point<f64, Logical>> {
+        let area = self.working_area;
+        let others: Vec<Rectangle<f64, Logical>> = self
+            .data
+            .iter()
+            .map(|data| Rectangle::new(data.logical_pos, data.size))
+            .collect();
+
+        let fits = |pos: Point<f64, Logical>| {
+            let rect = Rectangle::new(pos, size);
+            area.contains_rect(rect) && !others.iter().any(|other| other.overlaps(rect))
+        };
+
+        // The "centered tile" slot: the top-left tile of a hypothetical grid
+        // of same-size windows spread over the work area (place.c
+        // `center_tile_rect_in_area`; the remainder is the leftover space).
+        let candidate = Point::from((
+            area.loc.x + (area.size.w % (size.w + 1.)) / 2.,
+            area.loc.y + (area.size.h % (size.h + 1.)) / 3.,
+        ));
+        if fits(candidate) {
+            return Some(candidate);
+        }
+
+        let mut below_sorted = others.clone();
+        below_sorted.sort_by(|a, b| (a.loc.y, a.loc.x).partial_cmp(&(b.loc.y, b.loc.x)).unwrap());
+        for other in &below_sorted {
+            let candidate = Point::from((other.loc.x, other.loc.y + other.size.h));
+            if fits(candidate) {
+                return Some(candidate);
+            }
+        }
+
+        let mut end_sorted = others.clone();
+        end_sorted.sort_by(|a, b| (a.loc.x, a.loc.y).partial_cmp(&(b.loc.x, b.loc.y)).unwrap());
+        for other in &end_sorted {
+            let candidate = Point::from((other.loc.x + other.size.w, other.loc.y));
+            if fits(candidate) {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    /// mutter's `find_next_cascade()`: walk the windows northwest-first,
+    /// stepping the cascade slot diagonally past every window already
+    /// sitting on it; overflowing the work area starts a fresh column
+    /// shifted right.
+    fn find_next_cascade(&self, size: Size<f64, Logical>) -> Point<f64, Logical> {
+        // place.c: CASCADE_FUZZ, META_WINDOW_TITLEBAR_HEIGHT, CASCADE_INTERVAL.
+        const FUZZ: f64 = 15.;
+        const STEP: f64 = 50.;
+        const INTERVAL: f64 = 50.;
+
+        let area = self.working_area;
+        let origin = Point::from((f64::max(0., area.loc.x), f64::max(0., area.loc.y)));
+
+        let mut others: Vec<(Point<f64, Logical>, Size<f64, Logical>)> = self
+            .data
+            .iter()
+            .map(|data| (data.logical_pos, data.size))
+            .collect();
+        others.sort_by(|a, b| (a.0.x + a.0.y).partial_cmp(&(b.0.x + b.0.y)).unwrap());
+
+        let mut stage = 0.;
+        'restart: loop {
+            let mut cascade = Point::from((origin.x + stage * INTERVAL, origin.y));
+            if cascade.x + size.w > area.loc.x + area.size.w {
+                // Out of horizontal space entirely; give up at the origin.
+                return origin;
+            }
+
+            for (pos, _) in &others {
+                if (pos.x - cascade.x).abs() < FUZZ && (pos.y - cascade.y).abs() < FUZZ {
+                    // Something already sits at this slot; step past it.
+                    cascade = *pos + Point::from((STEP, STEP));
+                    if cascade.x + size.w > area.loc.x + area.size.w
+                        || cascade.y + size.h > area.loc.y + area.size.h
+                    {
+                        stage += 1.;
+                        continue 'restart;
+                    }
+                }
+            }
+
+            return cascade;
+        }
     }
 
     pub fn stored_or_default_tile_pos(&self, tile: &Tile<W>) -> Option<Point<f64, Logical>> {

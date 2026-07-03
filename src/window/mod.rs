@@ -4,7 +4,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::window_rule::{Match, WindowRule};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
-    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
+    ResolvedPopupsRules, ShadowRule, TabIndicatorRule, WindowingMode,
 };
 use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -361,9 +361,15 @@ impl ResolvedWindowRules {
         (min_size, max_size)
     }
 
-    pub fn compute_open_floating(&self, toplevel: &ToplevelSurface) -> bool {
+    pub fn compute_open_floating(&self, toplevel: &ToplevelSurface, mode: WindowingMode) -> bool {
         if let Some(res) = self.open_floating {
             return res;
+        }
+
+        // GNOME windowing: every window opens floating unless a rule says
+        // otherwise. The heuristics below only apply to the scrolling mode.
+        if mode == WindowingMode::Floating {
+            return true;
         }
 
         // Windows with a parent (usually dialogs) open as floating by default.

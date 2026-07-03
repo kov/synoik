@@ -148,7 +148,10 @@ impl CompositorHandler for State {
                     // The GTK about dialog sets min/max size after the initial configure but
                     // before mapping, so we need to compute open_floating at the last possible
                     // moment, that is here.
-                    let is_floating = rules.compute_open_floating(toplevel);
+                    let is_floating = rules.compute_open_floating(
+                        toplevel,
+                        self.niri.config.borrow().layout.windowing_mode,
+                    );
 
                     // Figure out if we should activate the window.
                     let activate = rules.open_focused.map(|focus| {

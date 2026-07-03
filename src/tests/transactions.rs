@@ -35,7 +35,7 @@ fn create_window(f: &mut Fixture, id: ClientId, w: u16, h: u16) -> WlSurface {
 
 #[test]
 fn column_resize_waits_for_both_windows() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
 

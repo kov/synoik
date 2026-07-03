@@ -9,6 +9,7 @@ use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndica
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
+    pub windowing_mode: WindowingMode,
     pub focus_ring: FocusRing,
     pub border: Border,
     pub shadow: Shadow,
@@ -29,6 +30,7 @@ pub struct Layout {
 impl Default for Layout {
     fn default() -> Self {
         Self {
+            windowing_mode: WindowingMode::default(),
             focus_ring: FocusRing::default(),
             border: Border::default(),
             shadow: Shadow::default(),
@@ -72,6 +74,7 @@ impl MergeWith<LayoutPart> for Layout {
 
         merge_clone!(
             (self, part),
+            windowing_mode,
             preset_column_widths,
             preset_window_heights,
             center_focused_column,
@@ -96,6 +99,8 @@ impl MergeWith<LayoutPart> for Layout {
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct LayoutPart {
+    #[knuffel(child, unwrap(argument))]
+    pub windowing_mode: Option<WindowingMode>,
     #[knuffel(child)]
     pub focus_ring: Option<BorderRule>,
     #[knuffel(child)]
@@ -156,6 +161,21 @@ pub struct Struts {
     pub top: FloatOrInt<-65535, 65535>,
     #[knuffel(child, unwrap(argument), default)]
     pub bottom: FloatOrInt<-65535, 65535>,
+}
+
+/// How new windows are managed by default.
+///
+/// This fork is a GNOME-behaviors desktop: windows float by default, GNOME
+/// style. niri's scrollable tiling remains fully available as an opt-in.
+/// (The eventual GNOME-side setting for this is deferred; for now the switch
+/// lives in the niri config only.)
+#[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum WindowingMode {
+    /// New windows open floating (GNOME semantics). The default.
+    #[default]
+    Floating,
+    /// New windows tile into scrollable columns (niri semantics).
+    Scrolling,
 }
 
 #[derive(knuffel::DecodeScalar, Debug, Default, PartialEq, Eq, Clone, Copy)]

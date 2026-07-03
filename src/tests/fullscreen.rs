@@ -8,7 +8,7 @@ use crate::layout::LayoutElement as _;
 
 // Sets up a fixture with two outputs and 100×100 window.
 fn set_up() -> (Fixture, ClientId, WlSurface) {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1280, 720));
 

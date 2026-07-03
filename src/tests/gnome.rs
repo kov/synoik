@@ -985,3 +985,179 @@ fn overlay_key_setting_rebinds() {
         "a right Super tap must open the overview when it is the overlay key"
     );
 }
+
+/// Map a window of the given size, optionally as a transient child of
+/// `parent`, and return its surface.
+fn map_window_sized(
+    f: &mut Fixture,
+    id: ClientId,
+    size: (u16, u16),
+    parent: Option<&WlSurface>,
+) -> WlSurface {
+    let parent_toplevel = parent.map(|p| f.client(id).window(p).xdg_toplevel.clone());
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_parent(parent_toplevel.as_ref());
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(size.0, size.1);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    surface
+}
+
+/// The focused window's position within the workspace view.
+fn focused_window_pos(f: &mut Fixture) -> (f64, f64) {
+    let niri = f.niri();
+    let focused = niri.layout.focus().unwrap().id();
+    let ws = niri.layout.active_workspace().unwrap();
+    let (_, pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() == focused)
+        .unwrap();
+    (pos.x, pos.y)
+}
+
+#[track_caller]
+fn assert_pos_eq(actual: (f64, f64), expected: (f64, f64), what: &str) {
+    // Render positions round to physical pixels; allow that.
+    assert!(
+        (actual.0 - expected.0).abs() <= 1. && (actual.1 - expected.1).abs() <= 1.,
+        "{what}: expected about ({}, {}), got ({}, {})",
+        expected.0,
+        expected.1,
+        actual.0,
+        actual.1,
+    );
+}
+
+/// GNOME windowing: new windows open floating by default; niri's scrollable
+/// tiling remains available behind `windowing-mode "scrolling"`.
+#[test]
+fn windows_open_floating_by_default() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (100, 100), None);
+
+    let niri = f.niri();
+    let focused = niri.layout.focus().unwrap().window.clone();
+    let ws = niri.layout.active_workspace().unwrap();
+    assert!(
+        ws.is_floating(&focused),
+        "a new window must open floating by default"
+    );
+
+    let mut f = Fixture::with_config(scrolling(Config::default()));
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (100, 100), None);
+
+    let niri = f.niri();
+    let focused = niri.layout.focus().unwrap().window.clone();
+    let ws = niri.layout.active_workspace().unwrap();
+    assert!(
+        !ws.is_floating(&focused),
+        "windowing-mode scrolling must keep niri's tiled-by-default behavior"
+    );
+}
+
+/// New windows follow mutter's placement (`place.c`): the first window goes
+/// to the "centered tile" slot, and subsequent same-size windows first-fit
+/// *below* existing ones before going anywhere else.
+#[test]
+fn placement_first_fit_prefers_below() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // place.c center_tile_rect_in_area: the leftover space of a hypothetical
+    // grid of same-size windows, halved horizontally, third-ed vertically.
+    let slot = ((1920. % 101.) / 2., (1080. % 101.) / 3.);
+
+    let _w1 = map_window_sized(&mut f, id, (100, 100), None);
+    let w1_pos = focused_window_pos(&mut f);
+    assert_pos_eq(
+        w1_pos,
+        slot,
+        "first window must take the centered-tile slot",
+    );
+
+    let _w2 = map_window_sized(&mut f, id, (100, 100), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (w1_pos.0, w1_pos.1 + 100.),
+        "second window must first-fit below the first",
+    );
+
+    let _w3 = map_window_sized(&mut f, id, (100, 100), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (w1_pos.0, w1_pos.1 + 200.),
+        "third window must continue the downward first-fit chain",
+    );
+}
+
+/// Transient windows (dialogs) center horizontally on their parent and sit
+/// at the top-biased third vertically, leaving twice as much parent below as
+/// above (place.c).
+#[test]
+fn placement_dialogs_center_on_parent() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let parent = map_window_sized(&mut f, id, (600, 400), None);
+    let parent_pos = focused_window_pos(&mut f);
+
+    let _dialog = map_window_sized(&mut f, id, (200, 100), Some(&parent));
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (
+            parent_pos.0 + (600. - 200.) / 2.,
+            parent_pos.1 + (400. - 100.) / 3.,
+        ),
+        "a transient must center on its parent, biased to the top third",
+    );
+}
+
+/// When nothing fits, placement cascades from the work-area origin in 50px
+/// diagonal steps (place.c find_next_cascade).
+#[test]
+fn placement_cascades_when_nothing_fits() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // 1000×600 windows: after the first takes the centered-tile slot,
+    // below/right candidates all overflow the 1920×1080 work area, so
+    // first-fit fails and every subsequent window cascades.
+    let _w1 = map_window_sized(&mut f, id, (1000, 600), None);
+
+    let _w2 = map_window_sized(&mut f, id, (1000, 600), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (0., 0.),
+        "the first cascaded window must sit at the work-area origin",
+    );
+
+    let _w3 = map_window_sized(&mut f, id, (1000, 600), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (50., 50.),
+        "the next cascade slot is one 50px diagonal step down",
+    );
+
+    let _w4 = map_window_sized(&mut f, id, (1000, 600), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (100., 100.),
+        "each occupied slot steps the cascade another 50px",
+    );
+}

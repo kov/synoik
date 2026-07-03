@@ -575,7 +575,10 @@ impl XdgShellHandler for State {
                             state.states.unset(xdg_toplevel::State::Maximized);
                         });
 
-                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let is_floating = rules.compute_open_floating(
+                            &toplevel,
+                            self.niri.config.borrow().layout.windowing_mode,
+                        );
                         let configure_width = if is_floating {
                             *floating_width
                         } else if *is_full_width {
@@ -785,7 +788,10 @@ impl XdgShellHandler for State {
                             }
                         });
 
-                        let is_floating = rules.compute_open_floating(&toplevel);
+                        let is_floating = rules.compute_open_floating(
+                            &toplevel,
+                            self.niri.config.borrow().layout.windowing_mode,
+                        );
                         let configure_width = if is_floating {
                             *floating_width
                         } else if *is_full_width {
@@ -1109,7 +1115,8 @@ impl State {
         let mut height = None;
         let mut floating_height = None;
         let is_full_width = rules.open_maximized.unwrap_or(false);
-        let is_floating = rules.compute_open_floating(toplevel);
+        let is_floating =
+            rules.compute_open_floating(toplevel, self.niri.config.borrow().layout.windowing_mode);
 
         // Tell the surface the preferred size and bounds for its likely output.
         let ws = rules

@@ -9,7 +9,7 @@ use super::*;
 
 // Sets up a fixture with two outputs and 100×100 window.
 fn set_up() -> (Fixture, ClientId, WlSurface) {
-    set_up_with_config(Config::default())
+    set_up_with_config(scrolling(Config::default()))
 }
 
 fn set_up_with_config(config: Config) -> (Fixture, ClientId, WlSurface) {
@@ -782,7 +782,7 @@ fn interactive_move_restores_floating_size_when_set_to_floating() {
 
 #[test]
 fn floating_doesnt_store_fullscreen_size() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1280, 720));
 
@@ -842,7 +842,7 @@ fn floating_doesnt_store_fullscreen_size() {
 
 #[test]
 fn floating_doesnt_store_maximized_size() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1280, 720));
 
@@ -908,7 +908,7 @@ window-rule {
     max-width 300
 }
 "##;
-    let config = Config::parse_mem(config).unwrap();
+    let config = scrolling(Config::parse_mem(config).unwrap());
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Commit to the Activated state configure.
@@ -1209,7 +1209,7 @@ layout {
     gaps 0
 }
 "##;
-    let config = Config::parse_mem(config).unwrap();
+    let config = scrolling(Config::parse_mem(config).unwrap());
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Make it floating.
@@ -1253,7 +1253,7 @@ layout {
     gaps 0
 }
 "##;
-    let config = Config::parse_mem(config).unwrap();
+    let config = scrolling(Config::parse_mem(config).unwrap());
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Make it floating.

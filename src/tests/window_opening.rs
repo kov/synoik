@@ -11,7 +11,7 @@ use crate::utils::with_toplevel_role;
 
 #[test]
 fn simple_no_workspaces() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
 
     let id = f.add_client();
     let window = f.client(id).create_window();
@@ -39,7 +39,7 @@ fn simple_no_workspaces() {
 
 #[test]
 fn simple() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
 
     let id = f.add_client();
@@ -68,7 +68,7 @@ fn simple() {
 #[test]
 #[should_panic(expected = "Protocol error 3 on object xdg_surface")]
 fn dont_ack_initial_configure() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::with_config(scrolling(Config::default()));
     f.add_output(1, (1920, 1080));
 
     let id = f.add_client();
@@ -306,7 +306,7 @@ window-rule {{
 
     snapshot_desc.push(format!("config:{config}"));
 
-    let config = Config::parse_mem(&config).unwrap();
+    let config = scrolling(Config::parse_mem(&config).unwrap());
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));
@@ -601,7 +601,7 @@ layout {
 
     snapshot_desc.push(format!("config:{config}"));
 
-    let config = Config::parse_mem(&config).unwrap();
+    let config = scrolling(Config::parse_mem(&config).unwrap());
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));
@@ -772,7 +772,7 @@ window-rule {
 
     snapshot_desc.push(format!("config:{config}"));
 
-    let config = Config::parse_mem(&config).unwrap();
+    let config = scrolling(Config::parse_mem(&config).unwrap());
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));

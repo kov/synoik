@@ -161,6 +161,26 @@ gsd-media-keys' volume/brightness/media keys work, though without OSD popups
 until `ShowOSD` exists); there is no panel or GNOME chrome. The gaps you hit
 here are, in effect, the Phase 1 worklist.
 
+## Windowing mode: floating by default
+
+New windows **open floating with GNOME semantics** (`layout {
+windowing-mode "floating" }`, the default): mutter's placement rules
+(`src/layout/floating.rs`, ported from mutter `src/core/place.c`) — dialogs
+center on their parent (top-biased third), other windows first-fit without
+overlap and cascade in 50px steps when nothing fits. Window rules
+(`open-floating false`) still override per window.
+
+niri's scrollable tiling is one config line away:
+
+```kdl
+layout {
+    windowing-mode "scrolling"
+}
+```
+
+(The matching GNOME-side setting is deferred; the switch lives in the niri
+config for now.)
+
 ## How GNOME settings feed in
 
 On startup the compositor reads the settings it honors from the **same

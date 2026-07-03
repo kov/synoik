@@ -110,6 +110,10 @@ input {
 // Find more information on the wiki:
 // https://niri-wm.github.io/niri/Configuration:-Layout
 layout {
+    // How new windows are managed: "floating" (GNOME semantics, the default)
+    // or "scrolling" (niri's scrollable tiling).
+    // windowing-mode "floating"
+
     // Set gaps around windows in logical pixels.
     gaps 16
 

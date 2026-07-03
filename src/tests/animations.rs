@@ -73,7 +73,7 @@ fn set_up() -> Fixture {
         curve: Curve::Linear,
     });
 
-    let mut config = Config::default();
+    let mut config = scrolling(Config::default());
     config.layout.gaps = 0.0;
     config.animations.window_resize.anim.kind = LINEAR;
     config.animations.window_movement.0.kind = LINEAR;
