@@ -1,0 +1,13 @@
+[package]
+name = "vk-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Stage 0 bring-up spike for the owned Vulkan render stack (see docs/fork render plan). Not wired into the compositor."
+
+[dependencies]
+anyhow.workspace = true
+ash = "0.38.0"
+png = "0.18.1"
