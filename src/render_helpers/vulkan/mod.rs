@@ -16,6 +16,8 @@
 mod error;
 mod frame;
 mod renderer;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub use error::VulkanError;
