@@ -224,9 +224,7 @@ impl BorderRenderElement {
     }
 
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer)
-            .program(ProgramType::Border)
-            .is_some()
+        Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Border).is_some())
     }
 }
 

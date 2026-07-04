@@ -42,7 +42,10 @@ impl GradientFadeTextureRenderElement {
     }
 
     pub fn shader(renderer: &mut GlesRenderer) -> Option<GradientFadeShader> {
-        let program = Shaders::get(renderer).gradient_fade.clone();
+        let program = Shaders::get(renderer)
+            .expect("a GlesRenderer is always GLES-backed")
+            .gradient_fade
+            .clone();
         program.map(GradientFadeShader)
     }
 }

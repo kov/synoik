@@ -41,7 +41,10 @@ impl RoundedTextureRenderElement {
         scale: Scale<f64>,
     ) -> Self {
         // Missing shader (failed to compile) degrades to square corners.
-        let program = Shaders::get(renderer).clipped_surface.clone();
+        let program = Shaders::get(renderer)
+            .expect("a GlesRenderer is always GLES-backed")
+            .clipped_surface
+            .clone();
         Self {
             inner,
             program,

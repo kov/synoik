@@ -838,7 +838,9 @@ impl Tty {
                 debug!("bound legacy EGL to wl_display");
             }
 
-            let gles_renderer = renderer.as_gles_renderer();
+            let gles_renderer = renderer
+                .try_as_gles_renderer()
+                .expect("the Tty backend is always GLES-backed");
             resources::init(gles_renderer);
             shaders::init(gles_renderer);
 
@@ -1843,7 +1845,9 @@ impl Tty {
             .gpu_manager
             .single_renderer(&self.primary_render_node)
             .ok()?;
-        Some(f(renderer.as_gles_renderer()))
+        Some(f(renderer
+            .try_as_gles_renderer()
+            .expect("the Tty backend is always GLES-backed")))
     }
 
     pub fn render(

@@ -95,7 +95,10 @@ impl BlurProgram {
 
 impl Blur {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
-        let program = Shaders::get(renderer).blur.clone()?;
+        let program = Shaders::get(renderer)
+            .expect("a GlesRenderer is always GLES-backed")
+            .blur
+            .clone()?;
         Some(Self {
             program,
             renderer_context_id: renderer.context_id(),

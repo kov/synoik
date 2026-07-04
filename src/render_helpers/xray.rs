@@ -104,7 +104,10 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        let program = Shaders::get(ctx.renderer).postprocess_and_clip.clone();
+        let program = Shaders::get(ctx.renderer)
+            .expect("a GlesRenderer is always GLES-backed")
+            .postprocess_and_clip
+            .clone();
 
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);

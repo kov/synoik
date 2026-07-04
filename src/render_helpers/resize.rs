@@ -116,9 +116,7 @@ impl ResizeRenderElement {
     }
 
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer)
-            .program(ProgramType::Resize)
-            .is_some()
+        Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Resize).is_some())
     }
 }
 
