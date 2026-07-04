@@ -41,7 +41,7 @@ impl Gpu {
             unsafe { ash::Entry::load() }.context("loading the Vulkan loader (libvulkan)")?;
 
         let app = vk::ApplicationInfo::default()
-            .application_name(c"vk-spike")
+            .application_name(c"niri-vk")
             .api_version(vk::make_api_version(0, 1, 3, 0));
         let create_info = vk::InstanceCreateInfo::default().application_info(&app);
         let instance =

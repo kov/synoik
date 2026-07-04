@@ -1,9 +1,9 @@
 //! Stage 0 bring-up spike for the owned Vulkan render stack.
 //!
-//! Run:  `cargo run -p vk-spike`                        (default ICD → Venus on this VM)
-//!       `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p vk-spike`
+//! Run:  `cargo run -p niri-vk`                         (default ICD → Venus on this VM)
+//!       `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p niri-vk`
 //!                                                       (lavapipe → deterministic CPU baseline)
-//! Test: `cargo test -p vk-spike`                       (same, on whichever ICD the env selects)
+//! Test: `cargo test -p niri-vk`                        (same, on whichever ICD the env selects)
 //!
 //! Three offscreen render demos, each split into a pure `render_*` (returns read-back pixels) and
 //! a shared `assert_*` (structural, resolution-independent invariants):
@@ -19,25 +19,19 @@
 //! blending, descriptor sets / samplers, ping-pong blur, glyph atlas) on Venus and lavapipe,
 //! headless.
 
-mod blur;
-mod dmabuf;
-mod gpu;
 mod pango_ref;
-mod probes;
-mod render;
-mod text;
-mod texture;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ash::vk;
-use blur::BlurChain;
-use dmabuf::{ForeignBuffer, ImportedImage};
-use gpu::Gpu;
-use render::{QuadPipeline, QuadPush, RenderTarget};
-use text::{build_text, TextRenderer};
-use texture::Texture;
+use niri_vk::blur::BlurChain;
+use niri_vk::dmabuf::{ForeignBuffer, ImportedImage};
+use niri_vk::gpu::Gpu;
+use niri_vk::probes;
+use niri_vk::render::{self, QuadPipeline, QuadPush, RenderTarget};
+use niri_vk::text::{build_text, TextRenderer};
+use niri_vk::texture::Texture;
 
 const QUAD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
 const SOLID_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solid.frag.spv"));
@@ -58,23 +52,23 @@ const TEX_BL: [u8; 4] = [60, 120, 240, 255];
 const TEX_BR: [u8; 4] = [240, 240, 240, 255];
 
 fn main() -> Result<()> {
-    eprintln!("vk-spike: enumerating Vulkan devices");
+    eprintln!("niri-vk: enumerating Vulkan devices");
     let gpu = Gpu::new()?;
-    eprintln!("vk-spike: using {:?}", gpu.device_name);
+    eprintln!("niri-vk: using {:?}", gpu.device_name);
 
     let scene = render_scene(&gpu)?;
     assert_scene(&scene)?;
     let out = artifact_path("scene.png");
     write_png(&out, WIDTH, HEIGHT, &scene)?;
-    eprintln!("vk-spike: wrote {}", out.display());
-    eprintln!("vk-spike: OK — render pass + solid + SDF rounded-rect + textured quad verified");
+    eprintln!("niri-vk: wrote {}", out.display());
+    eprintln!("niri-vk: OK — render pass + solid + SDF rounded-rect + textured quad verified");
 
     let blur = render_blur(&gpu)?;
     assert_blur(&blur)?;
     let path = artifact_path("blur.png");
     write_png(&path, SRC_W, SRC_H, &blur)?;
-    eprintln!("vk-spike: wrote {}", path.display());
-    eprintln!("vk-spike: OK — dual-kawase blur verified");
+    eprintln!("niri-vk: wrote {}", path.display());
+    eprintln!("niri-vk: OK — dual-kawase blur verified");
 
     let text = render_text(&gpu)?;
     assert_text(&text)?;
@@ -93,17 +87,17 @@ fn main() -> Result<()> {
     let path = artifact_path("text.png");
     write_png(&path, TW, TH * 2, &combined)?;
     eprintln!(
-        "vk-spike: wrote {} (top: swash atlas, bottom: pango ref)",
+        "niri-vk: wrote {} (top: swash atlas, bottom: pango ref)",
         path.display()
     );
-    eprintln!("vk-spike: OK — hinted glyph-atlas text verified");
+    eprintln!("niri-vk: OK — hinted glyph-atlas text verified");
 
     if let Some(dmabuf) = render_dmabuf(&gpu)? {
         assert_dmabuf(&dmabuf)?;
         let path = artifact_path("dmabuf.png");
         write_png(&path, DMABUF_W, DMABUF_H, &dmabuf)?;
-        eprintln!("vk-spike: wrote {}", path.display());
-        eprintln!("vk-spike: OK — foreign dmabuf import (GBM, LINEAR modifier) verified");
+        eprintln!("niri-vk: wrote {}", path.display());
+        eprintln!("niri-vk: OK — foreign dmabuf import (GBM, LINEAR modifier) verified");
     }
 
     probes::report(&gpu);
@@ -248,7 +242,7 @@ fn assert_blur(out: &[u8]) -> Result<()> {
     let center = at(ow / 2, cy);
     let step_l = at(ow / 2 - 1, cy);
     let step_r = at(ow / 2, cy);
-    eprintln!("vk-spike: blur left={left:?} center={center:?} right={right:?}");
+    eprintln!("niri-vk: blur left={left:?} center={center:?} right={right:?}");
 
     anyhow::ensure!(
         left[0] as i16 - left[2] as i16 > 40,
@@ -343,7 +337,7 @@ fn assert_text(ours: &[u8]) -> Result<()> {
         .chunks_exact(4)
         .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
         .count();
-    eprintln!("vk-spike: text bright pixels = {bright}");
+    eprintln!("niri-vk: text bright pixels = {bright}");
     check(
         "text bg corner is dark",
         sample_at(ours, TW, 2, 2),
@@ -374,7 +368,7 @@ fn render_dmabuf(gpu: &Gpu) -> Result<Option<Vec<u8>>> {
     // dmabufs — skip. (lavapipe still advertises the extensions, so this must gate before them.)
     if gpu.device_type == vk::PhysicalDeviceType::CPU {
         eprintln!(
-            "vk-spike: skipping dmabuf demo — {:?} is a CPU device (no dmabuf import)",
+            "niri-vk: skipping dmabuf demo — {:?} is a CPU device (no dmabuf import)",
             gpu.device_name
         );
         return Ok(None);
@@ -385,14 +379,14 @@ fn render_dmabuf(gpu: &Gpu) -> Result<Option<Vec<u8>>> {
         "VK_EXT_image_drm_format_modifier",
     ] {
         if !gpu.supports(ext) {
-            eprintln!("vk-spike: skipping dmabuf demo — {ext} not available on this ICD");
+            eprintln!("niri-vk: skipping dmabuf demo — {ext} not available on this ICD");
             return Ok(None);
         }
     }
 
     let buf = ForeignBuffer::allocate_filled(DMABUF_W, DMABUF_H, [DMA_TL, DMA_TR, DMA_BL, DMA_BR])?;
     eprintln!(
-        "vk-spike: dmabuf {}x{} modifier {:#x} stride {} offset {}",
+        "niri-vk: dmabuf {}x{} modifier {:#x} stride {} offset {}",
         buf.width, buf.height, buf.modifier, buf.stride, buf.offset
     );
 
@@ -448,7 +442,7 @@ fn assert_dmabuf(pixels: &[u8]) -> Result<()> {
     let tr = sample_at(pixels, DMABUF_W, DMABUF_W * 3 / 4, DMABUF_H / 4);
     let bl = sample_at(pixels, DMABUF_W, DMABUF_W / 4, DMABUF_H * 3 / 4);
     let br = sample_at(pixels, DMABUF_W, DMABUF_W * 3 / 4, DMABUF_H * 3 / 4);
-    eprintln!("vk-spike: dmabuf quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
+    eprintln!("niri-vk: dmabuf quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
     check("dmabuf TL", tl, DMA_TL, 2)?;
     check("dmabuf TR", tr, DMA_TR, 2)?;
     check("dmabuf BL", bl, DMA_BL, 2)?;
@@ -546,7 +540,7 @@ mod tests {
     use super::*;
 
     // Exercises the full offscreen path — scene, blur, text — on a single device. The ICD is
-    // chosen by the environment: `cargo test -p vk-spike` hits the real GPU (Venus here); pinning
+    // chosen by the environment: `cargo test -p niri-vk` hits the real GPU (Venus here); pinning
     // VK_DRIVER_FILES to lavapipe gives a deterministic CPU baseline. Assertions are structural
     // (resolution-independent), so they hold on any conformant driver — no golden images.
     #[test]

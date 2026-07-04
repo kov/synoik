@@ -59,7 +59,7 @@ data path itself is up. `renderD128` is world-rw; `Seccomp: 0`.
 Measured with `vkGetPhysicalDeviceExternalSemaphoreProperties` for the cross product
 {`OPAQUE_FD`, `SYNC_FD`} × {binary, timeline}, reading
 `externalSemaphoreFeatures & {EXPORTABLE, IMPORTABLE}`. Source lives in this repo at
-`vk-spike/src/probes.rs` (`external_semaphores()`); the timeline variant is requested by
+`niri-vk/src/probes.rs` (`external_semaphores()`); the timeline variant is requested by
 chaining `VkSemaphoreTypeCreateInfo{ semaphoreType = TIMELINE }` into the query's `pNext`.
 
 **Result (Venus — and byte-for-byte identical on lavapipe):**
@@ -76,9 +76,9 @@ Reproduce (from the guest):
 
 ```sh
 # Venus (default ICD on this VM):
-cargo run -p vk-spike        # prints the "probes" block at the end
+cargo run -p niri-vk        # prints the "probes" block at the end
 # lavapipe (deterministic CPU baseline — shows the SAME semaphore result):
-VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p vk-spike
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p niri-vk
 ```
 
 `vulkaninfo` in this Mesa build does **not** print an external-semaphore section, so the probe
@@ -257,7 +257,7 @@ confirm the pieces the guest can't see from a capability bit:
 - Prior art to copy (C): `wlroots` `render/vulkan` + `types/wlr_linux_drm_syncobj_v1.c`
   (timeline syncobj ⟷ sync_file ⟷ binary VkSemaphore, exactly §5); Mesa `src/virtio/venus`
   external-sync handling; `virglrenderer` Venus backend fence code.
-- This repo: `vk-spike/src/probes.rs` (the probe), and the memory note
+- This repo: `niri-vk/src/probes.rs` (the probe), and the memory note
   `render-stack-maturity.md` (Stage 0 / Stage 3 planning) in
   `~/.claude/projects/-home-kov-Projects-gnome-shell-rs/memory/`.
 

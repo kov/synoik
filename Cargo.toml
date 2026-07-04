@@ -3,7 +3,7 @@ members = [
     "niri-config",
     "niri-ipc",
     "niri-visual-tests",
-    "vk-spike",
+    "niri-vk",
 ]
 
 [workspace.package]

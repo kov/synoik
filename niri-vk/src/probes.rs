@@ -12,7 +12,7 @@ use ash::vk;
 use crate::gpu::Gpu;
 
 pub fn report(gpu: &Gpu) {
-    eprintln!("vk-spike: --- probes (planning data for later stages) ---");
+    eprintln!("niri-vk: --- probes (planning data for later stages) ---");
     drm_modifiers(
         gpu,
         vk::Format::B8G8R8A8_UNORM,

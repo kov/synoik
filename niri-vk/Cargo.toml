@@ -1,0 +1,22 @@
+[package]
+name = "niri-vk"
+version = "0.0.0"
+edition = "2021"
+# Above the workspace's 1.85 floor (pango 0.22 needs 1.92). This library leads the toolchain
+# requirement; matching niri's pango 0.22 also dedupes the workspace build.
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Owned Vulkan (ash) render primitives for the compositor's Vulkan renderer, plus a headless bring-up/CI binary (see docs/fork render plan)."
+
+[dependencies]
+anyhow.workspace = true
+ash = "0.38.0"
+cairo-rs = "0.22.0"
+cosmic-text = "0.19.0"
+etagere = "0.3.0"
+gbm = "0.18.0"
+pango = "0.22.8"
+pangocairo = "0.22.8"
+png = "0.18.1"
+swash = "0.2"

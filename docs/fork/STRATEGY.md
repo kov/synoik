@@ -343,8 +343,10 @@ first-class constraint on this work.
   pipeline (solid / SDF-rounded / textured) + dual-kawase blur + hinted cosmic-text/swash
   glyph-atlas text vs a pango reference, all verified on both Venus and lavapipe via structural
   pixel-invariant `cargo test` (no golden images), plus forward-looking DRM-modifier /
-  external-semaphore probes. Lives in `vk-spike/` (isolated workspace member; its ash/png deps
-  never touch the niri binary). **Text at 1× must stay crisp → hinted glyph atlas, not
+  external-semaphore probes. Lives in `niri-vk/` (workspace member, promoted from the spike into a
+  reusable ash primitive **library** + a headless bring-up/CI binary, so the Stage-2 Vulkan
+  renderer consumes the same low-level pieces; its ash/png deps reach the niri binary only behind
+  the opt-in `vulkan` feature). **Text at 1× must stay crisp → hinted glyph atlas, not
   GPU-raster-into-atlas.**
 - **(1) dmabuf import with DRM modifiers on Venus** — the #1 front-loaded risk. Probes show
   Venus exposes only the LINEAR modifier here, so scope the importer to linear.

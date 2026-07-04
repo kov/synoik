@@ -34,11 +34,11 @@ const IMPORT_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 fn log_try<T>(label: &str, r: std::io::Result<T>) -> Option<T> {
     match r {
         Ok(v) => {
-            eprintln!("vk-spike: gbm OK  {label}");
+            eprintln!("niri-vk: gbm OK  {label}");
             Some(v)
         }
         Err(e) => {
-            eprintln!("vk-spike: gbm --  {label}: {e}");
+            eprintln!("niri-vk: gbm --  {label}: {e}");
             None
         }
     }
@@ -125,7 +125,7 @@ impl ForeignBuffer {
                 )
             })
             .context("gbm allocate LINEAR buffer: every strategy failed (see attempts above)")?;
-        eprintln!("vk-spike: gbm buffer reported modifier {:?}", bo.modifier());
+        eprintln!("niri-vk: gbm buffer reported modifier {:?}", bo.modifier());
 
         let modifier = match bo.modifier() {
             // USE_LINEAR forces a linear layout; some drivers report INVALID rather than LINEAR.
@@ -239,7 +239,7 @@ impl ImportedImage {
         } {
             Ok(()) => type_bits &= fd_props.memory_type_bits,
             Err(e) => eprintln!(
-                "vk-spike: vkGetMemoryFdPropertiesKHR failed ({e:?}); using image memory_type_bits"
+                "niri-vk: vkGetMemoryFdPropertiesKHR failed ({e:?}); using image memory_type_bits"
             ),
         }
         anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
