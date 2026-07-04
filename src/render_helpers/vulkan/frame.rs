@@ -43,10 +43,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         output_size: Size<i32, Physical>,
         transform: Transform,
     ) -> Result<Self, VulkanError> {
+        let (fb_w, fb_h) = fb.buffer.extent();
         let extent = vk::Extent2D {
-            width: fb.buffer.width,
-            height: fb.buffer.height,
+            width: fb_w,
+            height: fb_h,
         };
+        // `Bind<VkTexture>` only produces a `VkFramebuffer` for offscreen textures, so this is
+        // Some.
+        let framebuffer = fb
+            .buffer
+            .framebuffer()
+            .expect("bound VkFramebuffer wraps an offscreen texture");
         let cbuf = {
             let dev = &renderer.gpu.device;
             let alloc = vk::CommandBufferAllocateInfo::default()
@@ -64,7 +71,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // Load op is DONT_CARE (see renderer::create_render_pass); callers clear explicitly.
             let pass_begin = vk::RenderPassBeginInfo::default()
                 .render_pass(renderer.render_pass)
-                .framebuffer(fb.buffer.framebuffer)
+                .framebuffer(framebuffer)
                 .render_area(render_area);
             let viewport = vk::Viewport {
                 x: 0.0,
@@ -96,7 +103,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
     /// Render-target size in pixels, as `[w, h]` floats for the shader's NDC conversion.
     fn target_dims(&self) -> [f32; 2] {
-        [self.fb.buffer.width as f32, self.fb.buffer.height as f32]
+        let (w, h) = self.fb.buffer.extent();
+        [w as f32, h as f32]
     }
 
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
@@ -278,6 +286,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&self.cbuf));
         }
+        // The render pass's `final_layout` leaves the target in TRANSFER_SRC_OPTIMAL (see
+        // `create_render_pass`); record it so readback is a no-op and `make_sampleable` knows the
+        // source layout for its barrier.
+        self.fb
+            .buffer
+            .set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         Ok(SyncPoint::signaled())
     }
 }
@@ -303,9 +317,10 @@ impl Frame for VulkanFrame<'_, '_> {
         color: Color32F,
         at: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
+        let (fb_w, fb_h) = self.fb.buffer.extent();
         let extent = vk::Extent2D {
-            width: self.fb.buffer.width,
-            height: self.fb.buffer.height,
+            width: fb_w,
+            height: fb_h,
         };
         let attachment = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,

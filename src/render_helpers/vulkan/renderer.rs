@@ -21,9 +21,7 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform
 
 use super::error::VulkanError;
 use super::frame::VulkanFrame;
-use super::types::{
-    is_rgba8888, VkFramebuffer, VkMapping, VkRenderBuffer, VkTexture, IMAGE_VK_FORMAT,
-};
+use super::types::{is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT};
 
 /// One `quad.vert` + material-fragment graphics pipeline with dynamic viewport/scissor (so it is
 /// reused across differently-sized targets).
@@ -203,11 +201,13 @@ impl VulkanRenderer {
         Ok((pool, set))
     }
 
-    /// Copy a `w×h` region of `image` (assumed `TRANSFER_SRC_OPTIMAL`) into a host `Vec<u8>` of
-    /// tight RGBA8. Used by [`ExportMem::copy_framebuffer`].
+    /// Copy a `w×h` region of `tex`'s image into a host `Vec<u8>` of tight RGBA8. Used by
+    /// [`ExportMem::copy_framebuffer`]. Transitions the image to `TRANSFER_SRC_OPTIMAL` first if
+    /// the tracked layout says it is elsewhere (e.g. `SHADER_READ_ONLY_OPTIMAL` after it was
+    /// sampled).
     fn download_region(
         &self,
-        image: vk::Image,
+        tex: &VkTexture,
         x: i32,
         y: i32,
         w: u32,
@@ -215,6 +215,8 @@ impl VulkanRenderer {
     ) -> Result<Vec<u8>, VulkanError> {
         let dev = &self.gpu.device;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
+        let image = tex.image();
+        let old_layout = tex.layout();
 
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size)
@@ -229,6 +231,17 @@ impl VulkanRenderer {
         unsafe { dev.bind_buffer_memory(buffer, mem, 0) }?;
 
         self.gpu.run_commands(self.command_pool, |cbuf| unsafe {
+            if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+                transition_image(
+                    dev,
+                    cbuf,
+                    image,
+                    old_layout,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+            }
             let region = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -262,6 +275,7 @@ impl VulkanRenderer {
                 &[],
             );
         })?;
+        tex.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
 
         let mut pixels = vec![0u8; size as usize];
         unsafe {
@@ -273,6 +287,93 @@ impl VulkanRenderer {
         }
         Ok(pixels)
     }
+
+    /// Transition an offscreen [`VkTexture`] into `SHADER_READ_ONLY_OPTIMAL` so it can be sampled
+    /// after being rendered into (the offscreen-snapshot / blur / clipped-surface bridge). No-op if
+    /// it is already sampleable. Runs as its own fence-waited submission, matching this renderer's
+    /// synchronous per-submit model; call it once, between finishing the offscreen render and using
+    /// the texture as a draw source.
+    // Exercised by the offscreen round-trip test; the live consumers (offscreen snapshots, blur,
+    // clipped-surface) that call it in a non-test build are the next M3 step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn make_sampleable(&self, tex: &VkTexture) -> Result<(), VulkanError> {
+        let old_layout = tex.layout();
+        if old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return Ok(());
+        }
+        let image = tex.image();
+        self.gpu.run_commands(self.command_pool, |cbuf| unsafe {
+            transition_image(
+                &self.gpu.device,
+                cbuf,
+                image,
+                old_layout,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            );
+        })?;
+        tex.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(())
+    }
+}
+
+/// The `(src_access, src_stage)` masks for a layout transition *out of* `old` — the write/stage
+/// that must complete before the new layout is usable. Covers the layouts an offscreen
+/// [`VkTexture`] passes through in this renderer's synchronous lifecycle.
+fn src_masks_for(old: vk::ImageLayout) -> (vk::AccessFlags, vk::PipelineStageFlags) {
+    match old {
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        ),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+        ),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ),
+        // UNDEFINED (and anything else): no prior contents to preserve.
+        _ => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        ),
+    }
+}
+
+/// Record a single-image layout transition barrier into `cbuf`. Prior hazards are already resolved
+/// by this renderer's fence-per-submit model, so the source masks come only from `old`'s layout.
+#[allow(clippy::too_many_arguments)]
+unsafe fn transition_image(
+    dev: &ash::Device,
+    cbuf: vk::CommandBuffer,
+    image: vk::Image,
+    old: vk::ImageLayout,
+    new: vk::ImageLayout,
+    dst_access: vk::AccessFlags,
+    dst_stage: vk::PipelineStageFlags,
+) {
+    let (src_access, src_stage) = src_masks_for(old);
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(old)
+        .new_layout(new)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(COLOR_RANGE)
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access);
+    dev.cmd_pipeline_barrier(
+        cbuf,
+        src_stage,
+        dst_stage,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        std::slice::from_ref(&barrier),
+    );
 }
 
 impl Drop for VulkanRenderer {
@@ -352,69 +453,52 @@ impl Renderer for VulkanRenderer {
     }
 }
 
-impl Bind<VkRenderBuffer> for VulkanRenderer {
-    fn bind<'a>(
-        &mut self,
-        target: &'a mut VkRenderBuffer,
-    ) -> Result<VkFramebuffer<'a>, VulkanError> {
+impl Bind<VkTexture> for VulkanRenderer {
+    fn bind<'a>(&mut self, target: &'a mut VkTexture) -> Result<VkFramebuffer<'a>, VulkanError> {
+        // Only offscreen textures (created by `create_buffer`) carry a render-pass framebuffer.
+        if target.framebuffer().is_none() {
+            return Err(VulkanError::Unsupported(
+                "binding an imported (non-renderable) texture as a target",
+            ));
+        }
         Ok(VkFramebuffer { buffer: target })
     }
 }
 
-impl Offscreen<VkRenderBuffer> for VulkanRenderer {
+impl Offscreen<VkTexture> for VulkanRenderer {
     fn create_buffer(
         &mut self,
         format: Fourcc,
         size: Size<i32, BufferCoord>,
-    ) -> Result<VkRenderBuffer, VulkanError> {
+    ) -> Result<VkTexture, VulkanError> {
         if !is_rgba8888(format) {
             return Err(VulkanError::UnsupportedFormat(format));
         }
         let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-        let dev = &self.gpu.device;
+        let filter = match self.upscale_filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
 
-        let image_ci = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(IMAGE_VK_FORMAT)
-            .extent(vk::Extent3D {
-                width: w,
-                height: h,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { dev.create_image(&image_ci, None) }?;
-        let req = unsafe { dev.get_image_memory_requirements(image) };
-        let memory = self
-            .gpu
-            .allocate(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        unsafe { dev.bind_image_memory(image, memory, 0) }?;
-
-        let view_ci = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(IMAGE_VK_FORMAT)
-            .subresource_range(COLOR_RANGE);
-        let view = unsafe { dev.create_image_view(&view_ci, None) }?;
+        // A blank, sampleable color-attachment image (see `Texture::new_color_target`), plus a
+        // render-pass framebuffer over its view and a descriptor set so it can be re-sampled once
+        // rendered into — the offscreen-snapshot / blur / clipped-surface bridge.
+        let tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
+        let (desc_pool, set) = self.make_texture_set(&tex)?;
 
         let fb_ci = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
-            .attachments(std::slice::from_ref(&view))
+            .attachments(std::slice::from_ref(&tex.view))
             .width(w)
             .height(h)
             .layers(1);
-        let framebuffer = unsafe { dev.create_framebuffer(&fb_ci, None) }?;
+        let framebuffer = unsafe { self.gpu.device.create_framebuffer(&fb_ci, None) }?;
 
-        Ok(VkRenderBuffer::new(
+        Ok(VkTexture::new_offscreen(
             self.gpu.clone(),
-            image,
-            memory,
-            view,
+            tex,
+            desc_pool,
+            set,
             framebuffer,
             w,
             h,
@@ -481,7 +565,7 @@ impl ExportMem for VulkanRenderer {
         }
         let w = region.size.w.max(0) as u32;
         let h = region.size.h.max(0) as u32;
-        let data = self.download_region(target.buffer.image, region.loc.x, region.loc.y, w, h)?;
+        let data = self.download_region(&*target.buffer, region.loc.x, region.loc.y, w, h)?;
         Ok(VkMapping {
             data,
             width: w,

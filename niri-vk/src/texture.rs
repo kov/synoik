@@ -53,6 +53,71 @@ impl Texture {
         )
     }
 
+    /// Create a blank `width*height` color target that is **both** renderable and sampleable: a
+    /// device-local `COLOR_ATTACHMENT | SAMPLED | TRANSFER_SRC` image plus a view and sampler, with
+    /// no upload. The image is left in `UNDEFINED` layout — the caller's render pass performs the
+    /// first transition (its `initial_layout` is `UNDEFINED`, discarding the blank contents), and a
+    /// later barrier moves it to `SHADER_READ_ONLY_OPTIMAL` when it is re-sampled. This is the
+    /// offscreen-snapshot / blur / clipped-surface bridge: render into it, then sample it.
+    pub fn new_color_target(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        let device = &gpu.device;
+
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(FORMAT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image =
+            unsafe { device.create_image(&image_ci, None) }.context("color-target image")?;
+        let ireq = unsafe { device.get_image_memory_requirements(image) };
+        let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(FORMAT)
+            .subresource_range(COLOR_RANGE);
+        let view =
+            unsafe { device.create_image_view(&view_ci, None) }.context("color-target view")?;
+
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+
+        Ok(Texture {
+            image,
+            view,
+            sampler,
+            memory,
+            width,
+            height,
+        })
+    }
+
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
     #[allow(clippy::too_many_arguments)]
     fn upload(

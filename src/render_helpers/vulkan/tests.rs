@@ -734,3 +734,78 @@ fn vulkan_rounded_texture_zero_radius_is_plain() {
         px(&pixels, 32, 32),
     );
 }
+
+// --- The sampleable-offscreen bridge: render into an offscreen, then sample it ------------------
+
+/// Render a scene into an offscreen [`VkTexture`], transition it to sampleable, then draw that
+/// offscreen (full-`src`, 1:1) into a *second* offscreen and read the second back. The re-sampled
+/// result must reproduce the source pixel-for-pixel — proving `Offscreen::create_buffer` targets
+/// can be rendered into **and then re-sampled** (the offscreen-snapshot / blur / clipped-surface
+/// bridge), not merely rendered into and read straight back.
+#[test]
+fn vulkan_offscreen_sampleable_roundtrip() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_offscreen_sampleable_roundtrip: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let size = Size::<i32, Physical>::from((W, H));
+
+    // Source offscreen A: the two-solid scene (red left half, green top-right, clear bottom-right).
+    // `render_elements_into` leaves A holding the scene and returns its readback — our reference
+    // for what a correct re-sample must reproduce.
+    let mut a = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen A");
+    let a_elements: Vec<OutputRenderElements<VulkanRenderer>> = solid_scene()
+        .into_iter()
+        .map(OutputRenderElements::SolidColor)
+        .collect();
+    let a_pixels = render_elements_into(&mut vk, &mut a, &a_elements);
+
+    // The bridge: transition A from its post-render TRANSFER_SRC_OPTIMAL to
+    // SHADER_READ_ONLY_OPTIMAL so it can be bound as a sampled texture.
+    vk.make_sampleable(&a).expect("make A sampleable");
+
+    // Destination offscreen B: clear, then sample all of A 1:1 over the whole quad.
+    let mut b = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen B");
+    {
+        let mut fb = vk.bind(&mut b).expect("bind B");
+        let mut frame = vk
+            .render(&mut fb, size, Transform::Normal)
+            .expect("render B");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear B");
+        let full_src = Rectangle::<f64, BufferCoord>::from_size(Size::from((W as f64, H as f64)));
+        let full_dst = Rectangle::<i32, Physical>::from_size(size);
+        frame
+            .render_texture_from_to(
+                &a,
+                full_src,
+                full_dst,
+                &[full_dst],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("sample A into B");
+        let _sync = frame.finish().expect("finish B");
+    }
+
+    // Read B back and compare to A. A is opaque and the draw is full-coverage 1:1, so B must equal
+    // A.
+    let fb = vk.bind(&mut b).expect("rebind B for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer B");
+    let b_pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    assert_close(&a_pixels, &b_pixels);
+}
