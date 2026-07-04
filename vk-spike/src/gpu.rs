@@ -14,8 +14,7 @@ pub struct Gpu {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family: u32,
-    // Retained for upcoming milestones (format-support queries, DRM-modifier probes).
-    #[allow(dead_code)]
+    // Used by the device probes (format-support / DRM-modifier / external-semaphore queries).
     pub phys: vk::PhysicalDevice,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub device_name: String,
