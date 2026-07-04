@@ -20,6 +20,7 @@
 //! headless.
 
 mod blur;
+mod dmabuf;
 mod gpu;
 mod pango_ref;
 mod probes;
@@ -32,6 +33,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use ash::vk;
 use blur::BlurChain;
+use dmabuf::{ForeignBuffer, ImportedImage};
 use gpu::Gpu;
 use render::{QuadPipeline, QuadPush, RenderTarget};
 use text::{build_text, TextRenderer};
@@ -95,6 +97,14 @@ fn main() -> Result<()> {
         path.display()
     );
     eprintln!("vk-spike: OK — hinted glyph-atlas text verified");
+
+    if let Some(dmabuf) = render_dmabuf(&gpu)? {
+        assert_dmabuf(&dmabuf)?;
+        let path = artifact_path("dmabuf.png");
+        write_png(&path, DMABUF_W, DMABUF_H, &dmabuf)?;
+        eprintln!("vk-spike: wrote {}", path.display());
+        eprintln!("vk-spike: OK — foreign dmabuf import (GBM, LINEAR modifier) verified");
+    }
 
     probes::report(&gpu);
     Ok(())
@@ -347,6 +357,105 @@ fn assert_text(ours: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// --- dmabuf: import a foreign (GBM) buffer and sample it ---------------------------------------
+
+const DMABUF_W: u32 = 64;
+const DMABUF_H: u32 = 64;
+// Four distinct quadrant colors (RGBA), row-major TL, TR, BL, BR.
+const DMA_TL: [u8; 4] = [200, 40, 50, 255];
+const DMA_TR: [u8; 4] = [50, 200, 70, 255];
+const DMA_BL: [u8; 4] = [60, 90, 220, 255];
+const DMA_BR: [u8; 4] = [230, 215, 60, 255];
+
+/// Import a GBM-allocated LINEAR dmabuf and sample it into an RGBA target. Returns `None` when the
+/// dmabuf extensions are absent (lavapipe) so the caller can skip cleanly.
+fn render_dmabuf(gpu: &Gpu) -> Result<Option<Vec<u8>>> {
+    // A CPU device (lavapipe) isn't the GPU backing the DRM render node, so it can't import its
+    // dmabufs — skip. (lavapipe still advertises the extensions, so this must gate before them.)
+    if gpu.device_type == vk::PhysicalDeviceType::CPU {
+        eprintln!(
+            "vk-spike: skipping dmabuf demo — {:?} is a CPU device (no dmabuf import)",
+            gpu.device_name
+        );
+        return Ok(None);
+    }
+    for ext in [
+        "VK_KHR_external_memory_fd",
+        "VK_EXT_external_memory_dma_buf",
+        "VK_EXT_image_drm_format_modifier",
+    ] {
+        if !gpu.supports(ext) {
+            eprintln!("vk-spike: skipping dmabuf demo — {ext} not available on this ICD");
+            return Ok(None);
+        }
+    }
+
+    let buf = ForeignBuffer::allocate_filled(DMABUF_W, DMABUF_H, [DMA_TL, DMA_TR, DMA_BL, DMA_BR])?;
+    eprintln!(
+        "vk-spike: dmabuf {}x{} modifier {:#x} stride {} offset {}",
+        buf.width, buf.height, buf.modifier, buf.stride, buf.offset
+    );
+
+    let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+    let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.context("dmabuf pool")?;
+
+    let imported = ImportedImage::import(gpu, pool, &buf)?;
+
+    // Sample the imported image with a full-target textured quad into a same-size RGBA target.
+    let target = RenderTarget::new(gpu, DMABUF_W, DMABUF_H)?;
+    let set_layout = render::sampler_set_layout(gpu)?;
+    let textured = QuadPipeline::new(
+        gpu,
+        target.render_pass,
+        target.extent(),
+        QUAD_VERT,
+        TEX_FRAG,
+        std::slice::from_ref(&set_layout),
+    )?;
+    let (desc_pool, set) = bind_sampled(gpu, set_layout, imported.view, imported.sampler)?;
+
+    let dims = [DMABUF_W as f32, DMABUF_H as f32];
+    let quad = QuadPush {
+        origin: [0.0, 0.0],
+        size: dims,
+        target: dims,
+        corner_radius: 0.0,
+        _pad0: 0.0,
+        color: [1.0, 1.0, 1.0, 1.0],
+    };
+    gpu.run_commands(pool, |cbuf| {
+        target.begin(gpu, cbuf, unorm(CLEAR));
+        textured.draw(gpu, cbuf, &quad, Some(set));
+        unsafe { gpu.device.cmd_end_render_pass(cbuf) };
+    })?;
+    let pixels = target.read_back(gpu, pool)?;
+
+    unsafe {
+        gpu.device.destroy_descriptor_pool(desc_pool, None);
+        gpu.device.destroy_descriptor_set_layout(set_layout, None);
+        gpu.device.destroy_command_pool(pool, None);
+    }
+    textured.destroy(gpu);
+    target.destroy(gpu);
+    imported.destroy(gpu);
+    drop(buf);
+    Ok(Some(pixels))
+}
+
+/// The four quadrant centers sampled back must match the four colors written into the dmabuf.
+fn assert_dmabuf(pixels: &[u8]) -> Result<()> {
+    let tl = sample_at(pixels, DMABUF_W, DMABUF_W / 4, DMABUF_H / 4);
+    let tr = sample_at(pixels, DMABUF_W, DMABUF_W * 3 / 4, DMABUF_H / 4);
+    let bl = sample_at(pixels, DMABUF_W, DMABUF_W / 4, DMABUF_H * 3 / 4);
+    let br = sample_at(pixels, DMABUF_W, DMABUF_W * 3 / 4, DMABUF_H * 3 / 4);
+    eprintln!("vk-spike: dmabuf quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
+    check("dmabuf TL", tl, DMA_TL, 2)?;
+    check("dmabuf TR", tr, DMA_TR, 2)?;
+    check("dmabuf BL", bl, DMA_BL, 2)?;
+    check("dmabuf BR", br, DMA_BR, 2)?;
+    Ok(())
+}
+
 // --- shared helpers ----------------------------------------------------------------------------
 
 /// Allocate a one-set descriptor pool and point set 0 / binding 0 at `tex`.
@@ -354,6 +463,16 @@ fn bind_texture(
     gpu: &Gpu,
     set_layout: vk::DescriptorSetLayout,
     tex: &Texture,
+) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
+    bind_sampled(gpu, set_layout, tex.view, tex.sampler)
+}
+
+/// Allocate a one-set descriptor pool and point set 0 / binding 0 at a sampled `view`/`sampler`.
+fn bind_sampled(
+    gpu: &Gpu,
+    set_layout: vk::DescriptorSetLayout,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
 ) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
     let device = &gpu.device;
     let sizes = [vk::DescriptorPoolSize::default()
@@ -370,8 +489,8 @@ fn bind_texture(
     let set = unsafe { device.allocate_descriptor_sets(&alloc) }.context("alloc desc set")?[0];
 
     let img = vk::DescriptorImageInfo::default()
-        .sampler(tex.sampler)
-        .image_view(tex.view)
+        .sampler(sampler)
+        .image_view(view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     let write = vk::WriteDescriptorSet::default()
         .dst_set(set)
@@ -436,6 +555,10 @@ mod tests {
         assert_scene(&render_scene(&gpu)?)?;
         assert_blur(&render_blur(&gpu)?)?;
         assert_text(&render_text(&gpu)?)?;
+        // dmabuf import only where the extensions exist (Venus yes, lavapipe no).
+        if let Some(dmabuf) = render_dmabuf(&gpu)? {
+            assert_dmabuf(&dmabuf)?;
+        }
         Ok(())
     }
 }

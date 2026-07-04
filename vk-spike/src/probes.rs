@@ -20,6 +20,7 @@ pub fn report(gpu: &Gpu) {
     );
     drm_modifiers(gpu, vk::Format::R8G8B8A8_UNORM, "R8G8B8A8_UNORM (ABGR8888)");
     external_semaphores(gpu);
+    external_fences(gpu);
 }
 
 fn supports_extension(gpu: &Gpu, name: &str) -> bool {
@@ -107,5 +108,29 @@ fn external_semaphores(gpu: &Gpu) {
                 feats.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
             );
         }
+    }
+}
+
+// VkFence <-> FD support. The SYNC_FD export half is what a KMS OUT_FENCE / CPU-side wait needs
+// (Stage 3), the companion to the semaphore query above.
+fn external_fences(gpu: &Gpu) {
+    eprintln!("  external fence handle types (export/import):");
+    let handle_types = [
+        (vk::ExternalFenceHandleTypeFlags::OPAQUE_FD, "OPAQUE_FD"),
+        (vk::ExternalFenceHandleTypeFlags::SYNC_FD, "SYNC_FD"),
+    ];
+    for (handle, hname) in handle_types {
+        let info = vk::PhysicalDeviceExternalFenceInfo::default().handle_type(handle);
+        let mut props = vk::ExternalFenceProperties::default();
+        unsafe {
+            gpu.instance
+                .get_physical_device_external_fence_properties(gpu.phys, &info, &mut props);
+        }
+        let feats = props.external_fence_features;
+        eprintln!(
+            "    {hname}: export={} import={}",
+            feats.contains(vk::ExternalFenceFeatureFlags::EXPORTABLE),
+            feats.contains(vk::ExternalFenceFeatureFlags::IMPORTABLE),
+        );
     }
 }

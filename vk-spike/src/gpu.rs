@@ -18,6 +18,12 @@ pub struct Gpu {
     pub phys: vk::PhysicalDevice,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub device_name: String,
+    // CPU vs a real GPU — the dmabuf demo needs a hardware device tied to the DRM node, so it
+    // skips on CPU devices (lavapipe).
+    pub device_type: vk::PhysicalDeviceType,
+    // Device extensions we asked for AND the device advertised (so lavapipe, which lacks the
+    // dmabuf ones, still builds a device — the dmabuf demo checks these and skips if absent).
+    enabled_extensions: Vec<String>,
     pub instance: ash::Instance,
     // Owns the loaded Vulkan library; must outlive `instance`/`device`.
     #[allow(dead_code)]
@@ -74,12 +80,42 @@ impl Gpu {
             best.ok_or_else(|| anyhow!("no physical device with a graphics queue"))?;
         let device_name = device_name(&props);
 
+        // Enable the external-memory extensions needed to import dmabufs with DRM modifiers, but
+        // only those the device actually advertises. (external_memory / bind_memory2 /
+        // sampler_ycbcr_conversion / image_format_list are core in 1.1–1.2, so not listed here.)
+        let want: [&CStr; 4] = [
+            c"VK_KHR_external_memory_fd",
+            c"VK_EXT_external_memory_dma_buf",
+            c"VK_EXT_image_drm_format_modifier",
+            // For acquiring imported content from the FOREIGN (non-Vulkan producer) queue family;
+            // if absent we fall back to a plain layout transition (see dmabuf.rs).
+            c"VK_EXT_queue_family_foreign",
+        ];
+        let avail = unsafe { instance.enumerate_device_extension_properties(phys) }
+            .context("enumerate device extensions")?;
+        let has = |name: &CStr| {
+            avail
+                .iter()
+                .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name)
+        };
+        let enabled_cstr: Vec<&CStr> = want.into_iter().filter(|n| has(n)).collect();
+        let enabled_ptrs: Vec<*const std::ffi::c_char> =
+            enabled_cstr.iter().map(|s| s.as_ptr()).collect();
+        let enabled_extensions: Vec<String> = enabled_cstr
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if !enabled_extensions.is_empty() {
+            eprintln!("  enabling device extensions: {enabled_extensions:?}");
+        }
+
         let priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
-        let device_ci =
-            vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue_info));
+        let device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .enabled_extension_names(&enabled_ptrs);
         let device =
             unsafe { instance.create_device(phys, &device_ci, None) }.context("vkCreateDevice")?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -92,9 +128,16 @@ impl Gpu {
             phys,
             mem_props,
             device_name,
+            device_type: props.device_type,
+            enabled_extensions,
             instance,
             entry,
         })
+    }
+
+    /// Was this device extension enabled at device creation? (Used to gate the dmabuf demo.)
+    pub fn supports(&self, ext: &str) -> bool {
+        self.enabled_extensions.iter().any(|e| e == ext)
     }
 
     /// Pick a memory type satisfying `type_bits` (from a `*MemoryRequirements`) and `flags`.

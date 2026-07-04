@@ -4513,6 +4513,7 @@ dependencies = [
  "cairo-rs",
  "cosmic-text",
  "etagere",
+ "gbm",
  "pango",
  "pangocairo",
  "png",
