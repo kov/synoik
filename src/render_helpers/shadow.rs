@@ -288,3 +288,60 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
         self.inner.underlying_storage(renderer)
     }
 }
+
+// The owned Vulkan renderer draws the shadow procedurally in its own pipeline (M3), reading the
+// raw `params` rather than the GLES `inner` uniform list. The derivation is trivial (field
+// extraction + the shared `area_size`), so it is inlined here rather than shared.
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
+
+#[cfg(feature = "vulkan")]
+impl ShadowRenderElement {
+    /// Build the shadow material's push constants from `params`, with the quad placed at `dst`.
+    /// (`target` is filled by `VulkanFrame::render_shadow`.)
+    fn vulkan_push(&self, dst: Rectangle<i32, Physical>) -> niri_vk::render::ShadowPush {
+        let p = &self.params;
+        niri_vk::render::ShadowPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            target: [0.0, 0.0],
+            sigma: p.sigma,
+            niri_scale: p.scale,
+            shadow_color: p.color.to_array_premul(),
+            corner_radius: <[f32; 4]>::from(p.corner_radius),
+            window_corner_radius: <[f32; 4]>::from(p.window_corner_radius),
+            area_size: [p.size.w as f32, p.size.h as f32],
+            geo_loc: [p.geometry.loc.x as f32, p.geometry.loc.y as f32],
+            geo_size: [p.geometry.size.w as f32, p.geometry.size.h as f32],
+            window_geo_loc: [
+                p.window_geometry.loc.x as f32,
+                p.window_geometry.loc.y as f32,
+            ],
+            window_geo_size: [
+                p.window_geometry.size.w as f32,
+                p.window_geometry.size.h as f32,
+            ],
+            niri_alpha: p.alpha,
+            _pad0: 0.0,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for ShadowRenderElement {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        frame.render_shadow(self.vulkan_push(dst))
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}

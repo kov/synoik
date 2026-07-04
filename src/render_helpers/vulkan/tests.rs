@@ -22,6 +22,7 @@ use crate::niri::OutputRenderElements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
+use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 
@@ -638,6 +639,71 @@ fn vulkan_border_ring_gradient_and_rounding() {
     assert!(
         top[1] < 40,
         "top edge should be the border gradient, not the background, got {top:?}",
+    );
+}
+
+// --- M3 step 3: ShadowRenderElement through the owned Vulkan renderer --------------------------
+
+/// A gaussian drop shadow of a 32×32 box centered in the 64×64 area: darkest at the box center,
+/// fading smoothly to the background outward, monotonically. Exercises the shadow pipeline (erf
+/// gaussian + premultiplied blend). Oracle-free structural invariants.
+#[test]
+fn vulkan_shadow_gaussian_falloff() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_shadow_gaussian_falloff: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let black = Color::new_unpremul(0.0, 0.0, 0.0, 1.0);
+    // A 32×32 box centered in the 64×64 element (so the shadow has room to fall off on all sides).
+    let geometry = Rectangle::new(
+        Point::<f64, Logical>::from((16.0, 16.0)),
+        Size::<f64, Logical>::from((32.0, 32.0)),
+    );
+    let elem = ShadowRenderElement::new(
+        Size::<f64, Logical>::from((W as f64, H as f64)), // size (the drawn area)
+        geometry,
+        black,
+        4.0,                     // sigma
+        CornerRadius::from(0.0), // corner_radius
+        1.0,                     // scale
+        Rectangle::default(),    // window_geometry (no cutout)
+        CornerRadius::from(0.0), // window_corner_radius
+        1.0,                     // alpha
+    );
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
+
+    // Box center: nearly full shadow → dark (black over the background).
+    let center = px(&pixels, 32, 32);
+    assert!(
+        center[0] < 40 && center[1] < 40 && center[2] < 40,
+        "box center should be a dark shadow, got {center:?}",
+    );
+    // Far corner: outside 3·sigma → essentially no shadow → background.
+    assert!(
+        close_px(px(&pixels, 0, 0), clear_u8(), 10),
+        "far corner should be ~background, got {:?}",
+        px(&pixels, 0, 0),
+    );
+    // Monotonic falloff along the left approach (box starts at x=16): closer to the box is darker.
+    let far = px(&pixels, 2, 32)[0];
+    let near = px(&pixels, 14, 32)[0];
+    assert!(
+        far > near,
+        "shadow should deepen toward the box (far={far} should be lighter than near={near})",
+    );
+    // The approach has a genuine mid-tone (soft edge, not a hard step).
+    let mid = px(&pixels, 10, 32)[0];
+    assert!(
+        (near..far).contains(&mid) || (20..60).contains(&mid),
+        "shadow edge should be a soft gradient, mid={mid}",
     );
 }
 

@@ -25,3 +25,8 @@ pub const GRADIENT_FADE_FRAG: &[u8] =
 /// premultiplied color.
 pub const BORDER_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/border.vert.spv"));
 pub const BORDER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/border.frag.spv"));
+/// Shadow material vertex + fragment stages (gaussian-blurred rounded rect with an optional window
+/// cutout — niri's `ShadowRenderElement`). Both stages declare `ShadowPush`; frag outputs
+/// premultiplied color.
+pub const SHADOW_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+pub const SHADOW_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));

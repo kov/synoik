@@ -20,7 +20,6 @@ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
-use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::xray::XrayElement;
 
 /// Emit a degraded (no-op) `RenderElement<VulkanRenderer>` impl for a niri effect element.
@@ -50,8 +49,7 @@ macro_rules! degraded_vulkan_element {
     };
 }
 
-// BorderRenderElement has a real (procedural) Vulkan draw in border.rs.
-degraded_vulkan_element!(ShadowRenderElement);
+// BorderRenderElement and ShadowRenderElement have real (procedural) Vulkan draws in their modules.
 // The `VkTexture` specialization has a real (SDF-rounding) impl in `rounded_texture.rs`; the
 // `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.
 degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);

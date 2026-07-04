@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use ash::vk;
 use niri_vk::gpu::Gpu;
-use niri_vk::render::{load_module, sampler_set_layout, BorderPush, QuadPush, COLOR_RANGE};
+use niri_vk::render::{
+    load_module, sampler_set_layout, BorderPush, QuadPush, ShadowPush, COLOR_RANGE,
+};
 use niri_vk::shaders::{
-    BORDER_FRAG, BORDER_VERT, GRADIENT_FADE_FRAG, QUAD_VERT, ROUNDED_TEX_FRAG, SOLID_FRAG, TEX_FRAG,
+    BORDER_FRAG, BORDER_VERT, GRADIENT_FADE_FRAG, QUAD_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG,
+    SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::Fourcc;
@@ -50,6 +53,7 @@ pub struct VulkanRenderer {
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) gradient_fade_pipeline: Pipeline,
     pub(super) border_pipeline: Pipeline,
+    pub(super) shadow_pipeline: Pipeline,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
     downscale_filter: TextureFilter,
@@ -107,7 +111,7 @@ impl VulkanRenderer {
             quad_push,
             false,
         )?;
-        // The border material outputs premultiplied color and samples nothing (no descriptor set).
+        // The border/shadow materials output premultiplied color and sample nothing (no set).
         let border_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -115,6 +119,15 @@ impl VulkanRenderer {
             BORDER_FRAG,
             &[],
             std::mem::size_of::<BorderPush>() as u32,
+            true,
+        )?;
+        let shadow_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            SHADOW_VERT,
+            SHADOW_FRAG,
+            &[],
+            std::mem::size_of::<ShadowPush>() as u32,
             true,
         )?;
         let command_pool = {
@@ -133,6 +146,7 @@ impl VulkanRenderer {
             rounded_texture_pipeline,
             gradient_fade_pipeline,
             border_pipeline,
+            shadow_pipeline,
             sampler_set_layout,
             command_pool,
             downscale_filter: TextureFilter::Linear,
@@ -271,6 +285,7 @@ impl Drop for VulkanRenderer {
             self.rounded_texture_pipeline.destroy(dev);
             self.gradient_fade_pipeline.destroy(dev);
             self.border_pipeline.destroy(dev);
+            self.shadow_pipeline.destroy(dev);
             dev.destroy_descriptor_set_layout(self.sampler_set_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.command_pool, None);

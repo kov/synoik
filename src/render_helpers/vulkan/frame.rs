@@ -1,7 +1,7 @@
 use std::fmt;
 
 use ash::vk;
-use niri_vk::render::{as_bytes, BorderPush, QuadPush};
+use niri_vk::render::{as_bytes, BorderPush, QuadPush, ShadowPush};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -221,6 +221,28 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.target = self.target_dims();
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.border_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw a rounded-rectangle drop shadow — the owned-renderer equivalent of niri's
+    /// `ShadowRenderElement` (a gaussian-blurred rounded rect with an optional window cutout).
+    /// Like [`Self::render_border`], the caller fills the material fields plus `origin`/`size`;
+    /// this sets `target`, binds the premultiplied-blend shadow pipeline (no texture), and draws.
+    pub(crate) fn render_shadow(&mut self, mut push: ShadowPush) -> Result<(), VulkanError> {
+        push.target = self.target_dims();
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.shadow_pipeline;
         unsafe {
             dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
             dev.cmd_push_constants(

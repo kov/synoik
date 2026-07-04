@@ -67,6 +67,29 @@ pub struct BorderPush {
     pub niri_alpha: f32,
 }
 
+/// Push constants for the shadow material (`shadow.vert`/`shadow.frag`). Same layout discipline as
+/// [`BorderPush`] (natural std430 offsets, `origin`/`size`/`target` first). 128 bytes. `area_size`
+/// is shared by the shadow and window-cutout geometry transforms.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ShadowPush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub target: [f32; 2],
+    pub sigma: f32,
+    pub niri_scale: f32,
+    pub shadow_color: [f32; 4],
+    pub corner_radius: [f32; 4],
+    pub window_corner_radius: [f32; 4],
+    pub area_size: [f32; 2],
+    pub geo_loc: [f32; 2],
+    pub geo_size: [f32; 2],
+    pub window_geo_loc: [f32; 2],
+    pub window_geo_size: [f32; 2],
+    pub niri_alpha: f32,
+    pub _pad0: f32,
+}
+
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
     /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*
