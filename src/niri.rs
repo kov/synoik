@@ -172,6 +172,7 @@ use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
+use crate::ui::panel::Panel;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
@@ -422,6 +423,7 @@ pub struct Niri {
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
     pub run_dialog: RunDialog,
+    pub panel: Panel,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -2655,6 +2657,24 @@ impl Niri {
             )
             .unwrap();
 
+        // Tick the panel clock on each minute boundary. The timer is the wake
+        // source, so this works even when input is idle (no frame starvation).
+        event_loop
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(
+                    crate::ui::panel::secs_until_next_minute(),
+                )),
+                |_, _, state| {
+                    if state.niri.panel.update_clock() {
+                        state.niri.queue_redraw_all();
+                    }
+                    TimeoutAction::ToDuration(Duration::from_secs(
+                        crate::ui::panel::secs_until_next_minute(),
+                    ))
+                },
+            )
+            .unwrap();
+
         drop(config_);
         let mut niri = Self {
             config,
@@ -2783,6 +2803,7 @@ impl Niri {
             hotkey_overlay,
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
+            panel: Panel::new(),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -4295,6 +4316,10 @@ impl Niri {
         self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
 
+        // Keep the panel's Activities highlight in sync with the overview.
+        let overview_open = self.layout.is_overview_open();
+        self.panel.set_overview_open(overview_open);
+
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
                 let scale = Scale::from(out.current_scale().fractional_scale());
@@ -4513,6 +4538,15 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+
+        // The GNOME top panel sits above the windows (but below the transient
+        // overlays above). It stays up during the overview, matching gnome-shell.
+        // This is after the lock/screenshot early-returns, so it is hidden there.
+        if self.layout.is_gnome_mode() {
+            if let Some(element) = self.panel.render(ctx.renderer, output) {
+                push(element.into());
+            }
+        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.

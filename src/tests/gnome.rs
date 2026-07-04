@@ -206,6 +206,10 @@ fn super_then_click_does_not_toggle_overview() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
+    // Click mid-screen, clear of the panel's Activities button (which itself
+    // toggles the overview) so this exercises only the tap-cancel.
+    f.pointer_motion(960., 540.);
+
     f.key_press(KEY_LEFTMETA);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -1086,8 +1090,9 @@ fn placement_first_fit_prefers_below() {
     let id = f.add_client();
 
     // place.c center_tile_rect_in_area: the leftover space of a hypothetical
-    // grid of same-size windows, halved horizontally, third-ed vertically.
-    let slot = ((1920. % 101.) / 2., (1080. % 101.) / 3.);
+    // grid of same-size windows, halved horizontally, third-ed vertically —
+    // within the work area, which the top panel insets to (0, 32, 1920, 1048).
+    let slot = ((1920. % 101.) / 2., 32. + (1048. % 101.) / 3.);
 
     let _w1 = map_window_sized(&mut f, id, (100, 100), None);
     let w1_pos = focused_window_pos(&mut f);
@@ -1144,28 +1149,28 @@ fn placement_cascades_when_nothing_fits() {
     let id = f.add_client();
 
     // 1000×600 windows: after the first takes the centered-tile slot,
-    // below/right candidates all overflow the 1920×1080 work area, so
-    // first-fit fails and every subsequent window cascades.
+    // below/right candidates all overflow the 1920×1048 work area (the top
+    // panel insets it), so first-fit fails and every subsequent window cascades.
     let _w1 = map_window_sized(&mut f, id, (1000, 600), None);
 
     let _w2 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 0.),
+        (0., 32.),
         "the first cascaded window must sit at the work-area origin",
     );
 
     let _w3 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (50., 50.),
+        (50., 82.),
         "the next cascade slot is one 50px diagonal step down",
     );
 
     let _w4 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (100., 100.),
+        (100., 132.),
         "each occupied slot steps the cascade another 50px",
     );
 }
@@ -1319,18 +1324,18 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 960 × 1080, bounds: 1920 × 1080, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
+        @"size: 960 × 1048, bounds: 1920 × 1048, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
     );
 
     // The client commits the tiled size; the tile sits at the left edge.
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1080);
+    window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 0.),
+        (0., 32.),
         "a left-tiled window must sit at the work-area origin",
     );
 
@@ -1342,7 +1347,7 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 800 × 600, bounds: 1920 × 1080, states: [Activated]"
+        @"size: 800 × 600, bounds: 1920 × 1048, states: [Activated]"
     );
 
     let window = f.client(id).window(&surface);
@@ -1452,9 +1457,10 @@ fn oversized_window_auto_maximizes_with_clamped_restore() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
 
-    // scale = min(1920·√0.8/1800, 1080·√0.8/1000) ≈ 0.954 → 1717×954.
+    // Clamped to the work area (top panel insets it to 1920×1048):
+    // scale = min(1920·√0.8/1800, 1048·√0.8/1000) ≈ 0.937 → 1687×937.
     let factor = 0.8f64.sqrt();
-    let scale = f64::min(1920. * factor / 1800., 1080. * factor / 1000.);
+    let scale = f64::min(1920. * factor / 1800., 1048. * factor / 1000.);
     let expected = format!(
         "size: {} × {}",
         (1800. * scale).round() as i32,
@@ -1576,18 +1582,18 @@ fn drag_to_left_edge_tiles() {
 
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
-        configures.contains("TiledLeft") && configures.contains("size: 960 × 1080"),
+        configures.contains("TiledLeft") && configures.contains("size: 960 × 1048"),
         "dropping in the left edge band must tile left, got: {configures}"
     );
 
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1080);
+    window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 0.),
+        (0., 32.),
         "the tiled window must sit at the left work-area edge",
     );
     let _ = f.client(id).window(&surface).recent_configures();
@@ -1827,12 +1833,15 @@ fn overview_workspace_is_centered_at_gnome_scale() {
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
-    // Workspace-local slot (see expose::tests): (580, 255) 760 × 570, then
-    // through zoom 0.8 with the workspace centered at (192, 108).
+    // Workspace-local slot (see expose::tests): 760 × 570 centered in the
+    // work area — the top panel insets it to 1920×1048, so the slot sits at
+    // (580, 32 + (1048-570)/2) = (580, 271) — then through zoom 0.8 with the
+    // workspace miniature centered at (192, 108) (that uses the full view size,
+    // so it is unshifted).
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (192. + 580. * 0.8, 108. + 255. * 0.8),
+        (192. + 580. * 0.8, 108. + 271. * 0.8),
         "picker slot must reflect the centered 0.8-scale workspace",
     );
     assert!(
@@ -2303,7 +2312,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.set_size(1920, 1080);
+    window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
@@ -2336,7 +2345,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     for configure in f.client(id).window(&surface).recent_configures() {
         assert_eq!(
             configure.size,
-            (1920, 1080),
+            (1920, 1048),
             "an overview drag must never resize the maximized window, got: {configure}"
         );
         assert!(
@@ -2502,5 +2511,110 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     assert!(
         f.niri().layout.is_overview_open(),
         "the edge snaps must not leave the overview"
+    );
+}
+
+/// The GNOME top panel reserves a strut at the top of the work area (like
+/// gnome-shell's `set_builtin_struts`): a maximized window fills the output
+/// below the 32px panel band, never underneath it.
+#[test]
+fn panel_reserves_top_strut() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 1920 × 1048"),
+        "a maximized window must fill the work area below the panel, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1048);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (0., 32.),
+        "the maximized window must start below the panel strut",
+    );
+}
+
+/// The panel clock formats local wall time as `HH:MM` and advances with it.
+#[test]
+fn panel_clock_is_hh_mm() {
+    let mut panel = crate::ui::panel::Panel::new();
+
+    // Epoch 0 and one hour later differ by exactly one hour in any timezone.
+    panel.update_clock_at(0);
+    let at_epoch = panel.clock_text().to_string();
+    assert_eq!(at_epoch.len(), 5, "clock must be HH:MM, got {at_epoch:?}");
+    assert_eq!(
+        at_epoch.as_bytes()[2],
+        b':',
+        "clock must be HH:MM, got {at_epoch:?}"
+    );
+
+    assert!(
+        panel.update_clock_at(3600),
+        "an hour later the clock text must change"
+    );
+    assert_ne!(
+        at_epoch,
+        panel.clock_text(),
+        "an hour later must show a different time"
+    );
+}
+
+/// Clicking the panel's Activities button toggles the overview (the mouse
+/// counterpart of the Super-tap), and the button's checked highlight tracks
+/// the overview state.
+#[test]
+fn panel_activities_click_toggles_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert!(!f.niri().layout.is_overview_open());
+    f.niri().update_render_elements(None);
+    assert!(
+        !f.niri().panel.activities_checked(),
+        "Activities starts unchecked"
+    );
+
+    // Click within the Activities button at the top-left of the panel.
+    f.pointer_motion(10., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "clicking Activities must open the overview"
+    );
+    f.niri().update_render_elements(None);
+    assert!(
+        f.niri().panel.activities_checked(),
+        "Activities must be checked while the overview is open"
+    );
+
+    // A second click toggles it back.
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "clicking Activities again must close the overview"
+    );
+    f.niri().update_render_elements(None);
+    assert!(
+        !f.niri().panel.activities_checked(),
+        "Activities must be unchecked once the overview closes"
     );
 }

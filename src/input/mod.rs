@@ -2959,6 +2959,21 @@ impl State {
                 }
             }
 
+            // GNOME top panel: a left-click on the Activities button toggles the
+            // overview (the mouse counterpart of the Super-tap overlay key).
+            if self.niri.layout.is_gnome_mode() && button == Some(MouseButton::Left) {
+                let location = pointer.current_location();
+                if let Some((_output, pos_within_output)) = self.niri.output_under(location) {
+                    if self.niri.panel.hit_test(pos_within_output)
+                        == Some(crate::ui::panel::PanelItem::Activities)
+                    {
+                        self.niri.suppressed_buttons.insert(button_code);
+                        self.do_action(Action::ToggleOverview, false);
+                        return;
+                    }
+                }
+            }
+
             if is_mru_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = match button {
                     Some(MouseButton::Left) => Some(Trigger::MouseLeft),

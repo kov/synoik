@@ -250,7 +250,7 @@ impl<W: LayoutElement> Workspace<W> {
         );
 
         let view_size = output_size(&output);
-        let working_area = compute_working_area(&output);
+        let working_area = compute_working_area(&output, &options);
 
         let scrolling = ScrollingSpace::new(
             view_size,
@@ -547,7 +547,7 @@ impl<W: LayoutElement> Workspace<W> {
         let scale = output.current_scale();
         let transform = output.current_transform();
         let view_size = output_size(output);
-        let working_area = compute_working_area(output);
+        let working_area = compute_working_area(output, &self.options);
         self.set_view_size(scale, transform, view_size, working_area);
     }
 
@@ -2402,8 +2402,20 @@ impl<W: LayoutElement> Workspace<W> {
     }
 }
 
-pub(super) fn compute_working_area(output: &Output) -> Rectangle<f64, Logical> {
-    layer_map_for_output(output).non_exclusive_zone().to_f64()
+pub(super) fn compute_working_area(output: &Output, options: &Options) -> Rectangle<f64, Logical> {
+    let mut area = layer_map_for_output(output).non_exclusive_zone().to_f64();
+
+    // In GNOME (floating) mode the top panel reserves a strut at the top of the
+    // output, exactly like gnome-shell's `set_builtin_struts`. Applying it here,
+    // at the single working-area chokepoint, means maximize, edge-tiling,
+    // floating placement and the overview picker slots all inset uniformly.
+    if options.layout.windowing_mode == WindowingMode::Floating {
+        let inset = crate::ui::panel::PANEL_HEIGHT.min(area.size.h);
+        area.loc.y += inset;
+        area.size.h -= inset;
+    }
+
+    area
 }
 
 fn compute_workspace_shadow_config(

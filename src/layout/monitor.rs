@@ -337,7 +337,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         let scale = output.current_scale();
         let view_size = output_size(&output);
-        let working_area = compute_working_area(&output);
+        let working_area = compute_working_area(&output, &options);
 
         // Prepare the workspaces: set output, empty first, empty last.
         let mut active_workspace_idx = 0;
@@ -1327,7 +1327,7 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn update_output_size(&mut self) {
         self.scale = self.output.current_scale();
         self.view_size = output_size(&self.output);
-        self.working_area = compute_working_area(&self.output);
+        self.working_area = compute_working_area(&self.output, &self.options);
 
         for ws in &mut self.workspaces {
             ws.update_output_size();

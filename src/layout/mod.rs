@@ -5287,6 +5287,12 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
+    /// Whether the session is in GNOME (floating) windowing mode, where the top
+    /// panel is drawn and reserves a strut.
+    pub fn is_gnome_mode(&self) -> bool {
+        self.options.layout.windowing_mode == WindowingMode::Floating
+    }
+
     /// The overview picker slot of a window, in output coordinates — where
     /// the window's preview sits on screen in the GNOME overview.
     pub fn expose_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {

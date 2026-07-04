@@ -158,8 +158,9 @@ Expectations: this exercises the Phase 1 contract surface (STRATEGY.md §3.8).
 Display config and most gsd daemons should come up (niri implements the core
 `org.gnome.Mutter.*` names, and `org.gnome.Shell` accelerator grabs — so
 gsd-media-keys' volume/brightness/media keys work, though without OSD popups
-until `ShowOSD` exists); there is no panel or GNOME chrome. The gaps you hit
-here are, in effect, the Phase 1 worklist.
+until `ShowOSD` exists); the GNOME top panel is drawn (see below), but the
+rest of the GNOME chrome (quick settings, notifications, calendar) is not.
+The gaps you hit here are, in effect, the Phase 1 worklist.
 
 ## Windowing mode: floating by default
 
@@ -288,6 +289,28 @@ live.
 
 Not yet ported: preview chrome (title, close button, app icon), the app
 grid, and search.
+
+## The top panel
+
+In floating (GNOME) windowing mode a **top panel** is drawn in-compositor
+(`src/ui/panel.rs`) on every output: a 32px opaque bar (gnome-shell's
+`2.2em @ 11pt`) with a left **Activities** button and a centered **clock**
+(local `HH:MM`, ticking on the minute). Clicking Activities toggles the
+overview — the mouse counterpart of the Super-tap — and highlights while the
+overview is open; the panel itself stays put in the overview (in the dark
+theme gnome-shell's `:overview` transparency is a visual no-op). It renders
+above the windows but below the transient overlays (run dialog, Alt-Tab), and
+is hidden on the lock and screenshot screens.
+
+Crucially the panel **reserves a top strut**: the work area
+(`layout::workspace::compute_working_area`) insets by the panel height, so
+maximize, edge-tiling, floating placement and the overview picker slots all
+sit below it — gnome-shell's `set_builtin_struts`. The strut and the drawing
+are gated on floating mode, so niri's scrolling mode is unaffected.
+
+Deferred: quick-settings/status indicators, the calendar popover, the
+`clock-format`/date/seconds settings, the Activities workspace-dot animation,
+and GNOME's primary-monitor-only placement (we currently panel every output).
 
 ## How GNOME settings feed in
 

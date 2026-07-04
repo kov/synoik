@@ -31,6 +31,10 @@ fn make_options() -> Options {
     let mut options = Options {
         layout: niri_config::Layout {
             gaps: 0.0,
+            // These exercise niri's scrolling-column animations; run them in
+            // scrolling mode so the GNOME top-panel strut (floating mode only)
+            // doesn't offset their geometry.
+            windowing_mode: niri_config::WindowingMode::Scrolling,
             ..Default::default()
         },
         ..Options::default()
