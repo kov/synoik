@@ -10,6 +10,7 @@
 //! rasterization path (render pass, pipeline, SPIR-V, push constants, alpha blending, descriptor
 //! sets / samplers) on both Venus and lavapipe, headless.
 
+mod blur;
 mod gpu;
 mod render;
 mod texture;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ash::vk;
+use blur::BlurChain;
 use gpu::Gpu;
 use render::{QuadPipeline, QuadPush, RenderTarget};
 use texture::Texture;
@@ -73,6 +75,81 @@ fn main() -> Result<()> {
     write_png(&out, WIDTH, HEIGHT, &pixels)?;
     eprintln!("vk-spike: wrote {}", out.display());
     eprintln!("vk-spike: OK — render pass + solid + SDF rounded-rect + textured quad verified");
+
+    blur_demo(&gpu)?;
+    Ok(())
+}
+
+const SRC_W: u32 = 192;
+const SRC_H: u32 = 128;
+const EDGE_RED: [u8; 4] = [230, 40, 40, 255];
+const EDGE_BLUE: [u8; 4] = [40, 60, 230, 255];
+const BLUR_PASSES: usize = 3;
+const BLUR_OFFSET: f32 = 3.0;
+
+/// Blur a hard vertical red|blue edge and check the step became a smooth gradient.
+fn blur_demo(gpu: &Gpu) -> Result<()> {
+    let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+    let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.context("blur pool")?;
+
+    // Source: left half red, right half blue (a maximal high-contrast step).
+    let mut src = vec![0u8; (SRC_W * SRC_H * 4) as usize];
+    for y in 0..SRC_H {
+        for x in 0..SRC_W {
+            let c = if x < SRC_W / 2 { EDGE_RED } else { EDGE_BLUE };
+            let i = ((y * SRC_W + x) * 4) as usize;
+            src[i..i + 4].copy_from_slice(&c);
+        }
+    }
+    let source = Texture::from_rgba(gpu, pool, SRC_W, SRC_H, &src, vk::Filter::LINEAR)?;
+    let chain = BlurChain::new(gpu, &source, BLUR_PASSES)?;
+
+    gpu.run_commands(pool, |cbuf| chain.record(gpu, cbuf, BLUR_OFFSET))?;
+    let (ow, oh) = chain.output_size();
+    let out = chain.read_output(gpu, pool)?;
+
+    let at = |x: u32, y: u32| -> [u8; 4] {
+        let i = ((y * ow + x) * 4) as usize;
+        [out[i], out[i + 1], out[i + 2], out[i + 3]]
+    };
+    let cy = oh / 2;
+    let left = at(8, cy);
+    let right = at(ow - 8, cy);
+    let center = at(ow / 2, cy);
+    let step_l = at(ow / 2 - 1, cy);
+    let step_r = at(ow / 2, cy);
+    eprintln!("vk-spike: blur left={left:?} center={center:?} right={right:?}");
+
+    // Far from the edge the colors survive; at the edge they mix; the hard step is gone.
+    anyhow::ensure!(
+        left[0] as i16 - left[2] as i16 > 40,
+        "blur: left should stay red-dominant, got {left:?}"
+    );
+    anyhow::ensure!(
+        right[2] as i16 - right[0] as i16 > 40,
+        "blur: right should stay blue-dominant, got {right:?}"
+    );
+    anyhow::ensure!(
+        center[0] > 60 && center[2] > 60 && (center[0] as i16 - center[2] as i16).abs() < 80,
+        "blur: center should be a red/blue mix, got {center:?}"
+    );
+    anyhow::ensure!(
+        (step_l[0] as i16 - step_r[0] as i16).abs() < 40,
+        "blur: the hard step should be smoothed, got {step_l:?} vs {step_r:?}"
+    );
+    anyhow::ensure!(
+        [left, center, right].iter().all(|p| p[3] == 255),
+        "blur: output should stay opaque"
+    );
+
+    let path = artifact_path("blur.png");
+    write_png(&path, ow, oh, &out)?;
+    eprintln!("vk-spike: wrote {}", path.display());
+    eprintln!("vk-spike: OK — dual-kawase blur verified");
+
+    chain.destroy(gpu);
+    source.destroy(gpu);
+    unsafe { gpu.device.destroy_command_pool(pool, None) };
     Ok(())
 }
 

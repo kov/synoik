@@ -401,7 +401,7 @@ impl QuadPipeline {
     }
 }
 
-fn load_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
+pub(crate) fn load_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).context("read SPIR-V")?;
     let ci = vk::ShaderModuleCreateInfo::default().code(&code);
     unsafe { device.create_shader_module(&ci, None) }.context("create shader module")
@@ -420,6 +420,6 @@ pub fn sampler_set_layout(gpu: &Gpu) -> Result<vk::DescriptorSetLayout> {
 }
 
 /// View a `repr(C)` POD as bytes for `cmd_push_constants`.
-fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+pub(crate) fn as_bytes<T: Copy>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
 }
