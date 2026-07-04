@@ -265,6 +265,7 @@ impl QuadPipeline {
         extent: vk::Extent2D,
         vert_spv: &[u8],
         frag_spv: &[u8],
+        set_layouts: &[vk::DescriptorSetLayout],
     ) -> Result<Self> {
         let device = &gpu.device;
         let vert = load_module(device, vert_spv)?;
@@ -327,6 +328,7 @@ impl QuadPipeline {
             .offset(0)
             .size(std::mem::size_of::<QuadPush>() as u32);
         let layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(set_layouts)
             .push_constant_ranges(std::slice::from_ref(&push_range));
         let layout = unsafe { device.create_pipeline_layout(&layout_ci, None) }
             .context("pipeline layout")?;
@@ -356,11 +358,27 @@ impl QuadPipeline {
         })
     }
 
-    /// Bind, push `quad`'s params, and draw the two-triangle quad.
-    pub fn draw(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, quad: &QuadPush) {
+    /// Bind, (optionally) bind descriptor set 0, push `quad`'s params, and draw the quad.
+    pub fn draw(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        quad: &QuadPush,
+        set: Option<vk::DescriptorSet>,
+    ) {
         unsafe {
             gpu.device
                 .cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            if let Some(set) = set {
+                gpu.device.cmd_bind_descriptor_sets(
+                    cbuf,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
             gpu.device.cmd_push_constants(
                 cbuf,
                 self.layout,
@@ -387,6 +405,18 @@ fn load_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).context("read SPIR-V")?;
     let ci = vk::ShaderModuleCreateInfo::default().code(&code);
     unsafe { device.create_shader_module(&ci, None) }.context("create shader module")
+}
+
+/// Descriptor set layout for a single combined image sampler at binding 0 (fragment stage) —
+/// what the textured / glyph-atlas materials sample from.
+pub fn sampler_set_layout(gpu: &Gpu) -> Result<vk::DescriptorSetLayout> {
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
+    unsafe { gpu.device.create_descriptor_set_layout(&ci, None) }.context("descriptor set layout")
 }
 
 /// View a `repr(C)` POD as bytes for `cmd_push_constants`.

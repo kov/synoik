@@ -110,6 +110,19 @@ impl Gpu {
             .ok_or_else(|| anyhow!("no memory type for bits {type_bits:#x} flags {flags:?}"))
     }
 
+    /// Allocate device memory sized/typed for `req` with the given property `flags`.
+    pub fn allocate(
+        &self,
+        req: vk::MemoryRequirements,
+        flags: vk::MemoryPropertyFlags,
+    ) -> Result<vk::DeviceMemory> {
+        let index = self.find_memory_type(req.memory_type_bits, flags)?;
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(index);
+        unsafe { self.device.allocate_memory(&info, None) }.context("allocate_memory")
+    }
+
     /// Record `record` into a one-time primary command buffer, submit, and block until done.
     pub fn run_commands(
         &self,
