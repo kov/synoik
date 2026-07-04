@@ -20,7 +20,9 @@ pub const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
 };
 
 /// Push-constant block shared by `quad.vert` and its material fragment stages. `repr(C)` layout
-/// matches the GLSL `Push` block (std430 push-constant rules: `color` lands at offset 32).
+/// matches the GLSL `Push` block (std430 push-constant rules: `color` lands at offset 32,
+/// `src_rect` at 48). Materials that don't need a field (e.g. `solid.frag` ignores `src_rect`)
+/// simply declare a shorter `Push` block — a shader may access a prefix of the range.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct QuadPush {
@@ -30,6 +32,9 @@ pub struct QuadPush {
     pub corner_radius: f32,
     pub _pad0: f32,
     pub color: [f32; 4],
+    /// Sub-rectangle of the texture to sample, normalized `[u0, v0, du, dv]`; `[0, 0, 1, 1]` is
+    /// the full texture. Used by the sampling materials to remap `v_uv` (see `texture.frag`).
+    pub src_rect: [f32; 4],
 }
 
 pub struct RenderTarget {

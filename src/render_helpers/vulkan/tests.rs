@@ -12,7 +12,9 @@ use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportMem, Offscreen, Renderer,
 };
-use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
 use super::VulkanRenderer;
 use crate::niri::OutputRenderElements;
@@ -335,13 +337,19 @@ fn close_px(a: [u8; 4], b: [u8; 4], tol: u8) -> bool {
     a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= tol)
 }
 
-/// Build a rounded `W×H` texture element on `vk` and render it (cleared to `CLEAR`) into a fresh
-/// offscreen, returning the read-back pixels. Drawn 1:1 (no filtering), full-`src`, `geometry ==
-/// dst`, scale 1 — the wallpaper-shaped case the M3 material handles.
-fn render_rounded(vk: &mut VulkanRenderer, corner_radius: f64) -> Vec<u8> {
+/// Build a rounded `W×H` texture element on `vk` from `texels` (a `W×H` image) sampling `src`
+/// (logical; `None` = full), and render it (cleared to `CLEAR`) into a fresh offscreen, returning
+/// the read-back pixels. Drawn 1:1 into the whole target, `geometry == dst`, scale 1 — the
+/// wallpaper-shaped case the M3 material handles.
+fn render_rounded_src(
+    vk: &mut VulkanRenderer,
+    texels: &[u8],
+    corner_radius: f64,
+    src: Option<Rectangle<f64, Logical>>,
+) -> Vec<u8> {
     let buffer = TextureBuffer::from_memory(
         vk,
-        &rounded_texels(),
+        texels,
         Fourcc::Abgr8888,
         (W, H),
         false,
@@ -354,8 +362,10 @@ fn render_rounded(vk: &mut VulkanRenderer, corner_radius: f64) -> Vec<u8> {
         buffer,
         Point::<f64, _>::from((0.0, 0.0)),
         1.0,
-        None,
-        None,
+        src,
+        // Explicit dst size so the element geometry stays the full quad even for a partial `src`
+        // (the wallpaper likewise passes its view size, not the cropped src size).
+        Some(Size::<f64, _>::from((W as f64, H as f64))),
         Kind::Unspecified,
     );
     let elem = RoundedTextureRenderElement::new_vulkan(
@@ -369,6 +379,11 @@ fn render_rounded(vk: &mut VulkanRenderer, corner_radius: f64) -> Vec<u8> {
         .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
         .expect("vulkan offscreen");
     render_elements_into(vk, &mut target, std::slice::from_ref(&elem))
+}
+
+/// The wallpaper-shaped full-`src` gradient scene.
+fn render_rounded(vk: &mut VulkanRenderer, corner_radius: f64) -> Vec<u8> {
+    render_rounded_src(vk, &rounded_texels(), corner_radius, None)
 }
 
 /// The rounded-texture material cuts the quad's corners to the SDF disc: interior shows the source
@@ -424,6 +439,53 @@ fn vulkan_rounded_texture_cuts_corners() {
     assert!(
         has_aa,
         "expected an antialiased partial-coverage pixel along the corner arc",
+    );
+}
+
+/// A partial `src` (the overview wallpaper's zoom-crop) must be sampled through the shader's
+/// `src_rect` remap: with a left-red / right-blue texture and `src` = the right half, the whole
+/// quad shows blue — a pixel that would be red under a (wrong) full-`src` sample proves the remap.
+#[test]
+fn vulkan_rounded_texture_partial_src() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_rounded_texture_partial_src: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const RED: [u8; 4] = [200, 40, 40, 255];
+    const BLUE: [u8; 4] = [40, 40, 200, 255];
+    let mut texels = Vec::with_capacity((W * H * 4) as usize);
+    for _y in 0..H {
+        for x in 0..W {
+            texels.extend_from_slice(if x < W / 2 { &RED } else { &BLUE });
+        }
+    }
+    // Sample only the right (blue) half, stretched across the whole quad.
+    let src = Rectangle::new(
+        Point::<f64, Logical>::from((W as f64 / 2.0, 0.0)),
+        Size::<f64, Logical>::from((W as f64 / 2.0, H as f64)),
+    );
+    let pixels = render_rounded_src(&mut vk, &texels, RADIUS, Some(src));
+
+    // Interior, and a left-side opaque point that a full-`src` sample would draw red, are blue.
+    assert!(
+        close_px(px(&pixels, 32, 32), BLUE, 3),
+        "interior should sample the blue src half, got {:?}",
+        px(&pixels, 32, 32),
+    );
+    assert!(
+        close_px(px(&pixels, 8, 32), BLUE, 3),
+        "left-edge pixel should sample blue (full-src would sample red here), got {:?}",
+        px(&pixels, 8, 32),
+    );
+    // Rounding still cuts the corner to the background.
+    assert!(
+        close_px(px(&pixels, 2, 2), clear_u8(), 3),
+        "corner should still be cut to the background, got {:?}",
+        px(&pixels, 2, 2),
     );
 }
 

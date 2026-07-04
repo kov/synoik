@@ -13,6 +13,7 @@ layout(push_constant) uniform Push {
     float corner_radius; // physical pixels
     float _pad0;
     vec4 color;          // straight-alpha tint, [1,1,1,alpha]
+    vec4 src_rect;       // sub-rect to sample, normalized [u0, v0, du, dv]
 } pc;
 
 layout(location = 0) in vec2 v_uv;    // 0..1 across the quad
@@ -27,7 +28,8 @@ float sd_round_box(vec2 p, vec2 b, float r) {
 }
 
 void main() {
-    vec4 c = texture(tex, v_uv) * pc.color;
+    vec2 uv = pc.src_rect.xy + v_uv * pc.src_rect.zw;
+    vec4 c = texture(tex, uv) * pc.color;
 
     vec2 half_size = pc.size * 0.5;
     float r = clamp(pc.corner_radius, 0.0, min(half_size.x, half_size.y));

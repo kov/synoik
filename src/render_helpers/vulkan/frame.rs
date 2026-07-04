@@ -116,16 +116,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         corner_radius: f32,
         alpha: f32,
     ) -> Result<(), VulkanError> {
-        // Skeleton scope: full-`src`, unflipped only (see `render_texture_from_to`).
-        let full_src = src.loc.x == 0.0
-            && src.loc.y == 0.0
-            && src.size.w as u32 == texture.width()
-            && src.size.h as u32 == texture.height();
-        if texture.flipped() || !full_src {
+        // Skeleton scope: unflipped only (the shader remaps a partial `src` via `src_rect`).
+        if texture.flipped() {
             tracing::warn!(
-                "VulkanFrame::render_rounded_texture: unsupported (flipped={}, full_src={full_src}); \
-                 skipping",
-                texture.flipped(),
+                "VulkanFrame::render_rounded_texture: flipped textures unsupported; skipping"
             );
             return Ok(());
         }
@@ -139,6 +133,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
             // alpha; the SDF coverage then cuts the corners.
             color: [1.0, 1.0, 1.0, alpha],
+            src_rect: normalized_src(src, texture),
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.rounded_texture_pipeline;
@@ -276,6 +271,7 @@ impl Frame for VulkanFrame<'_, '_> {
             corner_radius: 0.0,
             _pad0: 0.0,
             color: color.components(),
+            src_rect: [0.0, 0.0, 1.0, 1.0], // unused by solid.frag
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.solid_pipeline;
@@ -304,16 +300,13 @@ impl Frame for VulkanFrame<'_, '_> {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), VulkanError> {
-        // Skeleton scope: full-`src`, `Transform::Normal`, unflipped only. Anything else would
-        // draw wrong pixels, so degrade to a no-op (a visible gap) rather than lie.
-        let full_src = src.loc.x == 0.0
-            && src.loc.y == 0.0
-            && src.size.w as u32 == texture.width()
-            && src.size.h as u32 == texture.height();
-        if src_transform != Transform::Normal || texture.flipped() || !full_src {
+        // Skeleton scope: `Transform::Normal`, unflipped only. A partial `src` is handled by the
+        // shader's `src_rect` remap; other transforms would draw wrong pixels, so degrade to a
+        // no-op (a visible gap) rather than lie.
+        if src_transform != Transform::Normal || texture.flipped() {
             tracing::warn!(
                 "VulkanFrame::render_texture_from_to: unsupported (transform={src_transform:?}, \
-                 flipped={}, full_src={full_src}); skipping",
+                 flipped={}); skipping",
                 texture.flipped(),
             );
             return Ok(());
@@ -327,6 +320,7 @@ impl Frame for VulkanFrame<'_, '_> {
             _pad0: 0.0,
             // texture.frag multiplies the sample by this, so white-with-alpha modulates alpha.
             color: [1.0, 1.0, 1.0, alpha],
+            src_rect: normalized_src(src, texture),
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.texture_pipeline;
@@ -368,4 +362,16 @@ impl Frame for VulkanFrame<'_, '_> {
     fn finish(mut self) -> Result<SyncPoint, VulkanError> {
         self.finish_internal()
     }
+}
+
+/// Normalize a buffer-space `src` sub-rectangle to `[u0, v0, du, dv]` texture coordinates for the
+/// sampling materials' `src_rect` push constant. `[0, 0, 1, 1]` is the full texture.
+fn normalized_src(src: Rectangle<f64, BufferCoord>, texture: &VkTexture) -> [f32; 4] {
+    let (tw, th) = (texture.width() as f32, texture.height() as f32);
+    [
+        src.loc.x as f32 / tw,
+        src.loc.y as f32 / th,
+        src.size.w as f32 / tw,
+        src.size.h as f32 / th,
+    ]
 }
