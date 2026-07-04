@@ -100,9 +100,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     }
 
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
-    /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. Same
-    /// full-`src`/unflipped scope as [`Frame::render_texture_from_to`]; anything outside it
-    /// degrades to a no-op (a visible gap) rather than a wrong picture.
+    /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. A partial
+    /// `src` is remapped by the shader; only flipped textures are out of scope and degrade to a
+    /// no-op (a visible gap) rather than a wrong picture.
     ///
     /// Assumes the element's rounding geometry equals `dst` (true for the overview wallpaper, whose
     /// `geometry` is the whole view at the origin); the general `geometry != dst` clip is a later
@@ -129,14 +129,67 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             size: [dst.size.w as f32, dst.size.h as f32],
             target: self.target_dims(),
             corner_radius,
-            _pad0: 0.0,
             // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
             // alpha; the SDF coverage then cuts the corners.
             color: [1.0, 1.0, 1.0, alpha],
             src_rect: normalized_src(src, texture),
+            ..Default::default()
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.rounded_texture_pipeline;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw `texture` into `dst` with a horizontal alpha fade over `cutoff` (`[left, right]` in the
+    /// sampled texture's u coordinate; `left >= right` disables it) — the owned-renderer equivalent
+    /// of niri's `GradientFadeTextureRenderElement` (the MRU switcher fades clipped thumbnails).
+    /// Same partial-`src`/unflipped scope as [`Self::render_rounded_texture`].
+    pub(crate) fn render_gradient_fade(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        cutoff: (f32, f32),
+        alpha: f32,
+    ) -> Result<(), VulkanError> {
+        if texture.flipped() {
+            tracing::warn!(
+                "VulkanFrame::render_gradient_fade: flipped textures unsupported; skipping"
+            );
+            return Ok(());
+        }
+
+        let push = QuadPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            target: self.target_dims(),
+            color: [1.0, 1.0, 1.0, alpha],
+            src_rect: normalized_src(src, texture),
+            cutoff: [cutoff.0, cutoff.1],
+            ..Default::default()
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.gradient_fade_pipeline;
         let set = texture.descriptor_set();
         unsafe {
             dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
@@ -268,10 +321,8 @@ impl Frame for VulkanFrame<'_, '_> {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
             target: self.target_dims(),
-            corner_radius: 0.0,
-            _pad0: 0.0,
             color: color.components(),
-            src_rect: [0.0, 0.0, 1.0, 1.0], // unused by solid.frag
+            ..Default::default()
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.solid_pipeline;
@@ -316,11 +367,10 @@ impl Frame for VulkanFrame<'_, '_> {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
             target: self.target_dims(),
-            corner_radius: 0.0,
-            _pad0: 0.0,
             // texture.frag multiplies the sample by this, so white-with-alpha modulates alpha.
             color: [1.0, 1.0, 1.0, alpha],
             src_rect: normalized_src(src, texture),
+            ..Default::default()
         };
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.texture_pipeline;

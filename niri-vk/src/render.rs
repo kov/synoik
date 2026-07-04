@@ -35,6 +35,27 @@ pub struct QuadPush {
     /// Sub-rectangle of the texture to sample, normalized `[u0, v0, du, dv]`; `[0, 0, 1, 1]` is
     /// the full texture. Used by the sampling materials to remap `v_uv` (see `texture.frag`).
     pub src_rect: [f32; 4],
+    /// Horizontal fade band `[left, right]` in the sampled texture's u coordinate, for
+    /// `gradient_fade.frag`; `left >= right` disables the fade. Ignored by other materials.
+    pub cutoff: [f32; 2],
+}
+
+impl Default for QuadPush {
+    /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
+    /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*
+    /// texture `[0, 0, 1, 1]`, not zeros, so a defaulted sampling quad samples everything.
+    fn default() -> Self {
+        QuadPush {
+            origin: [0.0, 0.0],
+            size: [0.0, 0.0],
+            target: [0.0, 0.0],
+            corner_radius: 0.0,
+            _pad0: 0.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            src_rect: [0.0, 0.0, 1.0, 1.0],
+            cutoff: [0.0, 0.0],
+        }
+    }
 }
 
 pub struct RenderTarget {

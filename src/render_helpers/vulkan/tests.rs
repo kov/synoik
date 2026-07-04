@@ -18,6 +18,7 @@ use smithay::utils::{
 
 use super::VulkanRenderer;
 use crate::niri::OutputRenderElements;
+use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -486,6 +487,85 @@ fn vulkan_rounded_texture_partial_src() {
         close_px(px(&pixels, 2, 2), clear_u8(), 3),
         "corner should still be cut to the background, got {:?}",
         px(&pixels, 2, 2),
+    );
+}
+
+// --- M3 step 1c: GradientFadeTextureRenderElement through the owned Vulkan renderer ------------
+
+/// A horizontally-clipped texture (src narrower than the buffer) fades its alpha out toward the
+/// clipped edge: the left stays opaque, the right edge fades to the background, and the band
+/// between is a monotonic partial blend. Oracle-free structural invariants.
+#[test]
+fn vulkan_gradient_fade_clipped_texture() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_gradient_fade_clipped_texture: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const ORANGE: [u8; 4] = [220, 120, 40, 255];
+    let texels: Vec<u8> = ORANGE
+        .iter()
+        .copied()
+        .cycle()
+        .take((W * H * 4) as usize)
+        .collect();
+    let buffer = TextureBuffer::from_memory(
+        &mut vk,
+        &texels,
+        Fourcc::Abgr8888,
+        (W, H),
+        false,
+        1.0,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .expect("import gradient texture");
+    // src is only 48 of the 64 wide → clipped, so the element adds a fade near the right edge.
+    let src = Rectangle::new(
+        Point::<f64, Logical>::from((0.0, 0.0)),
+        Size::<f64, Logical>::from((48.0, H as f64)),
+    );
+    let inner = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::<f64, _>::from((0.0, 0.0)),
+        1.0,
+        Some(src),
+        Some(Size::<f64, _>::from((W as f64, H as f64))),
+        Kind::Unspecified,
+    );
+    let elem = GradientFadeTextureRenderElement::new_vulkan(inner);
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
+
+    // Left of the fade band: opaque source color.
+    assert!(
+        close_px(px(&pixels, 4, 32), ORANGE, 4),
+        "left should be opaque orange, got {:?}",
+        px(&pixels, 4, 32),
+    );
+    // Right edge: faded almost fully out → close to the background (low red, orange R=220 vs
+    // clear R=64).
+    let right = px(&pixels, W - 1, 32);
+    assert!(
+        right[0] <= 90,
+        "right edge should fade toward the background, got {right:?}",
+    );
+    // Band midpoint: a partial blend of orange (R=220) and background (R=64).
+    let mid_r = px(&pixels, 52, 32)[0];
+    assert!(
+        (100..=180).contains(&mid_r),
+        "fade band midpoint should be a partial blend, red={mid_r}",
+    );
+    // Monotonic: more fade toward the right → red decreases across the band.
+    assert!(
+        px(&pixels, 44, 32)[0] > px(&pixels, 58, 32)[0],
+        "fade should be monotonic across the band",
     );
 }
 

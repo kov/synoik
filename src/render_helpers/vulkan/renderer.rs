@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ash::vk;
 use niri_vk::gpu::Gpu;
 use niri_vk::render::{load_module, sampler_set_layout, QuadPush, COLOR_RANGE};
-use niri_vk::shaders::{QUAD_VERT, ROUNDED_TEX_FRAG, SOLID_FRAG, TEX_FRAG};
+use niri_vk::shaders::{GRADIENT_FADE_FRAG, QUAD_VERT, ROUNDED_TEX_FRAG, SOLID_FRAG, TEX_FRAG};
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::sync::SyncPoint;
@@ -46,6 +46,7 @@ pub struct VulkanRenderer {
     pub(super) solid_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
+    pub(super) gradient_fade_pipeline: Pipeline,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
     downscale_filter: TextureFilter,
@@ -79,6 +80,13 @@ impl VulkanRenderer {
             ROUNDED_TEX_FRAG,
             std::slice::from_ref(&sampler_set_layout),
         )?;
+        let gradient_fade_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            GRADIENT_FADE_FRAG,
+            std::slice::from_ref(&sampler_set_layout),
+        )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(gpu.queue_family)
@@ -93,6 +101,7 @@ impl VulkanRenderer {
             solid_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
+            gradient_fade_pipeline,
             sampler_set_layout,
             command_pool,
             downscale_filter: TextureFilter::Linear,
@@ -229,6 +238,7 @@ impl Drop for VulkanRenderer {
             self.solid_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
+            self.gradient_fade_pipeline.destroy(dev);
             dev.destroy_descriptor_set_layout(self.sampler_set_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.command_pool, None);

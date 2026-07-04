@@ -16,3 +16,7 @@ pub const TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.fr
 /// rounded-rect coverage — niri's `RoundedTextureRenderElement`).
 pub const ROUNDED_TEX_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/rounded_texture.frag.spv"));
+/// Gradient-fade fragment stage (sample a `sampler2D`, then fade the alpha out horizontally across
+/// a cutoff band — niri's `GradientFadeTextureRenderElement`).
+pub const GRADIENT_FADE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gradient_fade.frag.spv"));

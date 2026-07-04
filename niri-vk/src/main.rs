@@ -133,9 +133,8 @@ fn render_scene(gpu: &Gpu) -> Result<Vec<u8>> {
         size: [96.0, 88.0],
         target: dims,
         corner_radius,
-        _pad0: 0.0,
         color: unorm(color),
-        src_rect: [0.0, 0.0, 1.0, 1.0],
+        ..Default::default()
     };
     let solid_quad = column(16.0, RED, 0.0);
     let rounded_quad = column(144.0, GREEN, 26.0);
@@ -410,10 +409,7 @@ fn render_dmabuf(gpu: &Gpu) -> Result<Option<Vec<u8>>> {
         origin: [0.0, 0.0],
         size: dims,
         target: dims,
-        corner_radius: 0.0,
-        _pad0: 0.0,
-        color: [1.0, 1.0, 1.0, 1.0],
-        src_rect: [0.0, 0.0, 1.0, 1.0],
+        ..Default::default()
     };
     gpu.run_commands(pool, |cbuf| {
         target.begin(gpu, cbuf, unorm(CLEAR));

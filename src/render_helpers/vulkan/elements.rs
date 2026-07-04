@@ -57,7 +57,7 @@ degraded_vulkan_element!(ShadowRenderElement);
 // `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.
 degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
 degraded_vulkan_element!(ClippedSurfaceRenderElement<VulkanRenderer>);
-degraded_vulkan_element!(GradientFadeTextureRenderElement);
+degraded_vulkan_element!(GradientFadeTextureRenderElement<GlesTexture>);
 degraded_vulkan_element!(ResizeRenderElement);
 degraded_vulkan_element!(XrayElement);
 degraded_vulkan_element!(ShaderRenderElement);
