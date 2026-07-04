@@ -2,7 +2,9 @@
 name = "vk-spike"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.85"
+# Above the workspace's 1.85 floor (pango 0.22 needs 1.92). This is an isolated spike, so it may
+# lead the toolchain requirement; matching niri's pango 0.22 also dedupes the workspace build.
+rust-version = "1.92"
 license = "GPL-3.0-or-later"
 publish = false
 description = "Stage 0 bring-up spike for the owned Vulkan render stack (see docs/fork render plan). Not wired into the compositor."
@@ -10,4 +12,10 @@ description = "Stage 0 bring-up spike for the owned Vulkan render stack (see doc
 [dependencies]
 anyhow.workspace = true
 ash = "0.38.0"
+cairo-rs = "0.22.0"
+cosmic-text = "0.19.0"
+etagere = "0.3.0"
+pango = "0.22.8"
+pangocairo = "0.22.8"
 png = "0.18.1"
+swash = "0.2"

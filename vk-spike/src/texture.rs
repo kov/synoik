@@ -20,8 +20,7 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Upload `rgba` (tight `width*height*4` RGBA8) into a shader-readable texture. `filter`
-    /// picks nearest vs linear sampling.
+    /// Upload tight `width*height` RGBA8 pixels into a shader-readable texture.
     pub fn from_rgba(
         gpu: &Gpu,
         pool: vk::CommandPool,
@@ -30,9 +29,49 @@ impl Texture {
         rgba: &[u8],
         filter: vk::Filter,
     ) -> Result<Self> {
+        Self::upload(gpu, pool, width, height, rgba, FORMAT, 4, filter)
+    }
+
+    /// Upload tight `width*height` single-channel coverage (R8) — the glyph atlas format.
+    pub fn from_coverage(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        coverage: &[u8],
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        Self::upload(
+            gpu,
+            pool,
+            width,
+            height,
+            coverage,
+            vk::Format::R8_UNORM,
+            1,
+            filter,
+        )
+    }
+
+    /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
+    #[allow(clippy::too_many_arguments)]
+    fn upload(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        format: vk::Format,
+        bpp: vk::DeviceSize,
+        filter: vk::Filter,
+    ) -> Result<Self> {
         let device = &gpu.device;
-        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
-        assert_eq!(rgba.len() as vk::DeviceSize, size, "rgba size mismatch");
+        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * bpp;
+        assert_eq!(
+            data.len() as vk::DeviceSize,
+            size,
+            "texture data size mismatch"
+        );
 
         // --- staging buffer with the pixel data ---
         let staging_ci = vk::BufferCreateInfo::default()
@@ -51,14 +90,14 @@ impl Texture {
             let ptr = device
                 .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
                 .context("map staging")? as *mut u8;
-            std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr, rgba.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
             device.unmap_memory(smem);
         }
 
         // --- device-local sampled image ---
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(FORMAT)
+            .format(format)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -128,7 +167,7 @@ impl Texture {
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(FORMAT)
+            .format(format)
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }.context("texture view")?;
 

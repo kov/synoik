@@ -12,7 +12,9 @@
 
 mod blur;
 mod gpu;
+mod pango_ref;
 mod render;
+mod text;
 mod texture;
 
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ use ash::vk;
 use blur::BlurChain;
 use gpu::Gpu;
 use render::{QuadPipeline, QuadPush, RenderTarget};
+use text::{build_text, TextRenderer};
 use texture::Texture;
 
 const QUAD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
@@ -77,7 +80,114 @@ fn main() -> Result<()> {
     eprintln!("vk-spike: OK — render pass + solid + SDF rounded-rect + textured quad verified");
 
     blur_demo(&gpu)?;
+    text_demo(&gpu)?;
     Ok(())
+}
+
+const TEXT: &str = "Activities 12:34";
+const TEXT_PX: f32 = 13.0;
+const TW: u32 = 200;
+const TH: u32 = 32;
+const TEXT_BG: [u8; 4] = [24, 24, 28, 255];
+const TEXT_FG: [u8; 4] = [235, 235, 235, 255];
+const TEXT_ORIGIN: (f32, f32) = (10.0, 8.0);
+
+/// Render our hinted swash-atlas text into a Vulkan target, then stack the pango/cairo reference
+/// below it into text.png for a side-by-side 1x crispness comparison.
+fn text_demo(gpu: &Gpu) -> Result<()> {
+    let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+    let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.context("text pool")?;
+
+    let atlas = build_text(gpu, pool, TEXT, TEXT_PX)?;
+    anyhow::ensure!(!atlas.glyphs.is_empty(), "no glyphs were shaped/rasterized");
+
+    let target = RenderTarget::new(gpu, TW, TH)?;
+    let set_layout = render::sampler_set_layout(gpu)?;
+    let renderer = TextRenderer::new(gpu, target.render_pass, target.extent(), set_layout)?;
+
+    // Descriptor set pointing at the atlas.
+    let sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)];
+    let dp_ci = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(1)
+        .pool_sizes(&sizes);
+    let desc_pool = unsafe { gpu.device.create_descriptor_pool(&dp_ci, None) }.context("pool")?;
+    let alloc = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(desc_pool)
+        .set_layouts(std::slice::from_ref(&set_layout));
+    let set = unsafe { gpu.device.allocate_descriptor_sets(&alloc) }.context("set")?[0];
+    let img = vk::DescriptorImageInfo::default()
+        .sampler(atlas.texture.sampler)
+        .image_view(atlas.texture.view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(std::slice::from_ref(&img));
+    unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+
+    let dims = [TW as f32, TH as f32];
+    gpu.run_commands(pool, |cbuf| {
+        target.begin(gpu, cbuf, unorm(TEXT_BG));
+        renderer.draw(gpu, cbuf, set, &atlas, TEXT_ORIGIN, dims, unorm(TEXT_FG));
+        unsafe { gpu.device.cmd_end_render_pass(cbuf) };
+    })?;
+    let ours = target.read_back(gpu, pool)?;
+
+    // How much ink did we actually rasterize? (bright text pixels over the dark bg)
+    let bright = ours
+        .chunks_exact(4)
+        .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+        .count();
+    eprintln!("vk-spike: text bright pixels = {bright}");
+    check(
+        "text bg corner is dark",
+        sample_at(&ours, TW, 2, 2),
+        TEXT_BG,
+        3,
+    )?;
+    anyhow::ensure!(
+        bright > 40,
+        "expected visible glyph ink, got {bright} bright pixels"
+    );
+
+    // Reference render (pango/cairo), stacked below ours into one PNG.
+    let reference = pango_ref::render(
+        TEXT,
+        TW as i32,
+        TH as i32,
+        TEXT_PX as f64,
+        [TEXT_FG[0], TEXT_FG[1], TEXT_FG[2]],
+        [TEXT_BG[0], TEXT_BG[1], TEXT_BG[2]],
+        (TEXT_ORIGIN.0 as f64, TEXT_ORIGIN.1 as f64),
+    )?;
+    let mut combined = ours.clone();
+    combined.extend_from_slice(&reference);
+
+    let path = artifact_path("text.png");
+    write_png(&path, TW, TH * 2, &combined)?;
+    eprintln!(
+        "vk-spike: wrote {} (top: swash atlas, bottom: pango ref)",
+        path.display()
+    );
+    eprintln!("vk-spike: OK — hinted glyph-atlas text verified");
+
+    unsafe {
+        gpu.device.destroy_descriptor_pool(desc_pool, None);
+        gpu.device.destroy_descriptor_set_layout(set_layout, None);
+        gpu.device.destroy_command_pool(pool, None);
+    }
+    renderer.destroy(gpu);
+    atlas.texture.destroy(gpu);
+    target.destroy(gpu);
+    Ok(())
+}
+
+fn sample_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * width + x) * 4) as usize;
+    [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
 }
 
 const SRC_W: u32 = 192;
