@@ -15,6 +15,7 @@
 
 mod error;
 mod frame;
+mod integration;
 mod renderer;
 #[cfg(test)]
 mod tests;
