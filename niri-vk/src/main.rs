@@ -30,13 +30,9 @@ use niri_vk::dmabuf::{ForeignBuffer, ImportedImage};
 use niri_vk::gpu::Gpu;
 use niri_vk::probes;
 use niri_vk::render::{self, QuadPipeline, QuadPush, RenderTarget};
+use niri_vk::shaders::{QUAD_VERT, SDF_FRAG, SOLID_FRAG, TEX_FRAG};
 use niri_vk::text::{build_text, TextRenderer};
 use niri_vk::texture::Texture;
-
-const QUAD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert.spv"));
-const SOLID_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solid.frag.spv"));
-const SDF_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdf_rect.frag.spv"));
-const TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.spv"));
 
 const WIDTH: u32 = 384;
 const HEIGHT: u32 = 128;

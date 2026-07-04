@@ -50,6 +50,8 @@ pub mod snapshot;
 pub mod solid_color;
 pub mod surface;
 pub mod texture;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 pub mod xray;
 
 /// A rendering context.
