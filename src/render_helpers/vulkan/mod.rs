@@ -13,6 +13,7 @@
 //! [`niri_vk`] workspace library; this module is only the Smithay-trait glue, templated
 //! method-for-method on Smithay's `PixmanRenderer`.
 
+mod elements;
 mod error;
 mod frame;
 mod integration;

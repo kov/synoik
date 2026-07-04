@@ -183,5 +183,38 @@ macro_rules! niri_render_elements {
                 }
             }
         }
+
+        // The owned Vulkan renderer arm (only when the `vulkan` feature is enabled). Every variant
+        // implements `RenderElement<VulkanRenderer>` — plain Smithay elements generically, the niri
+        // effects via degraded (no-op) impls until they are ported (M3).
+        #[cfg(feature = "vulkan")]
+        impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>
+            for $($name_R<$crate::render_helpers::vulkan::VulkanRenderer>)? $($name_no_R)?
+        {
+            fn draw(
+                &self,
+                frame: &mut $crate::render_helpers::vulkan::VulkanFrame<'_, '_>,
+                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+                opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+                cache: Option<&smithay::utils::user_data::UserDataMap>,
+            ) -> Result<(), $crate::render_helpers::vulkan::VulkanError> {
+                match self {
+                    $($name::$variant(elem) => {
+                        smithay::backend::renderer::element::RenderElement::<$crate::render_helpers::vulkan::VulkanRenderer>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
+                    })+
+                }
+            }
+
+            fn underlying_storage(
+                &self,
+                renderer: &mut $crate::render_helpers::vulkan::VulkanRenderer,
+            ) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+                match self {
+                    $($name::$variant(elem) => elem.underlying_storage(renderer)),+
+                }
+            }
+        }
     };
 }
