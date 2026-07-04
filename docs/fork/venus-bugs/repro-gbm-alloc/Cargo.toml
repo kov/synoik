@@ -1,0 +1,13 @@
+# Standalone reproducer — deliberately detached from the parent cargo workspace.
+# The empty [workspace] table stops cargo from walking up and joining the repo
+# workspace, so `cargo build`/`cargo run` here resolve only this crate.
+[workspace]
+
+[package]
+name = "repro-gbm-alloc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gbm = "0.18.0"

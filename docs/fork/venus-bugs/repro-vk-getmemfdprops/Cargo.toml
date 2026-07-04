@@ -1,0 +1,14 @@
+# Standalone reproducer: detached from the parent workspace so a repo-root `cargo`
+# never picks it up and it builds with only its own two deps.
+[workspace]
+
+[package]
+name = "repro-vk-getmemfdprops"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Isolates a Venus (Mesa venus) inconsistency: vkGetMemoryFdPropertiesKHR rejects a dmabuf FD that vkAllocateMemory (import) then accepts."
+
+[dependencies]
+ash = "0.38.0"
+gbm = "0.18.0"
