@@ -99,6 +99,72 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         [self.fb.buffer.width as f32, self.fb.buffer.height as f32]
     }
 
+    /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
+    /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. Same
+    /// full-`src`/unflipped scope as [`Frame::render_texture_from_to`]; anything outside it
+    /// degrades to a no-op (a visible gap) rather than a wrong picture.
+    ///
+    /// Assumes the element's rounding geometry equals `dst` (true for the overview wallpaper, whose
+    /// `geometry` is the whole view at the origin); the general `geometry != dst` clip is a later
+    /// clipped-surface concern. Called from `RoundedTextureRenderElement`'s Vulkan draw, hence
+    /// `pub(crate)`.
+    pub(crate) fn render_rounded_texture(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        corner_radius: f32,
+        alpha: f32,
+    ) -> Result<(), VulkanError> {
+        // Skeleton scope: full-`src`, unflipped only (see `render_texture_from_to`).
+        let full_src = src.loc.x == 0.0
+            && src.loc.y == 0.0
+            && src.size.w as u32 == texture.width()
+            && src.size.h as u32 == texture.height();
+        if texture.flipped() || !full_src {
+            tracing::warn!(
+                "VulkanFrame::render_rounded_texture: unsupported (flipped={}, full_src={full_src}); \
+                 skipping",
+                texture.flipped(),
+            );
+            return Ok(());
+        }
+
+        let push = QuadPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            target: self.target_dims(),
+            corner_radius,
+            _pad0: 0.0,
+            // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
+            // alpha; the SDF coverage then cuts the corners.
+            color: [1.0, 1.0, 1.0, alpha],
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.rounded_texture_pipeline;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
         if self.finished {
             return Ok(SyncPoint::signaled());

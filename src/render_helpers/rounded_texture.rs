@@ -12,7 +12,7 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::backend::renderer::Texture as _;
+use smithay::backend::renderer::Texture;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
@@ -21,9 +21,13 @@ use super::shaders::{mat3_uniform, Shaders};
 use super::texture::TextureRenderElement;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
+/// Generic over the stored texture `T` so the same element can be built for GLES (`GlesTexture`,
+/// the default — every bare mention across the enum definitions resolves to it unchanged) and for
+/// the owned Vulkan renderer (`VkTexture`). GLES rounds via the `clipped_surface` shader carried in
+/// `program`; the Vulkan draw rounds in its own pipeline and leaves `program` `None`.
 #[derive(Debug, Clone)]
-pub struct RoundedTextureRenderElement {
-    inner: TextureRenderElement<GlesTexture>,
+pub struct RoundedTextureRenderElement<T: Texture = GlesTexture> {
+    inner: TextureRenderElement<T>,
     program: Option<GlesTexProgram>,
     /// Corner radius in the logical units of `geometry`.
     corner_radius: f32,
@@ -32,7 +36,15 @@ pub struct RoundedTextureRenderElement {
     scale: f32,
 }
 
-impl RoundedTextureRenderElement {
+impl<T: Texture> RoundedTextureRenderElement<T> {
+    fn rounds(&self) -> Option<&GlesTexProgram> {
+        (self.corner_radius > 0.)
+            .then_some(self.program.as_ref())
+            .flatten()
+    }
+}
+
+impl RoundedTextureRenderElement<GlesTexture> {
     pub fn new(
         renderer: &mut GlesRenderer,
         inner: TextureRenderElement<GlesTexture>,
@@ -52,12 +64,6 @@ impl RoundedTextureRenderElement {
             geometry,
             scale: scale.x as f32,
         }
-    }
-
-    fn rounds(&self) -> Option<&GlesTexProgram> {
-        (self.corner_radius > 0.)
-            .then_some(self.program.as_ref())
-            .flatten()
     }
 
     /// Same mapping as `ClippedSurfaceRenderElement::compute_uniforms`, in
@@ -110,7 +116,7 @@ impl RoundedTextureRenderElement {
     }
 }
 
-impl Element for RoundedTextureRenderElement {
+impl<T: Texture> Element for RoundedTextureRenderElement<T> {
     fn id(&self) -> &Id {
         self.inner.id()
     }
@@ -156,7 +162,7 @@ impl Element for RoundedTextureRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for RoundedTextureRenderElement {
+impl RenderElement<GlesRenderer> for RoundedTextureRenderElement<GlesTexture> {
     fn draw(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -197,7 +203,7 @@ impl RenderElement<GlesRenderer> for RoundedTextureRenderElement {
     }
 }
 
-impl<'render> RenderElement<TtyRenderer<'render>> for RoundedTextureRenderElement {
+impl<'render> RenderElement<TtyRenderer<'render>> for RoundedTextureRenderElement<GlesTexture> {
     fn draw(
         &self,
         frame: &mut TtyFrame<'render, '_, '_>,
@@ -224,6 +230,72 @@ impl<'render> RenderElement<TtyRenderer<'render>> for RoundedTextureRenderElemen
         &self,
         _renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+// The owned Vulkan renderer rounds a `VkTexture` in its own pipeline (M3). The `GlesTexture`
+// specialization keeps its degraded no-op `RenderElement<VulkanRenderer>` (a `GlesTexture` cannot
+// be sampled by Vulkan), so `OutputRenderElements<VulkanRenderer>`, which carries the
+// `GlesTexture` variant, still composes; only elements built directly with a `VkTexture` (the
+// M3 tests, and later the Vulkan wallpaper path) take this real draw.
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
+
+#[cfg(feature = "vulkan")]
+impl RoundedTextureRenderElement<VkTexture> {
+    /// Build a rounded-texture element for the owned Vulkan renderer, which rounds in its own
+    /// pipeline and needs no GLES shader program.
+    pub fn new_vulkan(
+        inner: TextureRenderElement<VkTexture>,
+        corner_radius: f64,
+        geometry: Rectangle<f64, Logical>,
+        scale: Scale<f64>,
+    ) -> Self {
+        Self {
+            inner,
+            program: None,
+            corner_radius: corner_radius as f32,
+            geometry,
+            scale: scale.x as f32,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for RoundedTextureRenderElement<VkTexture> {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        // Zero radius: the corners aren't cut, so draw the plain texture (already correct on
+        // Vulkan). `rounds()` is always `None` here (no GLES program), so gate on the radius.
+        if self.corner_radius <= 0. {
+            return RenderElement::<VulkanRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            );
+        }
+
+        let texture = self.inner.buffer().texture();
+        // `corner_radius` is in the logical units of `geometry`; the pipeline's SDF works in
+        // physical pixels of `dst`, and (for this element) `geometry == dst`, so scale it up.
+        let radius_px = self.corner_radius * self.scale;
+        let alpha = Element::alpha(&self.inner);
+        frame.render_rounded_texture(texture, src, dst, radius_px, alpha)
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

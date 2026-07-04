@@ -16,6 +16,7 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, S
 
 use super::VulkanRenderer;
 use crate::niri::OutputRenderElements;
+use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 
@@ -292,4 +293,164 @@ fn vulkan_matches_pixman() {
     let px_pixels = render_into(&mut px, &mut px_target);
 
     assert_close(&vk_pixels, &px_pixels);
+}
+
+// --- M3 step 1: RoundedTextureRenderElement through the owned Vulkan renderer -------------------
+
+/// Corner radius (logical px == physical px here, scale 1) for the rounded-texture tests.
+const RADIUS: f64 = 16.0;
+
+/// A `W×H` opaque gradient with every channel well above `CLEAR` (so an interior pixel is
+/// unambiguously distinguishable from the cleared background), tight `[R,G,B,A]`. Blue is constant
+/// so coverage — not the gradient — is what varies it across the corner.
+fn rounded_texels() -> Vec<u8> {
+    let mut v = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            v.extend_from_slice(&expected_texel(x, y));
+        }
+    }
+    v
+}
+
+/// The gradient value of [`rounded_texels`] at `(x, y)` — the color an opaque (covered) output
+/// pixel should hold when the texture is drawn 1:1.
+fn expected_texel(x: i32, y: i32) -> [u8; 4] {
+    [(96 + x) as u8, (96 + y) as u8, 180, 255]
+}
+
+/// The opaque background color `CLEAR` as read back (`round(0.25 * 255) = 64`).
+fn clear_u8() -> [u8; 4] {
+    CLEAR.map(|c| (c * 255.0).round() as u8)
+}
+
+/// One `[R,G,B,A]` pixel out of a tight `W`-wide RGBA8 buffer.
+fn px(buf: &[u8], x: i32, y: i32) -> [u8; 4] {
+    let i = ((y * W + x) * 4) as usize;
+    [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+}
+
+/// Whether two pixels agree within `tol` per channel.
+fn close_px(a: [u8; 4], b: [u8; 4], tol: u8) -> bool {
+    a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= tol)
+}
+
+/// Build a rounded `W×H` texture element on `vk` and render it (cleared to `CLEAR`) into a fresh
+/// offscreen, returning the read-back pixels. Drawn 1:1 (no filtering), full-`src`, `geometry ==
+/// dst`, scale 1 — the wallpaper-shaped case the M3 material handles.
+fn render_rounded(vk: &mut VulkanRenderer, corner_radius: f64) -> Vec<u8> {
+    let buffer = TextureBuffer::from_memory(
+        vk,
+        &rounded_texels(),
+        Fourcc::Abgr8888,
+        (W, H),
+        false,
+        1.0,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .expect("import rounded texture");
+    let inner = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::<f64, _>::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let elem = RoundedTextureRenderElement::new_vulkan(
+        inner,
+        corner_radius,
+        Rectangle::from_size(Size::<f64, _>::from((W as f64, H as f64))),
+        Scale::from(1.0),
+    );
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    render_elements_into(vk, &mut target, std::slice::from_ref(&elem))
+}
+
+/// The rounded-texture material cuts the quad's corners to the SDF disc: interior shows the source
+/// texel, deep corners show the cleared background, the corner arc-center stays opaque (not a
+/// square clip), and the boundary is antialiased (not a 1-bit mask). Oracle-free structural
+/// invariants — Pixman renders square corners so it is an anti-oracle here, and these pins encode
+/// the exact intended behavior.
+#[test]
+fn vulkan_rounded_texture_cuts_corners() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_rounded_texture_cuts_corners: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let pixels = render_rounded(&mut vk, RADIUS);
+    let clear = clear_u8();
+
+    // Interior: the source texel, not the background (fails on the degraded no-op).
+    assert!(
+        close_px(px(&pixels, 32, 32), expected_texel(32, 32), 3),
+        "interior should be the source texel, got {:?}",
+        px(&pixels, 32, 32),
+    );
+    // Deep corner: cut to the background (fails on a plain/square-corner draw).
+    assert!(
+        close_px(px(&pixels, 2, 2), clear, 3),
+        "corner should be cut to the background, got {:?}",
+        px(&pixels, 2, 2),
+    );
+    // Arc center (radius, radius): inside the rounded region → opaque texel (fails on an
+    // over-aggressive full-quadrant clip).
+    assert!(
+        close_px(px(&pixels, 16, 16), expected_texel(16, 16), 4),
+        "corner arc-center should be opaque texel, got {:?}",
+        px(&pixels, 16, 16),
+    );
+    // Edge midpoint: only the corners are cut → opaque texel.
+    assert!(
+        close_px(px(&pixels, 32, 2), expected_texel(32, 2), 3),
+        "top edge midpoint should be opaque texel, got {:?}",
+        px(&pixels, 32, 2),
+    );
+    // Antialiasing: some corner pixel is a partial blend of texel-blue (180) and clear-blue (64),
+    // i.e. strictly between them — a 1-bit mask would have none.
+    let has_aa = (0..12)
+        .flat_map(|y| (0..12).map(move |x| (x, y)))
+        .any(|(x, y)| {
+            let b = px(&pixels, x, y)[2];
+            b > 70 && b < 174
+        });
+    assert!(
+        has_aa,
+        "expected an antialiased partial-coverage pixel along the corner arc",
+    );
+}
+
+/// A zero radius exercises the delegate-to-`inner` branch: no corners are cut, so the whole quad —
+/// corners included — is the opaque source texture, identical to a plain textured draw.
+#[test]
+fn vulkan_rounded_texture_zero_radius_is_plain() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_rounded_texture_zero_radius_is_plain: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+    let pixels = render_rounded(&mut vk, 0.0);
+
+    // The corner is now the plain texture, not the background.
+    assert!(
+        close_px(px(&pixels, 2, 2), expected_texel(2, 2), 3),
+        "zero radius must draw the plain texture into the corner, got {:?}",
+        px(&pixels, 2, 2),
+    );
+    assert!(
+        close_px(px(&pixels, 32, 32), expected_texel(32, 32), 3),
+        "interior should be the source texel, got {:?}",
+        px(&pixels, 32, 32),
+    );
 }

@@ -12,3 +12,7 @@ pub const SOLID_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solid.fr
 pub const SDF_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdf_rect.frag.spv"));
 /// Textured fragment stage (sample a bound `sampler2D`, tinted by the push-constant color).
 pub const TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.spv"));
+/// Rounded-texture fragment stage (sample a `sampler2D`, then cut the corners with the SDF
+/// rounded-rect coverage — niri's `RoundedTextureRenderElement`).
+pub const ROUNDED_TEX_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rounded_texture.frag.spv"));

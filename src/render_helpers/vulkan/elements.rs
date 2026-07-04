@@ -7,6 +7,7 @@
 //! implement `RenderElement<R>` generically, so they render correctly through Vulkan today.
 
 use smithay::backend::renderer::element::{RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::gles::GlesTexture;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle};
 
@@ -52,7 +53,9 @@ macro_rules! degraded_vulkan_element {
 
 degraded_vulkan_element!(BorderRenderElement);
 degraded_vulkan_element!(ShadowRenderElement);
-degraded_vulkan_element!(RoundedTextureRenderElement);
+// The `VkTexture` specialization has a real (SDF-rounding) impl in `rounded_texture.rs`; the
+// `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.
+degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
 degraded_vulkan_element!(ClippedSurfaceRenderElement<VulkanRenderer>);
 degraded_vulkan_element!(GradientFadeTextureRenderElement);
 degraded_vulkan_element!(ResizeRenderElement);
