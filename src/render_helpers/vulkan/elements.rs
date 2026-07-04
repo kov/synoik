@@ -59,5 +59,5 @@ degraded_vulkan_element!(ResizeRenderElement);
 degraded_vulkan_element!(XrayElement);
 degraded_vulkan_element!(ShaderRenderElement);
 degraded_vulkan_element!(FramebufferEffectElement);
-degraded_vulkan_element!(OffscreenRenderElement);
+degraded_vulkan_element!(OffscreenRenderElement<GlesTexture>);
 degraded_vulkan_element!(PrimaryGpuTextureRenderElement);

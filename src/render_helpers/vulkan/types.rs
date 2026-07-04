@@ -126,6 +126,13 @@ impl VkTexture {
         self.0.flipped
     }
 
+    /// Whether this is the only handle to the underlying GPU resources (no other clone is live) —
+    /// the [`smithay::backend::renderer::gles::GlesTexture::is_unique_reference`] equivalent, used
+    /// by `OffscreenBuffer` to decide whether a cached offscreen texture can be reused.
+    pub fn is_unique_reference(&mut self) -> bool {
+        Arc::get_mut(&mut self.0).is_some()
+    }
+
     /// The underlying color image (sampled source and, for offscreens, the render-pass attachment).
     pub(super) fn image(&self) -> vk::Image {
         self.0.tex.image

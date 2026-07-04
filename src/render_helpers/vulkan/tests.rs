@@ -17,10 +17,11 @@ use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 
-use super::VulkanRenderer;
+use super::{VkTexture, VulkanRenderer};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
+use crate::render_helpers::offscreen::OffscreenBuffer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -808,4 +809,44 @@ fn vulkan_offscreen_sampleable_roundtrip() {
     let b_pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
     assert_close(&a_pixels, &b_pixels);
+}
+
+// --- Offscreen snapshots: OffscreenBuffer renders a subtree, its element re-samples it ----------
+
+/// niri's `OffscreenBuffer` renders a subtree into an offscreen texture and hands back an element
+/// that re-samples it (window open/close + alpha-fade animations). Drive that whole machinery
+/// through the owned Vulkan renderer — `OffscreenBuffer::render` create_buffer→bind→render→
+/// make-sampleable, then `OffscreenRenderElement<VkTexture>`'s Vulkan draw — and assert the
+/// snapshot reproduces a direct render of the same scene.
+#[test]
+fn vulkan_offscreen_snapshot() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_offscreen_snapshot: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Reference: the two-solid scene rendered directly into an offscreen (cleared to CLEAR).
+    let mut ref_target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("reference offscreen");
+    let direct = render_elements_into(&mut vk, &mut ref_target, &solid_scene());
+
+    // Snapshot: render the same scene into an OffscreenBuffer (cleared transparent), then draw the
+    // element it returns — which samples the offscreen — over a CLEAR background.
+    let buffer = OffscreenBuffer::<VkTexture>::default();
+    let (elem, _sync, _data) = buffer
+        .render(&mut vk, Scale::from(1.0), &solid_scene())
+        .expect("offscreen snapshot render");
+
+    let mut snap_target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("snapshot offscreen");
+    let snapshot = render_elements_into(&mut vk, &mut snap_target, std::slice::from_ref(&elem));
+
+    // The offscreen is opaque where the solids cover it and transparent elsewhere, so re-sampling
+    // it over CLEAR must match the direct render pixel-for-pixel.
+    assert_close(&direct, &snapshot);
 }

@@ -13,32 +13,38 @@ use smithay::backend::renderer::utils::{
     CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions,
 };
 use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, Frame as _, Offscreen as _, Renderer, Texture as _,
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
 };
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::encompassing_geo;
-use super::renderer::AsGlesFrame as _;
+use super::renderer::{AsGlesFrame as _, OffscreenRenderer};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// Buffer for offscreen rendering.
+///
+/// Generic over the offscreen texture type `T` (the renderer's `TextureId`), defaulting to
+/// `GlesTexture` so bare mentions across the render tree resolve unchanged; the owned Vulkan
+/// renderer specializes it to `VkTexture`. (`ContextId<T>` requires `T: Texture`.)
 #[derive(Debug)]
-pub struct OffscreenBuffer {
+pub struct OffscreenBuffer<T: Texture = GlesTexture> {
     id: Id,
 
     /// The cached texture buffer.
     ///
     /// Lazily created when `render` is called. Recreated when necessary.
-    inner: RefCell<Option<Inner>>,
+    inner: RefCell<Option<Inner<T>>>,
 }
 
 #[derive(Debug)]
-struct Inner {
+struct Inner<T: Texture> {
     /// The texture with offscreened contents.
-    texture: GlesTexture,
+    texture: T,
     /// Id of the renderer context that the texture comes from.
-    renderer_context_id: ContextId<GlesTexture>,
+    renderer_context_id: ContextId<T>,
     /// Scale of the texture.
     scale: Scale<f64>,
     /// Damage tracker for drawing to the texture.
@@ -48,10 +54,10 @@ struct Inner {
 }
 
 #[derive(Debug, Clone)]
-pub struct OffscreenRenderElement {
+pub struct OffscreenRenderElement<T: Texture = GlesTexture> {
     id: Id,
-    texture: GlesTexture,
-    renderer_context_id: ContextId<GlesTexture>,
+    texture: T,
+    renderer_context_id: ContextId<T>,
     scale: Scale<f64>,
     damage: DamageSnapshot<i32, Buffer>,
     offset: Point<f64, Logical>,
@@ -68,13 +74,17 @@ pub struct OffscreenData {
     pub states: RenderElementStates,
 }
 
-impl OffscreenBuffer {
-    pub fn render(
+impl<T: Texture + Clone + 'static> OffscreenBuffer<T> {
+    pub fn render<R>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         scale: Scale<f64>,
-        elements: &[impl RenderElement<GlesRenderer>],
-    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
+        elements: &[impl RenderElement<R>],
+    ) -> anyhow::Result<(OffscreenRenderElement<T>, SyncPoint, OffscreenData)>
+    where
+        R: OffscreenRenderer + Renderer<TextureId = T> + Offscreen<T> + Bind<T>,
+        R::Error: std::error::Error + Send + Sync + 'static,
+    {
         let _span = tracy_client::span!("OffscreenBuffer::render");
 
         let geo = encompassing_geo(scale, elements.iter());
@@ -111,7 +121,7 @@ impl OffscreenBuffer {
                 reason = &size_string;
 
                 *inner = None;
-            } else if !texture.is_unique_reference() {
+            } else if !renderer.offscreen_is_reusable(texture) {
                 reason = "not unique";
 
                 *inner = None;
@@ -131,7 +141,7 @@ impl OffscreenBuffer {
             let span = tracy_client::span!("creating offscreen buffer");
             span.emit_text(reason);
 
-            let texture: GlesTexture = renderer
+            let texture: T = renderer
                 .create_buffer(Fourcc::Abgr8888, src_size)
                 .context("error creating texture")?;
 
@@ -169,6 +179,12 @@ impl OffscreenBuffer {
                 .context("error rendering")?
         };
 
+        // Make the just-rendered offscreen sampleable by the returned element's draw (a no-op on
+        // GLES; the owned Vulkan renderer inserts the layout barrier its images need).
+        renderer
+            .make_offscreen_sampleable(&inner.texture)
+            .context("error preparing offscreen for sampling")?;
+
         // Add the resulting damage to the outer tracker.
         if let Some(damage) = res.damage {
             // OutputDamageTracker gives us Physical coordinate space, but it's actually the Buffer
@@ -201,7 +217,7 @@ impl OffscreenBuffer {
     }
 }
 
-impl Default for OffscreenBuffer {
+impl<T: Texture> Default for OffscreenBuffer<T> {
     fn default() -> Self {
         OffscreenBuffer {
             inner: RefCell::new(None),
@@ -210,8 +226,8 @@ impl Default for OffscreenBuffer {
     }
 }
 
-impl OffscreenRenderElement {
-    pub fn texture(&self) -> &GlesTexture {
+impl<T: Texture> OffscreenRenderElement<T> {
+    pub fn texture(&self) -> &T {
         &self.texture
     }
 
@@ -242,7 +258,7 @@ impl OffscreenRenderElement {
     }
 }
 
-impl Element for OffscreenRenderElement {
+impl<T: Texture> Element for OffscreenRenderElement<T> {
     fn id(&self) -> &Id {
         &self.id
     }
@@ -299,7 +315,7 @@ impl Element for OffscreenRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for OffscreenRenderElement {
+impl RenderElement<GlesRenderer> for OffscreenRenderElement<GlesTexture> {
     fn draw(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -334,7 +350,7 @@ impl RenderElement<GlesRenderer> for OffscreenRenderElement {
     }
 }
 
-impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement {
+impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement<GlesTexture> {
     fn draw(
         &self,
         frame: &mut TtyFrame<'_, '_, '_>,
@@ -363,6 +379,40 @@ impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement {
     ) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
+        None
+    }
+}
+
+// The `VkTexture` specialization samples the offscreen through the owned Vulkan renderer (the
+// sampleable-offscreen bridge); the render tree's `<GlesTexture>` variant stays a degraded no-op.
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        if frame.context_id() != self.renderer_context_id {
+            warn!("trying to render texture from different renderer");
+            return Ok(());
+        }
+
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            Transform::Normal,
+            self.alpha,
+        )
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

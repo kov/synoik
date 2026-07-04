@@ -292,10 +292,8 @@ impl VulkanRenderer {
     /// after being rendered into (the offscreen-snapshot / blur / clipped-surface bridge). No-op if
     /// it is already sampleable. Runs as its own fence-waited submission, matching this renderer's
     /// synchronous per-submit model; call it once, between finishing the offscreen render and using
-    /// the texture as a draw source.
-    // Exercised by the offscreen round-trip test; the live consumers (offscreen snapshots, blur,
-    // clipped-surface) that call it in a non-test build are the next M3 step.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// the texture as a draw source. Reached generically via
+    /// [`crate::render_helpers::renderer::OffscreenRenderer::make_offscreen_sampleable`].
     pub(crate) fn make_sampleable(&self, tex: &VkTexture) -> Result<(), VulkanError> {
         let old_layout = tex.layout();
         if old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {

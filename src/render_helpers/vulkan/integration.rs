@@ -20,11 +20,23 @@ use smithay::wayland::compositor::SurfaceData;
 use super::error::VulkanError;
 use super::types::{VkFramebuffer, VkTexture};
 use super::VulkanRenderer;
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::renderer::{AsGlesRenderer, OffscreenRenderer};
 
 impl AsGlesRenderer for VulkanRenderer {
     fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
         None
+    }
+}
+
+impl OffscreenRenderer for VulkanRenderer {
+    fn make_offscreen_sampleable(&self, texture: &VkTexture) -> anyhow::Result<()> {
+        // Transition the just-rendered offscreen from TRANSFER_SRC_OPTIMAL to SHADER_READ_ONLY so a
+        // later draw can sample it (the sampleable-offscreen bridge).
+        self.make_sampleable(texture).map_err(Into::into)
+    }
+
+    fn offscreen_is_reusable(&self, texture: &mut VkTexture) -> bool {
+        texture.is_unique_reference()
     }
 }
 

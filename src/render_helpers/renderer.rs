@@ -1,5 +1,5 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
+use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{
     Bind, ExportMem, ImportAll, ImportMem, Renderer, RendererSuper, Texture,
 };
@@ -71,6 +71,33 @@ impl AsGlesRenderer for GlesRenderer {
 impl AsGlesRenderer for TtyRenderer<'_> {
     fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
         Some(self.as_mut())
+    }
+}
+
+/// A renderer that can produce **re-sampleable** offscreen snapshots (see
+/// [`crate::render_helpers::offscreen::OffscreenBuffer`]): it knows how to make a freshly-rendered
+/// offscreen texture readable by a later sampling draw, and whether a cached offscreen texture can
+/// be reused. GLES textures are immediately sampleable and expose `is_unique_reference` directly;
+/// the owned Vulkan renderer inserts a layout barrier and checks its own `Arc` uniqueness.
+///
+/// Only implemented for the renderers that actually drive `OffscreenBuffer::render` —
+/// `GlesRenderer` (the live path) and the owned `VulkanRenderer` (offscreen-verified). The Tty
+/// `MultiRenderer` is never passed to it (its callers drop to GLES first), so it needs no impl.
+pub trait OffscreenRenderer: Renderer {
+    /// Prepare a just-rendered offscreen `texture` to be sampled. No-op on GLES (an FBO-backed
+    /// texture is immediately sampleable); the Vulkan renderer transitions the image layout.
+    fn make_offscreen_sampleable(&self, _texture: &Self::TextureId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether a cached offscreen `texture` can be reused, i.e. no other live reference holds its
+    /// GPU resources (a still-displayed snapshot from a previous frame must not be drawn over).
+    fn offscreen_is_reusable(&self, texture: &mut Self::TextureId) -> bool;
+}
+
+impl OffscreenRenderer for GlesRenderer {
+    fn offscreen_is_reusable(&self, texture: &mut GlesTexture) -> bool {
+        texture.is_unique_reference()
     }
 }
 
