@@ -12,7 +12,6 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
-use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
@@ -51,7 +50,7 @@ macro_rules! degraded_vulkan_element {
     };
 }
 
-degraded_vulkan_element!(BorderRenderElement);
+// BorderRenderElement has a real (procedural) Vulkan draw in border.rs.
 degraded_vulkan_element!(ShadowRenderElement);
 // The `VkTexture` specialization has a real (SDF-rounding) impl in `rounded_texture.rs`; the
 // `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.

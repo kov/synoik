@@ -20,3 +20,8 @@ pub const ROUNDED_TEX_FRAG: &[u8] =
 /// a cutoff band — niri's `GradientFadeTextureRenderElement`).
 pub const GRADIENT_FADE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gradient_fade.frag.spv"));
+/// Border material vertex + fragment stages (angled gradient clipped to a rounded-rect ring —
+/// niri's `BorderRenderElement`). Both stages declare the `BorderPush` block; the fragment outputs
+/// premultiplied color.
+pub const BORDER_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/border.vert.spv"));
+pub const BORDER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/border.frag.spv"));

@@ -40,6 +40,33 @@ pub struct QuadPush {
     pub cutoff: [f32; 2],
 }
 
+/// Push constants for the border material (`border.vert`/`border.frag`). `repr(C)` field order is
+/// chosen so each member lands at its natural std430 offset (all `vec4`s at 16-aligned offsets),
+/// matching the GLSL block exactly. 136 bytes (well under the 256-byte push limit).
+/// `origin`/`size`/ `target` mirror [`QuadPush`]'s first three fields so the shared quad-emission
+/// vertex stage works.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BorderPush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub target: [f32; 2],
+    pub border_width: f32,
+    pub colorspace: f32,
+    pub color_from: [f32; 4],
+    pub color_to: [f32; 4],
+    pub outer_radius: [f32; 4],
+    pub grad_offset: [f32; 2],
+    pub grad_vec: [f32; 2],
+    pub area_size: [f32; 2],
+    pub geo_loc: [f32; 2],
+    pub geo_size: [f32; 2],
+    pub grad_width: f32,
+    pub hue_interpolation: f32,
+    pub niri_scale: f32,
+    pub niri_alpha: f32,
+}
+
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
     /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*

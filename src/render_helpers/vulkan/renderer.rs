@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use ash::vk;
 use niri_vk::gpu::Gpu;
-use niri_vk::render::{load_module, sampler_set_layout, QuadPush, COLOR_RANGE};
-use niri_vk::shaders::{GRADIENT_FADE_FRAG, QUAD_VERT, ROUNDED_TEX_FRAG, SOLID_FRAG, TEX_FRAG};
+use niri_vk::render::{load_module, sampler_set_layout, BorderPush, QuadPush, COLOR_RANGE};
+use niri_vk::shaders::{
+    BORDER_FRAG, BORDER_VERT, GRADIENT_FADE_FRAG, QUAD_VERT, ROUNDED_TEX_FRAG, SOLID_FRAG, TEX_FRAG,
+};
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::sync::SyncPoint;
@@ -47,6 +49,7 @@ pub struct VulkanRenderer {
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) gradient_fade_pipeline: Pipeline,
+    pub(super) border_pipeline: Pipeline,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
     downscale_filter: TextureFilter,
@@ -65,27 +68,54 @@ impl VulkanRenderer {
     fn with_gpu(gpu: Arc<Gpu>) -> Result<Self, VulkanError> {
         let render_pass = create_render_pass(&gpu.device)?;
         let sampler_set_layout = sampler_set_layout(&gpu)?;
-        let solid_pipeline = build_pipeline(&gpu, render_pass, QUAD_VERT, SOLID_FRAG, &[])?;
+        let quad_push = std::mem::size_of::<QuadPush>() as u32;
+        let sampler = std::slice::from_ref(&sampler_set_layout);
+        // Straight-alpha materials (output non-premultiplied color).
+        let solid_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            SOLID_FRAG,
+            &[],
+            quad_push,
+            false,
+        )?;
         let texture_pipeline = build_pipeline(
             &gpu,
             render_pass,
             QUAD_VERT,
             TEX_FRAG,
-            std::slice::from_ref(&sampler_set_layout),
+            sampler,
+            quad_push,
+            false,
         )?;
         let rounded_texture_pipeline = build_pipeline(
             &gpu,
             render_pass,
             QUAD_VERT,
             ROUNDED_TEX_FRAG,
-            std::slice::from_ref(&sampler_set_layout),
+            sampler,
+            quad_push,
+            false,
         )?;
         let gradient_fade_pipeline = build_pipeline(
             &gpu,
             render_pass,
             QUAD_VERT,
             GRADIENT_FADE_FRAG,
-            std::slice::from_ref(&sampler_set_layout),
+            sampler,
+            quad_push,
+            false,
+        )?;
+        // The border material outputs premultiplied color and samples nothing (no descriptor set).
+        let border_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            BORDER_VERT,
+            BORDER_FRAG,
+            &[],
+            std::mem::size_of::<BorderPush>() as u32,
+            true,
         )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
@@ -102,6 +132,7 @@ impl VulkanRenderer {
             texture_pipeline,
             rounded_texture_pipeline,
             gradient_fade_pipeline,
+            border_pipeline,
             sampler_set_layout,
             command_pool,
             downscale_filter: TextureFilter::Linear,
@@ -239,6 +270,7 @@ impl Drop for VulkanRenderer {
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
             self.gradient_fade_pipeline.destroy(dev);
+            self.border_pipeline.destroy(dev);
             dev.destroy_descriptor_set_layout(self.sampler_set_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.command_pool, None);
@@ -502,14 +534,18 @@ fn create_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, VulkanError> 
     unsafe { dev.create_render_pass(&ci, None) }.map_err(VulkanError::from)
 }
 
-/// Build a `quad.vert` + `frag_spv` pipeline with straight-alpha over-blend and dynamic
-/// viewport/scissor against `render_pass`.
+/// Build a `vert_spv` + `frag_spv` pipeline with dynamic viewport/scissor against `render_pass`.
+/// `push_size` is the pipeline's push-constant range size; `premultiplied` selects the source
+/// color blend factor (`ONE` for shaders that output premultiplied color like the border/shadow
+/// materials, `SRC_ALPHA` for straight-alpha materials like solid/texture).
 fn build_pipeline(
     gpu: &Gpu,
     render_pass: vk::RenderPass,
     vert_spv: &[u8],
     frag_spv: &[u8],
     set_layouts: &[vk::DescriptorSetLayout],
+    push_size: u32,
+    premultiplied: bool,
 ) -> Result<Pipeline, VulkanError> {
     let dev = &gpu.device;
     let vert = load_module(dev, vert_spv)?;
@@ -548,9 +584,14 @@ fn build_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+    let src_color_factor = if premultiplied {
+        vk::BlendFactor::ONE
+    } else {
+        vk::BlendFactor::SRC_ALPHA
+    };
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .src_color_blend_factor(src_color_factor)
         .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .color_blend_op(vk::BlendOp::ADD)
         .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -563,7 +604,7 @@ fn build_pipeline(
     let push_range = vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
-        .size(std::mem::size_of::<QuadPush>() as u32);
+        .size(push_size);
     let layout = unsafe {
         dev.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()

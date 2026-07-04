@@ -30,6 +30,19 @@ pub struct BorderRenderElement {
     params: Parameters,
 }
 
+/// Renderer-agnostic derived inputs for the border shader (see [`BorderRenderElement::computed`]).
+#[derive(Clone, Copy)]
+struct ComputedBorder {
+    grad_offset: Vec2,
+    grad_vec: Vec2,
+    grad_width: f32,
+    area_size: Vec2,
+    geo_loc: Vec2,
+    geo_size: Vec2,
+    colorspace: f32,
+    hue_interpolation: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Parameters {
     size: Size<f64, Logical>,
@@ -142,19 +155,17 @@ impl BorderRenderElement {
         self.update_inner();
     }
 
-    fn update_inner(&mut self) {
+    /// The renderer-agnostic derived quantities the border shader needs, computed from
+    /// [`Self::params`]. Shared by the GLES uniform build ([`Self::update_inner`]) and the owned
+    /// Vulkan push (`vulkan_push`) so the two never drift.
+    fn computed(&self) -> ComputedBorder {
         let Parameters {
             size,
             gradient_area,
             gradient_format,
-            color_from,
-            color_to,
             angle,
             geometry,
-            border_width,
-            corner_radius,
-            scale,
-            alpha,
+            ..
         } = self.params;
 
         let grad_offset = geometry.loc - gradient_area.loc;
@@ -175,12 +186,8 @@ impl BorderRenderElement {
         }
 
         let area_size = Vec2::new(size.w as f32, size.h as f32);
-
         let geo_loc = Vec2::new(geometry.loc.x as f32, geometry.loc.y as f32);
         let geo_size = Vec2::new(geometry.size.w as f32, geometry.size.h as f32);
-
-        let input_to_geo =
-            Mat3::from_scale(area_size) * Mat3::from_translation(-geo_loc / area_size);
 
         let colorspace = match gradient_format.color_space {
             GradientColorSpace::Srgb => 0.,
@@ -196,21 +203,49 @@ impl BorderRenderElement {
             HueInterpolation::Decreasing => 3.,
         };
 
+        ComputedBorder {
+            grad_offset,
+            grad_vec,
+            grad_width: w,
+            area_size,
+            geo_loc,
+            geo_size,
+            colorspace,
+            hue_interpolation,
+        }
+    }
+
+    fn update_inner(&mut self) {
+        let Parameters {
+            size,
+            color_from,
+            color_to,
+            border_width,
+            corner_radius,
+            scale,
+            alpha,
+            ..
+        } = self.params;
+
+        let c = self.computed();
+        let input_to_geo =
+            Mat3::from_scale(c.area_size) * Mat3::from_translation(-c.geo_loc / c.area_size);
+
         self.inner.update(
             size,
             None,
             scale,
             alpha,
             Rc::new([
-                Uniform::new("colorspace", colorspace),
-                Uniform::new("hue_interpolation", hue_interpolation),
+                Uniform::new("colorspace", c.colorspace),
+                Uniform::new("hue_interpolation", c.hue_interpolation),
                 Uniform::new("color_from", color_from.to_array_unpremul()),
                 Uniform::new("color_to", color_to.to_array_unpremul()),
-                Uniform::new("grad_offset", grad_offset.to_array()),
-                Uniform::new("grad_width", w),
-                Uniform::new("grad_vec", grad_vec.to_array()),
+                Uniform::new("grad_offset", c.grad_offset.to_array()),
+                Uniform::new("grad_width", c.grad_width),
+                Uniform::new("grad_vec", c.grad_vec.to_array()),
                 mat3_uniform("input_to_geo", input_to_geo),
-                Uniform::new("geo_size", geo_size.to_array()),
+                Uniform::new("geo_size", c.geo_size.to_array()),
                 Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
                 Uniform::new("border_width", border_width),
             ]),
@@ -325,5 +360,58 @@ impl<'render> RenderElement<TtyRenderer<'render>> for BorderRenderElement {
         renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
         self.inner.underlying_storage(renderer)
+    }
+}
+
+// The owned Vulkan renderer draws the border procedurally in its own pipeline (M3); it reads the
+// raw `params` (not the GLES `inner` uniform list), sharing the derivation via `computed()`.
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
+
+#[cfg(feature = "vulkan")]
+impl BorderRenderElement {
+    /// Build the border material's push constants from `params`, with the quad placed at `dst`.
+    /// (`target` is filled by `VulkanFrame::render_border`.)
+    fn vulkan_push(&self, dst: Rectangle<i32, Physical>) -> niri_vk::render::BorderPush {
+        let c = self.computed();
+        let p = &self.params;
+        niri_vk::render::BorderPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            target: [0.0, 0.0],
+            border_width: p.border_width,
+            colorspace: c.colorspace,
+            color_from: p.color_from.to_array_unpremul(),
+            color_to: p.color_to.to_array_unpremul(),
+            outer_radius: <[f32; 4]>::from(p.corner_radius),
+            grad_offset: c.grad_offset.to_array(),
+            grad_vec: c.grad_vec.to_array(),
+            area_size: c.area_size.to_array(),
+            geo_loc: c.geo_loc.to_array(),
+            geo_size: c.geo_size.to_array(),
+            grad_width: c.grad_width,
+            hue_interpolation: c.hue_interpolation,
+            niri_scale: p.scale,
+            niri_alpha: p.alpha,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for BorderRenderElement {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        frame.render_border(self.vulkan_push(dst))
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
     }
 }

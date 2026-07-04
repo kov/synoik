@@ -1,7 +1,7 @@
 use std::fmt;
 
 use ash::vk;
-use niri_vk::render::{as_bytes, QuadPush};
+use niri_vk::render::{as_bytes, BorderPush, QuadPush};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -201,6 +201,28 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 std::slice::from_ref(&set),
                 &[],
             );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw a border ring — the owned-renderer equivalent of niri's `BorderRenderElement` (an
+    /// angled gradient clipped to a rounded-rect ring). The caller (the element's Vulkan draw)
+    /// fills every material field of `push` plus `origin`/`size` from `dst`; this sets `target`,
+    /// binds the premultiplied-blend border pipeline (no texture), and draws the quad.
+    pub(crate) fn render_border(&mut self, mut push: BorderPush) -> Result<(), VulkanError> {
+        push.target = self.target_dims();
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.border_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
             dev.cmd_push_constants(
                 self.cbuf,
                 pipe.layout,

@@ -6,6 +6,7 @@
 //! it makes an ideal oracle: the Pixman side needs no device, and the Vulkan side guard-skips when
 //! no Vulkan device is present. Runs on Venus (real target) and lavapipe (deterministic CPU).
 
+use niri_config::{Color, CornerRadius, GradientInterpolation};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::pixman::PixmanRenderer;
@@ -18,6 +19,7 @@ use smithay::utils::{
 
 use super::VulkanRenderer;
 use crate::niri::OutputRenderElements;
+use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -566,6 +568,76 @@ fn vulkan_gradient_fade_clipped_texture() {
     assert!(
         px(&pixels, 44, 32)[0] > px(&pixels, 58, 32)[0],
         "fade should be monotonic across the band",
+    );
+}
+
+// --- M3 step 2: BorderRenderElement through the owned Vulkan renderer --------------------------
+
+/// A rounded border with a horizontal red→blue sRGB gradient: the ring is colored (red on the
+/// left, blue on the right), its interior is cut out to the background, and the rounded outer
+/// corner is cut away. Exercises the procedural border pipeline (gradient + double rounded-rect
+/// SDF + premultiplied blend). Oracle-free structural invariants.
+#[test]
+fn vulkan_border_ring_gradient_and_rounding() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_border_ring_gradient_and_rounding: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let red = Color::new_unpremul(1.0, 0.0, 0.0, 1.0);
+    let blue = Color::new_unpremul(0.0, 0.0, 1.0, 1.0);
+    let geo = Rectangle::from_size(Size::<f64, Logical>::from((W as f64, H as f64)));
+    let elem = BorderRenderElement::new(
+        Size::<f64, Logical>::from((W as f64, H as f64)), // size
+        geo,                                              // gradient_area
+        GradientInterpolation::default(),                 // sRGB / shorter
+        red,
+        blue,
+        0.0, // angle (horizontal gradient)
+        geo, // geometry
+        8.0, // border_width
+        CornerRadius::from(16.0),
+        1.0, // scale
+        1.0, // alpha
+    );
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
+
+    // Left of the ring: reddish (gradient start).
+    let left = px(&pixels, 2, 32);
+    assert!(
+        left[0] > 150 && left[2] < 90,
+        "left ring should be reddish, got {left:?}",
+    );
+    // Right of the ring: bluish (gradient end).
+    let right = px(&pixels, W - 3, 32);
+    assert!(
+        right[2] > 150 && right[0] < 90,
+        "right ring should be bluish, got {right:?}",
+    );
+    // Interior (inside the border width): cut out to the background.
+    assert!(
+        close_px(px(&pixels, 32, 32), clear_u8(), 4),
+        "interior should be cut out to the background, got {:?}",
+        px(&pixels, 32, 32),
+    );
+    // Rounded outer corner: cut away to the background.
+    assert!(
+        close_px(px(&pixels, 1, 1), clear_u8(), 4),
+        "outer corner should be rounded away, got {:?}",
+        px(&pixels, 1, 1),
+    );
+    // Top edge band is the gradient (green channel far from the background's 64).
+    let top = px(&pixels, 32, 2);
+    assert!(
+        top[1] < 40,
+        "top edge should be the border gradient, not the background, got {top:?}",
     );
 }
 
