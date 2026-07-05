@@ -801,8 +801,17 @@ fn build_pipeline(
     premultiplied: bool,
 ) -> Result<Pipeline, VulkanError> {
     let dev = &gpu.device;
+    // vk handles have no RAII: each fallible step past `vert` must destroy what precedes it before
+    // bailing, or a failed pipeline build (e.g. a user shader rejected at pipeline-creation time
+    // via `set_custom_shader`) leaks a shader module / pipeline layout.
     let vert = load_module(dev, vert_spv)?;
-    let frag = load_module(dev, frag_spv)?;
+    let frag = match load_module(dev, frag_spv) {
+        Ok(frag) => frag,
+        Err(e) => {
+            unsafe { dev.destroy_shader_module(vert, None) };
+            return Err(e.into());
+        }
+    };
 
     let stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -858,14 +867,23 @@ fn build_pipeline(
         .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
         .size(push_size);
-    let layout = unsafe {
+    let layout = match unsafe {
         dev.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(set_layouts)
                 .push_constant_ranges(std::slice::from_ref(&push_range)),
             None,
         )
-    }?;
+    } {
+        Ok(layout) => layout,
+        Err(e) => {
+            unsafe {
+                dev.destroy_shader_module(vert, None);
+                dev.destroy_shader_module(frag, None);
+            }
+            return Err(e.into());
+        }
+    };
 
     let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
@@ -879,9 +897,19 @@ fn build_pipeline(
         .layout(layout)
         .render_pass(render_pass)
         .subpass(0);
-    let pipeline =
-        unsafe { dev.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None) }
-            .map_err(|(_, e)| VulkanError::from(e))?[0];
+    let pipeline = match unsafe {
+        dev.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+    } {
+        Ok(pipelines) => pipelines[0],
+        Err((_, e)) => {
+            unsafe {
+                dev.destroy_pipeline_layout(layout, None);
+                dev.destroy_shader_module(vert, None);
+                dev.destroy_shader_module(frag, None);
+            }
+            return Err(VulkanError::from(e));
+        }
+    };
 
     Ok(Pipeline {
         pipeline,

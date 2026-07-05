@@ -417,16 +417,25 @@ fn compile_spirv(stage: Stage, glsl: &str) -> Result<Vec<u8>, VulkanError> {
         .spawn()
         .map_err(|e| VulkanError::CustomShader(format!("could not run glslangValidator: {e}")))?;
 
-    // Small inputs (a few KB) fit the pipe buffer, so writing-then-waiting cannot deadlock.
+    // Small inputs (a few KB) fit the pipe buffer, so writing-then-waiting cannot deadlock. Ignore
+    // a write error (e.g. EPIPE if an incompatible glslang exited during argument parsing, before
+    // draining stdin) and fall through to wait_with_output: that reaps the child (no zombie) and
+    // surfaces glslang's real diagnostic via the `!success` branch, instead of masking it with a
+    // generic "broken pipe" and leaking the child + temp file. `stdin` drops at the block's end,
+    // closing the write end so glslang sees EOF and wait_with_output does not hang.
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(glsl.as_bytes()).map_err(|e| {
-            VulkanError::CustomShader(format!("could not feed shader to glslangValidator: {e}"))
-        })?;
+        let _ = stdin.write_all(glsl.as_bytes());
     }
 
-    let output = child.wait_with_output().map_err(|e| {
-        VulkanError::CustomShader(format!("glslangValidator did not complete: {e}"))
-    })?;
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(VulkanError::CustomShader(format!(
+                "glslangValidator did not complete: {e}"
+            )));
+        }
+    };
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&out_path);
