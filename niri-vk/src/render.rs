@@ -90,6 +90,31 @@ pub struct ShadowPush {
     pub _pad0: f32,
 }
 
+/// Push constants for the postprocess-and-clip material (`postprocess.vert`/`postprocess.frag`).
+/// Matches the GLSL `Push` block: `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430
+/// layout, `origin`/`size`/`target` first like [`QuadPush`] so the shared quad emission works).
+/// `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry space) is passed as three
+/// `vec4` columns — the shader reads `.xyz` of each — to avoid `mat3` push-constant layout
+/// ambiguity. 144 bytes. Callers must set every field (there is no meaningful identity default).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PostprocessPush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub target: [f32; 2],
+    pub geo_size: [f32; 2],
+    pub src_rect: [f32; 4],
+    pub corner_radius: [f32; 4],
+    /// Premultiplied background mixed behind the (premultiplied) texture.
+    pub bg_color: [f32; 4],
+    /// `input_to_geo` as 3 column vectors (`.xyz` used); build from a `glam::Mat3`'s columns.
+    pub input_to_geo: [[f32; 4]; 3],
+    pub niri_scale: f32,
+    pub niri_alpha: f32,
+    pub saturation: f32,
+    pub noise: f32,
+}
+
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
     /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*

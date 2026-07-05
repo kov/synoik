@@ -30,3 +30,11 @@ pub const BORDER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/border.
 /// premultiplied color.
 pub const SHADOW_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 pub const SHADOW_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
+/// Postprocess-and-clip material vertex + fragment stages (sample a texture, apply
+/// saturation/noise/bg, then clip to a rounded rect via a general `input_to_geo` mapping — niri's
+/// `ClippedSurfaceRenderElement` / `FramebufferEffectElement` postprocess). Both stages declare the
+/// `PostprocessPush` block; the fragment samples `set 0` and outputs premultiplied color.
+pub const POSTPROCESS_VERT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/postprocess.vert.spv"));
+pub const POSTPROCESS_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/postprocess.frag.spv"));

@@ -7,6 +7,7 @@
 //! no Vulkan device is present. Runs on Venus (real target) and lavapipe (deterministic CPU).
 
 use niri_config::{Color, CornerRadius, GradientInterpolation};
+use niri_vk::render::PostprocessPush;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::pixman::PixmanRenderer;
@@ -924,5 +925,98 @@ fn vulkan_blur_smooths_edge() {
         r(4),
         r(W / 2),
         r(W - 4),
+    );
+}
+
+// --- Postprocess-and-clip: sample + saturation + rounded-corner clip -----------------------------
+
+/// The postprocess-and-clip material (`render_postprocess`, niri's clipped-surface /
+/// framebuffer-effect shader) samples a texture, desaturates it, and cuts it to a rounded rect.
+/// With an opaque red source, `saturation = 0.3`, and `corner_radius = 16` over the whole quad
+/// (identity `input_to_geo`): a deep corner is clipped away (shows the CLEAR background) while the
+/// interior is the source pulled toward its own luminance (red drops, green rises, the channel gap
+/// shrinks).
+#[test]
+fn vulkan_postprocess_clips_and_desaturates() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_postprocess_clips_and_desaturates: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Opaque, strongly-saturated red source.
+    let mut texels = Vec::with_capacity((W * H * 4) as usize);
+    for _ in 0..(W * H) {
+        texels.extend_from_slice(&[200, 40, 40, 255]);
+    }
+    let source = vk
+        .import_memory(&texels, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import source");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let full_src = Rectangle::<f64, BufferCoord>::from_size(Size::from((W as f64, H as f64)));
+        let full_dst = Rectangle::<i32, Physical>::from_size(size);
+        let push = PostprocessPush {
+            geo_size: [W as f32, H as f32],
+            corner_radius: [16.0; 4],
+            bg_color: [0.0; 4],
+            // Identity mat3 (as columns): coords_geo == v_uv, so the geometry is the whole quad.
+            input_to_geo: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            niri_scale: 1.0,
+            niri_alpha: 1.0,
+            saturation: 0.3,
+            noise: 0.0,
+            // origin/size/target/src_rect are filled by render_postprocess.
+            ..Default::default()
+        };
+        frame
+            .render_postprocess(&source, full_src, full_dst, push)
+            .expect("render postprocess");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // Deep corner: clipped away, so the CLEAR background shows through (material contributed
+    // nothing).
+    assert!(
+        close_px(px(&pixels, 2, 2), clear_u8(), 8),
+        "corner should be clipped to the background, got {:?}",
+        px(&pixels, 2, 2),
+    );
+    // Interior: the red source desaturated toward its luminance (≈(112, 64, 64) at sat 0.3). Red
+    // drops from 200, green rises from 40, and the red/green gap shrinks from 160.
+    let inner = px(&pixels, 32, 32);
+    assert!(
+        (95..=130).contains(&(inner[0] as i32)),
+        "interior red should drop toward gray, got {inner:?}",
+    );
+    assert!(
+        (50..=80).contains(&(inner[1] as i32)),
+        "interior green should rise toward gray, got {inner:?}",
+    );
+    assert!(
+        (inner[0] as i32) - (inner[1] as i32) < 80,
+        "saturation should shrink the red/green gap, got {inner:?}",
     );
 }

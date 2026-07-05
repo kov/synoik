@@ -1,7 +1,7 @@
 use std::fmt;
 
 use ash::vk;
-use niri_vk::render::{as_bytes, BorderPush, QuadPush, ShadowPush};
+use niri_vk::render::{as_bytes, BorderPush, PostprocessPush, QuadPush, ShadowPush};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -253,6 +253,61 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let pipe = &self.renderer.shadow_pipeline;
         unsafe {
             dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw the postprocess-and-clip material: sample `texture` (from `src`) into `dst`, applying
+    /// the saturation / noise / premultiplied-bg + general rounded-corner clip carried by `push`.
+    /// The caller fills the material fields (`geo_size`, `corner_radius`, `bg_color`,
+    /// `input_to_geo`, `niri_scale`, `niri_alpha`, `saturation`, `noise`); this fills the placement
+    /// (`origin`/`size`/`target`/`src_rect`), binds the premultiplied-blend postprocess pipeline +
+    /// the texture's descriptor set, and draws the quad. The owned-renderer equivalent of niri's
+    /// clipped-surface / framebuffer-effect postprocess shader. Same unflipped scope as the other
+    /// sampling materials.
+    // Consumed by the live ClippedSurfaceRenderElement / FramebufferEffectElement wiring (Stage 3);
+    // exercised now by the offscreen material test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_postprocess(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        mut push: PostprocessPush,
+    ) -> Result<(), VulkanError> {
+        if texture.flipped() {
+            tracing::warn!(
+                "VulkanFrame::render_postprocess: flipped textures unsupported; skipping"
+            );
+            return Ok(());
+        }
+
+        push.origin = [dst.loc.x as f32, dst.loc.y as f32];
+        push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.target = self.target_dims();
+        push.src_rect = normalized_src(src, texture);
+
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.postprocess_pipeline;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
             dev.cmd_push_constants(
                 self.cbuf,
                 pipe.layout,
