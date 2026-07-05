@@ -22,6 +22,13 @@ pub struct VulkanFrame<'frame, 'buffer> {
     transform: Transform,
     /// `output_size` with `transform` applied (Smithay's convention); == `output_size` for Normal.
     _size: Size<i32, Physical>,
+    /// Every texture sampled by a recorded draw, cloned (ref-count bump) so its GPU image and
+    /// descriptor set outlive command-buffer submission. Draw records reference these resources;
+    /// callers (e.g. the render-element loop) routinely drop the source element right after
+    /// `draw`, before `finish` submits — without this, the freed image/descriptor would be
+    /// sampled by the in-flight GPU work (a use-after-free that segfaults on lavapipe).
+    /// `finish` fence-waits, so releasing these when the frame drops (after `finish`) is safe.
+    held: Vec<VkTexture>,
     finished: bool,
 }
 
@@ -98,6 +105,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             output_size,
             transform,
             _size: transform.transform_size(output_size),
+            held: Vec::new(),
             finished: false,
         })
     }
@@ -106,6 +114,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     fn target_dims(&self) -> [f32; 2] {
         let (w, h) = self.fb.buffer.extent();
         [w as f32, h as f32]
+    }
+
+    /// Keep `texture` alive until this frame is dropped (i.e. past `finish`'s fence wait), so a
+    /// draw that samples it can't outlive the source element. Cheap: a ref-count bump.
+    fn retain(&mut self, texture: &VkTexture) {
+        self.held.push(texture.clone());
     }
 
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
@@ -144,6 +158,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             src_rect: normalized_src(src, texture),
             ..Default::default()
         };
+        self.retain(texture);
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.rounded_texture_pipeline;
         let set = texture.descriptor_set();
@@ -197,6 +212,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             cutoff: [cutoff.0, cutoff.1],
             ..Default::default()
         };
+        self.retain(texture);
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.gradient_fade_pipeline;
         let set = texture.descriptor_set();
@@ -296,6 +312,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.target = self.target_dims();
         push.src_rect = normalized_src(src, texture);
 
+        self.retain(texture);
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.postprocess_pipeline;
         let set = texture.descriptor_set();
@@ -347,6 +364,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.target = self.target_dims();
 
+        self.retain(tex_prev);
+        self.retain(tex_next);
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.resize_pipeline;
         let sets = [tex_prev.descriptor_set(), tex_next.descriptor_set()];
@@ -393,6 +412,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.target = self.target_dims();
 
+        self.retain(tex_prev);
+        self.retain(tex_next);
         let Some(pipe) = self.renderer.custom_pipeline(CustomShaderType::Resize) else {
             tracing::warn!("render_custom_resize: no custom resize shader installed; skipping");
             return Ok(());
@@ -446,6 +467,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.target = self.target_dims();
 
+        self.retain(texture);
         let Some(pipe) = self.renderer.custom_pipeline(ty) else {
             tracing::warn!("render_custom_anim: no custom {ty:?} shader installed; skipping");
             return Ok(());
@@ -640,6 +662,7 @@ impl Frame for VulkanFrame<'_, '_> {
             src_rect: normalized_src(src, texture),
             ..Default::default()
         };
+        self.retain(texture);
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.texture_pipeline;
         let set = texture.descriptor_set();

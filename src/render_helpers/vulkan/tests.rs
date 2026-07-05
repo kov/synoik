@@ -1568,3 +1568,69 @@ fn vulkan_import_respects_byte_order_and_x_alpha() {
         px(&out, TW / 2, TH / 2),
     );
 }
+
+// --- production render_helpers path through Vulkan (Brick 2)
+// --------------------------------------
+
+/// The generic `render_helpers::render_to_vec` (the same entry `Niri::screenshot` uses) composites
+/// a real `TextureRenderElement` through the owned Vulkan renderer and reads it back — proving the
+/// production render path (create offscreen → bind → draw elements → ExportMem readback) is now
+/// renderer-agnostic, not GLES-only. Uses an imported client-style texture, so the whole
+/// import→composite→download chain runs on Vulkan.
+#[test]
+fn vulkan_render_to_vec_composites_a_texture() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_render_to_vec_composites_a_texture: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // A client-style ARGB buffer (BGRA bytes) imported as a texture element at the origin.
+    let (r, g, b) = (0x20u8, 0x40u8, 0x80u8);
+    let buffer = TextureBuffer::from_memory(
+        &mut vk,
+        &solid_texels([b, g, r, 0xFF]),
+        Fourcc::Argb8888,
+        (TW, TH),
+        false,
+        1.0,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .expect("import client buffer");
+    let element = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::<f64, _>::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+
+    // The production helper: no hand-rolled bind/render/readback here.
+    let pixels = crate::render_helpers::render_to_vec(
+        &mut vk,
+        Size::<i32, Physical>::from((W, H)),
+        Scale::<f64>::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [element].into_iter(),
+    )
+    .expect("render_to_vec through Vulkan");
+
+    // The texture shows where it was placed...
+    assert!(
+        close_px(px(&pixels, TW / 2, TH / 2), [r, g, b, 255], 2),
+        "composited texture wrong: got {:?}, want {:?}",
+        px(&pixels, TW / 2, TH / 2),
+        [r, g, b, 255],
+    );
+    // ...and the rest of the frame is the transparent clear render_to_vec uses.
+    assert!(
+        close_px(px(&pixels, W - 8, H - 8), [0, 0, 0, 0], 2),
+        "outside the texture should be transparent, got {:?}",
+        px(&pixels, W - 8, H - 8),
+    );
+}

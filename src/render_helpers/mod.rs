@@ -7,9 +7,7 @@ use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexture,
-};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
@@ -184,20 +182,23 @@ pub fn encompassing_geo(
         .unwrap_or_default()
 }
 
-pub fn create_texture(
-    renderer: &mut GlesRenderer,
+pub fn create_texture<R, T>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     fourcc: Fourcc,
-) -> Result<GlesTexture, GlesError> {
+) -> Result<T, R::Error>
+where
+    R: Renderer<TextureId = T> + Offscreen<T>,
+{
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     renderer.create_buffer(fourcc, buffer_size)
 }
 
-pub fn copy_framebuffer(
-    renderer: &mut GlesRenderer,
-    target: &GlesTarget,
+pub fn copy_framebuffer<R: ExportMem>(
+    renderer: &mut R,
+    target: &R::Framebuffer<'_>,
     fourcc: Fourcc,
-) -> Result<GlesMapping, GlesError> {
+) -> Result<R::TextureMapping, R::Error> {
     renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
 }
 
@@ -219,14 +220,18 @@ pub fn render_to_encompassing_texture(
     Ok((texture, sync_point, geo))
 }
 
-pub fn render_to_texture(
-    renderer: &mut GlesRenderer,
+pub fn render_to_texture<R, T>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<(GlesTexture, SyncPoint)> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<(T, SyncPoint)>
+where
+    R: Renderer<TextureId = T> + Offscreen<T>,
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -242,35 +247,47 @@ pub fn render_to_texture(
     Ok((texture, sync_point))
 }
 
-pub fn render_and_download(
-    renderer: &mut GlesRenderer,
+pub fn render_and_download<R, T>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<GlesMapping> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<R::TextureMapping>
+where
+    R: Renderer<TextureId = T> + Offscreen<T> + ExportMem,
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
-    let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
-    let mut target = renderer
+    // Render into a fresh offscreen, then bind a new framebuffer over it for readback. Factored
+    // through `render_to_texture` (rather than one bind reused for both render and copy) so the two
+    // phases don't share a live frame — the readback bind starts clean after the render frame has
+    // finished and its resources released. Both GLES and the owned Vulkan renderer read back
+    // correctly this way.
+    let (mut texture, _sync) =
+        render_to_texture(renderer, size, scale, transform, fourcc, elements)
+            .context("error rendering")?;
+    let target = renderer
         .bind(&mut texture)
-        .context("error binding texture")?;
-
-    let _sync = render_elements(renderer, &mut target, size, scale, transform, elements)
-        .context("error rendering")?;
+        .context("error binding texture for readback")?;
 
     copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
 }
 
-pub fn render_to_vec(
-    renderer: &mut GlesRenderer,
+pub fn render_to_vec<R, T>(
+    renderer: &mut R,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<Vec<u8>> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<Vec<u8>>
+where
+    R: Renderer<TextureId = T> + Offscreen<T> + ExportMem,
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     let mapping = render_and_download(renderer, size, scale, transform, fourcc, elements)
@@ -377,14 +394,17 @@ pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::
     frame.finish().context("error finishing frame")
 }
 
-fn render_elements(
-    renderer: &mut GlesRenderer,
-    target: &mut GlesTarget,
+fn render_elements<R: Renderer>(
+    renderer: &mut R,
+    target: &mut R::Framebuffer<'_>,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<SyncPoint> {
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<SyncPoint>
+where
+    R::Error: Send + Sync + 'static,
+{
     let transform = transform.invert();
     let output_rect = Rectangle::from_size(transform.transform_size(size));
 
