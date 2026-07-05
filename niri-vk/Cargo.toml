@@ -14,8 +14,12 @@ anyhow.workspace = true
 ash = "0.38.0"
 cairo-rs = "0.22.0"
 cosmic-text = "0.19.0"
+# Explicit-sync spike (sync_spike.rs): drm_syncobj ioctls + raw sync_file/eventfd/poll. drm-ffi
+# 0.9 dedupes with the version Smithay already pulls into the workspace.
+drm-ffi = "0.9.1"
 etagere = "0.3.0"
 gbm = "0.18.0"
+libc = "0.2"
 pango = "0.22.8"
 pangocairo = "0.22.8"
 png = "0.18.1"

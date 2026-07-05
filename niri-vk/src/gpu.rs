@@ -83,13 +83,20 @@ impl Gpu {
         // Enable the external-memory extensions needed to import dmabufs with DRM modifiers, but
         // only those the device actually advertises. (external_memory / bind_memory2 /
         // sampler_ycbcr_conversion / image_format_list are core in 1.1–1.2, so not listed here.)
-        let want: [&CStr; 4] = [
+        let want: [&CStr; 6] = [
             c"VK_KHR_external_memory_fd",
             c"VK_EXT_external_memory_dma_buf",
             c"VK_EXT_image_drm_format_modifier",
             // For acquiring imported content from the FOREIGN (non-Vulkan producer) queue family;
             // if absent we fall back to a plain layout transition (see dmabuf.rs).
             c"VK_EXT_queue_family_foreign",
+            // Explicit sync (Stage 3): export a submit's completion as a binary SYNC_FD, the only
+            // usable Vulkan external-sync bridge on Venus/lavapipe (see
+            // docs/fork/venus-explicit-sync-gap.md). Both are enable-only — no feature struct —
+            // and their base extensions (external_semaphore/fence) are core in 1.1. See
+            // sync_spike.
+            c"VK_KHR_external_semaphore_fd",
+            c"VK_KHR_external_fence_fd",
         ];
         let avail = unsafe { instance.enumerate_device_extension_properties(phys) }
             .context("enumerate device extensions")?;

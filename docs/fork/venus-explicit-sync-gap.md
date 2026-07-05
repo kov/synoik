@@ -16,6 +16,39 @@ that is an architectural dead end and is not needed.**
 
 ---
 
+## Resolution (2026-07-05) — §6 answered by the `niri-vk` sync spike
+
+The compositor-side spike `niri-vk/src/sync_spike.rs` (test `explicit_sync_bridge`, run on both
+ICDs) has now **measured behaviour**, not just the API surface. Result: **the explicit-sync bridge
+is buildable here — but on `VkFence` export, not `VkSemaphore` export.** An asymmetry §5 below did
+not anticipate:
+
+- **`VkFence` → `SYNC_FD` export is real and pipelined on Venus.** A submit's *pending* completion
+  exports in ~0.01 ms as a genuine kernel `dma_fence` (`SYNC_IOC_FILE_INFO` `driver_name =
+  virtio_gpu`, **unsignalled at export**), and a downstream `poll(2)` blocks until the GPU actually
+  finishes (≈ the calibrated busy-work duration). So **host-GPU completion *does* propagate to a
+  guest fence** through virtio-gpu (§6.2 — the deep risk — is answered ✅), and `VkFence`→`SYNC_FD`
+  export works (§6.1 ✅).
+- That fence carries all the way through a kernel `drm_syncobj`: `IMPORT_SYNC_FILE` → `SYNCOBJ_WAIT`,
+  and `SYNCOBJ_TRANSFER` binary→timeline → `TIMELINE_WAIT` (the exact `linux-drm-syncobj-v1`
+  client-release shape) both block-until-GPU-done. `SYNCOBJ_EVENTFD` (Smithay's
+  `supports_syncobj_eventfd` gate) is present and fires on completion.
+- **`VkSemaphore` → `SYNC_FD` export is *emulated*.** Venus blocks on the CPU until the GPU
+  finishes, then hands back an *already-signalled* `detached-driver` stub — useless for pipelining.
+  lavapipe emulates *both* paths this way (it is the spike's negative control, and correctly comes
+  back "not pipelined", proving the test has teeth).
+
+**Design consequence:** build the renderer's explicit sync on **`VkFence` `SYNC_FD` export** for the
+signal/release + KMS `OUT_FENCE` direction. The acquire/wait direction imports a client `sync_file`
+into a binary VkSemaphore (import, not export — untested here, expected fine). Do **not** route
+release through `vkGetSemaphoreFdKHR`. `import_sync_file` had to be issued as a raw ioctl (drm-ffi's
+`fd_to_handle` hardcodes `handle = 0`).
+
+Residual Stage-3 risks the offscreen spike does **not** cover (need a later DRM-master atomic test):
+virtio-gpu KMS `IN_FENCE_FD`/`OUT_FENCE` plumbing and scanout of Venus-rendered dmabufs.
+
+---
+
 ## 1. Why this matters
 
 The `gnome-shell-rs` fork is building an owned Vulkan renderer (currently a Stage-0 offscreen

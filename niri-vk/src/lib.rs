@@ -20,5 +20,6 @@ pub mod gpu;
 pub mod probes;
 pub mod render;
 pub mod shaders;
+pub mod sync_spike;
 pub mod text;
 pub mod texture;

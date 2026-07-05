@@ -97,6 +97,14 @@ fn main() -> Result<()> {
     }
 
     probes::report(&gpu);
+
+    // Stage 3 de-risking: does host-GPU completion propagate to a guest sync_file/syncobj? (The one
+    // measured risk in docs/fork/venus-explicit-sync-gap.md §6.2.) Non-fatal if it errors.
+    match niri_vk::sync_spike::run_sync_spike(&gpu) {
+        Ok(report) => report.print(),
+        Err(e) => eprintln!("niri-vk: sync spike error: {e:#}"),
+    }
+
     Ok(())
 }
 
