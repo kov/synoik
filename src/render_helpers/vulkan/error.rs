@@ -15,6 +15,9 @@ pub enum VulkanError {
     Unsupported(&'static str),
     /// Waiting on a `SyncPoint` was interrupted.
     SyncInterrupted,
+    /// A custom (user-supplied) animation shader failed to assemble, compile, or fit the device's
+    /// push-constant budget. Carries the human-readable reason (e.g. the glslang error log).
+    CustomShader(String),
     /// Any other failure carried up from the low-level layer.
     Other(String),
 }
@@ -26,6 +29,7 @@ impl fmt::Display for VulkanError {
             VulkanError::UnsupportedFormat(fourcc) => write!(f, "unsupported format: {fourcc:?}"),
             VulkanError::Unsupported(what) => write!(f, "unsupported in Vulkan skeleton: {what}"),
             VulkanError::SyncInterrupted => write!(f, "wait on sync point interrupted"),
+            VulkanError::CustomShader(msg) => write!(f, "custom shader error: {msg}"),
             VulkanError::Other(msg) => write!(f, "{msg}"),
         }
     }

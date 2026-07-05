@@ -6,6 +6,7 @@
 //! it makes an ideal oracle: the Pixman side needs no device, and the Vulkan side guard-skips when
 //! no Vulkan device is present. Runs on Venus (real target) and lavapipe (deterministic CPU).
 
+use glam::Mat3;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_vk::render::{PostprocessPush, ResizePush};
 use smithay::backend::allocator::Fourcc;
@@ -18,6 +19,7 @@ use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 
+use super::custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::{VkTexture, VulkanRenderer};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
@@ -1116,5 +1118,349 @@ fn vulkan_resize_crossfades() {
         close_px(px(&pixels, 2, 2), clear_u8(), 8),
         "corner should be clipped to the background, got {:?}",
         px(&pixels, 2, 2),
+    );
+}
+
+// --- M3 step 5: custom runtime GLSL animation shaders -------------------------------------------
+
+/// A W×H opaque solid, tight `[R,G,B,A]`, for the custom-shader tests.
+fn solid_texels(rgba: [u8; 4]) -> Vec<u8> {
+    rgba.iter()
+        .copied()
+        .cycle()
+        .take((W * H * 4) as usize)
+        .collect()
+}
+
+/// A user **resize** snippet, compiled from GLSL at runtime (glslangValidator) and drawn through
+/// the owned Vulkan renderer, produces the crossfade + clip it describes. This exercises the whole
+/// runtime custom-shader path at once: assemble → compile → cached two-texture pipeline → draw,
+/// plus the `texture2D`→`texture` shim and the affine `mat3` reconstruction from packed `vec4`s.
+/// Red "prev" + blue "next" at progress 0.5 ⇒ a purple interior; a deep corner is clipped away
+/// (clip_to_geometry + corner rounding), exactly like the built-in `render_resize` material — but
+/// here the shader came from a config-style snippet, not a compiled-in one.
+#[test]
+fn vulkan_custom_resize_crossfade() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_custom_resize_crossfade: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let tex_prev = vk
+        .import_memory(
+            &solid_texels([255, 0, 0, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import prev");
+    let tex_next = vk
+        .import_memory(
+            &solid_texels([0, 0, 255, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import next");
+
+    // A user snippet using GLES-style texture2D and the niri_* uniform names, exactly as a config
+    // custom shader would (this is niri's built-in resize body, supplied as if by the user).
+    let snippet = "\
+vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
+    vec4 prev = texture2D(niri_tex_prev, (niri_geo_to_tex_prev * coords_curr_geo).st);
+    vec4 next = texture2D(niri_tex_next, (niri_geo_to_tex_next * coords_curr_geo).st);
+    return mix(prev, next, niri_clamped_progress);
+}";
+    vk.set_custom_shader(CustomShaderType::Resize, Some(snippet))
+        .expect("compile custom resize snippet");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        // Identity affine-diagonal transforms; the drawn quad is the geometry.
+        let push = CustomResizePush {
+            curr_geo_size: [W as f32, H as f32],
+            input_to_curr_geo: [1.0, 1.0, 0.0, 0.0],
+            geo_to_tex_prev: [1.0, 1.0, 0.0, 0.0],
+            geo_to_tex_next: [1.0, 1.0, 0.0, 0.0],
+            corner_radius: [16.0; 4],
+            progress: 0.5,
+            clamped_progress: 0.5,
+            clip_to_geometry: 1.0,
+            alpha: 1.0,
+            scale: 1.0,
+            ..Default::default()
+        };
+        frame
+            .render_custom_resize(&tex_prev, &tex_next, dst, push)
+            .expect("draw custom resize");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let inner = px(&pixels, 32, 32);
+    assert!(
+        inner[1] < 20
+            && (100..=155).contains(&(inner[0] as i32))
+            && (100..=155).contains(&(inner[2] as i32)),
+        "custom resize interior should be the 50/50 red/blue blend, got {inner:?}",
+    );
+    assert!(
+        close_px(px(&pixels, 2, 2), clear_u8(), 8),
+        "custom resize corner should be clipped to the background, got {:?}",
+        px(&pixels, 2, 2),
+    );
+}
+
+/// A user **close** snippet that returns its incoming `coords_geo` as color, drawn with a
+/// non-identity affine transform (distinct per-axis scale + translation), lands the exact pixels
+/// the packed-`vec4` → `mat3` reconstruction predicts. This is the one test that drives the affine
+/// path with real, per-axis-distinct values (identity would hide a swapped or dropped coefficient),
+/// and it exercises the single-texture close/open pipeline and the `close_color` entry point. The
+/// transform is built the way the Stage-3 element glue will build it — a `glam::Mat3` from
+/// scale∘translate, packed by [`pack_affine`].
+#[test]
+fn vulkan_custom_close_affine_reconstruction() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_custom_close_affine_reconstruction: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // The snippet ignores the texture and reports coords_geo directly, so the readback IS the
+    // transformed coordinate — a direct probe of the mat3 reconstruction.
+    let snippet = "\
+vec4 close_color(vec3 coords_geo, vec3 size_geo) {
+    return vec4(coords_geo.x, coords_geo.y, 0.0, 1.0);
+}";
+    vk.set_custom_shader(CustomShaderType::Close, Some(snippet))
+        .expect("compile custom close snippet");
+
+    // input_to_geo = translate(0.1, 0.2) ∘ scale(0.5, 0.25): coords_geo = (0.5*u+0.1, 0.25*v+0.2).
+    let input_to_geo = pack_affine(
+        Mat3::from_translation(glam::Vec2::new(0.1, 0.2))
+            * Mat3::from_scale(glam::Vec2::new(0.5, 0.25)),
+    );
+    assert_eq!(input_to_geo, [0.5, 0.25, 0.1, 0.2]);
+
+    // A texture must be bound (the pipeline has one sampler set) even though the snippet ignores
+    // it.
+    let dummy = vk
+        .import_memory(
+            &solid_texels([10, 20, 30, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import dummy");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        let push = CustomAnimPush {
+            geo_size: [W as f32, H as f32],
+            input_to_geo,
+            geo_to_tex: [1.0, 1.0, 0.0, 0.0],
+            alpha: 1.0,
+            scale: 1.0,
+            ..Default::default()
+        };
+        frame
+            .render_custom_anim(CustomShaderType::Close, &dummy, dst, push)
+            .expect("draw custom close");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // At pixel (32, 32) the varying niri_v_coords ≈ (32.5/64, 32.5/64) = (0.5078, 0.5078).
+    // coords_geo = (0.5*0.5078 + 0.1, 0.25*0.5078 + 0.2) = (0.3539, 0.3270) ⇒ R≈90, G≈83.
+    let got = px(&pixels, 32, 32);
+    let uv = 32.5 / W as f32;
+    let expect_r = ((0.5 * uv + 0.1) * 255.0).round() as i32;
+    let expect_g = ((0.25 * uv + 0.2) * 255.0).round() as i32;
+    assert!(
+        (got[0] as i32 - expect_r).abs() <= 3 && (got[1] as i32 - expect_g).abs() <= 3,
+        "affine-reconstructed coords should read back as ~({expect_r},{expect_g},0), got {got:?}",
+    );
+}
+
+/// A user **open** snippet: samples the snapshot texture and uses the *unclamped* `niri_progress`
+/// (which can overshoot [0,1] under spring animation) distinctly from `niri_clamped_progress`.
+/// Proves the open entry point, single-texture sampling through the shim, and that progress is
+/// passed unclamped: with progress = 1.5 and clamped = 1.0, the red channel encodes 1.5 (⇒ ~191,
+/// clamped on write), which a clamped value (1.0 ⇒ 128) could not produce.
+#[test]
+fn vulkan_custom_open_samples_and_unclamped_progress() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_custom_open_samples_and_unclamped_progress: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    let snippet = "\
+vec4 open_color(vec3 coords_geo, vec3 size_geo) {
+    vec4 tex = texture2D(niri_tex, (niri_geo_to_tex * coords_geo).st);
+    return vec4(niri_progress * 0.5, niri_clamped_progress * 0.5, tex.b, 1.0);
+}";
+    vk.set_custom_shader(CustomShaderType::Open, Some(snippet))
+        .expect("compile custom open snippet");
+
+    // Snapshot with a distinctive blue channel to prove the texture was sampled.
+    let tex = vk
+        .import_memory(
+            &solid_texels([0, 0, 200, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import snapshot");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        let push = CustomAnimPush {
+            geo_size: [W as f32, H as f32],
+            input_to_geo: [1.0, 1.0, 0.0, 0.0],
+            geo_to_tex: [1.0, 1.0, 0.0, 0.0],
+            progress: 1.5, // unclamped (spring overshoot)
+            clamped_progress: 1.0,
+            alpha: 1.0,
+            scale: 1.0,
+            ..Default::default()
+        };
+        frame
+            .render_custom_anim(CustomShaderType::Open, &tex, dst, push)
+            .expect("draw custom open");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let got = px(&pixels, 32, 32);
+    assert!(
+        (got[0] as i32 - 191).abs() <= 4,
+        "unclamped progress 1.5 should give red ~191 (clamped would be 128), got {got:?}",
+    );
+    assert!(
+        (got[1] as i32 - 128).abs() <= 4,
+        "clamped progress 1.0 should give green ~128, got {got:?}",
+    );
+    assert!(
+        (got[2] as i32 - 200).abs() <= 4,
+        "snapshot blue channel should be sampled through, got {got:?}",
+    );
+}
+
+/// A syntactically-broken user snippet must degrade gracefully: `set_custom_shader` returns `Err`
+/// (carrying the glslang log), never panics, leaves the slot empty, and a subsequent
+/// `render_custom_anim` for that empty slot is a no-op that leaves the CLEAR background intact.
+#[test]
+fn vulkan_custom_bad_snippet_degrades() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_custom_bad_snippet_degrades: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let err = vk.set_custom_shader(CustomShaderType::Close, Some("this is not valid glsl {{{"));
+    assert!(
+        err.is_err(),
+        "a broken snippet should return an error, not compile",
+    );
+
+    // The slot is still empty, so drawing it is a no-op: the target stays cleared.
+    let tex = vk
+        .import_memory(
+            &solid_texels([255, 255, 255, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import");
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        frame
+            .render_custom_anim(
+                CustomShaderType::Close,
+                &tex,
+                dst,
+                CustomAnimPush::default(),
+            )
+            .expect("no-op draw for empty slot");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    assert!(
+        close_px(px(&pixels, 32, 32), clear_u8(), 2),
+        "an unset custom shader should draw nothing (background stays CLEAR), got {:?}",
+        px(&pixels, 32, 32),
     );
 }

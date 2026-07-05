@@ -6,6 +6,7 @@ use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
+use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
 use super::types::{VkFramebuffer, VkTexture};
@@ -357,6 +358,108 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 pipe.layout,
                 0,
                 &sets,
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw a user **resize** animation shader (niri's `custom_resize`) over two window snapshots
+    /// (`tex_prev` at set 0, `tex_next` at set 1). No-op (with a warning) if no custom resize
+    /// shader is installed — the built-in crossfade is `render_resize`, so this path is purely
+    /// the user override. The caller fills the material fields of `push`; this fills placement.
+    // Consumed by the live custom-shader wiring (Stage 3); exercised now by the material test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_custom_resize(
+        &mut self,
+        tex_prev: &VkTexture,
+        tex_next: &VkTexture,
+        dst: Rectangle<i32, Physical>,
+        mut push: CustomResizePush,
+    ) -> Result<(), VulkanError> {
+        if tex_prev.flipped() || tex_next.flipped() {
+            tracing::warn!("render_custom_resize: flipped textures unsupported; skipping");
+            return Ok(());
+        }
+        push.origin = [dst.loc.x as f32, dst.loc.y as f32];
+        push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.target = self.target_dims();
+
+        let Some(pipe) = self.renderer.custom_pipeline(CustomShaderType::Resize) else {
+            tracing::warn!("render_custom_resize: no custom resize shader installed; skipping");
+            return Ok(());
+        };
+        let dev = &self.renderer.gpu.device;
+        let sets = [tex_prev.descriptor_set(), tex_next.descriptor_set()];
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                &sets,
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw a user **close** or **open** animation shader (niri's `custom_close`/`custom_open`)
+    /// over one window snapshot (`texture` at set 0). No-op (with a warning) if that slot has
+    /// no shader installed. `ty` must be `Close` or `Open` — resize uses
+    /// [`Self::render_custom_resize`].
+    // Consumed by the live custom-shader wiring (Stage 3); exercised now by the material test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_custom_anim(
+        &mut self,
+        ty: CustomShaderType,
+        texture: &VkTexture,
+        dst: Rectangle<i32, Physical>,
+        mut push: CustomAnimPush,
+    ) -> Result<(), VulkanError> {
+        debug_assert!(
+            matches!(ty, CustomShaderType::Close | CustomShaderType::Open),
+            "render_custom_anim is for close/open; resize uses render_custom_resize",
+        );
+        if texture.flipped() {
+            tracing::warn!("render_custom_anim: flipped textures unsupported; skipping");
+            return Ok(());
+        }
+        push.origin = [dst.loc.x as f32, dst.loc.y as f32];
+        push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.target = self.target_dims();
+
+        let Some(pipe) = self.renderer.custom_pipeline(ty) else {
+            tracing::warn!("render_custom_anim: no custom {ty:?} shader installed; skipping");
+            return Ok(());
+        };
+        let dev = &self.renderer.gpu.device;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
                 &[],
             );
             dev.cmd_push_constants(

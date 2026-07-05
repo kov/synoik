@@ -21,6 +21,7 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
+use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
 use super::frame::VulkanFrame;
 use super::types::{is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT};
@@ -57,6 +58,11 @@ pub struct VulkanRenderer {
     pub(super) shadow_pipeline: Pipeline,
     pub(super) postprocess_pipeline: Pipeline,
     pub(super) resize_pipeline: Pipeline,
+    /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
+    /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
+    custom_resize: Option<Pipeline>,
+    custom_close: Option<Pipeline>,
+    custom_open: Option<Pipeline>,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
     downscale_filter: TextureFilter,
@@ -172,6 +178,9 @@ impl VulkanRenderer {
             shadow_pipeline,
             postprocess_pipeline,
             resize_pipeline,
+            custom_resize: None,
+            custom_close: None,
+            custom_open: None,
             sampler_set_layout,
             command_pool,
             downscale_filter: TextureFilter::Linear,
@@ -188,6 +197,81 @@ impl VulkanRenderer {
     /// A clone of this renderer's context identity, shared by its frames.
     pub(super) fn ctx_id(&self) -> ContextId<VkTexture> {
         self.context_id.clone()
+    }
+
+    /// Compile a user animation shader from GLSL `src` and install it in the `ty` slot (or clear
+    /// the slot with `None`), destroying the previous pipeline. The owned-renderer equivalent
+    /// of niri's `set_custom_{resize,close,open}_program`: on a compile error it returns `Err`
+    /// (with the glslang log) and leaves the previous slot untouched — a bad snippet never
+    /// panics or replaces a working shader. The built-in resize crossfade lives separately in
+    /// `render_resize`; this slot only holds user overrides.
+    ///
+    /// The live config path (feeding these) is Stage 3; today only the tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn set_custom_shader(
+        &mut self,
+        ty: CustomShaderType,
+        src: Option<&str>,
+    ) -> Result<(), VulkanError> {
+        let new = match src {
+            None => None,
+            Some(src) => {
+                let compiled = compile_custom(ty, src)?;
+                // Guard the push budget: CustomResizePush is the first block over the 128-byte spec
+                // minimum, so a clean error beats a pipeline-layout VUID on an exotic device.
+                let max_push = unsafe {
+                    self.gpu
+                        .instance
+                        .get_physical_device_properties(self.gpu.phys)
+                }
+                .limits
+                .max_push_constants_size;
+                if compiled.push_size > max_push {
+                    return Err(VulkanError::CustomShader(format!(
+                        "custom {ty:?} shader needs {} push-constant bytes, device allows {max_push}",
+                        compiled.push_size,
+                    )));
+                }
+                let set_layouts = vec![self.sampler_set_layout; compiled.sampler_count as usize];
+                let pipeline = build_pipeline(
+                    &self.gpu,
+                    self.render_pass,
+                    &compiled.vert_spv,
+                    &compiled.frag_spv,
+                    &set_layouts,
+                    compiled.push_size,
+                    true,
+                )?;
+                Some(pipeline)
+            }
+        };
+
+        // Swap in the new slot value, then destroy the old pipeline. `&mut self` here means no
+        // frame can be recording (a `VulkanFrame` borrows the renderer mutably) and every
+        // submit fence-waits in `finish`, so the old pipeline is guaranteed idle — no
+        // `device_wait_idle` needed.
+        let old = std::mem::replace(self.custom_slot_mut(ty), new);
+        if let Some(old) = old {
+            unsafe { old.destroy(&self.gpu.device) };
+        }
+        Ok(())
+    }
+
+    fn custom_slot_mut(&mut self, ty: CustomShaderType) -> &mut Option<Pipeline> {
+        match ty {
+            CustomShaderType::Resize => &mut self.custom_resize,
+            CustomShaderType::Close => &mut self.custom_close,
+            CustomShaderType::Open => &mut self.custom_open,
+        }
+    }
+
+    /// The compiled pipeline for a custom shader slot, if one is installed.
+    pub(super) fn custom_pipeline(&self, ty: CustomShaderType) -> Option<&Pipeline> {
+        match ty {
+            CustomShaderType::Resize => self.custom_resize.as_ref(),
+            CustomShaderType::Close => self.custom_close.as_ref(),
+            CustomShaderType::Open => self.custom_open.as_ref(),
+        }
     }
 
     /// Allocate a one-set descriptor pool and bind `tex`'s image+sampler at set 0, binding 0.
@@ -449,6 +533,14 @@ impl Drop for VulkanRenderer {
             self.shadow_pipeline.destroy(dev);
             self.postprocess_pipeline.destroy(dev);
             self.resize_pipeline.destroy(dev);
+            // Custom pipelines' layouts reference the shared sampler set layout, so free them
+            // first.
+            for pipeline in [&self.custom_resize, &self.custom_close, &self.custom_open]
+                .into_iter()
+                .flatten()
+            {
+                pipeline.destroy(dev);
+            }
             dev.destroy_descriptor_set_layout(self.sampler_set_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.command_pool, None);
