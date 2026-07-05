@@ -1634,3 +1634,128 @@ fn vulkan_render_to_vec_composites_a_texture() {
         px(&pixels, W - 8, H - 8),
     );
 }
+
+// --- Stage 3 / Brick A: render into a GBM-allocated dmabuf (the KMS-scanout target) ------------
+
+/// The KMS-scanout foundation: `VulkanRenderer` must be able to bind a **GBM-allocated dmabuf** as
+/// a render target and composite straight into its memory, so a display controller can scan out the
+/// result. This is the render-*into*-dmabuf half of the residual Stage-3 risk (the actual page-flip
+/// is a live/gsrs check). We allocate a buffer the same way the tty backend does (a `GbmAllocator`
+/// on the render node), export it as a Smithay `Dmabuf`, render a recognizable scene into it via
+/// the real `Bind<Dmabuf>`, and read it back through the same imported image — proving the pixels
+/// landed in the dmabuf's own memory. Skips when there is no Vulkan device or no usable render
+/// node.
+#[test]
+fn vulkan_renders_into_a_gbm_dmabuf() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_renders_into_a_gbm_dmabuf: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("skipping vulkan_renders_into_a_gbm_dmabuf: no render node ({e})");
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            // e.g. under VK_DRIVER_FILES=lvp, Mesa GBM can't pick a device (Zink). GBM needs the
+            // real virtio-gpu stack, so this path is a Venus-only test.
+            eprintln!("skipping vulkan_renders_into_a_gbm_dmabuf: no GBM device ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+    let bo = match alloc.create_buffer(W as u32, H as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_renders_into_a_gbm_dmabuf: GBM cannot allocate Abgr8888 LINEAR \
+                 ({e})"
+            );
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export dmabuf");
+    eprintln!(
+        "dmabuf: {:?} {}x{} modifier {:?} on {}",
+        dmabuf.format().code,
+        dmabuf.width(),
+        dmabuf.height(),
+        dmabuf.format().modifier,
+        vk.device_name(),
+    );
+
+    let elements = solid_scene();
+    let size = Size::<i32, Physical>::from((W, H));
+    let scale = Scale::<f64>::from(1.0);
+
+    // Bind the dmabuf as the render target and composite into it.
+    let mut fb = vk.bind(&mut dmabuf).expect("bind dmabuf as render target");
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        for e in &elements {
+            let geo = Element::geometry(e, scale);
+            RenderElement::<VulkanRenderer>::draw(
+                e,
+                &mut frame,
+                Element::src(e),
+                geo,
+                &[Rectangle::from_size(geo.size)],
+                &[],
+                None,
+            )
+            .expect("draw solid");
+        }
+        // finish() submits + fence-waits, leaving the dmabuf image in TRANSFER_SRC for readback.
+        let _sync = frame.finish().expect("finish");
+    }
+
+    // Read back through the same imported image: the memory is the dmabuf's, so correct pixels here
+    // prove the render targeted the dmabuf.
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // solid_scene(): red over the left half, green over the top-right quadrant, CLEAR (grey) in the
+    // bottom-right. Sample one representative pixel of each region.
+    let red = [204, 26, 26, 255];
+    let green = [26, 179, 51, 255];
+    let grey = [64, 64, 64, 255];
+    assert!(
+        close_px(px(&pixels, W / 4, H / 2), red, 3),
+        "left half should be red, got {:?}",
+        px(&pixels, W / 4, H / 2),
+    );
+    assert!(
+        close_px(px(&pixels, 3 * W / 4, H / 4), green, 3),
+        "top-right should be green, got {:?}",
+        px(&pixels, 3 * W / 4, H / 4),
+    );
+    assert!(
+        close_px(px(&pixels, 3 * W / 4, 3 * H / 4), grey, 3),
+        "bottom-right should be the clear color, got {:?}",
+        px(&pixels, 3 * W / 4, 3 * H / 4),
+    );
+}

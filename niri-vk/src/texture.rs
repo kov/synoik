@@ -1,6 +1,8 @@
 //! A sampled texture: device-local image uploaded from host RGBA via a staging buffer, plus a
 //! view and sampler. This is the infrastructure both the blur passes and the glyph atlas reuse.
 
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+
 use anyhow::{Context, Result};
 use ash::vk;
 
@@ -139,6 +141,134 @@ impl Texture {
         let view =
             unsafe { device.create_image_view(&view_ci, None) }.context("color-target view")?;
 
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+
+        Ok(Texture {
+            image,
+            view,
+            sampler,
+            memory,
+            width,
+            height,
+        })
+    }
+
+    /// Import a foreign (GBM-allocated) dmabuf as a **renderable** color target: a
+    /// `COLOR_ATTACHMENT | TRANSFER_SRC` `VkImage` whose memory is the dmabuf, with an explicit DRM
+    /// format modifier + plane layout. This is the KMS-scanout dual of [`crate::dmabuf`]'s sampled
+    /// import (Stage 1) — render a frame into it and the pixels land in the dmabuf for scanout (or,
+    /// in tests, a CPU map of the LINEAR buffer). Single plane only (all our formats are); the
+    /// render pass performs the `UNDEFINED`→attachment transition, so no pre-acquire barrier is
+    /// needed for the LINEAR modifier (nothing to detile). `TRANSFER_SRC` lets a test read it back.
+    ///
+    /// `fd` is duplicated internally (Vulkan consumes the dup on a successful import; the caller
+    /// keeps ownership of the original). `format` must match `fourcc`'s byte order (e.g.
+    /// `R8G8B8A8_UNORM` for `Abgr8888`/`Xbgr8888`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dmabuf_render_target(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        fd: BorrowedFd<'_>,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+        format: vk::Format,
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        let device = &gpu.device;
+
+        let plane_layout = vk::SubresourceLayout {
+            offset: offset as u64,
+            size: 0,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let mut mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(std::slice::from_ref(&plane_layout));
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut ext_info)
+            .push_next(&mut mod_info);
+        let image = unsafe { device.create_image(&image_ci, None) }
+            .context("create dmabuf render-target image")?;
+
+        let mem_req = unsafe { device.get_image_memory_requirements(image) };
+
+        // Prefer the memory types the driver reports valid for this fd, but treat the query as
+        // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
+        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
+        let mut type_bits = mem_req.memory_type_bits;
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        if let Ok(()) = unsafe {
+            ext_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.try_clone_to_owned()
+                    .context("dup dmabuf fd for property query")?
+                    .into_raw_fd(),
+                &mut fd_props,
+            )
+        } {
+            type_bits &= fd_props.memory_type_bits;
+        }
+        anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
+        let mem_type = type_bits.trailing_zeros();
+
+        // Import consumes the fd on success; hand Vulkan a fresh dup and let the caller keep
+        // theirs.
+        let raw_fd = fd
+            .try_clone_to_owned()
+            .context("dup dmabuf fd for import")?
+            .into_raw_fd();
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(raw_fd);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(mem_type)
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| {
+            // On failure Vulkan did not take the fd; close our dup so it doesn't leak.
+            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            anyhow::anyhow!("import dmabuf render-target memory (vkAllocateMemory): {e}")
+        })?;
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .context("bind imported render-target memory")?;
+
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(COLOR_RANGE);
+        let view = unsafe { device.create_image_view(&view_ci, None) }
+            .context("dmabuf render-target view")?;
+
+        // Sampler is unused (a scanout target is never sampled) but kept so this fits `Texture`.
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(filter)
             .min_filter(filter)

@@ -134,6 +134,33 @@ impl VkTexture {
         }))
     }
 
+    /// A dmabuf-backed scanout render target: like [`Self::new_offscreen`] but carries **no**
+    /// descriptor set (a scanout buffer is rendered into and handed to KMS, never sampled), so its
+    /// `NiriTexture` need not — and, being `COLOR_ATTACHMENT`-only, must not — advertise `SAMPLED`
+    /// usage. The null `desc_pool`/`set` are valid no-ops to destroy. Starts `UNDEFINED`; the
+    /// render pass performs the first transition.
+    pub(super) fn new_dmabuf_target(
+        gpu: Arc<Gpu>,
+        tex: NiriTexture,
+        framebuffer: vk::Framebuffer,
+        width: u32,
+        height: u32,
+        format: Fourcc,
+    ) -> Self {
+        VkTexture(Arc::new(VkTextureInner {
+            gpu,
+            tex,
+            desc_pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+            framebuffer: Some(framebuffer),
+            layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            width,
+            height,
+            format,
+            flipped: false,
+        }))
+    }
+
     /// The combined image-sampler descriptor set that binds this texture at set 0, binding 0.
     pub(super) fn descriptor_set(&self) -> vk::DescriptorSet {
         self.0.set
@@ -207,10 +234,25 @@ impl Texture for VkTexture {
 
 // --- VkFramebuffer: a bound target (Smithay `Framebuffer<'buffer>`) -----------------------------
 
-/// A borrowed, in-use render target — Smithay's `Framebuffer`. Binding is zero-cost: it just
-/// mutably borrows the offscreen [`VkTexture`] whose GPU framebuffer the frame renders into.
+/// An in-use render target — Smithay's `Framebuffer`. Holds the target [`VkTexture`] as a cheap
+/// ref-counted clone rather than a borrow: a `Framebuffer` must be able to outlive the `bind` call,
+/// and for a dmabuf scanout target the caller owns only the `Dmabuf` (not a `VkTexture`), so there
+/// is nothing to borrow — the renderer imports one and the framebuffer keeps it alive (cf. Pixman's
+/// refcounted `Framebuffer` image). The lifetime is a marker so this still fits Smithay's
+/// `Framebuffer<'buffer>` GAT. Cloning is an `Arc` bump; the underlying GPU image is shared, so
+/// rendering through the clone writes the same image the caller (offscreen) or dmabuf reads back.
 pub struct VkFramebuffer<'a> {
-    pub(super) buffer: &'a mut VkTexture,
+    pub(super) buffer: VkTexture,
+    pub(super) _marker: std::marker::PhantomData<&'a mut ()>,
+}
+
+impl VkFramebuffer<'_> {
+    pub(super) fn new(buffer: VkTexture) -> Self {
+        VkFramebuffer {
+            buffer,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl fmt::Debug for VkFramebuffer<'_> {

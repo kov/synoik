@@ -12,7 +12,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::display::EGLBufferReader;
 use smithay::backend::egl::Error as EglError;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::{Bind, ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl};
+use smithay::backend::renderer::{ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::DisplayHandle;
@@ -21,7 +21,7 @@ use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::shm::with_buffer_contents;
 
 use super::error::VulkanError;
-use super::types::{VkFramebuffer, VkTexture};
+use super::types::VkTexture;
 use super::VulkanRenderer;
 use crate::render_helpers::renderer::{AsGlesRenderer, OffscreenRenderer};
 
@@ -40,14 +40,6 @@ impl OffscreenRenderer for VulkanRenderer {
 
     fn offscreen_is_reusable(&self, texture: &mut VkTexture) -> bool {
         texture.is_unique_reference()
-    }
-}
-
-impl Bind<Dmabuf> for VulkanRenderer {
-    fn bind<'a>(&mut self, _target: &'a mut Dmabuf) -> Result<VkFramebuffer<'a>, VulkanError> {
-        Err(VulkanError::Unsupported(
-            "binding a dmabuf as a render target (KMS scanout is Stage 3)",
-        ))
     }
 }
 

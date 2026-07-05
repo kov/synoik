@@ -13,7 +13,8 @@ use niri_vk::shaders::{
     RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper,
@@ -617,7 +618,79 @@ impl Bind<VkTexture> for VulkanRenderer {
                 "binding an imported (non-renderable) texture as a target",
             ));
         }
-        Ok(VkFramebuffer { buffer: target })
+        Ok(VkFramebuffer::new(target.clone()))
+    }
+}
+
+impl Bind<Dmabuf> for VulkanRenderer {
+    /// Bind a (GBM-allocated) dmabuf as a render target — the KMS-scanout path (Stage 3). Imports
+    /// the dmabuf's memory as a `COLOR_ATTACHMENT` `VkImage` + render-pass framebuffer, so a frame
+    /// renders straight into the buffer a display controller can scan out. A fresh import per bind
+    /// (no cache yet — a follow-up); the returned framebuffer owns it and frees it on drop.
+    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<VkFramebuffer<'a>, VulkanError> {
+        let tex = self.import_dmabuf_target(target)?;
+        Ok(VkFramebuffer::new(tex))
+    }
+}
+
+impl VulkanRenderer {
+    /// Import a single-plane dmabuf as a renderable [`VkTexture`] scanout target. Reuses the owned
+    /// renderer's `R8G8B8A8`-order render pass, so the dmabuf must be `Abgr8888`/`Xbgr8888`
+    /// ([`is_rgba8888`]); other byte orders (the `Argb8888` KMS default) would need a second,
+    /// `B8G8R8A8` render pass + pipeline set — deferred until a scanout format survey says it's
+    /// needed.
+    fn import_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VkTexture, VulkanError> {
+        let fourcc = dmabuf.format().code;
+        if !is_rgba8888(fourcc) {
+            return Err(VulkanError::UnsupportedFormat(fourcc));
+        }
+        if dmabuf.num_planes() != 1 {
+            return Err(VulkanError::Other(format!(
+                "dmabuf scanout target must be single-plane, got {}",
+                dmabuf.num_planes()
+            )));
+        }
+        let (w, h) = (dmabuf.width(), dmabuf.height());
+        let modifier: u64 = dmabuf.format().modifier.into();
+        let fd = dmabuf
+            .handles()
+            .next()
+            .ok_or_else(|| VulkanError::Other("dmabuf has no plane fd".into()))?;
+        let offset = dmabuf.offsets().next().unwrap_or(0);
+        let stride = dmabuf.strides().next().unwrap_or(0);
+        let filter = match self.upscale_filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
+
+        let tex = NiriTexture::import_dmabuf_render_target(
+            &self.gpu,
+            w,
+            h,
+            fd,
+            offset,
+            stride,
+            modifier,
+            IMAGE_VK_FORMAT,
+            filter,
+        )?;
+
+        let fb_ci = vk::FramebufferCreateInfo::default()
+            .render_pass(self.render_pass)
+            .attachments(std::slice::from_ref(&tex.view))
+            .width(w)
+            .height(h)
+            .layers(1);
+        let framebuffer = unsafe { self.gpu.device.create_framebuffer(&fb_ci, None) }?;
+
+        Ok(VkTexture::new_dmabuf_target(
+            self.gpu.clone(),
+            tex,
+            framebuffer,
+            w,
+            h,
+            fourcc,
+        ))
     }
 }
 
@@ -748,7 +821,7 @@ impl ExportMem for VulkanRenderer {
         }
         let w = region.size.w.max(0) as u32;
         let h = region.size.h.max(0) as u32;
-        let data = self.download_region(&*target.buffer, region.loc.x, region.loc.y, w, h)?;
+        let data = self.download_region(&target.buffer, region.loc.x, region.loc.y, w, h)?;
         Ok(VkMapping {
             data,
             width: w,
