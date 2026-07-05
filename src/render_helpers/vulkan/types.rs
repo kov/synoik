@@ -138,6 +138,12 @@ impl VkTexture {
         self.0.tex.image
     }
 
+    /// The underlying niri-vk texture (image + view + sampler), for low-level pipelines that sample
+    /// it directly — e.g. the blur chain, which needs its `view`/`sampler`.
+    pub(super) fn niri_texture(&self) -> &NiriTexture {
+        &self.0.tex
+    }
+
     /// The render-pass framebuffer, iff this is an offscreen target. `None` for imported textures.
     pub(super) fn framebuffer(&self) -> Option<vk::Framebuffer> {
         self.0.framebuffer

@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use ash::vk;
+use niri_vk::blur::BlurChain;
 use niri_vk::gpu::Gpu;
 use niri_vk::render::{
     load_module, sampler_set_layout, BorderPush, QuadPush, ShadowPush, COLOR_RANGE,
@@ -22,6 +23,7 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform
 use super::error::VulkanError;
 use super::frame::VulkanFrame;
 use super::types::{is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT};
+use crate::render_helpers::blur::BlurOptions;
 
 /// One `quad.vert` + material-fragment graphics pipeline with dynamic viewport/scissor (so it is
 /// reused across differently-sized targets).
@@ -313,6 +315,41 @@ impl VulkanRenderer {
         })?;
         tex.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
+    }
+
+    /// Blur `source` with the dual-kawase [`BlurChain`] and return the result as a fresh,
+    /// sampleable offscreen [`VkTexture`] the same size as `source` — the owned-renderer
+    /// equivalent of niri's GLES `Blur` (the `FramebufferEffectElement` backdrop blur).
+    /// `source` must be sampleable (`SHADER_READ_ONLY_OPTIMAL`): imported textures are; an
+    /// offscreen must go through [`Self::make_sampleable`] first.
+    ///
+    /// Builds a transient blur chain per call (unoptimized — the render pass, pipelines and level
+    /// pyramid are rebuilt each time); the eventual live `FramebufferEffectElement` consumer will
+    /// cache it. The chain records the down/up passes plus a copy of its output into `output`, then
+    /// this fence-waits and hands back `output` in `SHADER_READ_ONLY_OPTIMAL`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_blur(
+        &mut self,
+        source: &VkTexture,
+        options: BlurOptions,
+    ) -> Result<VkTexture, VulkanError> {
+        let (w, h) = source.extent();
+        let output = self.create_buffer(Fourcc::Abgr8888, Size::from((w as i32, h as i32)))?;
+
+        let gpu = self.gpu.clone();
+        let pool = self.command_pool;
+        let passes = (options.passes as usize).clamp(1, 31);
+        let chain = BlurChain::new(&gpu, source.niri_texture(), passes)?;
+        let recorded = gpu.run_commands(pool, |cbuf| {
+            chain.record(&gpu, cbuf, options.offset as f32);
+            chain.copy_output_to(&gpu, cbuf, output.image(), w, h);
+        });
+        // Free the transient chain regardless of whether recording/submission succeeded.
+        chain.destroy(&gpu);
+        recorded?;
+
+        output.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(output)
     }
 }
 

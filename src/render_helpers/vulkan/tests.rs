@@ -19,6 +19,7 @@ use smithay::utils::{
 
 use super::{VkTexture, VulkanRenderer};
 use crate::niri::OutputRenderElements;
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
@@ -849,4 +850,79 @@ fn vulkan_offscreen_snapshot() {
     // The offscreen is opaque where the solids cover it and transparent elsewhere, so re-sampling
     // it over CLEAR must match the direct render pixel-for-pixel.
     assert_close(&direct, &snapshot);
+}
+
+// --- Dual-kawase blur: a hard edge becomes a smooth ramp ----------------------------------------
+
+/// The owned renderer's dual-kawase blur (`render_blur`, driving niri-vk's `BlurChain`) softens a
+/// hard black|white split into a monotonic mid-gray ramp localized around the boundary. Structural
+/// invariants (blur has no per-pixel oracle): the boundary column is intermediate gray, the profile
+/// is monotonic left→right, and columns deep in each half keep their extreme (not washed uniform).
+#[test]
+fn vulkan_blur_smooths_edge() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_blur_smooths_edge: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // A hard vertical split: left half black, right half white (opaque).
+    let mut texels = Vec::with_capacity((W * H * 4) as usize);
+    for _y in 0..H {
+        for x in 0..W {
+            let v = if x < W / 2 { 0 } else { 255 };
+            texels.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    let source = vk
+        .import_memory(&texels, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import source");
+
+    let mut blurred = vk
+        .render_blur(
+            &source,
+            BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            },
+        )
+        .expect("render blur");
+
+    // Read the blurred output back (a sampleable offscreen).
+    let fb = vk.bind(&mut blurred).expect("bind blurred");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // Red channel along the mid-height scanline (grayscale, so r == g == b).
+    let r = |x: i32| px(&pixels, x, H / 2)[0] as i32;
+
+    // The boundary is a genuine blend, not the original hard step.
+    assert!(
+        (30..=225).contains(&r(W / 2)),
+        "boundary should be mid-gray, got {}",
+        r(W / 2),
+    );
+    // A step convolved with a symmetric kernel is a monotonic ramp: darker left of the split,
+    // lighter right of it.
+    assert!(
+        r(W / 2 - 8) < r(W / 2) && r(W / 2) < r(W / 2 + 8),
+        "expected a monotonic ramp across the split, got {} {} {}",
+        r(W / 2 - 8),
+        r(W / 2),
+        r(W / 2 + 8),
+    );
+    // The blur is localized: columns deep in each half stay near their extreme rather than washing
+    // out to uniform gray.
+    assert!(
+        r(4) < r(W / 2) && r(W - 4) > r(W / 2),
+        "deep columns should keep their extreme (left {} < mid {} < right {})",
+        r(4),
+        r(W / 2),
+        r(W - 4),
+    );
 }

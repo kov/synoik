@@ -334,6 +334,103 @@ impl BlurChain {
         (self.levels[0].w, self.levels[0].h)
     }
 
+    /// Record a copy of the blurred output (level 0) into `dst` — a same-size, same-format image
+    /// created with `TRANSFER_DST` (and expected in `UNDEFINED` layout) — leaving `dst` in
+    /// `SHADER_READ_ONLY_OPTIMAL` so the caller can sample it. Records into `cbuf` after
+    /// [`Self::record`], within the same submission. Used by the compositor to lift the blur result
+    /// into a sampleable `VkTexture`. `dst_w`/`dst_h` must equal [`Self::output_size`].
+    pub fn copy_output_to(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        dst: vk::Image,
+        dst_w: u32,
+        dst_h: u32,
+    ) {
+        let device = &gpu.device;
+        let out = &self.levels[0];
+        unsafe {
+            // Level 0: SHADER_READ_ONLY (render-pass final layout) → TRANSFER_SRC. The producing
+            // access is the final upsample pass's color write (L0 is never fragment-sampled).
+            let l0_to_src = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(out.image)
+                .subresource_range(crate::render::COLOR_RANGE)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            // Destination: UNDEFINED → TRANSFER_DST (contents discarded; we overwrite fully).
+            let dst_to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst)
+                .subresource_range(crate::render::COLOR_RANGE)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cbuf,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[l0_to_src, dst_to_dst],
+            );
+
+            let region = vk::ImageCopy::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .extent(vk::Extent3D {
+                    width: dst_w,
+                    height: dst_h,
+                    depth: 1,
+                });
+            device.cmd_copy_image(
+                cbuf,
+                out.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            // Destination: TRANSFER_DST → SHADER_READ_ONLY so the caller can sample it.
+            let dst_to_sampled = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst)
+                .subresource_range(crate::render::COLOR_RANGE)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            device.cmd_pipeline_barrier(
+                cbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[dst_to_sampled],
+            );
+        }
+    }
+
     pub fn destroy(&self, gpu: &Gpu) {
         let d = &gpu.device;
         unsafe {
