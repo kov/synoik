@@ -24,7 +24,9 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform
 use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
 use super::frame::VulkanFrame;
-use super::types::{is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT};
+use super::types::{
+    import_format, is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
+};
 use crate::render_helpers::blur::BlurOptions;
 
 /// One `quad.vert` + material-fragment graphics pipeline with dynamic viewport/scissor (so it is
@@ -669,15 +671,33 @@ impl ImportMem for VulkanRenderer {
         size: Size<i32, BufferCoord>,
         flipped: bool,
     ) -> Result<VkTexture, VulkanError> {
-        if !is_rgba8888(format) {
+        let Some((vk_format, alpha_one)) = import_format(format) else {
             return Err(VulkanError::UnsupportedFormat(format));
-        }
+        };
         let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+        // `ImportMem`'s contract is tightly packed `w*h*4` bytes (`import_shm_buffer` repacks
+        // strided shm into this shape before calling here).
+        let expected = (w as usize) * (h as usize) * 4;
+        if data.len() < expected {
+            return Err(VulkanError::Other(format!(
+                "import_memory: {} bytes for {w}x{h}, need {expected}",
+                data.len()
+            )));
+        }
         let filter = match self.upscale_filter {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
-        let tex = NiriTexture::from_rgba(&self.gpu, self.command_pool, w, h, data, filter)?;
+        let tex = NiriTexture::from_bytes_32bpp(
+            &self.gpu,
+            self.command_pool,
+            w,
+            h,
+            &data[..expected],
+            vk_format,
+            alpha_one,
+            filter,
+        )?;
         let (desc_pool, set) = self.make_texture_set(&tex)?;
         Ok(VkTexture::new(
             self.gpu.clone(),
@@ -701,7 +721,16 @@ impl ImportMem for VulkanRenderer {
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
-        Box::new([Fourcc::Abgr8888, Fourcc::Xbgr8888].into_iter())
+        // ARGB/XRGB (BGRA byte order) are what most toolkits send over wl_shm; ABGR/XBGR too.
+        Box::new(
+            [
+                Fourcc::Argb8888,
+                Fourcc::Xrgb8888,
+                Fourcc::Abgr8888,
+                Fourcc::Xbgr8888,
+            ]
+            .into_iter(),
+        )
     }
 }
 

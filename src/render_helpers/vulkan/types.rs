@@ -17,6 +17,23 @@ pub(super) fn is_rgba8888(f: Fourcc) -> bool {
     matches!(f, Fourcc::Abgr8888 | Fourcc::Xbgr8888)
 }
 
+/// Map a 32-bpp DRM fourcc to the VkFormat that reproduces its byte order when sampled, plus
+/// whether the fourth byte is `X` (undefined) and alpha must be forced to 1.0. Vulkan non-PACK
+/// formats name channels in memory-byte order, so the client's bytes upload verbatim (no CPU
+/// swizzle) and a sampler returns correct RGBA regardless of texture format. Both VkFormats are
+/// mandatory SAMPLED_IMAGE formats, so no runtime feature query is needed. This is broader than
+/// [`is_rgba8888`] (which gates the RGBA-order render targets / readback) because clients most
+/// commonly send ARGB/XRGB (BGRA byte order).
+pub(super) fn import_format(f: Fourcc) -> Option<(vk::Format, bool)> {
+    match f {
+        Fourcc::Argb8888 => Some((vk::Format::B8G8R8A8_UNORM, false)),
+        Fourcc::Xrgb8888 => Some((vk::Format::B8G8R8A8_UNORM, true)),
+        Fourcc::Abgr8888 => Some((vk::Format::R8G8B8A8_UNORM, false)),
+        Fourcc::Xbgr8888 => Some((vk::Format::R8G8B8A8_UNORM, true)),
+        _ => None,
+    }
+}
+
 // --- VkTexture: a sampled texture id (Smithay `TextureId`), optionally an offscreen target -------
 
 struct VkTextureInner {

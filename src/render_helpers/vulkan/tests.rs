@@ -1464,3 +1464,107 @@ fn vulkan_custom_bad_snippet_degrades() {
         px(&pixels, 32, 32),
     );
 }
+
+// --- shm client-buffer import: byte order + X-alpha swizzle --------------------------------------
+
+/// Import a `TW*TH` texture from `data` in `fourcc` (via `import_memory`, the same path
+/// `import_shm_buffer` funnels into), draw it at the origin over `clear`, and read back the frame.
+fn import_and_draw(
+    vk: &mut VulkanRenderer,
+    data: &[u8],
+    fourcc: Fourcc,
+    clear: [f32; 4],
+) -> Vec<u8> {
+    let buffer = TextureBuffer::from_memory(
+        vk,
+        data,
+        fourcc,
+        (TW, TH),
+        false,
+        1.0,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .expect("import client buffer");
+    let texture = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::<f64, _>::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let size = Size::<i32, Physical>::from((W, H));
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(clear), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let geo = Element::geometry(&texture, Scale::<f64>::from(1.0));
+        RenderElement::<VulkanRenderer>::draw(
+            &texture,
+            &mut frame,
+            Element::src(&texture),
+            geo,
+            &[Rectangle::from_size(geo.size)],
+            &[],
+            None,
+        )
+        .expect("draw texture");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    vk.map_texture(&mapping).expect("map_texture").to_vec()
+}
+
+/// wl_shm clients send pixels in ARGB/XRGB (BGRA byte order) and XBGR (with an undefined X byte).
+/// `import_memory` must map each fourcc to the VkFormat that samples back correct RGBA, and force
+/// the X byte to alpha 1.0. A channel-asymmetric color makes any byte swap unmistakable; the
+/// X-format case draws over a DISTINCT clear color so a missing alpha-1 swizzle (which would leave
+/// alpha 0 and show the background) is caught by the blend, not hidden.
+#[test]
+fn vulkan_import_respects_byte_order_and_x_alpha() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_import_respects_byte_order_and_x_alpha: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    let (r, g, b) = (0x20u8, 0x40u8, 0x80u8);
+
+    // ARGB8888 = memory bytes [B, G, R, A], opaque. The sampler must return (R, G, B, A).
+    let argb = solid_texels([b, g, r, 0xFF]);
+    let out = import_and_draw(&mut vk, &argb, Fourcc::Argb8888, CLEAR);
+    assert!(
+        close_px(px(&out, TW / 2, TH / 2), [r, g, b, 255], 2),
+        "ARGB8888 byte order wrong: got {:?}, want {:?}",
+        px(&out, TW / 2, TH / 2),
+        [r, g, b, 255],
+    );
+
+    // XBGR8888 = memory bytes [R, G, B, X] with X = 0. Correct swizzle forces alpha to 1.0, so the
+    // texture fully covers a distinct red clear; a swizzle bug would leave alpha 0 and show the
+    // red.
+    let distinct = [0.85, 0.05, 0.05, 1.0];
+    let xbgr = solid_texels([r, g, b, 0x00]);
+    let out = import_and_draw(&mut vk, &xbgr, Fourcc::Xbgr8888, distinct);
+    assert!(
+        close_px(px(&out, TW / 2, TH / 2), [r, g, b, 255], 2),
+        "XBGR8888 X byte must sample as alpha=1 (covering the clear), got {:?}",
+        px(&out, TW / 2, TH / 2),
+    );
+}

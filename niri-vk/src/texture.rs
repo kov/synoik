@@ -29,7 +29,42 @@ impl Texture {
         rgba: &[u8],
         filter: vk::Filter,
     ) -> Result<Self> {
-        Self::upload(gpu, pool, width, height, rgba, FORMAT, 4, filter)
+        Self::upload(
+            gpu,
+            pool,
+            width,
+            height,
+            rgba,
+            FORMAT,
+            4,
+            vk::ComponentMapping::default(),
+            filter,
+        )
+    }
+
+    /// Upload tight `width*height` 32bpp pixels in an arbitrary byte order, selected by `format`
+    /// (e.g. `B8G8R8A8_UNORM` for wl_shm ARGB, `R8G8B8A8_UNORM` for ABGR). The VkFormat defines the
+    /// channel interpretation, so a sampler returns correct RGBA with no CPU swizzle. `alpha_one`
+    /// forces the sampled alpha to 1.0 via the view (for X-formats whose fourth byte is undefined).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bytes_32bpp(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        format: vk::Format,
+        alpha_one: bool,
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        let components = if alpha_one {
+            vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
+        } else {
+            vk::ComponentMapping::default()
+        };
+        Self::upload(
+            gpu, pool, width, height, data, format, 4, components, filter,
+        )
     }
 
     /// Upload tight `width*height` single-channel coverage (R8) — the glyph atlas format.
@@ -49,6 +84,7 @@ impl Texture {
             coverage,
             vk::Format::R8_UNORM,
             1,
+            vk::ComponentMapping::default(),
             filter,
         )
     }
@@ -131,6 +167,7 @@ impl Texture {
         data: &[u8],
         format: vk::Format,
         bpp: vk::DeviceSize,
+        components: vk::ComponentMapping,
         filter: vk::Filter,
     ) -> Result<Self> {
         let device = &gpu.device;
@@ -236,6 +273,7 @@ impl Texture {
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
+            .components(components)
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }.context("texture view")?;
 
