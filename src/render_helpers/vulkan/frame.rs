@@ -496,6 +496,101 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         Ok(())
     }
 
+    /// Record the present-blit into `self.cbuf` (already past `cmd_end_render_pass`): transition
+    /// the imported dmabuf to a transfer destination, blit the R8G8B8A8 shadow
+    /// (`self.fb.buffer`, left in `TRANSFER_SRC_OPTIMAL` by the render pass) into it —
+    /// `vkCmdBlitImage` converts component order, so RGBA lands as the BGRA bytes
+    /// `Argb8888`/`Xrgb8888` scanout wants — then leave it in `GENERAL` for the display engine.
+    /// (No queue-family-foreign ownership release: we CPU-wait for completion and the buffer is
+    /// LINEAR, so the memory is coherent for KMS; a formal release would also block reading the
+    /// result back on our own queue. Revisit if live scanout needs it.)
+    fn record_present_blit(&self, present: &VkTexture) {
+        let dev = &self.renderer.gpu.device;
+        let (w, h) = self.fb.buffer.extent();
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        unsafe {
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(present.image())
+                .subresource_range(range);
+            dev.cmd_pipeline_barrier(
+                self.cbuf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_dst),
+            );
+
+            let blit = vk::ImageBlit::default()
+                .src_subresource(layers)
+                .src_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: w as i32,
+                        y: h as i32,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(layers)
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: w as i32,
+                        y: h as i32,
+                        z: 1,
+                    },
+                ]);
+            dev.cmd_blit_image(
+                self.cbuf,
+                self.fb.buffer.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                present.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&blit),
+                // Same size, so nearest is exact (and avoids a LINEAR-filter format check).
+                vk::Filter::NEAREST,
+            );
+
+            let to_display = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(present.image())
+                .subresource_range(range);
+            dev.cmd_pipeline_barrier(
+                self.cbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_display),
+            );
+        }
+        present.set_layout(vk::ImageLayout::GENERAL);
+    }
+
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
         if self.finished {
             return Ok(SyncPoint::signaled());
@@ -504,6 +599,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dev = &self.renderer.gpu.device;
         unsafe {
             dev.cmd_end_render_pass(self.cbuf);
+            // Present-blit scanout (KMS planes wanting `Argb8888`/`Xrgb8888`): the render pass left
+            // the R8G8B8A8 shadow in `TRANSFER_SRC_OPTIMAL` (its subpass→EXTERNAL dependency
+            // already makes the writes available to a transfer read), so blit it into
+            // the imported dmabuf, reordering RGBA→BGRA, then release the dmabuf to the
+            // display engine.
+            if let Some(present) = self.fb.present.as_ref() {
+                self.record_present_blit(present);
+            }
             dev.end_command_buffer(self.cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit =

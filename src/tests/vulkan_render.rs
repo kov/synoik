@@ -27,6 +27,9 @@ const WIN: u16 = 200;
 // in the composited readback is unambiguous. Single-pixel-buffer channels are premultiplied and
 // scaled so u32::MAX == 1.0.
 const GREEN: [u32; 4] = [0, u32::MAX, 0, u32::MAX];
+// A saturated, opaque red window. Unlike green (R=B=0), red has R≠B, so a readback distinguishes
+// RGBA byte order from BGRA — the present-blit scanout test uses it to prove the blit reorders.
+const RED: [u32; 4] = [u32::MAX, 0, 0, u32::MAX];
 
 /// The tight `Abgr8888` pixel at (x, y) in a `w`-wide readback buffer.
 fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
@@ -34,11 +37,11 @@ fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
     [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
 }
 
-/// Build a Vulkan-backed fixture with one 1280×720 output and a single opaque-green window, mapped
-/// and animation-settled (a static scene). Returns `None` (with a skip message) when there is no
-/// Vulkan device — smithay renders the single-pixel buffer as a solid color, so the window needs no
-/// client-buffer import.
-fn green_window_fixture() -> Option<Fixture> {
+/// Build a Vulkan-backed fixture with one 1280×720 output and a single opaque window of the given
+/// premultiplied color, mapped and animation-settled (a static scene). Returns `None` (with a skip
+/// message) when there is no Vulkan device — smithay renders the single-pixel buffer as a solid
+/// color, so the window needs no client-buffer import.
+fn window_fixture(color: [u32; 4]) -> Option<Fixture> {
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
@@ -59,7 +62,7 @@ fn green_window_fixture() -> Option<Fixture> {
     f.roundtrip(id);
 
     let window = f.client(id).window(&surface);
-    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.attach_solid_buffer(color[0], color[1], color[2], color[3]);
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
@@ -69,6 +72,11 @@ fn green_window_fixture() -> Option<Fixture> {
     f.double_roundtrip(id);
 
     Some(f)
+}
+
+/// The green-window fixture used by the offscreen/direct-scanout tests.
+fn green_window_fixture() -> Option<Fixture> {
+    window_fixture(GREEN)
 }
 
 /// Assert the composited frame shows the window (some opaque-green pixel) *and* composited more
@@ -316,4 +324,158 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
         "vulkan_composites_a_scene_into_a_scanout_dmabuf: {green} window px; wrote {}",
         path.display()
     );
+}
+
+/// The present-blit scanout path (KMS planes that want `Argb8888`/`Xrgb8888`): composite the live
+/// scene into a GBM `Argb8888` scanout dmabuf via `Bind<Dmabuf>` — which renders into an R8G8B8A8
+/// shadow and blits it into the dmabuf, reordering RGBA→BGRA — then read the dmabuf back (through
+/// Vulkan, `ExportMem`, which now targets the scanout buffer) and prove an opaque-**red** window
+/// landed as the BGRA bytes `[0,0,255,255]`. This is the exact path the virtio-gpu tty target takes
+/// (its primary plane advertises only XR24/AR24). Venus-only (needs GBM).
+#[test]
+fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    let Some(mut f) = window_fixture(RED) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("skipping vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: no render node ({e})");
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: no GBM ({e})"
+            );
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = match alloc.create_buffer(
+        u32::from(OUT_W),
+        u32::from(OUT_H),
+        Fourcc::Argb8888,
+        &[Modifier::Linear],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: GBM cannot \
+                 allocate Argb8888 LINEAR scanout buffer ({e})"
+            );
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+    eprintln!(
+        "argb scanout dmabuf: {:?} {}x{} modifier {:?}",
+        dmabuf.format().code,
+        dmabuf.width(),
+        dmabuf.height(),
+        dmabuf.format().modifier,
+    );
+
+    let state = f.niri_state();
+    let (pixels, w, h) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let size = output.current_transform().transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
+                niri.render_to_vec(ctx, &output, false);
+
+            // Bind the Argb dmabuf: `Bind<Dmabuf>` takes the present-blit path (shadow + blit).
+            let mut fb = vk
+                .bind(&mut dmabuf)
+                .map_err(|e| anyhow::anyhow!("bind dmabuf: {e}"))?;
+            {
+                let mut frame = vk
+                    .render(&mut fb, size, Transform::Normal)
+                    .map_err(|e| anyhow::anyhow!("render: {e}"))?;
+                frame
+                    .clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])
+                    .map_err(|e| anyhow::anyhow!("clear: {e}"))?;
+                for e in elements.iter().rev() {
+                    let geo = Element::geometry(e, scale);
+                    if let Some(mut damage) = Rectangle::from_size(size).intersection(geo) {
+                        damage.loc -= geo.loc;
+                        RenderElement::<VulkanRenderer>::draw(
+                            e,
+                            &mut frame,
+                            Element::src(e),
+                            geo,
+                            &[damage],
+                            &[],
+                            None,
+                        )
+                        .map_err(|e| anyhow::anyhow!("draw: {e}"))?;
+                    }
+                }
+                // `finish` runs the present-blit shadow→dmabuf, then CPU-waits for completion.
+                let _sync = frame.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+            }
+
+            // Read back the *scanout* buffer (`copy_framebuffer` follows the present-blit to the
+            // dmabuf) — the bytes are Argb8888 order, i.e. BGRA.
+            let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((size.w, size.h)));
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Argb8888)
+                .map_err(|e| anyhow::anyhow!("copy_framebuffer: {e}"))?;
+            let pixels = vk
+                .map_texture(&mapping)
+                .map_err(|e| anyhow::anyhow!("map_texture: {e}"))?
+                .to_vec();
+            Ok((pixels, size.w, size.h))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("present-blit compositing into the scanout dmabuf must not error");
+
+    // Argb8888 bytes are `[B, G, R, A]`. The opaque-red window must read `[0, 0, 255, 255]` — a raw
+    // (non-reordering) copy would instead leave red as `[255, 0, 0, 255]`, so this proves the blit
+    // reordered RGBA→BGRA.
+    assert_eq!(
+        pixels.len(),
+        (w * h * 4) as usize,
+        "unexpected readback size"
+    );
+    let is_red_bgra = |p: [u8; 4]| p[0] < 40 && p[1] < 40 && p[2] > 200 && p[3] > 200;
+    let red = (0..w * h)
+        .filter(|i| is_red_bgra(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert!(
+        red > 0,
+        "the red window is absent, or the present-blit did not reorder RGBA→BGRA"
+    );
+    assert!(
+        red < (w * h) as usize,
+        "the frame is uniformly the window color; nothing else composited"
+    );
+
+    eprintln!("vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: {red} red (BGRA) window px");
 }

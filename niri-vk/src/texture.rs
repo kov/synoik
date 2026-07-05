@@ -169,7 +169,10 @@ impl Texture {
     ///
     /// `fd` is duplicated internally (Vulkan consumes the dup on a successful import; the caller
     /// keeps ownership of the original). `format` must match `fourcc`'s byte order (e.g.
-    /// `R8G8B8A8_UNORM` for `Abgr8888`/`Xbgr8888`).
+    /// `R8G8B8A8_UNORM` for `Abgr8888`/`Xbgr8888`, `B8G8R8A8_UNORM` for `Argb8888`/`Xrgb8888`).
+    /// `usage` selects the role: `COLOR_ATTACHMENT | TRANSFER_SRC` to render straight into the
+    /// dmabuf (RGBA-order scanout), or `COLOR_ATTACHMENT | TRANSFER_DST` for a present-blit target
+    /// that receives a byte-reordering blit (the `Argb8888`/`Xrgb8888` KMS path).
     #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf_render_target(
         gpu: &Gpu,
@@ -180,6 +183,7 @@ impl Texture {
         stride: u32,
         modifier: u64,
         format: vk::Format,
+        usage: vk::ImageUsageFlags,
         filter: vk::Filter,
     ) -> Result<Self> {
         let device = &gpu.device;
@@ -208,7 +212,7 @@ impl Texture {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut ext_info)

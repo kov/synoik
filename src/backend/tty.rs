@@ -29,6 +29,7 @@ use smithay::backend::drm::{
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
@@ -64,9 +65,9 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::niri::{Niri, RedrawState, State};
+use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
@@ -104,6 +105,12 @@ pub struct Tty {
     // Whether the debug tinting is enabled.
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    // The owned Vulkan renderer, present only when niri was started with `--renderer=vulkan`. When
+    // set, `render()` composites and scans out through it (feeding the same `DrmCompositor`)
+    // instead of the GLES `gpu_manager`. GLES stays the default and the A/B correctness
+    // oracle.
+    #[cfg(feature = "vulkan")]
+    vulkan_renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
 }
 
 pub type TtyRenderer<'render> = MultiRenderer<
@@ -417,6 +424,7 @@ impl Tty {
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
+        renderer: crate::backend::RendererKind,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("Tty::new");
 
@@ -498,6 +506,22 @@ impl Tty {
         }
         info!("using as the render node: {node_path}");
 
+        // Bring up the owned Vulkan renderer if requested. It self-enumerates its device (the
+        // single virtio-gpu on our target VM), independent of the GLES `gpu_manager`. GBM
+        // buffers allocated by `device.allocator` are imported into it via `Bind<Dmabuf>`
+        // for scanout.
+        #[cfg(feature = "vulkan")]
+        let vulkan_renderer = if renderer == crate::backend::RendererKind::Vulkan {
+            let vk = crate::render_helpers::vulkan::VulkanRenderer::new()
+                .context("error creating the Vulkan renderer")?;
+            info!("using the owned Vulkan renderer for the TTY backend");
+            Some(vk)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "vulkan"))]
+        let _ = renderer;
+
         Ok(Self {
             config,
             session,
@@ -512,7 +536,23 @@ impl Tty {
             update_output_config_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "vulkan")]
+            vulkan_renderer,
         })
+    }
+
+    /// Whether this backend composites and scans out through the owned Vulkan renderer (rather than
+    /// the GLES `gpu_manager`). Always `false` unless built with the `vulkan` feature and started
+    /// with `--renderer=vulkan`.
+    fn use_vulkan(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        {
+            self.vulkan_renderer.is_some()
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
@@ -1248,6 +1288,7 @@ impl Tty {
         let connector_name = format_connector_name(&connector);
         debug!("connecting connector: {connector_name}");
 
+        let use_vulkan = self.use_vulkan();
         let device = self.devices.get_mut(&node).context("missing device")?;
 
         let disable_monitor_names = self.config.borrow().debug.disable_monitor_names;
@@ -1399,48 +1440,71 @@ impl Tty {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
 
-        let render_node = device.render_node.unwrap_or(self.primary_render_node);
-        let renderer = self.gpu_manager.single_renderer(&render_node)?;
-        let egl_context = renderer.as_ref().egl_context();
-        let render_formats = egl_context.dmabuf_render_formats();
-
-        // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
-        // configurations to stop working.
-        //
-        // For display only devices, restrict to linear buffers for best compatibility.
-        //
-        // The invalid modifier attempt below should make this unnecessary in some cases, but it
-        // would still be a bad idea to remove this until Smithay has some kind of full-device
-        // modesetting test that is able to "downgrade" existing connector modifiers to get enough
-        // bandwidth for a newly connected one.
-        let render_formats = render_formats
-            .iter()
-            .copied()
-            .filter(|format| {
-                if device.render_node.is_none() {
-                    return format.modifier == Modifier::Linear;
-                }
-
-                let is_ccs = matches!(
-                    format.modifier,
-                    Modifier::I915_y_tiled_ccs
-                    // I915_FORMAT_MOD_Yf_TILED_CCS
-                    | Modifier::Unrecognized(0x100000000000005)
-                    | Modifier::I915_y_tiled_gen12_rc_ccs
-                    | Modifier::I915_y_tiled_gen12_mc_ccs
-                    // I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC
-                    | Modifier::Unrecognized(0x100000000000008)
-                    // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS
-                    | Modifier::Unrecognized(0x10000000000000a)
-                    // I915_FORMAT_MOD_4_TILED_DG2_MC_CCS
-                    | Modifier::Unrecognized(0x10000000000000b)
-                    // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
-                    | Modifier::Unrecognized(0x10000000000000c)
-                );
-
-                !is_ccs
+        let render_formats = if use_vulkan {
+            // The owned Vulkan renderer's `Bind<Dmabuf>` scanout targets, with an explicit LINEAR
+            // modifier: Venus GBM allocates LINEAR scanout buffers, and Vulkan dmabuf import needs
+            // an explicit modifier (not INVALID). It renders RGBA-order buffers (Abgr/Xbgr)
+            // directly and BGRA-order ones (Argb/Xrgb — the usual KMS primary-plane
+            // byte order) via a present-blit. Supply all four rather than querying EGL;
+            // DrmCompositor intersects them with the plane's formats and
+            // `SUPPORTED_COLOR_FORMATS` to pick the buffer format, then allocates via
+            // `device.allocator` and imports each into the renderer via `Bind`.
+            [
+                Fourcc::Argb8888,
+                Fourcc::Xrgb8888,
+                Fourcc::Abgr8888,
+                Fourcc::Xbgr8888,
+            ]
+            .into_iter()
+            .map(|code| smithay::backend::allocator::Format {
+                code,
+                modifier: Modifier::Linear,
             })
-            .collect::<FormatSet>();
+            .collect::<FormatSet>()
+        } else {
+            let render_node = device.render_node.unwrap_or(self.primary_render_node);
+            let renderer = self.gpu_manager.single_renderer(&render_node)?;
+            let egl_context = renderer.as_ref().egl_context();
+            let render_formats = egl_context.dmabuf_render_formats();
+
+            // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
+            // configurations to stop working.
+            //
+            // For display only devices, restrict to linear buffers for best compatibility.
+            //
+            // The invalid modifier attempt below should make this unnecessary in some cases, but it
+            // would still be a bad idea to remove this until Smithay has some kind of full-device
+            // modesetting test that is able to "downgrade" existing connector modifiers to get
+            // enough bandwidth for a newly connected one.
+            render_formats
+                .iter()
+                .copied()
+                .filter(|format| {
+                    if device.render_node.is_none() {
+                        return format.modifier == Modifier::Linear;
+                    }
+
+                    let is_ccs = matches!(
+                        format.modifier,
+                        Modifier::I915_y_tiled_ccs
+                        // I915_FORMAT_MOD_Yf_TILED_CCS
+                        | Modifier::Unrecognized(0x100000000000005)
+                        | Modifier::I915_y_tiled_gen12_rc_ccs
+                        | Modifier::I915_y_tiled_gen12_mc_ccs
+                        // I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC
+                        | Modifier::Unrecognized(0x100000000000008)
+                        // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS
+                        | Modifier::Unrecognized(0x10000000000000a)
+                        // I915_FORMAT_MOD_4_TILED_DG2_MC_CCS
+                        | Modifier::Unrecognized(0x10000000000000b)
+                        // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
+                        | Modifier::Unrecognized(0x10000000000000c)
+                    );
+
+                    !is_ccs
+                })
+                .collect::<FormatSet>()
+        };
 
         // Create the compositor.
         let res = DrmCompositor::new(
@@ -1459,6 +1523,11 @@ impl Tty {
 
         let mut compositor = match res {
             Ok(x) => x,
+            // The owned Vulkan renderer cannot import an INVALID-modifier buffer, so the fallback
+            // below doesn't apply — surface the error instead (e.g. KMS rejecting LINEAR scanout).
+            Err(err) if use_vulkan => {
+                return Err(err).context("error creating DRM compositor for the Vulkan renderer");
+            }
             Err(err) => {
                 warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
 
@@ -1858,7 +1927,8 @@ impl Tty {
     ) -> RenderResult {
         let span = tracy_client::span!("Tty::render");
 
-        let mut rv = RenderResult::Skipped;
+        let rv = RenderResult::Skipped;
+        let config = self.config.clone();
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
@@ -1879,6 +1949,27 @@ impl Tty {
             return rv;
         }
 
+        // Composite and scan out through the owned Vulkan renderer, if enabled; otherwise the GLES
+        // multi-GPU renderer. Both feed the same `DrmCompositor` (renderer-agnostic at the struct
+        // level; `render_frame` is generic over the renderer).
+        #[cfg(feature = "vulkan")]
+        if let Some(vk) = self.vulkan_renderer.as_mut() {
+            // First cut: composite everything into the DrmCompositor swapchain buffer and scan that
+            // out — no direct client / overlay / cursor-plane scanout. Those offloads make
+            // `render_frame` import client and cursor buffers into the renderer (`ImportDma`),
+            // which the owned Vulkan renderer doesn't support yet; the cursor is
+            // composited in software.
+            return render_surface_with(
+                niri,
+                output,
+                vk,
+                surface,
+                &config,
+                FrameFlags::empty(),
+                target_presentation_time,
+            );
+        }
+
         let mut renderer = match self.gpu_manager.renderer(
             &self.primary_render_node,
             &device.render_node.unwrap_or(self.primary_render_node),
@@ -1891,24 +1982,10 @@ impl Tty {
             }
         };
 
-        // Render the elements.
-        let ctx = RenderCtx {
-            renderer: &mut renderer,
-            target: RenderTarget::Output,
-            xray: None,
-        };
-        let mut elements = niri.render_to_vec(ctx, output, true);
-
-        // Visualize the damage, if enabled.
-        if niri.debug_draw_damage {
-            let output_state = niri.output_state.get_mut(output).unwrap();
-            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
-        }
-
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
         let flags = {
-            let debug = &self.config.borrow().debug;
+            let debug = &config.borrow().debug;
 
             let primary_scanout_flag = if debug.restrict_primary_scanout_to_matching_format {
                 FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
@@ -1937,80 +2014,15 @@ impl Tty {
             flags
         };
 
-        // Hand them over to the DRM.
-        let drm_compositor = &mut surface.compositor;
-        match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
-            Ok(res) => {
-                let needs_sync = res.needs_sync()
-                    || self
-                        .config
-                        .borrow()
-                        .debug
-                        .wait_for_frame_completion_before_queueing;
-                if needs_sync {
-                    if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
-                        let _span = tracy_client::span!("wait for completion");
-                        if let Err(err) = element.sync.wait() {
-                            warn!("error waiting for frame completion: {err:?}");
-                        }
-                    }
-                }
-
-                niri.update_primary_scanout_output(output, &res.states);
-                if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
-                    niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
-                }
-
-                if !res.is_empty {
-                    let presentation_feedbacks =
-                        niri.take_presentation_feedbacks(output, &res.states);
-                    let data = (presentation_feedbacks, target_presentation_time);
-
-                    match drm_compositor.queue_frame(data) {
-                        Ok(()) => {
-                            let output_state = niri.output_state.get_mut(output).unwrap();
-                            let new_state = RedrawState::WaitingForVBlank {
-                                redraw_needed: false,
-                            };
-                            match mem::replace(&mut output_state.redraw_state, new_state) {
-                                RedrawState::Idle => unreachable!(),
-                                RedrawState::Queued => (),
-                                RedrawState::WaitingForVBlank { .. } => unreachable!(),
-                                RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
-                                RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                                    niri.event_loop.remove(token);
-                                }
-                            };
-
-                            // We queued this frame successfully, so the current client buffers were
-                            // latched. We can send frame callbacks now, since a new client commit
-                            // will no longer overwrite this frame and will wait for a VBlank.
-                            output_state.frame_callback_sequence =
-                                output_state.frame_callback_sequence.wrapping_add(1);
-
-                            return RenderResult::Submitted;
-                        }
-                        Err(err) => {
-                            warn!("error queueing frame: {err}");
-                        }
-                    }
-                } else {
-                    rv = RenderResult::NoDamage;
-                }
-            }
-            Err(err) => {
-                // Can fail if we switched to a different TTY.
-                warn!("error rendering frame: {err}");
-            }
-        }
-
-        // We're not expecting a vblank right after this.
-        drop(surface.vblank_frame.take());
-
-        // Queue a timer to fire at the predicted vblank time.
-        queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
-
-        rv
+        render_surface_with(
+            niri,
+            output,
+            &mut renderer,
+            surface,
+            &config,
+            flags,
+            target_presentation_time,
+        )
     }
 
     pub fn change_vt(&mut self, vt: i32) {
@@ -2955,6 +2967,116 @@ fn suspend() -> anyhow::Result<()> {
     .context("error suspending")?;
 
     Ok(())
+}
+
+/// Composite `output`'s render elements through `renderer` and hand the frame to `surface`'s
+/// `DrmCompositor` for scanout. Renderer-generic so the GLES `MultiRenderer` and the owned
+/// `VulkanRenderer` share one present path — `DrmCompositor` is renderer-agnostic at the struct
+/// level and `render_frame` is generic over `R: Renderer + Bind<Dmabuf>` (both satisfied by
+/// `NiriRenderer`). The `OutputRenderElements<R>: RenderElement<R>` bound restricts `R` to the
+/// renderers the element macro emits arms for (GLES/Tty and, under the feature, Vulkan).
+#[allow(clippy::too_many_arguments)]
+fn render_surface_with<R>(
+    niri: &mut Niri,
+    output: &Output,
+    renderer: &mut R,
+    surface: &mut Surface,
+    config: &Rc<RefCell<Config>>,
+    flags: FrameFlags,
+    target_presentation_time: Duration,
+) -> RenderResult
+where
+    R: NiriRenderer,
+    OutputRenderElements<R>: RenderElement<R>,
+{
+    let mut rv = RenderResult::Skipped;
+
+    // Render the elements.
+    let ctx = RenderCtx {
+        renderer: &mut *renderer,
+        target: RenderTarget::Output,
+        xray: None,
+    };
+    let mut elements = niri.render_to_vec(ctx, output, true);
+
+    // Visualize the damage, if enabled.
+    if niri.debug_draw_damage {
+        let output_state = niri.output_state.get_mut(output).unwrap();
+        draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+    }
+
+    // Hand them over to the DRM.
+    let drm_compositor = &mut surface.compositor;
+    match drm_compositor.render_frame::<_, _>(renderer, &elements, [0.; 4], flags) {
+        Ok(res) => {
+            let needs_sync = res.needs_sync()
+                || config
+                    .borrow()
+                    .debug
+                    .wait_for_frame_completion_before_queueing;
+            if needs_sync {
+                if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
+                    let _span = tracy_client::span!("wait for completion");
+                    if let Err(err) = element.sync.wait() {
+                        warn!("error waiting for frame completion: {err:?}");
+                    }
+                }
+            }
+
+            niri.update_primary_scanout_output(output, &res.states);
+            if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
+                niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
+            }
+
+            if !res.is_empty {
+                let presentation_feedbacks = niri.take_presentation_feedbacks(output, &res.states);
+                let data = (presentation_feedbacks, target_presentation_time);
+
+                match drm_compositor.queue_frame(data) {
+                    Ok(()) => {
+                        let output_state = niri.output_state.get_mut(output).unwrap();
+                        let new_state = RedrawState::WaitingForVBlank {
+                            redraw_needed: false,
+                        };
+                        match mem::replace(&mut output_state.redraw_state, new_state) {
+                            RedrawState::Idle => unreachable!(),
+                            RedrawState::Queued => (),
+                            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+                            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                                niri.event_loop.remove(token);
+                            }
+                        };
+
+                        // We queued this frame successfully, so the current client buffers were
+                        // latched. We can send frame callbacks now, since a new client commit
+                        // will no longer overwrite this frame and will wait for a VBlank.
+                        output_state.frame_callback_sequence =
+                            output_state.frame_callback_sequence.wrapping_add(1);
+
+                        return RenderResult::Submitted;
+                    }
+                    Err(err) => {
+                        warn!("error queueing frame: {err}");
+                    }
+                }
+            } else {
+                rv = RenderResult::NoDamage;
+            }
+        }
+        Err(err) => {
+            // Can fail if we switched to a different TTY.
+            warn!("error rendering frame: {err}");
+        }
+    }
+
+    // We're not expecting a vblank right after this.
+    drop(surface.vblank_frame.take());
+
+    // Queue a timer to fire at the predicted vblank time.
+    queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+
+    rv
 }
 
 fn queue_estimated_vblank_timer(

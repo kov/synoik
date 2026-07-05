@@ -44,12 +44,17 @@ impl Server {
     }
 }
 
-/// `--renderer=vulkan` is only wired on the headless backend (and only with the `vulkan` feature).
-/// Requesting it on the auto (winit/tty) backend — or in a build without the feature — must be
-/// rejected cleanly by `State::new`, before any backend/socket setup. Covers both the per-backend
-/// bail (vulkan build) and the missing-feature bail (default build) with one assertion.
+/// `State::new`'s handling of `--renderer=vulkan` on the auto backend depends on the build and the
+/// selected backend. In a build *without* the `vulkan` feature it is rejected up front regardless
+/// of backend. With the feature, the tty backend now supports Vulkan (it scans out through the
+/// owned renderer), so only the winit backend still rejects it. `State::new` always fails in a
+/// headless test (no seat/TTY, no display), so we assert on *which* error we get.
 #[test]
-fn vulkan_renderer_is_rejected_where_unsupported() {
+fn vulkan_renderer_matches_backend_support() {
+    let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_SOCKET").is_some()
+        || std::env::var_os("DISPLAY").is_some();
+
     let event_loop = EventLoop::try_new().unwrap();
     let display = Display::new().unwrap();
     let result = State::new(
@@ -64,9 +69,25 @@ fn vulkan_renderer_is_rejected_where_unsupported() {
     );
     let err = result
         .err()
-        .expect("Vulkan on the auto backend must be rejected");
-    assert!(
-        err.to_string().to_lowercase().contains("vulkan"),
-        "unexpected error: {err}"
-    );
+        .expect("Vulkan on the auto backend cannot succeed in a headless test");
+    let msg = err.to_string().to_lowercase();
+
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = has_display;
+        // No feature: rejected before any backend selection, with a clear "vulkan" message.
+        assert!(msg.contains("vulkan"), "unexpected error: {err}");
+    }
+    #[cfg(feature = "vulkan")]
+    if has_display {
+        // Auto picks the winit backend, which has no Vulkan present path yet.
+        assert!(msg.contains("winit"), "unexpected error: {err}");
+    } else {
+        // Auto picks the tty backend, which now supports Vulkan: the renderer-kind check passes and
+        // we fail only in backend init (no seat/TTY here), not with a "not yet supported" bail.
+        assert!(
+            !msg.contains("not yet supported"),
+            "Vulkan should be accepted on the tty backend: {err}"
+        );
+    }
 }

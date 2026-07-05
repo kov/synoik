@@ -624,26 +624,29 @@ impl Bind<VkTexture> for VulkanRenderer {
 
 impl Bind<Dmabuf> for VulkanRenderer {
     /// Bind a (GBM-allocated) dmabuf as a render target — the KMS-scanout path (Stage 3). Imports
-    /// the dmabuf's memory as a `COLOR_ATTACHMENT` `VkImage` + render-pass framebuffer, so a frame
-    /// renders straight into the buffer a display controller can scan out. A fresh import per bind
-    /// (no cache yet — a follow-up); the returned framebuffer owns it and frees it on drop.
+    /// the dmabuf's memory as a `VkImage`; a frame then renders into it (directly for RGBA-order
+    /// buffers, or via a shadow + present-blit for `Argb8888`/`Xrgb8888` planes) so a display
+    /// controller can scan it out. A fresh import per bind (no cache yet — a follow-up); the
+    /// returned framebuffer owns the import(s) and frees them on drop.
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<VkFramebuffer<'a>, VulkanError> {
-        let tex = self.import_dmabuf_target(target)?;
-        Ok(VkFramebuffer::new(tex))
+        self.import_dmabuf_target(target)
     }
 }
 
 impl VulkanRenderer {
-    /// Import a single-plane dmabuf as a renderable [`VkTexture`] scanout target. Reuses the owned
-    /// renderer's `R8G8B8A8`-order render pass, so the dmabuf must be `Abgr8888`/`Xbgr8888`
-    /// ([`is_rgba8888`]); other byte orders (the `Argb8888` KMS default) would need a second,
-    /// `B8G8R8A8` render pass + pipeline set — deferred until a scanout format survey says it's
-    /// needed.
-    fn import_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Result<VkTexture, VulkanError> {
+    /// Import a single-plane dmabuf as a scanout [`VkFramebuffer`]. Two shapes:
+    ///
+    /// - `Abgr8888`/`Xbgr8888` ([`is_rgba8888`]) match the owned renderer's `R8G8B8A8`-order render
+    ///   pass, so a frame renders **straight into** the dmabuf.
+    /// - `Argb8888`/`Xrgb8888` (the common KMS primary-plane byte order — `B8G8R8A8`) do not, so we
+    ///   render into an R8G8B8A8 shadow (reusing the render pass + all pipelines) and blit it into
+    ///   the dmabuf on `finish`, the blit reordering RGBA→BGRA. This avoids a whole second
+    ///   `B8G8R8A8` render pass + pipeline set at the cost of one full-frame blit.
+    fn import_dmabuf_target<'a>(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<VkFramebuffer<'a>, VulkanError> {
         let fourcc = dmabuf.format().code;
-        if !is_rgba8888(fourcc) {
-            return Err(VulkanError::UnsupportedFormat(fourcc));
-        }
         if dmabuf.num_planes() != 1 {
             return Err(VulkanError::Other(format!(
                 "dmabuf scanout target must be single-plane, got {}",
@@ -663,7 +666,48 @@ impl VulkanRenderer {
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
 
-        let tex = NiriTexture::import_dmabuf_render_target(
+        if is_rgba8888(fourcc) {
+            // Direct: the dmabuf's byte order matches the render pass, render into it in place.
+            let tex = NiriTexture::import_dmabuf_render_target(
+                &self.gpu,
+                w,
+                h,
+                fd,
+                offset,
+                stride,
+                modifier,
+                IMAGE_VK_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                filter,
+            )?;
+            let framebuffer = self.dmabuf_framebuffer(&tex, w, h)?;
+            let buffer =
+                VkTexture::new_dmabuf_target(self.gpu.clone(), tex, framebuffer, w, h, fourcc);
+            return Ok(VkFramebuffer::new(buffer));
+        }
+
+        // Present-blit: the plane's byte order differs from the render pass. `import_format` maps
+        // `Argb8888`/`Xrgb8888` → `B8G8R8A8_UNORM`; anything else is unsupported.
+        let Some((present_format, _opaque)) = import_format(fourcc) else {
+            return Err(VulkanError::UnsupportedFormat(fourcc));
+        };
+
+        // Shadow: an R8G8B8A8 render target (reuses the render pass + every pipeline). Its `format`
+        // is the RGBA byte order the render pass actually writes.
+        let shadow_tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
+        let framebuffer = self.dmabuf_framebuffer(&shadow_tex, w, h)?;
+        let shadow = VkTexture::new_dmabuf_target(
+            self.gpu.clone(),
+            shadow_tex,
+            framebuffer,
+            w,
+            h,
+            Fourcc::Abgr8888,
+        );
+
+        // Present: the imported dmabuf as a blit destination (`TRANSFER_DST`), reported with the
+        // real scanout `fourcc`.
+        let present_tex = NiriTexture::import_dmabuf_render_target(
             &self.gpu,
             w,
             h,
@@ -671,26 +715,33 @@ impl VulkanRenderer {
             offset,
             stride,
             modifier,
-            IMAGE_VK_FORMAT,
+            present_format,
+            // TRANSFER_DST for the blit; TRANSFER_SRC so the scanout buffer can be read back
+            // (ExportMem / the scanout test).
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             filter,
         )?;
+        let present = VkTexture::new_present_target(self.gpu.clone(), present_tex, w, h, fourcc);
 
+        Ok(VkFramebuffer::new_with_present(shadow, present))
+    }
+
+    /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.
+    fn dmabuf_framebuffer(
+        &self,
+        tex: &NiriTexture,
+        w: u32,
+        h: u32,
+    ) -> Result<vk::Framebuffer, VulkanError> {
         let fb_ci = vk::FramebufferCreateInfo::default()
             .render_pass(self.render_pass)
             .attachments(std::slice::from_ref(&tex.view))
             .width(w)
             .height(h)
             .layers(1);
-        let framebuffer = unsafe { self.gpu.device.create_framebuffer(&fb_ci, None) }?;
-
-        Ok(VkTexture::new_dmabuf_target(
-            self.gpu.clone(),
-            tex,
-            framebuffer,
-            w,
-            h,
-            fourcc,
-        ))
+        unsafe { self.gpu.device.create_framebuffer(&fb_ci, None) }.map_err(VulkanError::from)
     }
 }
 
@@ -816,12 +867,18 @@ impl ExportMem for VulkanRenderer {
         region: Rectangle<i32, BufferCoord>,
         format: Fourcc,
     ) -> Result<VkMapping, VulkanError> {
-        if !is_rgba8888(format) {
+        // Any 32-bpp 8888 order — RGBA (Abgr/Xbgr) for the offscreen/direct path, BGRA (Argb/Xrgb)
+        // for a present-blit scanout buffer. `download_region` copies raw bytes, so they come back
+        // in the source's own order; `format` labels that order for the caller.
+        if import_format(format).is_none() {
             return Err(VulkanError::UnsupportedFormat(format));
         }
+        // On the present-blit path the bytes actually scanned out live in the dmabuf (`present`),
+        // not the R8G8B8A8 shadow — read the real target.
+        let source = target.present.as_ref().unwrap_or(&target.buffer);
         let w = region.size.w.max(0) as u32;
         let h = region.size.h.max(0) as u32;
-        let data = self.download_region(&target.buffer, region.loc.x, region.loc.y, w, h)?;
+        let data = self.download_region(source, region.loc.x, region.loc.y, w, h)?;
         Ok(VkMapping {
             data,
             width: w,

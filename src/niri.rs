@@ -753,9 +753,9 @@ impl State {
 
         let config = Rc::new(RefCell::new(config));
 
-        // The Vulkan renderer is opt-in and only wired on the headless backend so far (Winit/TTY
-        // have no live Vulkan present path — that's Stage 3). Reject impossible combinations up
-        // front with a clear message rather than degrading silently.
+        // The Vulkan renderer is opt-in and wired on the headless and TTY backends (the TTY path
+        // scans out through the owned renderer — Stage 3); the Winit backend has no live Vulkan
+        // present path yet. Reject impossible combinations up front rather than degrading silently.
         #[cfg(not(feature = "vulkan"))]
         if renderer == RendererKind::Vulkan {
             return Err(
@@ -785,14 +785,7 @@ impl State {
                 Backend::Winit(winit)
             }
             BackendMode::Auto => {
-                if renderer == RendererKind::Vulkan {
-                    return Err(
-                        "the Vulkan renderer is not yet supported on the tty backend; \
-                                run with --headless"
-                            .into(),
-                    );
-                }
-                let tty = Tty::new(config.clone(), event_loop.clone())
+                let tty = Tty::new(config.clone(), event_loop.clone(), renderer)
                     .context("error initializing the TTY backend")?;
                 Backend::Tty(tty)
             }

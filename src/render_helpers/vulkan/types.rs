@@ -161,6 +161,32 @@ impl VkTexture {
         }))
     }
 
+    /// A dmabuf-backed **present-blit** target: the scanout buffer whose byte order (`Argb8888`/
+    /// `Xrgb8888` → `B8G8R8A8`) differs from the renderer's RGBA render pass, so it is never
+    /// rendered into directly — [`super::VulkanFrame::finish`] blits the R8G8B8A8 shadow into it
+    /// (reordering bytes). Carries no framebuffer (not a render target) and no descriptor set
+    /// (never sampled). Starts `UNDEFINED`; the blit barriers transition it.
+    pub(super) fn new_present_target(
+        gpu: Arc<Gpu>,
+        tex: NiriTexture,
+        width: u32,
+        height: u32,
+        format: Fourcc,
+    ) -> Self {
+        VkTexture(Arc::new(VkTextureInner {
+            gpu,
+            tex,
+            desc_pool: vk::DescriptorPool::null(),
+            set: vk::DescriptorSet::null(),
+            framebuffer: None,
+            layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            width,
+            height,
+            format,
+            flipped: false,
+        }))
+    }
+
     /// The combined image-sampler descriptor set that binds this texture at set 0, binding 0.
     pub(super) fn descriptor_set(&self) -> vk::DescriptorSet {
         self.0.set
@@ -243,6 +269,13 @@ impl Texture for VkTexture {
 /// rendering through the clone writes the same image the caller (offscreen) or dmabuf reads back.
 pub struct VkFramebuffer<'a> {
     pub(super) buffer: VkTexture,
+    /// Set on the **present-blit** scanout path (KMS planes that want `Argb8888`/`Xrgb8888`, whose
+    /// byte order differs from the renderer's RGBA render pass): `buffer` is then an R8G8B8A8
+    /// shadow rendered into as usual, and this is the imported dmabuf that
+    /// [`super::VulkanFrame::finish`] blits the shadow into (reordering bytes RGBA→BGRA).
+    /// `None` for direct render targets (offscreen textures, or RGBA-order dmabufs rendered
+    /// into in place).
+    pub(super) present: Option<VkTexture>,
     pub(super) _marker: std::marker::PhantomData<&'a mut ()>,
 }
 
@@ -250,6 +283,17 @@ impl VkFramebuffer<'_> {
     pub(super) fn new(buffer: VkTexture) -> Self {
         VkFramebuffer {
             buffer,
+            present: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// A present-blit framebuffer: render into `buffer` (an R8G8B8A8 shadow), then blit into
+    /// `present` (the imported scanout dmabuf) on `finish`. See [`Self::present`].
+    pub(super) fn new_with_present(buffer: VkTexture, present: VkTexture) -> Self {
+        VkFramebuffer {
+            buffer,
+            present: Some(present),
             _marker: std::marker::PhantomData,
         }
     }
@@ -271,7 +315,11 @@ impl Texture for VkFramebuffer<'_> {
         self.buffer.height()
     }
     fn format(&self) -> Option<Fourcc> {
-        self.buffer.format()
+        // On the present-blit path the true target is the scanout dmabuf (`Argb8888`/`Xrgb8888`),
+        // not the R8G8B8A8 shadow rendered into — report the format callers can actually scan out.
+        self.present
+            .as_ref()
+            .map_or_else(|| self.buffer.format(), |p| p.format())
     }
 }
 
