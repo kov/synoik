@@ -1,18 +1,22 @@
 //! End-to-end proof that the live `Niri::render` compositing path runs on the **owned Vulkan
-//! renderer**, not just GLES: a real client window is mapped through the headless test harness, the
-//! whole scene is composited to pixels through `VulkanRenderer`, and the result is read back and
-//! checked. This exercises the renderer-agnostic render helpers (Brick 2) *and* the `try_as_gles`
-//! degradation guards on the GLES-only sub-paths (xray capture, GNOME wallpaper, per-tile
-//! background effect) that would otherwise panic a Vulkan render (Brick 3).
+//! renderer**, not just GLES: a real client window is mapped through the headless test harness and
+//! the whole scene is composited through `VulkanRenderer`, both into an offscreen buffer (the
+//! screenshot path) and into a **GBM-allocated scanout dmabuf** (the KMS-present path — everything
+//! except the DRM page-flip, which is validated live). Exercises the renderer-agnostic render
+//! helpers (Brick 2), the `try_as_gles` degradation guards (Brick 3), and `Bind<Dmabuf>` (Brick A).
 //!
-//! Skips gracefully when no Vulkan device is present, like the other `--features vulkan` tests.
+//! Skips gracefully when no Vulkan device is present. The scanout test additionally needs a real
+//! GBM device (the render node), so it is Venus-only (lavapipe/CPU has no GBM).
 
 use niri_config::Config;
 use smithay::backend::allocator::Fourcc;
-use smithay::utils::{Physical, Scale, Size, Transform};
+use smithay::backend::renderer::element::{Element, RenderElement};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
+use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Transform};
 
 use super::fixture::Fixture;
 use crate::backend::RendererKind;
+use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 
@@ -30,12 +34,14 @@ fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
     [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
 }
 
-#[test]
-fn vulkan_composites_a_mapped_window() {
-    // Cheap up-front device probe so we skip (not fail) on machines without Vulkan.
+/// Build a Vulkan-backed fixture with one 1280×720 output and a single opaque-green window, mapped
+/// and animation-settled (a static scene). Returns `None` (with a skip message) when there is no
+/// Vulkan device — smithay renders the single-pixel buffer as a solid color, so the window needs no
+/// client-buffer import.
+fn green_window_fixture() -> Option<Fixture> {
     if let Err(e) = VulkanRenderer::new() {
-        eprintln!("skipping vulkan_composites_a_mapped_window: no Vulkan device ({e})");
-        return;
+        eprintln!("skipping: no Vulkan device ({e})");
+        return None;
     }
 
     let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
@@ -46,9 +52,6 @@ fn vulkan_composites_a_mapped_window() {
         .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
-    // Map one plain toplevel with an opaque green single-pixel buffer (smithay renders single-pixel
-    // buffers as a solid color, so this composites through `draw_solid` with no client-buffer
-    // import needed).
     let id = f.add_client();
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
@@ -61,10 +64,41 @@ fn vulkan_composites_a_mapped_window() {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    // Settle any map/open animation so we screenshot a static scene.
+    // Settle any map/open animation so we composite a static scene.
     f.niri_complete_animations();
     f.double_roundtrip(id);
 
+    Some(f)
+}
+
+/// Assert the composited frame shows the window (some opaque-green pixel) *and* composited more
+/// than just the window (background/backdrop present). Returns the green-pixel count for logging.
+fn assert_window_and_background(pixels: &[u8], w: i32, h: i32) -> usize {
+    assert_eq!(
+        pixels.len(),
+        (w * h * 4) as usize,
+        "unexpected readback size"
+    );
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+        .count();
+    assert!(
+        green > 0,
+        "the mapped green window is absent from the frame"
+    );
+    assert!(
+        green < (w * h) as usize,
+        "the frame is uniformly the window color; nothing else composited"
+    );
+    green
+}
+
+#[test]
+fn vulkan_composites_a_mapped_window() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
     let output = f.niri_output(1);
 
     // Composite the whole output through the owned Vulkan renderer — the same element collection
@@ -103,26 +137,7 @@ fn vulkan_composites_a_mapped_window() {
         .expect("headless backend must hold a Vulkan renderer")
         .expect("compositing through Vulkan must not error");
 
-    assert_eq!(
-        pixels.len(),
-        (w * h * 4) as usize,
-        "unexpected readback size"
-    );
-
-    // The window must be visible: some pixel is (close to) opaque green.
-    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
-    let green_count = (0..w * h)
-        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
-        .count();
-    assert!(
-        green_count > 0,
-        "the mapped green window is absent from the Vulkan-composited frame"
-    );
-    // ...but the whole frame is not the window: the background/backdrop composited too.
-    assert!(
-        green_count < (w * h) as usize,
-        "the frame is uniformly the window color; nothing else composited"
-    );
+    let green = assert_window_and_background(&pixels, w, h);
 
     // Write the observable artifact next to the target dir.
     let path = std::env::temp_dir().join("vulkan_composited_window.png");
@@ -135,7 +150,7 @@ fn vulkan_composites_a_mapped_window() {
     )
     .expect("write PNG");
     eprintln!(
-        "vulkan_composites_a_mapped_window: {green_count} window px; wrote {}",
+        "vulkan_composites_a_mapped_window: {green} window px; wrote {}",
         path.display()
     );
 
@@ -151,5 +166,154 @@ fn vulkan_composites_a_mapped_window() {
     assert!(
         ran.is_some(),
         "screenshot did not run on the Vulkan renderer"
+    );
+}
+
+/// The KMS-present pipeline minus the flip: composite the same live scene straight into a
+/// GBM-allocated **scanout dmabuf** via `Bind<Dmabuf>`, exactly as the tty present path will, and
+/// read it back from the dmabuf's own memory. This proves the whole GPU half of Stage 3 Brick B —
+/// `Niri::render` (Brick 3) → owned Vulkan renderer → scanout buffer (Brick A) — is correct; only
+/// the DRM framebuffer export + atomic page-flip remain (live-validated). Venus-only (needs GBM).
+#[test]
+fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // Allocate a scanout-flagged GBM buffer the size of the output and export it as a Smithay
+    // Dmabuf — the same allocation the tty backend performs for a scanout target.
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_composites_a_scene_into_a_scanout_dmabuf: no render node ({e})"
+            );
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_composites_a_scene_into_a_scanout_dmabuf: no GBM ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = match alloc.create_buffer(
+        u32::from(OUT_W),
+        u32::from(OUT_H),
+        Fourcc::Abgr8888,
+        &[Modifier::Linear],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_composites_a_scene_into_a_scanout_dmabuf: GBM cannot allocate \
+                 Abgr8888 LINEAR scanout buffer ({e})"
+            );
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+    eprintln!(
+        "scanout dmabuf: {:?} {}x{} modifier {:?}",
+        dmabuf.format().code,
+        dmabuf.width(),
+        dmabuf.height(),
+        dmabuf.format().modifier,
+    );
+
+    let state = f.niri_state();
+    let (pixels, w, h) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let size = output.current_transform().transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            // Collect the scene's elements for the Vulkan renderer.
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
+                niri.render_to_vec(ctx, &output, false);
+
+            // Bind the scanout dmabuf as the render target and composite straight into it.
+            let mut fb = vk
+                .bind(&mut dmabuf)
+                .map_err(|e| anyhow::anyhow!("bind dmabuf: {e}"))?;
+            {
+                let mut frame = vk
+                    .render(&mut fb, size, Transform::Normal)
+                    .map_err(|e| anyhow::anyhow!("render: {e}"))?;
+                frame
+                    .clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])
+                    .map_err(|e| anyhow::anyhow!("clear: {e}"))?;
+                // Back-to-front (elements are front-to-back).
+                for e in elements.iter().rev() {
+                    let geo = Element::geometry(e, scale);
+                    if let Some(mut damage) = Rectangle::from_size(size).intersection(geo) {
+                        damage.loc -= geo.loc;
+                        RenderElement::<VulkanRenderer>::draw(
+                            e,
+                            &mut frame,
+                            Element::src(e),
+                            geo,
+                            &[damage],
+                            &[],
+                            None,
+                        )
+                        .map_err(|e| anyhow::anyhow!("draw: {e}"))?;
+                    }
+                }
+                let _sync = frame.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+            }
+
+            // Read back from the dmabuf's own memory — correct pixels prove the scene landed in the
+            // scanout buffer.
+            let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((size.w, size.h)));
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .map_err(|e| anyhow::anyhow!("copy_framebuffer: {e}"))?;
+            let pixels = vk
+                .map_texture(&mapping)
+                .map_err(|e| anyhow::anyhow!("map_texture: {e}"))?
+                .to_vec();
+            Ok((pixels, size.w, size.h))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("compositing into the scanout dmabuf must not error");
+
+    let green = assert_window_and_background(&pixels, w, h);
+
+    let path = std::env::temp_dir().join("vulkan_scanout_dmabuf.png");
+    image::save_buffer(
+        &path,
+        &pixels,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::Rgba8,
+    )
+    .expect("write PNG");
+    eprintln!(
+        "vulkan_composites_a_scene_into_a_scanout_dmabuf: {green} window px; wrote {}",
+        path.display()
     );
 }
