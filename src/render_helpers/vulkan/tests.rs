@@ -7,7 +7,7 @@
 //! no Vulkan device is present. Runs on Venus (real target) and lavapipe (deterministic CPU).
 
 use niri_config::{Color, CornerRadius, GradientInterpolation};
-use niri_vk::render::PostprocessPush;
+use niri_vk::render::{PostprocessPush, ResizePush};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::pixman::PixmanRenderer;
@@ -1018,5 +1018,103 @@ fn vulkan_postprocess_clips_and_desaturates() {
     assert!(
         (inner[0] as i32) - (inner[1] as i32) < 80,
         "saturation should shrink the red/green gap, got {inner:?}",
+    );
+}
+
+// --- M3 step 4: resize cross-fade through the owned Vulkan renderer ------------------------------
+
+/// The resize cross-fade material (`render_resize`, niri's `ResizeRenderElement`) blends two window
+/// snapshots (prev + next) by `clamped_progress`, then optionally clips/rounds to the current
+/// geometry. With an opaque red "prev", blue "next", `clamped_progress = 0.5`, identity transforms,
+/// and `corner_radius = 16` clipped to the whole quad: the interior is the 50/50 blend (purple),
+/// and a deep corner is clipped away to the CLEAR background. Oracle-free structural invariants.
+#[test]
+fn vulkan_resize_crossfades() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_resize_crossfades: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Opaque red "prev" and blue "next" snapshots (pure primaries so a 50/50 blend is unambiguous).
+    let red: Vec<u8> = [255u8, 0, 0, 255]
+        .iter()
+        .copied()
+        .cycle()
+        .take((W * H * 4) as usize)
+        .collect();
+    let blue: Vec<u8> = [0u8, 0, 255, 255]
+        .iter()
+        .copied()
+        .cycle()
+        .take((W * H * 4) as usize)
+        .collect();
+    let tex_prev = vk
+        .import_memory(&red, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import prev");
+    let tex_next = vk
+        .import_memory(&blue, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import next");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let dst = Rectangle::<i32, Physical>::from_size(size);
+        // Identity affine-diagonal transforms ([scale.xy, translate.xy]): coords_curr_geo == v_uv,
+        // and each texture is sampled 1:1 across the whole geometry.
+        let push = ResizePush {
+            curr_geo_size: [W as f32, H as f32],
+            input_to_curr_geo: [1.0, 1.0, 0.0, 0.0],
+            geo_to_tex_prev: [1.0, 1.0, 0.0, 0.0],
+            geo_to_tex_next: [1.0, 1.0, 0.0, 0.0],
+            corner_radius: [16.0; 4],
+            clamped_progress: 0.5,
+            clip_to_geometry: 1.0,
+            niri_scale: 1.0,
+            niri_alpha: 1.0,
+            // origin/size/target are filled by render_resize.
+            ..Default::default()
+        };
+        frame
+            .render_resize(&tex_prev, &tex_next, dst, push)
+            .expect("render resize");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // Interior: the 50/50 cross-fade of red and blue → purple (r ≈ b, little green).
+    let inner = px(&pixels, 32, 32);
+    assert!(
+        inner[1] < 20,
+        "cross-fade of pure red + pure blue should have ~no green, got {inner:?}",
+    );
+    assert!(
+        (100..=155).contains(&(inner[0] as i32)) && (100..=155).contains(&(inner[2] as i32)),
+        "interior should be a ~50/50 red/blue blend, got {inner:?}",
+    );
+    assert!(
+        (inner[0] as i32 - inner[2] as i32).abs() < 20,
+        "at progress 0.5 red and blue should be ~equal, got {inner:?}",
+    );
+    // Deep corner: rounded/clipped away to the CLEAR background.
+    assert!(
+        close_px(px(&pixels, 2, 2), clear_u8(), 8),
+        "corner should be clipped to the background, got {:?}",
+        px(&pixels, 2, 2),
     );
 }

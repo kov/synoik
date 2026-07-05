@@ -115,6 +115,28 @@ pub struct PostprocessPush {
     pub noise: f32,
 }
 
+/// Push constants for the resize cross-fade material (`resize.vert`/`resize.frag`). Blends two
+/// window snapshots (bound at set 0 / set 1) by `clamped_progress`, then optionally clips/rounds to
+/// the current geometry. The three used transforms are affine-diagonal, each packed as a `vec4`
+/// `[scale.xy, translate.xy]` (the GLES shader's two unused matrices and `niri_progress` are
+/// dropped). `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430). 112 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ResizePush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub target: [f32; 2],
+    pub curr_geo_size: [f32; 2],
+    pub input_to_curr_geo: [f32; 4],
+    pub geo_to_tex_prev: [f32; 4],
+    pub geo_to_tex_next: [f32; 4],
+    pub corner_radius: [f32; 4],
+    pub clamped_progress: f32,
+    pub clip_to_geometry: f32,
+    pub niri_scale: f32,
+    pub niri_alpha: f32,
+}
+
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
     /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*

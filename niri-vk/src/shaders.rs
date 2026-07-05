@@ -38,3 +38,9 @@ pub const POSTPROCESS_VERT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/postprocess.vert.spv"));
 pub const POSTPROCESS_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/postprocess.frag.spv"));
+/// Resize cross-fade material vertex + fragment stages (blend two window snapshots bound at set 0 /
+/// set 1 by progress, then optionally clip/round to the current geometry — niri's
+/// `ResizeRenderElement`). Both stages declare `ResizePush`; the fragment outputs premultiplied
+/// color.
+pub const RESIZE_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/resize.vert.spv"));
+pub const RESIZE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/resize.frag.spv"));

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use ash::vk;
-use niri_vk::render::{as_bytes, BorderPush, PostprocessPush, QuadPush, ShadowPush};
+use niri_vk::render::{as_bytes, BorderPush, PostprocessPush, QuadPush, ResizePush, ShadowPush};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -306,6 +306,57 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 pipe.layout,
                 0,
                 std::slice::from_ref(&set),
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Draw the resize cross-fade material: blend two window snapshots (`tex_prev`, `tex_next`)
+    /// into `dst` by `push.clamped_progress`, then optionally clip/round to the current
+    /// geometry. The caller fills the material fields (the three transforms, `curr_geo_size`,
+    /// `corner_radius`, `clamped_progress`, `clip_to_geometry`, `niri_scale`, `niri_alpha`);
+    /// this fills the placement (`origin`/`size`/`target`), binds the premultiplied-blend
+    /// resize pipeline with each texture's own descriptor set (prev at set 0, next at set 1),
+    /// and draws the quad. The owned-renderer equivalent of niri's `ResizeRenderElement`.
+    // Consumed by the live ResizeRenderElement wiring (Stage 3); exercised now by the material
+    // test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_resize(
+        &mut self,
+        tex_prev: &VkTexture,
+        tex_next: &VkTexture,
+        dst: Rectangle<i32, Physical>,
+        mut push: ResizePush,
+    ) -> Result<(), VulkanError> {
+        if tex_prev.flipped() || tex_next.flipped() {
+            tracing::warn!("VulkanFrame::render_resize: flipped textures unsupported; skipping");
+            return Ok(());
+        }
+
+        push.origin = [dst.loc.x as f32, dst.loc.y as f32];
+        push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.target = self.target_dims();
+
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.resize_pipeline;
+        let sets = [tex_prev.descriptor_set(), tex_next.descriptor_set()];
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                &sets,
                 &[],
             );
             dev.cmd_push_constants(
