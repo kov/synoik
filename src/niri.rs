@@ -34,7 +34,7 @@ use smithay::backend::renderer::element::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::{Color32F, Offscreen};
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
     send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
@@ -4456,7 +4456,12 @@ impl Niri {
             }
         }
 
-        self.fill_xray_elements(ctx.as_gles(), output);
+        // Xray background/backdrop capture is a GLES-only path for now; on the owned Vulkan
+        // renderer this degrades to empty xray buffers (windows referencing xray sample nothing
+        // rather than panicking). Guard here because `as_gles()` panics on evaluation.
+        if let Some(gles_ctx) = ctx.try_as_gles() {
+            self.fill_xray_elements(gles_ctx, output);
+        }
 
         // Reborrow to shorten lifetime to be able to put in xray.
         let mut ctx = ctx.r();
@@ -4676,15 +4681,17 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, geo)) = mon.workspaces_with_render_geo().next() {
+                // The GNOME wallpaper bakes a GlesTexture; on the owned Vulkan renderer it degrades
+                // to nothing (the solid `render_background` below still draws).
                 if gnome_mode {
-                    if let Some(elem) = self.wallpaper.render(
-                        ctx.renderer.as_gles_renderer(),
-                        ws.view_size(),
-                        0.,
-                        output_scale,
-                    ) {
-                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
-                            push(elem.into());
+                    if let Some(gles) = ctx.renderer.try_as_gles_renderer() {
+                        if let Some(elem) =
+                            self.wallpaper
+                                .render(gles, ws.view_size(), 0., output_scale)
+                        {
+                            if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
+                                push(elem.into());
+                            }
                         }
                     }
                 }
@@ -4739,15 +4746,19 @@ impl Niri {
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
                 let mut wallpapered = false;
+                // As above: the GNOME wallpaper is GLES-only; degrades to the solid background on
+                // the owned Vulkan renderer.
                 if gnome_mode {
-                    if let Some(elem) = self.wallpaper.render(
-                        ctx.renderer.as_gles_renderer(),
-                        ws.view_size(),
-                        wallpaper_radius,
-                        output_scale,
-                    ) {
-                        process!(geo)(elem);
-                        wallpapered = true;
+                    if let Some(gles) = ctx.renderer.try_as_gles_renderer() {
+                        if let Some(elem) = self.wallpaper.render(
+                            gles,
+                            ws.view_size(),
+                            wallpaper_radius,
+                            output_scale,
+                        ) {
+                            process!(geo)(elem);
+                            wallpapered = true;
+                        }
                     }
                 }
                 // The solid color would poke out of the wallpaper's rounded
@@ -5868,14 +5879,17 @@ impl Niri {
         })
     }
 
-    pub fn screenshot(
+    pub fn screenshot<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         write_to_disk: bool,
         include_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot");
 
         self.update_render_elements(Some(output));

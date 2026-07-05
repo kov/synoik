@@ -101,7 +101,11 @@ impl HotkeyOverlay {
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            let renderer = renderer.as_gles_renderer();
+            // The overlay texture is built CPU-side and uploaded to a GlesTexture; on the owned
+            // Vulkan renderer that path is unavailable, so degrade to no overlay.
+            let Some(renderer) = renderer.try_as_gles_renderer() else {
+                return RenderedOverlay { buffer: None };
+            };
             render(renderer, &self.config.borrow(), self.mod_key, scale)
                 .unwrap_or_else(|_| RenderedOverlay { buffer: None })
         });

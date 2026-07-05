@@ -222,8 +222,12 @@ impl RunDialog {
         };
 
         let size = buffer.logical_size();
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer.as_gles_renderer(), buffer)
-        else {
+        // The dialog texture uploads to a GlesTexture; skip drawing it on the owned Vulkan
+        // renderer.
+        let Some(gles) = renderer.try_as_gles_renderer() else {
+            return;
+        };
+        let Ok(buffer) = TextureBuffer::from_memory_buffer(gles, buffer) else {
             return;
         };
 

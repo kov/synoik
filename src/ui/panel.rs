@@ -147,10 +147,13 @@ impl Panel {
 
         let mut buffers = self.buffers.borrow_mut();
         let buffer = buffers.entry(key).or_insert_with(|| {
+            // The bar renders CPU-side and uploads to a GlesTexture; degrade to no bar on the owned
+            // Vulkan renderer rather than panicking.
+            let gles = renderer.try_as_gles_renderer()?;
             // Degrade a paint panic to a missing bar rather than aborting scanout.
             std::panic::catch_unwind(AssertUnwindSafe(|| {
                 render_bar(
-                    renderer.as_gles_renderer(),
+                    gles,
                     scale,
                     width_px,
                     &self.clock_text,

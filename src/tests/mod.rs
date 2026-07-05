@@ -23,4 +23,6 @@ mod gnome;
 mod layer_shell;
 mod remove_output;
 mod transactions;
+#[cfg(feature = "vulkan")]
+mod vulkan_render;
 mod window_opening;

@@ -14,6 +14,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config) -> Self {
+        Self::new_with_renderer(config, RendererKind::Gles)
+    }
+
+    pub fn new_with_renderer(config: Config, renderer: RendererKind) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
         let display = Display::new().unwrap();
@@ -23,7 +27,7 @@ impl Server {
             event_loop.get_signal(),
             display,
             BackendMode::HeadlessTest,
-            RendererKind::Gles,
+            renderer,
             false,
             false,
         )
