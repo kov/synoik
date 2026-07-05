@@ -11,11 +11,11 @@ use std::sync::atomic::Ordering;
 use std::{env, mem};
 
 use calloop::EventLoop;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum as _};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use directories::ProjectDirs;
-use niri::backend::BackendMode;
+use niri::backend::{BackendMode, RendererKind};
 use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
 use niri::dbus;
@@ -186,12 +186,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         BackendMode::Auto
     };
+    // CLI flag wins; otherwise fall back to NIRI_RENDERER, otherwise the default (GLES).
+    let renderer = cli
+        .renderer
+        .or_else(|| {
+            env::var("NIRI_RENDERER")
+                .ok()
+                .and_then(|s| RendererKind::from_str(&s, true).ok())
+        })
+        .unwrap_or_default();
     let mut state = State::new(
         config,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
         mode,
+        renderer,
         true,
         cli.session,
     )

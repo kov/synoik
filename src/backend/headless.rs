@@ -18,19 +18,33 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
 
-use super::{IpcOutputMap, OutputId, RenderResult};
+use super::{IpcOutputMap, OutputId, RenderResult, RendererKind};
 use crate::niri::{Niri, RedrawState};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
+/// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
+/// the compositor logic itself is driveable over IPC with none. It can be either the default
+/// GLES renderer or — behind `--renderer=vulkan` + the `vulkan` feature — the owned Vulkan one.
+#[allow(clippy::large_enum_variant)]
+enum HeadlessRenderer {
+    Gles(GlesRenderer),
+    // Held for the Stage-3 live present path; nothing reads it yet (headless `render` is a
+    // no-op), hence the dead_code allow.
+    #[cfg(feature = "vulkan")]
+    Vulkan(#[allow(dead_code)] crate::render_helpers::vulkan::VulkanRenderer),
+}
+
 pub struct Headless {
-    renderer: Option<GlesRenderer>,
+    kind: RendererKind,
+    renderer: Option<HeadlessRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
 impl Headless {
-    pub fn new() -> Self {
+    pub fn new(kind: RendererKind) -> Self {
         Self {
+            kind,
             renderer: None,
             ipc_outputs: Default::default(),
         }
@@ -44,17 +58,33 @@ impl Headless {
             return Ok(());
         }
 
-        let mut renderer = unsafe {
-            let display =
-                EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
-            let context = EGLContext::new(&display).context("error creating EGL context")?;
-            GlesRenderer::new(context).context("error creating renderer")?
-        };
-
-        resources::init(&mut renderer);
-        shaders::init(&mut renderer);
-
-        self.renderer = Some(renderer);
+        self.renderer = Some(match self.kind {
+            RendererKind::Gles => {
+                let mut renderer = unsafe {
+                    let display = EGLDisplay::new(EGLSurfacelessDisplay)
+                        .context("error creating EGL display")?;
+                    let context =
+                        EGLContext::new(&display).context("error creating EGL context")?;
+                    GlesRenderer::new(context).context("error creating renderer")?
+                };
+                resources::init(&mut renderer);
+                shaders::init(&mut renderer);
+                HeadlessRenderer::Gles(renderer)
+            }
+            #[cfg(feature = "vulkan")]
+            RendererKind::Vulkan => {
+                // The owned Vulkan renderer brings up its own instance/device (no EGL, no
+                // surface) and manages its own pipelines — no resources/shaders init needed.
+                let renderer = crate::render_helpers::vulkan::VulkanRenderer::new()
+                    .context("error creating the Vulkan renderer")?;
+                HeadlessRenderer::Vulkan(renderer)
+            }
+            #[cfg(not(feature = "vulkan"))]
+            RendererKind::Vulkan => {
+                // Unreachable: State::new rejects --renderer=vulkan without the feature.
+                anyhow::bail!("niri was built without the `vulkan` feature");
+            }
+        });
         Ok(())
     }
 
@@ -124,7 +154,14 @@ impl Headless {
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
     ) -> Option<T> {
-        self.renderer.as_mut().map(f)
+        // This accessor is GLES-typed (its callers are GLES-only edge tasks — screencast setup,
+        // etc.); under the Vulkan renderer it returns None and those tasks degrade cleanly.
+        match &mut self.renderer {
+            Some(HeadlessRenderer::Gles(renderer)) => Some(f(renderer)),
+            #[cfg(feature = "vulkan")]
+            Some(HeadlessRenderer::Vulkan(_)) => None,
+            None => None,
+        }
     }
 
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
@@ -164,6 +201,34 @@ impl Headless {
 
 impl Default for Headless {
     fn default() -> Self {
-        Self::new()
+        Self::new(RendererKind::default())
+    }
+}
+
+#[cfg(all(test, feature = "vulkan"))]
+mod tests {
+    use super::*;
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    // `--renderer=vulkan` end-to-end on the headless backend: the stored kind drives
+    // `add_renderer` to build the owned Vulkan renderer, and the GLES-typed primary-renderer
+    // accessor degrades to None (its callers are GLES-only edge tasks). Skips with no device,
+    // matching the other Vulkan tests.
+    #[test]
+    fn headless_builds_the_vulkan_renderer() {
+        if let Err(e) = VulkanRenderer::new() {
+            eprintln!("skipping headless_builds_the_vulkan_renderer: no Vulkan device ({e})");
+            return;
+        }
+
+        let mut backend = Headless::new(RendererKind::Vulkan);
+        backend
+            .add_renderer()
+            .expect("headless should build the Vulkan renderer");
+        assert!(matches!(
+            backend.renderer,
+            Some(HeadlessRenderer::Vulkan(_))
+        ));
+        assert!(backend.with_primary_renderer(|_| ()).is_none());
     }
 }

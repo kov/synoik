@@ -117,7 +117,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty, Winit};
+use crate::backend::{Backend, BackendMode, Headless, RenderResult, RendererKind, Tty, Winit};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -738,12 +738,14 @@ pub struct State {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
         mode: BackendMode,
+        renderer: RendererKind,
         create_wayland_socket: bool,
         is_session_instance: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -751,17 +753,45 @@ impl State {
 
         let config = Rc::new(RefCell::new(config));
 
+        // The Vulkan renderer is opt-in and only wired on the headless backend so far (Winit/TTY
+        // have no live Vulkan present path — that's Stage 3). Reject impossible combinations up
+        // front with a clear message rather than degrading silently.
+        #[cfg(not(feature = "vulkan"))]
+        if renderer == RendererKind::Vulkan {
+            return Err(
+                "the Vulkan renderer requires niri to be built with the `vulkan` feature; \
+                        rebuild with `--features vulkan`"
+                    .into(),
+            );
+        }
+
         let has_display = env::var_os("WAYLAND_DISPLAY").is_some()
             || env::var_os("WAYLAND_SOCKET").is_some()
             || env::var_os("DISPLAY").is_some();
 
         let mut backend = match mode {
-            BackendMode::Headless | BackendMode::HeadlessTest => Backend::Headless(Headless::new()),
+            BackendMode::Headless | BackendMode::HeadlessTest => {
+                Backend::Headless(Headless::new(renderer))
+            }
             BackendMode::Auto if has_display => {
+                if renderer == RendererKind::Vulkan {
+                    return Err(
+                        "the Vulkan renderer is not yet supported on the winit backend; \
+                                run with --headless"
+                            .into(),
+                    );
+                }
                 let winit = Winit::new(config.clone(), event_loop.clone())?;
                 Backend::Winit(winit)
             }
             BackendMode::Auto => {
+                if renderer == RendererKind::Vulkan {
+                    return Err(
+                        "the Vulkan renderer is not yet supported on the tty backend; \
+                                run with --headless"
+                            .into(),
+                    );
+                }
                 let tty = Tty::new(config.clone(), event_loop.clone())
                     .context("error initializing the TTY backend")?;
                 Backend::Tty(tty)

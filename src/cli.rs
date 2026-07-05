@@ -35,6 +35,14 @@ pub struct Cli {
     /// session or a free VT.
     #[arg(long)]
     pub headless: bool,
+    /// Renderer to draw with: `gles` (default) or `vulkan`.
+    ///
+    /// `vulkan` selects the fork's experimental owned Vulkan renderer; it requires a build with
+    /// the `vulkan` feature and is currently only supported on the headless backend. This can also
+    /// be set with the `NIRI_RENDERER` environment variable; the command-line argument takes
+    /// precedence.
+    #[arg(long, value_enum)]
+    pub renderer: Option<crate::backend::RendererKind>,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,

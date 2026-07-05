@@ -39,6 +39,19 @@ pub enum BackendMode {
     HeadlessTest,
 }
 
+/// Which renderer draws the compositor's output.
+///
+/// GLES is the default production path. Vulkan selects the fork's experimental owned Vulkan
+/// renderer (`docs/fork/STRATEGY.md` §3.10) and requires a build with the `vulkan` feature; it is
+/// currently only wired on the headless backend (Winit/TTY reject it — no live present path yet,
+/// that's Stage 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum RendererKind {
+    #[default]
+    Gles,
+    Vulkan,
+}
+
 #[derive(PartialEq, Eq)]
 pub enum RenderResult {
     /// The frame was submitted to the backend for presentation.
