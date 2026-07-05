@@ -24,7 +24,6 @@ use smithay::utils::{Point, Transform};
 
 use crate::niri_render_elements;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -57,8 +56,11 @@ pub struct RunDialog {
 type BuffersByScale = HashMap<NotNan<f64>, (u64, Option<MemoryBuffer>)>;
 
 niri_render_elements! {
-    RunDialogRenderElement => {
-        Texture = PrimaryGpuTextureRenderElement,
+    RunDialogRenderElement<R> => {
+        // A plain memory-uploaded texture drawn through the active renderer's `ImportMem`, so the
+        // dialog composites on any renderer (GLES, Tty, or the owned Vulkan renderer) — unlike the
+        // GLES-locked `PrimaryGpuTextureRenderElement`.
+        Texture = TextureRenderElement<R::TextureId>,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -197,7 +199,7 @@ impl RunDialog {
         &self,
         renderer: &mut R,
         output: &Output,
-        push: &mut dyn FnMut(RunDialogRenderElement),
+        push: &mut dyn FnMut(RunDialogRenderElement<R>),
     ) {
         if !self.open {
             return;
@@ -222,12 +224,9 @@ impl RunDialog {
         };
 
         let size = buffer.logical_size();
-        // The dialog texture uploads to a GlesTexture; skip drawing it on the owned Vulkan
-        // renderer.
-        let Some(gles) = renderer.try_as_gles_renderer() else {
-            return;
-        };
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(gles, buffer) else {
+        // Upload the CPU-rendered dialog through the active renderer's `ImportMem`, so it draws on
+        // any renderer (including the owned Vulkan one) rather than only GLES.
+        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer, buffer) else {
             return;
         };
 
@@ -244,9 +243,7 @@ impl RunDialog {
             None,
             Kind::Unspecified,
         );
-        push(RunDialogRenderElement::Texture(
-            PrimaryGpuTextureRenderElement(elem),
-        ));
+        push(RunDialogRenderElement::Texture(elem));
 
         // Backdrop.
         let backdrop = SolidColorBuffer::new(output_size, BACKDROP_COLOR);

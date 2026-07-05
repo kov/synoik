@@ -8,10 +8,11 @@
 //! Skips gracefully when no Vulkan device is present. The scanout test additionally needs a real
 //! GBM device (the render node), so it is Venus-only (lavapipe/CPU has no GBM).
 
-use niri_config::Config;
+use niri_config::{Action, Config};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
+use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Transform};
 
 use super::fixture::Fixture;
@@ -102,6 +103,42 @@ fn assert_window_and_background(pixels: &[u8], w: i32, h: i32) -> usize {
     green
 }
 
+/// Composite the whole `output` through the owned Vulkan renderer (the `Niri::screenshot` path),
+/// returning the tight `Abgr8888` readback and its dimensions.
+fn render_output_vulkan(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let size = output.current_transform().transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::ScreenCapture,
+                xray: None,
+            };
+            let elements = niri.render_to_vec(ctx, output, false);
+            let elements = elements.iter().rev();
+            let pixels = render_to_vec(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements,
+            )?;
+            Ok((pixels, size.w, size.h))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("compositing through Vulkan must not error")
+}
+
 #[test]
 fn vulkan_composites_a_mapped_window() {
     let Some(mut f) = green_window_fixture() else {
@@ -175,6 +212,43 @@ fn vulkan_composites_a_mapped_window() {
         ran.is_some(),
         "screenshot did not run on the Vulkan renderer"
     );
+}
+
+#[test]
+fn vulkan_composites_the_run_dialog() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // Baseline: the static scene with no dialog.
+    let (before, w, h) = render_output_vulkan(&mut f, &output);
+
+    // Open the Alt+F2 run dialog, settle, and recomposite.
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.niri_complete_animations();
+    assert!(f.niri().run_dialog.is_open(), "run dialog must be open");
+    let (after, aw, ah) = render_output_vulkan(&mut f, &output);
+    assert_eq!((w, h), (aw, ah), "output size changed between renders");
+
+    // The old GLES-locked path early-returned before pushing *any* element on the Vulkan renderer,
+    // so opening the dialog left the frame byte-identical. The genericized path uploads the
+    // CPU-rendered dialog through Vulkan's `ImportMem` and draws it (plus its backdrop), so the
+    // frame must now change.
+    assert_ne!(
+        before, after,
+        "opening the run dialog did not change the Vulkan-composited frame (dialog skipped?)"
+    );
+
+    // Stronger than a global diff: the dialog box and its backdrop cover the output *center*, so
+    // the center pixel must change — not merely some backdrop edge.
+    let (cx, cy) = (w / 2, h / 2);
+    assert_ne!(
+        px(&before, w, cx, cy),
+        px(&after, w, cx, cy),
+        "the dialog did not composite at the output center"
+    );
+    eprintln!("vulkan_composites_the_run_dialog: {w}x{h} frame changed with the dialog open");
 }
 
 /// The KMS-present pipeline minus the flip: composite the same live scene straight into a
