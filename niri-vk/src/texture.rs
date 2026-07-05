@@ -1,7 +1,7 @@
 //! A sampled texture: device-local image uploaded from host RGBA via a staging buffer, plus a
 //! view and sampler. This is the infrastructure both the blur passes and the glyph atlas reuse.
 
-use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -224,11 +224,11 @@ impl Texture {
         let mut type_bits = mem_req.memory_type_bits;
         let mut fd_props = vk::MemoryFdPropertiesKHR::default();
         if let Ok(()) = unsafe {
+            // The query borrows the fd; it does NOT consume it (unlike the import below), so pass a
+            // plain borrow — duping here would leak one fd per call (and this runs per bind).
             ext_fd.get_memory_fd_properties(
                 vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                fd.try_clone_to_owned()
-                    .context("dup dmabuf fd for property query")?
-                    .into_raw_fd(),
+                fd.as_raw_fd(),
                 &mut fd_props,
             )
         } {
