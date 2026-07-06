@@ -1208,8 +1208,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         for closing in self.closing_windows.iter().rev() {
-            let elem = closing.render(ctx.as_gles(), view_rect, scale);
-            push(elem.into());
+            // The closing-window animation renders through a GLES offscreen; skip it on the owned
+            // Vulkan renderer (the window is already unmapped, so it just won't animate out).
+            if let Some(ctx) = ctx.try_as_gles() {
+                let elem = closing.render(ctx, view_rect, scale);
+                push(elem.into());
+            }
         }
 
         let active = self.active_window_id.clone();

@@ -455,7 +455,11 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        let title_texture = self.title_texture(ctx.as_gles().renderer, mapped, scale);
+        // The title texture renders through GLES; on the owned Vulkan renderer there is no title
+        // (and the `Some`-guarded block that draws it below is then skipped).
+        let title_texture = ctx
+            .try_as_gles()
+            .and_then(|ctx| self.title_texture(ctx.renderer, mapped, scale));
         let title_texture = title_texture.map(|texture| {
             let mut size = texture.logical_size();
             size.w = f64::min(size.w, preview_geo.size.w);
@@ -1133,8 +1137,10 @@ impl WindowMruUi {
         };
 
         // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
+        // The offscreen is GLES-only; on the owned Vulkan renderer skip it (falls through to the
+        // backdrop below — alt-tab still shows, just without the fade-out offscreen).
         let mut pushed_offscreen = false;
-        if *output == inner.output && alpha < 1. {
+        if *output == inner.output && alpha < 1. && ctx.try_as_gles().is_some() {
             let mut ctx = ctx.as_gles();
 
             let mut elems = Vec::new();
@@ -1559,10 +1565,12 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        let panel_texture =
+        // The scope panel texture renders through GLES; no panel on the owned Vulkan renderer.
+        let panel_texture = ctx.try_as_gles().and_then(|ctx| {
             self.scope_panel
                 .borrow_mut()
-                .get(ctx.as_gles().renderer, scale, self.wmru.scope);
+                .get(ctx.renderer, scale, self.wmru.scope)
+        });
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 

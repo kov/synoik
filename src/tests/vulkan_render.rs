@@ -43,6 +43,12 @@ fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
 /// message) when there is no Vulkan device — smithay renders the single-pixel buffer as a solid
 /// color, so the window needs no client-buffer import.
 fn window_fixture(color: [u32; 4]) -> Option<Fixture> {
+    window_fixture_settled(color, true)
+}
+
+/// As [`window_fixture`], but `settle` controls whether the map/open animation is completed. Pass
+/// `false` to leave the tile open animation active (the guarded GLES-offscreen render path).
+fn window_fixture_settled(color: [u32; 4], settle: bool) -> Option<Fixture> {
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
@@ -68,9 +74,11 @@ fn window_fixture(color: [u32; 4]) -> Option<Fixture> {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    // Settle any map/open animation so we composite a static scene.
-    f.niri_complete_animations();
-    f.double_roundtrip(id);
+    if settle {
+        // Settle any map/open animation so we composite a static scene.
+        f.niri_complete_animations();
+        f.double_roundtrip(id);
+    }
 
     Some(f)
 }
@@ -552,6 +560,28 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
     );
 
     eprintln!("vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: {red} red (BGRA) window px");
+}
+
+#[test]
+fn vulkan_renders_a_window_mid_open_animation() {
+    // The tile open animation renders through a GLES offscreen; before it was guarded, mapping a
+    // window (which starts that animation) panicked on the owned Vulkan renderer ("this render path
+    // requires a GLES-backed renderer"). Build the scene WITHOUT settling animations so the open
+    // animation is active, and composite — it must degrade (skip the offscreen effect) and render
+    // the window instead of panicking.
+    let Some(mut f) = window_fixture_settled(GREEN, false) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected the window open animation to be active (the guarded as_gles render path)"
+    );
+
+    // Must not panic; reaching pixels proves the open-animation branch degraded to a plain render.
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let green = assert_window_and_background(&pixels, w, h);
+    eprintln!("vulkan_renders_a_window_mid_open_animation: composited {green} window px, no panic");
 }
 
 /// Import a **CPU-filled client dmabuf** (a GBM `Argb8888` LINEAR buffer painted with four known

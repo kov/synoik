@@ -1351,8 +1351,10 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        if let Some(open) = &self.open_animation {
-            let mut ctx = ctx.as_gles();
+        // The open / alpha animations render the tile through a GLES offscreen. On a non-GLES
+        // renderer (the owned Vulkan one) they degrade: skip the offscreen effect and fall through
+        // to the plain render below, so the window still shows (just without the animation).
+        if let (Some(open), Some(mut ctx)) = (&self.open_animation, ctx.try_as_gles()) {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1378,8 +1380,7 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let Some(alpha) = &self.alpha_animation {
-            let mut ctx = ctx.as_gles();
+        } else if let (Some(alpha), Some(mut ctx)) = (&self.alpha_animation, ctx.try_as_gles()) {
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
