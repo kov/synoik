@@ -18,7 +18,7 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
-    Bind, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper,
+    Bind, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
     TextureFilter,
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -72,6 +72,11 @@ pub struct VulkanRenderer {
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
+    /// Reused R8G8B8A8 shadow for the present-blit scanout path, kept across frames so `bind` does
+    /// not allocate a full-screen device image every frame (which exhausts host memory on Venus
+    /// under sustained rendering). Reallocated only when the target size changes; safe to reuse
+    /// because rendering is synchronous (`finish` CPU-waits, so the shadow is never in flight).
+    present_blit_shadow: Option<VkTexture>,
 }
 
 impl VulkanRenderer {
@@ -190,6 +195,7 @@ impl VulkanRenderer {
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
+            present_blit_shadow: None,
         })
     }
 
@@ -760,17 +766,9 @@ impl VulkanRenderer {
         };
 
         // Shadow: an R8G8B8A8 render target (reuses the render pass + every pipeline). Its `format`
-        // is the RGBA byte order the render pass actually writes.
-        let shadow_tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
-        let framebuffer = self.dmabuf_framebuffer(&shadow_tex, w, h)?;
-        let shadow = VkTexture::new_dmabuf_target(
-            self.gpu.clone(),
-            shadow_tex,
-            framebuffer,
-            w,
-            h,
-            Fourcc::Abgr8888,
-        );
+        // is the RGBA byte order the render pass actually writes. Cached across frames — see
+        // `present_blit_shadow_for`.
+        let shadow = self.present_blit_shadow_for(w, h, filter)?;
 
         // Present: the imported dmabuf as a blit destination (`TRANSFER_DST`), reported with the
         // real scanout `fourcc`.
@@ -796,6 +794,38 @@ impl VulkanRenderer {
     }
 
     /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.
+    /// The reused present-blit shadow sized `w`×`h`, (re)allocating it only when the cached one is
+    /// absent or a different size. Returns an `Arc`-clone: the caller's [`VkFramebuffer`] holds one
+    /// reference and the renderer's cache the other, so dropping the frame does not free the image
+    /// — it is reused next frame. This keeps `bind` from allocating a full-screen device image
+    /// every frame (the memory churn that aborts Venus under sustained rendering). Safe because
+    /// rendering is synchronous (`finish` CPU-waits), so the shadow is never read/written by
+    /// two frames at once.
+    fn present_blit_shadow_for(
+        &mut self,
+        w: u32,
+        h: u32,
+        filter: vk::Filter,
+    ) -> Result<VkTexture, VulkanError> {
+        if let Some(shadow) = &self.present_blit_shadow {
+            if shadow.width() == w && shadow.height() == h {
+                return Ok(shadow.clone());
+            }
+        }
+        let shadow_tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
+        let framebuffer = self.dmabuf_framebuffer(&shadow_tex, w, h)?;
+        let shadow = VkTexture::new_dmabuf_target(
+            self.gpu.clone(),
+            shadow_tex,
+            framebuffer,
+            w,
+            h,
+            Fourcc::Abgr8888,
+        );
+        self.present_blit_shadow = Some(shadow.clone());
+        Ok(shadow)
+    }
+
     fn dmabuf_framebuffer(
         &self,
         tex: &NiriTexture,

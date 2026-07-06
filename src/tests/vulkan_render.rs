@@ -562,6 +562,91 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
     eprintln!("vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: {red} red (BGRA) window px");
 }
 
+/// Render several frames through the present-blit path on **one** renderer + one Argb scanout
+/// dmabuf, each a different solid color, and check every frame reads back its own color. This
+/// guards the reused present-blit shadow (kept across frames so `bind` doesn't allocate a
+/// full-screen device image every frame — the churn that aborted Venus live): a stale or
+/// incorrectly-recleared shadow would bleed the previous frame's color. Venus-only (needs GBM).
+#[test]
+fn vulkan_reuses_present_blit_shadow_across_frames() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_reuses_present_blit_shadow_across_frames: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_reuses_present_blit_shadow_across_frames: no render node ({e})"
+            );
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_reuses_present_blit_shadow_across_frames: no GBM ({e})");
+            return;
+        }
+    };
+    const S: i32 = 128;
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Argb8888, &[Modifier::Linear]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_reuses_present_blit_shadow_across_frames: GBM alloc ({e})");
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    let size = Size::<i32, Physical>::from((S, S));
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+    // (render color, expected Argb8888/BGRA readback). Red then blue then green: each frame differs
+    // from the last, so a shadow that wasn't re-cleared would fail on frame 2+.
+    let frames: [(Color32F, [u8; 4]); 3] = [
+        (Color32F::from([1., 0., 0., 1.]), [0, 0, 255, 255]),
+        (Color32F::from([0., 0., 1., 1.]), [255, 0, 0, 255]),
+        (Color32F::from([0., 1., 0., 1.]), [0, 255, 0, 255]),
+    ];
+
+    for (i, (color, want)) in frames.iter().enumerate() {
+        let mut fb = vk.bind(&mut dmabuf).expect("bind");
+        {
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .clear(*color, &[Rectangle::from_size(size)])
+                .expect("clear");
+            frame.finish().expect("finish");
+        }
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Argb8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+        let p = px(&pixels, S, S / 2, S / 2);
+        let near = |a: u8, b: u8| (i16::from(a) - i16::from(b)).abs() < 40;
+        assert!(
+            p.iter().zip(want).all(|(a, b)| near(*a, *b)),
+            "frame {i}: expected BGRA {want:?}, got {p:?} (stale/reused shadow not re-cleared?)"
+        );
+    }
+    eprintln!("vulkan_reuses_present_blit_shadow_across_frames: 3 frames each read back correctly");
+}
+
 #[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders through a GLES offscreen; before it was guarded, mapping a
