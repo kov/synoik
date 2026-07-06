@@ -573,7 +573,7 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
 
     use smithay::backend::allocator::dmabuf::AsDmabuf;
     use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+    use smithay::backend::allocator::{Allocator, Modifier};
 
     let mut vk = match VulkanRenderer::new() {
         Ok(vk) => vk,
@@ -631,7 +631,7 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
             frame
                 .clear(*color, &[Rectangle::from_size(size)])
                 .expect("clear");
-            frame.finish().expect("finish");
+            let _ = frame.finish().expect("finish");
         }
         let mapping = vk
             .copy_framebuffer(&fb, region, Fourcc::Argb8888)
@@ -645,6 +645,84 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
         );
     }
     eprintln!("vulkan_reuses_present_blit_shadow_across_frames: 3 frames each read back correctly");
+}
+
+/// Bind → render → finish the **same** scanout dmabuf a few hundred times, the way the live tty
+/// present loop does every frame against `DrmCompositor`'s handful of cycled GBM buffers. Each
+/// `bind` re-imports the dmabuf as a Vulkan image, which on Venus creates a host-side resource;
+/// re-importing the same buffer every frame churns those host resources and, after some seconds
+/// live, trips the ring `FATAL` bit → `abort()` (no guest OOM). This test reproduces that churn
+/// deterministically: it must complete all iterations without aborting. Venus-only (needs GBM;
+/// lavapipe has no host-import churn to speak of).
+#[test]
+fn vulkan_reimporting_a_scanout_target_every_frame_does_not_abort() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_reimporting_a_scanout_target...: no Vulkan ({e})");
+            return;
+        }
+    };
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("skipping vulkan_reimporting_a_scanout_target...: no render node ({e})");
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_reimporting_a_scanout_target...: no GBM ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    // Full 720p, like a real scanout buffer, so the per-import host cost matches live.
+    let bo = match alloc.create_buffer(
+        u32::from(OUT_W),
+        u32::from(OUT_H),
+        Fourcc::Argb8888,
+        &[Modifier::Linear],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_reimporting_a_scanout_target...: GBM alloc ({e})");
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    let size = Size::<i32, Physical>::from((i32::from(OUT_W), i32::from(OUT_H)));
+    // ~10s of live rendering at 60 Hz. Live crashed at 7–39s, so this comfortably covers it.
+    const FRAMES: usize = 600;
+    for i in 0..FRAMES {
+        let mut fb = vk.bind(&mut dmabuf).expect("bind");
+        {
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .clear(
+                    Color32F::from([0., 0., 1., 1.]),
+                    &[Rectangle::from_size(size)],
+                )
+                .expect("clear");
+            let _ = frame.finish().expect("finish");
+        }
+        if i % 100 == 0 {
+            eprintln!("vulkan_reimporting_a_scanout_target...: frame {i}/{FRAMES} ok");
+        }
+    }
+    eprintln!("vulkan_reimporting_a_scanout_target...: survived {FRAMES} re-imports");
 }
 
 #[test]

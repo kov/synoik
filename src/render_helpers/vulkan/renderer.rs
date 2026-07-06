@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use niri_vk::shaders::{
     RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
-use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::renderer::sync::SyncPoint;
@@ -77,6 +78,15 @@ pub struct VulkanRenderer {
     /// under sustained rendering). Reallocated only when the target size changes; safe to reuse
     /// because rendering is synchronous (`finish` CPU-waits, so the shadow is never in flight).
     present_blit_shadow: Option<VkTexture>,
+    /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
+    /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
+    /// creates a host-side resource, so re-importing per frame churns those resources until the
+    /// guest↔host ring is marked `FATAL` and `vn_ring_submit` aborts (no guest OOM — the guest
+    /// image is freed cleanly each frame). Cache each imported target and reuse it across frames;
+    /// entries whose buffer was freed are evicted. Reuse is safe for the same reason as the
+    /// shadow: `finish` CPU-waits, so no import is in flight when the next frame reuses it.
+    /// Mirrors `GlesRenderer`'s `buffers` bound-dmabuf cache.
+    dmabuf_target_cache: HashMap<WeakDmabuf, VkTexture>,
 }
 
 impl VulkanRenderer {
@@ -196,6 +206,7 @@ impl VulkanRenderer {
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
             present_blit_shadow: None,
+            dmabuf_target_cache: HashMap::new(),
         })
     }
 
@@ -741,21 +752,37 @@ impl VulkanRenderer {
 
         if is_rgba8888(fourcc) {
             // Direct: the dmabuf's byte order matches the render pass, render into it in place.
-            let tex = NiriTexture::import_dmabuf_render_target(
-                &self.gpu,
-                w,
-                h,
-                fd,
-                offset,
-                stride,
-                modifier,
-                IMAGE_VK_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
-                filter,
-            )?;
-            let framebuffer = self.dmabuf_framebuffer(&tex, w, h)?;
-            let buffer =
-                VkTexture::new_dmabuf_target(self.gpu.clone(), tex, framebuffer, w, h, fourcc);
+            // Reuse the cached import for this buffer if we already made one (re-importing every
+            // frame aborts Venus — see `dmabuf_target_cache`).
+            let buffer = match self.cached_dmabuf_target(dmabuf) {
+                Some(buffer) => buffer,
+                None => {
+                    let tex = NiriTexture::import_dmabuf_render_target(
+                        &self.gpu,
+                        w,
+                        h,
+                        fd,
+                        offset,
+                        stride,
+                        modifier,
+                        IMAGE_VK_FORMAT,
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                        filter,
+                    )?;
+                    let framebuffer = self.dmabuf_framebuffer(&tex, w, h)?;
+                    let buffer = VkTexture::new_dmabuf_target(
+                        self.gpu.clone(),
+                        tex,
+                        framebuffer,
+                        w,
+                        h,
+                        fourcc,
+                    );
+                    self.dmabuf_target_cache
+                        .insert(dmabuf.weak(), buffer.clone());
+                    buffer
+                }
+            };
             return Ok(VkFramebuffer::new(buffer));
         }
 
@@ -765,32 +792,49 @@ impl VulkanRenderer {
             return Err(VulkanError::UnsupportedFormat(fourcc));
         };
 
+        // Present: the imported dmabuf as a blit destination (`TRANSFER_DST`), reported with the
+        // real scanout `fourcc`. Cached across frames per buffer — see `dmabuf_target_cache`.
+        let present = match self.cached_dmabuf_target(dmabuf) {
+            Some(present) => present,
+            None => {
+                let present_tex = NiriTexture::import_dmabuf_render_target(
+                    &self.gpu,
+                    w,
+                    h,
+                    fd,
+                    offset,
+                    stride,
+                    modifier,
+                    present_format,
+                    // TRANSFER_DST for the blit; TRANSFER_SRC so the scanout buffer can be read
+                    // back (ExportMem / the scanout test).
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    filter,
+                )?;
+                let present =
+                    VkTexture::new_present_target(self.gpu.clone(), present_tex, w, h, fourcc);
+                self.dmabuf_target_cache
+                    .insert(dmabuf.weak(), present.clone());
+                present
+            }
+        };
+
         // Shadow: an R8G8B8A8 render target (reuses the render pass + every pipeline). Its `format`
         // is the RGBA byte order the render pass actually writes. Cached across frames — see
         // `present_blit_shadow_for`.
         let shadow = self.present_blit_shadow_for(w, h, filter)?;
 
-        // Present: the imported dmabuf as a blit destination (`TRANSFER_DST`), reported with the
-        // real scanout `fourcc`.
-        let present_tex = NiriTexture::import_dmabuf_render_target(
-            &self.gpu,
-            w,
-            h,
-            fd,
-            offset,
-            stride,
-            modifier,
-            present_format,
-            // TRANSFER_DST for the blit; TRANSFER_SRC so the scanout buffer can be read back
-            // (ExportMem / the scanout test).
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                | vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::TRANSFER_SRC,
-            filter,
-        )?;
-        let present = VkTexture::new_present_target(self.gpu.clone(), present_tex, w, h, fourcc);
-
         Ok(VkFramebuffer::new_with_present(shadow, present))
+    }
+
+    /// The cached imported target for `dmabuf` (present-blit `present`, or a direct render target),
+    /// if one is live; also evicts entries whose buffer was freed. `None` means the caller must
+    /// import and then `dmabuf_target_cache.insert` it. See [`Self::dmabuf_target_cache`].
+    fn cached_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Option<VkTexture> {
+        self.dmabuf_target_cache.retain(|weak, _| !weak.is_gone());
+        self.dmabuf_target_cache.get(&dmabuf.weak()).cloned()
     }
 
     /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.
