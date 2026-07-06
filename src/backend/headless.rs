@@ -26,13 +26,22 @@ use crate::utils::{get_monotonic_time, logical_output};
 /// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
 /// the compositor logic itself is driveable over IPC with none. It can be either the default
 /// GLES renderer or — behind `--renderer=vulkan` + the `vulkan` feature — the owned Vulkan one.
+///
+/// The `Vulkan` variant keeps a GLES renderer **alongside** the Vulkan one, mirroring the Tty
+/// backend (where the GLES `gpu_manager` coexists with `vulkan_renderer`). Snapshot-based
+/// animations — the resize crossfade in particular — capture through the GLES renderer even on a
+/// Vulkan session (`with_primary_renderer`), so a Vulkan-only headless backend could never
+/// exercise or test that path.
 #[allow(clippy::large_enum_variant)]
 enum HeadlessRenderer {
     Gles(GlesRenderer),
-    // Held for the Stage-3 live present path; nothing reads it yet (headless `render` is a
-    // no-op), hence the dead_code allow.
     #[cfg(feature = "vulkan")]
-    Vulkan(#[allow(dead_code)] crate::render_helpers::vulkan::VulkanRenderer),
+    Vulkan {
+        gles: GlesRenderer,
+        // Read by the test-only `with_vulkan_renderer`; the live headless `render` is a no-op.
+        #[cfg_attr(not(test), allow(dead_code))]
+        vulkan: crate::render_helpers::vulkan::VulkanRenderer,
+    },
 }
 
 pub struct Headless {
@@ -79,9 +88,20 @@ impl Headless {
             RendererKind::Vulkan => {
                 // The owned Vulkan renderer brings up its own instance/device (no EGL, no
                 // surface) and manages its own pipelines — no resources/shaders init needed.
-                let renderer = crate::render_helpers::vulkan::VulkanRenderer::new()
+                let vulkan = crate::render_helpers::vulkan::VulkanRenderer::new()
                     .context("error creating the Vulkan renderer")?;
-                HeadlessRenderer::Vulkan(renderer)
+                // Also build a GLES renderer, as the Tty backend does, for snapshot capture (the
+                // resize crossfade's neutral buffer is rendered through it even on Vulkan).
+                let mut gles = unsafe {
+                    let display = EGLDisplay::new(EGLSurfacelessDisplay)
+                        .context("error creating EGL display")?;
+                    let context =
+                        EGLContext::new(&display).context("error creating EGL context")?;
+                    GlesRenderer::new(context).context("error creating GLES renderer")?
+                };
+                resources::init(&mut gles);
+                shaders::init(&mut gles);
+                HeadlessRenderer::Vulkan { gles, vulkan }
             }
             #[cfg(not(feature = "vulkan"))]
             RendererKind::Vulkan => {
@@ -158,12 +178,13 @@ impl Headless {
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
     ) -> Option<T> {
-        // This accessor is GLES-typed (its callers are GLES-only edge tasks — screencast setup,
-        // etc.); under the Vulkan renderer it returns None and those tasks degrade cleanly.
+        // This accessor is GLES-typed. On a Vulkan session it hands out the coexisting GLES
+        // renderer (as the Tty backend does), so GLES-only tasks — screencast setup, snapshot
+        // capture — keep working.
         match &mut self.renderer {
             Some(HeadlessRenderer::Gles(renderer)) => Some(f(renderer)),
             #[cfg(feature = "vulkan")]
-            Some(HeadlessRenderer::Vulkan(_)) => None,
+            Some(HeadlessRenderer::Vulkan { gles, .. }) => Some(f(gles)),
             None => None,
         }
     }
@@ -176,7 +197,7 @@ impl Headless {
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
     ) -> Option<T> {
         match &mut self.renderer {
-            Some(HeadlessRenderer::Vulkan(renderer)) => Some(f(renderer)),
+            Some(HeadlessRenderer::Vulkan { vulkan, .. }) => Some(f(vulkan)),
             _ => None,
         }
     }
@@ -228,8 +249,8 @@ mod tests {
     use crate::render_helpers::vulkan::VulkanRenderer;
 
     // `--renderer=vulkan` end-to-end on the headless backend: the stored kind drives
-    // `add_renderer` to build the owned Vulkan renderer, and the GLES-typed primary-renderer
-    // accessor degrades to None (its callers are GLES-only edge tasks). Skips with no device,
+    // `add_renderer` to build the owned Vulkan renderer plus a coexisting GLES renderer (mirroring
+    // Tty), so the GLES-typed primary-renderer accessor still hands one out. Skips with no device,
     // matching the other Vulkan tests.
     #[test]
     fn headless_builds_the_vulkan_renderer() {
@@ -244,8 +265,9 @@ mod tests {
             .expect("headless should build the Vulkan renderer");
         assert!(matches!(
             backend.renderer,
-            Some(HeadlessRenderer::Vulkan(_))
+            Some(HeadlessRenderer::Vulkan { .. })
         ));
-        assert!(backend.with_primary_renderer(|_| ()).is_none());
+        // The coexisting GLES renderer is available for snapshot capture.
+        assert!(backend.with_primary_renderer(|_| ()).is_some());
     }
 }

@@ -725,6 +725,88 @@ fn vulkan_reimporting_a_scanout_target_every_frame_does_not_abort() {
     eprintln!("vulkan_reimporting_a_scanout_target...: survived {FRAMES} re-imports");
 }
 
+/// A resize animation on a Vulkan session must draw the cross-fade (`render_resize`), not the red
+/// `SolidColorBuffer` placeholder. Reproduces the live "the window becomes a red rect while
+/// maximizing/restoring" bug: map a window, issue a niri-driven (animated) resize, commit the new
+/// size, and composite mid-animation — the frame must show window content with no pure-red fill.
+///
+/// This exercises the full dual-renderer path the Tty backend uses (snapshot captured through the
+/// coexisting GLES renderer, composited through Vulkan), which the headless backend now mirrors.
+#[test]
+fn vulkan_resize_animation_is_not_a_red_rect() {
+    use niri_config::animations::{Curve, EasingParams, Kind};
+    use niri_ipc::SizeChange;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_resize_animation_is_not_a_red_rect: no Vulkan device");
+        return;
+    }
+
+    const LINEAR: Kind = Kind::Easing(EasingParams {
+        duration_ms: 1000,
+        curve: Curve::Linear,
+    });
+    let mut config = Config::default();
+    config.animations.window_resize.anim.kind = LINEAR;
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // A real shm-textured buffer (not single-pixel) so the snapshot path can bake it.
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    // Issue a niri-driven resize (this animates, like a keybind maximize).
+    f.niri().layout.set_column_width(SizeChange::SetFixed(900));
+    f.double_roundtrip(id);
+
+    // The client commits the new size, which starts the resize animation.
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(900, WIN as i32, 0, 255, 0, 255);
+    window.set_size(900, WIN);
+    window.ack_last_and_commit();
+    f.roundtrip(id);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected an ongoing resize animation to composite"
+    );
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_resize_animation_is_not_a_red_rect: {green} green px, {red} red px");
+    assert!(green > 0, "no window content in the resize frame");
+    assert!(
+        red < 100,
+        "resize rendered the red placeholder ({red} red px) instead of the cross-fade"
+    );
+}
+
 #[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders through a GLES offscreen; before it was guarded, mapping a

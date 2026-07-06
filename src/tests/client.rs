@@ -36,6 +36,8 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
+use wayland_client::protocol::wl_shm::{self, WlShm};
+use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -60,6 +62,7 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
+    pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
     pub seat: Option<WlSeat>,
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
@@ -75,6 +78,7 @@ pub struct State {
 pub struct Window {
     pub qh: QueueHandle<State>,
     pub spbm: WpSinglePixelBufferManagerV1,
+    pub shm: Option<WlShm>,
 
     pub surface: WlSurface,
     pub xdg_surface: XdgSurface,
@@ -193,6 +197,7 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             spbm: None,
+            shm: None,
             viewporter: None,
             seat: None,
             shortcuts_inhibit_manager: None,
@@ -298,6 +303,7 @@ impl State {
         let window = Window {
             qh: self.qh.clone(),
             spbm: self.spbm.clone().unwrap(),
+            shm: self.shm.clone(),
 
             surface,
             xdg_surface,
@@ -399,6 +405,36 @@ impl Window {
     pub fn attach_solid_buffer(&self, r: u32, g: u32, b: u32, a: u32) {
         let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
+    }
+
+    /// Attach an opaque `w`×`h` **shm** buffer filled with a solid RGBA color. Unlike a
+    /// single-pixel buffer, this carries a real texture, so the compositor's snapshot path
+    /// (`render_snapshot_from_surface_tree`) can bake it — required to exercise resize/close
+    /// animations. Uses `wl_shm` `Argb8888` (0xAARRGGBB little-endian ⇒ bytes `[B, G, R, A]`).
+    pub fn attach_shm_buffer(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
+        use std::io::Write as _;
+        use std::os::fd::{AsFd, OwnedFd};
+
+        use smithay::reexports::rustix::fs::{ftruncate, memfd_create, MemfdFlags};
+
+        let shm = self.shm.as_ref().expect("wl_shm not bound");
+        let stride = w * 4;
+        let size = (stride * h) as usize;
+
+        let fd = memfd_create("niri-test-shm", MemfdFlags::CLOEXEC).expect("memfd_create");
+        ftruncate(&fd, size as u64).expect("ftruncate");
+
+        let px = [b, g, r, a];
+        let data: Vec<u8> = px.iter().copied().cycle().take(size).collect();
+        let mut file = std::fs::File::from(fd);
+        file.write_all(&data).expect("write shm buffer");
+        let fd: OwnedFd = file.into();
+
+        let pool = shm.create_pool(fd.as_fd(), size as i32, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, w, h);
+        pool.destroy();
     }
 
     pub fn attach_null(&self) {
@@ -575,6 +611,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlShm::interface().name {
+                    let version = min(version, WlShm::interface().version);
+                    state.shm = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
@@ -803,6 +842,31 @@ impl Dispatch<WlBuffer, ()> for State {
             wl_buffer::Event::Release => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<WlShm, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShm,
+        _event: <WlShm as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // Only the `format` advertisement; we hardcode Argb8888, so ignore it.
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlShmPool,
+        _event: <WlShmPool as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }
 
