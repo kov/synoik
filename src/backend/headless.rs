@@ -50,6 +50,10 @@ impl Headless {
         }
     }
 
+    pub fn using_vulkan(&self) -> bool {
+        self.kind == RendererKind::Vulkan
+    }
+
     pub fn init(&mut self, _niri: &mut Niri) {}
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {

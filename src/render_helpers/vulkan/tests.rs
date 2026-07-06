@@ -26,6 +26,8 @@ use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
+use crate::render_helpers::render_to_vec;
+use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -1118,6 +1120,125 @@ fn vulkan_resize_crossfades() {
         close_px(px(&pixels, 2, 2), clear_u8(), 8),
         "corner should be clipped to the background, got {:?}",
         px(&pixels, 2, 2),
+    );
+}
+
+/// The live `ResizeRenderElement::new_vulkan` constructor: it lowers the resize geometry to a
+/// `ResizePush` and draws through `render_resize` (the path `tile.rs` takes on a Vulkan session,
+/// replacing the red placeholder). A spatially-distinct 4-quadrant "prev" with identity geometry
+/// must be reproduced **1:1 at progress 0** — proving the affine-diagonal transforms carry no flip
+/// or axis-swap — a solid "next" must fully take over at progress 1, and 0.5 must blend them.
+#[test]
+fn vulkan_new_vulkan_resize_element_crossfades() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_new_vulkan_resize_element_crossfades: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    // 4-quadrant "prev": TL red, TR green, BL blue, BR white (tight `[R,G,B,A]`).
+    let mut prev = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let c = match (x < W / 2, y < H / 2) {
+                (true, true) => [255u8, 0, 0, 255],
+                (false, true) => [0, 255, 0, 255],
+                (true, false) => [0, 0, 255, 255],
+                (false, false) => [255, 255, 255, 255],
+            };
+            prev.extend_from_slice(&c);
+        }
+    }
+    let next = solid_texels([0, 0, 255, 255]);
+
+    let full_logical = Rectangle::<f64, Logical>::from_size(Size::from((W as f64, H as f64)));
+    let full_phys = Rectangle::<i32, Physical>::from_size(Size::from((W, H)));
+    let sz = Size::<f64, Logical>::from((W as f64, H as f64));
+
+    let render = |vk: &mut VulkanRenderer, progress: f32| -> Vec<u8> {
+        let tex_prev = vk
+            .import_memory(&prev, Fourcc::Abgr8888, Size::from((W, H)), false)
+            .expect("import prev");
+        let tex_next = vk
+            .import_memory(&next, Fourcc::Abgr8888, Size::from((W, H)), false)
+            .expect("import next");
+        let elem = ResizeRenderElement::new_vulkan(
+            full_logical,
+            Scale::from(1.0),
+            (tex_prev, full_phys),
+            sz,
+            (tex_next, full_phys),
+            sz,
+            progress,
+            CornerRadius::default(),
+            false,
+            1.0,
+        );
+        render_to_vec(
+            vk,
+            Size::from((W, H)),
+            Scale::from(1.0),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            [elem].into_iter(),
+        )
+        .expect("render resize element")
+    };
+
+    let near = |p: [u8; 4], want: [u8; 4]| {
+        p.iter()
+            .zip(want)
+            .all(|(a, b)| (i16::from(*a) - i16::from(b)).abs() < 24)
+    };
+    let (qx, qy) = (W / 4, H / 4);
+
+    // progress 0 ⇒ pure prev, reproduced 1:1: the four quadrant colors in their correct corners.
+    let p0 = render(&mut vk, 0.0);
+    assert!(
+        near(px(&p0, qx, qy), [255, 0, 0, 255]),
+        "TL should be red, got {:?}",
+        px(&p0, qx, qy)
+    );
+    assert!(
+        near(px(&p0, 3 * qx, qy), [0, 255, 0, 255]),
+        "TR should be green, got {:?}",
+        px(&p0, 3 * qx, qy)
+    );
+    assert!(
+        near(px(&p0, qx, 3 * qy), [0, 0, 255, 255]),
+        "BL should be blue, got {:?}",
+        px(&p0, qx, 3 * qy)
+    );
+    assert!(
+        near(px(&p0, 3 * qx, 3 * qy), [255, 255, 255, 255]),
+        "BR should be white, got {:?}",
+        px(&p0, 3 * qx, 3 * qy)
+    );
+
+    // progress 1 ⇒ pure next (solid blue) everywhere.
+    let p1 = render(&mut vk, 1.0);
+    assert!(
+        near(px(&p1, qx, qy), [0, 0, 255, 255]),
+        "at progress 1 TL should be next=blue, got {:?}",
+        px(&p1, qx, qy)
+    );
+    assert!(
+        near(px(&p1, 3 * qx, 3 * qy), [0, 0, 255, 255]),
+        "at progress 1 BR should be next=blue, got {:?}",
+        px(&p1, 3 * qx, 3 * qy)
+    );
+
+    // progress 0.5 ⇒ blend. TL is prev-red + next-blue ⇒ purple: R≈B, little green.
+    let ph = render(&mut vk, 0.5);
+    let tl = px(&ph, qx, qy);
+    assert!(tl[1] < 40, "TL blend should have little green, got {tl:?}");
+    assert!(
+        tl[0] > 60 && tl[2] > 60,
+        "TL blend should mix red and blue, got {tl:?}"
     );
 }
 

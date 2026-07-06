@@ -92,6 +92,22 @@ impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
     }
 }
 
+#[cfg(feature = "vulkan")]
+impl<'a, R: crate::render_helpers::renderer::AsVulkanRenderer> RenderCtx<'a, R> {
+    /// Reborrows this context as a concrete `VulkanRenderer` context, if the renderer is the owned
+    /// Vulkan renderer. Returns `None` otherwise, so Vulkan-only render paths (e.g. the resize
+    /// crossfade) can specialize and fall back elsewhere.
+    pub fn try_as_vulkan<'b>(
+        &'b mut self,
+    ) -> Option<RenderCtx<'b, crate::render_helpers::vulkan::VulkanRenderer>> {
+        Some(RenderCtx {
+            renderer: self.renderer.try_as_vulkan_renderer()?,
+            target: self.target,
+            xray: self.xray,
+        })
+    }
+}
+
 /// What we're rendering for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {

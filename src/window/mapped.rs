@@ -451,6 +451,7 @@ impl Mapped {
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),
             blocked_out_texture: Default::default(),
+            neutral: Default::default(),
         }
     }
 
@@ -467,8 +468,20 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
-        self.animation_snapshot = Some(self.render_snapshot(renderer));
+    pub fn store_animation_snapshot(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        scale: Scale<f64>,
+        capture_neutral: bool,
+    ) {
+        let snapshot = self.render_snapshot(renderer);
+        // On a Vulkan session the resize crossfade has no GLES renderer at render time, so capture
+        // a renderer-neutral CPU copy of the pre-resize contents now, to upload to a VkTexture
+        // later.
+        if capture_neutral {
+            snapshot.capture_neutral(renderer, scale);
+        }
+        self.animation_snapshot = Some(snapshot);
     }
 
     pub fn take_pending_transaction(&mut self, commit_serial: Serial) -> Option<Transaction> {

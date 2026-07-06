@@ -13,6 +13,18 @@ pub struct MemoryBuffer {
     transform: Transform,
 }
 
+impl std::fmt::Debug for MemoryBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryBuffer")
+            .field("len", &self.data.len())
+            .field("format", &self.format)
+            .field("size", &self.size)
+            .field("scale", &self.scale)
+            .field("transform", &self.transform)
+            .finish()
+    }
+}
+
 impl MemoryBuffer {
     pub fn new(
         data: impl Into<Arc<[u8]>>,

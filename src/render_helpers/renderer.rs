@@ -13,6 +13,28 @@ use crate::backend::tty::{TtyFrame, TtyRenderer};
 /// [`AsGlesRenderer::try_as_gles_renderer`] (which returns `None` for a non-GLES renderer), so a
 /// renderer that isn't backed by GLES — the owned Vulkan renderer — can implement this core while
 /// GLES-specific features degrade gracefully.
+#[cfg(feature = "vulkan")]
+pub trait NiriRenderer:
+    ImportAll
+    + ImportMem
+    + ExportMem
+    + Bind<Dmabuf>
+    + Renderer<TextureId = Self::NiriTextureId, Error = Self::NiriError>
+    + AsGlesRenderer
+    + AsVulkanRenderer
+{
+    // Associated types to work around the instability of associated type bounds.
+    type NiriTextureId: Texture + Clone + Send + 'static;
+    // The `From<GlesError>` bound is retained so generic code can still propagate GLES errors; a
+    // non-GLES renderer satisfies it with a trivial conversion.
+    type NiriError: std::error::Error
+        + Send
+        + Sync
+        + From<<GlesRenderer as RendererSuper>::Error>
+        + 'static;
+}
+
+#[cfg(not(feature = "vulkan"))]
 pub trait NiriRenderer:
     ImportAll
     + ImportMem
@@ -32,6 +54,19 @@ pub trait NiriRenderer:
         + 'static;
 }
 
+#[cfg(feature = "vulkan")]
+impl<R> NiriRenderer for R
+where
+    R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + AsGlesRenderer + AsVulkanRenderer,
+    R::TextureId: Texture + Clone + Send + 'static,
+    R::Error:
+        std::error::Error + Send + Sync + From<<GlesRenderer as RendererSuper>::Error> + 'static,
+{
+    type NiriTextureId = R::TextureId;
+    type NiriError = R::Error;
+}
+
+#[cfg(not(feature = "vulkan"))]
 impl<R> NiriRenderer for R
 where
     R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + AsGlesRenderer,
@@ -71,6 +106,44 @@ impl AsGlesRenderer for GlesRenderer {
 impl AsGlesRenderer for TtyRenderer<'_> {
     fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
         Some(self.as_mut())
+    }
+}
+
+/// Fallible access to the owned `VulkanRenderer` — the dual of [`AsGlesRenderer`] for Vulkan-only
+/// render paths (e.g. the resize crossfade, which builds `VkTexture`s and draws via
+/// `VulkanFrame::render_resize`). Only the `VulkanRenderer` returns `Some`; GLES-backed renderers
+/// return `None`, so a generic render path can specialize to Vulkan and degrade elsewhere.
+#[cfg(feature = "vulkan")]
+pub trait AsVulkanRenderer {
+    fn try_as_vulkan_renderer(
+        &mut self,
+    ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer>;
+}
+
+#[cfg(feature = "vulkan")]
+impl AsVulkanRenderer for GlesRenderer {
+    fn try_as_vulkan_renderer(
+        &mut self,
+    ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer> {
+        None
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl AsVulkanRenderer for TtyRenderer<'_> {
+    fn try_as_vulkan_renderer(
+        &mut self,
+    ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer> {
+        None
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl AsVulkanRenderer for crate::render_helpers::vulkan::VulkanRenderer {
+    fn try_as_vulkan_renderer(
+        &mut self,
+    ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer> {
+        Some(self)
     }
 }
 

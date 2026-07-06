@@ -121,7 +121,7 @@ pub struct PostprocessPush {
 /// `[scale.xy, translate.xy]` (the GLES shader's two unused matrices and `niri_progress` are
 /// dropped). `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430). 112 bytes.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct ResizePush {
     pub origin: [f32; 2],
     pub size: [f32; 2],

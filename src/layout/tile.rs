@@ -28,6 +28,8 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -154,6 +156,17 @@ struct ResizeAnimation {
     size_from: Size<f64, Logical>,
     snapshot: LayoutElementRenderSnapshot,
     offscreen: OffscreenBuffer,
+    /// The "current window" snapshot rendered through the owned Vulkan renderer (the GLES
+    /// `offscreen` above has an incompatible texture type). Reused across frames — its texture is
+    /// re-rendered in place, never reallocated (matters on Venus, where per-frame allocation
+    /// exhausts host blobs).
+    #[cfg(feature = "vulkan")]
+    offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
+    /// The pre-resize snapshot uploaded to a `VkTexture`, cached for the whole animation (the
+    /// source `MemoryBuffer` in `snapshot.neutral` never changes), so it is imported once, not
+    /// per frame.
+    #[cfg(feature = "vulkan")]
+    prev_vk: std::cell::RefCell<Option<crate::render_helpers::vulkan::VkTexture>>,
     tile_size_from: Size<f64, Logical>,
     // If the resize involved the fullscreen state at some point, this is the progress toward the
     // fullscreen state. Used for things like fullscreen backdrop alpha.
@@ -386,6 +399,13 @@ impl<W: LayoutElement> Tile<W> {
                     size_from,
                     snapshot: animate_from,
                     offscreen,
+                    // Fresh per resize-start (persists across the animation's frames, reused
+                    // there); prev_vk starts empty since the pre-resize
+                    // snapshot just changed.
+                    #[cfg(feature = "vulkan")]
+                    offscreen_vk: OffscreenBuffer::default(),
+                    #[cfg(feature = "vulkan")]
+                    prev_vk: std::cell::RefCell::new(None),
                     tile_size_from,
                     fullscreen_progress,
                     expanded_progress,
@@ -1161,6 +1181,83 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
 
+            // Owned Vulkan renderer: the GLES `has_shader` gate above is false (Shaders live in the
+            // GLES context), so drive the same crossfade through `render_resize` instead of the red
+            // fallback. `tex_prev` comes from the neutral snapshot captured at resize-start
+            // (uploaded once); `tex_next` is the current window rendered into the
+            // reused Vulkan offscreen.
+            #[cfg(feature = "vulkan")]
+            if !pushed_resize {
+                if let Some(mut vctx) = ctx.try_as_vulkan() {
+                    if let Some((prev_mem, prev_geo)) =
+                        resize.snapshot.neutral.get().and_then(|o| o.as_ref())
+                    {
+                        if resize.prev_vk.borrow().is_none() {
+                            match TextureBuffer::from_memory_buffer(vctx.renderer, prev_mem) {
+                                Ok(tb) => {
+                                    *resize.prev_vk.borrow_mut() = Some(tb.texture().clone());
+                                }
+                                Err(err) => {
+                                    warn!("error uploading resize snapshot to Vulkan: {err:?}");
+                                }
+                            }
+                        }
+                        let prev_tex = resize.prev_vk.borrow().clone();
+
+                        if let Some(prev_tex) = prev_tex {
+                            let mut window_elements = Vec::new();
+                            self.window.render_normal(
+                                vctx.r(),
+                                Point::from((0., 0.)),
+                                scale,
+                                1.,
+                                &mut |elem| window_elements.push(elem),
+                            );
+
+                            let current = resize
+                                .offscreen_vk
+                                .render(vctx.renderer, scale, &window_elements)
+                                .map_err(|err| {
+                                    warn!("error rendering window to Vulkan texture: {err:?}")
+                                })
+                                .ok();
+
+                            let clip_to_geometry =
+                                if vctx.target.should_block_out(resize.snapshot.block_out_from)
+                                    && vctx.target.should_block_out(rules.block_out_from)
+                                {
+                                    true
+                                } else {
+                                    clip_to_geometry
+                                };
+
+                            if let Some((elem_current, _sync_point, mut data)) = current {
+                                let texture_current = elem_current.texture().clone();
+                                let texture_current_geo = elem_current.geometry(scale);
+
+                                let elem = ResizeRenderElement::new_vulkan(
+                                    area,
+                                    scale,
+                                    (prev_tex, *prev_geo),
+                                    resize.snapshot.size,
+                                    (texture_current, texture_current_geo),
+                                    window_size,
+                                    resize.anim.clamped_value().clamp(0., 1.) as f32,
+                                    radius,
+                                    clip_to_geometry,
+                                    win_alpha,
+                                );
+
+                                data.id = elem.id().clone();
+                                self.window.set_offscreen_data(Some(data));
+                                push(elem.into());
+                                pushed_resize = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             if !pushed_resize {
                 let fallback_buffer = SolidColorBuffer::new(area.size, [1., 0., 0., 1.]);
                 let elem = SolidColorRenderElement::from_buffer(
@@ -1537,6 +1634,7 @@ impl<W: LayoutElement> Tile<W> {
             texture: Default::default(),
             texture_with_blocked_out_bg: Default::default(),
             blocked_out_texture: Default::default(),
+            neutral: Default::default(),
         }
     }
 

@@ -123,6 +123,7 @@ impl TestWindow {
                         texture: OnceCell::new(),
                         texture_with_blocked_out_bg: Default::default(),
                         blocked_out_texture: OnceCell::new(),
+                        neutral: OnceCell::new(),
                     }));
                 }
 

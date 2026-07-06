@@ -544,6 +544,10 @@ impl Tty {
     /// Whether this backend composites and scans out through the owned Vulkan renderer (rather than
     /// the GLES `gpu_manager`). Always `false` unless built with the `vulkan` feature and started
     /// with `--renderer=vulkan`.
+    pub fn using_vulkan(&self) -> bool {
+        self.use_vulkan()
+    }
+
     fn use_vulkan(&self) -> bool {
         #[cfg(feature = "vulkan")]
         {

@@ -17,7 +17,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
-use smithay::utils::{Logical, Rectangle, Serial};
+use smithay::utils::{Logical, Rectangle, Scale, Serial};
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
     HookId, SurfaceAttributes,
@@ -1556,8 +1556,14 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
+                let scale = Scale::from(
+                    output
+                        .map(|o| o.current_scale().fractional_scale())
+                        .unwrap_or(1.),
+                );
+                let capture_neutral = state.backend.using_vulkan();
                 state.backend.with_primary_renderer(|renderer| {
-                    mapped.store_animation_snapshot(renderer);
+                    mapped.store_animation_snapshot(renderer, scale, capture_neutral);
                 });
             }
 

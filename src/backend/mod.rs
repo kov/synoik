@@ -97,6 +97,16 @@ impl Backend {
         }
     }
 
+    /// Whether this backend composites through the owned Vulkan renderer (rather than GLES).
+    /// Governs Vulkan-only capture paths such as the resize crossfade's neutral snapshot buffer.
+    pub fn using_vulkan(&self) -> bool {
+        match self {
+            Backend::Tty(tty) => tty.using_vulkan(),
+            Backend::Winit(_) => false,
+            Backend::Headless(headless) => headless.using_vulkan(),
+        }
+    }
+
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
