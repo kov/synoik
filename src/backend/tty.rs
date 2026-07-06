@@ -1969,6 +1969,9 @@ impl Tty {
                 surface,
                 &config,
                 FrameFlags::empty(),
+                // Force a full redraw each frame — the Vulkan renderer doesn't preserve buffer-age
+                // content, so partial-damage rendering would leave settled regions black.
+                true,
                 target_presentation_time,
             );
         }
@@ -2024,6 +2027,8 @@ impl Tty {
             surface,
             &config,
             flags,
+            // GLES preserves buffer-age content, so keep DrmCompositor's partial-damage rendering.
+            false,
             target_presentation_time,
         )
     }
@@ -3022,6 +3027,7 @@ fn render_surface_with<R>(
     surface: &mut Surface,
     config: &Rc<RefCell<Config>>,
     flags: FrameFlags,
+    force_full_damage: bool,
     target_presentation_time: Duration,
 ) -> RenderResult
 where
@@ -3046,6 +3052,15 @@ where
 
     // Hand them over to the DRM.
     let drm_compositor = &mut surface.compositor;
+    // The owned Vulkan renderer's render pass discards the target's prior contents (loadOp
+    // DONT_CARE) and does not preserve buffer-age content, so DrmCompositor's partial-damage
+    // rendering would leave undamaged regions (desktop background, window borders) black once the
+    // scene settles. Reset the buffer ages so every frame is a full redraw.
+    // FIXME: implement damage-preserving rendering (render pass LOAD + a dmabuf→shadow pre-load for
+    // the present-blit path) and drop this full-redraw-every-frame fallback.
+    if force_full_damage {
+        drm_compositor.reset_buffer_ages();
+    }
     match drm_compositor.render_frame::<_, _>(renderer, &elements, [0.; 4], flags) {
         Ok(res) => {
             let needs_sync = res.needs_sync()
