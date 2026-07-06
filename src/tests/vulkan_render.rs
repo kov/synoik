@@ -20,6 +20,7 @@ use crate::backend::RendererKind;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+use crate::utils::{output_size, to_physical_precise_round};
 
 const OUT_W: u16 = 1280;
 const OUT_H: u16 = 720;
@@ -723,6 +724,49 @@ fn vulkan_reimporting_a_scanout_target_every_frame_does_not_abort() {
         }
     }
     eprintln!("vulkan_reimporting_a_scanout_target...: survived {FRAMES} re-imports");
+}
+
+/// The GNOME top panel renders on the owned Vulkan renderer. It used to `try_as_gles_renderer()?`
+/// and return `None` on Vulkan (a blank bar); now it uploads its CPU-rendered bar through the
+/// active renderer's `ImportMem`. Assert `render` yields an element and that compositing it
+/// produces the opaque bar (alpha 255), rather than nothing.
+#[test]
+fn vulkan_renders_the_top_panel() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let width = to_physical_precise_round(scale.x, output_size(&output).w);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+
+    let state = f.niri_state();
+    let opaque = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elem = state
+                .niri
+                .panel
+                .render(vk, &output)
+                .expect("panel produced no element on Vulkan (still blank)");
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((width, bar_h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                [elem].into_iter(),
+            )
+            .expect("render panel");
+            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        opaque > 0,
+        "the panel bar did not composite any opaque pixels on Vulkan"
+    );
 }
 
 /// A resize animation on a Vulkan session must draw the cross-fade (`render_resize`), not the red

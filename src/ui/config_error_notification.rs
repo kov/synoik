@@ -9,13 +9,12 @@ use ordered_float::NotNan;
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::FontDescription;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Point, Transform};
 
 use crate::animation::{Animation, Clock};
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -26,7 +25,7 @@ const BORDER: i32 = 4;
 
 pub struct ConfigErrorNotification {
     state: State,
-    buffers: RefCell<HashMap<NotNan<f64>, Option<TextureBuffer<GlesTexture>>>>,
+    buffers: RefCell<HashMap<NotNan<f64>, Option<MemoryBuffer>>>,
 
     // If set, this is a "Created config at {path}" notification. If unset, this is a config error
     // notification.
@@ -134,7 +133,7 @@ impl ConfigErrorNotification {
         &self,
         renderer: &mut R,
         output: &Output,
-    ) -> Option<PrimaryGpuTextureRenderElement> {
+    ) -> Option<TextureRenderElement<R::TextureId>> {
         if matches!(self.state, State::Hidden) {
             return None;
         }
@@ -147,13 +146,11 @@ impl ConfigErrorNotification {
         let buffer = buffers
             .entry(NotNan::new(scale).unwrap())
             .or_insert_with(move || {
-                // CPU-rendered text uploaded to a GlesTexture; degrade to no notification on the
-                // owned Vulkan renderer rather than panicking.
-                renderer
-                    .try_as_gles_renderer()
-                    .and_then(|r| render(r, scale, path).ok())
+                // CPU-rendered into a renderer-neutral buffer, uploaded through the active renderer
+                // below so it draws on GLES and Vulkan alike.
+                render(scale, path).ok()
             });
-        let buffer = buffer.clone()?;
+        let buffer = buffer.as_ref()?;
 
         let size = buffer.logical_size();
         let y_range = size.h + f64::from(PADDING) * 2.;
@@ -168,6 +165,9 @@ impl ConfigErrorNotification {
         let location = Point::from((x, y));
         let location = location.to_physical_precise_round(scale).to_logical(scale);
 
+        let buffer: TextureBuffer<R::TextureId> =
+            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
+
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
             location,
@@ -176,15 +176,11 @@ impl ConfigErrorNotification {
             None,
             Kind::Unspecified,
         );
-        Some(PrimaryGpuTextureRenderElement(elem))
+        Some(elem)
     }
 }
 
-fn render(
-    renderer: &mut GlesRenderer,
-    scale: f64,
-    created_path: Option<&Path>,
-) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+fn render(scale: f64, created_path: Option<&Path>) -> anyhow::Result<MemoryBuffer> {
     let _span = tracy_client::span!("config_error_notification::render");
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);
@@ -239,16 +235,13 @@ fn render(
     drop(cr);
 
     let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
+    let buffer = MemoryBuffer::new(
+        data.to_vec(),
         Fourcc::Argb8888,
         (width, height),
-        false,
         scale,
         Transform::Normal,
-        Vec::new(),
-    )?;
+    );
 
     Ok(buffer)
 }

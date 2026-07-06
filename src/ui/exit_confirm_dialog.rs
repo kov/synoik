@@ -16,7 +16,6 @@ use smithay::utils::{Point, Transform};
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -37,8 +36,8 @@ pub struct ExitConfirmDialog {
 }
 
 niri_render_elements! {
-    ExitConfirmDialogRenderElement => {
-        Texture = RescaleRenderElement<PrimaryGpuTextureRenderElement>,
+    ExitConfirmDialogRenderElement<R> => {
+        Texture = RescaleRenderElement<TextureRenderElement<R::TextureId>>,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -150,7 +149,7 @@ impl ExitConfirmDialog {
         &self,
         renderer: &mut R,
         output: &Output,
-        push: &mut dyn FnMut(ExitConfirmDialogRenderElement),
+        push: &mut dyn FnMut(ExitConfirmDialogRenderElement<R>),
     ) {
         let (value, clamped_value) = match &self.state {
             State::Hidden => return,
@@ -177,12 +176,9 @@ impl ExitConfirmDialog {
         let buffer = buffer.as_ref().unwrap_or(&fallback);
 
         let size = buffer.logical_size();
-        // The dialog texture uploads to a GlesTexture; skip drawing it on the owned Vulkan
-        // renderer.
-        let Some(gles) = renderer.try_as_gles_renderer() else {
-            return;
-        };
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(gles, buffer) else {
+        // Upload through the active renderer's `ImportMem`, so the dialog draws on GLES and the
+        // owned Vulkan renderer alike.
+        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer, buffer) else {
             return;
         };
 
@@ -199,7 +195,6 @@ impl ExitConfirmDialog {
             None,
             Kind::Unspecified,
         );
-        let elem = PrimaryGpuTextureRenderElement(elem);
         let elem = RescaleRenderElement::from_element(
             elem,
             (location + size.downscale(2.)).to_physical_precise_round(scale),

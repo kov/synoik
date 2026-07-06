@@ -22,12 +22,11 @@ use ordered_float::NotNan;
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::FontDescription;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::Output;
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -56,7 +55,7 @@ pub enum PanelItem {
 /// Cached bar textures keyed by (fractional scale, physical width). The panel
 /// spans the output width, so width is part of the key (unlike the fixed-size
 /// overlays, which key by scale alone).
-type ScaledBuffers = HashMap<(NotNan<f64>, i32), Option<TextureBuffer<GlesTexture>>>;
+type ScaledBuffers = HashMap<(NotNan<f64>, i32), Option<MemoryBuffer>>;
 
 pub struct Panel {
     /// Current clock string, e.g. "14:30". Recomputed on the minute tick.
@@ -139,7 +138,7 @@ impl Panel {
         &self,
         renderer: &mut R,
         output: &Output,
-    ) -> Option<PrimaryGpuTextureRenderElement> {
+    ) -> Option<TextureRenderElement<R::TextureId>> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
         let width_px = to_physical_precise_round(scale, width);
@@ -147,26 +146,22 @@ impl Panel {
 
         let mut buffers = self.buffers.borrow_mut();
         let buffer = buffers.entry(key).or_insert_with(|| {
-            // The bar renders CPU-side and uploads to a GlesTexture; degrade to no bar on the owned
-            // Vulkan renderer rather than panicking.
-            let gles = renderer.try_as_gles_renderer()?;
-            // Degrade a paint panic to a missing bar rather than aborting scanout.
+            // The bar renders CPU-side into a renderer-neutral buffer; degrade a paint panic to a
+            // missing bar rather than aborting scanout.
             std::panic::catch_unwind(AssertUnwindSafe(|| {
-                render_bar(
-                    gles,
-                    scale,
-                    width_px,
-                    &self.clock_text,
-                    self.activities_checked,
-                )
-                .ok()
+                render_bar(scale, width_px, &self.clock_text, self.activities_checked).ok()
             }))
             .unwrap_or_else(|_| {
                 tracing::error!("panic while painting the panel");
                 None
             })
         });
-        let buffer = buffer.clone()?;
+        let buffer = buffer.as_ref()?;
+
+        // Upload the CPU-rendered bar through the active renderer's `ImportMem`, so it draws on any
+        // renderer (including the owned Vulkan one) rather than only GLES.
+        let buffer: TextureBuffer<R::TextureId> =
+            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
@@ -176,7 +171,7 @@ impl Panel {
             None,
             Kind::Unspecified,
         );
-        Some(PrimaryGpuTextureRenderElement(elem))
+        Some(elem)
     }
 }
 
@@ -240,29 +235,26 @@ fn make_font(scale: f64) -> FontDescription {
 /// Paint the whole bar into a texture: opaque black background, left Activities
 /// button, centered clock.
 fn render_bar(
-    renderer: &mut GlesRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
     checked: bool,
-) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+) -> anyhow::Result<MemoryBuffer> {
     let _span = tracy_client::span!("panel::render_bar");
 
     let width_px = width_px.max(1);
     let height_px: i32 = to_physical_precise_round(scale, PANEL_HEIGHT);
-    let surface = draw_bar(scale, width_px, height_px.max(1), clock, checked)?;
+    let height_px = height_px.max(1);
+    let surface = draw_bar(scale, width_px, height_px, clock, checked)?;
 
     let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
+    let buffer = MemoryBuffer::new(
+        data.to_vec(),
         Fourcc::Argb8888,
-        (width_px, height_px.max(1)),
-        false,
+        (width_px, height_px),
         scale,
         Transform::Normal,
-        Vec::new(),
-    )?;
+    );
 
     Ok(buffer)
 }

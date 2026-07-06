@@ -9,13 +9,12 @@ use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Scale, Transform};
 
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -35,7 +34,7 @@ pub struct HotkeyOverlay {
 }
 
 pub struct RenderedOverlay {
-    buffer: Option<TextureBuffer<GlesTexture>>,
+    buffer: Option<MemoryBuffer>,
 }
 
 impl HotkeyOverlay {
@@ -79,7 +78,7 @@ impl HotkeyOverlay {
         &self,
         renderer: &mut R,
         output: &Output,
-    ) -> Option<PrimaryGpuTextureRenderElement> {
+    ) -> Option<TextureRenderElement<R::TextureId>> {
         if !self.is_open {
             return None;
         }
@@ -94,20 +93,17 @@ impl HotkeyOverlay {
         let weak = output.downgrade();
         if let Some(rendered) = buffers.get(&weak) {
             if let Some(buffer) = &rendered.buffer {
-                if buffer.texture_scale() != Scale::from(scale) {
+                if buffer.scale() != Scale::from(scale) {
                     buffers.remove(&weak);
                 }
             }
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            // The overlay texture is built CPU-side and uploaded to a GlesTexture; on the owned
-            // Vulkan renderer that path is unavailable, so degrade to no overlay.
-            let Some(renderer) = renderer.try_as_gles_renderer() else {
-                return RenderedOverlay { buffer: None };
-            };
-            render(renderer, &self.config.borrow(), self.mod_key, scale)
-                .unwrap_or_else(|_| RenderedOverlay { buffer: None })
+            // The overlay is built CPU-side into a renderer-neutral buffer, uploaded through the
+            // active renderer below so it draws on GLES and Vulkan alike.
+            render(&self.config.borrow(), self.mod_key, scale)
+                .unwrap_or(RenderedOverlay { buffer: None })
         });
         let buffer = rendered.buffer.as_ref()?;
 
@@ -117,8 +113,11 @@ impl HotkeyOverlay {
         location.x = f64::max(0., location.x);
         location.y = f64::max(0., location.y);
 
+        let buffer: TextureBuffer<R::TextureId> =
+            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
+
         let elem = TextureRenderElement::from_texture_buffer(
-            buffer.clone(),
+            buffer,
             location,
             0.9,
             None,
@@ -126,7 +125,7 @@ impl HotkeyOverlay {
             Kind::Unspecified,
         );
 
-        Some(PrimaryGpuTextureRenderElement(elem))
+        Some(elem)
     }
 
     pub fn a11y_text(&self) -> String {
@@ -307,12 +306,7 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
     actions
 }
 
-fn render(
-    renderer: &mut GlesRenderer,
-    config: &Config,
-    mod_key: ModKey,
-    scale: f64,
-) -> anyhow::Result<RenderedOverlay> {
+fn render(config: &Config, mod_key: ModKey, scale: f64) -> anyhow::Result<RenderedOverlay> {
     let _span = tracy_client::span!("hotkey_overlay::render");
 
     // let margin = MARGIN * scale;
@@ -443,16 +437,13 @@ fn render(
     drop(cr);
 
     let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
+    let buffer = MemoryBuffer::new(
+        data.to_vec(),
         Fourcc::Argb8888,
         (width, height),
-        false,
         scale,
         Transform::Normal,
-        Vec::new(),
-    )?;
+    );
 
     Ok(RenderedOverlay {
         buffer: Some(buffer),

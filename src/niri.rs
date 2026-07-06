@@ -160,7 +160,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
@@ -6916,9 +6916,13 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
-        ExitConfirmDialog = ExitConfirmDialogRenderElement,
+        ExitConfirmDialog = ExitConfirmDialogRenderElement<R>,
         RunDialog = RunDialogRenderElement<R>,
         Texture = PrimaryGpuTextureRenderElement,
+        // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
+        // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
+        // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).
+        UiTexture = TextureRenderElement<R::TextureId>,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }
