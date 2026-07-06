@@ -866,6 +866,10 @@ impl Tty {
             let render_node = self.primary_render_node;
             debug!("initializing the primary renderer");
 
+            // Computed before borrowing the GLES renderer below (avoids a &self / &mut borrow
+            // clash).
+            let use_vulkan = self.use_vulkan();
+
             let mut renderer = self
                 .gpu_manager
                 .single_renderer(&render_node)
@@ -898,8 +902,14 @@ impl Tty {
 
             niri.update_shaders();
 
-            // Create the dmabuf global.
-            let primary_formats = renderer.dmabuf_formats();
+            // Create the dmabuf global. On the Vulkan path advertise the owned renderer's
+            // importable formats (LINEAR 8888) instead of the GLES/EGL set, so clients
+            // allocate buffers the Vulkan renderer can actually import.
+            let primary_formats = if use_vulkan {
+                owned_vulkan_dmabuf_formats()
+            } else {
+                renderer.dmabuf_formats()
+            };
             let default_feedback =
                 DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
                     .build()
@@ -1441,26 +1451,15 @@ impl Tty {
         }
 
         let render_formats = if use_vulkan {
-            // The owned Vulkan renderer's `Bind<Dmabuf>` scanout targets, with an explicit LINEAR
-            // modifier: Venus GBM allocates LINEAR scanout buffers, and Vulkan dmabuf import needs
-            // an explicit modifier (not INVALID). It renders RGBA-order buffers (Abgr/Xbgr)
-            // directly and BGRA-order ones (Argb/Xrgb — the usual KMS primary-plane
-            // byte order) via a present-blit. Supply all four rather than querying EGL;
-            // DrmCompositor intersects them with the plane's formats and
-            // `SUPPORTED_COLOR_FORMATS` to pick the buffer format, then allocates via
-            // `device.allocator` and imports each into the renderer via `Bind`.
-            [
-                Fourcc::Argb8888,
-                Fourcc::Xrgb8888,
-                Fourcc::Abgr8888,
-                Fourcc::Xbgr8888,
-            ]
-            .into_iter()
-            .map(|code| smithay::backend::allocator::Format {
-                code,
-                modifier: Modifier::Linear,
-            })
-            .collect::<FormatSet>()
+            // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888): Venus GBM
+            // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier (not
+            // INVALID). The renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order
+            // ones (Argb/Xrgb — the usual KMS primary-plane byte order) via a present-blit.
+            // DrmCompositor intersects these with the plane's formats and `SUPPORTED_COLOR_FORMATS`
+            // to pick the buffer format, then allocates via `device.allocator` and imports each
+            // into the renderer via `Bind`. Same set advertised to clients (single
+            // source of truth).
+            owned_vulkan_dmabuf_formats()
         } else {
             let render_node = device.render_node.unwrap_or(self.primary_render_node);
             let renderer = self.gpu_manager.single_renderer(&render_node)?;
@@ -1563,7 +1562,11 @@ impl Tty {
 
         let mut dmabuf_feedback = None;
         if let Ok(primary_renderer) = self.gpu_manager.single_renderer(&self.primary_render_node) {
-            let primary_formats = primary_renderer.dmabuf_formats();
+            let primary_formats = if use_vulkan {
+                owned_vulkan_dmabuf_formats()
+            } else {
+                primary_renderer.dmabuf_formats()
+            };
 
             match surface_dmabuf_feedback(
                 &compositor,
@@ -2053,7 +2056,28 @@ impl Tty {
     }
 
     pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
-        let mut renderer = match self.gpu_manager.single_renderer(&self.primary_render_node) {
+        let primary_render_node = self.primary_render_node;
+
+        // This is the `DmabufHandler` validation callback — the one site that actually *gates*
+        // which client buffers are accepted. On the Vulkan path it must validate against
+        // the owned renderer (which only imports single-plane LINEAR 8888), or a client
+        // that ignores the dmabuf feedback could get a tiled/multiplanar buffer accepted
+        // here and then fail at render (a blank window and per-frame error spam).
+        #[cfg(feature = "vulkan")]
+        if let Some(vk) = self.vulkan_renderer.as_mut() {
+            return match ImportDma::import_dmabuf(vk, dmabuf, None) {
+                Ok(_texture) => {
+                    dmabuf.set_node(Some(primary_render_node));
+                    true
+                }
+                Err(err) => {
+                    debug!("error importing dmabuf into the Vulkan renderer: {err:?}");
+                    false
+                }
+            };
+        }
+
+        let mut renderer = match self.gpu_manager.single_renderer(&primary_render_node) {
             Ok(renderer) => renderer,
             Err(err) => {
                 debug!("error creating renderer for primary GPU: {err:?}");
@@ -2063,7 +2087,7 @@ impl Tty {
 
         match renderer.import_dmabuf(dmabuf, None) {
             Ok(_texture) => {
-                dmabuf.set_node(Some(self.primary_render_node));
+                dmabuf.set_node(Some(primary_render_node));
                 true
             }
             Err(err) => {
@@ -2814,6 +2838,21 @@ fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     }
 
     disabled_nodes
+}
+
+/// The DRM formats to advertise to clients (dmabuf feedback) and feed the DrmCompositor when
+/// compositing through the owned Vulkan renderer: the renderer's own importable set (single source
+/// of truth — [`crate::render_helpers::vulkan::dmabuf_formats`]). Only ever called on the Vulkan
+/// path (`use_vulkan`), which is impossible without the feature, so the fallback is unreachable.
+fn owned_vulkan_dmabuf_formats() -> FormatSet {
+    #[cfg(feature = "vulkan")]
+    {
+        crate::render_helpers::vulkan::dmabuf_formats()
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        FormatSet::default()
+    }
 }
 
 fn surface_dmabuf_feedback(

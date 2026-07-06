@@ -291,6 +291,174 @@ impl Texture {
         })
     }
 
+    /// Import a foreign (client-allocated) dmabuf as a **sampled** texture: a `SAMPLED` `VkImage`
+    /// whose memory is the dmabuf, with an explicit DRM format modifier + single-plane layout, a
+    /// view (optionally forcing sampled alpha to 1.0 for the `X`-formats via a component swizzle),
+    /// and a sampler. This is the client-buffer dual of [`Self::import_dmabuf_render_target`]: the
+    /// compositor samples it when compositing the window.
+    ///
+    /// Unlike the render-target import, the producer is outside Vulkan, so an explicit acquire
+    /// barrier transitions `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL`, transferring ownership from the
+    /// `FOREIGN` queue family when `VK_EXT_queue_family_foreign` is present. For the LINEAR
+    /// modifier the bytes survive the `UNDEFINED` old layout (nothing to detile). Single plane
+    /// only.
+    ///
+    /// `fd` is duplicated internally (Vulkan consumes the dup on success; the caller keeps the
+    /// original). `format` must match `fourcc`'s byte order (e.g. `B8G8R8A8_UNORM` for
+    /// `Argb8888`/`Xrgb8888`, `R8G8B8A8_UNORM` for `Abgr8888`/`Xbgr8888`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_dmabuf_sampled(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        width: u32,
+        height: u32,
+        fd: BorrowedFd<'_>,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+        format: vk::Format,
+        alpha_one: bool,
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        let device = &gpu.device;
+
+        let plane_layout = vk::SubresourceLayout {
+            offset: offset as u64,
+            size: 0,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let mut mod_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(std::slice::from_ref(&plane_layout));
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut ext_info)
+            .push_next(&mut mod_info);
+        let image = unsafe { device.create_image(&image_ci, None) }
+            .context("create sampled dmabuf image")?;
+
+        let mem_req = unsafe { device.get_image_memory_requirements(image) };
+
+        // Prefer the memory types the driver reports valid for this fd, but treat the query as
+        // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
+        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
+        let mut type_bits = mem_req.memory_type_bits;
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        if let Ok(()) = unsafe {
+            ext_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            )
+        } {
+            type_bits &= fd_props.memory_type_bits;
+        }
+        anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
+        let mem_type = type_bits.trailing_zeros();
+
+        // Import consumes the fd on success; hand Vulkan a fresh dup and let the caller keep
+        // theirs.
+        let raw_fd = fd
+            .try_clone_to_owned()
+            .context("dup dmabuf fd for import")?
+            .into_raw_fd();
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(raw_fd);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(mem_type)
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| {
+            // On failure Vulkan did not take the fd; close our dup so it doesn't leak.
+            drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+            anyhow::anyhow!("import sampled dmabuf memory (vkAllocateMemory): {e}")
+        })?;
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .context("bind imported sampled memory")?;
+
+        // Acquire the content from the outside-Vulkan producer and transition it for sampling.
+        // Transfer ownership from the FOREIGN queue family when that extension is present, else a
+        // plain layout transition. For the LINEAR modifier the bytes survive `UNDEFINED`.
+        let (src_qf, dst_qf) = if gpu.supports("VK_EXT_queue_family_foreign") {
+            (vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.queue_family)
+        } else {
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        };
+        gpu.run_commands(pool, |cbuf| unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(src_qf)
+                .dst_queue_family_index(dst_qf)
+                .image(image)
+                .subresource_range(COLOR_RANGE);
+            device.cmd_pipeline_barrier(
+                cbuf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        })
+        .context("acquire imported sampled image")?;
+
+        let components = if alpha_one {
+            vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
+        } else {
+            vk::ComponentMapping::default()
+        };
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(components)
+            .subresource_range(COLOR_RANGE);
+        let view =
+            unsafe { device.create_image_view(&view_ci, None) }.context("sampled dmabuf view")?;
+
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }
+            .context("sampled dmabuf sampler")?;
+
+        Ok(Texture {
+            image,
+            view,
+            sampler,
+            memory,
+            width,
+            height,
+        })
+    }
+
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
     #[allow(clippy::too_many_arguments)]
     fn upload(

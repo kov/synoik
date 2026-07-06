@@ -14,7 +14,7 @@
 //! back and matching the pattern proves the path end-to-end.
 
 use std::fs::File;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
@@ -173,6 +173,12 @@ impl ForeignBuffer {
             offset,
             fd,
         })
+    }
+
+    /// The exported dmabuf FD (borrowed; valid until this `ForeignBuffer` drops). Callers that need
+    /// to hand it to an API that consumes an `OwnedFd` should `try_clone_to_owned` it.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

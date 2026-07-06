@@ -553,3 +553,108 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
 
     eprintln!("vulkan_composites_a_scene_into_an_argb_scanout_dmabuf: {red} red (BGRA) window px");
 }
+
+/// Import a **CPU-filled client dmabuf** (a GBM `Argb8888` LINEAR buffer painted with four known
+/// quadrant colors) through `ImportDma::import_dmabuf` — the path real GPU app windows take — then
+/// sample it 1:1 into an offscreen and read it back, proving the owned renderer imports client
+/// dmabufs with the Argb→BGRA byte order and orientation correct. Venus-only (needs GBM). The
+/// buffer is CPU-filled, so this validates import+sample+byte-order, not producer-side GPU
+/// synchronization.
+#[test]
+fn vulkan_imports_a_client_dmabuf() {
+    use niri_vk::dmabuf::ForeignBuffer;
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::Modifier;
+    use smithay::backend::renderer::element::Kind;
+    use smithay::backend::renderer::ImportDma;
+    use smithay::utils::Point;
+
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_imports_a_client_dmabuf: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // A 64×64 Argb8888 LINEAR dmabuf, four quadrants: TL red, TR green, BL blue, BR yellow (the
+    // `[R,G,B,A]` colors are written BGRA into the Argb buffer by `allocate_filled`).
+    const S: u32 = 64;
+    let fb = match ForeignBuffer::allocate_filled(
+        S,
+        S,
+        [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_imports_a_client_dmabuf: GBM cannot allocate ({e})");
+            return;
+        }
+    };
+
+    // Wrap it as a Smithay client Dmabuf (single plane, explicit LINEAR).
+    let mut builder = Dmabuf::builder(
+        (S as i32, S as i32),
+        Fourcc::Argb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+    );
+    assert!(builder.add_plane(
+        fb.fd().try_clone_to_owned().expect("dup fd"),
+        0,
+        fb.offset,
+        fb.stride,
+    ));
+    let dmabuf = builder.build().expect("build dmabuf");
+
+    // The path a real client window takes.
+    let imported = vk
+        .import_dmabuf(&dmabuf, None)
+        .expect("import client dmabuf");
+
+    // Sample it 1:1 into an offscreen and read back tight Abgr8888 (`[R,G,B,A]`).
+    let size = Size::<i32, Physical>::from((S as i32, S as i32));
+    let buffer = TextureBuffer::from_texture(&vk, imported, 1.0, Transform::Normal, Vec::new());
+    let element = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let pixels = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [element].into_iter(),
+    )
+    .expect("render imported dmabuf");
+
+    // Sample the center of each quadrant; readback is `[R,G,B,A]`.
+    let q = S as i32 / 4;
+    let at = |x: i32, y: i32| px(&pixels, S as i32, x, y);
+    let (tl, tr, bl, br) = (at(q, q), at(3 * q, q), at(q, 3 * q), at(3 * q, 3 * q));
+    let near = |p: [u8; 4], want: [u8; 4]| {
+        p.iter()
+            .zip(want)
+            .all(|(a, b)| (i16::from(*a) - i16::from(b)).abs() < 40)
+    };
+    assert!(near(tl, [255, 0, 0, 255]), "TL should be red, got {tl:?}");
+    assert!(near(tr, [0, 255, 0, 255]), "TR should be green, got {tr:?}");
+    assert!(near(bl, [0, 0, 255, 255]), "BL should be blue, got {bl:?}");
+    assert!(
+        near(br, [255, 255, 0, 255]),
+        "BR should be yellow, got {br:?}"
+    );
+    eprintln!("vulkan_imports_a_client_dmabuf: quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
+}

@@ -2,10 +2,9 @@
 //! buffer imports ([`ImportMemWl`]/[`ImportEgl`]/[`ImportDma`]) and dmabuf-target [`Bind`], plus
 //! the fallible GLES access ([`AsGlesRenderer`]).
 //!
-//! Client-buffer import and dmabuf scanout targets are **not implemented yet** — they return an
-//! error. The offscreen render/readback path (M1) does not exercise them; real shm/dmabuf import is
-//! the material tail (M3), and dmabuf render targets are Stage 3 (KMS scanout). Their presence here
-//! is only what `NiriRenderer`'s supertraits require so a Vulkan renderer can be a `NiriRenderer`.
+//! shm ([`ImportMemWl`]) and single-plane LINEAR dmabuf ([`ImportDma`]) client buffers import for
+//! real; EGL client-buffer import ([`ImportEgl`]) still returns an error (clients use dmabuf/shm on
+//! this stack). The dmabuf-target [`Bind`] (KMS scanout) lives in `renderer.rs`.
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Fourcc;
@@ -149,10 +148,16 @@ impl ImportEgl for VulkanRenderer {
 impl ImportDma for VulkanRenderer {
     fn import_dmabuf(
         &mut self,
-        _dmabuf: &Dmabuf,
+        dmabuf: &Dmabuf,
         _damage: Option<&[Rectangle<i32, BufferCoord>]>,
     ) -> Result<VkTexture, VulkanError> {
-        Err(VulkanError::Unsupported("dmabuf client-buffer import"))
+        // Damage is ignored: smithay caches the imported texture per (buffer, renderer) and only
+        // re-imports on a new commit, so each import is a fresh full acquire of the client buffer.
+        self.import_dmabuf_as_texture(dmabuf)
+    }
+
+    fn dmabuf_formats(&self) -> smithay::backend::allocator::format::FormatSet {
+        super::renderer::dmabuf_formats()
     }
 }
 

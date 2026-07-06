@@ -14,7 +14,8 @@ use niri_vk::shaders::{
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::allocator::{Buffer as _, Fourcc};
+use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, ContextId, DebugFlags, ExportMem, ImportMem, Offscreen, Renderer, RendererSuper,
@@ -313,6 +314,72 @@ impl VulkanRenderer {
             .image_info(&image_info);
         unsafe { dev.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         Ok((pool, set))
+    }
+
+    /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The
+    /// buffer's DRM format must be one of the 8888 byte orders [`import_format`] handles, with the
+    /// LINEAR modifier (all Venus exposes) — clients are advertised exactly [`dmabuf_formats`], so
+    /// a mismatch is a misbehaving client, not the common path. The image is acquired from the
+    /// FOREIGN queue family and left in `SHADER_READ_ONLY_OPTIMAL`, wrapped with a descriptor
+    /// set so a frame can sample it like any other texture.
+    pub(super) fn import_dmabuf_as_texture(
+        &mut self,
+        dmabuf: &Dmabuf,
+    ) -> Result<VkTexture, VulkanError> {
+        // SCOPE NOTE — producer-side synchronization is not handled here. The acquire barrier below
+        // (and the synchronous `finish()` on the compositing submit) only order *our* work; they do
+        // not wait on the client's producing GPU fence (the dmabuf's implicit fence, nor an
+        // explicit `wp_linux_drm_syncobj` release point). With a real GPU client this can
+        // sample a partially-written frame (tearing/garbage on a busy client). It does not
+        // manifest on LINEAR/Venus with the CPU-filled test buffer. Wiring client-buffer
+        // readiness through the fence↔drm_syncobj bridge (see `sync_spike`) is a follow-up;
+        // this is an ownership acquire, not a readiness wait — do not conflate them.
+        if dmabuf.num_planes() != 1 {
+            return Err(VulkanError::Unsupported("multi-planar dmabuf import"));
+        }
+        let format = dmabuf.format();
+        if format.modifier != Modifier::Linear {
+            return Err(VulkanError::Other(format!(
+                "dmabuf import: only the LINEAR modifier is supported, got {:?}",
+                format.modifier
+            )));
+        }
+        let Some((vk_format, alpha_one)) = import_format(format.code) else {
+            return Err(VulkanError::UnsupportedFormat(format.code));
+        };
+        let (w, h) = (dmabuf.width(), dmabuf.height());
+        // Single plane (checked above).
+        let fd = dmabuf.handles().next().expect("one plane");
+        let offset = dmabuf.offsets().next().expect("one plane");
+        let stride = dmabuf.strides().next().expect("one plane");
+        let filter = match self.upscale_filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
+        let tex = NiriTexture::import_dmabuf_sampled(
+            &self.gpu,
+            self.command_pool,
+            w,
+            h,
+            fd,
+            offset,
+            stride,
+            format.modifier.into(),
+            vk_format,
+            alpha_one,
+            filter,
+        )?;
+        let (desc_pool, set) = self.make_texture_set(&tex)?;
+        Ok(VkTexture::new(
+            self.gpu.clone(),
+            tex,
+            desc_pool,
+            set,
+            w,
+            h,
+            format.code,
+            false,
+        ))
     }
 
     /// Copy a `w×h` region of `tex`'s image into a host `Vec<u8>` of tight RGBA8. Used by
@@ -785,6 +852,25 @@ impl Offscreen<VkTexture> for VulkanRenderer {
             format,
         ))
     }
+}
+
+/// The DRM formats the owned renderer imports as client buffers: the four 8888 byte orders,
+/// **LINEAR modifier only** (all Venus exposes for them). This is advertised to clients as dmabuf
+/// feedback so they allocate buffers [`VulkanRenderer::import_dmabuf_as_texture`] can import; the
+/// tty backend uses it in place of the GLES renderer's formats on the Vulkan path.
+pub fn dmabuf_formats() -> FormatSet {
+    [
+        Fourcc::Argb8888,
+        Fourcc::Xrgb8888,
+        Fourcc::Abgr8888,
+        Fourcc::Xbgr8888,
+    ]
+    .into_iter()
+    .map(|code| Format {
+        code,
+        modifier: Modifier::Linear,
+    })
+    .collect()
 }
 
 impl ImportMem for VulkanRenderer {

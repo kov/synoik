@@ -25,5 +25,5 @@ mod types;
 
 pub use error::VulkanError;
 pub use frame::VulkanFrame;
-pub use renderer::VulkanRenderer;
+pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub use types::{VkMapping, VkTexture};
