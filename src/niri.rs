@@ -155,6 +155,7 @@ use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManag
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
@@ -174,7 +175,7 @@ use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::panel::Panel;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
-use crate::ui::screen_transition::{self, ScreenTransition};
+use crate::ui::screen_transition::{self, ScreenTransition, ScreenTransitionRenderElement};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -517,7 +518,7 @@ pub struct OutputState {
     pub lock_render_state: LockRenderState,
     pub lock_surface: Option<LockSurface>,
     pub lock_color_buffer: SolidColorBuffer,
-    screen_transition: Option<ScreenTransition>,
+    pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
 }
@@ -4493,7 +4494,7 @@ impl Niri {
         // Next, the screen transition texture.
         {
             if let Some(transition) = &state.screen_transition {
-                push(transition.render(ctx.target).into());
+                push(transition.render(ctx.renderer, ctx.target).into());
             }
         }
 
@@ -6622,7 +6623,12 @@ impl Niri {
         }
     }
 
-    pub fn do_screen_transition(&mut self, renderer: &mut GlesRenderer, delay_ms: Option<u16>) {
+    pub fn do_screen_transition(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        using_vulkan: bool,
+        delay_ms: Option<u16>,
+    ) {
         let _span = tracy_client::span!("Niri::do_screen_transition");
 
         self.update_render_elements(None);
@@ -6636,6 +6642,50 @@ impl Niri {
                 let transform = output.current_transform();
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
+
+                // On a Vulkan session the Output target composites through the owned renderer,
+                // which can't sample a GLES texture. Capture that target's contents
+                // once into a renderer-neutral CPU buffer for the crossfade to
+                // upload lazily (mirrors the resize crossfade's neutral snapshot).
+                // Screencast/screen-capture still render through GLES.
+                let output_neutral = if using_vulkan {
+                    let ctx = RenderCtx {
+                        renderer,
+                        target: RenderTarget::Output,
+                        xray: None,
+                    };
+                    let elements = self.render_to_vec(ctx, &output, false);
+                    let elements = elements.iter().rev();
+                    match render_to_vec(
+                        renderer,
+                        size,
+                        scale,
+                        transform,
+                        Fourcc::Abgr8888,
+                        elements,
+                    ) {
+                        Ok(data) => {
+                            let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+                            Some(MemoryBuffer::new(
+                                data,
+                                Fourcc::Abgr8888,
+                                buffer_size,
+                                scale,
+                                transform,
+                            ))
+                        }
+                        Err(err) => {
+                            warn!(
+                                "error capturing screen transition neutral buffer for {}: {err:?}",
+                                output.name()
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let targets = [
                     RenderTarget::Output,
                     RenderTarget::Screencast,
@@ -6681,7 +6731,7 @@ impl Niri {
                     )
                 });
 
-                Some((output, textures))
+                Some((output, textures, output_neutral))
             })
             .collect();
 
@@ -6689,10 +6739,11 @@ impl Niri {
             Duration::from_millis(u64::from(d))
         });
 
-        for (output, from_texture) in textures {
+        for (output, from_texture, output_neutral) in textures {
             let state = self.output_state.get_mut(&output).unwrap();
             state.screen_transition = Some(ScreenTransition::new(
                 from_texture,
+                output_neutral,
                 delay,
                 self.clock.clone(),
             ));
@@ -6915,6 +6966,7 @@ niri_render_elements! {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
+        ScreenTransition = ScreenTransitionRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement<R>,
         RunDialog = RunDialogRenderElement<R>,

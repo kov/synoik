@@ -850,8 +850,10 @@ impl State {
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
+                let using_vulkan = self.backend.using_vulkan();
                 self.backend.with_primary_renderer(|renderer| {
-                    self.niri.do_screen_transition(renderer, delay_ms);
+                    self.niri
+                        .do_screen_transition(renderer, using_vulkan, delay_ms);
                 });
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {

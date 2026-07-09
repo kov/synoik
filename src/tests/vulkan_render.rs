@@ -20,6 +20,7 @@ use crate::backend::RendererKind;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+use crate::ui::screen_transition::ScreenTransitionRenderElement;
 use crate::utils::{output_size, to_physical_precise_round};
 
 const OUT_W: u16 = 1280;
@@ -115,6 +116,16 @@ fn assert_window_and_background(pixels: &[u8], w: i32, h: i32) -> usize {
 /// Composite the whole `output` through the owned Vulkan renderer (the `Niri::screenshot` path),
 /// returning the tight `Abgr8888` readback and its dimensions.
 fn render_output_vulkan(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
+    render_output_vulkan_target(f, output, RenderTarget::ScreenCapture)
+}
+
+/// As [`render_output_vulkan`], but for an explicit [`RenderTarget`] — some overlays (e.g. the
+/// screen transition) only composite through the owned renderer for `RenderTarget::Output`.
+fn render_output_vulkan_target(
+    f: &mut Fixture,
+    output: &Output,
+    target: RenderTarget,
+) -> (Vec<u8>, i32, i32) {
     let state = f.niri_state();
     state
         .backend
@@ -129,7 +140,7 @@ fn render_output_vulkan(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32)
 
             let ctx = RenderCtx {
                 renderer: vk,
-                target: RenderTarget::ScreenCapture,
+                target,
                 xray: None,
             };
             let elements = niri.render_to_vec(ctx, output, false);
@@ -258,6 +269,114 @@ fn vulkan_composites_the_run_dialog() {
         "the dialog did not composite at the output center"
     );
     eprintln!("vulkan_composites_the_run_dialog: {w}x{h} frame changed with the dialog open");
+}
+
+/// The screen-transition crossfade captures the screen through GLES (which the owned Vulkan
+/// renderer can't sample), so on a Vulkan session it uploads that neutral capture to a `VkTexture`
+/// for the Output target. Freeze a green-window screen, recolor the live window red, then composite
+/// the Output target through Vulkan: the frozen green frame must draw and occlude the live red
+/// window (a blank no-op overlay — the old behavior — would leak the live red window through
+/// instead).
+#[test]
+fn vulkan_screen_transition_draws_the_captured_frame() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_screen_transition_draws_the_captured_frame: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+
+    // Freeze the green-window screen into a transition (delay 0 → alpha ≈ 1, fully the capture).
+    f.niri_state()
+        .do_action(Action::DoScreenTransition(Some(0)), false);
+    assert!(
+        f.niri()
+            .output_state
+            .values()
+            .any(|s| s.screen_transition.is_some()),
+        "screen transition must be active after DoScreenTransition"
+    );
+
+    // The Output target must take the Vulkan upload path; the screencast/screen-capture targets
+    // keep the GLES texture (a degraded no-op on the Vulkan renderer — in production they
+    // render through GLES, so only Output needs the upload).
+    {
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let transition = state
+                    .niri
+                    .output_state
+                    .values()
+                    .find_map(|s| s.screen_transition.as_ref())
+                    .expect("active transition");
+                assert!(
+                    matches!(
+                        transition.render(vk, RenderTarget::Output),
+                        ScreenTransitionRenderElement::Vulkan(_)
+                    ),
+                    "Output target did not upload the capture to a VkTexture"
+                );
+                assert!(
+                    matches!(
+                        transition.render(vk, RenderTarget::ScreenCapture),
+                        ScreenTransitionRenderElement::Gles(_)
+                    ),
+                    "ScreenCapture target should keep the GLES texture"
+                );
+            })
+            .expect("headless backend must hold a Vulkan renderer");
+    }
+
+    // Recolor the live window red. The frozen transition still holds the green capture.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(RED[0], RED[1], RED[2], RED[3]);
+    window.commit();
+    f.double_roundtrip(id);
+
+    // Composite the Output target: the frozen green frame must occlude the live red window.
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_screen_transition_draws_the_captured_frame: {green} green px, {red} red px");
+    assert!(
+        green > 0,
+        "the captured (green) transition frame did not draw on Vulkan (blank overlay?)"
+    );
+    assert!(
+        red < 100,
+        "the live red window leaked through the frozen transition ({red} red px)"
+    );
 }
 
 /// The KMS-present pipeline minus the flip: composite the same live scene straight into a
