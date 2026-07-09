@@ -18,9 +18,9 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Tr
 use super::fixture::Fixture;
 use crate::backend::RendererKind;
 use crate::niri::OutputRenderElements;
+use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
-use crate::ui::screen_transition::ScreenTransitionRenderElement;
 use crate::utils::{output_size, to_physical_precise_round};
 
 const OUT_W: u16 = 1280;
@@ -337,14 +337,14 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
                 assert!(
                     matches!(
                         transition.render(vk, RenderTarget::Output),
-                        ScreenTransitionRenderElement::Vulkan(_)
+                        DualTextureRenderElement::Vulkan(_)
                     ),
                     "Output target did not upload the capture to a VkTexture"
                 );
                 assert!(
                     matches!(
                         transition.render(vk, RenderTarget::ScreenCapture),
-                        ScreenTransitionRenderElement::Gles(_)
+                        DualTextureRenderElement::Gles(_)
                     ),
                     "ScreenCapture target should keep the GLES texture"
                 );
