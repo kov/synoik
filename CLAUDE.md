@@ -13,6 +13,9 @@ Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
 - Dev loop: `cargo test -p niri` (headless, no GPU, ~2s). Runtime control plane: niri-ipc
   over `$NIRI_SOCKET`. New GNOME policy/UI state should flow through one inspectable model;
   keep the per-frame render path separate.
+- Live validation needs the real binary: `cargo test` does NOT rebuild `target/debug/niri`
+  (only the test harness). After code changes, always `cargo build --features vulkan --bin niri`
+  and restart the session, or the running compositor keeps running stale code.
 - Reference checkouts (read-only, not this repo): `~/Projects/gnome-shell` and
   `~/Projects/mutter` (both 50.1) — ground behavior there; never copy GObject.
 
