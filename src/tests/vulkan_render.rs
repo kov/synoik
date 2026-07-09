@@ -271,6 +271,44 @@ fn vulkan_composites_the_run_dialog() {
     eprintln!("vulkan_composites_the_run_dialog: {w}x{h} frame changed with the dialog open");
 }
 
+/// The screenshot UI freezes the screen into a GLES texture the owned Vulkan renderer can't sample,
+/// so on a Vulkan session it reads that capture back and uploads it to a `VkTexture` for the Output
+/// target. Open the UI over a green-window scene, then composite the Output target through Vulkan:
+/// with the UI open the compositor draws only the UI, so the frozen green screen must be present (a
+/// blank no-op overlay — the old behavior — would leave only the dark backdrop).
+#[test]
+fn vulkan_screenshot_ui_draws_the_frozen_screen() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    assert!(
+        f.niri().screenshot_ui.is_open(),
+        "screenshot UI must be open"
+    );
+    // Settle the open animation so the UI is at full opacity.
+    f.niri_complete_animations();
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // Green-dominant, to catch both the bright (selected) and the 0.5-darkened (unselected) regions
+    // of the frozen screenshot; the dark backdrop is not green-dominant.
+    let is_greenish = |p: [u8; 4]| {
+        let (r, g, b) = (p[0] as i16, p[1] as i16, p[2] as i16);
+        g > 60 && g > r + 30 && g > b + 30
+    };
+    let green = (0..w * h)
+        .filter(|i| is_greenish(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_screenshot_ui_draws_the_frozen_screen: {green} greenish px");
+    assert!(
+        green > 1000,
+        "the frozen screenshot did not draw on Vulkan (blank overlay?): {green} greenish px"
+    );
+}
+
 /// The screen-transition crossfade captures the screen through GLES (which the owned Vulkan
 /// renderer can't sample), so on a Vulkan session it uploads that neutral capture to a `VkTexture`
 /// for the Output target. Freeze a green-window screen, recolor the live window red, then composite

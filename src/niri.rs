@@ -2089,10 +2089,12 @@ impl State {
 
         self.niri.update_render_elements(None);
 
-        let Some(screenshots) = self
-            .backend
-            .with_primary_renderer(|renderer| self.niri.capture_screenshots(renderer).collect())
-        else {
+        let using_vulkan = self.backend.using_vulkan();
+        let Some(screenshots) = self.backend.with_primary_renderer(|renderer| {
+            self.niri
+                .capture_screenshots(renderer, using_vulkan)
+                .collect()
+        }) else {
             return;
         };
 
@@ -2107,9 +2109,14 @@ impl State {
         }
 
         self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
+            self.niri.screenshot_ui.open(
+                renderer,
+                screenshots,
+                default_output,
+                show_pointer,
+                path,
+                using_vulkan,
+            )
         });
 
         self.niri
@@ -4552,7 +4559,9 @@ impl Niri {
         // If the screenshot UI is open, draw it.
         if self.screenshot_ui.is_open() {
             self.screenshot_ui
-                .render_output(output, ctx.target, &mut |elem| push(elem.into()));
+                .render_output(ctx.renderer, output, ctx.target, &mut |elem| {
+                    push(elem.into())
+                });
 
             // Add the backdrop for outputs that were connected while the screenshot UI was open.
             push(backdrop);
@@ -5796,82 +5805,93 @@ impl Niri {
     pub fn capture_screenshots<'a>(
         &'a self,
         renderer: &'a mut GlesRenderer,
+        using_vulkan: bool,
     ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a {
-        self.global_space.outputs().cloned().filter_map(|output| {
-            let size = output.current_mode().unwrap().size;
-            let transform = output.current_transform();
-            let size = transform.transform_size(size);
+        self.global_space
+            .outputs()
+            .cloned()
+            .filter_map(move |output| {
+                let size = output.current_mode().unwrap().size;
+                let transform = output.current_transform();
+                let size = transform.transform_size(size);
 
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            let targets = [
-                RenderTarget::Output,
-                RenderTarget::Screencast,
-                RenderTarget::ScreenCapture,
-            ];
-            let screenshot = targets.map(|target| {
-                let ctx = RenderCtx {
-                    renderer,
-                    target,
-                    xray: None,
-                };
-                let elements = self.render_to_vec(ctx, &output, false);
-                let elements = elements.iter().rev();
-
-                let res = render_to_texture(
-                    renderer,
-                    size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements,
-                );
-                if let Err(err) = &res {
-                    warn!("error rendering output {}: {err:?}", output.name());
-                }
-                let res_output = res.ok();
-
-                let mut pointer = Vec::new();
-
-                // We check the pointer visibility for Disabled (and not .is_visible()) in order to
-                // show the pointer even when it's hidden through cursor {} options. The user can
-                // then toggle it in the screenshot UI as needed.
-                if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
-                }
-
-                let res_pointer = if pointer.is_empty() {
-                    None
-                } else {
-                    let res = render_to_encompassing_texture(
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let targets = [
+                    RenderTarget::Output,
+                    RenderTarget::Screencast,
+                    RenderTarget::ScreenCapture,
+                ];
+                let screenshot = targets.map(|target| {
+                    let ctx = RenderCtx {
                         renderer,
+                        target,
+                        xray: None,
+                    };
+                    let elements = self.render_to_vec(ctx, &output, false);
+                    let elements = elements.iter().rev();
+
+                    let res = render_to_texture(
+                        renderer,
+                        size,
                         scale,
                         Transform::Normal,
                         Fourcc::Abgr8888,
-                        &pointer,
+                        elements,
                     );
                     if let Err(err) = &res {
-                        warn!("error rendering pointer for {}: {err:?}", output.name());
+                        warn!("error rendering output {}: {err:?}", output.name());
                     }
-                    res.ok()
-                };
+                    let res_output = res.ok();
 
-                res_output.map(|(texture, _)| {
-                    OutputScreenshot::from_textures(
-                        renderer,
-                        scale,
-                        texture,
-                        res_pointer.map(|(texture, _, geo)| (texture, geo)),
-                    )
-                })
-            });
+                    let mut pointer = Vec::new();
 
-            if screenshot.iter().any(|res| res.is_none()) {
-                return None;
-            }
+                    // We check the pointer visibility for Disabled (and not .is_visible()) in order
+                    // to show the pointer even when it's hidden through cursor
+                    // {} options. The user can then toggle it in the screenshot
+                    // UI as needed.
+                    if self.pointer_visibility != PointerVisibility::Disabled {
+                        self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
+                    }
 
-            let screenshot = screenshot.map(|res| res.unwrap());
-            Some((output, screenshot))
-        })
+                    let res_pointer = if pointer.is_empty() {
+                        None
+                    } else {
+                        let res = render_to_encompassing_texture(
+                            renderer,
+                            scale,
+                            Transform::Normal,
+                            Fourcc::Abgr8888,
+                            &pointer,
+                        );
+                        if let Err(err) = &res {
+                            warn!("error rendering pointer for {}: {err:?}", output.name());
+                        }
+                        res.ok()
+                    };
+
+                    // Only the on-screen (Output) target composites through the owned Vulkan
+                    // renderer, so only it needs a renderer-neutral readback
+                    // for re-upload.
+                    let capture_neutral = using_vulkan && target == RenderTarget::Output;
+
+                    res_output.map(|(texture, _)| {
+                        OutputScreenshot::from_textures(
+                            renderer,
+                            scale,
+                            texture,
+                            res_pointer.map(|(texture, _, geo)| (texture, geo)),
+                            capture_neutral,
+                        )
+                    })
+                });
+
+                if screenshot.iter().any(|res| res.is_none()) {
+                    return None;
+                }
+
+                let screenshot = screenshot.map(|res| res.unwrap());
+                Some((output, screenshot))
+            })
     }
 
     pub fn screenshot<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
