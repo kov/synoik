@@ -17,7 +17,6 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
@@ -31,8 +30,8 @@ use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -118,7 +117,10 @@ niri_render_elements! {
 niri_render_elements! {
     WindowMruUiRenderElement<R> => {
         SolidColor = SolidColorRenderElement,
-        TextureElement = PrimaryGpuTextureRenderElement,
+        // CPU-rendered title/scope-panel text, uploaded through the active renderer so it draws on
+        // GLES and the owned Vulkan renderer alike (the M1 escape hatch: TextureRenderElement impls
+        // RenderElement<R> for any R: Renderer<TextureId = T>).
+        UiTexture = TextureRenderElement<R::TextureId>,
         GradientFadeElem = GradientFadeTextureRenderElement,
         FocusRing = FocusRingRenderElement,
         Offscreen = OffscreenRenderElement,
@@ -185,7 +187,10 @@ struct MoveAnimation {
     from: f64,
 }
 
-type MruTexture = TextureBuffer<GlesTexture>;
+/// CPU-drawn title/scope text cached as a renderer-neutral buffer, uploaded through the active
+/// renderer at render time (so it works on GLES and the owned Vulkan renderer alike). Cheap to
+/// clone (the pixel data is `Arc`-shared).
+type MruTexture = MemoryBuffer;
 
 /// Cached title texture.
 #[derive(Debug, Default)]
@@ -322,16 +327,11 @@ impl Thumbnail {
         size.to_physical_precise_round(scale).to_logical(scale)
     }
 
-    fn title_texture(
-        &self,
-        renderer: &mut GlesRenderer,
-        mapped: &Mapped,
-        scale: f64,
-    ) -> Option<MruTexture> {
+    fn title_texture(&self, mapped: &Mapped, scale: f64) -> Option<MruTexture> {
         with_toplevel_role(mapped.toplevel(), |role| {
             role.title
                 .as_ref()
-                .and_then(|title| self.title_texture.borrow_mut().get(renderer, title, scale))
+                .and_then(|title| self.title_texture.borrow_mut().get(title, scale))
         })
     }
 
@@ -455,11 +455,8 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        // The title texture renders through GLES; on the owned Vulkan renderer there is no title
-        // (and the `Some`-guarded block that draws it below is then skipped).
-        let title_texture = ctx
-            .try_as_gles()
-            .and_then(|ctx| self.title_texture(ctx.renderer, mapped, scale));
+        // The title text is a renderer-neutral CPU buffer, uploaded through the active renderer.
+        let title_texture = self.title_texture(mapped, scale);
         let title_texture = title_texture.map(|texture| {
             let mut size = texture.logical_size();
             size.w = f64::min(size.w, preview_geo.size.w);
@@ -483,22 +480,42 @@ impl Thumbnail {
                     preview_geo.size.h + title_gap,
                 );
             let loc = loc.to_physical_precise_round(scale).to_logical(scale);
-            let texture = TextureRenderElement::from_texture_buffer(
-                texture,
-                loc,
-                preview_alpha,
-                Some(src),
-                None,
-                Kind::Unspecified,
-            );
 
-            let ctx = ctx.as_gles();
-            if let Some(program) = GradientFadeTextureRenderElement::shader(ctx.renderer) {
-                let elem = GradientFadeTextureRenderElement::new(texture, program);
-                push(WindowMruUiRenderElement::GradientFadeElem(elem));
-            } else {
-                let elem = PrimaryGpuTextureRenderElement(texture);
-                push(WindowMruUiRenderElement::TextureElement(elem));
+            // On GLES, soft-fade the right edge with the gradient shader. Built entirely inside the
+            // GLES branch so the concrete `GlesTexture` element matches the gradient wrapper; the
+            // owned Vulkan renderer has no such shader, so it degrades to the plain (hard-clipped)
+            // texture below.
+            let mut pushed = false;
+            if let Some(gles) = ctx.try_as_gles() {
+                if let Some(program) = GradientFadeTextureRenderElement::shader(gles.renderer) {
+                    if let Ok(buffer) = TextureBuffer::from_memory_buffer(gles.renderer, &texture) {
+                        let elem = TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            loc,
+                            preview_alpha,
+                            Some(src),
+                            None,
+                            Kind::Unspecified,
+                        );
+                        let elem = GradientFadeTextureRenderElement::new(elem, program);
+                        push(WindowMruUiRenderElement::GradientFadeElem(elem));
+                        pushed = true;
+                    }
+                }
+            }
+
+            if !pushed {
+                if let Ok(buffer) = TextureBuffer::from_memory_buffer(ctx.renderer, &texture) {
+                    let elem = TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        loc,
+                        preview_alpha,
+                        Some(src),
+                        None,
+                        Kind::Unspecified,
+                    );
+                    push(WindowMruUiRenderElement::UiTexture(elem));
+                }
             }
         }
 
@@ -1565,26 +1582,24 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        // The scope panel texture renders through GLES; no panel on the owned Vulkan renderer.
-        let panel_texture = ctx.try_as_gles().and_then(|ctx| {
-            self.scope_panel
-                .borrow_mut()
-                .get(ctx.renderer, scale, self.wmru.scope)
-        });
+        // The scope panel is a renderer-neutral CPU buffer, uploaded through the active renderer.
+        let panel_texture = self.scope_panel.borrow_mut().get(scale, self.wmru.scope);
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 
             let size = texture.logical_size();
             let location = Point::new((output_size.w - size.w) / 2., padding * 2.);
-            let elem = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                texture.clone(),
-                location,
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            ));
-            push(WindowMruUiRenderElement::TextureElement(elem));
+            if let Ok(buffer) = TextureBuffer::from_memory_buffer(ctx.renderer, &texture) {
+                let elem = TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    location,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                );
+                push(WindowMruUiRenderElement::UiTexture(elem));
+            }
         }
 
         let current_id = self.wmru.current_id;
@@ -1640,7 +1655,7 @@ impl Inner {
 }
 
 impl TitleTexture {
-    fn get(&mut self, renderer: &mut GlesRenderer, title: &str, scale: f64) -> Option<MruTexture> {
+    fn get(&mut self, title: &str, scale: f64) -> Option<MruTexture> {
         if self.title != title || self.scale != scale {
             self.texture = None;
             self.title = title.to_owned();
@@ -1648,7 +1663,7 @@ impl TitleTexture {
         }
 
         self.texture
-            .get_or_insert_with(|| generate_title_texture(renderer, title, scale).ok())
+            .get_or_insert_with(|| generate_title_texture(title, scale).ok())
             .clone()
     }
 
@@ -1661,11 +1676,7 @@ impl TitleTexture {
     }
 }
 
-fn generate_title_texture(
-    renderer: &mut GlesRenderer,
-    title: &str,
-    scale: f64,
-) -> anyhow::Result<MruTexture> {
+fn generate_title_texture(title: &str, scale: f64) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::generate_title_texture");
 
     let mut font = FontDescription::from_string(FONT);
@@ -1695,43 +1706,30 @@ fn generate_title_texture(
 
     drop(cr);
     let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
+    Ok(MemoryBuffer::new(
+        data.to_vec(),
         Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
+        Size::from((width, height)),
+        Scale::from(scale),
         Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
+    ))
 }
 
 impl ScopePanel {
-    fn get(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        scale: f64,
-        scope: MruScope,
-    ) -> Option<MruTexture> {
+    fn get(&mut self, scale: f64, scope: MruScope) -> Option<MruTexture> {
         if self.scale != scale {
             self.textures = None;
             self.scale = scale;
         }
 
         self.textures
-            .get_or_insert_with(|| generate_scope_panels(renderer, scale).ok())
+            .get_or_insert_with(|| generate_scope_panels(scale).ok())
             .as_ref()
             .map(|x| x[scope as usize].clone())
     }
 }
 
-fn generate_scope_panels(
-    renderer: &mut GlesRenderer,
-    scale: f64,
-) -> anyhow::Result<[MruTexture; 3]> {
+fn generate_scope_panels(scale: f64) -> anyhow::Result<[MruTexture; 3]> {
     fn make_panel_text(idx: usize) -> String {
         let span_unselected = "<span fgcolor='#999999'>";
         let span_end = "</span>";
@@ -1763,13 +1761,13 @@ fn generate_scope_panels(
 
     // Can't wait for array::try_map()
     Ok([
-        render_panel(renderer, scale, &make_panel_text(0))?,
-        render_panel(renderer, scale, &make_panel_text(1))?,
-        render_panel(renderer, scale, &make_panel_text(2))?,
+        render_panel(scale, &make_panel_text(0))?,
+        render_panel(scale, &make_panel_text(1))?,
+        render_panel(scale, &make_panel_text(2))?,
     ])
 }
 
-fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::Result<MruTexture> {
+fn render_panel(scale: f64, text: &str) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
     let mut font = FontDescription::from_string(FONT);
@@ -1817,18 +1815,13 @@ fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::
 
     drop(cr);
     let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
+    Ok(MemoryBuffer::new(
+        data.to_vec(),
         Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
+        Size::from((width, height)),
+        Scale::from(scale),
         Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
+    ))
 }
 
 /// Returns key bindings available when the MRU UI is open.

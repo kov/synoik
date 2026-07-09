@@ -271,6 +271,45 @@ fn vulkan_composites_the_run_dialog() {
     eprintln!("vulkan_composites_the_run_dialog: {w}x{h} frame changed with the dialog open");
 }
 
+/// The alt-tab MRU draws its window titles and scope panel as CPU/cairo text that was uploaded
+/// through GLES-locked elements — blank on the owned Vulkan renderer. Now the text is a
+/// renderer-neutral buffer uploaded through the active renderer. Open the MRU over a window and
+/// composite the Output target through Vulkan: the white scope-panel text must be present (before,
+/// only the thumbnails and dark backdrop drew).
+#[test]
+fn vulkan_mru_draws_the_scope_panel() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let clock = f.niri().clock.clone();
+    let wmru = crate::ui::mru::WindowMru::new(f.niri());
+    f.niri().window_mru_ui.open(clock, wmru, output.clone());
+    assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
+    // Settle the open animation so the MRU renders directly (alpha == 1).
+    f.niri_complete_animations();
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // The scope panel ("Scope: All Output Workspace") sits in a strip near the top, well above the
+    // centered thumbnails and their focus ring. Its white text over the dark backdrop is
+    // unambiguous there — white pixels in the top strip ⟹ the CPU panel uploaded and drew on
+    // Vulkan.
+    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let top = h / 8;
+    let white = (0..top * w)
+        .filter(|i| is_white(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_mru_draws_the_scope_panel: {white} white px in the top strip");
+    // The blank (old) behavior leaves ~0 white in this strip, so a low threshold still
+    // discriminates clearly while tolerating font-metric variation.
+    assert!(
+        white > 40,
+        "the MRU scope panel text did not draw on Vulkan (blank overlay?): {white} white px"
+    );
+}
+
 /// The screenshot UI freezes the screen into a GLES texture the owned Vulkan renderer can't sample,
 /// so on a Vulkan session it reads that capture back and uploads it to a `VkTexture` for the Output
 /// target. Open the UI over a green-window scene, then composite the Output target through Vulkan:
