@@ -1976,18 +1976,25 @@ impl Tty {
         // level; `render_frame` is generic over the renderer).
         #[cfg(feature = "vulkan")]
         if let Some(vk) = self.vulkan_renderer.as_mut() {
-            // First cut: composite everything into the DrmCompositor swapchain buffer and scan that
-            // out — no direct client / overlay / cursor-plane scanout. Those offloads make
-            // `render_frame` import client and cursor buffers into the renderer (`ImportDma`),
-            // which the owned Vulkan renderer doesn't support yet; the cursor is
-            // composited in software.
+            // Hardware cursor + overlay planes work with the owned Vulkan renderer because those
+            // scanout paths bypass the renderer entirely: `DrmCompositor` puts the cursor into its
+            // own gbm Argb8888/Linear buffer (CPU copy or its internal pixman renderer) and
+            // overlay-scans a client's dmabuf straight to KMS via gbm — `render_frame` only needs
+            // `Renderer + Bind<Dmabuf>` (the primary swapchain), which we satisfy. So mirror the
+            // GLES flags, minus primary-plane direct scanout: that one hands a client buffer to KMS
+            // as the *primary* framebuffer, bypassing our present-blit/shadow and damage-preserving
+            // path, and depends on the Vulkan element tree surfacing `underlying_storage` — its own
+            // follow-up with its own validation. Overlay stays behind `debug.enable_overlay_planes`
+            // (off by default, same as GLES).
+            let flags =
+                compositor_frame_flags(&config, niri, output, /* allow_primary */ false);
             return render_surface_with(
                 niri,
                 output,
                 vk,
                 surface,
                 &config,
-                FrameFlags::empty(),
+                flags,
                 // Partial-damage rendering works when there's a single scanout surface (see
                 // `single_scanout_surface`): the Vulkan renderer preserves the present-blit shadow
                 // (render-pass LOAD) so DrmCompositor's buffer-age damage is enough. With multiple
@@ -2009,37 +2016,7 @@ impl Tty {
             }
         };
 
-        // Overlay planes are disabled by default as they cause weird performance issues on my
-        // system.
-        let flags = {
-            let debug = &config.borrow().debug;
-
-            let primary_scanout_flag = if debug.restrict_primary_scanout_to_matching_format {
-                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
-            } else {
-                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
-            };
-            let mut flags = primary_scanout_flag | FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
-
-            if debug.enable_overlay_planes {
-                flags.insert(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
-            }
-            if debug.disable_direct_scanout {
-                flags.remove(primary_scanout_flag);
-                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
-            }
-            if debug.disable_cursor_plane {
-                flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
-            }
-            if debug.skip_cursor_only_updates_during_vrr {
-                let output_state = niri.output_state.get(output).unwrap();
-                if output_state.frame_clock.vrr() {
-                    flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
-                }
-            }
-
-            flags
-        };
+        let flags = compositor_frame_flags(&config, niri, output, /* allow_primary */ true);
 
         render_surface_with(
             niri,
@@ -3152,6 +3129,51 @@ where
     queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
 
     rv
+}
+
+/// The `DrmCompositor` scanout flags derived from the debug config, shared by the GLES and Vulkan
+/// render paths so the two can't drift. Cursor-plane scanout is on by default (honoring
+/// `debug.disable_cursor_plane`); overlay-plane scanout stays behind `debug.enable_overlay_planes`
+/// (off by default — overlay planes cause performance issues on some systems). `allow_primary`
+/// gates primary-plane direct scanout: the GLES path passes `true`, the Vulkan path `false` for now
+/// (see the Vulkan branch in `Tty::render`).
+fn compositor_frame_flags(
+    config: &Rc<RefCell<Config>>,
+    niri: &Niri,
+    output: &Output,
+    allow_primary: bool,
+) -> FrameFlags {
+    let debug = &config.borrow().debug;
+
+    let primary_scanout_flag = if debug.restrict_primary_scanout_to_matching_format {
+        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+    } else {
+        FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+    };
+    let mut flags = FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+    if allow_primary {
+        flags.insert(primary_scanout_flag);
+    }
+
+    if debug.enable_overlay_planes {
+        flags.insert(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+    }
+    if debug.disable_direct_scanout {
+        // No-op for the primary flag when `!allow_primary` (it was never inserted).
+        flags.remove(primary_scanout_flag);
+        flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+    }
+    if debug.disable_cursor_plane {
+        flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+    }
+    if debug.skip_cursor_only_updates_during_vrr {
+        let output_state = niri.output_state.get(output).unwrap();
+        if output_state.frame_clock.vrr() {
+            flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
+        }
+    }
+
+    flags
 }
 
 fn queue_estimated_vblank_timer(
