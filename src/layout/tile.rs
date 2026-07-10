@@ -1289,21 +1289,27 @@ impl<W: LayoutElement> Tile<W> {
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
             let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+            // On the owned Vulkan renderer there is no GLES clip shader; clip in its own pipeline.
+            #[cfg(feature = "vulkan")]
+            let vulkan_clip = ctx.try_as_vulkan().is_some();
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
                     // If we should clip to geometry, render a clipped window.
-                    if clip_to_geometry {
+                    if clip_to_geometry
+                        && ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius)
+                    {
                         if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
-                                return ClippedSurfaceRenderElement::new(
-                                    elem,
-                                    scale,
-                                    geo,
-                                    shader.clone(),
-                                    radius,
-                                )
-                                .into();
-                            }
+                            return ClippedSurfaceRenderElement::new(
+                                elem, scale, geo, shader, radius,
+                            )
+                            .into();
+                        }
+                        #[cfg(feature = "vulkan")]
+                        if vulkan_clip {
+                            return ClippedSurfaceRenderElement::new_vulkan(
+                                elem, scale, geo, radius,
+                            )
+                            .into();
                         }
                     }
 

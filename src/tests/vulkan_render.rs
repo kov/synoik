@@ -8,7 +8,7 @@
 //! Skips gracefully when no Vulkan device is present. The scanout test additionally needs a real
 //! GBM device (the render node), so it is Venus-only (lavapipe/CPU has no GBM).
 
-use niri_config::{Action, Config};
+use niri_config::{Action, Config, CornerRadius, WindowRule};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
@@ -1904,4 +1904,237 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
             "vulkan_backdrop_effect_roundtrips_under_rotation {t:?}: corners {pc:?} preserved"
         );
     }
+}
+
+/// Composite `output` through the fixture's GLES oracle renderer (the `with_primary_renderer`
+/// path), returning the tight `Abgr8888` readback and its dimensions. The GLES sibling of
+/// [`render_output_vulkan`], for oracle comparisons of the full `Niri::render_to_vec` scene.
+fn render_output_gles(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_primary_renderer(|g| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let size = output.current_transform().transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            let ctx = RenderCtx {
+                renderer: g,
+                target: RenderTarget::ScreenCapture,
+                xray: None,
+            };
+            let elements = niri.render_to_vec(ctx, output, false);
+            let elements = elements.iter().rev();
+            let pixels = render_to_vec(
+                g,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements,
+            )?;
+            Ok((pixels, size.w, size.h))
+        })
+        .expect("headless backend must hold a GLES renderer")
+        .expect("compositing through GLES must not error")
+}
+
+/// A green window with a corner radius + `clip-to-geometry`, so the tile clips it to a rounded
+/// rectangle — exercising [`ClippedSurfaceRenderElement`]. Mirrors [`window_fixture`] but installs
+/// a matches-all window rule. `None` (skip) when there is no Vulkan device.
+fn clipped_window_fixture() -> Option<Fixture> {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return None;
+    }
+
+    let mut config = Config::default();
+    // Strip the decorations (focus ring, border, shadow) so the only things on screen are the
+    // clipped window and the backdrop — otherwise the focus ring's accent color bleeds into the
+    // corners we sample and confounds the clip check.
+    config.layout.focus_ring.off = true;
+    config.layout.border.off = true;
+    config.window_rules.push(WindowRule {
+        geometry_corner_radius: Some(CornerRadius::from(CLIP_RADIUS)),
+        clip_to_geometry: Some(true),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // A real shm-textured window (not a single-pixel solid buffer): a solid buffer renders as a
+    // SolidColorRenderElement (the SolidColor arm, never clipped), while a textured buffer renders
+    // as a WaylandSurfaceRenderElement — the arm the clip closure actually rounds.
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    Some(f)
+}
+
+const CLIP_RADIUS: f32 = 30.;
+
+/// The clip material must both **sample** the window (rounded corners are not blank) and **round**
+/// it (the geometry corners are cut away), matching the GLES oracle. This drives the full
+/// `Niri::render_to_vec` scene — a green window with a corner radius + `clip-to-geometry` — through
+/// both renderers and asserts, without pixel-exact AA comparison, that: the window center is green
+/// (sampled), the corners of the green region are **not** green (rounded away to the backdrop), and
+/// the mid-edges **are** green (only the corners were cut — it is rounding, not a full clip).
+#[test]
+fn vulkan_clips_a_window_to_rounded_geometry() {
+    let Some(mut f) = clipped_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+
+    // The tight bounding box of the green (window) pixels.
+    let green_bbox = |pixels: &[u8], w: i32, h: i32| -> (i32, i32, i32, i32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, -1, -1);
+        for y in 0..h {
+            for x in 0..w {
+                if is_green(px(pixels, w, x, y)) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        assert!(x1 >= 0, "the mapped green window is absent from the frame");
+        (x0, y0, x1, y1)
+    };
+
+    let check = |name: &str, pixels: &[u8], w: i32, h: i32| {
+        let (x0, y0, x1, y1) = green_bbox(pixels, w, h);
+        let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+
+        // Center is green — the clip pipeline sampled the window (not blanked).
+        assert!(
+            is_green(px(pixels, w, cx, cy)),
+            "{name}: window center ({cx},{cy}) is not green — the clip blanked the surface"
+        );
+
+        // The four extreme corners of the green box are rounded away (a corner radius of 30 cuts
+        // the corner pixel well outside the quarter-circle), so they show the backdrop, not
+        // the window.
+        for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+            assert!(
+                !is_green(px(pixels, w, x, y)),
+                "{name}: geometry corner ({x},{y}) is still green — not clipped/rounded (square \
+                 corners)"
+            );
+        }
+
+        // The mid-edges reach the box extremes — only the corners were cut, proving rounding rather
+        // than a wholesale clip. (Sample a few px inside the edge to dodge AA at the very border.)
+        assert!(
+            is_green(px(pixels, w, cx, y0 + 2)) && is_green(px(pixels, w, x0 + 2, cy)),
+            "{name}: mid-edges are not green — the window was over-clipped"
+        );
+        (x0, y0, x1, y1)
+    };
+
+    let (vk, vw, vh) = render_output_vulkan(&mut f, &output);
+    let (gl, gw, gh) = render_output_gles(&mut f, &output);
+    assert_eq!((vw, vh), (gw, gh), "readback dimensions differ");
+
+    // Print both before asserting, so a failure shows the oracle side too.
+    let gbox = check("gles", &gl, gw, gh);
+    let vbox = check("vulkan", &vk, vw, vh);
+
+    // Oracle agreement: the clipped window lands at the same place and size on both renderers (a
+    // few px of AA slack on the rounded edges).
+    for (v, g) in [
+        (vbox.0, gbox.0),
+        (vbox.1, gbox.1),
+        (vbox.2, gbox.2),
+        (vbox.3, gbox.3),
+    ] {
+        assert!(
+            (v - g).abs() <= 2,
+            "clipped window bbox disagrees with the GLES oracle: vulkan={vbox:?} gles={gbox:?}"
+        );
+    }
+    eprintln!("vulkan_clips_a_window_to_rounded_geometry: bbox vulkan={vbox:?} gles={gbox:?}");
+}
+
+/// A clipped window must render correctly through an outer placement wrapper. The overview draws
+/// every window through a `RelocateRenderElement<RescaleRenderElement<…>>`, which forwards a
+/// rescaled/relocated `dst` (smithay `element/utils/elements.rs`) to the inner clipped surface. The
+/// clip's `input_to_geo` is built from the element's **creation-space** geometry, not that `dst`,
+/// so the zoomed-out window still samples and rounds correctly. This exercises exactly that
+/// wrapped- clip path on Vulkan: open the overview and assert the clipped window renders at its
+/// zoomed-out overview slot (green content present, and smaller than the full-size desktop window —
+/// i.e. it is the wrapped render, not the desktop showing through).
+#[test]
+fn vulkan_clips_a_window_through_the_overview_wrapper() {
+    let Some(mut f) = clipped_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the overview must be open"
+    );
+    f.niri_complete_animations();
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // The overview dims windows to ~[40,65,40], so match green-dominant (not bright-green): any
+    // pixel where green clearly leads red/blue is the (dimmed) window content vs the gray backdrop.
+    let is_green =
+        |p: [u8; 4]| p[1] as i32 > p[0] as i32 + 15 && p[1] as i32 > p[2] as i32 + 15 && p[1] > 45;
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, -1, -1);
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .inspect(|i| {
+            let (x, y) = (i % w, i / w);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        })
+        .count();
+    eprintln!(
+        "vulkan_clips_a_window_through_the_overview_wrapper: {green} green px bbox=({x0},{y0})..({x1},{y1})"
+    );
+    // Present (the wrapped clip sampled the window, not blanked)...
+    assert!(
+        green > 200,
+        "the clipped window did not render through the overview's rescale/relocate wrapper: \
+         {green} green px"
+    );
+    // ...and zoomed out (smaller than the WIN×WIN desktop window), proving it is the wrapped
+    // overview render rather than the unwrapped desktop window showing through.
+    assert!(
+        (x1 - x0) < WIN as i32 && (y1 - y0) < WIN as i32,
+        "the green region ({}×{}) is not zoomed out — not the overview's wrapped render",
+        x1 - x0,
+        y1 - y0,
+    );
 }

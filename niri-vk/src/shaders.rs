@@ -20,6 +20,14 @@ pub const ROUNDED_TEX_FRAG: &[u8] =
 /// a cutoff band — niri's `GradientFadeTextureRenderElement`).
 pub const GRADIENT_FADE_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gradient_fade.frag.spv"));
+/// Clipped-surface fragment stage (sample a `sampler2D` via the folded `tex_transform`, then clip
+/// to a rounded rectangle in a general `input_to_geo` geometry space — niri's
+/// `ClippedSurfaceRenderElement`, the window rounded-corner / clip-to-geometry path). Declares the
+/// `ClippedTexturePush` block; blends straight-alpha (attenuates only the alpha). Unlike
+/// `POSTPROCESS_FRAG`, sampling goes through `tex_transform`, so a y-flipped or buffer-transformed
+/// client surface samples correctly.
+pub const CLIPPED_TEX_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/clipped_texture.frag.spv"));
 /// Border material vertex + fragment stages (angled gradient clipped to a rounded-rect ring —
 /// niri's `BorderRenderElement`). Both stages declare the `BorderPush` block; the fragment outputs
 /// premultiplied color.

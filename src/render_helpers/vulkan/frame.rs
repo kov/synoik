@@ -2,7 +2,9 @@ use std::fmt;
 
 use ash::vk;
 use glam::{Mat3, Vec2, Vec3};
-use niri_vk::render::{as_bytes, BorderPush, PostprocessPush, QuadPush, ResizePush, ShadowPush};
+use niri_vk::render::{
+    as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
+};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
@@ -12,6 +14,26 @@ use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
 use super::types::{VkFramebuffer, VkTexture};
+
+/// The clip a [`ClippedSurfaceRenderElement`](crate::render_helpers::clipped_surface) wants applied
+/// to the surface it is about to draw. Set on the frame (via [`VulkanFrame::set_clip_override`])
+/// before the inner `WaylandSurfaceRenderElement` draws, so [`VulkanFrame::render_texture_from_to`]
+/// — the single sampling entry point Smithay routes that surface through — swaps to the clipped
+/// pipeline and folds in the clip. The owned-renderer analogue of GLES's
+/// `GlesFrame::override_default_tex_program`. Cleared right after.
+///
+/// `input_to_geo` maps `v_uv` (0..1 across the quad) to `[0, 1]` geometry space, packed as 3 `vec4`
+/// columns (`.xyz` used). It is built by the element from **creation-space** quantities (not the
+/// draw-time `dst`), so it is invariant under a `RescaleRenderElement`/`RelocateRenderElement`
+/// wrapping the clipped element. `geo_size` is the **logical** geometry size (the rounding
+/// coordinate space, matching GLES `ClippedSurfaceRenderElement::compute_uniforms`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClipParams {
+    pub input_to_geo: [[f32; 4]; 3],
+    pub geo_size: [f32; 2],
+    pub corner_radius: [f32; 4],
+    pub niri_scale: f32,
+}
 
 /// An in-progress render into a bound [`VkFramebuffer`]. Records draws into one command buffer
 /// begun in [`VulkanFrame::begin`] and submitted (synchronously, fence-waited) in
@@ -40,6 +62,10 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// sampled by the in-flight GPU work (a use-after-free that segfaults on lavapipe).
     /// `finish` fence-waits, so releasing these when the frame drops (after `finish`) is safe.
     held: Vec<VkTexture>,
+    /// A pending clip for the next surface draw (see [`ClipParams`]). While `Some`,
+    /// `render_texture_from_to` binds the clipped-surface pipeline instead of the plain texture
+    /// one.
+    clip_override: Option<ClipParams>,
     finished: bool,
 }
 
@@ -118,6 +144,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             logical_size: transform.transform_size(output_size),
             proj: ndc_transform(transform),
             held: Vec::new(),
+            clip_override: None,
             finished: false,
         })
     }
@@ -134,6 +161,80 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// draw that samples it can't outlive the source element. Cheap: a ref-count bump.
     fn retain(&mut self, texture: &VkTexture) {
         self.held.push(texture.clone());
+    }
+
+    /// Arm (or clear) a clip for the next surface draw. `ClippedSurfaceRenderElement`'s Vulkan draw
+    /// sets this, draws its inner `WaylandSurfaceRenderElement` (which routes through
+    /// `render_texture_from_to`), then clears it. See [`ClipParams`].
+    pub(crate) fn set_clip_override(&mut self, clip: Option<ClipParams>) {
+        self.clip_override = clip;
+    }
+
+    /// Draw `texture` (from `src`) into `dst`, clipped to `clip`'s rounded geometry — the owned-
+    /// renderer port of niri's `ClippedSurfaceRenderElement` GLES draw (window rounded corners /
+    /// clip-to-geometry). Reached from [`render_texture_from_to`](Frame::render_texture_from_to)
+    /// when a clip is armed. Samples through the same `tex_transform` as the plain texture path (so
+    /// a partial `src`, buffer rotation/flip, and y-invert are handled), then masks the result.
+    ///
+    /// `dst` is used only for placement (via the shared quad vertex + `proj`); the clip mask uses
+    /// the element-supplied [`ClipParams::input_to_geo`] (built from creation-space geometry), so
+    /// it is correct even when an outer `RescaleRenderElement`/`RelocateRenderElement` has
+    /// transformed `dst`, and — acting on the quad coordinate, not the sampled UV or the
+    /// post-`proj` position — independent of both the buffer transform and the output
+    /// transform.
+    fn render_clipped_texture(
+        &mut self,
+        texture: &VkTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        src_transform: Transform,
+        alpha: f32,
+        clip: ClipParams,
+    ) -> Result<(), VulkanError> {
+        let push = ClippedTexturePush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            corner_radius: 0.0,
+            _pad0: 0.0,
+            // clipped_texture.frag multiplies the sample by this, so white-with-alpha modulates
+            // alpha (and, being straight-alpha, fades the AA edge to the destination).
+            color: [1.0, 1.0, 1.0, alpha],
+            tex_transform: build_tex_transform(src, texture, src_transform),
+            geo_size: clip.geo_size,
+            _pad1: [0.0, 0.0],
+            clip_corner_radius: clip.corner_radius,
+            // Built by the element from creation-space geometry, so `dst` (possibly rescaled/
+            // relocated by an outer wrapper) is used only for placement, never for the clip.
+            input_to_geo: clip.input_to_geo,
+            niri_scale: clip.niri_scale,
+            _pad2: [0.0, 0.0, 0.0],
+        };
+        self.retain(texture);
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.clipped_texture_pipeline;
+        let set = texture.descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+        }
+        Ok(())
     }
 
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
@@ -1045,6 +1146,13 @@ impl Frame for VulkanFrame<'_, '_> {
         // `tex_transform`, so there is no unsupported case left to skip.
         if src.size.w <= 0.0 || src.size.h <= 0.0 || texture.width() == 0 || texture.height() == 0 {
             return Ok(());
+        }
+
+        // A `ClippedSurfaceRenderElement` armed a clip for this surface: swap to the
+        // clipped-surface pipeline, which samples through the same `tex_transform` but
+        // masks the result to a rounded geometry. See `render_clipped_texture`.
+        if let Some(clip) = self.clip_override {
+            return self.render_clipped_texture(texture, src, dst, src_transform, alpha, clip);
         }
 
         let push = QuadPush {

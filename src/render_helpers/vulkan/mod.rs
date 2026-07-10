@@ -26,6 +26,7 @@ mod types;
 
 pub(crate) use backdrop_blur::BackdropBlur;
 pub use error::VulkanError;
+pub(crate) use frame::ClipParams;
 pub use frame::VulkanFrame;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub use types::{VkMapping, VkTexture};

@@ -18,7 +18,9 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    /// The GLES clip shader, carried for the GLES/Tty draw. `None` on the owned Vulkan renderer,
+    /// which clips in its own pipeline (`clipped_texture.frag`) and needs no GLES program.
+    program: Option<GlesTexProgram>,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -40,7 +42,27 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
     ) -> Self {
         Self {
             inner: elem,
-            program,
+            program: Some(program),
+            corner_radius,
+            geometry,
+            scale: scale.x as f32,
+        }
+    }
+
+    /// Build a clipped-surface element for the owned Vulkan renderer, which clips in its own
+    /// pipeline (`clipped_texture.frag`) and needs no GLES program. Same clip geometry / radius as
+    /// [`Self::new`]; the Vulkan `RenderElement` draw folds them into the pipeline's push
+    /// constants.
+    #[cfg(feature = "vulkan")]
+    pub fn new_vulkan(
+        elem: WaylandSurfaceRenderElement<R>,
+        scale: Scale<f64>,
+        geometry: Rectangle<f64, Logical>,
+        corner_radius: CornerRadius,
+    ) -> Self {
+        Self {
+            inner: elem,
+            program: None,
             corner_radius,
             geometry,
             scale: scale.x as f32,
@@ -238,7 +260,11 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
+        let program = self
+            .program
+            .clone()
+            .expect("a GLES clipped-surface element always carries its program");
+        frame.override_default_tex_program(program, self.compute_uniforms());
         RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
@@ -271,9 +297,13 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        let program = self
+            .program
+            .clone()
+            .expect("a GLES clipped-surface element always carries its program");
         frame
             .as_gles_frame()
-            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
+            .override_default_tex_program(program, self.compute_uniforms());
         RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache)?;
         frame.as_gles_frame().clear_tex_program_override();
         Ok(())
@@ -285,6 +315,83 @@ impl<'render> RenderElement<TtyRenderer<'render>>
     ) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
+        None
+    }
+}
+
+// The owned Vulkan renderer clips the surface in its own `clipped_texture` pipeline (M3): the draw
+// arms the clip on the frame, then draws the inner `WaylandSurfaceRenderElement`, whose sampling
+// (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline. Mirrors the GLES
+// `override_default_tex_program` mechanism. The `GlesTexture`-carrying specializations keep the
+// GLES/Tty impls above.
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{ClipParams, VulkanError, VulkanFrame, VulkanRenderer};
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement<VulkanRenderer> {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        let scale = Scale::from(f64::from(self.scale));
+        // Build `input_to_geo` from *creation-space* quantities, never the draw-time `dst`: the
+        // element can be wrapped in a `RescaleRenderElement` / `RelocateRenderElement` (overview
+        // zoom, MRU thumbnails, snapshot/offscreen renders, region screencasts) that transforms
+        // `dst` but not `self.inner`/`self.geometry`. `v_uv` (0..1 across the quad) spans the
+        // element's content, so mapping it to `[0, 1]` geometry space via `elem_geo → geo` (both
+        // creation-space physical) is invariant under those wrappers — exactly why GLES's
+        // `compute_uniforms` derives its `input_to_geo` from `self.inner.geometry(scale)`, not
+        // `dst`. The buffer transform / y-invert stay in the sampling `tex_transform`, so
+        // this geometric mapping needs only a scale + translate (no rotation/flip terms).
+        let elem_geo: Rectangle<i32, Physical> = self.inner.geometry(scale);
+        let geo: Rectangle<i32, Physical> = self.geometry.to_physical_precise_round(scale);
+        let (gw, gh) = (geo.size.w as f32, geo.size.h as f32);
+        // Degenerate (zero-size) geometry would divide by zero; nothing is inside it, so skip the
+        // whole element (leaving the clip disarmed).
+        if gw <= 0. || gh <= 0. {
+            return Ok(());
+        }
+        // coords_geo = (elem_geo.loc + v_uv * elem_geo.size - geo.loc) / geo.size, packed as 3
+        // `vec4` columns (`.xyz` used) for the shader's `mat3(i2g...) * vec3(v_uv, 1)`.
+        let input_to_geo = [
+            [elem_geo.size.w as f32 / gw, 0., 0., 0.],
+            [0., elem_geo.size.h as f32 / gh, 0., 0.],
+            [
+                (elem_geo.loc.x - geo.loc.x) as f32 / gw,
+                (elem_geo.loc.y - geo.loc.y) as f32 / gh,
+                1.,
+                0.,
+            ],
+        ];
+        let clip = ClipParams {
+            input_to_geo,
+            // Logical geometry size = the rounding coordinate space (matches `compute_uniforms`).
+            geo_size: [self.geometry.size.w as f32, self.geometry.size.h as f32],
+            corner_radius: <[f32; 4]>::from(self.corner_radius),
+            niri_scale: self.scale,
+        };
+        // Arm the clip, draw the inner surface, then disarm unconditionally (even on error) so a
+        // later unclipped surface on the same frame isn't clipped by a stale override.
+        frame.set_clip_override(Some(clip));
+        let res = RenderElement::<VulkanRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        );
+        frame.set_clip_override(None);
+        res
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

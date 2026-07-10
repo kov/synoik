@@ -12,7 +12,6 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
-use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -65,7 +64,8 @@ macro_rules! degraded_vulkan_element {
 // The `VkTexture` specialization has a real (SDF-rounding) impl in `rounded_texture.rs`; the
 // `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.
 degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
-degraded_vulkan_element!(ClippedSurfaceRenderElement<VulkanRenderer>);
+// ClippedSurfaceRenderElement<VulkanRenderer> has a real Vulkan draw (clip via the clipped_texture
+// pipeline) in clipped_surface.rs.
 degraded_vulkan_element!(GradientFadeTextureRenderElement<GlesTexture>);
 // ResizeRenderElement has a real Vulkan draw (render_resize) in render_helpers/resize.rs.
 degraded_vulkan_element!(XrayElement);

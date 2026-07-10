@@ -6,12 +6,13 @@ use ash::vk;
 use niri_vk::blur::BlurChain;
 use niri_vk::gpu::Gpu;
 use niri_vk::render::{
-    load_module, sampler_set_layout, BorderPush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
-    COLOR_RANGE,
+    load_module, sampler_set_layout, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush,
+    ResizePush, ShadowPush, COLOR_RANGE,
 };
 use niri_vk::shaders::{
-    BORDER_FRAG, BORDER_VERT, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT,
-    RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
+    BORDER_FRAG, BORDER_VERT, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG,
+    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG,
+    SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
@@ -65,6 +66,7 @@ pub struct VulkanRenderer {
     pub(super) solid_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
+    pub(super) clipped_texture_pipeline: Pipeline,
     pub(super) gradient_fade_pipeline: Pipeline,
     pub(super) border_pipeline: Pipeline,
     pub(super) shadow_pipeline: Pipeline,
@@ -148,6 +150,17 @@ impl VulkanRenderer {
             quad_push,
             false,
         )?;
+        // Clipped-surface: samples a texture (set 0) and clips it to a rounded geometry. Like the
+        // texture material it blends straight-alpha (attenuates only the alpha for the AA edge).
+        let clipped_texture_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            CLIPPED_TEX_FRAG,
+            sampler,
+            std::mem::size_of::<ClippedTexturePush>() as u32,
+            false,
+        )?;
         let gradient_fade_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -211,6 +224,7 @@ impl VulkanRenderer {
             solid_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
+            clipped_texture_pipeline,
             gradient_fade_pipeline,
             border_pipeline,
             shadow_pipeline,

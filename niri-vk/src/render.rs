@@ -70,6 +70,54 @@ pub const IDENTITY_TEX_TRANSFORM: [[f32; 4]; 3] = [
     [0.0, 0.0, 1.0, 0.0],
 ];
 
+/// Push constants for the clipped-surface material (`quad.vert`/`clipped_texture.frag`) — the
+/// window rounded-corner / clip-to-geometry path (niri's `ClippedSurfaceRenderElement`). The
+/// leading fields through `tex_transform` mirror [`QuadPush`] byte-for-byte (so the shared
+/// `quad.vert` places the quad and the sampling matches `texture.frag`); the tail carries the clip:
+/// `geo_size` (logical geometry size, the rounding coordinate space), `clip_corner_radius` (per-
+/// corner radii, logical px), `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry
+/// space, passed as three `vec4` columns — the shader reads `.xyz`), and `niri_scale` (edge AA).
+/// 208 bytes — equal to the largest built-in ([`PostprocessPush`]); the renderer's push-budget
+/// guard already covers it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ClippedTexturePush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    /// Output-transform 2×2 (see [`QuadPush::proj`]).
+    pub proj: [f32; 4],
+    pub target: [f32; 2],
+    /// Unused SDF scalar; kept only so the block offsets match the shared vertex stage.
+    pub corner_radius: f32,
+    pub _pad0: f32,
+    /// Straight-alpha tint `[1, 1, 1, alpha]` (see [`QuadPush::color`]).
+    pub color: [f32; 4],
+    /// Sampling transform (see [`QuadPush::tex_transform`]).
+    pub tex_transform: [[f32; 4]; 3],
+    /// Logical geometry size in pixels (the rounding coordinate space).
+    pub geo_size: [f32; 2],
+    pub _pad1: [f32; 2],
+    /// Per-corner radii in logical pixels: `[top_left, top_right, bottom_right, bottom_left]`.
+    pub clip_corner_radius: [f32; 4],
+    /// `input_to_geo` as 3 column vectors (`.xyz` used); build from a `glam::Mat3`'s columns.
+    pub input_to_geo: [[f32; 4]; 3],
+    pub niri_scale: f32,
+    pub _pad2: [f32; 3],
+}
+
+// The Rust layout must match the GLSL std430 `Push` block byte-for-byte; catch drift at compile
+// time (offsets: proj@16, color@48, tex_transform@64/80/96, geo_size@112, clip_corner_radius@128,
+// input_to_geo@144/160/176, niri_scale@192).
+const _: () = {
+    assert!(std::mem::size_of::<ClippedTexturePush>() == 208);
+    assert!(std::mem::offset_of!(ClippedTexturePush, color) == 48);
+    assert!(std::mem::offset_of!(ClippedTexturePush, tex_transform) == 64);
+    assert!(std::mem::offset_of!(ClippedTexturePush, geo_size) == 112);
+    assert!(std::mem::offset_of!(ClippedTexturePush, clip_corner_radius) == 128);
+    assert!(std::mem::offset_of!(ClippedTexturePush, input_to_geo) == 144);
+    assert!(std::mem::offset_of!(ClippedTexturePush, niri_scale) == 192);
+};
+
 /// Push constants for the border material (`border.vert`/`border.frag`). `repr(C)` field order is
 /// chosen so each member lands at its natural std430 offset (all `vec4`s at 16-aligned offsets),
 /// matching the GLSL block exactly. 152 bytes (well under the 256-byte push limit).
