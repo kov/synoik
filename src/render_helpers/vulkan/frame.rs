@@ -66,6 +66,13 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// `render_texture_from_to` binds the clipped-surface pipeline instead of the plain texture
     /// one.
     clip_override: Option<ClipParams>,
+    /// Physical-framebuffer rects this frame actually touched (every `clear` rect and every draw's
+    /// scissor rects). On the present-blit path their union is exactly the age-N damage
+    /// `DrmCompositor` rendered into the shadow, so `record_present_blit` copies only these
+    /// regions shadow→dmabuf instead of the whole frame — the cycled dmabuf already holds the
+    /// rest from its own age-N-ago presentation. Empty (e.g. a clear-only frame that cleared
+    /// nothing) falls back to a whole-frame blit. See [`Self::record_present_blit`].
+    present_damage: Vec<vk::Rect2D>,
     finished: bool,
 }
 
@@ -167,6 +174,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             proj: ndc_transform(transform),
             held: Vec::new(),
             clip_override: None,
+            present_damage: Vec::new(),
             finished: false,
         })
     }
@@ -195,13 +203,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// undamaged pixels and, because the damage tracker SKIPS undamaged elements above this one,
     /// erase their LOAD-preserved shadow content — the partial-damage blanking bug.
     fn damage_scissors(
-        &self,
+        &mut self,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Vec<vk::Rect2D> {
         let (fb_w, fb_h) = self.fb.buffer.extent();
         let bounds = Rectangle::from_size(dst.size);
-        damage
+        let scissors: Vec<vk::Rect2D> = damage
             .iter()
             .filter_map(|rect| {
                 // Clip the element-local damage to the element, then place it in output space.
@@ -221,7 +229,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     },
                 })
             })
-            .collect()
+            .collect();
+        // Record what this draw touches so the present-blit can copy only the damaged regions.
+        self.present_damage.extend_from_slice(&scissors);
+        scissors
     }
 
     /// Record the 6-vertex quad once per scissor rect, so a draw only touches the damaged pixels
@@ -1022,6 +1033,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// (`self.fb.buffer`, left in `TRANSFER_SRC_OPTIMAL` by the render pass) into it —
     /// `vkCmdBlitImage` converts component order, so RGBA lands as the BGRA bytes
     /// `Argb8888`/`Xrgb8888` scanout wants — then leave it in `GENERAL` for the display engine.
+    ///
+    /// Only the regions the frame actually touched are copied (see [`Self::present_damage`]): their
+    /// union is the age-N damage `DrmCompositor` rendered for this cycled dmabuf, so the dmabuf's
+    /// other pixels — its own age-N-ago presentation — are preserved (hence the barrier from the
+    /// dmabuf's *tracked* layout, not `UNDEFINED`). This drops the per-frame cost from a
+    /// full-screen blit to just the damage (e.g. a cursor move copies a couple of small rects,
+    /// not 1280×720).
+    ///
     /// (No queue-family-foreign ownership release: we CPU-wait for completion and the buffer is
     /// LINEAR, so the memory is coherent for KMS; a formal release would also block reading the
     /// result back on our own queue. Revisit if live scanout needs it.)
@@ -1040,9 +1059,69 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .base_array_layer(0)
             .layer_count(1);
 
+        // Copy only the regions this frame touched (`present_damage`); the cycled dmabuf already
+        // holds the rest from its own age-N-ago presentation. Clamp to the image and dedup exact
+        // duplicates (many elements can share one damage rect). An empty set (nothing
+        // drawn/cleared) falls back to a whole-frame copy.
+        let mut rects: Vec<vk::Rect2D> = self
+            .present_damage
+            .iter()
+            .filter_map(|r| {
+                let x0 = r.offset.x.max(0);
+                let y0 = r.offset.y.max(0);
+                let x1 = ((r.offset.x as i64) + r.extent.width as i64).min(w as i64) as i32;
+                let y1 = ((r.offset.y as i64) + r.extent.height as i64).min(h as i64) as i32;
+                (x1 > x0 && y1 > y0).then(|| vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                })
+            })
+            .collect();
+        rects.sort_unstable_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
+        rects.dedup_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
+        if rects.is_empty() {
+            rects.push(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: w,
+                    height: h,
+                },
+            });
+        }
+        let blits: Vec<vk::ImageBlit> = rects
+            .iter()
+            .map(|r| {
+                let x0 = r.offset.x;
+                let y0 = r.offset.y;
+                let x1 = x0 + r.extent.width as i32;
+                let y1 = y0 + r.extent.height as i32;
+                vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D { x: x0, y: y0, z: 0 },
+                        vk::Offset3D { x: x1, y: y1, z: 1 },
+                    ])
+                    .dst_subresource(layers)
+                    .dst_offsets([
+                        vk::Offset3D { x: x0, y: y0, z: 0 },
+                        vk::Offset3D { x: x1, y: y1, z: 1 },
+                    ])
+            })
+            .collect();
+
+        // Preserve the dmabuf's existing content (its own last presentation) OUTSIDE the blitted
+        // regions: transition from its TRACKED layout, not `UNDEFINED` (which would discard it and
+        // reintroduce blanking under a partial copy). The first time a given scanout buffer is used
+        // its tracked layout is `UNDEFINED`, which coincides with the age-0 full-damage frame that
+        // copies the whole shadow anyway.
+        let old_layout = present.layout();
+
         unsafe {
             let to_dst = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(old_layout)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1060,32 +1139,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 std::slice::from_ref(&to_dst),
             );
 
-            let blit = vk::ImageBlit::default()
-                .src_subresource(layers)
-                .src_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: w as i32,
-                        y: h as i32,
-                        z: 1,
-                    },
-                ])
-                .dst_subresource(layers)
-                .dst_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: w as i32,
-                        y: h as i32,
-                        z: 1,
-                    },
-                ]);
             dev.cmd_blit_image(
                 self.cbuf,
                 self.fb.buffer.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 present.image(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&blit),
+                &blits,
                 // Same size, so nearest is exact (and avoids a LINEAR-filter format check).
                 vk::Filter::NEAREST,
             );
@@ -1215,6 +1275,9 @@ impl Frame for VulkanFrame<'_, '_> {
                 }
             })
             .collect();
+        // Record the cleared regions so the present-blit copies them (they are the non-opaque part
+        // of the frame's damage; the draws cover the rest).
+        self.present_damage.extend(rects.iter().map(|r| r.rect));
         unsafe {
             self.renderer.gpu.device.cmd_clear_attachments(
                 self.cbuf,
