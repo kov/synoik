@@ -938,6 +938,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.target = self.target_dims();
+        push.proj = self.proj;
 
         self.retain(tex_prev);
         self.retain(tex_next);
@@ -998,6 +999,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.target = self.target_dims();
+        push.proj = self.proj;
 
         self.retain(texture);
         let Some(pipe) = self.renderer.custom_pipeline(ty) else {

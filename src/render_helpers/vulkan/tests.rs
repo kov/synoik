@@ -1468,6 +1468,125 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
     );
 }
 
+/// The custom-shader vertex stage rotates placement into a rotated output via `pc.proj` (the same
+/// `mat2(proj)` convention as `quad.vert`). Draw a solid-green close shader over the **logical
+/// left-half** rect under every output transform: dimension-*preserving* transforms
+/// (Normal/180/Flipped/Flipped180) keep it a LEFT|RIGHT (vertical) split, while
+/// dimension-*swapping* ones (90/270 and their flips) turn the tall rect into a TOP|BOTTOM
+/// (horizontal) split. Probing the four quadrant centers, the split axis must flip exactly for the
+/// swapping transforms — which only holds if `proj` is applied. Without it, every transform would
+/// keep the vertical split and the swapping-transform assertions fail. (Square target, so logical
+/// == physical dims for all.)
+#[test]
+fn vulkan_custom_shader_placement_follows_output_transform() {
+    use smithay::utils::Transform;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_custom_shader_placement_follows_output_transform: no Vulkan \
+                 device ({e})"
+            );
+            return;
+        }
+    };
+
+    // Ignores its inputs and paints solid green — placement is the whole point here.
+    let snippet = "\
+vec4 close_color(vec3 coords_geo, vec3 size_geo) {
+    return vec4(0.0, 1.0, 0.0, 1.0);
+}";
+    vk.set_custom_shader(CustomShaderType::Close, Some(snippet))
+        .expect("compile custom close snippet");
+
+    // One sampler set must be bound even though the snippet ignores it.
+    let dummy = vk
+        .import_memory(
+            &solid_texels([10, 20, 30, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import dummy");
+
+    let is_green = |p: [u8; 4]| p[1] > 150 && p[0] < 100 && p[2] < 100;
+
+    let transforms = [
+        (Transform::Normal, false),
+        (Transform::_180, false),
+        (Transform::Flipped, false),
+        (Transform::Flipped180, false),
+        (Transform::_90, true),
+        (Transform::_270, true),
+        (Transform::Flipped90, true),
+        (Transform::Flipped270, true),
+    ];
+
+    for (transform, swaps) in transforms {
+        let size = Size::<i32, Physical>::from((W, H));
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+            .expect("offscreen");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, transform).expect("render");
+            frame
+                .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+                .expect("clear");
+            // Logical left-half: a tall (W/2 × H) rect anchored at the origin.
+            let dst = Rectangle::<i32, Physical>::new((0, 0).into(), (W / 2, H).into());
+            let push = CustomAnimPush {
+                geo_size: [(W / 2) as f32, H as f32],
+                input_to_geo: [1.0, 1.0, 0.0, 0.0],
+                geo_to_tex: [1.0, 1.0, 0.0, 0.0],
+                alpha: 1.0,
+                scale: 1.0,
+                ..Default::default()
+            };
+            frame
+                .render_custom_anim(
+                    CustomShaderType::Close,
+                    &dummy,
+                    dst,
+                    &[Rectangle::from_size(dst.size)],
+                    push,
+                )
+                .expect("draw custom close");
+            let _sync = frame.finish().expect("finish");
+        }
+
+        let fb = vk.bind(&mut target).expect("rebind for readback");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+        // Quadrant centers: A top-left, B top-right, C bottom-left, D bottom-right.
+        let a = is_green(px(&pixels, W / 4, H / 4));
+        let b = is_green(px(&pixels, 3 * W / 4, H / 4));
+        let c = is_green(px(&pixels, W / 4, 3 * H / 4));
+        let d = is_green(px(&pixels, 3 * W / 4, 3 * H / 4));
+
+        if swaps {
+            // Horizontal split: top row uniform, bottom row uniform, the two rows differ.
+            assert!(
+                a == b && c == d && a != c,
+                "{transform:?}: swapping transform should give a TOP|BOTTOM split \
+                 (A={a} B={b} C={c} D={d})",
+            );
+        } else {
+            // Vertical split: left column uniform, right column uniform, the two columns differ.
+            assert!(
+                a == c && b == d && a != b,
+                "{transform:?}: preserving transform should give a LEFT|RIGHT split \
+                 (A={a} B={b} C={c} D={d})",
+            );
+        }
+    }
+}
+
 /// A user **open** snippet: samples the snapshot texture and uses the *unclamped* `niri_progress`
 /// (which can overshoot [0,1] under spring animation) distinctly from `niri_clamped_progress`.
 /// Proves the open entry point, single-texture sampling through the shim, and that progress is

@@ -49,10 +49,15 @@ pub(crate) enum CustomShaderType {
 /// Push constants for a custom **resize** shader. Mirrors niri's resize uniform set; the five
 /// transform matrices are affine-diagonal, each packed as `vec4 [sx, sy, tx, ty]`. Field order is
 /// the std430 layout the assembled GLSL push block declares (all `vec4`s land on 16-byte
-/// boundaries because the four leading `vec2`s sum to 32). 148 bytes.
+/// boundaries because `proj` is 16 bytes and the four following `vec2`s sum to 32). 164 bytes.
+///
+/// `proj` leads the block (matching `quad.vert`/`resize.vert`) so the shared vertex stage can
+/// rotate placement into a rotated output; prepending keeps every `vec4` 16-aligned so std430 and
+/// `#[repr(C)]` agree at every offset (appending after the trailing scalars would skew them).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CustomResizePush {
+    pub proj: [f32; 4],
     pub origin: [f32; 2],
     pub size: [f32; 2],
     pub target: [f32; 2],
@@ -70,10 +75,13 @@ pub(crate) struct CustomResizePush {
     pub scale: f32,
 }
 
-/// Push constants for a custom **close** or **open** shader (one snapshot texture). 84 bytes.
+/// Push constants for a custom **close** or **open** shader (one snapshot texture). 100 bytes.
+/// `proj` leads the block (see [`CustomResizePush`]) so the shared vertex stage rotates placement
+/// into a rotated output.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CustomAnimPush {
+    pub proj: [f32; 4],
     pub origin: [f32; 2],
     pub size: [f32; 2],
     pub target: [f32; 2],
@@ -204,13 +212,16 @@ void main() {
     vec2 c = niri_corner(gl_VertexIndex);
     niri_v_coords = c;
     vec2 p = pc.origin + c * pc.size;
+    // Ortho into y-down NDC (logical space), then rotate into the physical framebuffer via the
+    // output-transform 2x2 in pc.proj (same convention as quad.vert / resize.vert).
     vec2 ndc = p / pc.target * 2.0 - 1.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(mat2(pc.proj) * ndc, 0.0, 1.0);
 }
 ";
 
 const RESIZE_PUSH_BLOCK: &str = "\
 layout(push_constant) uniform Push {
+    vec4 proj;
     vec2 origin;
     vec2 size;
     vec2 target;
@@ -231,6 +242,7 @@ layout(push_constant) uniform Push {
 
 const ANIM_PUSH_BLOCK: &str = "\
 layout(push_constant) uniform Push {
+    vec4 proj;
     vec2 origin;
     vec2 size;
     vec2 target;
@@ -469,8 +481,11 @@ mod unit {
 
     #[test]
     fn push_structs_have_the_documented_sizes() {
-        assert_eq!(std::mem::size_of::<CustomResizePush>(), 148);
-        assert_eq!(std::mem::size_of::<CustomAnimPush>(), 84);
+        // The GLSL push blocks (std430) and these `#[repr(C)]` structs must agree byte-for-byte.
+        // `proj` leads both blocks so every `vec4` stays 16-aligned and the two layout systems
+        // never disagree; a reorder that reintroduces padding skew changes these sizes.
+        assert_eq!(std::mem::size_of::<CustomResizePush>(), 164);
+        assert_eq!(std::mem::size_of::<CustomAnimPush>(), 100);
     }
 
     #[test]
