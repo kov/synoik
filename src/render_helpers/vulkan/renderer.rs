@@ -55,6 +55,13 @@ pub struct VulkanRenderer {
     pub(super) gpu: Arc<Gpu>,
     context_id: ContextId<VkTexture>,
     pub(super) render_pass: vk::RenderPass,
+    /// A render pass **compatible** with [`Self::render_pass`] (same attachment format/samples and
+    /// single subpass, so the same pipelines bind) but with `load_op = LOAD` and
+    /// `initial_layout = TRANSFER_SRC_OPTIMAL`: the pass a [`VulkanFrame`] restarts on after a
+    /// mid-frame capture (`VulkanFrame::capture_region`). Preserves what was drawn before the
+    /// capture instead of discarding it, so framebuffer effects (backdrop blur) can grab the
+    /// scene-so-far and keep compositing on top of it.
+    pub(super) continuation_render_pass: vk::RenderPass,
     pub(super) solid_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
@@ -99,6 +106,7 @@ impl VulkanRenderer {
 
     fn with_gpu(gpu: Arc<Gpu>) -> Result<Self, VulkanError> {
         let render_pass = create_render_pass(&gpu.device)?;
+        let continuation_render_pass = create_continuation_render_pass(&gpu.device)?;
         let sampler_set_layout = sampler_set_layout(&gpu)?;
         let quad_push = std::mem::size_of::<QuadPush>() as u32;
         let sampler = std::slice::from_ref(&sampler_set_layout);
@@ -189,6 +197,7 @@ impl VulkanRenderer {
             gpu,
             context_id: ContextId::new(),
             render_pass,
+            continuation_render_pass,
             solid_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
@@ -630,6 +639,7 @@ impl Drop for VulkanRenderer {
             }
             dev.destroy_descriptor_set_layout(self.sampler_set_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
+            dev.destroy_render_pass(self.continuation_render_pass, None);
             dev.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -1065,6 +1075,45 @@ impl ExportMem for VulkanRenderer {
     }
 }
 
+/// The subpass dependencies shared by [`create_render_pass`] and
+/// [`create_continuation_render_pass`]. They **must be byte-identical** between the two passes:
+/// render-pass compatibility (Vulkan spec §8.2, and enforced field-by-field by the validation
+/// layers) requires matching subpass dependencies, and the continuation pass relies on being
+/// compatible with the base pass so pipelines built against the base pass bind in it. Building both
+/// from this one helper is what guarantees they can't drift apart.
+///
+/// The masks are the union of what either pass needs:
+/// - EXTERNAL→0 also orders a preceding capture blit (`VulkanFrame::capture_region`, `TRANSFER` /
+///   `TRANSFER_READ`) and the continuation pass's `LOAD` (`COLOR_ATTACHMENT_READ`) before this
+///   pass's color use. Widening these on the base pass (whose attachment starts `UNDEFINED`, first
+///   use) only enlarges the ordering scope — harmless.
+/// - 0→EXTERNAL makes color writes available to the following transfer read (the readback /
+///   present-blit, or the next capture blit).
+fn split_compatible_deps() -> [vk::SubpassDependency; 2] {
+    [
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
+            )
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::TRANSFER_READ,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::COLOR_ATTACHMENT_READ,
+            ),
+        vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+    ]
+}
+
 /// The offscreen render pass: one `R8G8B8A8_UNORM` color attachment, contents discarded on load
 /// (callers clear explicitly) and left in `TRANSFER_SRC_OPTIMAL` so [`ExportMem`] can read it back.
 fn create_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, VulkanError> {
@@ -1083,22 +1132,41 @@ fn create_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, VulkanError> 
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(std::slice::from_ref(&color_ref));
-    let deps = [
-        vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-        vk::SubpassDependency::default()
-            .src_subpass(0)
-            .dst_subpass(vk::SUBPASS_EXTERNAL)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-    ];
+    // Byte-identical to the continuation pass — see `split_compatible_deps`.
+    let deps = split_compatible_deps();
+    let ci = vk::RenderPassCreateInfo::default()
+        .attachments(std::slice::from_ref(&attachment))
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(&deps);
+    unsafe { dev.create_render_pass(&ci, None) }.map_err(VulkanError::from)
+}
+
+/// The **continuation** render pass used after a mid-frame capture (see
+/// [`VulkanRenderer::continuation_render_pass`] and `VulkanFrame::capture_region`). It is
+/// render-pass *compatible* with [`create_render_pass`] — identical attachment format/samples, a
+/// single one-color-attachment subpass, and (crucially) the same [`split_compatible_deps`], so
+/// every pipeline built against the base pass binds unchanged — but differs in the ops that don't
+/// affect compatibility: `load_op = LOAD` and `initial_layout = TRANSFER_SRC_OPTIMAL` (the capture
+/// leaves the target there), so the scene-so-far is preserved rather than discarded. `final_layout`
+/// stays `TRANSFER_SRC_OPTIMAL` so `finish`/readback/a further capture see the same layout the base
+/// pass produces.
+fn create_continuation_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, VulkanError> {
+    let attachment = vk::AttachmentDescription::default()
+        .format(IMAGE_VK_FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+    let color_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(std::slice::from_ref(&color_ref));
+    let deps = split_compatible_deps();
     let ci = vk::RenderPassCreateInfo::default()
         .attachments(std::slice::from_ref(&attachment))
         .subpasses(std::slice::from_ref(&subpass))

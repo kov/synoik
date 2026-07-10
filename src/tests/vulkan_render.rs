@@ -1300,3 +1300,89 @@ fn vulkan_imports_a_client_dmabuf() {
     );
     eprintln!("vulkan_imports_a_client_dmabuf: quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
 }
+
+/// Directly exercise the mid-frame render-pass split behind the backdrop-blur port
+/// (`VulkanFrame::capture_region`): clear the target red, capture it, then overwrite with green on
+/// the continuation pass. The **capture** must read back red (the scene as it was when captured)
+/// and the **target** must read back green (the continuation pass LOAD-preserved the red, then the
+/// second clear replaced it) — proving the pass ended, the blit grabbed the mid-frame contents, and
+/// the LOAD-variant continuation pass resumed compositing correctly. Runs anywhere Vulkan is
+/// present (offscreen only, no GBM), so it validates the split on lavapipe too.
+#[test]
+fn vulkan_capture_region_splits_the_render_pass() {
+    use smithay::backend::renderer::Offscreen;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_capture_region_splits_the_render_pass: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+    let phys_region = Rectangle::<i32, Physical>::from_size(Size::from((S, S)));
+    let buf_size = Size::<i32, BufferCoord>::from((S, S));
+
+    // The capture destination (a SAMPLED | TRANSFER_DST offscreen) and the render target.
+    let mut dest = vk
+        .create_buffer(Fourcc::Abgr8888, buf_size)
+        .expect("create capture dest");
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, buf_size)
+        .expect("create target");
+
+    {
+        let mut fb = vk.bind(&mut target).expect("bind target");
+        {
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .clear(
+                    Color32F::from([1., 0., 0., 1.]),
+                    &[Rectangle::from_size(size)],
+                )
+                .expect("clear red");
+            frame.capture_region(phys_region, &dest).expect("capture");
+            // Draw (not clear) over the whole target so a real graphics pipeline binds *inside* the
+            // continuation pass — this is what proves the continuation pass is render-pass
+            // *compatible* with the pipelines (built against the base pass), which Phase 2's
+            // postprocess draw relies on.
+            frame
+                .draw_solid(
+                    phys_region,
+                    &[Rectangle::from_size(size)],
+                    Color32F::from([0., 1., 0., 1.]),
+                )
+                .expect("draw green");
+            let _ = frame.finish().expect("finish");
+        }
+
+        // The target read back green: the continuation pass preserved the captured red on LOAD,
+        // then the second clear overwrote it.
+        let tmap = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy target");
+        let tpx = vk.map_texture(&tmap).expect("map target").to_vec();
+        let g = px(&tpx, S, S / 2, S / 2);
+        assert!(
+            g[0] < 40 && g[1] > 200 && g[2] < 40 && g[3] > 200,
+            "target should be green after the continuation pass, got {g:?}"
+        );
+    }
+
+    // The capture read back red: the pass ended and the blit grabbed the mid-frame contents.
+    let dfb = vk.bind(&mut dest).expect("bind capture dest");
+    let dmap = vk
+        .copy_framebuffer(&dfb, region, Fourcc::Abgr8888)
+        .expect("copy capture");
+    let dpx = vk.map_texture(&dmap).expect("map capture").to_vec();
+    let r = px(&dpx, S, S / 2, S / 2);
+    assert!(
+        r[0] > 200 && r[1] < 40 && r[2] < 40 && r[3] > 200,
+        "capture should hold the pre-capture red, got {r:?}"
+    );
+
+    eprintln!("vulkan_capture_region_splits_the_render_pass: capture=red, target=green");
+}

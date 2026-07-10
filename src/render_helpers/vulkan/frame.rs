@@ -13,7 +13,9 @@ use super::types::{VkFramebuffer, VkTexture};
 
 /// An in-progress render into a bound [`VkFramebuffer`]. Records draws into one command buffer
 /// begun in [`VulkanFrame::begin`] and submitted (synchronously, fence-waited) in
-/// [`Frame::finish`] / on drop.
+/// [`Frame::finish`] / on drop. A mid-frame [`capture_region`](Self::capture_region) flushes that
+/// command buffer and swaps in a fresh one (continuing on the LOAD-variant render pass), so `cbuf`
+/// is read afresh by every recording method rather than cached.
 pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
     fb: &'frame mut VkFramebuffer<'buffer>,
@@ -335,6 +337,215 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             );
             dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
         }
+        Ok(())
+    }
+
+    /// Capture the scene rendered so far into `dest` and continue the frame on top of it — the
+    /// owned-renderer equivalent of niri's GLES `FramebufferEffectElement::capture_framebuffer`
+    /// (a `glBlitFramebuffer` from the draw framebuffer into an intermediate). Used mid-frame by a
+    /// framebuffer effect (backdrop blur) to grab the backdrop before compositing over it.
+    ///
+    /// A render pass can't be a transfer source while it's active, so this **ends** the in-progress
+    /// pass (leaving the target in `TRANSFER_SRC_OPTIMAL`), scaled-blits the `src_region` sub-rect
+    /// of the target into the whole of `dest` (`LINEAR`, mirroring the GLES blit — the size may
+    /// differ, e.g. the overview zoom trick), leaves `dest` in `SHADER_READ_ONLY_OPTIMAL`, then
+    /// **flushes** (submits + fence-waits) and re-opens a fresh command buffer on the LOAD-variant
+    /// [`continuation pass`](VulkanRenderer::continuation_render_pass) so the preserved scene can
+    /// be drawn over. Flushing (rather than a same-cbuf barrier) keeps `dest` fully written
+    /// before the caller's blur — which runs on its own one-shot submission (`render_blur`) —
+    /// samples it, matching this renderer's synchronous per-submit model. `dest` must be a
+    /// `SAMPLED | TRANSFER_DST` offscreen (i.e. from [`Offscreen::create_buffer`]); its whole
+    /// extent is filled.
+    // Consumed by the live FramebufferEffectElement wiring (Stage 3); exercised now by the
+    // render-pass-split test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn capture_region(
+        &mut self,
+        src_region: Rectangle<i32, Physical>,
+        dest: &VkTexture,
+    ) -> Result<(), VulkanError> {
+        let (fb_w, fb_h) = self.fb.buffer.extent();
+        // Clamp the blit source to the target bounds (a framebuffer effect near an edge can have a
+        // geometry that spills off-screen).
+        let sx0 = src_region.loc.x.clamp(0, fb_w as i32);
+        let sy0 = src_region.loc.y.clamp(0, fb_h as i32);
+        let sx1 = (src_region.loc.x + src_region.size.w).clamp(0, fb_w as i32);
+        let sy1 = (src_region.loc.y + src_region.size.h).clamp(0, fb_h as i32);
+        let (d_w, d_h) = dest.extent();
+
+        // A fully off-screen effect clamps to an empty source rect (and a zero-size `dest` is
+        // degenerate): there is nothing to capture, so skip the split entirely — leaving the frame
+        // on its current pass and `dest` untouched. Mirrors GLES `capture_framebuffer` returning
+        // early on an empty clamp (its `draw` then finds no intermediate and composites nothing).
+        if sx1 <= sx0 || sy1 <= sy0 || d_w == 0 || d_h == 0 {
+            return Ok(());
+        }
+
+        let src_image = self.fb.buffer.image();
+        let dest_image = dest.image();
+        let framebuffer = self
+            .fb
+            .buffer
+            .framebuffer()
+            .expect("bound VkFramebuffer wraps an offscreen texture");
+        let continuation = self.renderer.continuation_render_pass;
+        let extent = vk::Extent2D {
+            width: fb_w,
+            height: fb_h,
+        };
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: fb_w as f32,
+            height: fb_h as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let old_cbuf = self.cbuf;
+        // Poison the frame across the flush + re-open: after `cmd_end_render_pass` (and especially
+        // after `free_command_buffers`) `old_cbuf` is no longer a valid recording target, so if any
+        // fallible step below returns early, `Drop`/`finish` must NOT try to end a pass on it.
+        // Cleared once `new_cbuf` is installed, making the frame live again.
+        self.finished = true;
+        let dev = &self.renderer.gpu.device;
+        let new_cbuf = unsafe {
+            dev.cmd_end_render_pass(old_cbuf);
+
+            // Capture destination: contents are fully overwritten by the blit, so discard from
+            // UNDEFINED. (Reused across frames — safe because `finish` fence-waits, so the previous
+            // frame's sampling of `dest` has completed before this frame records.)
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dest_image)
+                .subresource_range(range);
+            dev.cmd_pipeline_barrier(
+                old_cbuf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_dst),
+            );
+
+            // Scaled blit of the source sub-region into the whole destination. The ended pass's
+            // subpass→EXTERNAL dependency already made its color writes available to this
+            // TRANSFER_READ, so no extra barrier is needed on the source.
+            let blit = vk::ImageBlit::default()
+                .src_subresource(layers)
+                .src_offsets([
+                    vk::Offset3D {
+                        x: sx0,
+                        y: sy0,
+                        z: 0,
+                    },
+                    vk::Offset3D {
+                        x: sx1,
+                        y: sy1,
+                        z: 1,
+                    },
+                ])
+                .dst_subresource(layers)
+                .dst_offsets([
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D {
+                        x: d_w as i32,
+                        y: d_h as i32,
+                        z: 1,
+                    },
+                ]);
+            dev.cmd_blit_image(
+                old_cbuf,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dest_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&blit),
+                vk::Filter::LINEAR,
+            );
+
+            // Make the capture sampleable for the caller's blur/postprocess.
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dest_image)
+                .subresource_range(range);
+            dev.cmd_pipeline_barrier(
+                old_cbuf,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_read),
+            );
+
+            // Flush the capture so `dest` is fully written before the caller's separately-submitted
+            // blur samples it, then re-open a fresh command buffer on the continuation pass.
+            dev.end_command_buffer(old_cbuf)?;
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&old_cbuf));
+            dev.queue_submit(
+                self.renderer.gpu.queue,
+                std::slice::from_ref(&submit),
+                fence,
+            )?;
+            dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            dev.destroy_fence(fence, None);
+            dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&old_cbuf));
+
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.renderer.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let new_cbuf = dev.allocate_command_buffers(&alloc)?[0];
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let pass_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(continuation)
+                .framebuffer(framebuffer)
+                .render_area(render_area);
+            dev.begin_command_buffer(new_cbuf, &begin_info)?;
+            dev.cmd_begin_render_pass(new_cbuf, &pass_begin, vk::SubpassContents::INLINE);
+            dev.cmd_set_viewport(new_cbuf, 0, std::slice::from_ref(&viewport));
+            dev.cmd_set_scissor(new_cbuf, 0, std::slice::from_ref(&render_area));
+            new_cbuf
+        };
+
+        self.cbuf = new_cbuf;
+        // The frame is live again on the fresh command buffer.
+        self.finished = false;
+        // The ended base pass left the target in TRANSFER_SRC; the blit left `dest` sampleable.
+        // (The continuation pass restores the target to TRANSFER_SRC again at `finish`.)
+        self.fb
+            .buffer
+            .set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        dest.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
     }
 
