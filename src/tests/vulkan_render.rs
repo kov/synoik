@@ -507,6 +507,152 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     );
 }
 
+/// Import `pattern` (an `out_size`-shaped `Abgr8888` buffer... actually `tex`-shaped) as a texture
+/// with buffer transform `src_transform`, render it full-screen through `render_texture_from_to`
+/// at output transform `out_transform`, and return the four (inset) corner pixels of the readback.
+/// Generic so it drives GLES and the Vulkan renderer identically.
+#[cfg(feature = "vulkan")]
+fn buffer_transform_corners<R, T>(
+    renderer: &mut R,
+    pattern: &[u8],
+    tex: Size<i32, BufferCoord>,
+    out_size: Size<i32, Physical>,
+    src_transform: Transform,
+    out_transform: Transform,
+) -> [[u8; 4]; 4]
+where
+    R: Renderer<TextureId = T>
+        + smithay::backend::renderer::Offscreen<T>
+        + ExportMem
+        + smithay::backend::renderer::ImportMem,
+    T: smithay::backend::renderer::Texture + Clone + 'static,
+    R::Error: std::fmt::Debug + Send + Sync + 'static,
+{
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    let tb = TextureBuffer::from_memory(
+        renderer,
+        pattern,
+        Fourcc::Abgr8888,
+        tex,
+        false,
+        1.0,
+        src_transform,
+        Vec::new(),
+    )
+    .expect("import pattern");
+    let elem =
+        TextureRenderElement::from_texture_buffer(tb, (0., 0.), 1.0, None, None, Kind::Unspecified);
+    let pixels = render_to_vec(
+        renderer,
+        out_size,
+        Scale::from(1.0),
+        out_transform,
+        Fourcc::Abgr8888,
+        [elem].into_iter(),
+    )
+    .expect("render");
+    let (w, h) = (out_size.w, out_size.h);
+    let m = 6;
+    [
+        px(&pixels, w, m, m),
+        px(&pixels, w, w - 1 - m, m),
+        px(&pixels, w, m, h - 1 - m),
+        px(&pixels, w, w - 1 - m, h - 1 - m),
+    ]
+}
+
+/// Buffer-transform (`src_transform`) conformance: a texture with a non-Normal buffer transform
+/// must sample identically to the GLES oracle — the second, independent transform axis from the
+/// output projection. This is what un-blanks the DualTexture capture overlays (screen-transition /
+/// screenshot / MRU) on a rotated output, where they carry `src_transform == output_transform`.
+/// Renders a 4-colour-quadrant texture through `render_texture_from_to` via BOTH renderers at all 8
+/// buffer transforms (Normal output) plus a few buffer×output crosses, on a non-square target.
+#[test]
+fn vulkan_buffer_transform_matches_the_gles_oracle() {
+    use smithay::utils::Transform::*;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+
+    // Non-square texture + output so a w/h swap can't cancel.
+    const W: i32 = 160;
+    const H: i32 = 100;
+    let tex = Size::<i32, BufferCoord>::from((W, H));
+    let out_size = Size::<i32, Physical>::from((W, H));
+
+    // 4-quadrant pattern in buffer (top-left origin) space: TL red, TR green, BL blue, BR white.
+    let red = [255u8, 0, 0, 255];
+    let green = [0u8, 255, 0, 255];
+    let blue = [0u8, 0, 255, 255];
+    let white = [255u8, 255, 255, 255];
+    let mut pattern = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let c = match (x < W / 2, y < H / 2) {
+                (true, true) => red,
+                (false, true) => green,
+                (true, false) => blue,
+                (false, false) => white,
+            };
+            pattern.extend_from_slice(&c);
+        }
+    }
+
+    let sweep = [
+        Normal, _90, _180, _270, Flipped, Flipped90, Flipped180, Flipped270,
+    ];
+    let combos: Vec<(Transform, Transform)> = sweep
+        .iter()
+        .map(|t| (*t, Normal))
+        // Crossed with a rotated output: buffer and output transforms are independent, so these
+        // must still match the oracle (catches any proj × tex_transform interaction).
+        .chain([(_90, _270), (Flipped90, _90), (_180, Flipped)])
+        .collect();
+
+    let state = f.niri_state();
+    let mut normal_out = Vec::new();
+    for (src_t, out_t) in combos {
+        let gles = state
+            .backend
+            .headless()
+            .with_primary_renderer(|g| {
+                buffer_transform_corners(g, &pattern, tex, out_size, src_t, out_t)
+            })
+            .expect("GLES renderer present");
+        let vk = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|v| {
+                buffer_transform_corners(v, &pattern, tex, out_size, src_t, out_t)
+            })
+            .expect("Vulkan renderer present");
+        assert_eq!(
+            gles, vk,
+            "Vulkan corners != GLES at src_transform={src_t:?} out_transform={out_t:?}"
+        );
+        eprintln!("vulkan_buffer_transform src={src_t:?} out={out_t:?}: corners {vk:?} match GLES");
+        if out_t == Normal {
+            normal_out.push((src_t, vk));
+        }
+    }
+
+    // Absolute anchors (no GLES) so a shared misunderstanding can't pass: Normal keeps the source
+    // top-left (red) at the physical top-left; a _90 *buffer* rotation makes the physical top-left
+    // sample the source bottom-left quadrant (blue).
+    let corners = |t: Transform| normal_out.iter().find(|(s, _)| *s == t).unwrap().1;
+    let near = |p: [u8; 4], c: [u8; 4]| (0..3).all(|i| (p[i] as i32 - c[i] as i32).abs() < 50);
+    assert!(near(corners(Normal)[0], red), "Normal TL should be red");
+    assert!(
+        near(corners(_90)[0], blue),
+        "_90 buffer transform: physical TL should sample source bottom-left (blue), got {:?}",
+        corners(_90)[0]
+    );
+}
+
 /// Output-transform conformance: the owned Vulkan renderer must place geometry identically to the
 /// GLES oracle under every rotation/flip. Render an asymmetric marker (a wide red rect anchored at
 /// the logical top-left) through *both* renderers at all 8 transforms and compare — GLES is the

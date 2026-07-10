@@ -1,6 +1,7 @@
 use std::fmt;
 
 use ash::vk;
+use glam::{Mat3, Vec2, Vec3};
 use niri_vk::render::{as_bytes, BorderPush, PostprocessPush, QuadPush, ResizePush, ShadowPush};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
@@ -136,9 +137,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     }
 
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
-    /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. A partial
-    /// `src` is remapped by the shader; only flipped textures are out of scope and degrade to a
-    /// no-op (a visible gap) rather than a wrong picture.
+    /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. The buffer
+    /// `src_transform` (rotation/flip/y-invert) and a partial `src` are baked into the sampling
+    /// `tex_transform`.
     ///
     /// Assumes the element's rounding geometry equals `dst` (true for the overview wallpaper, whose
     /// `geometry` is the whole view at the origin); the general `geometry != dst` clip is a later
@@ -149,17 +150,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        src_transform: Transform,
         corner_radius: f32,
         alpha: f32,
     ) -> Result<(), VulkanError> {
-        // Skeleton scope: unflipped only (the shader remaps a partial `src` via `src_rect`).
-        if texture.flipped() {
-            tracing::warn!(
-                "VulkanFrame::render_rounded_texture: flipped textures unsupported; skipping"
-            );
-            return Ok(());
-        }
-
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -169,7 +163,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
             // alpha; the SDF coverage then cuts the corners.
             color: [1.0, 1.0, 1.0, alpha],
-            src_rect: normalized_src(src, texture),
+            tex_transform: build_tex_transform(src, texture, src_transform),
             ..Default::default()
         };
         self.retain(texture);
@@ -201,29 +195,24 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Draw `texture` into `dst` with a horizontal alpha fade over `cutoff` (`[left, right]` in the
     /// sampled texture's u coordinate; `left >= right` disables it) — the owned-renderer equivalent
     /// of niri's `GradientFadeTextureRenderElement` (the MRU switcher fades clipped thumbnails).
-    /// Same partial-`src`/unflipped scope as [`Self::render_rounded_texture`].
+    /// The buffer `src_transform` and a partial `src` are baked into the sampling
+    /// `tex_transform`; the fade band follows the sampled u axis, matching the GLES shader.
     pub(crate) fn render_gradient_fade(
         &mut self,
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        src_transform: Transform,
         cutoff: (f32, f32),
         alpha: f32,
     ) -> Result<(), VulkanError> {
-        if texture.flipped() {
-            tracing::warn!(
-                "VulkanFrame::render_gradient_fade: flipped textures unsupported; skipping"
-            );
-            return Ok(());
-        }
-
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
             proj: self.proj,
             target: self.target_dims(),
             color: [1.0, 1.0, 1.0, alpha],
-            src_rect: normalized_src(src, texture),
+            tex_transform: build_tex_transform(src, texture, src_transform),
             cutoff: [cutoff.0, cutoff.1],
             ..Default::default()
         };
@@ -1051,15 +1040,10 @@ impl Frame for VulkanFrame<'_, '_> {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), VulkanError> {
-        // Skeleton scope: `Transform::Normal`, unflipped only. A partial `src` is handled by the
-        // shader's `src_rect` remap; other transforms would draw wrong pixels, so degrade to a
-        // no-op (a visible gap) rather than lie.
-        if src_transform != Transform::Normal || texture.flipped() {
-            tracing::warn!(
-                "VulkanFrame::render_texture_from_to: unsupported (transform={src_transform:?}, \
-                 flipped={}); skipping",
-                texture.flipped(),
-            );
+        // A degenerate src/texture has nothing to sample (mirrors GLES `build_texture_mat`'s early
+        // return). Every `src_transform` + `flipped()` case is otherwise handled by the sampling
+        // `tex_transform`, so there is no unsupported case left to skip.
+        if src.size.w <= 0.0 || src.size.h <= 0.0 || texture.width() == 0 || texture.height() == 0 {
             return Ok(());
         }
 
@@ -1070,7 +1054,7 @@ impl Frame for VulkanFrame<'_, '_> {
             target: self.target_dims(),
             // texture.frag multiplies the sample by this, so white-with-alpha modulates alpha.
             color: [1.0, 1.0, 1.0, alpha],
-            src_rect: normalized_src(src, texture),
+            tex_transform: build_tex_transform(src, texture, src_transform),
             ..Default::default()
         };
         self.retain(texture);
@@ -1137,8 +1121,58 @@ fn ndc_transform(transform: Transform) -> [f32; 4] {
     [m.x.x, -m.x.y, -m.y.x, m.y.y]
 }
 
+/// Pack a `glam::Mat3` into 3 `vec4` columns (`.xyz` used, `w = 0`) for a `mat3` push field.
+fn pack_mat3(m: Mat3) -> [[f32; 4]; 3] {
+    let col = |v: Vec3| [v.x, v.y, v.z, 0.0];
+    [col(m.x_axis), col(m.y_axis), col(m.z_axis)]
+}
+
+/// The `tex_transform` sampling matrix mapping `v_uv ∈ [0,1]` across the quad to normalized texture
+/// UV — the owned-renderer analogue of Smithay's `build_texture_mat`, folded so the input is the
+/// unit quad coordinate rather than dst-local pixels (the `dest.size` scale cancels, so it doesn't
+/// appear). Bakes: the buffer `src_transform` rotation/flip of the sampled content, the `src` crop,
+/// normalization to UV, and (for y-inverted textures) a v-flip. Built from `src_transform` ONLY —
+/// the output transform lives entirely in `proj`/position and must not enter here.
+fn build_tex_transform(
+    src: Rectangle<f64, BufferCoord>,
+    texture: &VkTexture,
+    src_transform: Transform,
+) -> [[f32; 4]; 3] {
+    let (tw, th) = (texture.width() as f32, texture.height() as f32);
+    // `src.size` with the buffer transform applied (w/h swapped for 90/270) — GLES `dst_src_size`.
+    let dss = src_transform.transform_size(src.size);
+    let (dw, dh) = (dss.w as f32, dss.h as f32);
+
+    // v_uv ∈ [0,1] → src-size pixels (dest.size folded out), then rotate/flip in pixel space...
+    let mut m = Mat3::from_cols_array(src_transform.matrix().as_ref())
+        * Mat3::from_scale(Vec2::new(dw, dh));
+    // ...then the per-transform re-centering translation (in dst_src_size units), matching the
+    // `translation` table in Smithay's `build_texture_mat`.
+    let t = match src_transform {
+        Transform::Normal | Transform::Flipped90 => Vec2::ZERO,
+        Transform::_90 => Vec2::new(0.0, dw),
+        Transform::_180 => Vec2::new(dw, dh),
+        Transform::_270 => Vec2::new(dh, 0.0),
+        Transform::Flipped => Vec2::new(dw, 0.0),
+        Transform::Flipped180 => Vec2::new(0.0, dh),
+        Transform::Flipped270 => Vec2::new(dh, dw),
+    };
+    m = Mat3::from_translation(t) * m;
+    // Crop offset (buffer coords), then normalize to [0,1] UV.
+    m = Mat3::from_translation(Vec2::new(src.loc.x as f32, src.loc.y as f32)) * m;
+    m = Mat3::from_scale(Vec2::new(1.0 / tw, 1.0 / th)) * m;
+    // y-inverted textures: flip v about the [0,1] centre. Our samplers are CLAMP_TO_EDGE (not GL
+    // REPEAT), so this must be `v ↦ 1 - v` (translate·scale), not Smithay's naked `-v`.
+    if texture.flipped() {
+        m = Mat3::from_translation(Vec2::new(0.0, 1.0))
+            * Mat3::from_scale(Vec2::new(1.0, -1.0))
+            * m;
+    }
+    pack_mat3(m)
+}
+
 /// Normalize a buffer-space `src` sub-rectangle to `[u0, v0, du, dv]` texture coordinates for the
-/// sampling materials' `src_rect` push constant. `[0, 0, 1, 1]` is the full texture.
+/// postprocess material's `src_rect` push constant. `[0, 0, 1, 1]` is the full texture.
 fn normalized_src(src: Rectangle<f64, BufferCoord>, texture: &VkTexture) -> [f32; 4] {
     let (tw, th) = (texture.width() as f32, texture.height() as f32);
     [

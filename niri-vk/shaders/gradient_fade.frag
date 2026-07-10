@@ -14,7 +14,9 @@ layout(push_constant) uniform Push {
     float corner_radius;
     float _pad0;
     vec4 color;          // straight-alpha tint, [1,1,1,alpha]
-    vec4 src_rect;       // sub-rect to sample, normalized [u0, v0, du, dv]
+    vec4 st0;            // tex_transform columns (xyz used): v_uv -> normalized UV
+    vec4 st1;
+    vec4 st2;
     vec2 cutoff;         // fade band [left, right] in sampled-texture u coords; left>=right = off
 } pc;
 
@@ -23,7 +25,7 @@ layout(location = 1) in vec2 v_local;
 layout(location = 0) out vec4 o;
 
 void main() {
-    vec2 uv = pc.src_rect.xy + v_uv * pc.src_rect.zw;
+    vec2 uv = (mat3(pc.st0.xyz, pc.st1.xyz, pc.st2.xyz) * vec3(v_uv, 1.0)).xy;
     vec4 c = texture(tex, uv) * pc.color;
 
     float fade = 1.0;

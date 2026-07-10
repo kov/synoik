@@ -27,8 +27,9 @@ pub const IDENTITY_PROJ: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 
 /// Push-constant block shared by `quad.vert` and its material fragment stages. `repr(C)` layout
 /// matches the GLSL `Push` block (std430 push-constant rules: `proj` at offset 16, `color` at 48,
-/// `src_rect` at 64). Materials that don't need a field (e.g. `solid.frag` ignores `src_rect`)
-/// simply declare a shorter `Push` block — a shader may access a prefix of the range. 88 bytes.
+/// `tex_transform` columns at 64/80/96, `cutoff` at 112). Materials that don't sample (e.g.
+/// `solid.frag`, `sdf_rect.frag`) simply declare a shorter `Push` block ending at `color` — a
+/// shader may access a prefix of the range. 120 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct QuadPush {
@@ -42,13 +43,32 @@ pub struct QuadPush {
     pub corner_radius: f32,
     pub _pad0: f32,
     pub color: [f32; 4],
-    /// Sub-rectangle of the texture to sample, normalized `[u0, v0, du, dv]`; `[0, 0, 1, 1]` is
-    /// the full texture. Used by the sampling materials to remap `v_uv` (see `texture.frag`).
-    pub src_rect: [f32; 4],
+    /// Texture sampling transform as 3 `vec4` columns (`.xyz` used): maps `v_uv` (0..1 across the
+    /// quad) to normalized texture UV, folding the src crop, the buffer/`src_transform` rotation
+    /// or flip, and y-inversion — the owned-renderer analogue of GLES `build_texture_mat`.
+    /// Identity-ish (a crop) for `Transform::Normal`. Used only by the sampling materials.
+    pub tex_transform: [[f32; 4]; 3],
     /// Horizontal fade band `[left, right]` in the sampled texture's u coordinate, for
     /// `gradient_fade.frag`; `left >= right` disables the fade. Ignored by other materials.
     pub cutoff: [f32; 2],
 }
+
+// The Rust layout must match the GLSL std430 `Push` block byte-for-byte; catch drift at compile
+// time (offsets: proj@16, color@48, tex_transform@64/80/96, cutoff@112).
+const _: () = {
+    assert!(std::mem::size_of::<QuadPush>() == 120);
+    assert!(std::mem::offset_of!(QuadPush, color) == 48);
+    assert!(std::mem::offset_of!(QuadPush, tex_transform) == 64);
+    assert!(std::mem::offset_of!(QuadPush, cutoff) == 112);
+};
+
+/// Identity `tex_transform` (as 3 `vec4` columns): samples `v_uv` straight, i.e. the whole texture
+/// with no rotation. The neutral value for a hand-built sampling push or a non-sampling material.
+pub const IDENTITY_TEX_TRANSFORM: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
 
 /// Push constants for the border material (`border.vert`/`border.frag`). `repr(C)` field order is
 /// chosen so each member lands at its natural std430 offset (all `vec4`s at 16-aligned offsets),
@@ -163,8 +183,9 @@ pub struct ResizePush {
 
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
-    /// they use (and callers set `origin`/`size`/`target`). Note `src_rect` defaults to the *full*
-    /// texture `[0, 0, 1, 1]`, not zeros, so a defaulted sampling quad samples everything.
+    /// they use (and callers set `origin`/`size`/`target`). Note `tex_transform` defaults to
+    /// identity (samples the *full* texture), not zeros, so a defaulted sampling quad samples
+    /// everything.
     fn default() -> Self {
         QuadPush {
             origin: [0.0, 0.0],
@@ -174,7 +195,7 @@ impl Default for QuadPush {
             corner_radius: 0.0,
             _pad0: 0.0,
             color: [1.0, 1.0, 1.0, 1.0],
-            src_rect: [0.0, 0.0, 1.0, 1.0],
+            tex_transform: IDENTITY_TEX_TRANSFORM,
             cutoff: [0.0, 0.0],
         }
     }
