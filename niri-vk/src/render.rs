@@ -19,15 +19,25 @@ pub const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     layer_count: 1,
 };
 
+/// Identity value for the `proj` output-transform field (column-major `[m00, m10, m01, m11]`).
+/// The `#[derive(Default)]` push blocks default `proj` to zeros (a collapse-to-nothing matrix);
+/// `VulkanFrame` overwrites `proj` on every draw, so that only matters for a hand-built push that
+/// forgets to — use this to stay explicit.
+pub const IDENTITY_PROJ: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
 /// Push-constant block shared by `quad.vert` and its material fragment stages. `repr(C)` layout
-/// matches the GLSL `Push` block (std430 push-constant rules: `color` lands at offset 32,
-/// `src_rect` at 48). Materials that don't need a field (e.g. `solid.frag` ignores `src_rect`)
-/// simply declare a shorter `Push` block — a shader may access a prefix of the range.
+/// matches the GLSL `Push` block (std430 push-constant rules: `proj` at offset 16, `color` at 48,
+/// `src_rect` at 64). Materials that don't need a field (e.g. `solid.frag` ignores `src_rect`)
+/// simply declare a shorter `Push` block — a shader may access a prefix of the range. 88 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct QuadPush {
     pub origin: [f32; 2],
     pub size: [f32; 2],
+    /// Output-transform 2×2, column-major `[m00, m10, m01, m11]` for `mat2(pc.proj)` — rotates the
+    /// (already y-down) ortho NDC into the physical framebuffer's orientation. Identity for
+    /// `Transform::Normal`; see `VulkanFrame`'s `ndc_transform`.
+    pub proj: [f32; 4],
     pub target: [f32; 2],
     pub corner_radius: f32,
     pub _pad0: f32,
@@ -42,14 +52,16 @@ pub struct QuadPush {
 
 /// Push constants for the border material (`border.vert`/`border.frag`). `repr(C)` field order is
 /// chosen so each member lands at its natural std430 offset (all `vec4`s at 16-aligned offsets),
-/// matching the GLSL block exactly. 136 bytes (well under the 256-byte push limit).
-/// `origin`/`size`/ `target` mirror [`QuadPush`]'s first three fields so the shared quad-emission
-/// vertex stage works.
+/// matching the GLSL block exactly. 152 bytes (well under the 256-byte push limit).
+/// `origin`/`size`/`proj`/`target` mirror [`QuadPush`]'s first four fields so the shared
+/// quad-emission vertex stage works.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BorderPush {
     pub origin: [f32; 2],
     pub size: [f32; 2],
+    /// Output-transform 2×2 (see [`QuadPush::proj`]).
+    pub proj: [f32; 4],
     pub target: [f32; 2],
     pub border_width: f32,
     pub colorspace: f32,
@@ -68,13 +80,15 @@ pub struct BorderPush {
 }
 
 /// Push constants for the shadow material (`shadow.vert`/`shadow.frag`). Same layout discipline as
-/// [`BorderPush`] (natural std430 offsets, `origin`/`size`/`target` first). 128 bytes. `area_size`
-/// is shared by the shadow and window-cutout geometry transforms.
+/// [`BorderPush`] (natural std430 offsets, `origin`/`size`/`proj`/`target` first). 144 bytes.
+/// `area_size` is shared by the shadow and window-cutout geometry transforms.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ShadowPush {
     pub origin: [f32; 2],
     pub size: [f32; 2],
+    /// Output-transform 2×2 (see [`QuadPush::proj`]).
+    pub proj: [f32; 4],
     pub target: [f32; 2],
     pub sigma: f32,
     pub niri_scale: f32,
@@ -92,15 +106,17 @@ pub struct ShadowPush {
 
 /// Push constants for the postprocess-and-clip material (`postprocess.vert`/`postprocess.frag`).
 /// Matches the GLSL `Push` block: `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430
-/// layout, `origin`/`size`/`target` first like [`QuadPush`] so the shared quad emission works).
-/// `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry space) is passed as three
-/// `vec4` columns — the shader reads `.xyz` of each — to avoid `mat3` push-constant layout
-/// ambiguity. 144 bytes. Callers must set every field (there is no meaningful identity default).
+/// layout, `origin`/`size`/`proj`/`target` first like [`QuadPush`] so the shared quad emission
+/// works). `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry space) is passed
+/// as three `vec4` columns — the shader reads `.xyz` of each — to avoid `mat3` push-constant layout
+/// ambiguity. 160 bytes. Callers must set every field (there is no meaningful identity default).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PostprocessPush {
     pub origin: [f32; 2],
     pub size: [f32; 2],
+    /// Output-transform 2×2 (see [`QuadPush::proj`]).
+    pub proj: [f32; 4],
     pub target: [f32; 2],
     pub geo_size: [f32; 2],
     pub src_rect: [f32; 4],
@@ -119,12 +135,14 @@ pub struct PostprocessPush {
 /// window snapshots (bound at set 0 / set 1) by `clamped_progress`, then optionally clips/rounds to
 /// the current geometry. The three used transforms are affine-diagonal, each packed as a `vec4`
 /// `[scale.xy, translate.xy]` (the GLES shader's two unused matrices and `niri_progress` are
-/// dropped). `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430). 112 bytes.
+/// dropped). `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430). 128 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ResizePush {
     pub origin: [f32; 2],
     pub size: [f32; 2],
+    /// Output-transform 2×2 (see [`QuadPush::proj`]).
+    pub proj: [f32; 4],
     pub target: [f32; 2],
     pub curr_geo_size: [f32; 2],
     pub input_to_curr_geo: [f32; 4],
@@ -145,6 +163,7 @@ impl Default for QuadPush {
         QuadPush {
             origin: [0.0, 0.0],
             size: [0.0, 0.0],
+            proj: IDENTITY_PROJ,
             target: [0.0, 0.0],
             corner_radius: 0.0,
             _pad0: 0.0,

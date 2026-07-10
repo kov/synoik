@@ -298,12 +298,14 @@ use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 #[cfg(feature = "vulkan")]
 impl ShadowRenderElement {
     /// Build the shadow material's push constants from `params`, with the quad placed at `dst`.
-    /// (`target` is filled by `VulkanFrame::render_shadow`.)
+    /// (`proj`/`target` are filled by `VulkanFrame::render_shadow`.)
     fn vulkan_push(&self, dst: Rectangle<i32, Physical>) -> niri_vk::render::ShadowPush {
         let p = &self.params;
         niri_vk::render::ShadowPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            // proj/target are placeholders; VulkanFrame::render_shadow fills them from the frame.
+            proj: niri_vk::render::IDENTITY_PROJ,
             target: [0.0, 0.0],
             sigma: p.sigma,
             niri_scale: p.scale,

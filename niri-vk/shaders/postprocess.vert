@@ -8,6 +8,7 @@
 layout(push_constant) uniform Push {
     vec2 origin;
     vec2 size;
+    vec4 proj;
     vec2 target;
     vec2 geo_size;
     vec4 src_rect;
@@ -38,5 +39,5 @@ void main() {
     v_uv = c;
     vec2 p = pc.origin + c * pc.size;
     vec2 ndc = p / pc.target * 2.0 - 1.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(mat2(pc.proj) * ndc, 0.0, 1.0);
 }

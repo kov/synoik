@@ -21,10 +21,17 @@ pub struct VulkanFrame<'frame, 'buffer> {
     renderer: &'frame mut VulkanRenderer,
     fb: &'frame mut VkFramebuffer<'buffer>,
     cbuf: vk::CommandBuffer,
+    /// Physical framebuffer size (the raw arg to `render`, == `fb.buffer.extent()`).
     output_size: Size<i32, Physical>,
+    /// The frame's output transform (already inverted by `render_elements`, per Smithay).
     transform: Transform,
-    /// `output_size` with `transform` applied (Smithay's convention); == `output_size` for Normal.
-    _size: Size<i32, Physical>,
+    /// Logical output size: `output_size` with `transform` applied (w/h swapped for 90/270).
+    /// Elements draw in this space; it's what `output_size()` returns (matching GLES) and the
+    /// `target` the vertex ortho divides by.
+    logical_size: Size<i32, Physical>,
+    /// Output-transform 2×2 for the vertex projection (see [`ndc_transform`]), applied to every
+    /// draw that targets this frame's output framebuffer. Offscreen passes (blur) stay identity.
+    proj: [f32; 4],
     /// Every texture sampled by a recorded draw, cloned (ref-count bump) so its GPU image and
     /// descriptor set outlive command-buffer submission. Draw records reference these resources;
     /// callers (e.g. the render-element loop) routinely drop the source element right after
@@ -107,16 +114,19 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             cbuf,
             output_size,
             transform,
-            _size: transform.transform_size(output_size),
+            logical_size: transform.transform_size(output_size),
+            proj: ndc_transform(transform),
             held: Vec::new(),
             finished: false,
         })
     }
 
-    /// Render-target size in pixels, as `[w, h]` floats for the shader's NDC conversion.
+    /// The `target` for the vertex ortho: the **logical** output size in pixels, as `[w, h]`
+    /// floats. Elements place geometry in logical space; the ortho divides by this and `proj` then
+    /// rotates into the physical framebuffer (whose extent may be w/h-swapped). == the physical
+    /// extent for `Transform::Normal`.
     fn target_dims(&self) -> [f32; 2] {
-        let (w, h) = self.fb.buffer.extent();
-        [w as f32, h as f32]
+        [self.logical_size.w as f32, self.logical_size.h as f32]
     }
 
     /// Keep `texture` alive until this frame is dropped (i.e. past `finish`'s fence wait), so a
@@ -153,6 +163,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
             target: self.target_dims(),
             corner_radius,
             // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
@@ -209,6 +220,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
             target: self.target_dims(),
             color: [1.0, 1.0, 1.0, alpha],
             src_rect: normalized_src(src, texture),
@@ -246,6 +258,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// fills every material field of `push` plus `origin`/`size` from `dst`; this sets `target`,
     /// binds the premultiplied-blend border pipeline (no texture), and draws the quad.
     pub(crate) fn render_border(&mut self, mut push: BorderPush) -> Result<(), VulkanError> {
+        push.proj = self.proj;
         push.target = self.target_dims();
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.border_pipeline;
@@ -268,6 +281,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Like [`Self::render_border`], the caller fills the material fields plus `origin`/`size`;
     /// this sets `target`, binds the premultiplied-blend shadow pipeline (no texture), and draws.
     pub(crate) fn render_shadow(&mut self, mut push: ShadowPush) -> Result<(), VulkanError> {
+        push.proj = self.proj;
         push.target = self.target_dims();
         let dev = &self.renderer.gpu.device;
         let pipe = &self.renderer.shadow_pipeline;
@@ -312,6 +326,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
         push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.proj = self.proj;
         push.target = self.target_dims();
         push.src_rect = normalized_src(src, texture);
 
@@ -550,10 +565,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         Ok(())
     }
 
-    /// The physical output size this frame renders into (pre-transform), for the framebuffer-effect
-    /// clamp math (mirrors `GlesFrame::output_size`).
+    /// The **logical** output size (w/h swapped for 90/270), the space elements draw in — mirrors
+    /// `GlesFrame::output_size`, which returns the transform-swapped size, not the physical extent.
+    /// The framebuffer-effect clamp math depends on this being logical.
+    // Returns `logical_size`, not the like-named `output_size` field — that's the whole point (see
+    // the doc above), so the misnamed-getter lint is a false positive here.
+    #[allow(clippy::misnamed_getters)]
     pub(crate) fn output_size(&self) -> Size<i32, Physical> {
-        self.output_size
+        self.logical_size
     }
 
     /// The frame's (already-inverted, per `render_elements`) output transform — mirrors
@@ -640,6 +659,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
         push.size = [dst.size.w as f32, dst.size.h as f32];
+        push.proj = self.proj;
         push.target = self.target_dims();
 
         self.retain(tex_prev);
@@ -944,6 +964,11 @@ impl Frame for VulkanFrame<'_, '_> {
             },
         };
         // Clear the given rects, or the whole target when none were provided.
+        // `cmd_clear_attachments` rects are in physical framebuffer space (no projection),
+        // but callers pass logical rects (e.g. `render_elements` clears the logical output
+        // rect) — so map each through the output transform, exactly as GLES's `clear`
+        // reaches the framebuffer via the transform-aware solid draw. Identity for
+        // `Normal`.
         let full = vk::ClearRect {
             rect: vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -956,19 +981,22 @@ impl Frame for VulkanFrame<'_, '_> {
             vec![full]
         } else {
             at.iter()
-                .map(|r| vk::ClearRect {
-                    rect: vk::Rect2D {
-                        offset: vk::Offset2D {
-                            x: r.loc.x,
-                            y: r.loc.y,
+                .map(|r| {
+                    let phys = self.transform.transform_rect_in(*r, &self.logical_size);
+                    vk::ClearRect {
+                        rect: vk::Rect2D {
+                            offset: vk::Offset2D {
+                                x: phys.loc.x,
+                                y: phys.loc.y,
+                            },
+                            extent: vk::Extent2D {
+                                width: phys.size.w.max(0) as u32,
+                                height: phys.size.h.max(0) as u32,
+                            },
                         },
-                        extent: vk::Extent2D {
-                            width: r.size.w.max(0) as u32,
-                            height: r.size.h.max(0) as u32,
-                        },
-                    },
-                    base_array_layer: 0,
-                    layer_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }
                 })
                 .collect()
         };
@@ -991,6 +1019,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
             target: self.target_dims(),
             color: color.components(),
             ..Default::default()
@@ -1037,6 +1066,7 @@ impl Frame for VulkanFrame<'_, '_> {
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
             target: self.target_dims(),
             // texture.frag multiplies the sample by this, so white-with-alpha modulates alpha.
             color: [1.0, 1.0, 1.0, alpha],
@@ -1073,8 +1103,11 @@ impl Frame for VulkanFrame<'_, '_> {
         self.transform
     }
 
+    // Logical size (transform-swapped), matching `GlesFrame::output_size`; see the inherent
+    // `output_size` above — the getter intentionally returns `logical_size`, not `output_size`.
+    #[allow(clippy::misnamed_getters)]
     fn output_size(&self) -> Size<i32, Physical> {
-        self.output_size
+        self.logical_size
     }
 
     fn wait(&mut self, sync: &SyncPoint) -> Result<(), VulkanError> {
@@ -1084,6 +1117,24 @@ impl Frame for VulkanFrame<'_, '_> {
     fn finish(mut self) -> Result<SyncPoint, VulkanError> {
         self.finish_internal()
     }
+}
+
+/// The output-transform 2×2 for the vertex projection (`proj` push field), column-major
+/// `[m00, m10, m01, m11]` so the shader's `mat2(pc.proj)` reconstructs it. It rotates/flips the
+/// (already y-down) ortho NDC — which places logical geometry into `[-1, 1]²` — into the physical
+/// framebuffer's orientation.
+///
+/// Derivation: mirroring GLES's `current_projection = flip180 · transform.matrix() · ortho`, the
+/// GL-y-up→Vulkan-y-down convention change conjugates the rotation by `diag(1, -1)`, i.e.
+/// `proj = diag(1,-1) · T₂ · diag(1,-1)` — Smithay's `transform.matrix()` top-left 2×2 with its
+/// off-diagonal entries negated (diagonal unchanged). Identity for `Normal`. Conjugation preserves
+/// the determinant, so rotations stay rotations and flips stay flips (the det = −1 cases reverse
+/// triangle winding — harmless only because every material pipeline uses `CullMode::NONE`).
+fn ndc_transform(transform: Transform) -> [f32; 4] {
+    // cgmath `Matrix3` is column-major: `m.x`/`m.y` are columns 0/1, so the top-left 2×2 is
+    // m00 = m.x.x, m10 = m.x.y, m01 = m.y.x, m11 = m.y.y. Negate the off-diagonals (m10, m01).
+    let m = transform.matrix();
+    [m.x.x, -m.x.y, -m.y.x, m.y.y]
 }
 
 /// Normalize a buffer-space `src` sub-rectangle to `[u0, v0, du, dv]` texture coordinates for the

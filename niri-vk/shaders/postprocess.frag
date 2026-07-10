@@ -17,6 +17,7 @@ layout(set = 0, binding = 0) uniform sampler2D tex;
 layout(push_constant) uniform Push {
     vec2 origin;
     vec2 size;
+    vec4 proj; // unused here; declared so the push-block offsets match the vertex stage
     vec2 target;
     vec2 geo_size;
     vec4 src_rect;       // sub-rect to sample, normalized [u0, v0, du, dv]

@@ -19,6 +19,7 @@ layout(set = 1, binding = 0) uniform sampler2D tex_next;
 layout(push_constant) uniform Push {
     vec2 origin;
     vec2 size;
+    vec4 proj; // unused here; declared so the push-block offsets match the vertex stage
     vec2 target;
     vec2 curr_geo_size;
     vec4 input_to_curr_geo; // [scale.xy, translate.xy]

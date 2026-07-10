@@ -507,6 +507,128 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     );
 }
 
+/// Output-transform conformance: the owned Vulkan renderer must place geometry identically to the
+/// GLES oracle under every rotation/flip. Render an asymmetric marker (a wide red rect anchored at
+/// the logical top-left) through *both* renderers at all 8 transforms and compare — GLES is the
+/// production-correct renderer, so byte-for-agreement proves the Vulkan `proj` projection +
+/// logical-`target` math. The framebuffer is **non-square** (240×120), so 90/270 genuinely swap
+/// logical w/h — that's what exercises `target_dims`/`output_size` returning the logical size.
+#[test]
+fn vulkan_output_transform_matches_the_gles_oracle() {
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+
+    // Non-square so logical != physical under 90/270 (catches a physical-vs-logical `target` bug).
+    const W: i32 = 240;
+    const H: i32 = 120;
+    let size = Size::<i32, Physical>::from((W, H));
+    let scale = Scale::from(1.0);
+
+    // A wide (2:1) red marker at the logical top-left: asymmetric in both axes, so its rendered
+    // position/shape is distinct for each of the 8 transforms (no accidental symmetry). 80×40 fits
+    // inside every logical orientation of a 240×120 output (portrait 120×240 included).
+    let marker = SolidColorBuffer::new(Size::from((80.0, 40.0)), [1.0, 0.0, 0.0, 1.0]);
+    let build = || {
+        vec![SolidColorRenderElement::from_buffer(
+            &marker,
+            (0.0, 0.0),
+            1.0,
+            Kind::Unspecified,
+        )]
+    };
+
+    // The tight bounding box of the red marker in an `Abgr8888` readback, or `None` if absent.
+    let red_bbox = |pixels: &[u8]| -> Option<(i32, i32, i32, i32)> {
+        let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 50 && p[2] < 50 && p[3] > 200;
+        let (mut x0, mut y0, mut x1, mut y1) = (W, H, -1, -1);
+        for y in 0..H {
+            for x in 0..W {
+                if is_red(px(pixels, W, x, y)) {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        (x1 >= 0).then_some((x0, y0, x1, y1))
+    };
+    let red_count = |pixels: &[u8]| -> usize {
+        let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 50 && p[2] < 50 && p[3] > 200;
+        (0..W * H)
+            .filter(|i| is_red(px(pixels, W, i % W, i / W)))
+            .count()
+    };
+
+    let all = [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    let state = f.niri_state();
+    let mut vk_boxes = Vec::new();
+    for t in all {
+        let gles = state
+            .backend
+            .headless()
+            .with_primary_renderer(|g| {
+                render_to_vec(g, size, scale, t, Fourcc::Abgr8888, build().into_iter())
+            })
+            .expect("GLES renderer present")
+            .expect("GLES render must succeed");
+        let vk = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|v| {
+                render_to_vec(v, size, scale, t, Fourcc::Abgr8888, build().into_iter())
+            })
+            .expect("Vulkan renderer present")
+            .expect("Vulkan render must succeed");
+
+        let gbox = red_bbox(&gles).unwrap_or_else(|| panic!("GLES marker missing at {t:?}"));
+        let vbox = red_bbox(&vk).unwrap_or_else(|| panic!("Vulkan marker missing at {t:?}"));
+        // Oracle agreement: the marker must land at the same place and cover the same area as the
+        // production GLES renderer. Placement (bbox) catches a wrong rotation/flip; area (count)
+        // catches a wrong aspect (e.g. logical w/h not swapped for 90/270).
+        assert_eq!(
+            gbox, vbox,
+            "Vulkan marker bbox {vbox:?} != GLES {gbox:?} at {t:?}"
+        );
+        assert_eq!(
+            red_count(&gles),
+            red_count(&vk),
+            "Vulkan red-pixel count != GLES at {t:?}"
+        );
+        eprintln!("vulkan_output_transform {t:?}: marker bbox {vbox:?} matches GLES");
+        vk_boxes.push(vbox);
+    }
+
+    // Absolute anchor: Normal places the 80×40 marker flush in the physical top-left. `x1`/`y1` are
+    // the inclusive max coords, hence 79/39.
+    assert_eq!(
+        vk_boxes[0],
+        (0, 0, 79, 39),
+        "Normal marker is not at the physical top-left"
+    );
+    // The transform is genuinely applied (not silently identity for all): the 8 placements are not
+    // all the same box.
+    assert!(
+        vk_boxes.iter().any(|b| *b != vk_boxes[0]),
+        "every transform produced the same marker box — proj not applied?"
+    );
+}
+
 /// The KMS-present pipeline minus the flip: composite the same live scene straight into a
 /// GBM-allocated **scanout dmabuf** via `Bind<Dmabuf>`, exactly as the tty present path will, and
 /// read it back from the dmabuf's own memory. This proves the whole GPU half of Stage 3 Brick B —

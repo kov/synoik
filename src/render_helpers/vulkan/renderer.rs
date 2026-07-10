@@ -108,6 +108,16 @@ impl VulkanRenderer {
         let render_pass = create_render_pass(&gpu.device)?;
         let continuation_render_pass = create_continuation_render_pass(&gpu.device)?;
         let sampler_set_layout = sampler_set_layout(&gpu)?;
+        // Our largest built-in push block (PostprocessPush, 160 B) exceeds the 128 B spec minimum;
+        // fail loudly on an ICD that can't hold it rather than eat a pipeline-layout VUID later.
+        let max_push = unsafe { gpu.instance.get_physical_device_properties(gpu.phys) }
+            .limits
+            .max_push_constants_size;
+        if (std::mem::size_of::<PostprocessPush>() as u32) > max_push {
+            return Err(VulkanError::Unsupported(
+                "device push-constant budget too small for the built-in materials",
+            ));
+        }
         let quad_push = std::mem::size_of::<QuadPush>() as u32;
         let sampler = std::slice::from_ref(&sampler_set_layout);
         // Straight-alpha materials (output non-premultiplied color).

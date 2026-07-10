@@ -6,9 +6,10 @@
 // constants and each material is a different fragment stage sharing this vertex stage.
 
 layout(push_constant) uniform Push {
-    vec2 origin;         // top-left in pixels
+    vec2 origin;         // top-left in pixels (logical output space)
     vec2 size;           // width/height in pixels
-    vec2 target;         // render target size in pixels
+    vec4 proj;           // output-transform 2x2, col-major [m00,m10,m01,m11]; mat2(proj)
+    vec2 target;         // logical output size in pixels
     float corner_radius; // pixels (used by SDF materials)
     float _pad0;
     vec4 color;          // straight-alpha RGBA
@@ -31,6 +32,7 @@ void main() {
     v_uv = c;
     v_local = c * pc.size;
     vec2 p = pc.origin + c * pc.size;
+    // Ortho into y-down NDC (logical space), then rotate into the physical framebuffer.
     vec2 ndc = p / pc.target * 2.0 - 1.0;
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_Position = vec4(mat2(pc.proj) * ndc, 0.0, 1.0);
 }

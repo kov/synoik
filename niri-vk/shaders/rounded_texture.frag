@@ -9,6 +9,7 @@ layout(set = 0, binding = 0) uniform sampler2D tex;
 layout(push_constant) uniform Push {
     vec2 origin;
     vec2 size;
+    vec4 proj; // unused here; declared so the push-block offsets match the vertex stage
     vec2 target;
     float corner_radius; // physical pixels
     float _pad0;

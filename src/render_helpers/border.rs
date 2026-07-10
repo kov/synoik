@@ -378,6 +378,8 @@ impl BorderRenderElement {
         niri_vk::render::BorderPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
+            // proj/target are placeholders; VulkanFrame::render_border fills them from the frame.
+            proj: niri_vk::render::IDENTITY_PROJ,
             target: [0.0, 0.0],
             border_width: p.border_width,
             colorspace: c.colorspace,
