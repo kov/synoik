@@ -13,7 +13,9 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::Animation;
 use crate::niri_render_elements;
-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
+use crate::render_helpers::offscreen::{
+    DualOffscreenRenderElement, OffscreenBuffer, OffscreenData,
+};
 use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
 
@@ -22,11 +24,14 @@ pub struct OpenAnimation {
     anim: Animation,
     random_seed: f32,
     buffer: OffscreenBuffer,
+    /// The same offscreen for the owned Vulkan renderer (distinct `VkTexture` type).
+    #[cfg(feature = "vulkan")]
+    buffer_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
 }
 
 niri_render_elements! {
     OpeningWindowRenderElement => {
-        Offscreen = RelocateRenderElement<RescaleRenderElement<OffscreenRenderElement>>,
+        Offscreen = RelocateRenderElement<RescaleRenderElement<DualOffscreenRenderElement>>,
         Shader = ShaderRenderElement,
     }
 }
@@ -37,6 +42,8 @@ impl OpenAnimation {
             anim,
             random_seed: fastrand::f32(),
             buffer: OffscreenBuffer::default(),
+            #[cfg(feature = "vulkan")]
+            buffer_vk: OffscreenBuffer::default(),
         }
     }
 
@@ -123,6 +130,48 @@ impl OpenAnimation {
         }
 
         let elem = elem.with_alpha(clamped_progress as f32 * alpha);
+        let elem = DualOffscreenRenderElement::Gles(elem);
+
+        let center = geo_size.to_point().downscale(2.);
+        let elem = RescaleRenderElement::from_element(
+            elem,
+            center.to_physical_precise_round(scale),
+            (progress / 2. + 0.5).max(0.),
+        );
+
+        let elem = RelocateRenderElement::from_element(
+            elem,
+            location.to_physical_precise_round(scale),
+            Relocate::Relative,
+        );
+
+        Ok((elem.into(), data))
+    }
+
+    /// The Vulkan sibling of [`render`](Self::render): renders into a `VkTexture` offscreen and
+    /// applies the default scale + fade. The custom `Open` GLSL shader is GLES-only, so on the
+    /// owned Vulkan renderer the animation always uses the default effect (never the custom
+    /// shader).
+    #[cfg(feature = "vulkan")]
+    pub fn render_vulkan(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+        elements: &[impl RenderElement<crate::render_helpers::vulkan::VulkanRenderer>],
+        geo_size: Size<f64, Logical>,
+        location: Point<f64, Logical>,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> anyhow::Result<(OpeningWindowRenderElement, OffscreenData)> {
+        let progress = self.anim.value();
+        let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
+
+        let (elem, _sync_point, data) = self
+            .buffer_vk
+            .render(renderer, scale, elements)
+            .context("error rendering to Vulkan offscreen buffer")?;
+
+        let elem = elem.with_alpha(clamped_progress as f32 * alpha);
+        let elem = DualOffscreenRenderElement::Vulkan(elem);
 
         let center = geo_size.to_point().downscale(2.);
         let elem = RescaleRenderElement::from_element(

@@ -1100,24 +1100,47 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
 
 #[test]
 fn vulkan_renders_a_window_mid_open_animation() {
-    // The tile open animation renders through a GLES offscreen; before it was guarded, mapping a
-    // window (which starts that animation) panicked on the owned Vulkan renderer ("this render path
-    // requires a GLES-backed renderer"). Build the scene WITHOUT settling animations so the open
-    // animation is active, and composite — it must degrade (skip the offscreen effect) and render
-    // the window instead of panicking.
+    // The tile open animation renders the window through an offscreen, scaling and fading it in.
+    // It used to be GLES-only — on the owned Vulkan renderer it degraded to a plain full-alpha
+    // render (the window popped in at once). Now it runs on Vulkan via a `VkTexture` offscreen.
+    // Compose an unsettled frame (mid-open, near progress 0 → faded toward invisible) and a settled
+    // frame (full window): the open animation must make the early frame markedly dimmer than the
+    // settled one. The old degraded path showed FULL alpha even unsettled, so this also proves the
+    // offscreen animation path is taken (not a fallback plain render) — and that it doesn't panic.
     let Some(mut f) = window_fixture_settled(GREEN, false) else {
         return;
     };
     let output = f.niri_output(1);
     assert!(
         f.niri().layout.are_animations_ongoing(Some(&output)),
-        "expected the window open animation to be active (the guarded as_gles render path)"
+        "expected the window open animation to be active"
     );
 
-    // Must not panic; reaching pixels proves the open-animation branch degraded to a plain render.
-    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
-    let green = assert_window_and_background(&pixels, w, h);
-    eprintln!("vulkan_renders_a_window_mid_open_animation: composited {green} window px, no panic");
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    // Unsettled: the fade-in is near its start, so the window is barely there.
+    let (early, w, h) = render_output_vulkan(&mut f, &output);
+    let green_early = count_green(&early, w, h);
+
+    // Settled: the window is fully opaque.
+    f.niri_complete_animations();
+    let (settled, _, _) = render_output_vulkan(&mut f, &output);
+    let green_settled = assert_window_and_background(&settled, w, h);
+
+    eprintln!(
+        "vulkan_renders_a_window_mid_open_animation: green early={green_early} settled={green_settled}"
+    );
+    assert!(green_settled > 0, "the settled window is absent");
+    assert!(
+        green_early < green_settled / 2,
+        "the open animation did not fade the window in on Vulkan (degraded to a plain render?): \
+         early={green_early} settled={green_settled}"
+    );
 }
 
 /// Import a **CPU-filled client dmabuf** (a GBM `Argb8888` LINEAR buffer painted with four known
