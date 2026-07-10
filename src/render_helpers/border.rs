@@ -258,7 +258,21 @@ impl BorderRenderElement {
         self
     }
 
+    /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than a
+    /// plain solid-color fallback. Callers use it to choose `BorderRenderElement` (rounded corners,
+    /// gradients) over pointy `SolidColorRenderElement` quads. True when the GLES border program is
+    /// loaded, **or** on the owned Vulkan renderer — which draws borders procedurally
+    /// (`VulkanFrame::render_border`, always with rounded corners) and needs no GLES program.
+    /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than a
+    /// plain solid-color fallback. Callers use it to choose `BorderRenderElement` (rounded corners,
+    /// gradients) over pointy `SolidColorRenderElement` quads. True when the GLES border program is
+    /// loaded, **or** on the owned Vulkan renderer — which draws borders procedurally
+    /// (`VulkanFrame::render_border`, always with rounded corners) and needs no GLES program.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
+        #[cfg(feature = "vulkan")]
+        if renderer.try_as_vulkan_renderer().is_some() {
+            return true;
+        }
         Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Border).is_some())
     }
 }

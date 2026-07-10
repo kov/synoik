@@ -2138,3 +2138,89 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
         y1 - y0,
     );
 }
+
+/// The focus ring / border outline must be rounded on Vulkan, not pointy. It is drawn by
+/// `BorderRenderElement` (a procedural rounded/gradient SDF) when the renderer can render it, else
+/// it falls back to plain `SolidColorRenderElement` quads (square corners). That choice hinges on
+/// `BorderRenderElement::has_shader`, which was GLES-only (`Shaders::get`) — so a Vulkan session
+/// got pointy quads even though the owned renderer draws borders procedurally (rounded). Now
+/// `has_shader` is true on Vulkan too. Map a focused window with a thick blue focus ring + corner
+/// radius and assert the ring is present but its extreme outer corner is rounded away to the
+/// backdrop.
+#[test]
+fn vulkan_draws_a_rounded_focus_ring() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping: no Vulkan device");
+        return;
+    }
+
+    let mut config = Config::default();
+    config.layout.border.off = true; // isolate the focus ring
+    config.layout.focus_ring.off = false;
+    config.layout.focus_ring.width = 12.;
+    // active_color defaults to [127,200,255]; make the ring's presence unambiguous.
+    config.window_rules.push(WindowRule {
+        geometry_corner_radius: Some(CornerRadius::from(20.)),
+        clip_to_geometry: Some(true),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // The active focus ring: blue-dominant, high blue (~[127,200,255]); distinct from the green
+    // window and gray backdrop.
+    let is_blue = |p: [u8; 4]| p[2] > 200 && p[0] > 80 && p[0] < 180 && p[1] as i32 > p[0] as i32;
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+
+    // Anchor on the (dense, unambiguous) green window rather than the blue bbox — stray blue AA
+    // elsewhere would inflate a whole-frame blue bbox.
+    let (mut gx0, mut gy0, mut gx1, mut gy1) = (w, h, -1, -1);
+    for y in 0..h {
+        for x in 0..w {
+            if is_green(px(&pixels, w, x, y)) {
+                gx0 = gx0.min(x);
+                gy0 = gy0.min(y);
+                gx1 = gx1.max(x);
+                gy1 = gy1.max(y);
+            }
+        }
+    }
+    assert!(gx1 >= 0, "the green window is absent from the frame");
+    eprintln!("vulkan_draws_a_rounded_focus_ring: window bbox=({gx0},{gy0})..({gx1},{gy1})");
+
+    let my = (gy0 + gy1) / 2;
+    // The ring drew (present just outside the window's left edge, within the 12px band).
+    assert!(
+        is_blue(px(&pixels, w, gx0 - 6, my)),
+        "the focus ring did not draw on Vulkan (no ring at the window's left edge)"
+    );
+    // Rounded, not pointy: a point diagonally outside the window's rounded top-left corner is
+    // outside a *rounded* ring's arc (→ backdrop), but inside a *pointy* square ring (→ ring
+    // color).
+    assert!(
+        !is_blue(px(&pixels, w, gx0 - 10, gy0 - 10)),
+        "the focus-ring corner is ring-colored — pointy (square), not rounded"
+    );
+}
