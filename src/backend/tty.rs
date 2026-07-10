@@ -1938,6 +1938,21 @@ impl Tty {
         let config = self.config.clone();
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+
+        // Damage-preserving (partial-damage) rendering on the owned Vulkan renderer is only safe
+        // with a SINGLE live scanout surface: the renderer keeps ONE present-blit shadow (shared
+        // Tty-wide, keyed by size), so with two same-size outputs a partial-damage frame for output
+        // B would LOAD-preserve output A's shadow content. Count the surfaces up front (before the
+        // mutable `device` borrow) and fall back to a full redraw whenever more than one exists.
+        // FIXME: a per-CRTC shadow (or the seed-blit variant) would lift this to multi-output.
+        #[cfg(feature = "vulkan")]
+        let single_scanout_surface = self
+            .devices
+            .values()
+            .map(|d| d.surfaces.len())
+            .sum::<usize>()
+            == 1;
+
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
             error!("missing output device");
             return rv;
@@ -1973,9 +1988,11 @@ impl Tty {
                 surface,
                 &config,
                 FrameFlags::empty(),
-                // Force a full redraw each frame — the Vulkan renderer doesn't preserve buffer-age
-                // content, so partial-damage rendering would leave settled regions black.
-                true,
+                // Partial-damage rendering works when there's a single scanout surface (see
+                // `single_scanout_surface`): the Vulkan renderer preserves the present-blit shadow
+                // (render-pass LOAD) so DrmCompositor's buffer-age damage is enough. With multiple
+                // surfaces the shared shadow makes that unsafe, so force a full redraw there.
+                !single_scanout_surface,
                 target_presentation_time,
             );
         }

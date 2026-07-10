@@ -1163,6 +1163,117 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
     eprintln!("vulkan_reuses_present_blit_shadow_across_frames: 3 frames each read back correctly");
 }
 
+/// Damage-preserving (partial-damage) rendering: render a full RED frame into an Argb scanout
+/// dmabuf, then a second frame that clears only a sub-rect to GREEN and touches nothing else. The
+/// second frame's render pass takes the LOAD (preserve) path — the reused shadow already holds a
+/// valid prior frame — so the un-cleared region still reads back RED (frame 1's content) while the
+/// sub-rect reads GREEN. This is a *positive* proof that the LOAD path is layout-correct end to end
+/// (right initial layout, no validation error, `begin`'s preserve-gate fires) and that a preserved
+/// scanout reads back correctly — the mechanism behind dropping the `force_full_damage` tty
+/// stopgap. It does NOT discriminate a regression to the DONT_CARE load op: this Venus stack
+/// physically retains the reused shadow's bits across a short two-frame run (DONT_CARE is a
+/// *license* to discard, not a mandate), so the live black-out — a sustained-operation symptom —
+/// can only be confirmed live. Venus-only (needs GBM). See `VulkanFrame::begin`.
+#[test]
+fn vulkan_preserves_undamaged_regions_across_frames() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_preserves_undamaged_regions_across_frames: no Vulkan ({e})");
+            return;
+        }
+    };
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_preserves_undamaged_regions_across_frames: no render node ({e})"
+            );
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_preserves_undamaged_regions_across_frames: no GBM ({e})");
+            return;
+        }
+    };
+    const S: i32 = 128;
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Argb8888, &[Modifier::Linear]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_preserves_undamaged_regions_across_frames: GBM alloc ({e})");
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    let size = Size::<i32, Physical>::from((S, S));
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+
+    // Frame 1: whole shadow RED. Leaves the shadow in TRANSFER_SRC_OPTIMAL (a valid prior frame).
+    {
+        let mut fb = vk.bind(&mut dmabuf).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(
+                Color32F::from([1., 0., 0., 1.]),
+                &[Rectangle::from_size(size)],
+            )
+            .expect("clear");
+        let _ = frame.finish().expect("finish");
+    }
+
+    // Frame 2: clear ONLY a 32×32 top-left sub-rect to GREEN; touch nothing else. `begin` sees a
+    // valid shadow and picks the LOAD pass, so the rest must survive as frame 1's RED.
+    let patch = Rectangle::<i32, Physical>::from_size(Size::from((32, 32)));
+    let mut fb = vk.bind(&mut dmabuf).expect("bind");
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from([0., 1., 0., 1.]), &[patch])
+            .expect("clear");
+        let _ = frame.finish().expect("finish");
+    }
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Argb8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let near = |a: u8, b: u8| (i16::from(a) - i16::from(b)).abs() < 40;
+    let is = |p: [u8; 4], want: [u8; 4]| p.iter().zip(want).all(|(a, b)| near(*a, b));
+
+    // Inside the patch: GREEN (Argb8888/BGRA [0, 255, 0, 255]).
+    let inside = px(&pixels, S, 16, 16);
+    assert!(
+        is(inside, [0, 255, 0, 255]),
+        "the damaged sub-rect should be green, got {inside:?}"
+    );
+    // Outside the patch: RED preserved from frame 1 (Argb8888/BGRA [0, 0, 255, 255]). A DONT_CARE
+    // load op would leave this undefined (black/garbage) on a tiler.
+    let outside = px(&pixels, S, S / 2, S / 2);
+    assert!(
+        is(outside, [0, 0, 255, 255]),
+        "undamaged region not preserved (render pass must LOAD): expected red [0,0,255,255], \
+         got {outside:?}"
+    );
+    eprintln!(
+        "vulkan_preserves_undamaged_regions_across_frames: patch green, undamaged region preserved red"
+    );
+}
+
 /// Bind → render → finish the **same** scanout dmabuf a few hundred times, the way the live tty
 /// present loop does every frame against `DrmCompositor`'s handful of cycled GBM buffers. Each
 /// `bind` re-imports the dmabuf as a Vulkan image, which on Venus creates a host-side resource;

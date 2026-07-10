@@ -99,6 +99,27 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .buffer
             .framebuffer()
             .expect("bound VkFramebuffer wraps an offscreen texture");
+
+        // Preserve the previous frame's contents (render-pass LOAD) instead of discarding them
+        // (DONT_CARE) when this is a present-blit scanout target that already holds a valid prior
+        // frame — the basis for damage-preserving (partial-damage) rendering. The present-blit
+        // shadow is a single buffer reused across frames, so from its perspective its buffer-age is
+        // always 1; DrmCompositor's per-dmabuf damage (age ≥ 1) is a superset of what the shadow
+        // needs preloaded, so LOAD + redrawing that damage always lands a fully-correct frame. A
+        // fresh (just-reallocated) shadow is `UNDEFINED` (nothing to preserve) so it discards
+        // (DONT_CARE) — aligned with the swapchain realloc that makes DrmCompositor full-damage.
+        // `finish_internal` only records `TRANSFER_SRC_OPTIMAL` after a successful submit, so an
+        // errored frame never leaves a "valid" layout over undefined content. The LOAD pass is
+        // render-pass-compatible with the base pass (identical attachment/subpass layout), so
+        // `framebuffer` (built against the base pass) and every pipeline bind unchanged.
+        let preserve =
+            fb.present.is_some() && fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let render_pass = if preserve {
+            renderer.continuation_render_pass
+        } else {
+            renderer.render_pass
+        };
+
         let cbuf = {
             let dev = &renderer.gpu.device;
             let alloc = vk::CommandBufferAllocateInfo::default()
@@ -113,9 +134,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent,
             };
-            // Load op is DONT_CARE (see renderer::create_render_pass); callers clear explicitly.
+            // `render_pass` is the DONT_CARE base pass (callers clear explicitly) or, when
+            // preserving a valid present-blit shadow, the LOAD continuation pass (see above).
             let pass_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(renderer.render_pass)
+                .render_pass(render_pass)
                 .framebuffer(framebuffer)
                 .render_area(render_area);
             let viewport = vk::Viewport {
