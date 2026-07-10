@@ -38,6 +38,20 @@ macro_rules! degraded_vulkan_element {
                 Ok(())
             }
 
+            // A no-op override of Smithay's `unimplemented!()` default. Only reached for a
+            // framebuffer effect (`FramebufferEffectElement`, degraded here) — without this the
+            // enum's forwarded `capture_framebuffer` would panic on a Vulkan session as soon as any
+            // blur/postprocess element is on screen. Degrading means the effect draws nothing.
+            fn capture_framebuffer(
+                &self,
+                _frame: &mut VulkanFrame<'_, '_>,
+                _src: Rectangle<f64, Buffer>,
+                _dst: Rectangle<i32, Physical>,
+                _cache: &UserDataMap,
+            ) -> Result<(), VulkanError> {
+                Ok(())
+            }
+
             fn underlying_storage(
                 &self,
                 _renderer: &mut VulkanRenderer,

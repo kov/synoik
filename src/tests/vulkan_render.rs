@@ -1143,6 +1143,59 @@ fn vulkan_renders_a_window_mid_open_animation() {
     );
 }
 
+/// A `FramebufferEffectElement` (GNOME background blur / postprocess) reports
+/// `is_framebuffer_effect() == true`, so the render loop calls `capture_framebuffer()` on it before
+/// `draw()`. Smithay's default `capture_framebuffer` is `unimplemented!()` — a panic — and the
+/// owned Vulkan renderer had no override, so the first blurred surface on a Vulkan session would
+/// crash the compositor. It now degrades (no-op capture + draw). Composite a blur element through
+/// Vulkan and assert it neither panics nor errors. (The real capture+blur lands in a later phase.)
+#[test]
+fn vulkan_framebuffer_effect_degrades_without_panic() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_framebuffer_effect_degrades_without_panic: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    let fbe = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
+    let params = crate::render_helpers::background_effect::RenderParams {
+        geometry: Rectangle::from_size(Size::from((200., 200.))),
+        subregion: None,
+        clip: None,
+        scale: 1.0,
+    };
+    // Blur on (`passes > 0`) so the effect is non-trivial; noise 0, saturation 1.
+    let blur = crate::render_helpers::blur::BlurOptions {
+        passes: 3,
+        offset: 5.0,
+    };
+    let elem = fbe.render(None, params, Some(blur), 0.0, 1.0);
+
+    // render_to_vec invokes capture_framebuffer() for is_framebuffer_effect elements — the panic
+    // path. Reaching a readback proves the Vulkan renderer degraded it instead of panicking.
+    let size = Size::<i32, Physical>::from((256, 256));
+    let pixels = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(elem),
+    )
+    .expect("compositing a framebuffer-effect element through Vulkan must not panic or error");
+    assert_eq!(
+        pixels.len(),
+        (256 * 256 * 4) as usize,
+        "unexpected readback size"
+    );
+    eprintln!(
+        "vulkan_framebuffer_effect_degrades_without_panic: {} bytes, no panic",
+        pixels.len()
+    );
+}
+
 /// Import a **CPU-filled client dmabuf** (a GBM `Argb8888` LINEAR buffer painted with four known
 /// quadrant colors) through `ImportDma::import_dmabuf` — the path real GPU app windows take — then
 /// sample it 1:1 into an offscreen and read it back, proving the owned renderer imports client

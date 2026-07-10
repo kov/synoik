@@ -207,6 +207,26 @@ macro_rules! niri_render_elements {
                 }
             }
 
+            // Forward capture_framebuffer to the variant. Smithay's default is `unimplemented!()`
+            // (a panic), and it IS called by OutputDamageTracker for any element whose
+            // `is_framebuffer_effect()` is true (the GNOME blur/postprocess element) — so the enum
+            // must dispatch, and every variant must provide at least a no-op (the degraded effects
+            // do, via `degraded_vulkan_element!`), or a Vulkan session panics the moment a
+            // framebuffer effect is on screen.
+            fn capture_framebuffer(
+                &self,
+                frame: &mut $crate::render_helpers::vulkan::VulkanFrame<'_, '_>,
+                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                cache: &smithay::utils::user_data::UserDataMap,
+            ) -> Result<(), $crate::render_helpers::vulkan::VulkanError> {
+                match self {
+                    $($name::$variant(elem) => {
+                        smithay::backend::renderer::element::RenderElement::<$crate::render_helpers::vulkan::VulkanRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+                    })+
+                }
+            }
+
             fn underlying_storage(
                 &self,
                 renderer: &mut $crate::render_helpers::vulkan::VulkanRenderer,
