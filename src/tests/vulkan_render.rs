@@ -1164,16 +1164,18 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
 }
 
 /// Damage-preserving (partial-damage) rendering: render a full RED frame into an Argb scanout
-/// dmabuf, then a second frame that clears only a sub-rect to GREEN and touches nothing else. The
-/// second frame's render pass takes the LOAD (preserve) path — the reused shadow already holds a
-/// valid prior frame — so the un-cleared region still reads back RED (frame 1's content) while the
-/// sub-rect reads GREEN. This is a *positive* proof that the LOAD path is layout-correct end to end
-/// (right initial layout, no validation error, `begin`'s preserve-gate fires) and that a preserved
-/// scanout reads back correctly — the mechanism behind dropping the `force_full_damage` tty
-/// stopgap. It does NOT discriminate a regression to the DONT_CARE load op: this Venus stack
-/// physically retains the reused shadow's bits across a short two-frame run (DONT_CARE is a
-/// *license* to discard, not a mandate), so the live black-out — a sustained-operation symptom —
-/// can only be confirmed live. Venus-only (needs GBM). See `VulkanFrame::begin`.
+/// dmabuf, then a second frame that clears only a sub-rect to GREEN, then a third frame that does
+/// an EMPTY clear and nothing else. The un-cleared region must read back RED (frame 1, preserved by
+/// the LOAD pass), the sub-rect GREEN, and frame 3 must change nothing. Two things are proven: the
+/// LOAD path is layout-correct end to end (right initial layout, no validation error, `begin`'s
+/// preserve-gate fires and a preserved scanout reads back correctly), AND `clear` with an empty
+/// rect slice is a no-op, not a whole-target wipe. That empty-clear case is the one the smithay
+/// damage tracker hits every frame whose damage is fully covered by opaque elements (e.g. the
+/// cursor over an opaque window); a "clear whole on empty" bug wiped the LOAD-preserved shadow
+/// there and flickered the live desktop, and frame 3 catches it *independently* of whether the
+/// driver discards on DONT_CARE (this Venus stack happens to retain the reused shadow's bits over a
+/// short run, so the LOAD-vs-DONT_CARE distinction itself can only be confirmed live). Venus-only
+/// (needs GBM). See `VulkanFrame::begin` and `VulkanFrame::clear`.
 #[test]
 fn vulkan_preserves_undamaged_regions_across_frames() {
     use std::fs::File;
@@ -1239,11 +1241,25 @@ fn vulkan_preserves_undamaged_regions_across_frames() {
     // Frame 2: clear ONLY a 32×32 top-left sub-rect to GREEN; touch nothing else. `begin` sees a
     // valid shadow and picks the LOAD pass, so the rest must survive as frame 1's RED.
     let patch = Rectangle::<i32, Physical>::from_size(Size::from((32, 32)));
+    {
+        let mut fb = vk.bind(&mut dmabuf).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from([0., 1., 0., 1.]), &[patch])
+            .expect("clear");
+        let _ = frame.finish().expect("finish");
+    }
+
+    // Frame 3: an EMPTY clear (the exact call the smithay damage tracker makes when the frame's
+    // damage is fully covered by opaque elements) and nothing else. It must be a NO-OP — clear
+    // nothing, not the whole target — so the readback is unchanged from frame 2. A "clear whole on
+    // empty" bug would instead wipe the scene to this blue; that is what flickered the live
+    // desktop.
     let mut fb = vk.bind(&mut dmabuf).expect("bind");
     {
         let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
         frame
-            .clear(Color32F::from([0., 1., 0., 1.]), &[patch])
+            .clear(Color32F::from([0., 0., 1., 1.]), &[])
             .expect("clear");
         let _ = frame.finish().expect("finish");
     }

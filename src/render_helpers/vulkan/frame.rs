@@ -1061,11 +1061,16 @@ impl Frame for VulkanFrame<'_, '_> {
         color: Color32F,
         at: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
-        let (fb_w, fb_h) = self.fb.buffer.extent();
-        let extent = vk::Extent2D {
-            width: fb_w,
-            height: fb_h,
-        };
+        // Smithay's `Frame::clear` contract: `at` is the set of regions to clear, so an EMPTY slice
+        // means clear NOTHING (mirroring `GlesFrame::clear`, which early-returns) — NOT "clear the
+        // whole target". The damage tracker calls `clear(color, damage - opaque_regions)` before
+        // drawing elements, and that difference is empty whenever the frame's damage is fully
+        // covered by opaque elements (e.g. the cursor moving over an opaque window). Treating empty
+        // as "whole target" would wipe the LOAD-preserved shadow on every such frame, so under
+        // partial damage the settled scene flickers to the clear color — the exact bug this avoids.
+        if at.is_empty() {
+            return Ok(());
+        }
         let attachment = vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             color_attachment: 0,
@@ -1075,43 +1080,30 @@ impl Frame for VulkanFrame<'_, '_> {
                 },
             },
         };
-        // Clear the given rects, or the whole target when none were provided.
-        // `cmd_clear_attachments` rects are in physical framebuffer space (no projection),
-        // but callers pass logical rects (e.g. `render_elements` clears the logical output
-        // rect) — so map each through the output transform, exactly as GLES's `clear`
-        // reaches the framebuffer via the transform-aware solid draw. Identity for
+        // `cmd_clear_attachments` rects are in physical framebuffer space (no projection), but
+        // callers pass logical rects — so map each through the output transform, exactly as GLES's
+        // `clear` reaches the framebuffer via the transform-aware solid draw. Identity for
         // `Normal`.
-        let full = vk::ClearRect {
-            rect: vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            },
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let rects: Vec<vk::ClearRect> = if at.is_empty() {
-            vec![full]
-        } else {
-            at.iter()
-                .map(|r| {
-                    let phys = self.transform.transform_rect_in(*r, &self.logical_size);
-                    vk::ClearRect {
-                        rect: vk::Rect2D {
-                            offset: vk::Offset2D {
-                                x: phys.loc.x,
-                                y: phys.loc.y,
-                            },
-                            extent: vk::Extent2D {
-                                width: phys.size.w.max(0) as u32,
-                                height: phys.size.h.max(0) as u32,
-                            },
+        let rects: Vec<vk::ClearRect> = at
+            .iter()
+            .map(|r| {
+                let phys = self.transform.transform_rect_in(*r, &self.logical_size);
+                vk::ClearRect {
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: phys.loc.x,
+                            y: phys.loc.y,
                         },
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }
-                })
-                .collect()
-        };
+                        extent: vk::Extent2D {
+                            width: phys.size.w.max(0) as u32,
+                            height: phys.size.h.max(0) as u32,
+                        },
+                    },
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }
+            })
+            .collect();
         unsafe {
             self.renderer.gpu.device.cmd_clear_attachments(
                 self.cbuf,
