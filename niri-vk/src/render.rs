@@ -109,7 +109,8 @@ pub struct ShadowPush {
 /// layout, `origin`/`size`/`proj`/`target` first like [`QuadPush`] so the shared quad emission
 /// works). `input_to_geo` (a `mat3` mapping `vec3(v_uv, 1)` to `[0, 1]` geometry space) is passed
 /// as three `vec4` columns — the shader reads `.xyz` of each — to avoid `mat3` push-constant layout
-/// ambiguity. 160 bytes. Callers must set every field (there is no meaningful identity default).
+/// ambiguity (`sample_transform` likewise). 208 bytes. Callers must set every field (there is no
+/// meaningful identity default).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PostprocessPush {
@@ -125,6 +126,11 @@ pub struct PostprocessPush {
     pub bg_color: [f32; 4],
     /// `input_to_geo` as 3 column vectors (`.xyz` used); build from a `glam::Mat3`'s columns.
     pub input_to_geo: [[f32; 4]; 3],
+    /// `sample_transform` as 3 column vectors (`.xyz` used): maps `v_uv` to the capture's UV,
+    /// undoing the output transform baked into the physically-oriented mid-frame capture. Identity
+    /// for `Transform::Normal`. Separate from `input_to_geo` because sampling and the geometry
+    /// clip need opposite handling of the rotation (see `postprocess.frag`).
+    pub sample_transform: [[f32; 4]; 3],
     pub niri_scale: f32,
     pub niri_alpha: f32,
     pub saturation: f32,

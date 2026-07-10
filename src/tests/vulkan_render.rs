@@ -1640,3 +1640,122 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
         "vulkan_backdrop_blur_softens_a_hard_edge: edge blend min(R,G)={best_blend}, left={left:?} right={right:?}"
     );
 }
+
+/// A blur-off, saturation-1, noise-0, unclipped framebuffer effect over the *whole* output is a
+/// no-op: it captures the backdrop and redraws it unchanged. That invariant must hold under **any**
+/// output transform — the capture blit grabs the scene in physical orientation, so the postprocess
+/// draw has to sample it back with the matching orientation (else a rotated output redraws the
+/// backdrop rotated/stretched). Render a hard red|green scene with and without the effect at a
+/// rotation and a transposing flip, and assert the effect leaves the corners unchanged. Guards the
+/// postprocess sampling-vs-geometry split under rotation.
+#[test]
+fn vulkan_backdrop_effect_roundtrips_under_rotation() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_backdrop_effect_roundtrips_under_rotation: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+
+    // Render the red|green scene at `transform`, optionally with a whole-output blur-off effect on
+    // top, and read it back.
+    let render_scene = |vk: &mut Vk, transform: Transform, with_effect: bool| -> Vec<u8> {
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+            .expect("create target");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, transform).expect("render");
+            // Logical left half red, right half green (a hard vertical edge in logical space).
+            frame
+                .draw_solid(
+                    Rectangle::new((0, 0).into(), (S / 2, S).into()),
+                    &[],
+                    Color32F::from([1., 0., 0., 1.]),
+                )
+                .expect("draw red");
+            frame
+                .draw_solid(
+                    Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
+                    &[],
+                    Color32F::from([0., 1., 0., 1.]),
+                )
+                .expect("draw green");
+
+            if with_effect {
+                let effect = FramebufferEffect::new();
+                let params = RenderParams {
+                    geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+                    subregion: None,
+                    clip: None,
+                    scale: 1.0,
+                };
+                // Blur OFF, noise 0, saturation 1 → the effect should reproduce the backdrop.
+                let element = effect.render(None, params, None, 0.0, 1.0);
+                let cache = UserDataMap::new();
+                let src = element.src();
+                let dst = element.geometry(Scale::from(1.0));
+                RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+                    .expect("capture_framebuffer");
+                RenderElement::<Vk>::draw(
+                    &element,
+                    &mut frame,
+                    src,
+                    dst,
+                    &[Rectangle::from_size(size)],
+                    &[],
+                    Some(&cache),
+                )
+                .expect("draw");
+            }
+            let _ = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        vk.map_texture(&mapping).expect("map").to_vec()
+    };
+
+    // Sample the four corners (inset a few px to dodge the LINEAR-sampled edge softening).
+    let corners = |pixels: &[u8]| -> [[u8; 4]; 4] {
+        let m = 4;
+        [
+            px(pixels, S, m, m),
+            px(pixels, S, S - 1 - m, m),
+            px(pixels, S, m, S - 1 - m),
+            px(pixels, S, S - 1 - m, S - 1 - m),
+        ]
+    };
+    let close = |a: [u8; 4], b: [u8; 4]| (0..4).all(|i| (a[i] as i32 - b[i] as i32).abs() <= 24);
+
+    // _90 rotates the vertical edge to horizontal; Flipped90 is a transposing flip (the anti-
+    // diagonal case a plain rotation wouldn't catch). Normal is the trivial baseline.
+    for t in [Transform::Normal, Transform::_90, Transform::Flipped90] {
+        let plain = render_scene(&mut vk, t, false);
+        let effected = render_scene(&mut vk, t, true);
+        let (pc, ec) = (corners(&plain), corners(&effected));
+        for (i, (p, e)) in pc.iter().zip(ec.iter()).enumerate() {
+            assert!(
+                close(*p, *e),
+                "{t:?}: corner {i} changed by the no-op effect: plain={p:?} effected={e:?} \
+                 (backdrop sampled with the wrong orientation)"
+            );
+        }
+        eprintln!(
+            "vulkan_backdrop_effect_roundtrips_under_rotation {t:?}: corners {pc:?} preserved"
+        );
+    }
+}

@@ -17,6 +17,9 @@ layout(push_constant) uniform Push {
     vec4 i2g0;
     vec4 i2g1;
     vec4 i2g2;
+    vec4 st0; // sample_transform (unused here; declared for push-block offset agreement)
+    vec4 st1;
+    vec4 st2;
     float niri_scale;
     float niri_alpha;
     float saturation;

@@ -486,20 +486,27 @@ mod vulkan_impl {
             let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
             let clip_size = Vec2::new(self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
 
-            // v_coords are [0,1] inside crop; map them to [0,1] inside clip_geo, then revert the
-            // texture transform (identity for Normal). Same construction as compute_uniforms.
-            let input_to_clip_geo = Mat3::from_scale(crop_size / clip_size)
+            // v_uv is [0,1] in logical space. The geometry clip works there directly (map into
+            // clip_geo). Sampling is different: the mid-frame capture holds the backdrop in
+            // *physical* orientation, so v_uv must be mapped through the output transform to index
+            // it — GLES bakes that into its tex_matrix and reverts it inside input_to_geo; here the
+            // two are separate push fields, so input_to_geo carries no transform. Identity for
+            // Normal, so both reduce to the previous behavior.
+            let input_to_geo = Mat3::from_scale(crop_size / clip_size)
                 * Mat3::from_translation(offset / crop_size);
-            let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
-                * Mat3::from_cols_array(transform.matrix().as_ref())
+            // Inverse of the output transform (about the UV centre): v_uv is a logical coordinate,
+            // and the capture holds the backdrop physically-oriented, so map logical → physical UV
+            // with the inverse (GLES's tex_matrix uses `frame.transformation().invert()`).
+            let sample_transform = Mat3::from_translation(Vec2::new(0.5, 0.5))
+                * Mat3::from_cols_array(transform.invert().matrix().as_ref())
                 * Mat3::from_translation(Vec2::new(-0.5, -0.5));
-            let input_to_geo = input_to_clip_geo * transform_mat;
 
             PostprocessPush {
                 geo_size: [self.clip_geo.size.w as f32, self.clip_geo.size.h as f32],
                 corner_radius: <[f32; 4]>::from(self.corner_radius),
                 bg_color: [0.0; 4],
                 input_to_geo: pack_mat3(input_to_geo),
+                sample_transform: pack_mat3(sample_transform),
                 niri_scale: self.scale,
                 niri_alpha: 1.0,
                 saturation: self.saturation,

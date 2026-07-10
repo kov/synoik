@@ -981,6 +981,12 @@ fn vulkan_postprocess_clips_and_desaturates() {
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
             ],
+            // Identity: sample straight at v_uv (no output-transform remap).
+            sample_transform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
             niri_scale: 1.0,
             niri_alpha: 1.0,
             saturation: 0.3,

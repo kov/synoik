@@ -26,6 +26,9 @@ layout(push_constant) uniform Push {
     vec4 i2g0;           // input_to_geo columns (xyz used): maps vec3(v_uv, 1) -> [0,1] geo space
     vec4 i2g1;
     vec4 i2g2;
+    vec4 st0;            // sample_transform columns (xyz used): v_uv -> capture UV, matching the
+    vec4 st1;            // physical orientation of the mid-frame capture (identity for Normal)
+    vec4 st2;
     float niri_scale;
     float niri_alpha;
     float saturation;
@@ -88,10 +91,16 @@ vec4 postprocess(vec4 color) {
 }
 
 void main() {
+    // Geometry mapping uses v_uv directly (logical space). Sampling uses a separately-transformed
+    // coordinate: the mid-frame capture holds the backdrop in *physical* orientation, so under a
+    // rotated output v_uv must be mapped back through sample_transform before indexing it. GLES
+    // bakes this into its tex_matrix; here it is its own push field (identity for Normal).
     mat3 input_to_geo = mat3(pc.i2g0.xyz, pc.i2g1.xyz, pc.i2g2.xyz);
     vec3 coords_geo = input_to_geo * vec3(v_uv, 1.0);
 
-    vec2 uv = pc.src_rect.xy + v_uv * pc.src_rect.zw;
+    mat3 sample_transform = mat3(pc.st0.xyz, pc.st1.xyz, pc.st2.xyz);
+    vec2 suv = (sample_transform * vec3(v_uv, 1.0)).xy;
+    vec2 uv = pc.src_rect.xy + suv * pc.src_rect.zw;
     vec4 color = texture(tex, uv);
 
     color = postprocess(color);

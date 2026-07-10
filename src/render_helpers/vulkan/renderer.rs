@@ -108,7 +108,7 @@ impl VulkanRenderer {
         let render_pass = create_render_pass(&gpu.device)?;
         let continuation_render_pass = create_continuation_render_pass(&gpu.device)?;
         let sampler_set_layout = sampler_set_layout(&gpu)?;
-        // Our largest built-in push block (PostprocessPush, 160 B) exceeds the 128 B spec minimum;
+        // Our largest built-in push block (PostprocessPush, 208 B) exceeds the 128 B spec minimum;
         // fail loudly on an ICD that can't hold it rather than eat a pipeline-layout VUID later.
         let max_push = unsafe { gpu.instance.get_physical_device_properties(gpu.phys) }
             .limits
