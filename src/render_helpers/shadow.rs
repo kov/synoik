@@ -336,11 +336,11 @@ impl RenderElement<VulkanRenderer> for ShadowRenderElement {
         frame: &mut VulkanFrame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), VulkanError> {
-        frame.render_shadow(self.vulkan_push(dst))
+        frame.render_shadow(self.vulkan_push(dst), dst, damage)
     }
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {

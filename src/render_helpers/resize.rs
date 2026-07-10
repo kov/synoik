@@ -430,14 +430,14 @@ mod vulkan {
             frame: &mut VulkanFrame<'_, '_>,
             _src: Rectangle<f64, Buffer>,
             dst: Rectangle<i32, Physical>,
-            _damage: &[Rectangle<i32, Physical>],
+            damage: &[Rectangle<i32, Physical>],
             _opaque_regions: &[Rectangle<i32, Physical>],
             _cache: Option<&UserDataMap>,
         ) -> Result<(), VulkanError> {
             let ResizeRenderElement::Vulkan(inner) = self else {
                 return Ok(());
             };
-            frame.render_resize(&inner.tex_prev, &inner.tex_next, dst, inner.push)
+            frame.render_resize(&inner.tex_prev, &inner.tex_next, dst, damage, inner.push)
         }
 
         fn underlying_storage(

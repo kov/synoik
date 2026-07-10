@@ -185,6 +185,59 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         self.held.push(texture.clone());
     }
 
+    /// Physical-framebuffer scissor rects for a draw of element geometry `dst` restricted to its
+    /// per-element `damage` (element-local rects, exactly as the damage tracker passes them). Each
+    /// rect is clipped to the element, shifted into output space, mapped through the output
+    /// transform (like [`Frame::clear`]), and clamped to the framebuffer (Vulkan scissors must be
+    /// non-negative and in-bounds). An empty result means the element has no on-target damage this
+    /// frame and must not be drawn — the analogue of `GlesFrame`'s per-damage-rect instancing (and
+    /// its `damage.is_empty()` early-out). Drawing the full `dst` unscissored instead would repaint
+    /// undamaged pixels and, because the damage tracker SKIPS undamaged elements above this one,
+    /// erase their LOAD-preserved shadow content — the partial-damage blanking bug.
+    fn damage_scissors(
+        &self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Vec<vk::Rect2D> {
+        let (fb_w, fb_h) = self.fb.buffer.extent();
+        let bounds = Rectangle::from_size(dst.size);
+        damage
+            .iter()
+            .filter_map(|rect| {
+                // Clip the element-local damage to the element, then place it in output space.
+                let mut r = bounds.intersection(*rect)?;
+                r.loc += dst.loc;
+                // Output space -> physical framebuffer (identity for `Transform::Normal`).
+                let phys = self.transform.transform_rect_in(r, &self.logical_size);
+                let x0 = phys.loc.x.max(0);
+                let y0 = phys.loc.y.max(0);
+                let x1 = (phys.loc.x + phys.size.w).min(fb_w as i32);
+                let y1 = (phys.loc.y + phys.size.h).min(fb_h as i32);
+                (x1 > x0 && y1 > y0).then(|| vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent: vk::Extent2D {
+                        width: (x1 - x0) as u32,
+                        height: (y1 - y0) as u32,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Record the 6-vertex quad once per scissor rect, so a draw only touches the damaged pixels
+    /// (the rest stay as the LOAD-preserved shadow). Pipeline, descriptor sets and push constants
+    /// must already be bound. Leaves the scissor at the last rect: every draw sets its own scissor
+    /// first, and `clear` / the present-blit are scissor-independent.
+    ///
+    /// # Safety
+    /// `cbuf` must be in the recording state with a compatible pipeline bound.
+    unsafe fn draw_quad(dev: &ash::Device, cbuf: vk::CommandBuffer, scissors: &[vk::Rect2D]) {
+        for s in scissors {
+            dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(s));
+            dev.cmd_draw(cbuf, 6, 1, 0, 0);
+        }
+    }
+
     /// Arm (or clear) a clip for the next surface draw. `ClippedSurfaceRenderElement`'s Vulkan draw
     /// sets this, draws its inner `WaylandSurfaceRenderElement` (which routes through
     /// `render_texture_from_to`), then clears it. See [`ClipParams`].
@@ -204,15 +257,21 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// transformed `dst`, and — acting on the quad coordinate, not the sampled UV or the
     /// post-`proj` position — independent of both the buffer transform and the output
     /// transform.
+    #[allow(clippy::too_many_arguments)]
     fn render_clipped_texture(
         &mut self,
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
         clip: ClipParams,
     ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         let push = ClippedTexturePush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -254,7 +313,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -268,15 +327,21 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// `geometry` is the whole view at the origin); the general `geometry != dst` clip is a later
     /// clipped-surface concern. Called from `RoundedTextureRenderElement`'s Vulkan draw, hence
     /// `pub(crate)`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_rounded_texture(
         &mut self,
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         corner_radius: f32,
         alpha: f32,
     ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -310,7 +375,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -320,15 +385,21 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// of niri's `GradientFadeTextureRenderElement` (the MRU switcher fades clipped thumbnails).
     /// The buffer `src_transform` and a partial `src` are baked into the sampling
     /// `tex_transform`; the fade band follows the sampled u axis, matching the GLES shader.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_gradient_fade(
         &mut self,
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         cutoff: (f32, f32),
         alpha: f32,
     ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -360,7 +431,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -369,7 +440,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// angled gradient clipped to a rounded-rect ring). The caller (the element's Vulkan draw)
     /// fills every material field of `push` plus `origin`/`size` from `dst`; this sets `target`,
     /// binds the premultiplied-blend border pipeline (no texture), and draws the quad.
-    pub(crate) fn render_border(&mut self, mut push: BorderPush) -> Result<(), VulkanError> {
+    pub(crate) fn render_border(
+        &mut self,
+        mut push: BorderPush,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         push.proj = self.proj;
         push.target = self.target_dims();
         let dev = &self.renderer.gpu.device;
@@ -383,7 +463,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -392,7 +472,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// `ShadowRenderElement` (a gaussian-blurred rounded rect with an optional window cutout).
     /// Like [`Self::render_border`], the caller fills the material fields plus `origin`/`size`;
     /// this sets `target`, binds the premultiplied-blend shadow pipeline (no texture), and draws.
-    pub(crate) fn render_shadow(&mut self, mut push: ShadowPush) -> Result<(), VulkanError> {
+    pub(crate) fn render_shadow(
+        &mut self,
+        mut push: ShadowPush,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         push.proj = self.proj;
         push.target = self.target_dims();
         let dev = &self.renderer.gpu.device;
@@ -406,7 +495,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -427,12 +516,18 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         mut push: PostprocessPush,
     ) -> Result<(), VulkanError> {
         if texture.flipped() {
             tracing::warn!(
                 "VulkanFrame::render_postprocess: flipped textures unsupported; skipping"
             );
+            return Ok(());
+        }
+
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
             return Ok(());
         }
 
@@ -463,7 +558,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -739,12 +834,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         &mut self,
         blur: &BackdropBlur,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         push: PostprocessPush,
     ) -> Result<(), VulkanError> {
         let tex = blur.intermediate();
         let (w, h) = tex.extent();
         let src = Rectangle::<f64, BufferCoord>::from_size(Size::from((w as f64, h as f64)));
-        self.render_postprocess(tex, src, dst, push)
+        self.render_postprocess(tex, src, dst, damage, push)
     }
 
     /// Draw the resize cross-fade material: blend two window snapshots (`tex_prev`, `tex_next`)
@@ -762,6 +858,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         tex_prev: &VkTexture,
         tex_next: &VkTexture,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         mut push: ResizePush,
     ) -> Result<(), VulkanError> {
         if tex_prev.flipped() || tex_next.flipped() {
@@ -769,6 +866,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             return Ok(());
         }
 
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
         push.size = [dst.size.w as f32, dst.size.h as f32];
         push.proj = self.proj;
@@ -796,7 +897,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -812,10 +913,15 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         tex_prev: &VkTexture,
         tex_next: &VkTexture,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         mut push: CustomResizePush,
     ) -> Result<(), VulkanError> {
         if tex_prev.flipped() || tex_next.flipped() {
             tracing::warn!("render_custom_resize: flipped textures unsupported; skipping");
+            return Ok(());
+        }
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
             return Ok(());
         }
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
@@ -847,7 +953,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -863,6 +969,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         ty: CustomShaderType,
         texture: &VkTexture,
         dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
         mut push: CustomAnimPush,
     ) -> Result<(), VulkanError> {
         debug_assert!(
@@ -871,6 +978,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         );
         if texture.flipped() {
             tracing::warn!("render_custom_anim: flipped textures unsupported; skipping");
+            return Ok(());
+        }
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
             return Ok(());
         }
         push.origin = [dst.loc.x as f32, dst.loc.y as f32];
@@ -901,7 +1012,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -1117,9 +1228,13 @@ impl Frame for VulkanFrame<'_, '_> {
     fn draw_solid(
         &mut self,
         dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -1139,7 +1254,7 @@ impl Frame for VulkanFrame<'_, '_> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }
@@ -1150,7 +1265,7 @@ impl Frame for VulkanFrame<'_, '_> {
         texture: &VkTexture,
         src: Rectangle<f64, BufferCoord>,
         dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         src_transform: Transform,
         alpha: f32,
@@ -1166,9 +1281,21 @@ impl Frame for VulkanFrame<'_, '_> {
         // clipped-surface pipeline, which samples through the same `tex_transform` but
         // masks the result to a rounded geometry. See `render_clipped_texture`.
         if let Some(clip) = self.clip_override {
-            return self.render_clipped_texture(texture, src, dst, src_transform, alpha, clip);
+            return self.render_clipped_texture(
+                texture,
+                src,
+                dst,
+                damage,
+                src_transform,
+                alpha,
+                clip,
+            );
         }
 
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
         let push = QuadPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -1200,7 +1327,7 @@ impl Frame for VulkanFrame<'_, '_> {
                 0,
                 as_bytes(&push),
             );
-            dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+            Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
     }

@@ -562,7 +562,7 @@ mod vulkan_impl {
             frame: &mut VulkanFrame<'_, '_>,
             src: Rectangle<f64, Buffer>,
             dst: Rectangle<i32, Physical>,
-            _damage: &[Rectangle<i32, Physical>],
+            damage: &[Rectangle<i32, Physical>],
             _opaque_regions: &[Rectangle<i32, Physical>],
             cache: Option<&UserDataMap>,
         ) -> Result<(), VulkanError> {
@@ -598,8 +598,18 @@ mod vulkan_impl {
             // `clamped_dst` is blurred. Full-geometry backdrop blur (the common GNOME case) is
             // correct; a client using an explicit blur-region protocol gets blur across its whole
             // geometry. Per-subregion scissored draws are a follow-up.
+            // The damage is element-local to `dst`; the backdrop is placed at `clamped_dst`, so
+            // re-base the rects by the same clamp offset before they scissor the draw.
+            let damage: Vec<Rectangle<i32, Physical>> = damage
+                .iter()
+                .map(|d| {
+                    let mut d = *d;
+                    d.loc -= clamp_offset;
+                    d
+                })
+                .collect();
             let push = self.postprocess_push(crop, frame.transform());
-            frame.draw_backdrop(blur, clamped_dst, push)
+            frame.draw_backdrop(blur, clamped_dst, &damage, push)
         }
 
         fn underlying_storage(

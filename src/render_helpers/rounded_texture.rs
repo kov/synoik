@@ -310,7 +310,7 @@ impl RenderElement<VulkanRenderer> for RoundedTextureRenderElement<VkTexture> {
         let radius_px = self.corner_radius * self.scale * rescale;
         let alpha = Element::alpha(&self.inner);
         let src_transform = Element::transform(&self.inner);
-        frame.render_rounded_texture(texture, src, dst, src_transform, radius_px, alpha)
+        frame.render_rounded_texture(texture, src, dst, damage, src_transform, radius_px, alpha)
     }
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {

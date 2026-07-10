@@ -210,14 +210,14 @@ impl RenderElement<VulkanRenderer> for GradientFadeTextureRenderElement<VkTextur
         frame: &mut VulkanFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), VulkanError> {
         let texture = self.inner.buffer().texture();
         let alpha = Element::alpha(&self.inner);
         let src_transform = Element::transform(&self.inner);
-        frame.render_gradient_fade(texture, src, dst, src_transform, self.cutoff, alpha)
+        frame.render_gradient_fade(texture, src, dst, damage, src_transform, self.cutoff, alpha)
     }
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {

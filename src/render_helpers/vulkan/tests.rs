@@ -995,7 +995,13 @@ fn vulkan_postprocess_clips_and_desaturates() {
             ..Default::default()
         };
         frame
-            .render_postprocess(&source, full_src, full_dst, push)
+            .render_postprocess(
+                &source,
+                full_src,
+                full_dst,
+                &[Rectangle::from_size(full_dst.size)],
+                push,
+            )
             .expect("render postprocess");
         let _sync = frame.finish().expect("finish");
     }
@@ -1095,7 +1101,13 @@ fn vulkan_resize_crossfades() {
             ..Default::default()
         };
         frame
-            .render_resize(&tex_prev, &tex_next, dst, push)
+            .render_resize(
+                &tex_prev,
+                &tex_next,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                push,
+            )
             .expect("render resize");
         let _sync = frame.finish().expect("finish");
     }
@@ -1330,7 +1342,13 @@ vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
             ..Default::default()
         };
         frame
-            .render_custom_resize(&tex_prev, &tex_next, dst, push)
+            .render_custom_resize(
+                &tex_prev,
+                &tex_next,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                push,
+            )
             .expect("draw custom resize");
         let _sync = frame.finish().expect("finish");
     }
@@ -1420,7 +1438,13 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
             ..Default::default()
         };
         frame
-            .render_custom_anim(CustomShaderType::Close, &dummy, dst, push)
+            .render_custom_anim(
+                CustomShaderType::Close,
+                &dummy,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                push,
+            )
             .expect("draw custom close");
         let _sync = frame.finish().expect("finish");
     }
@@ -1501,7 +1525,13 @@ vec4 open_color(vec3 coords_geo, vec3 size_geo) {
             ..Default::default()
         };
         frame
-            .render_custom_anim(CustomShaderType::Open, &tex, dst, push)
+            .render_custom_anim(
+                CustomShaderType::Open,
+                &tex,
+                dst,
+                &[Rectangle::from_size(dst.size)],
+                push,
+            )
             .expect("draw custom open");
         let _sync = frame.finish().expect("finish");
     }
@@ -1572,6 +1602,7 @@ fn vulkan_custom_bad_snippet_degrades() {
                 CustomShaderType::Close,
                 &tex,
                 dst,
+                &[Rectangle::from_size(dst.size)],
                 CustomAnimPush::default(),
             )
             .expect("no-op draw for empty slot");

@@ -1174,8 +1174,12 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
 /// cursor over an opaque window); a "clear whole on empty" bug wiped the LOAD-preserved shadow
 /// there and flickered the live desktop, and frame 3 catches it *independently* of whether the
 /// driver discards on DONT_CARE (this Venus stack happens to retain the reused shadow's bits over a
-/// short run, so the LOAD-vs-DONT_CARE distinction itself can only be confirmed live). Venus-only
-/// (needs GBM). See `VulkanFrame::begin` and `VulkanFrame::clear`.
+/// short run, so the LOAD-vs-DONT_CARE distinction itself can only be confirmed live). Frame 4 then
+/// draws a FULLSCREEN solid with only a small damage rect and asserts the rest of the scene
+/// survives — proof that draws scissor to their per-element damage instead of repainting the whole
+/// element (an unscissored fullscreen background repainting over everything the damage tracker
+/// skipped was the dominant live-blanking cause). Venus-only (needs GBM). See `VulkanFrame::begin`,
+/// `::clear`, `::draw_quad`.
 #[test]
 fn vulkan_preserves_undamaged_regions_across_frames() {
     use std::fs::File;
@@ -1285,8 +1289,46 @@ fn vulkan_preserves_undamaged_regions_across_frames() {
         "undamaged region not preserved (render pass must LOAD): expected red [0,0,255,255], \
          got {outside:?}"
     );
+
+    // Frame 4: draw a FULLSCREEN blue solid but with only a small 16×16 damage rect. The draw must
+    // scissor to that rect; repainting the whole element would erase everything the damage tracker
+    // legitimately skipped. This is the second half of the partial-damage bug — an unscissored
+    // fullscreen background/backdrop element repainting over the preserved scene every frame.
+    let hit = Rectangle::<i32, Physical>::new((S / 2, S / 2).into(), (16, 16).into());
+    let mut fb = vk.bind(&mut dmabuf).expect("bind");
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .draw_solid(
+                Rectangle::from_size(size),
+                &[hit],
+                Color32F::from([0., 0., 1., 1.]),
+            )
+            .expect("draw");
+        let _ = frame.finish().expect("finish");
+    }
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Argb8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    // The damaged rect is now BLUE (Argb8888/BGRA [255, 0, 0, 255]).
+    let hit_px = px(&pixels, S, S / 2 + 8, S / 2 + 8);
+    assert!(
+        is(hit_px, [255, 0, 0, 255]),
+        "the damaged rect should be blue, got {hit_px:?}"
+    );
+    // The GREEN patch (untouched by frame 4's damage) survived a FULLSCREEN draw — proof the draw
+    // scissored to its damage instead of repainting the whole element.
+    let patch_after = px(&pixels, S, 16, 16);
+    assert!(
+        is(patch_after, [0, 255, 0, 255]),
+        "a fullscreen draw with small damage repainted undamaged pixels (green patch lost): \
+         got {patch_after:?}"
+    );
+
     eprintln!(
-        "vulkan_preserves_undamaged_regions_across_frames: patch green, undamaged region preserved red"
+        "vulkan_preserves_undamaged_regions_across_frames: patch green, undamaged region preserved \
+         red, fullscreen draw scissored to its damage"
     );
 }
 
@@ -1849,14 +1891,14 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
         frame
             .draw_solid(
                 Rectangle::new((0, 0).into(), (S / 2, S).into()),
-                &[],
+                &[Rectangle::from_size((S / 2, S).into())],
                 Color32F::from([1., 0., 0., 1.]),
             )
             .expect("draw red");
         frame
             .draw_solid(
                 Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
-                &[],
+                &[Rectangle::from_size((S / 2, S).into())],
                 Color32F::from([0., 1., 0., 1.]),
             )
             .expect("draw green");
@@ -1954,14 +1996,14 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
             frame
                 .draw_solid(
                     Rectangle::new((0, 0).into(), (S / 2, S).into()),
-                    &[],
+                    &[Rectangle::from_size((S / 2, S).into())],
                     Color32F::from([1., 0., 0., 1.]),
                 )
                 .expect("draw red");
             frame
                 .draw_solid(
                     Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
-                    &[],
+                    &[Rectangle::from_size((S / 2, S).into())],
                     Color32F::from([0., 1., 0., 1.]),
                 )
                 .expect("draw green");
