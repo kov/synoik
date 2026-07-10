@@ -146,8 +146,11 @@ impl<T: Texture> Element for RoundedTextureRenderElement<T> {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        // The rounding cuts the corners transparent.
-        if self.rounds().is_some() {
+        // A non-zero radius cuts the corners transparent. Gate on the radius rather than
+        // `rounds()`: the Vulkan draw rounds in its own pipeline with no GLES `program`, so
+        // `rounds()` is always `None` there and would otherwise report the cut corners as opaque
+        // (occlusion culling would then drop whatever peeks through the corners).
+        if self.corner_radius > 0. {
             return OpaqueRegions::default();
         }
         self.inner.opaque_regions(scale)
@@ -288,9 +291,23 @@ impl RenderElement<VulkanRenderer> for RoundedTextureRenderElement<VkTexture> {
         }
 
         let texture = self.inner.buffer().texture();
-        // `corner_radius` is in the logical units of `geometry`; the pipeline's SDF works in
-        // physical pixels of `dst`, and (for this element) `geometry == dst`, so scale it up.
-        let radius_px = self.corner_radius * self.scale;
+        // `corner_radius` is in the logical units of `geometry`; the SDF pipeline works in physical
+        // pixels of `dst`. `self.scale` converts logical→physical, but the element may sit under an
+        // outer `RescaleRenderElement` (overview expose zoom, thumbnail strip) that scales `dst`
+        // relative to the element's own geometry. The GLES shader is invariant to that outer
+        // rescale (it maps in geometry space); match it by folding in the dst/geometry ratio so the
+        // radius tracks the on-screen size. With no outer rescale (`dst == geometry`) this is 1.
+        let geo_w = self
+            .inner
+            .geometry(Scale::from(f64::from(self.scale)))
+            .size
+            .w;
+        let rescale = if geo_w != 0 {
+            dst.size.w as f32 / geo_w as f32
+        } else {
+            1.
+        };
+        let radius_px = self.corner_radius * self.scale * rescale;
         let alpha = Element::alpha(&self.inner);
         frame.render_rounded_texture(texture, src, dst, radius_px, alpha)
     }

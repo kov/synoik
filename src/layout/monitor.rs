@@ -24,8 +24,8 @@ use crate::animation::{Animation, Clock};
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
+use crate::render_helpers::dual_texture::DualRoundedTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::xray::XrayPos;
@@ -218,7 +218,7 @@ niri_render_elements! {
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
         // The wallpaper in a workspace thumbnail.
-        RoundedTexture = RoundedTextureRenderElement,
+        RoundedTexture = DualRoundedTextureRenderElement,
     }
 }
 
@@ -2037,8 +2037,8 @@ impl<W: LayoutElement> Monitor<W> {
             let mut wallpapered = false;
             if let Some(wallpaper) = wallpaper {
                 let radius = 6. / strip.scale;
-                if let Some(elem) = wallpaper.render(
-                    ctx.renderer.as_gles_renderer(),
+                if let Some(elem) = wallpaper.render_dual(
+                    ctx.renderer,
                     ws.view_size(),
                     radius,
                     Scale::from(scale * strip.scale),

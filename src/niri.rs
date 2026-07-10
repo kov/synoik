@@ -155,11 +155,12 @@ use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManag
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
-use crate::render_helpers::dual_texture::DualTextureRenderElement;
+use crate::render_helpers::dual_texture::{
+    DualRoundedTextureRenderElement, DualTextureRenderElement,
+};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -4685,17 +4686,15 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, geo)) = mon.workspaces_with_render_geo().next() {
-                // The GNOME wallpaper bakes a GlesTexture; on the owned Vulkan renderer it degrades
-                // to nothing (the solid `render_background` below still draws).
+                // The GNOME wallpaper draws on GLES and, via an uploaded VkTexture, on the owned
+                // Vulkan renderer; the solid `render_background` below still backs it either way.
                 if gnome_mode {
-                    if let Some(gles) = ctx.renderer.try_as_gles_renderer() {
-                        if let Some(elem) =
-                            self.wallpaper
-                                .render(gles, ws.view_size(), 0., output_scale)
-                        {
-                            if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
-                                push(elem.into());
-                            }
+                    if let Some(elem) =
+                        self.wallpaper
+                            .render_dual(ctx.renderer, ws.view_size(), 0., output_scale)
+                    {
+                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
+                            push(elem.into());
                         }
                     }
                 }
@@ -4750,19 +4749,16 @@ impl Niri {
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
                 let mut wallpapered = false;
-                // As above: the GNOME wallpaper is GLES-only; degrades to the solid background on
-                // the owned Vulkan renderer.
+                // As above: the GNOME wallpaper draws on GLES and on the owned Vulkan renderer.
                 if gnome_mode {
-                    if let Some(gles) = ctx.renderer.try_as_gles_renderer() {
-                        if let Some(elem) = self.wallpaper.render(
-                            gles,
-                            ws.view_size(),
-                            wallpaper_radius,
-                            output_scale,
-                        ) {
-                            process!(geo)(elem);
-                            wallpapered = true;
-                        }
+                    if let Some(elem) = self.wallpaper.render_dual(
+                        ctx.renderer,
+                        ws.view_size(),
+                        wallpaper_radius,
+                        output_scale,
+                    ) {
+                        process!(geo)(elem);
+                        wallpapered = true;
                     }
                 }
                 // The solid color would poke out of the wallpaper's rounded
@@ -6981,7 +6977,7 @@ niri_render_elements! {
             SolidColorRenderElement
         >>>,
         RelocatedRoundedTexture = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
-            RoundedTextureRenderElement
+            DualRoundedTextureRenderElement
         >>>,
         Pointer = PointerRenderElements<R>,
         Wayland = WaylandSurfaceRenderElement<R>,
