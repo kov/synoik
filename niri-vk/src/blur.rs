@@ -10,10 +10,11 @@
 //! matching the reference. `half_pixel` is half a *destination* pixel on the way down and half a
 //! *source* pixel on the way up (both in the sampled texture's 0..1 UV space), exactly as niri.
 //!
-//! NOTE (spike limitation): resources are freed explicitly in [`BlurChain::destroy`]; the `?`
-//! error paths in `new`/`read_output` leak on a *failed* build, which is harmless here (any error
-//! aborts `main`, and `Gpu`'s Drop tears down the device and reclaims everything). If this chain
-//! is ever rebuilt at runtime (e.g. per output resize), give the resources a `Drop` impl first.
+//! Resources are freed explicitly in [`BlurChain::destroy`] (no `Drop` — teardown needs a `&Gpu`).
+//! [`BlurChain::new`] unwinds a *failed* build via an internal guard (the compositor now rebuilds a
+//! chain at runtime — per output/size/pass change — where an error propagates instead of aborting
+//! `main`, so a partial build must not leak). `read_output`'s `?` paths still leak on failure, but
+//! that helper is test-only.
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -64,6 +65,73 @@ const FULLSCREEN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscr
 const DOWN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_down.frag.spv"));
 const UP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_up.frag.spv"));
 
+/// Unwind guard for [`BlurChain::new`]: destroys every handle created so far if the build fails
+/// partway (each field starts null — `vkDestroy*` is a no-op on a null handle — and is filled as
+/// `new` progresses). `armed` is cleared once `new` succeeds and moves the handles into the
+/// returned chain. Mirrors [`BlurChain::destroy`]'s teardown order.
+struct NewGuard<'a> {
+    device: &'a ash::Device,
+    armed: bool,
+    render_pass: vk::RenderPass,
+    sampler: vk::Sampler,
+    set_layout: vk::DescriptorSetLayout,
+    desc_pool: vk::DescriptorPool,
+    pipeline_layout: vk::PipelineLayout,
+    down: vk::Pipeline,
+    up: vk::Pipeline,
+    vert: vk::ShaderModule,
+    down_frag: vk::ShaderModule,
+    up_frag: vk::ShaderModule,
+    levels: Vec<Level>,
+}
+
+impl<'a> NewGuard<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        NewGuard {
+            device,
+            armed: true,
+            render_pass: vk::RenderPass::null(),
+            sampler: vk::Sampler::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            desc_pool: vk::DescriptorPool::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            down: vk::Pipeline::null(),
+            up: vk::Pipeline::null(),
+            vert: vk::ShaderModule::null(),
+            down_frag: vk::ShaderModule::null(),
+            up_frag: vk::ShaderModule::null(),
+            levels: Vec::new(),
+        }
+    }
+}
+
+impl Drop for NewGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let d = self.device;
+        unsafe {
+            for level in &self.levels {
+                d.destroy_framebuffer(level.framebuffer, None);
+                d.destroy_image_view(level.view, None);
+                d.destroy_image(level.image, None);
+                d.free_memory(level.memory, None);
+            }
+            d.destroy_pipeline(self.down, None);
+            d.destroy_pipeline(self.up, None);
+            d.destroy_pipeline_layout(self.pipeline_layout, None);
+            d.destroy_shader_module(self.vert, None);
+            d.destroy_shader_module(self.down_frag, None);
+            d.destroy_shader_module(self.up_frag, None);
+            d.destroy_descriptor_pool(self.desc_pool, None);
+            d.destroy_descriptor_set_layout(self.set_layout, None);
+            d.destroy_sampler(self.sampler, None);
+            d.destroy_render_pass(self.render_pass, None);
+        }
+    }
+}
+
 impl BlurChain {
     /// Build the chain to blur `source` (which stays owned by the caller). `passes` is clamped to
     /// at least 1; `source` must be full-size (matches level 0).
@@ -72,7 +140,13 @@ impl BlurChain {
         let passes = passes.max(1);
         let (width, height) = (source.width, source.height);
 
-        let render_pass = create_blur_render_pass(device)?;
+        // The compositor rebuilds a chain at runtime (per output/size/pass-count change — see the
+        // `BackdropBlur` cache), where a failure no longer aborts the process, so a mid-build error
+        // must unwind instead of leaking. Accumulate every created handle in the guard; `disarm` on
+        // success. (`vkDestroy*` is a no-op on the null handles the guard starts with.)
+        let mut guard = NewGuard::new(device);
+
+        guard.render_pass = create_blur_render_pass(device)?;
 
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
@@ -80,10 +154,10 @@ impl BlurChain {
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let sampler =
+        guard.sampler =
             unsafe { device.create_sampler(&sampler_ci, None) }.context("blur sampler")?;
 
-        let set_layout = crate::render::sampler_set_layout(gpu)?;
+        guard.set_layout = crate::render::sampler_set_layout(gpu)?;
 
         // One descriptor set per level + one for the external source.
         let count = (passes + 2) as u32;
@@ -93,7 +167,7 @@ impl BlurChain {
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .max_sets(count)
             .pool_sizes(&sizes);
-        let desc_pool =
+        guard.desc_pool =
             unsafe { device.create_descriptor_pool(&dp_ci, None) }.context("blur desc pool")?;
 
         // Pipeline layout: set 0 = sampler, push constants = BlurPush (fragment).
@@ -102,50 +176,69 @@ impl BlurChain {
             .offset(0)
             .size(std::mem::size_of::<BlurPush>() as u32);
         let layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&set_layout))
+            .set_layouts(std::slice::from_ref(&guard.set_layout))
             .push_constant_ranges(std::slice::from_ref(&push));
-        let pipeline_layout =
+        guard.pipeline_layout =
             unsafe { device.create_pipeline_layout(&layout_ci, None) }.context("blur layout")?;
 
-        let vert = load_module(device, FULLSCREEN_VERT)?;
-        let down_frag = load_module(device, DOWN_FRAG)?;
-        let up_frag = load_module(device, UP_FRAG)?;
-        let down = build_pipeline(gpu, render_pass, pipeline_layout, vert, down_frag)?;
-        let up = build_pipeline(gpu, render_pass, pipeline_layout, vert, up_frag)?;
+        guard.vert = load_module(device, FULLSCREEN_VERT)?;
+        guard.down_frag = load_module(device, DOWN_FRAG)?;
+        guard.up_frag = load_module(device, UP_FRAG)?;
+        guard.down = build_pipeline(
+            gpu,
+            guard.render_pass,
+            guard.pipeline_layout,
+            guard.vert,
+            guard.down_frag,
+        )?;
+        guard.up = build_pipeline(
+            gpu,
+            guard.render_pass,
+            guard.pipeline_layout,
+            guard.vert,
+            guard.up_frag,
+        )?;
 
         // Create the level pyramid.
-        let mut levels = Vec::with_capacity(passes + 1);
         let (mut w, mut h) = (width, height);
         for _ in 0..=passes {
-            levels.push(create_level(
+            let level = create_level(
                 gpu,
-                render_pass,
-                sampler,
-                set_layout,
-                desc_pool,
+                guard.render_pass,
+                guard.sampler,
+                guard.set_layout,
+                guard.desc_pool,
                 w,
                 h,
-            )?);
+            )?;
+            guard.levels.push(level);
             w = (w / 2).max(1);
             h = (h / 2).max(1);
         }
 
-        // Descriptor set that samples the external source.
-        let source_set =
-            alloc_sampler_set(gpu, desc_pool, set_layout, source.view, source.sampler)?;
+        // Descriptor set that samples the external source (freed with `desc_pool`, no separate
+        // destroy — so the guard already covers it).
+        let source_set = alloc_sampler_set(
+            gpu,
+            guard.desc_pool,
+            guard.set_layout,
+            source.view,
+            source.sampler,
+        )?;
 
+        guard.armed = false;
         Ok(BlurChain {
-            render_pass,
-            sampler,
-            set_layout,
-            desc_pool,
-            pipeline_layout,
-            down,
-            up,
-            vert,
-            down_frag,
-            up_frag,
-            levels,
+            render_pass: guard.render_pass,
+            sampler: guard.sampler,
+            set_layout: guard.set_layout,
+            desc_pool: guard.desc_pool,
+            pipeline_layout: guard.pipeline_layout,
+            down: guard.down,
+            up: guard.up,
+            vert: guard.vert,
+            down_frag: guard.down_frag,
+            up_frag: guard.up_frag,
+            levels: std::mem::take(&mut guard.levels),
             source_set,
             passes,
         })
@@ -474,15 +567,23 @@ fn create_blur_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
         .color_attachments(std::slice::from_ref(&color_ref));
     let deps = [
         // A prior pass's write to (and sampling of) a level must finish before this pass touches
-        // it — covers both the read-after-write of the source and the write-after-read overwrite.
+        // it — covers the read-after-write of the source and the write-after-read overwrite. The
+        // TRANSFER scope also orders the previous frame's `copy_output_to` read of level 0 (a
+        // transfer read, when a cached chain is re-recorded frame-over-frame) before this frame's
+        // overwrite; without it that WAR would rest on the caller's per-submit fence alone.
         vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
             )
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ)
+            .src_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::TRANSFER_READ,
+            )
             .dst_stage_mask(
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                     | vk::PipelineStageFlags::FRAGMENT_SHADER,

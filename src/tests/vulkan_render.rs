@@ -1144,17 +1144,23 @@ fn vulkan_renders_a_window_mid_open_animation() {
 }
 
 /// A `FramebufferEffectElement` (GNOME background blur / postprocess) reports
-/// `is_framebuffer_effect() == true`, so the render loop calls `capture_framebuffer()` on it before
-/// `draw()`. Smithay's default `capture_framebuffer` is `unimplemented!()` — a panic — and the
-/// owned Vulkan renderer had no override, so the first blurred surface on a Vulkan session would
-/// crash the compositor. It now degrades (no-op capture + draw). Composite a blur element through
-/// Vulkan and assert it neither panics nor errors. (The real capture+blur lands in a later phase.)
+/// `is_framebuffer_effect() == true`, so the render loop (`render_helpers::render_elements`) calls
+/// `capture_framebuffer()` on it before `draw()`. This drives the **real** owned-Vulkan
+/// capture+blur path through that loop (not manual frame calls), proving the integration: the
+/// mid-frame render-pass split, the cached `BackdropBlur`, and the postprocess composite all run
+/// without panicking or erroring. (Smithay's default `capture_framebuffer` is `unimplemented!()` —
+/// a panic — so before the Vulkan override this crashed the compositor.) The blur here is over the
+/// cleared transparent backdrop, so nothing visible composites; the *visible* softening is asserted
+/// by `vulkan_backdrop_blur_softens_a_hard_edge`.
 #[test]
-fn vulkan_framebuffer_effect_degrades_without_panic() {
+fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skipping vulkan_framebuffer_effect_degrades_without_panic: no Vulkan ({e})");
+            eprintln!(
+                "skipping vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop: \
+                 no Vulkan ({e})"
+            );
             return;
         }
     };
@@ -1173,8 +1179,8 @@ fn vulkan_framebuffer_effect_degrades_without_panic() {
     };
     let elem = fbe.render(None, params, Some(blur), 0.0, 1.0);
 
-    // render_to_vec invokes capture_framebuffer() for is_framebuffer_effect elements — the panic
-    // path. Reaching a readback proves the Vulkan renderer degraded it instead of panicking.
+    // render_to_vec invokes capture_framebuffer() for is_framebuffer_effect elements, then draw().
+    // Reaching a readback proves the whole owned-Vulkan capture+blur+postprocess path ran cleanly.
     let size = Size::<i32, Physical>::from((256, 256));
     let pixels = render_to_vec(
         &mut vk,
@@ -1191,7 +1197,7 @@ fn vulkan_framebuffer_effect_degrades_without_panic() {
         "unexpected readback size"
     );
     eprintln!(
-        "vulkan_framebuffer_effect_degrades_without_panic: {} bytes, no panic",
+        "vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop: {} bytes, no panic",
         pixels.len()
     );
 }
@@ -1385,4 +1391,130 @@ fn vulkan_capture_region_splits_the_render_pass() {
     );
 
     eprintln!("vulkan_capture_region_splits_the_render_pass: capture=red, target=green");
+}
+
+/// End-to-end backdrop blur on the owned Vulkan renderer: draw a hard red|green vertical edge, then
+/// run a `FramebufferEffectElement` (blur enabled) over the whole frame — `capture_framebuffer`
+/// grabs the scene (mid-frame render-pass split), blurs it, and `draw` composites the result. A
+/// blurred edge produces **blended** pixels (both R and G raised) that the sharp scene never has,
+/// so finding one proves the capture→blur→postprocess path ran. Offscreen-only, so it runs on
+/// lavapipe too. This is the payoff of the mid-frame render-pass split.
+#[test]
+fn vulkan_backdrop_blur_softens_a_hard_edge() {
+    use niri_config::CornerRadius;
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_backdrop_blur_softens_a_hard_edge: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+        .expect("create target");
+
+    // A whole-output framebuffer effect with blur on (no clip, no rounding, no desaturation).
+    let effect = FramebufferEffect::new();
+    let params = RenderParams {
+        geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+        subregion: None,
+        clip: None,
+        scale: 1.0,
+    };
+    let element = effect.render(
+        None,
+        params,
+        Some(BlurOptions {
+            passes: 3,
+            offset: 2.0,
+        }),
+        0.0, // noise
+        1.0, // saturation (identity)
+    );
+    let _ = CornerRadius::default();
+    let cache = UserDataMap::new();
+    let src = element.src();
+    let dst = element.geometry(Scale::from(1.0));
+
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        // Scene behind: left half red, right half green — a hard vertical edge at x = S/2.
+        frame
+            .draw_solid(
+                Rectangle::new((0, 0).into(), (S / 2, S).into()),
+                &[],
+                Color32F::from([1., 0., 0., 1.]),
+            )
+            .expect("draw red");
+        frame
+            .draw_solid(
+                Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
+                &[],
+                Color32F::from([0., 1., 0., 1.]),
+            )
+            .expect("draw green");
+        // Capture the scene (render-pass split), blur it, composite it back.
+        RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+            .expect("capture_framebuffer");
+        RenderElement::<Vk>::draw(
+            &element,
+            &mut frame,
+            src,
+            dst,
+            &[Rectangle::from_size(size)],
+            &[],
+            Some(&cache),
+        )
+        .expect("draw");
+        let _ = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+
+    // Scan the middle row for a blended pixel (both channels raised) — impossible in the sharp
+    // red|green scene, so its presence proves the blur ran.
+    let y = S / 2;
+    let mut best_blend = 0u8;
+    for x in 0..S {
+        let p = px(&pixels, S, x, y);
+        best_blend = best_blend.max(p[0].min(p[1]));
+    }
+    assert!(
+        best_blend > 40,
+        "no blended pixel on the middle row (max min(R,G) = {best_blend}); blur did not composite"
+    );
+
+    // The composite is still the (blurred) scene, not garbage: far left stays red-dominant, far
+    // right green-dominant.
+    let left = px(&pixels, S, 2, y);
+    let right = px(&pixels, S, S - 3, y);
+    assert!(
+        left[0] > 150 && left[1] < 110,
+        "far-left should stay red-dominant, got {left:?}"
+    );
+    assert!(
+        right[1] > 150 && right[0] < 110,
+        "far-right should stay green-dominant, got {right:?}"
+    );
+
+    eprintln!(
+        "vulkan_backdrop_blur_softens_a_hard_edge: edge blend min(R,G)={best_blend}, left={left:?} right={right:?}"
+    );
 }

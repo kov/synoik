@@ -445,6 +445,165 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
     }
 }
 
+/// The owned Vulkan renderer's backdrop-blur path: the real (non-degraded)
+/// `RenderElement<VulkanRenderer>`. `capture_framebuffer` grabs the scene-behind into a cached
+/// [`BackdropBlur`] (stored in the element's `UserDataMap`, like the GLES `Inner`) and blurs it;
+/// `draw` composites the blurred result with the postprocess-and-clip material — the same two-phase
+/// shape as the GLES impl above, just driven through `VulkanFrame::capture_backdrop` /
+/// `draw_backdrop`. Rotated outputs are not yet handled (Normal-transform only), matching the rest
+/// of the Vulkan port.
+#[cfg(feature = "vulkan")]
+mod vulkan_impl {
+    use std::cell::RefCell;
+
+    use glam::{Mat3, Vec2, Vec3};
+    use niri_vk::render::PostprocessPush;
+    use smithay::backend::renderer::element::{RenderElement, UnderlyingStorage};
+    use smithay::utils::user_data::UserDataMap;
+    use smithay::utils::{Buffer, Logical, Physical, Rectangle, Transform};
+
+    use super::FramebufferEffectElement;
+    use crate::render_helpers::vulkan::{BackdropBlur, VulkanError, VulkanFrame, VulkanRenderer};
+
+    /// A `glam::Mat3` packed as `PostprocessPush::input_to_geo`'s 3 column-vectors (`.xyz`, `w =
+    /// 0`).
+    fn pack_mat3(m: Mat3) -> [[f32; 4]; 3] {
+        let col = |v: Vec3| [v.x, v.y, v.z, 0.0];
+        [col(m.x_axis), col(m.y_axis), col(m.z_axis)]
+    }
+
+    impl FramebufferEffectElement {
+        /// Build the postprocess material's push constants for `crop` (the source rect adjusted for
+        /// clamping) — the Vulkan sibling of [`Self::compute_uniforms`], packed into a
+        /// [`PostprocessPush`]. `render_postprocess` fills `origin`/`size`/`target`/`src_rect`.
+        fn postprocess_push(
+            &self,
+            crop: Rectangle<f64, Logical>,
+            transform: Transform,
+        ) -> PostprocessPush {
+            let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
+            let offset = Vec2::new(offset.x as f32, offset.y as f32);
+            let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
+            let clip_size = Vec2::new(self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
+
+            // v_coords are [0,1] inside crop; map them to [0,1] inside clip_geo, then revert the
+            // texture transform (identity for Normal). Same construction as compute_uniforms.
+            let input_to_clip_geo = Mat3::from_scale(crop_size / clip_size)
+                * Mat3::from_translation(offset / crop_size);
+            let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
+                * Mat3::from_cols_array(transform.matrix().as_ref())
+                * Mat3::from_translation(Vec2::new(-0.5, -0.5));
+            let input_to_geo = input_to_clip_geo * transform_mat;
+
+            PostprocessPush {
+                geo_size: [self.clip_geo.size.w as f32, self.clip_geo.size.h as f32],
+                corner_radius: <[f32; 4]>::from(self.corner_radius),
+                bg_color: [0.0; 4],
+                input_to_geo: pack_mat3(input_to_geo),
+                niri_scale: self.scale,
+                niri_alpha: 1.0,
+                saturation: self.saturation,
+                noise: self.noise,
+                // origin/size/target/src_rect are filled by render_postprocess.
+                ..Default::default()
+            }
+        }
+    }
+
+    impl RenderElement<VulkanRenderer> for FramebufferEffectElement {
+        fn capture_framebuffer(
+            &self,
+            frame: &mut VulkanFrame<'_, '_>,
+            src: Rectangle<f64, Buffer>,
+            dst: Rectangle<i32, Physical>,
+            cache: &UserDataMap,
+        ) -> Result<(), VulkanError> {
+            let output_rect = Rectangle::from_size(frame.output_size());
+            let transform = frame.transform();
+
+            // Clamp to the framebuffer (an effect near an edge spills off-screen).
+            let clamped_dst = match dst.intersection(output_rect) {
+                Some(clamped) => clamped,
+                None => return Ok(()),
+            };
+            let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
+
+            // Intermediate size from geometry + scale (not dst.size) — matches the GLES capture, so
+            // a zoom-out doesn't reallocate every frame and the blur tracks the on-screen size.
+            let size = src
+                .size
+                .to_logical(1., Transform::Normal)
+                .upscale(clamp_scale)
+                .to_physical_precise_round(self.scale);
+            let size = transform.transform_size(size);
+            let size = size.to_logical(1).to_buffer(1, Transform::Normal);
+
+            // The target sub-region to grab (Normal: == clamped_dst).
+            let src_region = transform.transform_rect_in(clamped_dst, &output_rect.size);
+
+            let passes = self.blur_options.map(|o| (o.passes as usize).clamp(1, 31));
+            let offset = self.blur_options.map_or(0.0, |o| o.offset) as f32;
+
+            let inner =
+                cache.get_or_insert::<RefCell<Option<BackdropBlur>>, _>(|| RefCell::new(None));
+            let mut slot = inner.borrow_mut();
+            frame.capture_backdrop(&mut slot, src_region, size, passes, offset)
+        }
+
+        fn draw(
+            &self,
+            frame: &mut VulkanFrame<'_, '_>,
+            src: Rectangle<f64, Buffer>,
+            dst: Rectangle<i32, Physical>,
+            _damage: &[Rectangle<i32, Physical>],
+            _opaque_regions: &[Rectangle<i32, Physical>],
+            cache: Option<&UserDataMap>,
+        ) -> Result<(), VulkanError> {
+            let Some(cache) = cache else {
+                return Ok(());
+            };
+            let Some(inner) = cache.get::<RefCell<Option<BackdropBlur>>>() else {
+                return Ok(());
+            };
+            let slot = inner.borrow();
+            let Some(blur) = slot.as_ref() else {
+                return Ok(());
+            };
+
+            // Clamp exactly as capture_framebuffer did.
+            let output_rect = Rectangle::from_size(frame.output_size());
+            let clamped_dst = match dst.intersection(output_rect) {
+                Some(clamped) => clamped,
+                None => return Ok(()),
+            };
+            let clamp_offset = clamped_dst.loc - dst.loc;
+
+            // The source crop, adjusted proportionally for the dst clamping (mirrors GLES draw).
+            let src_loc = src.loc.to_logical(1., Transform::Normal, &src.size);
+            let dst_to_src = src.size / dst.size.to_f64();
+            let crop = Rectangle::new(
+                src_loc + clamp_offset.to_f64().upscale(dst_to_src).to_logical(1.),
+                clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
+            );
+
+            // KNOWN DIVERGENCE from the GLES draw: `self.subregion` is ignored. GLES restricts the
+            // painted area to `subregion ∩ damage` (a client-requested blur region); here the whole
+            // `clamped_dst` is blurred. Full-geometry backdrop blur (the common GNOME case) is
+            // correct; a client using an explicit blur-region protocol gets blur across its whole
+            // geometry. Per-subregion scissored draws are a follow-up.
+            let push = self.postprocess_push(crop, frame.transform());
+            frame.draw_backdrop(blur, clamped_dst, push)
+        }
+
+        fn underlying_storage(
+            &self,
+            _renderer: &mut VulkanRenderer,
+        ) -> Option<UnderlyingStorage<'_>> {
+            None
+        }
+    }
+}
+
 impl Inner {
     fn new(renderer: &mut GlesRenderer) -> Self {
         Inner {

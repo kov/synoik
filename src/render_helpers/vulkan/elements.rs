@@ -13,7 +13,6 @@ use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
-use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -71,6 +70,7 @@ degraded_vulkan_element!(GradientFadeTextureRenderElement<GlesTexture>);
 // ResizeRenderElement has a real Vulkan draw (render_resize) in render_helpers/resize.rs.
 degraded_vulkan_element!(XrayElement);
 degraded_vulkan_element!(ShaderRenderElement);
-degraded_vulkan_element!(FramebufferEffectElement);
+// FramebufferEffectElement has a real Vulkan draw (backdrop capture + blur + postprocess) in
+// framebuffer_effect.rs.
 degraded_vulkan_element!(OffscreenRenderElement<GlesTexture>);
 degraded_vulkan_element!(PrimaryGpuTextureRenderElement);

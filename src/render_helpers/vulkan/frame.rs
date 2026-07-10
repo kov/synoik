@@ -6,6 +6,7 @@ use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 
+use super::backdrop_blur::BackdropBlur;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
@@ -547,6 +548,72 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         dest.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
+    }
+
+    /// The physical output size this frame renders into (pre-transform), for the framebuffer-effect
+    /// clamp math (mirrors `GlesFrame::output_size`).
+    pub(crate) fn output_size(&self) -> Size<i32, Physical> {
+        self.output_size
+    }
+
+    /// The frame's (already-inverted, per `render_elements`) output transform — mirrors
+    /// `GlesFrame::transformation`, used by the framebuffer-effect geometry mapping.
+    pub(crate) fn transform(&self) -> Transform {
+        self.transform
+    }
+
+    /// Capture the backdrop into `slot`'s cache and blur it (when enabled) — the orchestration
+    /// behind `FramebufferEffectElement`'s Vulkan `capture_framebuffer`. (Re)builds the cached
+    /// [`BackdropBlur`] when the intermediate `size`/`passes` change (kept across frames otherwise
+    /// — per-frame allocation is Venus blob churn), captures `src_region` of the target into it
+    /// via [`Self::capture_region`], then records the blur. The element then composites
+    /// [`BackdropBlur::intermediate`] with [`Self::render_postprocess`] in its `draw`.
+    pub(crate) fn capture_backdrop(
+        &mut self,
+        slot: &mut Option<BackdropBlur>,
+        src_region: Rectangle<i32, Physical>,
+        size: Size<i32, BufferCoord>,
+        passes: Option<usize>,
+        offset: f32,
+    ) -> Result<(), VulkanError> {
+        // A near-fully-clipped effect (edge, or deep overview zoom) can round the intermediate size
+        // to zero. `vkCreateImage` with a 0 extent is invalid usage, and a zero-region
+        // `capture_region` would skip the blit and leave `capture` UNDEFINED (then sampled as
+        // SHADER_READ) — so bail before allocating or capturing. There is nothing to composite;
+        // `draw` clamps to the same degenerate `dst`, so it contributes ~nothing. (A reused cache
+        // keeps last frame's content untouched — we skip capture AND blur, so it stays consistent.)
+        if size.w <= 0 || size.h <= 0 {
+            return Ok(());
+        }
+
+        let dims = (size.w as u32, size.h as u32);
+        let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));
+        if !reuse {
+            *slot = Some(BackdropBlur::new(self.renderer, size, passes)?);
+        }
+        let bb = slot.as_mut().expect("just populated");
+        self.capture_region(src_region, bb.capture())?;
+        bb.run_blur(offset)?;
+        Ok(())
+    }
+
+    /// Composite a captured/blurred backdrop into `dst` — the `draw` half of the framebuffer
+    /// effect, paired with [`Self::capture_backdrop`]. Samples the cached
+    /// [`BackdropBlur::intermediate`] (blurred output, or the raw capture when blur is off)
+    /// across its whole extent; the caller fills the material fields of `push` (`geo_size`,
+    /// `corner_radius`, `input_to_geo`, `niri_scale`, `saturation`, `noise`, `bg_color`), this
+    /// fills the placement + `src_rect` via [`Self::render_postprocess`] and clips to the
+    /// rounded geometry.
+    pub(crate) fn draw_backdrop(
+        &mut self,
+        blur: &BackdropBlur,
+        dst: Rectangle<i32, Physical>,
+        push: PostprocessPush,
+    ) -> Result<(), VulkanError> {
+        let tex = blur.intermediate();
+        let (w, h) = tex.extent();
+        let src = Rectangle::<f64, BufferCoord>::from_size(Size::from((w as f64, h as f64)));
+        self.render_postprocess(tex, src, dst, push)
     }
 
     /// Draw the resize cross-fade material: blend two window snapshots (`tex_prev`, `tex_next`)

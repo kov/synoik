@@ -13,6 +13,7 @@
 //! [`niri_vk`] workspace library; this module is only the Smithay-trait glue, templated
 //! method-for-method on Smithay's `PixmanRenderer`.
 
+mod backdrop_blur;
 mod custom;
 mod elements;
 mod error;
@@ -23,6 +24,7 @@ mod renderer;
 mod tests;
 mod types;
 
+pub(crate) use backdrop_blur::BackdropBlur;
 pub use error::VulkanError;
 pub use frame::VulkanFrame;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
