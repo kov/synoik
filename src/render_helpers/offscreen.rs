@@ -416,3 +416,195 @@ impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
         None
     }
 }
+
+/// A concrete enum carrying either the GLES-sampled offscreen element or the `VkTexture` one
+/// sampled through the owned Vulkan renderer — the same type-unification bridge as
+/// [`DualTextureRenderElement`](super::dual_texture::DualTextureRenderElement), for callers that
+/// push an offscreen element into a generic `<R>` render tree (the alt-tab MRU closing fade).
+/// `OffscreenRenderElement<VkTexture>` has no `RenderElement<GlesRenderer>` impl, so it can't ride
+/// a generic arm directly; this enum dispatches per renderer, no-op on the wrong one. The type is
+/// present with or without the `vulkan` feature (only the `Vulkan` variant is gated) so the render
+/// tree's arm stays unconditional, matching the macro's inability to cfg individual arms.
+#[derive(Debug)]
+pub enum DualOffscreenRenderElement {
+    Gles(OffscreenRenderElement<GlesTexture>),
+    #[cfg(feature = "vulkan")]
+    Vulkan(OffscreenRenderElement<VkTexture>),
+}
+
+impl DualOffscreenRenderElement {
+    fn inner(&self) -> &dyn Element {
+        match self {
+            DualOffscreenRenderElement::Gles(e) => e,
+            #[cfg(feature = "vulkan")]
+            DualOffscreenRenderElement::Vulkan(e) => e,
+        }
+    }
+}
+
+impl Element for DualOffscreenRenderElement {
+    fn id(&self) -> &Id {
+        self.inner().id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner().current_commit()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner().geometry(scale)
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner().transform()
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner().src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner().damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner().opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner().alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner().kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for DualOffscreenRenderElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), GlesError> {
+        match self {
+            DualOffscreenRenderElement::Gles(e) => RenderElement::<GlesRenderer>::draw(
+                e,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            // The Vulkan arm is only ever constructed on a Vulkan session, never here.
+            #[cfg(feature = "vulkan")]
+            DualOffscreenRenderElement::Vulkan(_) => {
+                debug_assert!(
+                    false,
+                    "Vulkan DualOffscreenRenderElement drawn through GLES"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        match self {
+            DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
+            #[cfg(feature = "vulkan")]
+            DualOffscreenRenderElement::Vulkan(_) => None,
+        }
+    }
+}
+
+impl<'render> RenderElement<TtyRenderer<'render>> for DualOffscreenRenderElement {
+    fn draw(
+        &self,
+        frame: &mut TtyFrame<'_, '_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), TtyRendererError<'render>> {
+        match self {
+            DualOffscreenRenderElement::Gles(e) => RenderElement::<TtyRenderer>::draw(
+                e,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            #[cfg(feature = "vulkan")]
+            DualOffscreenRenderElement::Vulkan(_) => {
+                debug_assert!(
+                    false,
+                    "Vulkan DualOffscreenRenderElement drawn through Tty GLES"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn underlying_storage(
+        &self,
+        renderer: &mut TtyRenderer<'render>,
+    ) -> Option<UnderlyingStorage<'_>> {
+        match self {
+            DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
+            #[cfg(feature = "vulkan")]
+            DualOffscreenRenderElement::Vulkan(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for DualOffscreenRenderElement {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        // Both arms dispatch to the inner element: the GLES variant's
+        // `RenderElement<VulkanRenderer>` is a degraded no-op (reached only if the Vulkan
+        // offscreen render failed and we kept it), the Vulkan variant draws for real.
+        match self {
+            DualOffscreenRenderElement::Gles(e) => RenderElement::<VulkanRenderer>::draw(
+                e,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+            DualOffscreenRenderElement::Vulkan(e) => RenderElement::<VulkanRenderer>::draw(
+                e,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            ),
+        }
+    }
+
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}

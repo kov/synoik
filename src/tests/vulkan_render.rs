@@ -310,6 +310,57 @@ fn vulkan_mru_draws_the_scope_panel() {
     );
 }
 
+/// During the alt-tab closing fade the MRU renders itself into an offscreen (to avoid transparent
+/// compositing artifacts), then composites that at a fading alpha. The offscreen was GLES-only, so
+/// on the owned Vulkan renderer the fade fell through to just the dark backdrop — the thumbnails
+/// and scope panel vanished the instant the fade began. Now it renders into a `VkTexture`
+/// offscreen. Open the MRU, start the close, step a little into the spring so `alpha < 1` (the
+/// offscreen path), and composite the Output target through Vulkan: the white scope-panel text must
+/// still be present (the old blank offscreen would have left only the backdrop).
+#[test]
+fn vulkan_mru_closing_fade_draws_through_the_offscreen() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let clock = f.niri().clock.clone();
+    let wmru = crate::ui::mru::WindowMru::new(f.niri());
+    f.niri().window_mru_ui.open(clock, wmru, output.clone());
+    // Settle the open animation so the MRU is fully open — a close before that skips the fade.
+    f.niri_complete_animations();
+    assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
+
+    // Start the close, then advance ~16 ms into the critically-damped fade spring so `alpha` is a
+    // little below 1 (≈0.9) — enough to take the offscreen path yet keep the text bright.
+    f.niri()
+        .window_mru_ui
+        .close(crate::ui::mru::MruCloseRequest::Cancel);
+    let now = f.niri().clock.now_unadjusted();
+    f.niri()
+        .clock
+        .set_unadjusted(now + std::time::Duration::from_millis(16));
+    f.niri().advance_animations();
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // Same white-text discriminator as the open case: at ~0.9 alpha the scope-panel text stays well
+    // above 200, while the old blank-offscreen fade leaves ~0 white here (only the dark backdrop
+    // faded over the desktop).
+    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let top = h / 8;
+    let white = (0..top * w)
+        .filter(|i| is_white(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!(
+        "vulkan_mru_closing_fade_draws_through_the_offscreen: {white} white px in the top strip"
+    );
+    assert!(
+        white > 40,
+        "the MRU closing fade did not render through the Vulkan offscreen (blank fade?): {white} white px"
+    );
+}
+
 /// The screenshot UI freezes the screen into a GLES texture the owned Vulkan renderer can't sample,
 /// so on a Vulkan session it reads that capture back and uploads it to a `VkTexture` for the Output
 /// target. Open the UI over a green-window scene, then composite the Output target through Vulkan:

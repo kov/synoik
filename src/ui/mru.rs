@@ -31,10 +31,12 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuffer};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
@@ -123,7 +125,7 @@ niri_render_elements! {
         UiTexture = TextureRenderElement<R::TextureId>,
         GradientFadeElem = GradientFadeTextureRenderElement,
         FocusRing = FocusRingRenderElement,
-        Offscreen = OffscreenRenderElement,
+        Offscreen = DualOffscreenRenderElement,
         Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement<R>>>,
     }
 }
@@ -171,6 +173,10 @@ struct Inner {
 
     /// Offscreen buffer for the closing fade animation on the main output.
     offscreen: OffscreenBuffer,
+
+    /// The same, for the owned Vulkan renderer (whose `VkTexture` offscreen is a distinct type).
+    #[cfg(feature = "vulkan")]
+    offscreen_vk: OffscreenBuffer<VkTexture>,
 }
 
 #[derive(Debug)]
@@ -964,6 +970,8 @@ impl WindowMruUi {
             scope_panel: Default::default(),
             backdrop_buffers: Default::default(),
             offscreen: OffscreenBuffer::default(),
+            #[cfg(feature = "vulkan")]
+            offscreen_vk: OffscreenBuffer::default(),
         };
         inner.view_pos = ViewPos::Static(inner.compute_view_pos());
 
@@ -1153,38 +1161,56 @@ impl WindowMruUi {
             // different <R> generic in offscreen vs. normal path.
         };
 
-        // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
-        // The offscreen is GLES-only; on the owned Vulkan renderer skip it (falls through to the
-        // backdrop below — alt-tab still shows, just without the fade-out offscreen).
+        // During the closing fade, render into an offscreen to avoid transparent compositing
+        // artifacts. Works on GLES and, via a `VkTexture` offscreen, on the owned Vulkan renderer;
+        // either way it falls through to the backdrop below if the offscreen render fails.
+        //
+        // FIXME: would be good to passthrough offscreen data to visible windows here. As is, during
+        // the closing fade, windows from other workspaces stop receiving frame callbacks. However,
+        // we need to refactor our offscreen data a bit to make this nicer. Currently it supports a
+        // stack of offscreens, but not several unrelated offscreens showing the same window
+        // (possibly in addition to the window itself). Anyhow, this is not very noticeable since
+        // Alt-Tab closing happens quickly.
         let mut pushed_offscreen = false;
-        if *output == inner.output && alpha < 1. && ctx.try_as_gles().is_some() {
-            let mut ctx = ctx.as_gles();
+        if *output == inner.output && alpha < 1. {
+            let scale = Scale::from(output.current_scale().fractional_scale());
 
-            let mut elems = Vec::new();
-            inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
-            elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
+            if let Some(mut gctx) = ctx.try_as_gles() {
+                let mut elems = Vec::new();
+                inner.render(niri, gctx.r(), &mut |elem| elems.push(elem));
+                elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
 
-            let scale = output.current_scale().fractional_scale();
-            match inner
-                .offscreen
-                .render(ctx.renderer, Scale::from(scale), &elems)
-            {
-                Ok((elem, _sync, _data)) => {
-                    // FIXME: would be good to passthrough offscreen data to visible windows here.
-                    // As is, during the closing fade, windows from other workspaces stop receiving
-                    // frame callbacks.
-                    //
-                    // However, we need to refactor our offscreen data a bit to make this nicer.
-                    // Currently it supports a stack of offscreens, but not a several unrelated
-                    // offscreens showing the same window (possibly in addition to the window
-                    // itself).
-                    //
-                    // Anyhow, this is not very noticeable since Alt-Tab closing happens quickly.
-                    push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
-                    pushed_offscreen = true;
+                match inner.offscreen.render(gctx.renderer, scale, &elems) {
+                    Ok((elem, _sync, _data)) => {
+                        push(WindowMruUiRenderElement::Offscreen(
+                            DualOffscreenRenderElement::Gles(elem.with_alpha(alpha)),
+                        ));
+                        pushed_offscreen = true;
+                    }
+                    Err(err) => {
+                        warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+                    }
                 }
-                Err(err) => {
-                    warn!("error rendering MRU to offscreen for fade-out: {err:?}");
+            }
+
+            #[cfg(feature = "vulkan")]
+            if !pushed_offscreen {
+                if let Some(mut vctx) = ctx.try_as_vulkan() {
+                    let mut elems = Vec::new();
+                    inner.render(niri, vctx.r(), &mut |elem| elems.push(elem));
+                    elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
+
+                    match inner.offscreen_vk.render(vctx.renderer, scale, &elems) {
+                        Ok((elem, _sync, _data)) => {
+                            push(WindowMruUiRenderElement::Offscreen(
+                                DualOffscreenRenderElement::Vulkan(elem.with_alpha(alpha)),
+                            ));
+                            pushed_offscreen = true;
+                        }
+                        Err(err) => {
+                            warn!("error rendering MRU to Vulkan offscreen for fade-out: {err:?}");
+                        }
+                    }
                 }
             }
         }
