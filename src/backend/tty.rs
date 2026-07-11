@@ -1976,18 +1976,26 @@ impl Tty {
         // level; `render_frame` is generic over the renderer).
         #[cfg(feature = "vulkan")]
         if let Some(vk) = self.vulkan_renderer.as_mut() {
-            // Hardware cursor + overlay planes work with the owned Vulkan renderer because those
-            // scanout paths bypass the renderer entirely: `DrmCompositor` puts the cursor into its
-            // own gbm Argb8888/Linear buffer (CPU copy or its internal pixman renderer) and
-            // overlay-scans a client's dmabuf straight to KMS via gbm — `render_frame` only needs
-            // `Renderer + Bind<Dmabuf>` (the primary swapchain), which we satisfy. So mirror the
-            // GLES flags, minus primary-plane direct scanout: that one hands a client buffer to KMS
-            // as the *primary* framebuffer, bypassing our present-blit/shadow and damage-preserving
-            // path, and depends on the Vulkan element tree surfacing `underlying_storage` — its own
-            // follow-up with its own validation. Overlay stays behind `debug.enable_overlay_planes`
-            // (off by default, same as GLES).
+            // Hardware cursor, overlay, and primary-plane direct scanout all work with the owned
+            // Vulkan renderer because those scanout paths bypass the renderer entirely: the cursor
+            // goes into DrmCompositor's own gbm Argb8888/Linear buffer (CPU copy or its internal
+            // pixman renderer), and overlay/primary scan a client's dmabuf straight to KMS via gbm.
+            // `render_frame` only needs `Renderer + Bind<Dmabuf>` (the primary swapchain), which we
+            // satisfy. A fullscreen client reaches the compositor as a bare
+            // `WaylandSurfaceRenderElement` (no clip/border/rounding wrapper), whose
+            // `underlying_storage` already yields the client `WlBuffer`, so primary scanout engages
+            // for it. It's safe against our present-blit shadow / damage-preserving path: during a
+            // scanout stretch no `VulkanFrame` runs and the damage tracker's timeline freezes, so
+            // on resume the reported damage is computed against exactly the frame the
+            // shadow holds (the age-1 superset invariant is preserved), and the present
+            // blit is clipped to freshly-written pixels regardless. The BGRA-only
+            // primary plane also guarantees colour safety: gbm only frames a client
+            // buffer whose format the plane lists (Argb/Xrgb8888), so an RGBA-order
+            // client can't be misinterpreted (it falls back to compositing). So
+            // mirror the GLES flags in full. Overlay stays behind `debug.enable_overlay_planes`
+            // (off by default, same as GLES); `debug.disable_direct_scanout` drops primary+overlay.
             let flags =
-                compositor_frame_flags(&config, niri, output, /* allow_primary */ false);
+                compositor_frame_flags(&config, niri, output, /* allow_primary */ true);
             return render_surface_with(
                 niri,
                 output,
