@@ -57,6 +57,7 @@ use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlob
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
 };
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use smithay::wayland::presentation::Refresh;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
@@ -937,6 +938,26 @@ impl Tty {
                 );
             assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
 
+            // Expose linux-drm-syncobj-v1 (explicit sync) if the primary GPU supports syncobj
+            // eventfd. This is renderer-agnostic — it benefits both the GLES and owned-Vulkan
+            // paths. Acquire timeline points become commit-time blockers (in the dmabuf
+            // pre-commit hooks, alongside the implicit-fence path); release points are signaled
+            // CPU-side when the buffer's last reference drops, so no renderer completion fence is
+            // needed while `VulkanFrame::finish()` stays synchronous. See
+            // docs/fork/explicit-sync.md.
+            if niri.drm_syncobj_state.is_none() {
+                let device_fd = drm.device_fd().clone();
+                if supports_syncobj_eventfd(&device_fd) {
+                    debug!("exposing linux-drm-syncobj-v1 (explicit sync)");
+                    niri.drm_syncobj_state = Some(DrmSyncobjState::new::<State>(
+                        &niri.display_handle,
+                        device_fd,
+                    ));
+                } else {
+                    debug!("primary GPU lacks syncobj eventfd; explicit sync not advertised");
+                }
+            }
+
             // Update the dmabuf feedbacks for all surfaces.
             for (node, device) in self.devices.iter_mut() {
                 for surface in device.surfaces.values_mut() {
@@ -1275,6 +1296,29 @@ impl Tty {
                     }
                 } else {
                     error!("dmabuf global was already missing");
+                }
+
+                // Tear down the explicit-sync (linux-drm-syncobj-v1) global that was created
+                // against this primary device's fd. This drops the `DrmSyncobjState`'s clone of
+                // the `DrmDeviceFd`, without which the refcounted fd close below would fail
+                // ("fd has unexpected references") and leak the seat fd; it also lets a re-added
+                // primary rebuild the global against the fresh fd (the `is_none()` guard in
+                // `device_added`). Mirrors the dmabuf-global teardown above.
+                if let Some(syncobj_state) = niri.drm_syncobj_state.take() {
+                    let global = syncobj_state.into_global();
+                    niri.display_handle.disable_global::<State>(global.clone());
+                    niri.event_loop
+                        .insert_source(
+                            Timer::from_duration(Duration::from_secs(10)),
+                            move |_, _, state| {
+                                state
+                                    .niri
+                                    .display_handle
+                                    .remove_global::<State>(global.clone());
+                                TimeoutAction::Drop
+                            },
+                        )
+                        .unwrap();
                 }
             }
 

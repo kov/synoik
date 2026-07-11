@@ -21,6 +21,7 @@ mod floating;
 mod fullscreen;
 mod gnome;
 mod layer_shell;
+mod producer_sync;
 mod remove_output;
 mod transactions;
 #[cfg(feature = "vulkan")]

@@ -79,6 +79,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::DmabufState;
+use smithay::wayland::drm_syncobj::DrmSyncobjState;
 use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
@@ -296,6 +297,12 @@ pub struct Niri {
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub dmabuf_state: DmabufState,
+    // linux-drm-syncobj-v1 explicit-sync global. `Some` on the tty backend while the primary GPU
+    // is up and supports syncobj eventfd (created in `Tty::device_added`, torn down and reset to
+    // `None` in `Tty::device_removed` so the device fd can be closed cleanly and a re-added
+    // primary rebuilds it against the fresh fd); always `None` on winit/headless (no DRM device).
+    // Renderer-agnostic: benefits both the GLES and Vulkan paths.
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub seat_state: SeatState<State>,
     pub tablet_state: TabletManagerState,
@@ -2508,6 +2515,8 @@ impl Niri {
         let output_manager_state =
             OutputManagerState::new_with_xdg_output::<State>(&display_handle);
         let dmabuf_state = DmabufState::new();
+        // Created lazily by the tty backend once the primary GPU is known (needs a DRM device).
+        let drm_syncobj_state = None;
         let fractional_scale_manager_state =
             FractionalScaleManagerState::new::<State>(&display_handle);
         let mut seat_state = SeatState::new();
@@ -2772,6 +2781,7 @@ impl Niri {
             shm_state,
             output_manager_state,
             dmabuf_state,
+            drm_syncobj_state,
             fractional_scale_manager_state,
             seat_state,
             tablet_state,
