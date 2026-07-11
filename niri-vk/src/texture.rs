@@ -606,6 +606,166 @@ impl Texture {
             d.free_memory(self.memory, None);
         }
     }
+
+    /// Re-upload a full `width*height` frame of tightly-packed pixels into this already-allocated
+    /// image, reusing `staging` (the caller must have `ensure`d capacity and `write`n the data).
+    /// It's a full overwrite, so the barrier discards the old contents (`UNDEFINED` old layout,
+    /// valid regardless of the image's current layout) and leaves the image in
+    /// `SHADER_READ_ONLY_OPTIMAL`. Used by the shm-client texture cache to refresh a cached texture
+    /// in place instead of allocating a fresh image + staging buffer every commit.
+    pub fn reupload_full(&self, gpu: &Gpu, pool: vk::CommandPool, staging: &Staging) -> Result<()> {
+        let device = &gpu.device;
+        gpu.run_commands(pool, |cbuf| unsafe {
+            transition(
+                device,
+                cbuf,
+                self.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: self.width,
+                    height: self.height,
+                    depth: 1,
+                });
+            device.cmd_copy_buffer_to_image(
+                cbuf,
+                staging.buffer,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            transition(
+                device,
+                cbuf,
+                self.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            );
+        })
+    }
+}
+
+/// A reusable `HOST_VISIBLE | HOST_COHERENT` staging buffer for repeated texture uploads. Grown on
+/// demand and never shrunk; the buffer + memory persist across uploads, so re-uploading a client's
+/// shm buffer every commit doesn't churn a fresh mappable allocation each time (the mappable-blob
+/// type that pressures the Venus host). Not internally synchronized — the renderer serializes
+/// access via `&mut self`, and each upload is fence-waited before the next, so overwriting the
+/// mapped bytes is safe. Call [`Staging::destroy`] before dropping (it holds raw Vulkan handles).
+pub struct Staging {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: vk::DeviceSize,
+}
+
+impl Staging {
+    pub const fn new() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            capacity: 0,
+        }
+    }
+
+    /// Ensure the staging holds at least `size` bytes, (re)allocating grow-only if needed. Safe to
+    /// realloc synchronously: the renderer fence-waits every upload, so nothing references the old
+    /// buffer.
+    pub fn ensure(&mut self, gpu: &Gpu, size: vk::DeviceSize) -> Result<()> {
+        if size <= self.capacity {
+            return Ok(());
+        }
+        unsafe { self.destroy(&gpu.device) };
+        let device = &gpu.device;
+        let ci = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.create_buffer(&ci, None) }.context("staging buffer")?;
+        // `buffer` is live but not yet owned by `self`, so destroy it on any error before
+        // returning: a failed allocate/bind (host mappable-memory exhaustion — the very
+        // pressure this cache targets) must not orphan the handle, or a failing grow would
+        // leak one per commit.
+        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let memory = match gpu.allocate(
+            req,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) {
+            Ok(memory) => memory,
+            Err(e) => {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        };
+        if let Err(e) =
+            unsafe { device.bind_buffer_memory(buffer, memory, 0) }.context("bind staging")
+        {
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return Err(e);
+        }
+        self.buffer = buffer;
+        self.memory = memory;
+        self.capacity = size;
+        Ok(())
+    }
+
+    /// Copy `data` into the staging (caller must have `ensure`d `data.len()` capacity). Maps and
+    /// unmaps around the copy; `HOST_COHERENT` means no explicit flush is needed.
+    pub fn write(&self, gpu: &Gpu, data: &[u8]) -> Result<()> {
+        assert!(data.len() as vk::DeviceSize <= self.capacity);
+        let device = &gpu.device;
+        unsafe {
+            let ptr = device
+                .map_memory(
+                    self.memory,
+                    0,
+                    data.len() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .context("map staging")? as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            device.unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+
+    /// Free the underlying buffer + memory (idempotent; leaves the staging empty — a later `ensure`
+    /// reallocates).
+    ///
+    /// # Safety
+    /// No in-flight GPU work may reference the buffer.
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.memory != vk::DeviceMemory::null() {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+        self.buffer = vk::Buffer::null();
+        self.memory = vk::DeviceMemory::null();
+        self.capacity = 0;
+    }
+}
+
+impl Default for Staging {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -2254,3 +2254,86 @@ fn vulkan_renders_into_a_gbm_dmabuf() {
         px(&pixels, 3 * W / 4, 3 * H / 4),
     );
 }
+
+// --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
+
+/// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads
+/// the new contents *in place* via `reupload_shm` — grow-only staging feeding `Texture::
+/// reupload_full`'s layout dance (UNDEFINED→TRANSFER_DST, full buffer→image copy, →SHADER_READ) —
+/// instead of allocating a fresh image every frame. Pin that the in-place re-upload actually lands
+/// the new pixels *and* leaves the same image sampleable: import an opaque-red source, re-upload it
+/// green into the very same `VkTexture`, then sample it 1:1 into an offscreen and read back green.
+/// A no-op or stale re-upload (or a botched layout transition) would read back the original red.
+#[test]
+fn vulkan_shm_reupload_overwrites_in_place() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_shm_reupload_overwrites_in_place: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const RED: [u8; 4] = [220, 30, 30, 255];
+    const GREEN: [u8; 4] = [30, 200, 60, 255];
+
+    // Import an opaque-red source; `import_memory` leaves it in SHADER_READ_ONLY_OPTIMAL, directly
+    // sampleable — the same state a cached shm texture sits in between commits.
+    let tex = vk
+        .import_memory(
+            &solid_texels(RED),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import red source");
+
+    // Re-upload green into the SAME VkImage (the cache-reuse path), allocating no new image.
+    vk.reupload_shm(&tex, &solid_texels(GREEN))
+        .expect("reupload green");
+
+    // Sample the re-uploaded texture 1:1 into an offscreen and read it back.
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let full_src = Rectangle::<f64, BufferCoord>::from_size(Size::from((W as f64, H as f64)));
+        let full_dst = Rectangle::<i32, Physical>::from_size(size);
+        frame
+            .render_texture_from_to(
+                &tex,
+                full_src,
+                full_dst,
+                &[full_dst],
+                &[],
+                Transform::Normal,
+                1.0,
+            )
+            .expect("sample re-uploaded texture");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    // The whole quad must be the re-uploaded green, and demonstrably not the original red.
+    let center = px(&pixels, W / 2, H / 2);
+    assert!(
+        close_px(center, GREEN, 3),
+        "re-upload should overwrite the image with green, got {center:?}",
+    );
+    assert!(
+        !close_px(center, RED, 40),
+        "re-upload must not leave the original red behind, got {center:?}",
+    );
+}

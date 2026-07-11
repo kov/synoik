@@ -79,6 +79,9 @@ pub struct VulkanRenderer {
     custom_open: Option<Pipeline>,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
+    /// Reused staging buffer for shm-client texture uploads (grown on demand), so the shm cache's
+    /// hit path refreshes a client buffer every commit without churning a mappable allocation.
+    shm_staging: niri_vk::texture::Staging,
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
@@ -235,6 +238,7 @@ impl VulkanRenderer {
             custom_open: None,
             sampler_set_layout,
             command_pool,
+            shm_staging: niri_vk::texture::Staging::new(),
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
@@ -690,6 +694,7 @@ impl Drop for VulkanRenderer {
         unsafe {
             let dev = &self.gpu.device;
             let _ = dev.device_wait_idle();
+            self.shm_staging.destroy(dev);
             self.solid_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
@@ -1024,6 +1029,20 @@ pub fn dmabuf_formats() -> FormatSet {
         modifier: Modifier::Linear,
     })
     .collect()
+}
+
+impl VulkanRenderer {
+    /// The shm-cache hit path: re-upload `data` (tightly-packed `w*h*4` bytes) into `tex`'s
+    /// existing image, reusing the renderer's staging buffer — no image or staging allocation.
+    /// Safe against a concurrent sample because every VulkanRenderer submit is immediately
+    /// fence-waited (the renderer is fully synchronous), so no in-flight frame can be sampling
+    /// `tex` here; if async submission is ever added this needs per-texture fence tracking.
+    pub(super) fn reupload_shm(&mut self, tex: &VkTexture, data: &[u8]) -> Result<(), VulkanError> {
+        self.shm_staging.ensure(&self.gpu, data.len() as u64)?;
+        self.shm_staging.write(&self.gpu, data)?;
+        tex.reupload_shm(self.command_pool, &self.shm_staging)?;
+        Ok(())
+    }
 }
 
 impl ImportMem for VulkanRenderer {

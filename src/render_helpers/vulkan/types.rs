@@ -232,7 +232,28 @@ impl VkTexture {
     pub(super) fn set_layout(&self, layout: vk::ImageLayout) {
         self.0.layout.store(layout.as_raw(), Ordering::Release);
     }
+
+    /// Re-upload a full frame of tightly-packed pixels into this texture's existing image, reusing
+    /// `staging` (the caller must have written the data into it). The shm-cache hit path: refresh a
+    /// cached texture in place with no allocation. The image ends in `SHADER_READ_ONLY_OPTIMAL`.
+    pub(super) fn reupload_shm(
+        &self,
+        pool: vk::CommandPool,
+        staging: &niri_vk::texture::Staging,
+    ) -> anyhow::Result<()> {
+        self.0.tex.reupload_full(&self.0.gpu, pool, staging)?;
+        self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(())
+    }
 }
+
+// The shm texture cache stores `VkTexture` in the surface's `data_map`, which requires the value be
+// `Send + Sync`. (All the Vulkan handles it holds are `u64`/atomics; `Gpu`'s dispatch tables are
+// `Send + Sync`.) Pin it so a future field can't silently break the cache.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<VkTexture>();
+};
 
 impl fmt::Debug for VkTexture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

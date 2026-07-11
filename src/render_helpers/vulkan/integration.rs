@@ -6,12 +6,17 @@
 //! real; EGL client-buffer import ([`ImportEgl`]) still returns an error (clients use dmabuf/shm on
 //! this stack). The dmabuf-target [`Bind`] (KMS scanout) lives in `renderer.rs`.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::display::EGLBufferReader;
 use smithay::backend::egl::Error as EglError;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::{ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl};
+use smithay::backend::renderer::{
+    ContextId, ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl, Renderer, Texture,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::DisplayHandle;
@@ -42,17 +47,26 @@ impl OffscreenRenderer for VulkanRenderer {
     }
 }
 
+/// Per-surface cache of the shm-imported [`VkTexture`], keyed by renderer context id, stored in the
+/// surface's `data_map` (freed on surface destroy). Mirrors the GLES renderer's shm texture cache
+/// (`Arc<Mutex<HashMap<ContextId, ..>>>`); it lets `import_shm_buffer` reuse the same `VkImage`
+/// across commits instead of re-allocating. `Mutex` because `data_map` values must be `Send +
+/// Sync`.
+#[derive(Default)]
+struct ShmTextureCache(Mutex<HashMap<ContextId<VkTexture>, VkTexture>>);
+
 impl ImportMemWl for VulkanRenderer {
     fn import_shm_buffer(
         &mut self,
         buffer: &WlBuffer,
-        _surface: Option<&SurfaceData>,
+        surface: Option<&SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<VkTexture, VulkanError> {
-        // Read the shm pool, repack the (possibly strided, offset) rows into a tight w*h*4 buffer,
-        // and hand it to `import_memory` (which maps the fourcc to the matching VkFormat). The
-        // whole buffer is uploaded — `_damage` is ignored, since there is no per-buffer texture
-        // cache to partially update yet (a per-commit full re-upload; a perf follow-up).
+        // Read the shm pool and repack the (possibly strided, offset) rows into a tight w*h*4
+        // buffer. We upload the whole buffer (`_damage` is ignored — damage-based partial
+        // upload is a bandwidth follow-up); the important win is the per-surface cache
+        // below, which reuses the VkImage + staging so an actively-updating client doesn't
+        // churn allocations every commit.
         let prepared = with_buffer_contents(buffer, |ptr, len, data| {
             let fourcc = match data.format {
                 wl_shm::Format::Argb8888 => Fourcc::Argb8888,
@@ -80,7 +94,34 @@ impl ImportMemWl for VulkanRenderer {
 
         let (packed, fourcc, size) =
             prepared.map_err(|e| VulkanError::Other(format!("shm buffer access: {e}")))??;
-        self.import_memory(&packed, fourcc, size, false)
+
+        // smithay re-calls this on every new-buffer commit, and the old code allocated a fresh
+        // device image + a fresh HOST_VISIBLE staging buffer each time — a per-commit churn of the
+        // mappable-blob type that pressures the Venus host. Reuse the cached VkImage in place when
+        // the (size, fourcc) match, so an actively-updating shm client allocates nothing per frame.
+        // Reuse keys on `Fourcc`, not VkFormat: Argb/Xrgb8888 share `B8G8R8A8_UNORM` but differ in
+        // the view's alpha swizzle, so a same-size fourcc switch must re-import.
+        let Some(surface) = surface else {
+            // No surface to hang the cache on (e.g. non-surface internal imports): keep the old
+            // uncached behavior.
+            return self.import_memory(&packed, fourcc, size, false);
+        };
+        let cache = surface
+            .data_map
+            .get_or_insert_threadsafe(ShmTextureCache::default);
+        let mut cache = cache.0.lock().unwrap();
+        let id = self.context_id();
+        if let Some(existing) = cache.get(&id) {
+            if existing.size() == size && existing.format() == Some(fourcc) {
+                let tex = existing.clone();
+                drop(cache);
+                self.reupload_shm(&tex, &packed)?;
+                return Ok(tex);
+            }
+        }
+        let tex = self.import_memory(&packed, fourcc, size, false)?;
+        cache.insert(id, tex.clone());
+        Ok(tex)
     }
 }
 
