@@ -575,6 +575,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
+        bridge_vulkan: bool,
         id: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -589,7 +590,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(
+            renderer,
+            bridge_vulkan,
+            snapshot,
+            tile_size,
+            tile_pos,
+            blocker,
+        );
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -625,6 +633,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn start_close_animation_for_tile(
         &mut self,
         renderer: &mut GlesRenderer,
+        bridge_vulkan: bool,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
@@ -646,7 +655,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer,
+            bridge_vulkan,
+            snapshot,
+            scale,
+            tile_size,
+            tile_pos,
+            blocker,
+            anim,
         );
         match res {
             Ok(closing) => {
@@ -1208,8 +1224,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         for closing in self.closing_windows.iter().rev() {
-            // The closing-window animation renders through a GLES offscreen; skip it on the owned
-            // Vulkan renderer (the window is already unmapped, so it just won't animate out).
+            #[cfg(feature = "vulkan")]
+            if let Some(vctx) = ctx.try_as_vulkan() {
+                if let Some(elem) =
+                    closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)
+                {
+                    push(elem.into());
+                }
+                continue;
+            }
+
             if let Some(ctx) = ctx.try_as_gles() {
                 let elem = closing.render(ctx, view_rect, scale);
                 push(elem.into());

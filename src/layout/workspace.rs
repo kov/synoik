@@ -2006,28 +2006,44 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
+        bridge_vulkan: bool,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
         if self.floating.has_window(window) {
-            self.floating
-                .start_close_animation_for_window(renderer, window, blocker);
+            self.floating.start_close_animation_for_window(
+                renderer,
+                bridge_vulkan,
+                window,
+                blocker,
+            );
         } else {
-            self.scrolling
-                .start_close_animation_for_window(renderer, window, blocker);
+            self.scrolling.start_close_animation_for_window(
+                renderer,
+                bridge_vulkan,
+                window,
+                blocker,
+            );
         }
     }
 
     pub fn start_close_animation_for_tile(
         &mut self,
         renderer: &mut GlesRenderer,
+        bridge_vulkan: bool,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
     ) {
-        self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.floating.start_close_animation_for_tile(
+            renderer,
+            bridge_vulkan,
+            snapshot,
+            tile_size,
+            tile_pos,
+            blocker,
+        );
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {

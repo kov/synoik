@@ -24,11 +24,11 @@
 //!
 //! Live wiring: config snippets are compiled in via
 //! `VulkanRenderer::set_custom_{resize,close,open}_shader` (the owned-renderer side of the
-//! `shaders::set_custom_*_program` install/reload sites), and the **resize** and **open**
-//! animations construct their elements through this on a Vulkan session (resize via
-//! `ResizeRenderElement`, open via `CustomAnimRenderElement`). **Close is not wired yet** — the
-//! closing-window animation has no Vulkan render path at all (it is GLES-gated), so there is
-//! nothing to route a custom close through.
+//! `shaders::set_custom_*_program` install/reload sites), and the **resize**, **open** and
+//! **close** animations construct their elements through this on a Vulkan session (resize via
+//! `ResizeRenderElement`, open/close via `CustomAnimRenderElement`). The closing-window animation
+//! captures its snapshot to a `MemoryBuffer` at close time and re-uploads it to a `VkTexture`, then
+//! routes a custom close shader through `render_custom_anim` (see `ClosingWindow::render_vulkan`).
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};

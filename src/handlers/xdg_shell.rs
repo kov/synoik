@@ -856,10 +856,14 @@ impl XdgShellHandler for State {
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
+        let bridge_vulkan = self.backend.using_vulkan();
         self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
+            self.niri.layout.start_close_animation_for_window(
+                renderer,
+                bridge_vulkan,
+                &window,
+                blocker,
+            );
         });
 
         let active_window = self.niri.layout.focus().map(|m| &m.window);

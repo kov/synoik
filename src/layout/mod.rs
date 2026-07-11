@@ -5022,6 +5022,7 @@ impl<W: LayoutElement> Layout<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
+        bridge_vulkan: bool,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -5053,7 +5054,14 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
 
                 let tile_pos = tile_pos - ws_geo.loc;
-                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+                ws.start_close_animation_for_tile(
+                    renderer,
+                    bridge_vulkan,
+                    snapshot,
+                    tile_size,
+                    tile_pos,
+                    blocker,
+                );
                 return;
             }
         }
@@ -5063,7 +5071,12 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(renderer, window, blocker);
+                            ws.start_close_animation_for_window(
+                                renderer,
+                                bridge_vulkan,
+                                window,
+                                blocker,
+                            );
                             return;
                         }
                     }
@@ -5072,7 +5085,12 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        ws.start_close_animation_for_window(renderer, window, blocker);
+                        ws.start_close_animation_for_window(
+                            renderer,
+                            bridge_vulkan,
+                            window,
+                            blocker,
+                        );
                         return;
                     }
                 }

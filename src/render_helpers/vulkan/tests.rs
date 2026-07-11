@@ -1406,6 +1406,78 @@ fn vulkan_custom_anim_element_draws_the_open_shader() {
     );
 }
 
+/// The close sibling of [`vulkan_custom_anim_element_draws_the_open_shader`]:
+/// `CustomAnimRenderElement`'s Vulkan arm, built with `CustomShaderType::Close`, draws through the
+/// installed custom `close` shader via `render_custom_anim`. This pins the element-level close
+/// wiring that `closing_window.rs::render_vulkan` uses when a custom close shader is configured
+/// (the snapshot is captured to a `MemoryBuffer` and re-uploaded to a `VkTexture` there; here we
+/// import one directly).
+#[test]
+fn vulkan_custom_anim_element_draws_the_close_shader() {
+    use crate::render_helpers::custom_anim::CustomAnimRenderElement;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_custom_anim_element_draws_the_close_shader: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    assert!(!vk.has_custom_shader(CustomShaderType::Close));
+    vk.set_custom_close_shader(Some(
+        "vec4 close_color(vec3 coords_geo, vec3 size_geo) {\n\
+         return vec4(0.0, 1.0, 0.0, 1.0);\n\
+         }",
+    ));
+    assert!(
+        vk.has_custom_shader(CustomShaderType::Close),
+        "set_custom_close_shader should compile + arm the slot",
+    );
+
+    let snapshot = vk
+        .import_memory(
+            &solid_texels([200, 0, 0, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import snapshot");
+    let area = Rectangle::<f64, Logical>::from_size(Size::from((W as f64, H as f64)));
+    let push = CustomAnimPush {
+        geo_size: [W as f32, H as f32],
+        input_to_geo: [1.0, 1.0, 0.0, 0.0],
+        geo_to_tex: [1.0, 1.0, 0.0, 0.0],
+        alpha: 1.0,
+        scale: 1.0,
+        ..Default::default()
+    };
+    let elem = CustomAnimRenderElement::new_vulkan_anim(
+        CustomShaderType::Close,
+        snapshot,
+        area,
+        1.0,
+        push,
+    );
+    let pixels = render_to_vec(
+        &mut vk,
+        Size::from((W, H)),
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [elem].into_iter(),
+    )
+    .expect("render custom close element");
+
+    let c = px(&pixels, W / 2, H / 2);
+    assert!(
+        c[1] > 150 && c[0] < 90 && c[2] < 90,
+        "custom close shader should paint green (not the red snapshot), got {c:?}",
+    );
+}
+
 // --- M3 step 5: custom runtime GLSL animation shaders -------------------------------------------
 
 /// A W×H opaque solid, tight `[R,G,B,A]`, for the custom-shader tests.
