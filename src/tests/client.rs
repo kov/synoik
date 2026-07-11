@@ -402,6 +402,9 @@ impl Window {
 
     /// Attach an opaque single-pixel buffer of the given color (premultiplied u32 channels, as the
     /// protocol expects), so the mapped window has visible content in a screenshot.
+    // Only the `vulkan` render tests map client buffers, so gate the attach helpers on it to avoid
+    // a dead-code warning in the default build.
+    #[cfg(feature = "vulkan")]
     pub fn attach_solid_buffer(&self, r: u32, g: u32, b: u32, a: u32) {
         let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
@@ -409,9 +412,32 @@ impl Window {
 
     /// Attach an opaque `w`×`h` **shm** buffer filled with a solid RGBA color. Unlike a
     /// single-pixel buffer, this carries a real texture, so the compositor's snapshot path
-    /// (`render_snapshot_from_surface_tree`) can bake it — required to exercise resize/close
-    /// animations. Uses `wl_shm` `Argb8888` (0xAARRGGBB little-endian ⇒ bytes `[B, G, R, A]`).
+    /// (`render_snapshot_from_surface_tree`) can bake it and the renderer's shm import/cache path
+    /// runs — required to exercise resize/close animations and the shm texture cache. Uses `wl_shm`
+    /// `Argb8888` (0xAARRGGBB little-endian ⇒ bytes `[B, G, R, A]`).
+    #[cfg(feature = "vulkan")]
     pub fn attach_shm_buffer(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
+        self.attach_shm_buffer_with_format(w, h, [b, g, r, a], wl_shm::Format::Argb8888);
+    }
+
+    /// As [`Self::attach_shm_buffer`], but a `wl_shm` `Abgr8888` buffer with `[R, G, B, A]` memory
+    /// order — a *different* fourcc at the same size, to exercise the renderer's format-change
+    /// re-import: Argb/Abgr map to different VkFormats, so a wrong same-size cache reuse would
+    /// sample the new bytes through the old view and swap R↔B (red would read back as blue).
+    #[cfg(feature = "vulkan")]
+    pub fn attach_shm_buffer_abgr(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
+        self.attach_shm_buffer_with_format(w, h, [r, g, b, a], wl_shm::Format::Abgr8888);
+    }
+
+    /// Attach a `w`×`h` shm buffer tiling the 4-byte `texel` (already in `format`'s memory order).
+    #[cfg(feature = "vulkan")]
+    fn attach_shm_buffer_with_format(
+        &self,
+        w: i32,
+        h: i32,
+        texel: [u8; 4],
+        format: wl_shm::Format,
+    ) {
         use std::io::Write as _;
         use std::os::fd::{AsFd, OwnedFd};
 
@@ -424,14 +450,13 @@ impl Window {
         let fd = memfd_create("niri-test-shm", MemfdFlags::CLOEXEC).expect("memfd_create");
         ftruncate(&fd, size as u64).expect("ftruncate");
 
-        let px = [b, g, r, a];
-        let data: Vec<u8> = px.iter().copied().cycle().take(size).collect();
+        let data: Vec<u8> = texel.iter().copied().cycle().take(size).collect();
         let mut file = std::fs::File::from(fd);
         file.write_all(&data).expect("write shm buffer");
         let fd: OwnedFd = file.into();
 
         let pool = shm.create_pool(fd.as_fd(), size as i32, &self.qh, ());
-        let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, stride, format, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
         self.surface.damage_buffer(0, 0, w, h);
         pool.destroy();

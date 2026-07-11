@@ -14,7 +14,9 @@ use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Transform};
+use wayland_client::protocol::wl_surface::WlSurface;
 
+use super::client::ClientId;
 use super::fixture::Fixture;
 use crate::backend::RendererKind;
 use crate::niri::OutputRenderElements;
@@ -2391,5 +2393,120 @@ fn vulkan_draws_a_rounded_focus_ring() {
     assert!(
         !is_blue(px(&pixels, w, gx0 - 10, gy0 - 10)),
         "the focus-ring corner is ring-colored — pointy (square), not rounded"
+    );
+}
+
+/// Map a real **shm-textured** window (a green `Argb8888` buffer, `WIN`×`WIN`) on a fresh
+/// Vulkan-backed fixture and settle the open animation, so the renderer's per-surface shm
+/// import/cache path (`import_shm_buffer`) runs on a static scene. Returns the fixture, client id,
+/// surface, and output for follow-up re-commits. `None` (with a skip) when no Vulkan device.
+fn shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping shm-cache test: no Vulkan device");
+        return None;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    Some((f, id, surface, output))
+}
+
+/// The shm cache keeps a client's `VkTexture` across commits and re-uploads the new contents *in
+/// place* on a same-(size, fourcc) hit. Drive a real surface through two same-size, same-format
+/// commits (green → red) and assert the second frame is the re-uploaded red with no stale green: a
+/// hit path that returned the cached texture without re-uploading would leave the first color.
+#[test]
+fn vulkan_shm_cache_refreshes_on_recommit() {
+    let Some((mut f, id, surface, output)) = shm_window_fixture() else {
+        return;
+    };
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+
+    // First frame: the green buffer imports and populates the per-surface cache.
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert!(green > 0, "green window absent from the first frame");
+
+    // Swap in a RED buffer of the SAME size + format → a cache hit that must re-upload in place.
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 255, 0, 0, 255);
+    window.commit();
+    f.double_roundtrip(id);
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert!(
+        red > 0,
+        "the re-committed red window is absent (cache returned stale content?)"
+    );
+    assert_eq!(
+        green, 0,
+        "stale green survived the re-commit ({green} px): the cache hit did not re-upload"
+    );
+}
+
+/// The cache keys reuse on `(size, fourcc)`, not size alone (unlike the GLES renderer): a same-size
+/// buffer with a DIFFERENT fourcc must re-import, because Argb/Abgr map to different VkFormats and
+/// view swizzles. Commit an Argb buffer, then an Abgr buffer of the same size whose bytes are RED
+/// in Abgr order — a correct re-import renders RED, while a size-only cache reuse would upload the
+/// new bytes through the old Argb view and swap R↔B, rendering BLUE.
+#[test]
+fn vulkan_shm_cache_reimports_on_format_change() {
+    let Some((mut f, id, surface, output)) = shm_window_fixture() else {
+        return;
+    };
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let is_blue = |p: [u8; 4]| p[2] > 200 && p[0] < 40 && p[1] < 40;
+
+    // First frame populates the cache with an Argb-format image (the fixture's green buffer).
+    let _ = render_output_vulkan(&mut f, &output);
+
+    // Swap in an Abgr buffer, SAME size, encoding RED. A size-only reuse would render it BLUE.
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer_abgr(WIN as i32, WIN as i32, 255, 0, 0, 255);
+    window.commit();
+    f.double_roundtrip(id);
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    let blue = (0..w * h)
+        .filter(|i| is_blue(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert!(red > 0, "the Abgr red window is absent from the frame");
+    assert_eq!(
+        blue, 0,
+        "the format change reused the Argb image ({blue} blue px): red read back as blue — \
+         cache keyed on size only, not fourcc"
     );
 }
