@@ -410,14 +410,25 @@ impl VulkanRenderer {
         &mut self,
         dmabuf: &Dmabuf,
     ) -> Result<VkTexture, VulkanError> {
-        // SCOPE NOTE — producer-side synchronization is not handled here. The acquire barrier below
-        // (and the synchronous `finish()` on the compositing submit) only order *our* work; they do
-        // not wait on the client's producing GPU fence (the dmabuf's implicit fence, nor an
-        // explicit `wp_linux_drm_syncobj` release point). With a real GPU client this can
-        // sample a partially-written frame (tearing/garbage on a busy client). It does not
-        // manifest on LINEAR/Venus with the CPU-filled test buffer. Wiring client-buffer
-        // readiness through the fence↔drm_syncobj bridge (see `sync_spike`) is a follow-up;
-        // this is an ownership acquire, not a readiness wait — do not conflate them.
+        // PRODUCER SYNC — this is an ownership *acquire* barrier (FOREIGN queue family →
+        // ours), NOT a readiness wait on the client's producing GPU fence. That's fine:
+        // producer readiness is guaranteed UPSTREAM, at commit time, renderer-agnostically.
+        // `State::add_default_dmabuf_pre_commit_hook` (and the mapped-toplevel hook in
+        // `handlers/xdg_shell.rs`) hold the surface commit until either the client's
+        // `linux-drm-syncobj-v1` acquire timeline point signals, or — for implicit-sync
+        // clients — smithay's `Dmabuf::generate_blocker(Interest::READ)` observes the buffer's
+        // producing (write/exclusive) fence via `poll(2)` on the plane fds. So by the time this
+        // import runs the buffer is producer-complete; there is nothing to wait on here. This
+        // matches mutter and smithay's anvil (commit-time gating, not render-time waits). The
+        // Venus implicit fence is trustworthy on this VM (the `sync_spike` proved a virtio_gpu
+        // dma_fence reflects host-GPU completion; GLES daily-drives tear-free on the same
+        // blocker). See `docs/fork/explicit-sync.md`.
+        //
+        // This becomes a real render-side gap ONLY if the fork later (a) advertises explicit
+        // sync while *skipping* the commit-time acquire blocker (non-standard; neither mutter
+        // nor anvil does this), or (b) drops the synchronous `finish()` CPU-wait to pipeline
+        // present — at which point acquire would ride a wait-semaphore and release an exported
+        // `VkFence`→`SYNC_FD` (the bridge the `sync_spike` de-risked). Neither is true today.
         if dmabuf.num_planes() != 1 {
             return Err(VulkanError::Unsupported("multi-planar dmabuf import"));
         }
