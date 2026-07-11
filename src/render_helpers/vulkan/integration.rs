@@ -51,7 +51,9 @@ impl OffscreenRenderer for VulkanRenderer {
 /// surface's `data_map` (freed on surface destroy). Mirrors the GLES renderer's shm texture cache
 /// (`Arc<Mutex<HashMap<ContextId, ..>>>`); it lets `import_shm_buffer` reuse the same `VkImage`
 /// across commits instead of re-allocating. `Mutex` because `data_map` values must be `Send +
-/// Sync`.
+/// Sync`. An entry keyed by a now-dead renderer `ContextId` (e.g. after a device re-add) keeps its
+/// `VkImage` — and the whole `Arc<Gpu>` it holds — alive until the surface is destroyed; that is a
+/// bounded, surface-lifetime retention, not a growing leak.
 #[derive(Default)]
 struct ShmTextureCache(Mutex<HashMap<ContextId<VkTexture>, VkTexture>>);
 

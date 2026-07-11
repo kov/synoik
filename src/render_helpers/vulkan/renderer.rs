@@ -1038,6 +1038,15 @@ impl VulkanRenderer {
     /// fence-waited (the renderer is fully synchronous), so no in-flight frame can be sampling
     /// `tex` here; if async submission is ever added this needs per-texture fence tracking.
     pub(super) fn reupload_shm(&mut self, tex: &VkTexture, data: &[u8]) -> Result<(), VulkanError> {
+        // `reupload_full` copies the image's full w*h extent out of the staging, so short data
+        // would be an out-of-bounds staging read. The sole caller only reaches here on a
+        // size-matched cache hit with a 32bpp shm buffer; this pins that contract rather
+        // than guarding at runtime.
+        debug_assert_eq!(
+            data.len(),
+            (tex.size().w as usize) * (tex.size().h as usize) * 4,
+            "reupload_shm data must be the texture's w*h*4 (32bpp) extent",
+        );
         self.shm_staging.ensure(&self.gpu, data.len() as u64)?;
         self.shm_staging.write(&self.gpu, data)?;
         tex.reupload_shm(self.command_pool, &self.shm_staging)?;
