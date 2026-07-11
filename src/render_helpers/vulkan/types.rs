@@ -245,6 +245,26 @@ impl VkTexture {
         self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
     }
+
+    /// Whether two handles refer to the *same* underlying texture (ref-counted inner). Used by the
+    /// dmabuf-import-cache test to prove a cache hit returns the reused image, not a fresh import.
+    #[cfg(test)]
+    pub(super) fn same_image(&self, other: &VkTexture) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Re-acquire this cached dmabuf-import for a fresh producer frame (the dmabuf-cache hit path):
+    /// the client wrote new content into the same shared dmabuf, so run an acquire barrier from the
+    /// tracked current layout before sampling again. No allocation — reuses the imported image,
+    /// view and descriptor set. See [`niri_vk::texture::Texture::reacquire_dmabuf_sampled`].
+    /// The image ends in `SHADER_READ_ONLY_OPTIMAL`.
+    pub(super) fn reacquire_dmabuf(&self, pool: vk::CommandPool) -> anyhow::Result<()> {
+        self.0
+            .tex
+            .reacquire_dmabuf_sampled(&self.0.gpu, pool, self.layout())?;
+        self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        Ok(())
+    }
 }
 
 // The shm texture cache stores `VkTexture` in the surface's `data_map`, which requires the value be

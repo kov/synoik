@@ -99,6 +99,23 @@ pub struct VulkanRenderer {
     /// shadow: `finish` CPU-waits, so no import is in flight when the next frame reuses it.
     /// Mirrors `GlesRenderer`'s `buffers` bound-dmabuf cache.
     dmabuf_target_cache: HashMap<WeakDmabuf, VkTexture>,
+    /// Imported **client** sampled dmabufs, keyed by buffer identity. smithay clears its
+    /// per-surface texture on *every* new-buffer commit (even a recycled `wl_buffer`), so an
+    /// animating dmabuf client (e.g. a WebGL page) would otherwise re-run the full
+    /// `import_dmabuf_sampled` — a fresh `vkAllocateMemory` import +
+    /// image/view/sampler/descriptor set + a fenced acquire barrier — every frame. On Venus
+    /// that per-frame host-resource churn is exactly what pressures the guest↔host ring into
+    /// the `FATAL`/alive-expiry abort (see `DEVMAC-SESSION-confusion.md`). Clients recycle a
+    /// small buffer pool, so cache the imported texture per buffer and reuse it; a hit only
+    /// re-runs the acquire barrier (`VkTexture::reacquire_dmabuf`) to pick up the freshly
+    /// produced content — no allocation. Entries whose buffer was freed are evicted lazily on
+    /// lookup. This is the sampled-import dual of [`Self::dmabuf_target_cache`] (which needs no
+    /// re-acquire because the compositor, not an external producer, writes the scanout target).
+    /// Reuse/eviction is safe for the same reason as the other caches: rendering is synchronous
+    /// (`finish` CPU-waits), so no cached image is in flight when the next frame reuses or drops
+    /// it; pipelined present would need per-texture fence tracking + deferred destruction
+    /// here.
+    dmabuf_import_cache: HashMap<WeakDmabuf, VkTexture>,
 }
 
 impl VulkanRenderer {
@@ -244,6 +261,7 @@ impl VulkanRenderer {
             debug_flags: DebugFlags::empty(),
             present_blit_shadow: None,
             dmabuf_target_cache: HashMap::new(),
+            dmabuf_import_cache: HashMap::new(),
         })
     }
 
@@ -455,6 +473,22 @@ impl VulkanRenderer {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
+        // Cache hit: the client recommitted a buffer we already imported (recycled from its pool).
+        // Reuse the imported image/view/sampler/descriptor set — the image's memory IS the shared
+        // dmabuf, so the new content is already there; only re-run the acquire barrier to make the
+        // producer's writes visible and re-take ownership from FOREIGN. See `dmabuf_import_cache`.
+        if let Some(tex) = self.cached_dmabuf_import(dmabuf) {
+            // A stable buffer identity implies immutable geometry/format, so a cached entry can
+            // only mismatch the live dmabuf if smithay ever reused a `WeakDmabuf` key
+            // across buffers.
+            debug_assert!(
+                tex.size() == Size::from((w as i32, h as i32)) && tex.format() == Some(format.code),
+                "cached dmabuf import metadata must match its stable buffer identity",
+            );
+            tex.reacquire_dmabuf(self.command_pool)
+                .map_err(|e| VulkanError::Other(format!("re-acquire cached dmabuf: {e}")))?;
+            return Ok(tex);
+        }
         let tex = NiriTexture::import_dmabuf_sampled(
             &self.gpu,
             self.command_pool,
@@ -469,7 +503,7 @@ impl VulkanRenderer {
             filter,
         )?;
         let (desc_pool, set) = self.make_texture_set(&tex)?;
-        Ok(VkTexture::new(
+        let tex = VkTexture::new(
             self.gpu.clone(),
             tex,
             desc_pool,
@@ -478,7 +512,9 @@ impl VulkanRenderer {
             h,
             format.code,
             false,
-        ))
+        );
+        self.dmabuf_import_cache.insert(dmabuf.weak(), tex.clone());
+        Ok(tex)
     }
 
     /// Copy a `w×h` region of `tex`'s image into a host `Vec<u8>` of tight RGBA8. Used by
@@ -919,6 +955,20 @@ impl VulkanRenderer {
     fn cached_dmabuf_target(&mut self, dmabuf: &Dmabuf) -> Option<VkTexture> {
         self.dmabuf_target_cache.retain(|weak, _| !weak.is_gone());
         self.dmabuf_target_cache.get(&dmabuf.weak()).cloned()
+    }
+
+    /// The cached sampled-import texture for a client `dmabuf`, if live; also evicts entries whose
+    /// buffer was freed. `None` means the caller must import and `dmabuf_import_cache.insert` it.
+    /// See [`Self::dmabuf_import_cache`].
+    fn cached_dmabuf_import(&mut self, dmabuf: &Dmabuf) -> Option<VkTexture> {
+        self.dmabuf_import_cache.retain(|weak, _| !weak.is_gone());
+        self.dmabuf_import_cache.get(&dmabuf.weak()).cloned()
+    }
+
+    /// Live entry count of the client sampled-dmabuf import cache (test-only observability).
+    #[cfg(test)]
+    pub(super) fn dmabuf_import_cache_len(&self) -> usize {
+        self.dmabuf_import_cache.len()
     }
 
     /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.

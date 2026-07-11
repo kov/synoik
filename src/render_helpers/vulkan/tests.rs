@@ -2255,6 +2255,116 @@ fn vulkan_renders_into_a_gbm_dmabuf() {
     );
 }
 
+// --- client dmabuf import cache: reuse the imported image across commits, evict freed buffers ----
+
+/// The client-dmabuf import cache (`import_dmabuf_as_texture`) keeps a client's imported
+/// `VkTexture` keyed by buffer identity, so an animating dmabuf client (e.g. a WebGL page) does not
+/// re-run the full `import_dmabuf_sampled` — a fresh `vkAllocateMemory` import +
+/// image/view/sampler/descriptor set + fenced acquire barrier — on every commit (the per-frame
+/// Venus host-resource churn that wedges the guest↔host ring; see `dmabuf_import_cache`). Pin the
+/// bookkeeping: re-importing the same buffer reuses its entry and returns the *same* image (only
+/// re-acquiring), a distinct buffer adds a distinct entry, and a freed buffer's entry is evicted on
+/// the next lookup. Needs a Venus + GBM stack (real client dmabufs); skips on lavapipe / no GBM.
+#[test]
+fn vulkan_dmabuf_import_cache_reuses_and_evicts() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_dmabuf_import_cache_reuses_and_evicts: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_dmabuf_import_cache_reuses_and_evicts: no render node ({e})"
+            );
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_dmabuf_import_cache_reuses_and_evicts: no GBM device ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+    let d1 = match alloc.create_buffer(W as u32, H as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
+        Ok(bo) => bo.export().expect("export d1"),
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_dmabuf_import_cache_reuses_and_evicts: GBM cannot allocate \
+                 Abgr8888 LINEAR ({e})"
+            );
+            return;
+        }
+    };
+    let d2 = alloc
+        .create_buffer(W as u32, H as u32, Fourcc::Abgr8888, &[Modifier::Linear])
+        .expect("second GBM buffer")
+        .export()
+        .expect("export d2");
+
+    // First import of d1: a miss populates the cache.
+    let t1 = vk.import_dmabuf_as_texture(&d1).expect("import d1");
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        1,
+        "first import populates the cache",
+    );
+
+    // Re-import d1 (a recycled commit): a hit reuses the entry and returns the same image.
+    let t1b = vk.import_dmabuf_as_texture(&d1).expect("re-import d1");
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        1,
+        "re-importing the same buffer must not grow the cache",
+    );
+    assert!(
+        t1.same_image(&t1b),
+        "a cache hit must return the reused image, not a fresh import",
+    );
+
+    // A distinct buffer imports a distinct image and adds an entry.
+    let t2 = vk.import_dmabuf_as_texture(&d2).expect("import d2");
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        2,
+        "a distinct buffer adds a distinct entry",
+    );
+    assert!(
+        !t1.same_image(&t2),
+        "distinct buffers must import distinct images",
+    );
+
+    // Free d1 entirely: its WeakDmabuf key goes gone, so the next lookup evicts the stale entry.
+    drop(t1);
+    drop(t1b);
+    drop(d1);
+    let _t2b = vk
+        .import_dmabuf_as_texture(&d2)
+        .expect("re-import d2 after freeing d1");
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        1,
+        "a freed buffer's entry must be evicted on the next lookup",
+    );
+}
+
 // --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
 
 /// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads

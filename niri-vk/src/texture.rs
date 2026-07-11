@@ -516,6 +516,64 @@ impl Texture {
         })
     }
 
+    /// Re-acquire an already-imported sampled dmabuf for a fresh producer frame. The client renders
+    /// new content into the *same* underlying dmabuf every frame (this image's memory IS that
+    /// shared dmabuf), so a cache that reuses the [`Self::import_dmabuf_sampled`] image across
+    /// commits must, before sampling it again, (a) make the producer's new writes visible to
+    /// our sampler and (b) re-take queue-family ownership from `FOREIGN`. That's exactly the
+    /// acquire barrier the initial import runs, with the queue-ownership acquire from `FOREIGN`
+    /// carrying the visibility of the producer's writes. When `VK_EXT_queue_family_foreign` is
+    /// present we keep the image's *current* tracked `old_layout` (`SHADER_READ_ONLY_OPTIMAL`)
+    /// rather than `UNDEFINED`: `UNDEFINED` licenses the driver to discard/re-lay-out contents,
+    /// harmless on this VM's LINEAR-only path but corrupting for a tiled/CCS modifier. Without
+    /// the extension there is no `FOREIGN` ownership transfer, so a same-layout barrier with an
+    /// empty source scope would be a visibility no-op and sample stale content; we instead
+    /// force an `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL` transition, which does invalidate the
+    /// read caches and is safe because only LINEAR buffers ever reach the cache (their bytes
+    /// survive `UNDEFINED`). Either way we deliberately skip the paired ours→`FOREIGN`
+    /// *release* after the previous frame's last sample: a full ownership round-trip is
+    /// spec-correct but tolerated to skip for LINEAR (revisit if tiled modifiers are ever
+    /// imported). The image ends in `SHADER_READ_ONLY_OPTIMAL`. Callers pass the tracked
+    /// current layout as `old_layout`.
+    pub fn reacquire_dmabuf_sampled(
+        &self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        old_layout: vk::ImageLayout,
+    ) -> Result<()> {
+        let device = &gpu.device;
+        let (src_qf, dst_qf, old_layout) = if gpu.supports("VK_EXT_queue_family_foreign") {
+            (vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.queue_family, old_layout)
+        } else {
+            (
+                vk::QUEUE_FAMILY_IGNORED,
+                vk::QUEUE_FAMILY_IGNORED,
+                vk::ImageLayout::UNDEFINED,
+            )
+        };
+        gpu.run_commands(pool, |cbuf| unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(old_layout)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(src_qf)
+                .dst_queue_family_index(dst_qf)
+                .image(self.image)
+                .subresource_range(COLOR_RANGE);
+            device.cmd_pipeline_barrier(
+                cbuf,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        })
+        .context("re-acquire imported sampled image")
+    }
+
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
     #[allow(clippy::too_many_arguments)]
     fn upload(
