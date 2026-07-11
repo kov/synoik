@@ -21,6 +21,63 @@ pub struct Texture {
     pub height: u32,
 }
 
+/// Unwind guard for [`Texture::upload`]: destroys every handle created so far if a later step
+/// fails, so a mid-build error (e.g. a HOST_VISIBLE staging allocation failing under the Venus
+/// mappable-blob pressure the shm cache targets) doesn't orphan the resource. Each field starts
+/// null (`vkDestroy*`/`vkFree*` no-op on null) and is filled as `upload` progresses;
+/// `staging`/`smem` are always freed (they never outlive `upload`), while the
+/// image/memory/view/sampler that move into the finished `Texture` are nulled out of the guard
+/// first so it leaves them alone. Mirrors the [`crate::blur::BlurChain`] `NewGuard` pattern.
+struct UploadGuard<'a> {
+    device: &'a ash::Device,
+    staging: vk::Buffer,
+    smem: vk::DeviceMemory,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+impl<'a> UploadGuard<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self {
+            device,
+            staging: vk::Buffer::null(),
+            smem: vk::DeviceMemory::null(),
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+        }
+    }
+}
+
+impl Drop for UploadGuard<'_> {
+    fn drop(&mut self) {
+        let d = self.device;
+        unsafe {
+            if self.sampler != vk::Sampler::null() {
+                d.destroy_sampler(self.sampler, None);
+            }
+            if self.view != vk::ImageView::null() {
+                d.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                d.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                d.free_memory(self.memory, None);
+            }
+            if self.staging != vk::Buffer::null() {
+                d.destroy_buffer(self.staging, None);
+            }
+            if self.smem != vk::DeviceMemory::null() {
+                d.free_memory(self.smem, None);
+            }
+        }
+    }
+}
+
 impl Texture {
     /// Upload tight `width*height` RGBA8 pixels into a shader-readable texture.
     pub fn from_rgba(
@@ -480,6 +537,11 @@ impl Texture {
             "texture data size mismatch"
         );
 
+        // Frees any handle created below if a later `?` fails partway (so a failed allocate/bind/
+        // create doesn't orphan a resource); on success the image/memory/view/sampler are nulled
+        // out of it before they move into the returned `Texture`, leaving it only the staging.
+        let mut guard = UploadGuard::new(device);
+
         // --- staging buffer with the pixel data ---
         let staging_ci = vk::BufferCreateInfo::default()
             .size(size)
@@ -487,11 +549,13 @@ impl Texture {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let staging =
             unsafe { device.create_buffer(&staging_ci, None) }.context("staging buffer")?;
+        guard.staging = staging;
         let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
         let smem = gpu.allocate(
             sreq,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
+        guard.smem = smem;
         unsafe {
             device.bind_buffer_memory(staging, smem, 0)?;
             let ptr = device
@@ -518,8 +582,10 @@ impl Texture {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&image_ci, None) }.context("texture image")?;
+        guard.image = image;
         let ireq = unsafe { device.get_image_memory_requirements(image) };
         let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0)? };
 
         gpu.run_commands(pool, |cbuf| unsafe {
@@ -565,11 +631,8 @@ impl Texture {
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
             );
         })?;
-
-        unsafe {
-            device.destroy_buffer(staging, None);
-            device.free_memory(smem, None);
-        }
+        // `staging`/`smem` are no longer referenced; the guard frees them on return (both here and
+        // on any error below), replacing the old manual free.
 
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -578,6 +641,7 @@ impl Texture {
             .components(components)
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }.context("texture view")?;
+        guard.view = view;
 
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(filter)
@@ -586,7 +650,14 @@ impl Texture {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
 
+        // Success: hand the image/memory/view/sampler to the `Texture` and disarm the guard for
+        // them (it still frees the staging buffer + memory on drop).
+        guard.image = vk::Image::null();
+        guard.memory = vk::DeviceMemory::null();
+        guard.view = vk::ImageView::null();
+        guard.sampler = vk::Sampler::null();
         Ok(Texture {
             image,
             view,

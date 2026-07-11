@@ -184,6 +184,15 @@ impl Gpu {
             .command_buffer_count(1);
         let cbufs = unsafe { self.device.allocate_command_buffers(&alloc) }?;
         let cbuf = cbufs[0];
+        // Free the command buffer + fence on every exit — including an early `?` (begin/end/submit/
+        // wait failure) that would otherwise leak the fence until device teardown and hold the cbuf
+        // until the pool is destroyed. Replaces the old manual cleanup on the success path.
+        let mut guard = RunGuard {
+            device: &self.device,
+            pool,
+            cbufs,
+            fence: vk::Fence::null(),
+        };
 
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -199,16 +208,45 @@ impl Gpu {
             self.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)?
         };
+        guard.fence = fence;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cbuf));
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
                 .context("vkQueueSubmit")?;
-            self.device.wait_for_fences(&[fence], true, u64::MAX)?;
-            self.device.destroy_fence(fence, None);
-            self.device.free_command_buffers(pool, &cbufs);
+            if let Err(e) = self.device.wait_for_fences(&[fence], true, u64::MAX) {
+                // The submit already succeeded, so the command buffer and the copy's source/dest
+                // (staging/image, freed by the caller's UploadGuard) may still be in flight. Drain
+                // the device — or confirm it is lost — before any guard frees those resources on
+                // unwind, so we never free memory an outstanding submission still references. (A
+                // successful wait is the common case; this only runs on a wait error, ~always
+                // DEVICE_LOST, where a drain returns immediately.)
+                let _ = self.device.device_wait_idle();
+                return Err(e).context("vkWaitForFences");
+            }
         }
         Ok(())
+    }
+}
+
+/// Frees the one-shot command buffer + fence that [`Gpu::run_commands`] allocates, on every exit
+/// path (so an error between allocate and the final wait doesn't leak them). `free_command_buffers`
+/// is valid for a cbuf in any state; the fence is skipped while still null.
+struct RunGuard<'a> {
+    device: &'a ash::Device,
+    pool: vk::CommandPool,
+    cbufs: Vec<vk::CommandBuffer>,
+    fence: vk::Fence,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.fence != vk::Fence::null() {
+                self.device.destroy_fence(self.fence, None);
+            }
+            self.device.free_command_buffers(self.pool, &self.cbufs);
+        }
     }
 }
 
