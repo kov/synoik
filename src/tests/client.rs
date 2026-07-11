@@ -36,7 +36,9 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
-use wayland_client::protocol::wl_shm::{self, WlShm};
+#[cfg(feature = "vulkan")]
+use wayland_client::protocol::wl_shm;
+use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
@@ -78,6 +80,9 @@ pub struct State {
 pub struct Window {
     pub qh: QueueHandle<State>,
     pub spbm: WpSinglePixelBufferManagerV1,
+    // Only read by the `#[cfg(feature = "vulkan")]` `attach_shm_buffer*` helpers; still bound
+    // unconditionally from `State.shm` so the field exists on both builds.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub shm: Option<WlShm>,
 
     pub surface: WlSurface,
