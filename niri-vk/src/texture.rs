@@ -78,6 +78,64 @@ impl Drop for UploadGuard<'_> {
     }
 }
 
+/// Unwind guard for the image-building constructors ([`Texture::new_color_target`] and the two
+/// dmabuf imports): frees the image/memory/view/sampler created so far if a later step fails —
+/// `vkAllocateMemory` under the Venus mappable-blob pressure these paths hit, the FOREIGN-acquire
+/// submit, or a view/sampler create — so a mid-build error doesn't orphan them. Each field starts
+/// null (`vkDestroy*`/`vkFree*` no-op on null) and is filled as the constructor progresses; on
+/// success [`Self::disarm`] nulls the four handles that move into the finished `Texture` so the
+/// guard leaves them alone. Free order matches [`Texture::destroy`] (sampler→view→image→memory).
+/// The sibling [`UploadGuard`] is the same guard plus the host staging buffer only
+/// `Texture::upload` builds; kept separate so neither carries the other's irrelevant fields.
+struct TextureGuard<'a> {
+    device: &'a ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+impl<'a> TextureGuard<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self {
+            device,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+        }
+    }
+
+    /// Disarm on success: the four handles now belong to the returned `Texture`, so the guard must
+    /// not free them.
+    fn disarm(&mut self) {
+        self.image = vk::Image::null();
+        self.memory = vk::DeviceMemory::null();
+        self.view = vk::ImageView::null();
+        self.sampler = vk::Sampler::null();
+    }
+}
+
+impl Drop for TextureGuard<'_> {
+    fn drop(&mut self) {
+        let d = self.device;
+        unsafe {
+            if self.sampler != vk::Sampler::null() {
+                d.destroy_sampler(self.sampler, None);
+            }
+            if self.view != vk::ImageView::null() {
+                d.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                d.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                d.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
 impl Texture {
     /// Upload tight `width*height` RGBA8 pixels into a shader-readable texture.
     pub fn from_rgba(
@@ -184,10 +242,13 @@ impl Texture {
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        let mut guard = TextureGuard::new(device);
         let image =
             unsafe { device.create_image(&image_ci, None) }.context("color-target image")?;
+        guard.image = image;
         let ireq = unsafe { device.get_image_memory_requirements(image) };
         let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0)? };
 
         let view_ci = vk::ImageViewCreateInfo::default()
@@ -197,6 +258,7 @@ impl Texture {
             .subresource_range(COLOR_RANGE);
         let view =
             unsafe { device.create_image_view(&view_ci, None) }.context("color-target view")?;
+        guard.view = view;
 
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(filter)
@@ -205,7 +267,9 @@ impl Texture {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
 
+        guard.disarm();
         Ok(Texture {
             image,
             view,
@@ -274,8 +338,10 @@ impl Texture {
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut ext_info)
             .push_next(&mut mod_info);
+        let mut guard = TextureGuard::new(device);
         let image = unsafe { device.create_image(&image_ci, None) }
             .context("create dmabuf render-target image")?;
+        guard.image = image;
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
@@ -318,6 +384,7 @@ impl Texture {
             drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             anyhow::anyhow!("import dmabuf render-target memory (vkAllocateMemory): {e}")
         })?;
+        guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported render-target memory")?;
 
@@ -328,6 +395,7 @@ impl Texture {
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }
             .context("dmabuf render-target view")?;
+        guard.view = view;
 
         // Sampler is unused (a scanout target is never sampled) but kept so this fits `Texture`.
         let sampler_ci = vk::SamplerCreateInfo::default()
@@ -337,7 +405,9 @@ impl Texture {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
 
+        guard.disarm();
         Ok(Texture {
             image,
             view,
@@ -408,8 +478,10 @@ impl Texture {
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut ext_info)
             .push_next(&mut mod_info);
+        let mut guard = TextureGuard::new(device);
         let image = unsafe { device.create_image(&image_ci, None) }
             .context("create sampled dmabuf image")?;
+        guard.image = image;
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
@@ -450,6 +522,7 @@ impl Texture {
             drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             anyhow::anyhow!("import sampled dmabuf memory (vkAllocateMemory): {e}")
         })?;
+        guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported sampled memory")?;
 
@@ -496,6 +569,7 @@ impl Texture {
             .subresource_range(COLOR_RANGE);
         let view =
             unsafe { device.create_image_view(&view_ci, None) }.context("sampled dmabuf view")?;
+        guard.view = view;
 
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(filter)
@@ -505,7 +579,9 @@ impl Texture {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }
             .context("sampled dmabuf sampler")?;
+        guard.sampler = sampler;
 
+        guard.disarm();
         Ok(Texture {
             image,
             view,
