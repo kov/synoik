@@ -592,31 +592,40 @@ impl Texture {
         })
     }
 
-    /// Re-acquire an already-imported sampled dmabuf for a fresh producer frame. The client renders
-    /// new content into the *same* underlying dmabuf every frame (this image's memory IS that
-    /// shared dmabuf), so a cache that reuses the [`Self::import_dmabuf_sampled`] image across
-    /// commits must, before sampling it again, (a) make the producer's new writes visible to
-    /// our sampler and (b) re-take queue-family ownership from `FOREIGN`. That's exactly the
-    /// acquire barrier the initial import runs, with the queue-ownership acquire from `FOREIGN`
-    /// carrying the visibility of the producer's writes. When `VK_EXT_queue_family_foreign` is
-    /// present we keep the image's *current* tracked `old_layout` (`SHADER_READ_ONLY_OPTIMAL`)
-    /// rather than `UNDEFINED`: `UNDEFINED` licenses the driver to discard/re-lay-out contents,
-    /// harmless on this VM's LINEAR-only path but corrupting for a tiled/CCS modifier. Without
-    /// the extension there is no `FOREIGN` ownership transfer, so a same-layout barrier with an
-    /// empty source scope would be a visibility no-op and sample stale content; we instead
-    /// force an `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL` transition, which does invalidate the
-    /// read caches and is safe because only LINEAR buffers ever reach the cache (their bytes
-    /// survive `UNDEFINED`). Either way we deliberately skip the paired ours→`FOREIGN`
-    /// *release* after the previous frame's last sample: a full ownership round-trip is
-    /// spec-correct but tolerated to skip for LINEAR (revisit if tiled modifiers are ever
-    /// imported). The image ends in `SHADER_READ_ONLY_OPTIMAL`. Callers pass the tracked
-    /// current layout as `old_layout`.
-    pub fn reacquire_dmabuf_sampled(
+    /// Record the re-acquire barrier for an already-imported sampled dmabuf into an existing
+    /// `cbuf` — the caller owns the submit. This is the barrier-recording half of
+    /// [`Self::reacquire_dmabuf_sampled`]; the compositor records it directly into a frame's
+    /// command buffer (before that frame's render pass) so the acquire rides the frame's single
+    /// submit instead of a per-commit standalone submit + fence-wait.
+    ///
+    /// The client renders new content into the *same* underlying dmabuf every frame (this image's
+    /// memory IS that shared dmabuf), so a cache that reuses the [`Self::import_dmabuf_sampled`]
+    /// image across commits must, before sampling it again, (a) invalidate our sampler's caches so
+    /// it re-reads the shared memory and (b) re-take queue-family ownership from `FOREIGN`. This is
+    /// an ownership *acquire* + cache-visibility barrier ONLY: it does **not** synchronize with the
+    /// producer's GPU writes (a pipeline barrier cannot observe a foreign GPU context). The
+    /// producer's writes are guaranteed to have already landed in the shared memory UPSTREAM, by
+    /// the commit-time acquire blocker (`linux-drm-syncobj-v1` timeline point / implicit-fence
+    /// poll); see the renderer's `import_dmabuf_as_texture`.
+    ///
+    /// When `VK_EXT_queue_family_foreign` is present we keep the image's *current* tracked
+    /// `old_layout` (`SHADER_READ_ONLY_OPTIMAL`) rather than `UNDEFINED`: `UNDEFINED` licenses the
+    /// driver to discard/re-lay-out contents, harmless on this VM's LINEAR-only path but corrupting
+    /// for a tiled/CCS modifier. Without the extension there is no `FOREIGN` ownership transfer, so
+    /// a same-layout barrier with an empty source scope would be a cache-invalidation no-op and
+    /// sample stale content; we instead force an `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL` transition,
+    /// which does invalidate the read caches and is safe because only LINEAR buffers ever reach the
+    /// cache (their bytes survive `UNDEFINED`). Either way we deliberately skip the paired
+    /// ours→`FOREIGN` *release* after the previous frame's last sample: a full ownership round-trip
+    /// is spec-correct but tolerated to skip for LINEAR (revisit if tiled modifiers are ever
+    /// imported). The image ends in `SHADER_READ_ONLY_OPTIMAL`. Callers pass the tracked current
+    /// layout as `old_layout`.
+    pub fn record_reacquire_dmabuf_sampled(
         &self,
         gpu: &Gpu,
-        pool: vk::CommandPool,
+        cbuf: vk::CommandBuffer,
         old_layout: vk::ImageLayout,
-    ) -> Result<()> {
+    ) {
         let device = &gpu.device;
         let (src_qf, dst_qf, old_layout) = if gpu.supports("VK_EXT_queue_family_foreign") {
             (vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.queue_family, old_layout)
@@ -627,7 +636,7 @@ impl Texture {
                 vk::ImageLayout::UNDEFINED,
             )
         };
-        gpu.run_commands(pool, |cbuf| unsafe {
+        unsafe {
             let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -646,6 +655,21 @@ impl Texture {
                 &[],
                 &[barrier],
             );
+        }
+    }
+
+    /// Standalone variant of [`Self::record_reacquire_dmabuf_sampled`]: records the acquire barrier
+    /// on its own command buffer and submits it. Kept as a self-contained niri-vk API for callers
+    /// that re-acquire outside a frame; the compositor's hot path uses the `record_*` variant to
+    /// fold the barrier into the frame submit. See that method for the full rationale.
+    pub fn reacquire_dmabuf_sampled(
+        &self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        old_layout: vk::ImageLayout,
+    ) -> Result<()> {
+        gpu.run_commands(pool, |cbuf| {
+            self.record_reacquire_dmabuf_sampled(gpu, cbuf, old_layout)
         })
         .context("re-acquire imported sampled image")
     }

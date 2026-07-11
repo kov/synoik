@@ -253,17 +253,19 @@ impl VkTexture {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Re-acquire this cached dmabuf-import for a fresh producer frame (the dmabuf-cache hit path):
-    /// the client wrote new content into the same shared dmabuf, so run an acquire barrier from the
-    /// tracked current layout before sampling again. No allocation — reuses the imported image,
-    /// view and descriptor set. See [`niri_vk::texture::Texture::reacquire_dmabuf_sampled`].
-    /// The image ends in `SHADER_READ_ONLY_OPTIMAL`.
-    pub(super) fn reacquire_dmabuf(&self, pool: vk::CommandPool) -> anyhow::Result<()> {
+    /// Record the deferred re-acquire barrier for this cached dmabuf-import into `cbuf` (a frame's
+    /// command buffer), then advance the tracked layout. The client wrote new content into the same
+    /// shared dmabuf, so before sampling again we re-take ownership from `FOREIGN` and invalidate
+    /// the sampler caches. The barrier is *recorded, not submitted*: it rides the frame's single
+    /// submit (see [`super::renderer::VulkanRenderer::record_pending_dmabuf_acquires`]). No
+    /// allocation — reuses the imported image, view and descriptor set. Reads the current tracked
+    /// layout at record time. The image ends in `SHADER_READ_ONLY_OPTIMAL`. See
+    /// [`niri_vk::texture::Texture::record_reacquire_dmabuf_sampled`].
+    pub(super) fn record_reacquire_dmabuf(&self, cbuf: vk::CommandBuffer) {
         self.0
             .tex
-            .reacquire_dmabuf_sampled(&self.0.gpu, pool, self.layout())?;
+            .record_reacquire_dmabuf_sampled(&self.0.gpu, cbuf, self.layout());
         self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        Ok(())
     }
 }
 

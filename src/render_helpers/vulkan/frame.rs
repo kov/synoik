@@ -127,6 +127,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             renderer.render_pass
         };
 
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
         let cbuf = {
             let dev = &renderer.gpu.device;
             let alloc = vk::CommandBufferAllocateInfo::default()
@@ -134,13 +138,24 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1);
             let cbuf = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
-
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            let render_area = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            };
+            unsafe { dev.begin_command_buffer(cbuf, &begin_info)? };
+            cbuf
+        };
+
+        // Fold every deferred client-dmabuf re-acquire barrier into this frame's command buffer,
+        // BEFORE the render pass (queue-family/layout barriers must be recorded outside a render
+        // pass). They ride this frame's single submit; the wait is the existing `finish()` park —
+        // no per-commit standalone submit/fence-wait per animating surface. Done after
+        // `begin_command_buffer` succeeds so an earlier failure leaves the queue intact for the
+        // next frame; once the frame is constructed its `Drop` always submits
+        // (`finish_internal`), so the recorded acquires are never orphaned. See
+        // `VulkanRenderer::pending_dmabuf_acquires`.
+        renderer.record_pending_dmabuf_acquires(cbuf);
+
+        {
+            let dev = &renderer.gpu.device;
             // `render_pass` is the DONT_CARE base pass (callers clear explicitly) or, when
             // preserving a valid present-blit shadow, the LOAD continuation pass (see above).
             let pass_begin = vk::RenderPassBeginInfo::default()
@@ -156,13 +171,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 max_depth: 1.0,
             };
             unsafe {
-                dev.begin_command_buffer(cbuf, &begin_info)?;
                 dev.cmd_begin_render_pass(cbuf, &pass_begin, vk::SubpassContents::INLINE);
                 dev.cmd_set_viewport(cbuf, 0, std::slice::from_ref(&viewport));
                 dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(&render_area));
             }
-            cbuf
-        };
+        }
 
         Ok(VulkanFrame {
             renderer,

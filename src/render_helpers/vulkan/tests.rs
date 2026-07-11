@@ -2365,6 +2365,149 @@ fn vulkan_dmabuf_import_cache_reuses_and_evicts() {
     );
 }
 
+/// Part 2 of the client dmabuf-import cache: a cache HIT no longer runs the re-acquire barrier on
+/// its own submit — it queues the texture, and the next `VulkanFrame::begin` folds the barrier into
+/// the frame's command buffer (riding the frame submit, so there is no per-commit standalone
+/// submit/fence-wait, the Venus ring pressure this path exists to reduce). Prove the mechanism
+/// end-to-end: a miss queues nothing (its full import runs an internal barrier), a hit queues
+/// exactly one deferred acquire, `begin()` drains it, and the frame samples the *new* producer
+/// content written into the *same* shared dmabuf between commits. The `pending_*_len` assertions
+/// are the mechanism proof (a disabled drain fails them — mutation-checked); the green→red content
+/// check guards against gross sampling regressions (it does not, on this CPU-coherent LINEAR path,
+/// by itself prove the barrier's placement). Needs a Venus + GBM stack (real client dmabufs,
+/// CPU-writable LINEAR); skips on lavapipe / no GBM.
+#[test]
+fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
+    use niri_vk::dmabuf::ForeignBuffer;
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::Modifier;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_dmabuf_import_cache_defers_reacquire: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    // Producer frame 1: a solid-green LINEAR client buffer.
+    let mut fb = match ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 255, 0, 255]; 4]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_dmabuf_import_cache_defers_reacquire: GBM cannot allocate ({e})"
+            );
+            return;
+        }
+    };
+    // One Dmabuf, reused across both commits: re-importing the *same* buffer is a cache hit.
+    let mut builder = Dmabuf::builder(
+        (W, H),
+        Fourcc::Argb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+    );
+    assert!(builder.add_plane(
+        fb.fd().try_clone_to_owned().expect("dup fd"),
+        0,
+        fb.offset,
+        fb.stride,
+    ));
+    let dmabuf = builder.build().expect("build dmabuf");
+
+    // Renders `tex` 1:1 into a W×H offscreen and reads back tight Abgr8888 (`[R,G,B,A]`). Each call
+    // is one frame → one `VulkanFrame::begin`, which drains any queued deferred acquire.
+    fn render_client(vk: &mut VulkanRenderer, tex: VkTexture) -> Vec<u8> {
+        let size = Size::<i32, Physical>::from((W, H));
+        let buffer = TextureBuffer::from_texture(&*vk, tex, 1.0, Transform::Normal, Vec::new());
+        let element = TextureRenderElement::from_texture_buffer(
+            buffer,
+            Point::from((0.0, 0.0)),
+            1.0,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+        render_to_vec(
+            vk,
+            size,
+            Scale::from(1.0),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            [element].into_iter(),
+        )
+        .expect("render client dmabuf")
+    }
+
+    // MISS: the full import populates the cache and runs its OWN acquire barrier — nothing queued.
+    let t1 = vk.import_dmabuf_as_texture(&dmabuf).expect("import (miss)");
+    let cached = t1.clone();
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        1,
+        "a miss populates the cache"
+    );
+    assert_eq!(
+        vk.pending_dmabuf_acquires_len(),
+        0,
+        "a miss runs its own import barrier and queues no deferred acquire",
+    );
+
+    // Frame 1 samples the imported buffer → green.
+    let f1 = render_client(&mut vk, t1);
+    let c1 = px(&f1, W / 2, H / 2);
+    assert!(
+        close_px(c1, [0, 255, 0, 255], 40),
+        "frame 1 should sample green, got {c1:?}"
+    );
+    assert_eq!(
+        vk.pending_dmabuf_acquires_len(),
+        0,
+        "no deferred acquire outstanding after the miss frame",
+    );
+
+    // Producer frame 2: rewrite the SAME dmabuf to solid red, then re-import — a cache HIT that
+    // queues exactly one deferred re-acquire (not run here).
+    fb.refill([[255, 0, 0, 255]; 4]).expect("refill red");
+    let t2 = vk
+        .import_dmabuf_as_texture(&dmabuf)
+        .expect("re-import (hit)");
+    assert!(
+        cached.same_image(&t2),
+        "a recycled buffer must hit the cache (same image)"
+    );
+    assert_eq!(
+        vk.dmabuf_import_cache_len(),
+        1,
+        "a hit must not grow the cache"
+    );
+    assert_eq!(
+        vk.pending_dmabuf_acquires_len(),
+        1,
+        "a hit queues exactly one deferred re-acquire",
+    );
+
+    // Frame 2: `begin()` folds the deferred acquire into the frame's command buffer before the
+    // render pass, so the sampler sees the re-committed RED content — and the queue is drained.
+    let f2 = render_client(&mut vk, t2);
+    let c2 = px(&f2, W / 2, H / 2);
+    assert!(
+        close_px(c2, [255, 0, 0, 255], 40),
+        "frame 2 should sample the re-committed red content, got {c2:?}",
+    );
+    assert_eq!(
+        vk.pending_dmabuf_acquires_len(),
+        0,
+        "VulkanFrame::begin must drain the deferred acquire",
+    );
+    eprintln!(
+        "vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame: frame1 center={c1:?} \
+         frame2 center={c2:?}",
+    );
+}
+
 // --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
 
 /// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads

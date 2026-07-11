@@ -137,27 +137,8 @@ impl ForeignBuffer {
             "expected 1 plane for LINEAR ARGB8888"
         );
 
-        // CPU-fill through the map (virtio-gpu backs this with a host transfer on unmap). We write
-        // at the *map* stride; GBM lands it in the real buffer at `bo.stride()`, which is what we
-        // hand Vulkan — so the two strides need not be equal.
-        bo.map_mut(0, 0, width, height, |m| -> Result<()> {
-            let stride = m.stride() as usize;
-            let buf = m.buffer_mut();
-            for y in 0..height as usize {
-                let bottom = y >= height as usize / 2;
-                for x in 0..width as usize {
-                    let right = x >= width as usize / 2;
-                    let [r, g, b, a] = quadrants[bottom as usize * 2 + right as usize];
-                    let i = y * stride + x * 4;
-                    buf[i] = b;
-                    buf[i + 1] = g;
-                    buf[i + 2] = r;
-                    buf[i + 3] = a;
-                }
-            }
-            Ok(())
-        })
-        .context("gbm_bo_map")??;
+        // CPU-fill through the map (virtio-gpu backs this with a host transfer on unmap).
+        fill_bo(&mut bo, width, height, quadrants)?;
 
         let fd = bo.fd().map_err(|e| anyhow!("gbm_bo_get_fd: {e}"))?;
         let stride = bo.stride();
@@ -180,6 +161,47 @@ impl ForeignBuffer {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+
+    /// Rewrite the four quadrants with new colors — simulate a producer committing a fresh frame
+    /// into the *same* shared dmabuf. The exported fd is unchanged, so a re-import of the wrapping
+    /// `Dmabuf` is a client-import-cache *hit*. (virtio-gpu lands the write in the host buffer on
+    /// unmap, so the new content is present by the time the fd is next imported/sampled.)
+    pub fn refill(&mut self, quadrants: [[u8; 4]; 4]) -> Result<()> {
+        fill_bo(&mut self._bo, self.width, self.height, quadrants).context("gbm_bo_map (refill)")
+    }
+}
+
+/// CPU-fill a LINEAR ARGB8888 buffer object's four solid quadrants (row-major TL, TR, BL, BR; each
+/// an RGBA color written in ARGB8888 memory order). We write at the *map* stride; GBM lands it in
+/// the real buffer at `bo.stride()`, which is what we hand Vulkan — so the two strides need not be
+/// equal.
+fn fill_bo(
+    bo: &mut gbm::BufferObject<()>,
+    width: u32,
+    height: u32,
+    quadrants: [[u8; 4]; 4],
+) -> Result<()> {
+    // `map_mut` returns `Result<closure_result, GbmError>`: the outer `.context()?` reports a map
+    // failure, and the inner `Result<()>` (the closure's write outcome) is returned as ours, so a
+    // write failure propagates to the caller's `?`.
+    bo.map_mut(0, 0, width, height, |m| -> Result<()> {
+        let stride = m.stride() as usize;
+        let buf = m.buffer_mut();
+        for y in 0..height as usize {
+            let bottom = y >= height as usize / 2;
+            for x in 0..width as usize {
+                let right = x >= width as usize / 2;
+                let [r, g, b, a] = quadrants[bottom as usize * 2 + right as usize];
+                let i = y * stride + x * 4;
+                buf[i] = b;
+                buf[i + 1] = g;
+                buf[i + 2] = r;
+                buf[i + 3] = a;
+            }
+        }
+        Ok(())
+    })
+    .context("gbm_bo_map")?
 }
 
 /// A dmabuf imported as a sampled VkImage (view + sampler), ready to bind to a descriptor set.

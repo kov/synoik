@@ -106,16 +106,33 @@ pub struct VulkanRenderer {
     /// image/view/sampler/descriptor set + a fenced acquire barrier — every frame. On Venus
     /// that per-frame host-resource churn is exactly what pressures the guest↔host ring into
     /// the `FATAL`/alive-expiry abort (see `DEVMAC-SESSION-confusion.md`). Clients recycle a
-    /// small buffer pool, so cache the imported texture per buffer and reuse it; a hit only
-    /// re-runs the acquire barrier (`VkTexture::reacquire_dmabuf`) to pick up the freshly
-    /// produced content — no allocation. Entries whose buffer was freed are evicted lazily on
-    /// lookup. This is the sampled-import dual of [`Self::dmabuf_target_cache`] (which needs no
-    /// re-acquire because the compositor, not an external producer, writes the scanout target).
-    /// Reuse/eviction is safe for the same reason as the other caches: rendering is synchronous
-    /// (`finish` CPU-waits), so no cached image is in flight when the next frame reuses or drops
-    /// it; pipelined present would need per-texture fence tracking + deferred destruction
-    /// here.
+    /// small buffer pool, so cache the imported texture per buffer and reuse it; a hit only needs
+    /// the acquire barrier (`VkTexture::record_reacquire_dmabuf`) to pick up the freshly produced
+    /// content — no allocation. Entries whose buffer was freed are evicted lazily on lookup. This
+    /// is the sampled-import dual of [`Self::dmabuf_target_cache`] (which needs no re-acquire
+    /// because the compositor, not an external producer, writes the scanout target).
+    /// Reuse/eviction is safe for the same reason as the other caches: rendering is
+    /// synchronous (`finish` CPU-waits), so no cached image is in flight when the next frame
+    /// reuses or drops it; pipelined present would need per-texture fence tracking + deferred
+    /// destruction here.
     dmabuf_import_cache: HashMap<WeakDmabuf, VkTexture>,
+
+    /// Cache-hit client dmabuf-imports awaiting their re-acquire barrier (Part 2: fold the barrier
+    /// into the frame submit instead of a per-commit standalone submit + fence-wait). Populated on
+    /// a hit in [`Self::import_dmabuf_as_texture`]; drained by [`super::VulkanFrame::begin`],
+    /// which records each barrier into the frame's command buffer BEFORE its render pass so
+    /// the acquire rides the frame's single submit — the wait is the existing `finish()` park,
+    /// so no extra submit/park per animating surface (the Venus ring pressure Part 1 started
+    /// to unwind).
+    ///
+    /// Invariant: a [`super::VulkanFrame`] mutably borrows the renderer, so no import (hence no
+    /// push) can happen while a frame exists — every push therefore precedes some `begin()`, and
+    /// every `begin()` drains. Any future non-frame consumer of client textures MUST drain first.
+    /// Entries hold a `VkTexture` clone, pinning the image (and its dmabuf import) until drained;
+    /// if damage tracking skips a frame after elements were built, a pending entry is simply
+    /// drained (harmless extra acquire) by the next real `begin()`. De-duped by image so a surface
+    /// imported twice before a frame records the barrier once.
+    pending_dmabuf_acquires: Vec<VkTexture>,
 }
 
 impl VulkanRenderer {
@@ -262,6 +279,7 @@ impl VulkanRenderer {
             present_blit_shadow: None,
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
+            pending_dmabuf_acquires: Vec::new(),
         })
     }
 
@@ -475,8 +493,13 @@ impl VulkanRenderer {
         };
         // Cache hit: the client recommitted a buffer we already imported (recycled from its pool).
         // Reuse the imported image/view/sampler/descriptor set — the image's memory IS the shared
-        // dmabuf, so the new content is already there; only re-run the acquire barrier to make the
-        // producer's writes visible and re-take ownership from FOREIGN. See `dmabuf_import_cache`.
+        // dmabuf, so the new content is already there. The image still needs a re-acquire barrier
+        // (re-take ownership from FOREIGN + invalidate the sampler caches) before it is sampled
+        // again, but we do NOT run it here on its own submit: queue the texture so the next
+        // `VulkanFrame::begin` records the barrier into the frame's command buffer, riding the
+        // frame submit (see `pending_dmabuf_acquires`). This is ownership/visibility only —
+        // producer readiness is guaranteed upstream by the commit-time acquire blocker
+        // (above).
         if let Some(tex) = self.cached_dmabuf_import(dmabuf) {
             // A stable buffer identity implies immutable geometry/format, so a cached entry can
             // only mismatch the live dmabuf if smithay ever reused a `WeakDmabuf` key
@@ -485,8 +508,16 @@ impl VulkanRenderer {
                 tex.size() == Size::from((w as i32, h as i32)) && tex.format() == Some(format.code),
                 "cached dmabuf import metadata must match its stable buffer identity",
             );
-            tex.reacquire_dmabuf(self.command_pool)
-                .map_err(|e| VulkanError::Other(format!("re-acquire cached dmabuf: {e}")))?;
+            // De-dupe: a surface imported twice before a frame drains needs the barrier recorded
+            // only once (a redundant self-acquire-while-owned is a tolerated no-op but wastes a
+            // Venus ring op — the very thing this path exists to reduce).
+            if !self
+                .pending_dmabuf_acquires
+                .iter()
+                .any(|t| t.image() == tex.image())
+            {
+                self.pending_dmabuf_acquires.push(tex.clone());
+            }
             return Ok(tex);
         }
         let tex = NiriTexture::import_dmabuf_sampled(
@@ -969,6 +1000,24 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn dmabuf_import_cache_len(&self) -> usize {
         self.dmabuf_import_cache.len()
+    }
+
+    /// Record every queued client-dmabuf re-acquire barrier into `cbuf` (a frame's command buffer),
+    /// clearing the queue. Called by [`super::VulkanFrame::begin`] before the render pass begins
+    /// (barriers must be recorded outside a render pass). Each barrier rides the frame's single
+    /// submit, so the acquire is no longer a standalone submit + fence-wait. See
+    /// [`Self::pending_dmabuf_acquires`].
+    pub(super) fn record_pending_dmabuf_acquires(&mut self, cbuf: vk::CommandBuffer) {
+        for tex in self.pending_dmabuf_acquires.drain(..) {
+            tex.record_reacquire_dmabuf(cbuf);
+        }
+    }
+
+    /// Count of client-dmabuf imports awaiting a deferred re-acquire barrier (test-only: asserts a
+    /// frame drained them). See [`Self::pending_dmabuf_acquires`].
+    #[cfg(test)]
+    pub(super) fn pending_dmabuf_acquires_len(&self) -> usize {
+        self.pending_dmabuf_acquires.len()
     }
 
     /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.
