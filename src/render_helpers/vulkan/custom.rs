@@ -22,8 +22,11 @@
 //! the push-constant budget with no UBO. The snippet's `niri_geo_to_tex * coords` therefore behaves
 //! exactly as under GLES.
 //!
-//! Live wiring (feeding config snippets + constructing the animation elements through Vulkan) is a
-//! Stage-3 concern; today this is exercised offscreen by the tests.
+//! Live wiring: config snippets are compiled in via
+//! `VulkanRenderer::set_custom_{resize,close,open}_shader` (the owned-renderer side of the
+//! `shaders::set_custom_*_program` install/reload sites), and the **resize** animation constructs
+//! its element through this on a Vulkan session. **Open/Close are not wired yet** (open still draws
+//! the default scale+fade; close has no Vulkan animation path at all).
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -55,7 +58,7 @@ pub(crate) enum CustomShaderType {
 /// rotate placement into a rotated output; prepending keeps every `vec4` 16-aligned so std430 and
 /// `#[repr(C)]` agree at every offset (appending after the trailing scalars would skew them).
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CustomResizePush {
     pub proj: [f32; 4],
     pub origin: [f32; 2],
@@ -79,7 +82,7 @@ pub(crate) struct CustomResizePush {
 /// `proj` leads the block (see [`CustomResizePush`]) so the shared vertex stage rotates placement
 /// into a rotated output.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CustomAnimPush {
     pub proj: [f32; 4],
     pub origin: [f32; 2],

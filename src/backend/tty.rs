@@ -893,14 +893,25 @@ impl Tty {
             shaders::init(gles_renderer);
 
             let config = self.config.borrow();
-            if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+            let resize_shader = config.animations.window_resize.custom_shader.as_deref();
+            let close_shader = config.animations.window_close.custom_shader.as_deref();
+            let open_shader = config.animations.window_open.custom_shader.as_deref();
+            if let Some(src) = resize_shader {
                 shaders::set_custom_resize_program(gles_renderer, Some(src));
             }
-            if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
+            if let Some(src) = close_shader {
                 shaders::set_custom_close_program(gles_renderer, Some(src));
             }
-            if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
+            if let Some(src) = open_shader {
                 shaders::set_custom_open_program(gles_renderer, Some(src));
+            }
+            // Also compile them into the owned Vulkan renderer, if present, so the wired custom
+            // animation paths (`render_custom_{resize,anim}`) have pipelines to draw with.
+            #[cfg(feature = "vulkan")]
+            if let Some(vk) = self.vulkan_renderer.as_mut() {
+                vk.set_custom_resize_shader(resize_shader);
+                vk.set_custom_close_shader(close_shader);
+                vk.set_custom_open_shader(open_shader);
             }
             drop(config);
 
@@ -1924,6 +1935,17 @@ impl Tty {
         Some(f(renderer
             .try_as_gles_renderer()
             .expect("the Tty backend is always GLES-backed")))
+    }
+
+    /// Run `f` with the owned Vulkan renderer if this Tty composites through it, else `None`.
+    /// The dual of [`Self::with_primary_renderer`] for owned-renderer-only setup (installing the
+    /// custom animation shaders into the owned renderer alongside the GLES ones).
+    #[cfg(feature = "vulkan")]
+    pub fn with_vulkan_renderer<T>(
+        &mut self,
+        f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
+    ) -> Option<T> {
+        self.vulkan_renderer.as_mut().map(f)
     }
 
     pub fn render(

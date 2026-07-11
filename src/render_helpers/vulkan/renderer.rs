@@ -260,8 +260,9 @@ impl VulkanRenderer {
     /// panics or replaces a working shader. The built-in resize crossfade lives separately in
     /// `render_resize`; this slot only holds user overrides.
     ///
-    /// The live config path (feeding these) is Stage 3; today only the tests call this.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Fed live from the config by [`Self::set_custom_resize_shader`] and friends (the
+    /// owned-renderer side of the `shaders::set_custom_*_program` calls at the GLES
+    /// install/reload sites).
     pub(super) fn set_custom_shader(
         &mut self,
         ty: CustomShaderType,
@@ -325,6 +326,39 @@ impl VulkanRenderer {
             CustomShaderType::Resize => self.custom_resize.as_ref(),
             CustomShaderType::Close => self.custom_close.as_ref(),
             CustomShaderType::Open => self.custom_open.as_ref(),
+        }
+    }
+
+    /// Whether the user installed a custom shader in `ty`'s slot. The wired animation elements
+    /// branch on this to draw via `render_custom_*` (the user override) instead of the built-in
+    /// effect.
+    pub(crate) fn has_custom_shader(&self, ty: CustomShaderType) -> bool {
+        self.custom_pipeline(ty).is_some()
+    }
+
+    /// Install (or clear, with `None`) the user's custom **resize** animation shader — the owned
+    /// renderer's dual of [`crate::render_helpers::shaders::set_custom_resize_program`], called
+    /// from the same config install/reload sites. A compile error is logged and leaves the
+    /// previous shader in place (graceful degrade), matching the GLES path.
+    pub(crate) fn set_custom_resize_shader(&mut self, src: Option<&str>) {
+        self.install_custom_shader(CustomShaderType::Resize, src);
+    }
+
+    /// Install (or clear) the user's custom **close** animation shader. See
+    /// [`Self::set_custom_resize_shader`].
+    pub(crate) fn set_custom_close_shader(&mut self, src: Option<&str>) {
+        self.install_custom_shader(CustomShaderType::Close, src);
+    }
+
+    /// Install (or clear) the user's custom **open** animation shader. See
+    /// [`Self::set_custom_resize_shader`].
+    pub(crate) fn set_custom_open_shader(&mut self, src: Option<&str>) {
+        self.install_custom_shader(CustomShaderType::Open, src);
+    }
+
+    fn install_custom_shader(&mut self, ty: CustomShaderType, src: Option<&str>) {
+        if let Err(err) = self.set_custom_shader(ty, src) {
+            warn!("error installing custom {ty:?} shader on the Vulkan renderer: {err}");
         }
     }
 

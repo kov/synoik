@@ -1671,6 +1671,9 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_resize_program(renderer, src);
             });
+            #[cfg(feature = "vulkan")]
+            self.backend
+                .with_vulkan_renderer(|vk| vk.set_custom_resize_shader(src));
             shaders_changed = true;
         }
 
@@ -1681,6 +1684,9 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
+            #[cfg(feature = "vulkan")]
+            self.backend
+                .with_vulkan_renderer(|vk| vk.set_custom_close_shader(src));
             shaders_changed = true;
         }
 
@@ -1691,6 +1697,9 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });
+            #[cfg(feature = "vulkan")]
+            self.backend
+                .with_vulkan_renderer(|vk| vk.set_custom_open_shader(src));
             shaders_changed = true;
         }
 

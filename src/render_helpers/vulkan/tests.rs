@@ -1192,9 +1192,11 @@ fn vulkan_new_vulkan_resize_element_crossfades() {
             (tex_next, full_phys),
             sz,
             progress,
+            progress,
             CornerRadius::default(),
             false,
             1.0,
+            false, // built-in crossfade
         );
         render_to_vec(
             vk,
@@ -1258,6 +1260,87 @@ fn vulkan_new_vulkan_resize_element_crossfades() {
         tl[0] > 60 && tl[2] > 60,
         "TL blend should mix red and blue, got {tl:?}"
     );
+}
+
+/// The live wiring routes a resize animation through the user's CUSTOM resize shader when one is
+/// installed (`use_custom=true` → `render_custom_resize`) instead of the built-in crossfade. Also
+/// covers the config-facing install roundtrip: `set_custom_resize_shader` compiles + arms the slot
+/// (`has_custom_shader` true), and `None` clears it. With a solid-green snippet installed, the
+/// whole resize quad is green at progress 0.5 — not the red/blue crossfade the built-in path
+/// produces.
+#[test]
+fn vulkan_resize_element_uses_custom_shader_when_installed() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_resize_element_uses_custom_shader_when_installed: no Vulkan \
+                 device ({e})"
+            );
+            return;
+        }
+    };
+
+    // Install roundtrip via the config-facing API (the owned-renderer dual of
+    // shaders::set_custom_resize_program).
+    assert!(!vk.has_custom_shader(CustomShaderType::Resize));
+    vk.set_custom_resize_shader(Some(
+        "vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {\n\
+         return vec4(0.0, 1.0, 0.0, 1.0);\n\
+         }",
+    ));
+    assert!(
+        vk.has_custom_shader(CustomShaderType::Resize),
+        "set_custom_resize_shader should compile + arm the slot",
+    );
+
+    let prev = solid_texels([255, 0, 0, 255]);
+    let next = solid_texels([0, 0, 255, 255]);
+    let full_logical = Rectangle::<f64, Logical>::from_size(Size::from((W as f64, H as f64)));
+    let full_phys = Rectangle::<i32, Physical>::from_size(Size::from((W, H)));
+    let sz = Size::<f64, Logical>::from((W as f64, H as f64));
+
+    let tex_prev = vk
+        .import_memory(&prev, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import prev");
+    let tex_next = vk
+        .import_memory(&next, Fourcc::Abgr8888, Size::from((W, H)), false)
+        .expect("import next");
+    let elem = ResizeRenderElement::new_vulkan(
+        full_logical,
+        Scale::from(1.0),
+        (tex_prev, full_phys),
+        sz,
+        (tex_next, full_phys),
+        sz,
+        0.5,
+        0.5,
+        CornerRadius::default(),
+        false,
+        1.0,
+        true, // custom shader
+    );
+    let pixels = render_to_vec(
+        &mut vk,
+        Size::from((W, H)),
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [elem].into_iter(),
+    )
+    .expect("render custom resize element");
+
+    // The custom snippet paints solid green, ignoring both snapshots — the built-in crossfade of
+    // red/blue would instead be purple-ish (little green).
+    let c = px(&pixels, W / 2, H / 2);
+    assert!(
+        c[1] > 150 && c[0] < 90 && c[2] < 90,
+        "custom resize shader should paint green (not the built-in crossfade), got {c:?}",
+    );
+
+    // Clearing removes it.
+    vk.set_custom_resize_shader(None);
+    assert!(!vk.has_custom_shader(CustomShaderType::Resize));
 }
 
 // --- M3 step 5: custom runtime GLSL animation shaders -------------------------------------------

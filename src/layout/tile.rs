@@ -1246,6 +1246,9 @@ impl<W: LayoutElement> Tile<W> {
                                 let texture_current = elem_current.texture().clone();
                                 let texture_current_geo = elem_current.geometry(scale);
 
+                                let use_custom = vctx.renderer.has_custom_shader(
+                                    crate::render_helpers::vulkan::CustomShaderType::Resize,
+                                );
                                 let elem = ResizeRenderElement::new_vulkan(
                                     area,
                                     scale,
@@ -1253,10 +1256,12 @@ impl<W: LayoutElement> Tile<W> {
                                     resize.snapshot.size,
                                     (texture_current, texture_current_geo),
                                     window_size,
+                                    resize.anim.value() as f32,
                                     resize.anim.clamped_value().clamp(0., 1.) as f32,
                                     radius,
                                     clip_to_geometry,
                                     win_alpha,
+                                    use_custom,
                                 );
 
                                 data.id = elem.id().clone();

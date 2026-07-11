@@ -917,8 +917,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// (`tex_prev` at set 0, `tex_next` at set 1). No-op (with a warning) if no custom resize
     /// shader is installed — the built-in crossfade is `render_resize`, so this path is purely
     /// the user override. The caller fills the material fields of `push`; this fills placement.
-    // Consumed by the live custom-shader wiring (Stage 3); exercised now by the material test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Wired live from the resize animation (`ResizeRenderElement`'s Vulkan arm).
     pub(crate) fn render_custom_resize(
         &mut self,
         tex_prev: &VkTexture,

@@ -118,6 +118,21 @@ impl Backend {
         }
     }
 
+    /// Run `f` with the owned Vulkan renderer if this backend composites through it, else `None`.
+    /// The dual of [`Self::with_primary_renderer`] (which yields the always-GLES primary renderer)
+    /// for owned-renderer-only setup such as installing custom animation shaders. Only the Tty
+    /// backend on the Vulkan path has one.
+    #[cfg(feature = "vulkan")]
+    pub fn with_vulkan_renderer<T>(
+        &mut self,
+        f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
+    ) -> Option<T> {
+        match self {
+            Backend::Tty(tty) => tty.with_vulkan_renderer(f),
+            _ => None,
+        }
+    }
+
     pub fn render(
         &mut self,
         niri: &mut Niri,
