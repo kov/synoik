@@ -973,8 +973,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// over one window snapshot (`texture` at set 0). No-op (with a warning) if that slot has
     /// no shader installed. `ty` must be `Close` or `Open` — resize uses
     /// [`Self::render_custom_resize`].
-    // Consumed by the live custom-shader wiring (Stage 3); exercised now by the material test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Wired live from the window open animation (`CustomAnimRenderElement`'s Vulkan arm).
     pub(crate) fn render_custom_anim(
         &mut self,
         ty: CustomShaderType,

@@ -1343,6 +1343,69 @@ fn vulkan_resize_element_uses_custom_shader_when_installed() {
     assert!(!vk.has_custom_shader(CustomShaderType::Resize));
 }
 
+/// The live open/close wiring's element: `CustomAnimRenderElement`'s Vulkan arm draws through the
+/// installed custom `open` shader via `render_custom_anim`. Install a solid-green open snippet,
+/// build the element over a red snapshot, and the result is green (the shader ran) — the path
+/// `opening_window.rs::render_vulkan` takes when a custom open shader is configured.
+#[test]
+fn vulkan_custom_anim_element_draws_the_open_shader() {
+    use crate::render_helpers::custom_anim::CustomAnimRenderElement;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_custom_anim_element_draws_the_open_shader: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    assert!(!vk.has_custom_shader(CustomShaderType::Open));
+    vk.set_custom_open_shader(Some(
+        "vec4 open_color(vec3 coords_geo, vec3 size_geo) {\n\
+         return vec4(0.0, 1.0, 0.0, 1.0);\n\
+         }",
+    ));
+    assert!(
+        vk.has_custom_shader(CustomShaderType::Open),
+        "set_custom_open_shader should compile + arm the slot",
+    );
+
+    let snapshot = vk
+        .import_memory(
+            &solid_texels([200, 0, 0, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import snapshot");
+    let area = Rectangle::<f64, Logical>::from_size(Size::from((W as f64, H as f64)));
+    let push = CustomAnimPush {
+        geo_size: [W as f32, H as f32],
+        input_to_geo: [1.0, 1.0, 0.0, 0.0],
+        geo_to_tex: [1.0, 1.0, 0.0, 0.0],
+        alpha: 1.0,
+        scale: 1.0,
+        ..Default::default()
+    };
+    let elem =
+        CustomAnimRenderElement::new_vulkan_anim(CustomShaderType::Open, snapshot, area, 1.0, push);
+    let pixels = render_to_vec(
+        &mut vk,
+        Size::from((W, H)),
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [elem].into_iter(),
+    )
+    .expect("render custom open element");
+
+    let c = px(&pixels, W / 2, H / 2);
+    assert!(
+        c[1] > 150 && c[0] < 90 && c[2] < 90,
+        "custom open shader should paint green (not the red snapshot), got {c:?}",
+    );
+}
+
 // --- M3 step 5: custom runtime GLSL animation shaders -------------------------------------------
 
 /// A W×H opaque solid, tight `[R,G,B,A]`, for the custom-shader tests.

@@ -13,6 +13,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::Animation;
 use crate::niri_render_elements;
+use crate::render_helpers::custom_anim::CustomAnimRenderElement;
 use crate::render_helpers::offscreen::{
     DualOffscreenRenderElement, OffscreenBuffer, OffscreenData,
 };
@@ -32,7 +33,7 @@ pub struct OpenAnimation {
 niri_render_elements! {
     OpeningWindowRenderElement => {
         Offscreen = RelocateRenderElement<RescaleRenderElement<DualOffscreenRenderElement>>,
-        Shader = ShaderRenderElement,
+        Shader = CustomAnimRenderElement,
     }
 }
 
@@ -122,6 +123,7 @@ impl OpenAnimation {
                 Kind::Unspecified,
             )
             .with_location(area.loc);
+            let elem = CustomAnimRenderElement::Gles(elem);
 
             // We're drawing the shader, not the offscreen itself.
             data.id = elem.id().clone();
@@ -149,9 +151,7 @@ impl OpenAnimation {
     }
 
     /// The Vulkan sibling of [`render`](Self::render): renders into a `VkTexture` offscreen and
-    /// applies the default scale + fade. The custom `Open` GLSL shader is GLES-only, so on the
-    /// owned Vulkan renderer the animation always uses the default effect (never the custom
-    /// shader).
+    /// applies the user's custom `open` shader if one is installed, else the default scale + fade.
     #[cfg(feature = "vulkan")]
     pub fn render_vulkan(
         &self,
@@ -162,13 +162,68 @@ impl OpenAnimation {
         scale: Scale<f64>,
         alpha: f32,
     ) -> anyhow::Result<(OpeningWindowRenderElement, OffscreenData)> {
+        use crate::render_helpers::vulkan::{pack_affine, CustomAnimPush, CustomShaderType};
+
         let progress = self.anim.value();
         let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
 
-        let (elem, _sync_point, data) = self
+        let (elem, _sync_point, mut data) = self
             .buffer_vk
             .render(renderer, scale, elements)
             .context("error rendering to Vulkan offscreen buffer")?;
+
+        if renderer.has_custom_shader(CustomShaderType::Open) {
+            // Mirror the GLES custom-open branch: same area expansion and affine geometry, packed
+            // into a CustomAnimPush and drawn via render_custom_anim. (See `render`.)
+            let offset = elem.offset();
+            let texture = elem.texture().clone();
+            let texture_size = elem.logical_size();
+
+            let mut area = Rectangle::new(location + offset, texture_size);
+            let mut target_size = area.size.upscale(1.5);
+            target_size.w = f64::max(area.size.w + 1000., target_size.w);
+            target_size.h = f64::max(area.size.h + 1000., target_size.h);
+            let diff = (target_size.to_point() - area.size.to_point()).downscale(2.);
+            let diff = diff.to_physical_precise_round(scale).to_logical(scale);
+            area.loc -= diff;
+            area.size += diff.upscale(2.).to_size();
+
+            let area_loc = Vec2::new(area.loc.x as f32, area.loc.y as f32);
+            let area_size = Vec2::new(area.size.w as f32, area.size.h as f32);
+            let geo_loc = Vec2::new(location.x as f32, location.y as f32);
+            let geo_size = Vec2::new(geo_size.w as f32, geo_size.h as f32);
+
+            let input_to_geo = Mat3::from_scale(area_size / geo_size)
+                * Mat3::from_translation((area_loc - geo_loc) / area_size);
+
+            let tex_scale = Vec2::new(scale.x as f32, scale.y as f32);
+            let tex_loc = Vec2::new(offset.x as f32, offset.y as f32);
+            let tex_size = Vec2::new(texture.width() as f32, texture.height() as f32) / tex_scale;
+            let geo_to_tex =
+                Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
+
+            let push = CustomAnimPush {
+                geo_size: geo_size.to_array(),
+                input_to_geo: pack_affine(input_to_geo),
+                geo_to_tex: pack_affine(geo_to_tex),
+                progress: progress as f32,
+                clamped_progress: clamped_progress as f32,
+                random_seed: self.random_seed,
+                alpha,
+                scale: scale.x as f32,
+                ..Default::default()
+            };
+
+            let elem = CustomAnimRenderElement::new_vulkan_anim(
+                CustomShaderType::Open,
+                texture,
+                area,
+                alpha,
+                push,
+            );
+            data.id = elem.id().clone();
+            return Ok((elem.into(), data));
+        }
 
         let elem = elem.with_alpha(clamped_progress as f32 * alpha);
         let elem = DualOffscreenRenderElement::Vulkan(elem);

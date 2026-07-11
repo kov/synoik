@@ -28,6 +28,7 @@ pub mod background_effect;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;
+pub mod custom_anim;
 pub mod damage;
 pub mod debug;
 pub mod dual_texture;

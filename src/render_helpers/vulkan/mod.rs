@@ -25,7 +25,7 @@ mod tests;
 mod types;
 
 pub(crate) use backdrop_blur::BackdropBlur;
-pub(crate) use custom::{CustomResizePush, CustomShaderType};
+pub(crate) use custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
 pub use error::VulkanError;
 pub(crate) use frame::ClipParams;
 pub use frame::VulkanFrame;

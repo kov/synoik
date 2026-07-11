@@ -24,9 +24,11 @@
 //!
 //! Live wiring: config snippets are compiled in via
 //! `VulkanRenderer::set_custom_{resize,close,open}_shader` (the owned-renderer side of the
-//! `shaders::set_custom_*_program` install/reload sites), and the **resize** animation constructs
-//! its element through this on a Vulkan session. **Open/Close are not wired yet** (open still draws
-//! the default scale+fade; close has no Vulkan animation path at all).
+//! `shaders::set_custom_*_program` install/reload sites), and the **resize** and **open**
+//! animations construct their elements through this on a Vulkan session (resize via
+//! `ResizeRenderElement`, open via `CustomAnimRenderElement`). **Close is not wired yet** — the
+//! closing-window animation has no Vulkan render path at all (it is GLES-gated), so there is
+//! nothing to route a custom close through.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -38,10 +40,6 @@ use super::error::VulkanError;
 
 /// Which niri custom animation shader is being compiled. `Close`/`Open` share one uniform/texture
 /// layout ([`CustomAnimPush`]); `Resize` has its own two-texture layout ([`CustomResizePush`]).
-///
-/// `Close`/`Open` are only constructed by the (Stage-3) live wiring and the tests, hence the
-/// `allow(dead_code)` on the non-test build.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CustomShaderType {
     Resize,
@@ -112,8 +110,7 @@ pub(super) struct CompiledCustom {
 /// for the shader's `NIRI_AFFINE` reconstruction. Debug-asserts the no-rotation/no-shear invariant
 /// the whole packing scheme relies on — every matrix niri feeds these shaders satisfies it, and
 /// this catches a future refactor that silently violates it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn pack_affine(m: Mat3) -> [f32; 4] {
+pub(crate) fn pack_affine(m: Mat3) -> [f32; 4] {
     debug_assert!(
         m.x_axis.y.abs() < 1e-4
             && m.x_axis.z.abs() < 1e-4
