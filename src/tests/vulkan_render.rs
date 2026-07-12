@@ -401,6 +401,57 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
     );
 }
 
+/// The screenshot UI's Output neutral is captured through the owned Vulkan renderer
+/// (`capture_screenshot_neutrals`), not a GLES readback — self-hosting site 3. Drive the capture
+/// DIRECTLY (bypassing the GLES fallback that `..._draws_the_frozen_screen` can't see past): map a
+/// green window and assert the returned per-output screen `MemoryBuffer` is output-sized and holds
+/// the green window, proving the Vulkan renderer rendered the frozen frame at capture-time.
+#[test]
+fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // `open_screenshot_ui` primes render elements before both passes; mirror that here.
+    f.niri().update_render_elements(None);
+
+    // Drive the Vulkan capture pass directly (disjoint borrows of niri + backend).
+    let neutrals = {
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| state.niri.capture_screenshot_neutrals(vk))
+            .expect("headless backend must hold a Vulkan renderer")
+    };
+
+    let neutral = neutrals
+        .get(&output)
+        .expect("no Vulkan-captured neutral for the output");
+    let screen = neutral
+        .screen
+        .as_ref()
+        .expect("no Vulkan-captured screen neutral");
+    let (w, h) = (screen.size().w, screen.size().h);
+    assert_eq!(
+        (w, h),
+        (OUT_W as i32, OUT_H as i32),
+        "screenshot neutral is not output-sized"
+    );
+
+    let data = screen.data();
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(data, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_captures_the_screenshot_neutral_through_vulkan: {green} green px");
+    assert!(
+        green as i32 > WIN as i32 * WIN as i32 / 2,
+        "Vulkan-captured screenshot neutral is missing the green window ({green} green px)"
+    );
+}
+
 /// The screen-transition crossfade captures the screen through GLES (which the owned Vulkan
 /// renderer can't sample), so on a Vulkan session it uploads that neutral capture to a `VkTexture`
 /// for the Output target. Freeze a green-window screen, recolor the live window red, then composite

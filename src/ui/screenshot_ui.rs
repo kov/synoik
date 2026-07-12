@@ -115,6 +115,16 @@ pub struct OutputData {
     panel_vk: (VkCache, VkCache),
 }
 
+/// An output's on-screen (`Output`-target) screenshot neutrals captured through the owned Vulkan
+/// renderer up front, so [`OutputScreenshot::from_textures`] need not read them back through GLES.
+/// `screen` and `pointer` capture independently; a `None` field falls back to the GLES readback.
+/// Empty (via `Default`) on a GLES session and on non-`Output` targets.
+#[derive(Default)]
+pub struct ScreenshotNeutral {
+    pub screen: Option<MemoryBuffer>,
+    pub pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
+}
+
 pub struct OutputScreenshot {
     texture: GlesTexture,
     buffer: PrimaryGpuTextureRenderElement,
@@ -1069,37 +1079,47 @@ impl ScreenshotUi {
 }
 
 impl OutputScreenshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_textures(
         renderer: &mut GlesRenderer,
         scale: Scale<f64>,
         texture: GlesTexture,
         pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
-        // Read the textures back into renderer-neutral CPU buffers so the owned Vulkan renderer
-        // can sample them (it can't sample a GlesTexture). Only the on-screen Output
-        // target needs this.
+        // The owned Vulkan renderer can't sample a GlesTexture, so the on-screen Output target
+        // needs a renderer-neutral CPU copy. On a Vulkan session these are captured through the
+        // Vulkan renderer up front (`Niri::capture_screenshot_neutrals`) and passed in here; a
+        // `None` field falls back to reading the GLES texture back below (gated on
+        // `capture_neutral`, which is only set for the Output target on a Vulkan session).
         capture_neutral: bool,
+        vk_neutral: Option<MemoryBuffer>,
+        vk_pointer_neutral: Option<(MemoryBuffer, Point<f64, Logical>)>,
     ) -> Self {
         // Read the neutrals off the source textures before they're moved into the GLES elements.
-        let neutral = if capture_neutral {
-            read_texture_to_memory(renderer, &texture, scale)
-                .map_err(|err| warn!("error reading screenshot back for Vulkan: {err:?}"))
-                .ok()
-        } else {
-            None
-        };
-        let pointer_neutral = if capture_neutral {
-            pointer.as_ref().and_then(|(ptexture, geo)| {
-                let loc = geo.to_f64().to_logical(scale).loc;
-                read_texture_to_memory(renderer, ptexture, scale)
-                    .map_err(|err| {
-                        warn!("error reading screenshot pointer back for Vulkan: {err:?}")
-                    })
+        // Prefer the Vulkan-captured buffer; fall back to a GLES readback per field.
+        let neutral = vk_neutral.or_else(|| {
+            if capture_neutral {
+                read_texture_to_memory(renderer, &texture, scale)
+                    .map_err(|err| warn!("error reading screenshot back for Vulkan: {err:?}"))
                     .ok()
-                    .map(|mb| (mb, loc))
-            })
-        } else {
-            None
-        };
+            } else {
+                None
+            }
+        });
+        let pointer_neutral = vk_pointer_neutral.or_else(|| {
+            if capture_neutral {
+                pointer.as_ref().and_then(|(ptexture, geo)| {
+                    let loc = geo.to_f64().to_logical(scale).loc;
+                    read_texture_to_memory(renderer, ptexture, scale)
+                        .map_err(|err| {
+                            warn!("error reading screenshot pointer back for Vulkan: {err:?}")
+                        })
+                        .ok()
+                        .map(|mb| (mb, loc))
+                })
+            } else {
+                None
+            }
+        });
 
         let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
             TextureBuffer::from_texture(
