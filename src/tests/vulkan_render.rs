@@ -509,6 +509,81 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     );
 }
 
+/// The screen-transition Output neutral is captured through the owned Vulkan renderer
+/// (`capture_screen_transition_neutrals`), not GLES — self-hosting site 2. Drive the capture
+/// DIRECTLY (bypassing the GLES fallback that `..._draws_the_captured_frame` can't see past): map a
+/// green window and assert the returned per-output `MemoryBuffer` is output-sized and contains the
+/// green window, proving the Vulkan renderer rendered the output offscreen at capture-time.
+#[test]
+fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!(
+            "skipping vulkan_captures_the_screen_transition_neutral_through_vulkan: no Vulkan device"
+        );
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+
+    // Drive the Vulkan capture pass directly (disjoint borrows of niri + backend).
+    let neutrals = {
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| state.niri.capture_screen_transition_neutrals(vk))
+            .expect("headless backend must hold a Vulkan renderer")
+    };
+
+    let neutral = neutrals
+        .get(&output)
+        .expect("no Vulkan-captured neutral for the output");
+    let (w, h) = (neutral.size().w, neutral.size().h);
+    assert_eq!(
+        (w, h),
+        (OUT_W as i32, OUT_H as i32),
+        "neutral buffer is not output-sized"
+    );
+
+    let data = neutral.data();
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(data, w, i % w, i / w)))
+        .count();
+    eprintln!(
+        "vulkan_captures_the_screen_transition_neutral_through_vulkan: {green} green px (window is {}x{})",
+        WIN, WIN
+    );
+    // The green window (WIN×WIN) must be present in the captured output — proves Vulkan rendered
+    // the scene, not an empty/failed buffer.
+    assert!(
+        green as i32 > WIN as i32 * WIN as i32 / 2,
+        "Vulkan-captured neutral is missing the green window ({green} green px)"
+    );
+}
+
 /// Import `pattern` (an `out_size`-shaped `Abgr8888` buffer... actually `tex`-shaped) as a texture
 /// with buffer transform `src_transform`, render it full-screen through `render_texture_from_to`
 /// at output transform `out_transform`, and return the four (inset) corner pixels of the readback.

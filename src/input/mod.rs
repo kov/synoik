@@ -851,9 +851,22 @@ impl State {
             }
             Action::DoScreenTransition(delay_ms) => {
                 let using_vulkan = self.backend.using_vulkan();
+                // On a Vulkan session, capture the Output-target neutral buffers through the owned
+                // renderer first (so that path never touches GLES); the GLES pass below consumes
+                // them and captures the screencast/screen-capture textures.
+                #[cfg(feature = "vulkan")]
+                let neutrals = if using_vulkan {
+                    self.backend
+                        .with_vulkan_renderer(|vk| self.niri.capture_screen_transition_neutrals(vk))
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                #[cfg(not(feature = "vulkan"))]
+                let neutrals = Default::default();
                 self.backend.with_primary_renderer(|renderer| {
                     self.niri
-                        .do_screen_transition(renderer, using_vulkan, delay_ms);
+                        .do_screen_transition(renderer, using_vulkan, neutrals, delay_ms);
                 });
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {

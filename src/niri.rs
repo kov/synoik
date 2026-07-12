@@ -6686,10 +6686,74 @@ impl Niri {
         }
     }
 
+    /// Renders an output's `Output`-target contents into a renderer-neutral CPU buffer through the
+    /// given renderer. On a Vulkan session the screen-transition crossfade composites the `Output`
+    /// target through the owned renderer (which can't sample a GLES texture), so it uploads this
+    /// buffer to a `VkTexture`; capturing it through the Vulkan renderer keeps that path off GLES.
+    /// Generic so it serves both the Vulkan capture and the GLES fallback.
+    fn capture_output_neutral<R>(&self, renderer: &mut R, output: &Output) -> Option<MemoryBuffer>
+    where
+        R: NiriRenderer + Offscreen<R::NiriTextureId>,
+        R::NiriError: Send + Sync + 'static,
+        OutputRenderElements<R>: RenderElement<R>,
+    {
+        let size = output.current_mode().unwrap().size;
+        let transform = output.current_transform();
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::Output,
+            xray: None,
+        };
+        let elements = self.render_to_vec(ctx, output, false);
+        let elements = elements.iter().rev();
+        match render_to_vec(renderer, size, scale, transform, Fourcc::Abgr8888, elements) {
+            Ok(data) => {
+                let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+                Some(MemoryBuffer::new(
+                    data,
+                    Fourcc::Abgr8888,
+                    buffer_size,
+                    scale,
+                    transform,
+                ))
+            }
+            Err(err) => {
+                warn!(
+                    "error capturing screen transition neutral buffer for {}: {err:?}",
+                    output.name()
+                );
+                None
+            }
+        }
+    }
+
+    /// Vulkan pass for [`Self::do_screen_transition`]: capture every output's `Output`-target
+    /// neutral buffer through the owned Vulkan renderer (so the crossfade needs no GLES), keyed by
+    /// output. `do_screen_transition` (the GLES pass) consumes the map; outputs whose Vulkan
+    /// capture failed are absent and fall back to the GLES capture there.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_screen_transition_neutrals(
+        &mut self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    ) -> std::collections::HashMap<Output, MemoryBuffer> {
+        self.update_render_elements(None);
+        let outputs: Vec<Output> = self.output_state.keys().cloned().collect();
+        outputs
+            .into_iter()
+            .filter_map(|output| {
+                let neutral = self.capture_output_neutral(renderer, &output)?;
+                Some((output, neutral))
+            })
+            .collect()
+    }
+
     pub fn do_screen_transition(
         &mut self,
         renderer: &mut GlesRenderer,
         using_vulkan: bool,
+        mut neutrals: std::collections::HashMap<Output, MemoryBuffer>,
         delay_ms: Option<u16>,
     ) {
         let _span = tracy_client::span!("Niri::do_screen_transition");
@@ -6707,44 +6771,15 @@ impl Niri {
                 let scale = Scale::from(output.current_scale().fractional_scale());
 
                 // On a Vulkan session the Output target composites through the owned renderer,
-                // which can't sample a GLES texture. Capture that target's contents
-                // once into a renderer-neutral CPU buffer for the crossfade to
-                // upload lazily (mirrors the resize crossfade's neutral snapshot).
-                // Screencast/screen-capture still render through GLES.
+                // which can't sample a GLES texture, so it uploads a renderer-neutral CPU capture
+                // to a VkTexture. That capture is taken through the Vulkan renderer up front (in
+                // `capture_screen_transition_neutrals`, the `neutrals` map); if it's missing for
+                // this output (the Vulkan capture failed), fall back to capturing through GLES
+                // here. Screencast/screen-capture still render through GLES.
                 let output_neutral = if using_vulkan {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target: RenderTarget::Output,
-                        xray: None,
-                    };
-                    let elements = self.render_to_vec(ctx, &output, false);
-                    let elements = elements.iter().rev();
-                    match render_to_vec(
-                        renderer,
-                        size,
-                        scale,
-                        transform,
-                        Fourcc::Abgr8888,
-                        elements,
-                    ) {
-                        Ok(data) => {
-                            let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
-                            Some(MemoryBuffer::new(
-                                data,
-                                Fourcc::Abgr8888,
-                                buffer_size,
-                                scale,
-                                transform,
-                            ))
-                        }
-                        Err(err) => {
-                            warn!(
-                                "error capturing screen transition neutral buffer for {}: {err:?}",
-                                output.name()
-                            );
-                            None
-                        }
-                    }
+                    neutrals
+                        .remove(&output)
+                        .or_else(|| self.capture_output_neutral(renderer, &output))
                 } else {
                     None
                 };
