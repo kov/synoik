@@ -4989,6 +4989,34 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Fills the stored unmap snapshot's neutral CPU buffer through the owned Vulkan renderer, so
+    /// the close animation can self-host without a GLES readback. Call after
+    /// [`Self::store_unmap_snapshot`] has baked the GLES snapshot; leaves the neutral empty
+    /// (falling back to the GLES readback in `ClosingWindow::new`) if the window is gone or
+    /// capture fails.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_unmap_neutral_vulkan(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+        window: &W::Id,
+    ) {
+        let _span = tracy_client::span!("Layout::capture_unmap_neutral_vulkan");
+
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            if move_.tile.window().id() == window {
+                move_.tile.capture_unmap_neutral_vulkan(renderer);
+                return;
+            }
+        }
+
+        for (_, _, ws) in self.workspaces() {
+            if let Some(tile) = ws.tiles().find(|tile| tile.window().id() == window) {
+                tile.capture_unmap_neutral_vulkan(renderer);
+                return;
+            }
+        }
+    }
+
     pub fn clear_unmap_snapshot(&mut self, window: &W::Id) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {

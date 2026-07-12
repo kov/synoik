@@ -1755,6 +1755,102 @@ fn vulkan_captures_the_resize_neutral_through_vulkan() {
     );
 }
 
+/// Direct test of the close-animation self-hosting: `State::store_unmap_snapshot` bakes the GLES
+/// unmap snapshot and then captures the neutral CPU buffer through the owned Vulkan renderer
+/// (`Layout::capture_unmap_neutral_vulkan` → `Tile::capture_unmap_neutral_vulkan`). Nothing else
+/// fills the close snapshot's `neutral` cell (GLES readback happens later, in `ClosingWindow::new`,
+/// only as a fallback), so an empty neutral here can only mean the Vulkan capture path silently
+/// failed — this asserts it produced the green tile, bypassing that fallback.
+#[test]
+fn vulkan_captures_the_close_neutral_through_vulkan() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_captures_the_close_neutral_through_vulkan: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    // The smithay `Window` backing the mapped tile (cloned so the `f.niri()` borrow ends). Uses the
+    // `LayoutElement::id` trait method (`= &Window`), not the inherent `Mapped::id() -> MappedId`.
+    let window_id = crate::layout::LayoutElement::id(
+        f.niri().layout.windows().next().expect("a mapped window").1,
+    )
+    .clone();
+
+    // Bake the unmap snapshot's GLES contents. `None` output → no xray background, which is all a
+    // plain window needs. (The integrated Vulkan pass inside `store_unmap_snapshot` is a no-op
+    // here: the `Backend` enum only exposes the Vulkan renderer for the Tty backend, so in
+    // tests we drive `Layout::capture_unmap_neutral_vulkan` directly through the headless
+    // accessor below — in production the Tty path runs exactly this via the enum.)
+    f.niri_state().store_unmap_snapshot(&window_id, None);
+
+    let state = f.niri_state();
+    state.backend.headless().with_vulkan_renderer(|vk| {
+        state
+            .niri
+            .layout
+            .capture_unmap_neutral_vulkan(vk, &window_id);
+    });
+
+    // Inspect the tile's captured neutral. The window is still mapped (storing a snapshot does not
+    // unmap it), so the tile is still in the active workspace.
+    let snapshot = f
+        .niri_state()
+        .niri
+        .layout
+        .active_workspace_mut()
+        .expect("active workspace")
+        .tiles_mut()
+        .next()
+        .expect("a tile")
+        .take_unmap_snapshot()
+        .expect("stored unmap snapshot");
+    let (buffer, geo) = snapshot
+        .neutral
+        .get()
+        .and_then(|n| n.as_ref())
+        .expect("Vulkan close neutral not captured");
+
+    // The tile encloses at least the WIN×WIN window (default config has no border).
+    let (w, h) = (buffer.size().w, buffer.size().h);
+    assert!(
+        w >= WIN as i32 && h >= WIN as i32 && geo.size.w >= WIN as i32,
+        "unexpected close neutral size {w}x{h} (geo {:?})",
+        geo.size
+    );
+
+    let data = buffer.data();
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(data, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_captures_the_close_neutral_through_vulkan: {green} green px");
+    assert!(
+        green as i32 > (WIN as i32) * (WIN as i32) * 3 / 4,
+        "close neutral is not the green tile ({green} green px) — Vulkan capture produced no content"
+    );
+}
+
 #[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders the window through an offscreen, scaling and fading it in.

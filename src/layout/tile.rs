@@ -1732,6 +1732,84 @@ impl<W: LayoutElement> Tile<W> {
         self.unmap_snapshot.take()
     }
 
+    /// Captures the stored unmap snapshot's neutral CPU buffer by rendering the whole tile through
+    /// the owned Vulkan renderer (the self-hosting path for the close animation — no GLES
+    /// readback). Call after [`Self::store_unmap_snapshot_if_empty`] baked the snapshot. The
+    /// tile is rendered exactly as `render_snapshot` bakes its `contents` (`Output` target,
+    /// origin, `focus_ring` off); `xray_pos`/`xray` are irrelevant on the Vulkan renderer (they
+    /// only feed the GLES-gated background effect at [`Self::render_inner`]), so
+    /// `XrayPos::default()` + no xray is used. `ClosingWindow` places this buffer at the GLES
+    /// `contents` geometry, so the two must share an encompassing geo — and they do: the only
+    /// element the GLES bake can add that this render omits is the background-effect blur, whose
+    /// geometry is bounded by the window surface area, so it can never extend past the
+    /// window/shadow that already define the geo. The blur pixels being absent is a cosmetic
+    /// Vulkan divergence (same class as the GLES-only background effect elsewhere). On failure the
+    /// `neutral` cell is left empty so `ClosingWindow::new` falls back to the GLES readback.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_unmap_neutral_vulkan(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    ) {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+        use smithay::utils::Transform;
+
+        use crate::render_helpers::memory::MemoryBuffer;
+        use crate::render_helpers::{encompassing_geo, render_to_vec};
+
+        let Some(snapshot) = self.unmap_snapshot.as_ref() else {
+            return;
+        };
+        if snapshot.neutral.get().is_some() {
+            return;
+        }
+
+        let scale = Scale::from(self.scale);
+        let mut elements = Vec::new();
+        self.render(
+            RenderCtx {
+                renderer,
+                target: RenderTarget::Output,
+                xray: None,
+            },
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            false,
+            &mut |elem| elements.push(elem),
+        );
+
+        let geo = encompassing_geo(scale, elements.iter());
+        if geo.size.is_empty() {
+            return;
+        }
+        let relocated = elements.iter().rev().map(|ele| {
+            RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
+        });
+        match render_to_vec(
+            renderer,
+            geo.size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            relocated,
+        ) {
+            Ok(data) => {
+                let buffer_size = geo.size.to_logical(1).to_buffer(1, Transform::Normal);
+                let buffer = MemoryBuffer::new(
+                    data,
+                    Fourcc::Abgr8888,
+                    buffer_size,
+                    scale,
+                    Transform::Normal,
+                );
+                let _ = snapshot.neutral.set(Some((buffer, geo)));
+            }
+            Err(err) => {
+                warn!("error capturing closing-window neutral via Vulkan: {err:?}");
+            }
+        }
+    }
+
     pub fn border(&self) -> &FocusRing {
         &self.border
     }

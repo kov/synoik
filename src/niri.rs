@@ -2242,6 +2242,18 @@ impl State {
                     .store_unmap_snapshot(renderer, None, false, window);
             }
         });
+
+        // Second pass: on a Vulkan session, self-host the close animation's neutral by capturing it
+        // through the owned Vulkan renderer (no GLES readback). Runs after the GLES bake above;
+        // leaves the neutral empty (GLES-readback fallback) if Vulkan capture is unavailable.
+        #[cfg(feature = "vulkan")]
+        if self.backend.using_vulkan() {
+            self.backend.with_vulkan_renderer(|renderer| {
+                self.niri
+                    .layout
+                    .capture_unmap_neutral_vulkan(renderer, window);
+            });
+        }
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]

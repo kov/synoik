@@ -144,9 +144,21 @@ impl ClosingWindow {
             .context("error rendering contents")?;
             #[cfg(feature = "vulkan")]
             if bridge_vulkan {
-                buffer_mem = readback_snapshot(renderer, &mut texture, scale)
-                    .map_err(|err| warn!("error reading back closing snapshot for Vulkan: {err:?}"))
-                    .ok();
+                // Prefer the neutral captured through the Vulkan renderer at snapshot time
+                // (self-hosting, no GLES readback); fall back to reading the freshly-rendered GLES
+                // texture back when the Vulkan capture was unavailable.
+                buffer_mem = snapshot
+                    .neutral
+                    .get()
+                    .and_then(|n| n.as_ref())
+                    .map(|(buf, _)| buf.clone());
+                if buffer_mem.is_none() {
+                    buffer_mem = readback_snapshot(renderer, &mut texture, scale)
+                        .map_err(|err| {
+                            warn!("error reading back closing snapshot for Vulkan: {err:?}")
+                        })
+                        .ok();
+                }
             }
             let buffer = TextureBuffer::from_texture(
                 renderer,
