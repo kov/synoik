@@ -1852,6 +1852,93 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
 }
 
 #[test]
+fn vulkan_picks_a_color_through_vulkan() {
+    // Phase C: pick-color reads back a single pixel through the *active* renderer. On a Vulkan
+    // session it must go through the owned Vulkan renderer (1x1 offscreen render + copy_framebuffer
+    // readback), not GLES. Assert the Vulkan pick equals the GLES oracle at the same point — a
+    // divergence (blank/wrong/None) can only mean the Vulkan 1x1 readback path is broken.
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_picks_a_color_through_vulkan: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Map a real client window so the composited scene is non-trivial (the oracle samples the
+    // backdrop below it, which is all the pick-path plumbing needs to exercise).
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let pos = smithay::utils::Point::<i32, Physical>::from((OUT_W as i32 / 2, OUT_H as i32 / 2));
+
+    let state = f.niri_state();
+    state.niri.update_render_elements(Some(&output));
+
+    let vk_color = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
+                &state.niri,
+                vk,
+                &output,
+                pos,
+                scale,
+            )
+        })
+        .flatten();
+
+    let gles_color = state
+        .backend
+        .with_primary_renderer(|g| {
+            crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
+                &state.niri,
+                g,
+                &output,
+                pos,
+                scale,
+            )
+        })
+        .flatten();
+
+    eprintln!("vulkan_picks_a_color_through_vulkan: vk={vk_color:?} gles={gles_color:?}");
+    let vk_color = vk_color.expect("Vulkan pick returned a color");
+    let gles_color = gles_color.expect("GLES pick returned a color");
+
+    // Same scene, same point: the owned renderer must match the GLES oracle within a rounding step.
+    // This is the correctness proof for the pick path — the 1x1 Vulkan offscreen render +
+    // copy_framebuffer readback + map_texture. A blank/wrong/None Vulkan result diverges here.
+    // (Client-texture compositing on Vulkan is proven separately by the whole-scene tests above.)
+    for i in 0..3 {
+        assert!(
+            (vk_color.rgb[i] - gles_color.rgb[i]).abs() < 2.0 / 255.0,
+            "channel {i} diverged: vk={:?} gles={:?}",
+            vk_color.rgb,
+            gles_color.rgb,
+        );
+    }
+}
+
+#[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders the window through an offscreen, scaling and fading it in.
     // It used to be GLES-only — on the owned Vulkan renderer it degraded to a plain full-alpha
