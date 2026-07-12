@@ -1594,10 +1594,27 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                         .map(|o| o.current_scale().fractional_scale())
                         .unwrap_or(1.),
                 );
-                let capture_neutral = state.backend.using_vulkan();
+                // GLES bakes the snapshot contents (still used for screencast / non-Output capture
+                // targets, and as the neutral-capture fallback below). The resize crossfade's
+                // neutral CPU buffer is captured through the owned Vulkan renderer instead, so on a
+                // Vulkan session the resize snapshot path never touches GLES.
                 state.backend.with_primary_renderer(|renderer| {
-                    mapped.store_animation_snapshot(renderer, scale, capture_neutral);
+                    mapped.store_animation_snapshot(renderer, scale, false);
                 });
+                #[cfg(feature = "vulkan")]
+                if state.backend.using_vulkan() {
+                    let captured = state
+                        .backend
+                        .with_vulkan_renderer(|vk| mapped.capture_neutral_vulkan(vk, scale))
+                        == Some(true);
+                    if !captured {
+                        // Vulkan capture unavailable/failed — fall back to GLES so the crossfade
+                        // still has a prev texture (no regression vs the prior hybrid path).
+                        state.backend.with_primary_renderer(|renderer| {
+                            mapped.capture_animation_snapshot_neutral_gles(renderer, scale);
+                        });
+                    }
+                }
             }
 
             // The toplevel remains mapped; clear any stored unmap snapshot.

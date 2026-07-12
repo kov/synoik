@@ -484,6 +484,51 @@ impl Mapped {
         self.animation_snapshot = Some(snapshot);
     }
 
+    /// Captures the stored animation snapshot's neutral CPU buffer through the owned Vulkan
+    /// renderer (the self-hosting path — no GLES). Call after [`Self::store_animation_snapshot`]
+    /// has stored the snapshot. Returns `true` if the neutral buffer is now populated (either just
+    /// captured or already present), `false` if capture failed — in which case the cell is left
+    /// uninitialized so the caller can fall back to the GLES capture.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_neutral_vulkan(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+        scale: Scale<f64>,
+    ) -> bool {
+        let Some(snapshot) = self.animation_snapshot.as_ref() else {
+            return false;
+        };
+        if snapshot.neutral.get().is_some() {
+            return true;
+        }
+
+        let buf_pos = self.window.geometry().loc.upscale(-1).to_f64();
+        let surface = self.toplevel().wl_surface();
+        match crate::render_helpers::snapshot::capture_neutral_from_surface_tree(
+            renderer, surface, buf_pos, scale,
+        ) {
+            Some(captured) => {
+                let _ = snapshot.neutral.set(Some(captured));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fallback for [`Self::capture_neutral_vulkan`]: capture the stored snapshot's neutral buffer
+    /// through GLES (rendering the already-baked `contents`), so the resize crossfade always has a
+    /// prev texture even if the Vulkan capture was unavailable.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_animation_snapshot_neutral_gles(
+        &self,
+        renderer: &mut GlesRenderer,
+        scale: Scale<f64>,
+    ) {
+        if let Some(snapshot) = self.animation_snapshot.as_ref() {
+            snapshot.capture_neutral(renderer, scale);
+        }
+    }
+
     pub fn take_pending_transaction(&mut self, commit_serial: Serial) -> Option<Transaction> {
         let mut rv = None;
 

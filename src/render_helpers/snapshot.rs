@@ -198,3 +198,73 @@ where
         .as_ref()
     }
 }
+
+/// Vulkan-native neutral capture: import a surface tree through the owned Vulkan renderer and
+/// render it into a renderer-neutral CPU [`MemoryBuffer`], at snapshot time.
+///
+/// The Vulkan analogue of [`RenderSnapshot::capture_neutral`] — used on a Vulkan session so the
+/// resize crossfade's pre-resize snapshot never touches GLES. Rather than re-render the GLES-baked
+/// `contents` (whose `PrimaryGpuTextureRenderElement` is a no-op on Vulkan), it re-imports the
+/// surface tree directly through the Vulkan renderer via the already-generic
+/// [`push_elements_from_surface_tree`] (a cache hit — the window has been compositing through this
+/// renderer). `buf_pos` is the window-geometry origin (logical, negated), matching
+/// [`RenderSnapshot::capture_neutral`]'s geometry so the resulting `(buffer, geo)` places
+/// `tex_prev` identically. Returns `None` on empty geometry or a render error, leaving the caller
+/// free to fall back to the GLES path.
+#[cfg(feature = "vulkan")]
+pub fn capture_neutral_from_surface_tree(
+    renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    buf_pos: Point<f64, Logical>,
+    scale: Scale<f64>,
+) -> Option<(MemoryBuffer, Rectangle<i32, Physical>)> {
+    use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+
+    use crate::render_helpers::surface::push_elements_from_surface_tree;
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    let _span = tracy_client::span!("capture_neutral_from_surface_tree");
+
+    let mut elements: Vec<WaylandSurfaceRenderElement<VulkanRenderer>> = Vec::new();
+    push_elements_from_surface_tree(
+        renderer,
+        surface,
+        buf_pos.to_physical_precise_round(scale),
+        scale,
+        1.,
+        Kind::Unspecified,
+        &mut |elem| elements.push(elem),
+    );
+
+    let geo = encompassing_geo(scale, elements.iter());
+    if geo.size.is_empty() {
+        return None;
+    }
+
+    // Reverse + relocate exactly as `capture_neutral`: elements are pushed front-to-back but
+    // `render_to_vec` draws front-to-back too, so the front-to-back push is drawn back-to-front
+    // via `.rev()`, and the whole tree is shifted so `geo.loc` becomes the origin.
+    let relocated = elements.iter().rev().map(|ele| {
+        RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
+    });
+
+    let fourcc = Fourcc::Abgr8888;
+    match render_to_vec(
+        renderer,
+        geo.size,
+        scale,
+        Transform::Normal,
+        fourcc,
+        relocated,
+    ) {
+        Ok(data) => {
+            let buffer_size = geo.size.to_logical(1).to_buffer(1, Transform::Normal);
+            let buffer = MemoryBuffer::new(data, fourcc, buffer_size, scale, Transform::Normal);
+            Some((buffer, geo))
+        }
+        Err(err) => {
+            warn!("error capturing neutral snapshot buffer via Vulkan: {err:?}");
+            None
+        }
+    }
+}

@@ -1460,8 +1460,12 @@ fn vulkan_renders_the_top_panel() {
 /// maximizing/restoring" bug: map a window, issue a niri-driven (animated) resize, commit the new
 /// size, and composite mid-animation — the frame must show window content with no pure-red fill.
 ///
-/// This exercises the full dual-renderer path the Tty backend uses (snapshot captured through the
-/// coexisting GLES renderer, composited through Vulkan), which the headless backend now mirrors.
+/// This exercises the resize path end-to-end: the pre-resize neutral snapshot is now captured
+/// through the owned Vulkan renderer (`capture_neutral_vulkan`), then composited through Vulkan.
+/// A failed neutral capture falls through to `!pushed_resize` → the red placeholder, so `red < 100`
+/// discriminates the crossfade path. (Because a broken Vulkan capture would be masked by the GLES
+/// fallback here, `vulkan_captures_the_resize_neutral_through_vulkan` proves the Vulkan path
+/// directly.)
 #[test]
 fn vulkan_resize_animation_is_not_a_red_rect() {
     use niri_config::animations::{Curve, EasingParams, Kind};
@@ -1534,6 +1538,94 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     assert!(
         red < 100,
         "resize rendered the red placeholder ({red} red px) instead of the cross-fade"
+    );
+}
+
+/// The resize crossfade's pre-resize neutral buffer is captured through the owned Vulkan renderer
+/// (`capture_neutral_from_surface_tree`), not GLES — the first vertical slice of self-hosting the
+/// Vulkan path. Map a green shm window and drive the capture DIRECTLY (bypassing the GLES fallback
+/// that `vulkan_resize_animation_is_not_a_red_rect` can't see past): the returned `MemoryBuffer`
+/// must be window-sized and green, proving the Vulkan renderer re-imported and rendered the surface
+/// tree offscreen at store-time.
+#[test]
+fn vulkan_captures_the_resize_neutral_through_vulkan() {
+    use crate::render_helpers::snapshot::capture_neutral_from_surface_tree;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_captures_the_resize_neutral_through_vulkan: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    // The server-side surface of the mapped window (cloned so the `f.niri()` borrow ends before we
+    // borrow the backend's Vulkan renderer).
+    let server_surface = {
+        let mapped = f.niri().layout.windows().next().expect("a mapped window").1;
+        mapped.toplevel().wl_surface().clone()
+    };
+
+    // buf_pos is irrelevant to the buffer content (we relocate by -geo.loc); use the origin.
+    let scale = Scale::from(1.);
+    let captured = f
+        .niri_state()
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            capture_neutral_from_surface_tree(
+                vk,
+                &server_surface,
+                smithay::utils::Point::from((0., 0.)),
+                scale,
+            )
+        })
+        .flatten();
+
+    let (buffer, geo) = captured.expect("Vulkan neutral capture returned nothing");
+    assert_eq!(
+        geo.size,
+        Size::from((WIN as i32, WIN as i32)),
+        "unexpected neutral geometry"
+    );
+    let (w, h) = (buffer.size().w, buffer.size().h);
+    assert_eq!(
+        (w, h),
+        (WIN as i32, WIN as i32),
+        "unexpected neutral buffer size"
+    );
+
+    let data = buffer.data();
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(data, w, i % w, i / w)))
+        .count();
+    eprintln!(
+        "vulkan_captures_the_resize_neutral_through_vulkan: {green}/{} green px",
+        w * h
+    );
+    assert!(
+        green as i32 > w * h * 3 / 4,
+        "neutral buffer is not the green window ({green} green px) — Vulkan capture produced no content"
     );
 }
 
