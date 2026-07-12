@@ -2077,8 +2077,9 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
             // element states, then `render_to_dmabuf` (which binds + `render_output_with_states`).
             let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
             let (_damages, states) = damage_tracker.damage_output(1, &elements).unwrap();
-            let _sync = render_to_dmabuf(vk, &mut damage_tracker, dmabuf.clone(), &elements, states)
-                .map_err(|e| anyhow::anyhow!("render_to_dmabuf: {e}"))?;
+            let _sync =
+                render_to_dmabuf(vk, &mut damage_tracker, dmabuf.clone(), &elements, states)
+                    .map_err(|e| anyhow::anyhow!("render_to_dmabuf: {e}"))?;
 
             // Read back from the dmabuf's own memory to prove the scene landed.
             let fb = vk
@@ -2099,6 +2100,71 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
 
     let green = assert_window_and_background(&pixels, w, h);
     eprintln!("vulkan_render_to_dmabuf_composites_the_scene: {green} window px");
+}
+
+#[test]
+fn crop_screenshot_neutral_crops_and_composites() {
+    // Phase C slice 4: the owned-Vulkan save-to-disk path crops the frozen-screen neutral CPU
+    // buffer and composites the pointer on top — no GLES readback. Test the pure pixel math
+    // directly (no GPU): a known crop offset and a premultiplied "over" blend.
+    use smithay::utils::Point;
+
+    use crate::render_helpers::memory::MemoryBuffer;
+    use crate::ui::screenshot_ui::crop_screenshot_neutral;
+
+    let px = |x: i32, y: i32| -> [u8; 4] { [(x * 10) as u8, (y * 10) as u8, 0, 255] };
+
+    // 4x4 Abgr8888 neutral: pixel (x,y) = [x*10, y*10, 0, 255].
+    let mut data = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            data.extend_from_slice(&px(x, y));
+        }
+    }
+    let neutral = MemoryBuffer::new(
+        data,
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((4, 4)),
+        Scale::from(1.0),
+        Transform::Normal,
+    );
+
+    // Crop the 2x2 region at (1,1) with no pointer: exactly the four source pixels.
+    let rect = Rectangle::<i32, Physical>::from_extremities((1, 1), (3, 3));
+    let out = crop_screenshot_neutral(&neutral, rect, None);
+    assert_eq!(&out[0..4], &px(1, 1), "crop TL");
+    assert_eq!(&out[4..8], &px(2, 1), "crop TR");
+    assert_eq!(&out[8..12], &px(1, 2), "crop BL");
+    assert_eq!(&out[12..16], &px(2, 2), "crop BR");
+
+    // Composite a half-transparent premultiplied red pointer ([128,0,0,128]) over a uniform-green
+    // neutral. Premultiplied over: out_c = src_c + dst_c*(255-128)/255.
+    let green = MemoryBuffer::new(
+        [0u8, 255, 0, 255].repeat(16),
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((4, 4)),
+        Scale::from(1.0),
+        Transform::Normal,
+    );
+    let pointer = MemoryBuffer::new(
+        [128u8, 0, 0, 128].repeat(4),
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((2, 2)),
+        Scale::from(1.0),
+        Transform::Normal,
+    );
+    // Crop the whole 4x4; pointer at physical origin (0,0) → covers the top-left 2x2.
+    let rect = Rectangle::<i32, Physical>::from_extremities((0, 0), (4, 4));
+    let out = crop_screenshot_neutral(&green, rect, Some((&pointer, Point::from((0, 0)))));
+    // Blended pixel: R = 128 + 0 = 128; G = 0 + (255*127+127)/255 = 127; B = 0; A = 255.
+    assert_eq!(&out[0..4], &[128, 127, 0, 255], "blended pointer pixel");
+    // A pixel outside the 2x2 pointer stays the untouched green neutral.
+    let idx = ((2 * 4 + 2) * 4) as usize;
+    assert_eq!(
+        &out[idx..idx + 4],
+        &[0, 255, 0, 255],
+        "untouched neutral pixel"
+    );
 }
 
 #[test]

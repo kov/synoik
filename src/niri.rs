@@ -2179,18 +2179,34 @@ impl State {
         };
         let path = path.take();
 
-        self.backend.with_primary_renderer(|renderer| {
-            match self.niri.screenshot_ui.capture(renderer) {
-                Ok((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
-                        warn!("error saving screenshot: {err:?}");
+        // On a Vulkan session, save from the frozen-screen neutral CPU buffer (a pure crop +
+        // pointer composite) so this path never renders/reads back through GLES (Phase C). Falls
+        // back to the GLES capture when no neutral was captured (GLES session).
+        #[cfg(feature = "vulkan")]
+        let captured = self.niri.screenshot_ui.capture_from_neutral();
+        #[cfg(not(feature = "vulkan"))]
+        let captured: Option<(Size<i32, Physical>, Vec<u8>)> = None;
+
+        if let Some((size, pixels)) = captured {
+            if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                warn!("error saving screenshot: {err:?}");
+            }
+        } else {
+            self.backend.with_primary_renderer(|renderer| {
+                match self.niri.screenshot_ui.capture(renderer) {
+                    Ok((size, pixels)) => {
+                        if let Err(err) =
+                            self.niri.save_screenshot(size, pixels, write_to_disk, path)
+                        {
+                            warn!("error saving screenshot: {err:?}");
+                        }
+                    }
+                    Err(err) => {
+                        warn!("error capturing screenshot: {err:?}");
                     }
                 }
-                Err(err) => {
-                    warn!("error capturing screenshot: {err:?}");
-                }
-            }
-        });
+            });
+        }
 
         self.niri.screenshot_ui.close();
         self.niri

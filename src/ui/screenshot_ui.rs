@@ -821,6 +821,43 @@ impl ScreenshotUi {
         Ok((rect.size, copy.to_vec()))
     }
 
+    /// Save-to-disk capture through the frozen-screen neutral `MemoryBuffer` (captured through the
+    /// owned Vulkan renderer at open time) — a pure CPU crop + pointer composite, so this path
+    /// never reads back through GLES (Phase C). Returns `None` when the neutral is absent (GLES
+    /// session or a non-`Output` target), so [`Self::capture`] handles it on GLES.
+    #[cfg(feature = "vulkan")]
+    pub fn capture_from_neutral(&self) -> Option<(Size<i32, Physical>, Vec<u8>)> {
+        let _span = tracy_client::span!("ScreenshotUi::capture_from_neutral");
+
+        let Self::Open {
+            selection,
+            output_data,
+            show_pointer,
+            ..
+        } = self
+        else {
+            panic!("screenshot UI must be open to capture");
+        };
+
+        let data = &output_data[&selection.0];
+        let screenshot = &data.screenshot[0];
+        let neutral = screenshot.neutral.as_ref()?;
+
+        let rect = rect_from_corner_points(selection.1, selection.2);
+
+        // The pointer neutral carries its top-left in logical output coordinates; map it back to
+        // the physical space the frozen screen (and the selection rect) live in.
+        let pointer = show_pointer
+            .then(|| screenshot.pointer_neutral.as_ref())
+            .flatten()
+            .map(|(ptr, loc)| {
+                let scale = Scale::from(data.scale);
+                (ptr, loc.to_physical_precise_round(scale))
+            });
+
+        Some((rect.size, crop_screenshot_neutral(neutral, rect, pointer)))
+    }
+
     pub fn action(&self, raw: Keysym, mods: ModifiersState) -> Option<Action> {
         let Self::Open { button, .. } = self else {
             return None;
@@ -1346,6 +1383,71 @@ pub fn rect_from_corner_points(
     // We're adding + 1 because the pointer is clamped to output size - 1, so to get the full
     // screen worth of selection we must add back that + 1.
     Rectangle::from_extremities((x1, y1), (x2 + 1, y2 + 1))
+}
+
+/// Crop `rect` out of the frozen-screen `neutral` buffer (tightly-packed `Abgr8888`, origin at the
+/// output's top-left) and, if `pointer` is given, composite that premultiplied buffer on top at its
+/// physical origin. Pure CPU — the owned-Vulkan save-to-disk path, so it never reads back through
+/// GLES. Returns `rect.size.w * rect.size.h * 4` bytes; out-of-bounds source pixels stay zero.
+#[cfg(feature = "vulkan")]
+pub(crate) fn crop_screenshot_neutral(
+    neutral: &MemoryBuffer,
+    rect: Rectangle<i32, Physical>,
+    pointer: Option<(&MemoryBuffer, Point<i32, Physical>)>,
+) -> Vec<u8> {
+    let (fw, fh) = (neutral.size().w, neutral.size().h);
+    let (rw, rh) = (rect.size.w.max(0), rect.size.h.max(0));
+    let src = neutral.data();
+    let mut out = vec![0u8; (rw * rh * 4) as usize];
+
+    // Crop: copy the in-bounds horizontal span of each row wholesale.
+    for y in 0..rh {
+        let sy = rect.loc.y + y;
+        if sy < 0 || sy >= fh {
+            continue;
+        }
+        let sx0 = rect.loc.x.max(0);
+        let sx1 = (rect.loc.x + rw).min(fw);
+        if sx1 <= sx0 {
+            continue;
+        }
+        let src_off = ((sy * fw + sx0) * 4) as usize;
+        let dst_off = ((y * rw + (sx0 - rect.loc.x)) * 4) as usize;
+        let n = ((sx1 - sx0) * 4) as usize;
+        out[dst_off..dst_off + n].copy_from_slice(&src[src_off..src_off + n]);
+    }
+
+    // Composite the pointer on top: premultiplied `Abgr8888` "over" (out = src + dst·(255−a)/255).
+    if let Some((ptr, ptr_origin)) = pointer {
+        let (pw, ph) = (ptr.size().w, ptr.size().h);
+        let pdata = ptr.data();
+        for py in 0..ph {
+            let cy = ptr_origin.y - rect.loc.y + py;
+            if cy < 0 || cy >= rh {
+                continue;
+            }
+            for px in 0..pw {
+                let cx = ptr_origin.x - rect.loc.x + px;
+                if cx < 0 || cx >= rw {
+                    continue;
+                }
+                let si = ((py * pw + px) * 4) as usize;
+                let a = pdata[si + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let inv = 255 - a;
+                let di = ((cy * rw + cx) * 4) as usize;
+                for c in 0..4 {
+                    let d = out[di + c] as u32;
+                    let v = pdata[si + c] as u32 + (d * inv + 127) / 255;
+                    out[di + c] = v.min(255) as u8;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 fn panel_location(output_data: &OutputData, panel_size: Size<i32, Buffer>) -> Point<i32, Physical> {
