@@ -872,6 +872,27 @@ impl State {
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();
                 if let Some(active) = active {
+                    // On a Vulkan session, render the screenshot through the owned renderer so this
+                    // path never touches GLES (Phase C). Falls back to GLES only when there is no
+                    // owned Vulkan renderer (i.e. not a Vulkan session).
+                    #[cfg(feature = "vulkan")]
+                    if self.backend.using_vulkan() {
+                        let res = self.backend.with_vulkan_renderer(|renderer| {
+                            self.niri.screenshot(
+                                renderer,
+                                &active,
+                                write_to_disk,
+                                show_pointer,
+                                path,
+                            )
+                        });
+                        match res {
+                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
+                            Some(Ok(())) => {}
+                        }
+                        return;
+                    }
                     self.backend.with_primary_renderer(|renderer| {
                         if let Err(err) = self.niri.screenshot(
                             renderer,
@@ -910,6 +931,25 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
+                    #[cfg(feature = "vulkan")]
+                    if self.backend.using_vulkan() {
+                        let res = self.backend.with_vulkan_renderer(|renderer| {
+                            self.niri.screenshot_window(
+                                renderer,
+                                output,
+                                mapped,
+                                write_to_disk,
+                                show_pointer,
+                                path,
+                            )
+                        });
+                        match res {
+                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
+                            Some(Ok(())) => {}
+                        }
+                        return;
+                    }
                     self.backend.with_primary_renderer(|renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,
@@ -934,6 +974,25 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
+                    #[cfg(feature = "vulkan")]
+                    if self.backend.using_vulkan() {
+                        let res = self.backend.with_vulkan_renderer(|renderer| {
+                            self.niri.screenshot_window(
+                                renderer,
+                                output,
+                                mapped,
+                                write_to_disk,
+                                show_pointer,
+                                path,
+                            )
+                        });
+                        match res {
+                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
+                            Some(Ok(())) => {}
+                        }
+                        return;
+                    }
                     self.backend.with_primary_renderer(|renderer| {
                         if let Err(err) = self.niri.screenshot_window(
                             renderer,

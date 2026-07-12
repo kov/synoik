@@ -2283,32 +2283,71 @@ impl State {
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
+        // On a Vulkan session, render the screenshot through the owned renderer (Phase C); the
+        // helper is renderer-agnostic and `to_screenshot` is passed by reference, so neither branch
+        // moves anything the other needs.
+        #[cfg(feature = "vulkan")]
+        let rv = if self.backend.using_vulkan() {
+            self.backend.with_vulkan_renderer(|renderer| {
+                Self::take_screenshot_with_renderer(
+                    &mut self.niri,
+                    renderer,
+                    include_cursor,
+                    to_screenshot,
+                )
+            })
+        } else {
+            self.backend.with_primary_renderer(|renderer| {
+                Self::take_screenshot_with_renderer(
+                    &mut self.niri,
+                    renderer,
+                    include_cursor,
+                    to_screenshot,
+                )
+            })
+        };
+        #[cfg(not(feature = "vulkan"))]
         let rv = self.backend.with_primary_renderer(|renderer| {
-            let on_done = {
-                let to_screenshot = to_screenshot.clone();
-                move |path| {
-                    let msg = NiriToScreenshot::ScreenshotResult(Some(path));
-                    if let Err(err) = to_screenshot.send_blocking(msg) {
-                        warn!("error sending path to screenshot: {err:?}");
-                    }
-                }
-            };
-
-            let res = self
-                .niri
-                .screenshot_all_outputs(renderer, include_cursor, on_done);
-
-            if let Err(err) = res {
-                warn!("error taking a screenshot: {err:?}");
-
-                let msg = NiriToScreenshot::ScreenshotResult(None);
-                if let Err(err) = to_screenshot.send_blocking(msg) {
-                    warn!("error sending None to screenshot: {err:?}");
-                }
-            }
+            Self::take_screenshot_with_renderer(
+                &mut self.niri,
+                renderer,
+                include_cursor,
+                to_screenshot,
+            )
         });
 
         if rv.is_none() {
+            let msg = NiriToScreenshot::ScreenshotResult(None);
+            if let Err(err) = to_screenshot.send_blocking(msg) {
+                warn!("error sending None to screenshot: {err:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "dbus")]
+    fn take_screenshot_with_renderer<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+        niri: &mut Niri,
+        renderer: &mut R,
+        include_cursor: bool,
+        to_screenshot: &async_channel::Sender<NiriToScreenshot>,
+    ) where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
+        let on_done = {
+            let to_screenshot = to_screenshot.clone();
+            move |path| {
+                let msg = NiriToScreenshot::ScreenshotResult(Some(path));
+                if let Err(err) = to_screenshot.send_blocking(msg) {
+                    warn!("error sending path to screenshot: {err:?}");
+                }
+            }
+        };
+
+        let res = niri.screenshot_all_outputs(renderer, include_cursor, on_done);
+
+        if let Err(err) = res {
+            warn!("error taking a screenshot: {err:?}");
+
             let msg = NiriToScreenshot::ScreenshotResult(None);
             if let Err(err) = to_screenshot.send_blocking(msg) {
                 warn!("error sending None to screenshot: {err:?}");
@@ -6139,15 +6178,18 @@ impl Niri {
             .context("error saving screenshot")
     }
 
-    pub fn screenshot_window(
+    pub fn screenshot_window<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         mapped: &Mapped,
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        WindowScreenshotRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -6158,7 +6200,7 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
-        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        let mut elements: Vec<WindowScreenshotRenderElement<R>> = Vec::new();
 
         // Add pointer if requested and it's over this window.
         if show_pointer {
@@ -6315,12 +6357,15 @@ impl Niri {
     }
 
     #[cfg(feature = "dbus")]
-    pub fn screenshot_all_outputs(
+    pub fn screenshot_all_outputs<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
 
         self.update_render_elements(None);

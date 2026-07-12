@@ -1939,6 +1939,62 @@ fn vulkan_picks_a_color_through_vulkan() {
 }
 
 #[test]
+fn vulkan_screenshots_a_window_through_vulkan() {
+    // Phase C: window screenshot-to-disk renders through the *active* renderer. Drive the
+    // genericized `Niri::screenshot_window` on the owned Vulkan renderer end-to-end (no disk write,
+    // so no async encode thread to await) — it must run the full render + readback path without
+    // erroring. Pixel correctness of the composited scene is proven by the whole-scene tests above.
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_screenshots_a_window_through_vulkan: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let state = f.niri_state();
+    state.niri.update_render_elements(Some(&output));
+    let mapped = state
+        .niri
+        .layout
+        .windows()
+        .next()
+        .expect("a mapped window")
+        .1;
+
+    let ran = state.backend.headless().with_vulkan_renderer(|vk| {
+        state
+            .niri
+            .screenshot_window(vk, &output, mapped, false, false, None)
+            .expect("screenshot_window must succeed on the Vulkan renderer");
+    });
+    assert!(
+        ran.is_some(),
+        "screenshot_window did not run on the Vulkan renderer"
+    );
+}
+
+#[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders the window through an offscreen, scaling and fading it in.
     // It used to be GLES-only — on the owned Vulkan renderer it degraded to a plain full-alpha
