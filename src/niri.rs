@@ -3986,6 +3986,9 @@ impl Niri {
     /// hotspot is written to the cursor plane's HOTSPOT_X/Y properties so the host composites our
     /// cursor plane as its pointer instead of drawing a second host cursor. Returns `(0, 0)` when
     /// the cursor is hidden — the value is unused then, as no cursor plane is assigned.
+    ///
+    /// Reported in the cursor image's own (unrotated) space; `DrmCompositor` rotates it into the
+    /// cursor plane buffer for the output transform, so this stays transform-agnostic.
     pub fn cursor_plane_hotspot(&self, output: &Output) -> Point<i32, Physical> {
         let output_scale = Scale::from(output.current_scale().fractional_scale());
         let cursor_scale = output.current_scale().integer_scale();
