@@ -15,6 +15,7 @@
 
 mod backdrop_blur;
 mod custom;
+mod effect_blur;
 mod elements;
 mod error;
 mod frame;
@@ -26,6 +27,7 @@ mod types;
 
 pub(crate) use backdrop_blur::BackdropBlur;
 pub(crate) use custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
+pub(crate) use effect_blur::EffectBlur;
 pub use error::VulkanError;
 pub(crate) use frame::ClipParams;
 pub use frame::VulkanFrame;

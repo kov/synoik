@@ -2588,6 +2588,260 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     );
 }
 
+/// Phase-C slice-5 (xray port) commit-1: the `EffectBuffer` gained a Vulkan arm that renders its
+/// elements into an owned offscreen and (eagerly) blurs it, sampled through `render_postprocess` —
+/// the exact primitive the ported `XrayElement::draw` will use in commit-2. This pins the whole arm
+/// end-to-end while it is still dead code. The offscreen is a hard red|green vertical edge, and the
+/// cases target the design's actual risks:
+///   (a) full src → left-red/right-green passthrough;
+///   (b) a cropped src (right half) → all green — proves the sampled sub-rect is honored (a
+///       full-src-only test would go green while hiding a src/composition bug);
+///   (c) blur on → the hard edge softens (blended pixels the sharp scene can't have), proving the
+///       eager Vulkan blur ran and differs from the unblurred consume;
+///   (d) resize via `update_size` + re-prepare → the **atomic blur-chain rebuild** (the trap this
+///       design exists for: the chain binds a fixed source view and has no `Drop`) produces a valid
+///       blurred sample at the new size, no validation error;
+///   (e) mutate the elements + re-prepare with blur → the blurred output *changed*, exercising the
+///       `valid`-flag invalidation and the same-`EffectBlur` output-reuse (UNDEFINED-discard) path.
+/// Offscreen-only, so it runs on lavapipe too.
+#[test]
+fn vulkan_effect_buffer_renders_offscreen_and_blur() {
+    use niri_vk::render::PostprocessPush;
+    use smithay::backend::renderer::element::Kind;
+    use smithay::backend::renderer::{Offscreen, Texture as _};
+
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::effect_buffer::EffectBuffer;
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+    use crate::render_helpers::vulkan::VkTexture;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_effect_buffer_renders_offscreen_and_blur: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const IDENTITY_MAT3: [[f32; 4]; 3] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+
+    // Identity postprocess (no clip, no rounding, no desaturation); render_postprocess fills
+    // origin/size/proj/target/src_rect.
+    let identity_push = |geo: i32| PostprocessPush {
+        origin: [0.0, 0.0],
+        size: [0.0, 0.0],
+        proj: [0.0; 4],
+        target: [0.0, 0.0],
+        geo_size: [geo as f32, geo as f32],
+        src_rect: [0.0; 4],
+        corner_radius: [0.0; 4],
+        bg_color: [0.0; 4],
+        input_to_geo: IDENTITY_MAT3,
+        sample_transform: IDENTITY_MAT3,
+        niri_scale: 1.0,
+        niri_alpha: 1.0,
+        saturation: 1.0,
+        noise: 0.0,
+    };
+
+    // Sample `tex` (through `src`) across a whole `s`×`s` target and read it back.
+    let sample = |vk: &mut VulkanRenderer,
+                  tex: &VkTexture,
+                  src: Rectangle<f64, BufferCoord>,
+                  s: i32|
+     -> Vec<u8> {
+        let size = Size::<i32, Physical>::from((s, s));
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((s, s)))
+            .expect("create sample target");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind sample target");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .clear(
+                    Color32F::from([0.0, 0.0, 0.0, 1.0]),
+                    &[Rectangle::from_size(size)],
+                )
+                .expect("clear");
+            let dst = Rectangle::<i32, Physical>::from_size(size);
+            frame
+                .render_postprocess(
+                    tex,
+                    src,
+                    dst,
+                    &[Rectangle::from_size(size)],
+                    identity_push(s),
+                )
+                .expect("render_postprocess");
+            let _ = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind sample target");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((s, s)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy");
+        vk.map_texture(&mapping).expect("map").to_vec()
+    };
+
+    // Fill the effect buffer's offscreen with a hard edge: left half red, right half green.
+    let fill_edge = |buffer: &mut EffectBuffer, s: i32| {
+        let red =
+            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [1.0, 0.0, 0.0, 1.0]);
+        let green =
+            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [0.0, 1.0, 0.0, 1.0]);
+        let elements = buffer.elements_vulkan();
+        elements.clear();
+        elements.push(
+            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
+        );
+        elements.push(
+            SolidColorRenderElement::from_buffer(
+                &green,
+                (s as f64 / 2.0, 0.0),
+                1.0,
+                Kind::Unspecified,
+            )
+            .into(),
+        );
+    };
+
+    const S: i32 = 64;
+    let scale = Scale::from(1.0);
+    let full_src = Rectangle::<f64, BufferCoord>::from_size(Size::from((S as f64, S as f64)));
+    let right_src = Rectangle::<f64, BufferCoord>::new(
+        (S as f64 / 2.0, 0.0).into(),
+        (S as f64 / 2.0, S as f64).into(),
+    );
+
+    let mut buffer = EffectBuffer::new();
+    buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
+    fill_edge(&mut buffer, S);
+    assert!(
+        buffer.prepare_vulkan(&mut vk, false),
+        "prepare_vulkan (no blur) failed"
+    );
+
+    // (a) full src → left red, right green; (b) cropped src = right half → all green.
+    {
+        let tex = buffer.texture_vulkan(false).expect("offscreen texture");
+
+        let full = sample(&mut vk, &tex, full_src, S);
+        let l = px(&full, S, 4, S / 2);
+        let r = px(&full, S, S - 5, S / 2);
+        assert!(
+            l[0] > 200 && l[1] < 50,
+            "full-src left should be red, got {l:?}"
+        );
+        assert!(
+            r[1] > 200 && r[0] < 50,
+            "full-src right should be green, got {r:?}"
+        );
+
+        let cropped = sample(&mut vk, &tex, right_src, S);
+        let l = px(&cropped, S, 4, S / 2);
+        let r = px(&cropped, S, S - 5, S / 2);
+        assert!(
+            l[1] > 200 && l[0] < 50,
+            "cropped-src left should sample the green right half, got {l:?}"
+        );
+        assert!(
+            r[1] > 200 && r[0] < 50,
+            "cropped-src right should be green, got {r:?}"
+        );
+    } // drop the offscreen clone before the next prepare so `is_unique_reference` holds
+
+    // (c) blur on → the hard edge softens.
+    buffer.update_blur_options(BlurOptions {
+        passes: 3,
+        offset: 2.0,
+    });
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "prepare_vulkan (blur) failed"
+    );
+    let edge_blend = {
+        let tex = buffer.texture_vulkan(true).expect("blurred texture");
+        let blurred = sample(&mut vk, &tex, full_src, S);
+        let y = S / 2;
+        let mut best = 0u8;
+        for x in 0..S {
+            let p = px(&blurred, S, x, y);
+            best = best.max(p[0].min(p[1]));
+        }
+        assert!(
+            best > 40,
+            "blur did not soften the edge (max min(R,G) = {best})"
+        );
+        best
+    };
+
+    // (d) resize → the atomic blur-chain rebuild at the new size (a full recreate: old chain
+    // dropped with the old offscreen, new chain bound to the new texture view).
+    const S2: i32 = 96;
+    buffer.update_size(Size::<i32, Physical>::from((S2, S2)), scale);
+    fill_edge(&mut buffer, S2);
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "prepare_vulkan after resize failed"
+    );
+    let full_src2 = Rectangle::<f64, BufferCoord>::from_size(Size::from((S2 as f64, S2 as f64)));
+    {
+        let tex = buffer
+            .texture_vulkan(true)
+            .expect("resized blurred texture");
+        assert_eq!(
+            tex.size(),
+            Size::<i32, BufferCoord>::from((S2, S2)),
+            "resized offscreen has the wrong size"
+        );
+        let blurred = sample(&mut vk, &tex, full_src2, S2);
+        let l = px(&blurred, S2, 3, S2 / 2);
+        let r = px(&blurred, S2, S2 - 4, S2 / 2);
+        assert!(
+            l[0] > 120 && l[0] > l[1],
+            "resized far-left should stay red-dominant, got {l:?}"
+        );
+        assert!(
+            r[1] > 120 && r[1] > r[0],
+            "resized far-right should stay green-dominant, got {r:?}"
+        );
+    }
+
+    // (e) mutate the offscreen (all blue) + re-prepare with blur → the blurred output changed (same
+    // texture re-rendered in place, blur invalidated + re-run into the reused output).
+    {
+        let blue = SolidColorBuffer::new(Size::from((S2 as f64, S2 as f64)), [0.0, 0.0, 1.0, 1.0]);
+        let elements = buffer.elements_vulkan();
+        elements.clear();
+        elements.push(
+            SolidColorRenderElement::from_buffer(&blue, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
+        );
+    }
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "prepare_vulkan after mutate failed"
+    );
+    {
+        let tex = buffer
+            .texture_vulkan(true)
+            .expect("mutated blurred texture");
+        let blurred = sample(&mut vk, &tex, full_src2, S2);
+        let c = px(&blurred, S2, S2 / 2, S2 / 2);
+        assert!(
+            c[2] > 180 && c[0] < 60 && c[1] < 60,
+            "mutated blur should be blue, got {c:?}"
+        );
+    }
+
+    eprintln!(
+        "vulkan_effect_buffer_renders_offscreen_and_blur: ok (edge blend min(R,G)={edge_blend})"
+    );
+}
+
 /// A blur-off, saturation-1, noise-0, unclipped framebuffer effect over the *whole* output is a
 /// no-op: it captures the backdrop and redraws it unchanged. That invariant must hold under **any**
 /// output transform — the capture blit grabs the scene in physical orientation, so the postprocess
