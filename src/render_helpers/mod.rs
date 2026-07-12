@@ -21,7 +21,7 @@ use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use self::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
@@ -316,11 +316,11 @@ where
     Ok(copy.to_vec())
 }
 
-pub fn render_to_dmabuf(
-    renderer: &mut GlesRenderer,
+pub fn render_to_dmabuf<R: NiriRenderer>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
@@ -344,11 +344,11 @@ pub fn render_to_dmabuf(
     Ok(res.sync)
 }
 
-pub fn render_to_shm(
-    renderer: &mut GlesRenderer,
+pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    renderer: &mut R,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<R>],
     states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();

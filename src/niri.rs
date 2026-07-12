@@ -5710,11 +5710,13 @@ impl Niri {
         feedback
     }
 
-    pub fn render_for_screencopy_with_damage(
+    pub fn render_for_screencopy_with_damage<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
-    ) {
+    ) where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
 
         let mut screencopy_state = mem::take(&mut self.screencopy_state);
@@ -5785,12 +5787,15 @@ impl Niri {
         self.screencopy_state = screencopy_state;
     }
 
-    pub fn render_for_screencopy_without_damage(
+    pub fn render_for_screencopy_without_damage<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         manager: &ZwlrScreencopyManagerV1,
         screencopy: Screencopy,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screencopy");
 
         let output = screencopy.output();
@@ -5868,10 +5873,10 @@ impl Niri {
     }
 
     #[allow(clippy::type_complexity)]
-    fn render_for_screencopy_internal(
-        renderer: &mut GlesRenderer,
+    fn render_for_screencopy_internal<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+        renderer: &mut R,
         damage_tracker: &mut OutputDamageTracker,
-        elements: &[impl RenderElement<GlesRenderer>],
+        elements: &[impl RenderElement<R>],
         states: RenderElementStates,
         screencopy: &Screencopy,
     ) -> anyhow::Result<Option<SyncPoint>> {

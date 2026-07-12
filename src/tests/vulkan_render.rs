@@ -1995,6 +1995,113 @@ fn vulkan_screenshots_a_window_through_vulkan() {
 }
 
 #[test]
+fn vulkan_render_to_dmabuf_composites_the_scene() {
+    // Phase C slice 3: screencopy renders into a client buffer through the shared
+    // `render_to_dmabuf` helper (also used by the screencast path). Drive that genericized helper
+    // on the owned Vulkan renderer — full damage-tracker flow (`damage_output` → `render_to_dmabuf`
+    // → readback) into a GBM dmabuf — and assert the composited scene landed. Venus-only (needs a
+    // render node + GBM), like the scanout test.
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::render_to_dmabuf;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_render_to_dmabuf_composites_the_scene: no render node ({e})"
+            );
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_render_to_dmabuf_composites_the_scene: no GBM ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = match alloc.create_buffer(
+        u32::from(OUT_W),
+        u32::from(OUT_H),
+        Fourcc::Abgr8888,
+        &[Modifier::Linear],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_render_to_dmabuf_composites_the_scene: GBM cannot allocate \
+                 Abgr8888 LINEAR buffer ({e})"
+            );
+            return;
+        }
+    };
+    let mut dmabuf = bo.export().expect("export dmabuf");
+
+    let state = f.niri_state();
+    let (pixels, w, h) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let size = output.current_transform().transform_size(size);
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::ScreenCapture,
+                xray: None,
+            };
+            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
+                niri.render_to_vec(ctx, &output, false);
+
+            // The exact damage-tracker flow the screencopy path runs: `damage_output` to derive the
+            // element states, then `render_to_dmabuf` (which binds + `render_output_with_states`).
+            let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+            let (_damages, states) = damage_tracker.damage_output(1, &elements).unwrap();
+            let _sync = render_to_dmabuf(vk, &mut damage_tracker, dmabuf.clone(), &elements, states)
+                .map_err(|e| anyhow::anyhow!("render_to_dmabuf: {e}"))?;
+
+            // Read back from the dmabuf's own memory to prove the scene landed.
+            let fb = vk
+                .bind(&mut dmabuf)
+                .map_err(|e| anyhow::anyhow!("bind dmabuf: {e}"))?;
+            let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((size.w, size.h)));
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .map_err(|e| anyhow::anyhow!("copy_framebuffer: {e}"))?;
+            let pixels = vk
+                .map_texture(&mapping)
+                .map_err(|e| anyhow::anyhow!("map_texture: {e}"))?
+                .to_vec();
+            Ok((pixels, size.w, size.h))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("render_to_dmabuf on the Vulkan renderer must not error");
+
+    let green = assert_window_and_background(&pixels, w, h);
+    eprintln!("vulkan_render_to_dmabuf_composites_the_scene: {green} window px");
+}
+
+#[test]
 fn vulkan_renders_a_window_mid_open_animation() {
     // The tile open animation renders the window through an offscreen, scaling and fading it in.
     // It used to be GLES-only — on the owned Vulkan renderer it degraded to a plain full-alpha
