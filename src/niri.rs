@@ -3979,6 +3979,30 @@ impl Niri {
         }
     }
 
+    /// Hotspot of the current cursor image for `output`, in physical pixels.
+    ///
+    /// Matches the offset `render_pointer` bakes into the cursor element position, so it can be
+    /// handed to `DrmCompositor::set_cursor_hotspot`: on para-virtualized drivers (virtio-gpu) the
+    /// hotspot is written to the cursor plane's HOTSPOT_X/Y properties so the host composites our
+    /// cursor plane as its pointer instead of drawing a second host cursor. Returns `(0, 0)` when
+    /// the cursor is hidden — the value is unused then, as no cursor plane is assigned.
+    pub fn cursor_plane_hotspot(&self, output: &Output) -> Point<i32, Physical> {
+        let output_scale = Scale::from(output.current_scale().fractional_scale());
+        let cursor_scale = output.current_scale().integer_scale();
+        match self.cursor_manager.get_render_cursor(cursor_scale) {
+            RenderCursor::Hidden => Point::default(),
+            RenderCursor::Surface { hotspot, .. } => {
+                hotspot.to_physical_precise_round(output_scale)
+            }
+            RenderCursor::Named { scale, cursor, .. } => {
+                let (_, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
+                XCursor::hotspot(frame)
+                    .to_logical(scale)
+                    .to_physical_precise_round(output_scale)
+            }
+        }
+    }
+
     pub fn render_pointer<R: NiriRenderer>(
         &self,
         renderer: &mut R,

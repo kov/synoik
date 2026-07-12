@@ -3122,8 +3122,14 @@ where
         draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
     }
 
+    // Give the compositor the current cursor hotspot before it assigns the cursor plane. On
+    // para-virtualized drivers (virtio-gpu) this drives the plane's HOTSPOT_X/Y so the host treats
+    // our cursor plane as its pointer and stops drawing a second host cursor; a no-op elsewhere.
+    let cursor_hotspot = niri.cursor_plane_hotspot(output);
+
     // Hand them over to the DRM.
     let drm_compositor = &mut surface.compositor;
+    drm_compositor.set_cursor_hotspot(cursor_hotspot);
     // The owned Vulkan renderer's render pass discards the target's prior contents (loadOp
     // DONT_CARE) and does not preserve buffer-age content, so DrmCompositor's partial-damage
     // rendering would leave undamaged regions (desktop background, window borders) black once the

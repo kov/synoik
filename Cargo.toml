@@ -28,15 +28,16 @@ tracy-client = { version = "0.18.4", default-features = false }
 
 [workspace.dependencies.smithay]
 # version = "0.4.1"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+# Local patched fork (branch gsrs-cursor-hotspot off upstream rev
+# ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef): adds para-virt cursor-plane
+# hotspot support (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT + HOTSPOT_X/Y) so the
+# virtio-gpu host stops drawing its own pointer alongside ours.
+path = "../smithay"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
 # version = "0.1.0"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
-# path = "../smithay/smithay-drm-extras"
+path = "../smithay/smithay-drm-extras"
 
 [package]
 name = "niri"
