@@ -523,7 +523,7 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
                     assert!(
                         matches!(
                             transition.render(vk, target),
-                            DualTextureRenderElement::Vulkan(_)
+                            Some(DualTextureRenderElement::Vulkan(_))
                         ),
                         "{target:?} did not upload the capture to a VkTexture; the Gles arm it \
                          fell through to draws nothing on Vulkan"

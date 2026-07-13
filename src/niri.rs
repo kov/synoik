@@ -4644,7 +4644,9 @@ impl Niri {
         // Next, the screen transition texture.
         {
             if let Some(transition) = &state.screen_transition {
-                push(transition.render(ctx.renderer, ctx.target).into());
+                if let Some(elem) = transition.render(ctx.renderer, ctx.target) {
+                    push(elem.into());
+                }
             }
         }
 
@@ -7232,7 +7234,7 @@ impl Niri {
                     )
                 });
 
-                Some((output, textures, neutrals))
+                Some((output, textures, neutrals, scale, transform))
             })
             .collect();
 
@@ -7240,11 +7242,13 @@ impl Niri {
             Duration::from_millis(u64::from(d))
         });
 
-        for (output, from_texture, neutrals) in textures {
+        for (output, from_texture, neutrals, scale, transform) in textures {
             let state = self.output_state.get_mut(&output).unwrap();
             state.screen_transition = Some(ScreenTransition::new(
                 from_texture,
                 neutrals,
+                scale,
+                transform,
                 delay,
                 self.clock.clone(),
             ));
