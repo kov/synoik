@@ -2688,20 +2688,23 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
 }
 
 /// The `Xrgb8888` shm pool that `render_to_shm` fills wants BGRA-order bytes, but the owned
-/// renderer renders `R8G8B8A8` and so cannot produce a BGRA-order offscreen at all — asking for one
-/// fails, which is what used to make every shm screencopy on a Vulkan session error out.
+/// renderer renders `R8G8B8A8` and cannot produce a BGRA-order offscreen at all — the render pass
+/// is hard-wired to that format, so a BGRA attachment is not a legal framebuffer.
 ///
-/// Pin both halves of the workaround: that the BGRA request really is rejected (so the swizzle is
-/// not cargo cult), and that reading back RGBA and swizzling yields the bytes the pool expects.
-/// Red is the discriminator — it is the channel that moves.
+/// The conversion therefore happens on the way *out*: `copy_framebuffer` blits through a staging
+/// image of the requested format and `vkCmdBlitImage` reorders the channels on the GPU. Pin both
+/// halves: that a BGRA offscreen really is still rejected (so nobody "fixes" it the wrong way), and
+/// that asking for BGRA bytes yields them — with no CPU pass over the pixels.
+///
+/// Red is the discriminator: it is the channel a red/blue swap moves.
 #[test]
-fn vulkan_shm_readback_swizzles_to_bgra() {
-    use crate::render_helpers::{create_texture, swizzle_rgba_to_bgra};
+fn vulkan_shm_readback_converts_to_bgra() {
+    use crate::render_helpers::create_texture;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skipping vulkan_shm_readback_swizzles_to_bgra: no Vulkan device ({e})");
+            eprintln!("skipping vulkan_shm_readback_converts_to_bgra: no Vulkan device ({e})");
             return;
         }
     };
@@ -2715,8 +2718,8 @@ fn vulkan_shm_readback_swizzles_to_bgra() {
             size.to_logical(1).to_buffer(1, Transform::Normal),
         )
         .is_err(),
-        "a BGRA-order offscreen must be rejected; if this starts passing, render_to_shm can drop \
-         the swizzle and read Xrgb8888 back directly",
+        "a BGRA-order offscreen must stay rejected: the shared render pass is R8G8B8A8, so such an \
+         attachment is not legal. The conversion belongs in the readback, not the render target.",
     );
 
     // The RGBA-order one we actually use. Clear it red: red is what a red/blue swap moves.
@@ -2734,22 +2737,65 @@ fn vulkan_shm_readback_swizzles_to_bgra() {
         let _ = frame.finish().expect("finish");
     }
     let fb = vk.bind(&mut texture).expect("rebind for readback");
+
+    // Negative control for the conversion: asking for the source's own order must NOT convert.
     let mapping = vk
         .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Abgr8888)
         .expect("copy_framebuffer");
     let rgba = vk.map_texture(&mapping).expect("map_texture").to_vec();
-
     assert_eq!(
         &rgba[..4],
         &[255, 0, 0, 255],
-        "the readback must be RGBA-order red",
+        "reading the source's own order must come back raw, not double-swapped",
     );
 
-    let mut bgra = vec![0u8; rgba.len()];
-    swizzle_rgba_to_bgra(&mut bgra, &rgba);
+    // ...and asking for the shm pool's order converts, on the GPU.
+    let mapping = vk
+        .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Xrgb8888)
+        .expect("copy_framebuffer as Xrgb8888");
+    let bgra = vk.map_texture(&mapping).expect("map_texture").to_vec();
     assert_eq!(
         &bgra[..4],
         &[0, 0, 255, 255],
-        "the shm pool wants BGRA-order red",
+        "a BGRA-order readback of red must have red in the third byte",
+    );
+}
+
+/// A converting readback must not allocate a staging image per call.
+///
+/// shm screencopy fires every frame, and on Venus a `VkImage` allocated per frame exhausts the host
+/// blob pool and aborts the session. The cache hit is invisible to any pixel assertion, so the
+/// allocation counter is the only thing that can pin this. Sibling of
+/// `vulkan_alternating_present_blit_sizes_reuse_shadows`.
+#[test]
+fn vulkan_repeated_converting_readbacks_reuse_staging() {
+    use crate::render_helpers::create_texture;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_repeated_converting_readbacks_reuse_staging: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut texture: VkTexture =
+        create_texture(&mut vk, size, Fourcc::Abgr8888).expect("Abgr8888 offscreen");
+
+    for _ in 0..8 {
+        let fb = vk.bind(&mut texture).expect("bind");
+        let mapping = vk
+            .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Xrgb8888)
+            .expect("converting copy_framebuffer");
+        let _ = vk.map_texture(&mapping).expect("map_texture");
+    }
+
+    assert_eq!(
+        vk.readback_staging_allocs(),
+        1,
+        "a converting readback of one size must allocate its staging image once, not per call \
+         (this is what aborts Venus)",
     );
 }

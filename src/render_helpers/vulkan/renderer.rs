@@ -111,6 +111,23 @@ pub struct VulkanRenderer {
     /// `vulkan_alternating_present_blit_sizes_reuse_shadows`.
     #[cfg(test)]
     present_blit_shadow_allocs: usize,
+    /// Staging images for a **converting** readback: when a caller wants bytes in an order the
+    /// source image doesn't hold (an `Xrgb8888` shm pool read off an `R8G8B8A8` offscreen), we
+    /// blit through one of these — `vkCmdBlitImage` reorders the channels on the GPU, so no
+    /// CPU swizzle.
+    ///
+    /// Cached for the same reason the present-blit shadows are: shm screencopy can fire every
+    /// frame, and allocating a `VkImage` per frame exhausts the Venus blob pool and aborts the
+    /// session. Keyed by size **and** format; LRU-evicted under [`MAX_READBACK_STAGING`]. Reuse
+    /// and eviction are safe because rendering is synchronous.
+    readback_staging: HashMap<(u32, u32, i32), StagingEntry>,
+    /// Monotonic tick for [`Self::readback_staging`]'s LRU, bumped once per lookup.
+    staging_clock: u64,
+    /// Count of readback staging images actually allocated (test-only): pins the no-churn
+    /// invariant, exactly as `present_blit_shadow_allocs` does — a cache *hit* is invisible to a
+    /// pixel assertion. See `vulkan_repeated_converting_readbacks_reuse_staging`.
+    #[cfg(test)]
+    readback_staging_allocs: usize,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
     /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
     /// creates a host-side resource, so re-importing per frame churns those resources until the
@@ -162,9 +179,20 @@ pub struct VulkanRenderer {
 /// device image. See [`VulkanRenderer::present_blit_shadows`].
 const MAX_PRESENT_BLIT_SHADOWS: usize = 8;
 
+/// Cap on cached readback staging images. Only a couple of sizes are ever live (the output size for
+/// screencopy, and the small cursor bitmap), so this is generous. See
+/// [`VulkanRenderer::readback_staging`].
+const MAX_READBACK_STAGING: usize = 4;
+
 /// A cached present-blit shadow plus the tick it was last used on (for LRU eviction).
 #[derive(Debug)]
 struct ShadowEntry {
+    texture: VkTexture,
+    last_used: u64,
+}
+
+/// A cached readback staging image. See [`VulkanRenderer::readback_staging`].
+struct StagingEntry {
     texture: VkTexture,
     last_used: u64,
 }
@@ -326,8 +354,12 @@ impl VulkanRenderer {
             debug_flags: DebugFlags::empty(),
             present_blit_shadows: HashMap::new(),
             shadow_clock: 0,
+            readback_staging: HashMap::new(),
+            staging_clock: 0,
             #[cfg(test)]
             present_blit_shadow_allocs: 0,
+            #[cfg(test)]
+            readback_staging_allocs: 0,
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
             pending_dmabuf_acquires: Vec::new(),
@@ -599,10 +631,17 @@ impl VulkanRenderer {
         Ok(tex)
     }
 
-    /// Copy a `w×h` region of `tex`'s image into a host `Vec<u8>` of tight RGBA8. Used by
+    /// Copy a `w×h` region of `tex`'s image into a tight host `Vec<u8>`, 4 bytes per pixel. Used by
     /// [`ExportMem::copy_framebuffer`]. Transitions the image to `TRANSFER_SRC_OPTIMAL` first if
     /// the tracked layout says it is elsewhere (e.g. `SHADER_READ_ONLY_OPTIMAL` after it was
     /// sampled).
+    ///
+    /// The bytes come back in `tex`'s own channel order — unless `via` is given, in which case the
+    /// region is first blitted into that staging image and copied out of *it*. Blitting between
+    /// images of different formats performs a format conversion (Vulkan spec, "Image Copies with
+    /// Scaling"), so an `R8G8B8A8` source through a `B8G8R8A8` staging image yields BGRA bytes with
+    /// no CPU pass over the pixels. Same-size, `NEAREST`: an exact copy, and it needs no linear
+    /// filter support.
     fn download_region(
         &self,
         tex: &VkTexture,
@@ -610,6 +649,7 @@ impl VulkanRenderer {
         y: i32,
         w: u32,
         h: u32,
+        via: Option<&VkTexture>,
     ) -> Result<Vec<u8>, VulkanError> {
         let dev = &self.gpu.device;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
@@ -628,6 +668,13 @@ impl VulkanRenderer {
         )?;
         unsafe { dev.bind_buffer_memory(buffer, mem, 0) }?;
 
+        // Without a staging image we copy straight out of `tex` at the region's origin; with one we
+        // blit the region into it first and then copy the whole staging image from its origin.
+        let (copy_from, copy_x, copy_y) = match via {
+            None => (image, x, y),
+            Some(staging) => (staging.image(), 0, 0),
+        };
+
         self.gpu.run_commands(self.command_pool, |cbuf| unsafe {
             if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                 transition_image(
@@ -640,6 +687,64 @@ impl VulkanRenderer {
                     vk::PipelineStageFlags::TRANSFER,
                 );
             }
+
+            if let Some(staging) = via {
+                transition_image(
+                    dev,
+                    cbuf,
+                    staging.image(),
+                    staging.layout(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+
+                let layers = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .src_offsets([
+                        vk::Offset3D { x, y, z: 0 },
+                        vk::Offset3D {
+                            x: x + w as i32,
+                            y: y + h as i32,
+                            z: 1,
+                        },
+                    ])
+                    .dst_subresource(layers)
+                    .dst_offsets([
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D {
+                            x: w as i32,
+                            y: h as i32,
+                            z: 1,
+                        },
+                    ]);
+                dev.cmd_blit_image(
+                    cbuf,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging.image(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::NEAREST,
+                );
+
+                transition_image(
+                    dev,
+                    cbuf,
+                    staging.image(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+            }
+
             let region = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -647,7 +752,11 @@ impl VulkanRenderer {
                     base_array_layer: 0,
                     layer_count: 1,
                 })
-                .image_offset(vk::Offset3D { x, y, z: 0 })
+                .image_offset(vk::Offset3D {
+                    x: copy_x,
+                    y: copy_y,
+                    z: 0,
+                })
                 .image_extent(vk::Extent3D {
                     width: w,
                     height: h,
@@ -655,7 +764,7 @@ impl VulkanRenderer {
                 });
             dev.cmd_copy_image_to_buffer(
                 cbuf,
-                image,
+                copy_from,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 buffer,
                 &[region],
@@ -674,6 +783,9 @@ impl VulkanRenderer {
             );
         })?;
         tex.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        if let Some(staging) = via {
+            staging.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        }
 
         let mut pixels = vec![0u8; size as usize];
         unsafe {
@@ -1081,6 +1193,60 @@ impl VulkanRenderer {
     /// (`finish` CPU-waits), so no shadow is read or written by two frames at once — including
     /// the shadow two *different* consumers of the same size share. See
     /// [`Self::present_blit_shadows`].
+    /// The cached staging image for a converting readback of `w`×`h` into `want`'s byte order,
+    /// allocating on a miss and LRU-evicting to stay under [`MAX_READBACK_STAGING`].
+    fn readback_staging_for(
+        &mut self,
+        w: u32,
+        h: u32,
+        want: Fourcc,
+    ) -> Result<VkTexture, VulkanError> {
+        let (format, _ignores_alpha) =
+            import_format(want).ok_or(VulkanError::UnsupportedFormat(want))?;
+
+        self.staging_clock += 1;
+        let now = self.staging_clock;
+        let key = (w, h, format.as_raw());
+
+        if let Some(entry) = self.readback_staging.get_mut(&key) {
+            entry.last_used = now;
+            return Ok(entry.texture.clone());
+        }
+
+        // Transfer-only: never rendered into, never sampled. `new_present_target` is the VkTexture
+        // shape with no framebuffer and no descriptor set, which is exactly that.
+        let tex = NiriTexture::new_transfer_image(&self.gpu, w, h, format)?;
+        let staging = VkTexture::new_present_target(self.gpu.clone(), tex, w, h, want);
+        #[cfg(test)]
+        {
+            self.readback_staging_allocs += 1;
+        }
+
+        // Same reasoning as the present-blit shadows: evicting a size that is read back every frame
+        // would reallocate it every frame, which is the Venus blob churn this cache prevents. If
+        // this logs steadily, the cap is too low.
+        if self.readback_staging.len() >= MAX_READBACK_STAGING {
+            if let Some(&lru) = self
+                .readback_staging
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key)
+            {
+                debug!("evicting readback staging image {}x{}", lru.0, lru.1);
+                self.readback_staging.remove(&lru);
+            }
+        }
+
+        self.readback_staging.insert(
+            key,
+            StagingEntry {
+                texture: staging.clone(),
+                last_used: now,
+            },
+        );
+        Ok(staging)
+    }
+
     fn present_blit_shadow_for(
         &mut self,
         w: u32,
@@ -1145,6 +1311,11 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn present_blit_shadow_allocs(&self) -> usize {
         self.present_blit_shadow_allocs
+    }
+
+    #[cfg(test)]
+    pub(super) fn readback_staging_allocs(&self) -> usize {
+        self.readback_staging_allocs
     }
 
     fn dmabuf_framebuffer(
@@ -1328,17 +1499,29 @@ impl ExportMem for VulkanRenderer {
         format: Fourcc,
     ) -> Result<VkMapping, VulkanError> {
         // Any 32-bpp 8888 order — RGBA (Abgr/Xbgr) for the offscreen/direct path, BGRA (Argb/Xrgb)
-        // for a present-blit scanout buffer. `download_region` copies raw bytes, so they come back
-        // in the source's own order; `format` labels that order for the caller.
+        // for a present-blit scanout buffer, or for a BGRA consumer reading an RGBA frame back.
         if import_format(format).is_none() {
             return Err(VulkanError::UnsupportedFormat(format));
         }
+
         // On the present-blit path the bytes actually scanned out live in the dmabuf (`present`),
         // not the R8G8B8A8 shadow — read the real target.
         let source = target.present.as_ref().unwrap_or(&target.buffer);
         let w = region.size.w.max(0) as u32;
         let h = region.size.h.max(0) as u32;
-        let data = self.download_region(source, region.loc.x, region.loc.y, w, h)?;
+
+        // `download_region` copies raw bytes, so they arrive in the *source image's* order. If the
+        // caller wants the other order, blit through a staging image of that format on the way out
+        // and let the GPU reorder the channels — no CPU pass over the pixels. (Reading the source's
+        // own order is the common case and stays a plain copy.)
+        let source_order = source.format().map(is_rgba8888);
+        let want_order = is_rgba8888(format);
+        let via = match source_order {
+            Some(order) if order != want_order => Some(self.readback_staging_for(w, h, format)?),
+            _ => None,
+        };
+
+        let data = self.download_region(source, region.loc.x, region.loc.y, w, h, via.as_ref())?;
         Ok(VkMapping {
             data,
             width: w,

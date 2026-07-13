@@ -206,6 +206,63 @@ impl Texture {
         )
     }
 
+    /// A blank transfer-only image in an arbitrary `format`: `TRANSFER_DST | TRANSFER_SRC`,
+    /// device-local, `OPTIMAL` tiling, and **no view or sampler** (it is never rendered into nor
+    /// sampled — only blitted into and copied out of).
+    ///
+    /// This is the readback conversion staging image: blit an `R8G8B8A8` frame into a `B8G8R8A8`
+    /// one and `vkCmdBlitImage` reorders the channels for us, so a BGRA consumer (an `Xrgb8888` shm
+    /// pool, say) needs no CPU swizzle. `OPTIMAL` tiling matters: the spec's
+    /// required-format-support tables mandate `BLIT_SRC | BLIT_DST` for both formats there, so
+    /// the blit is guaranteed on any conformant driver rather than resting on what Venus
+    /// happens to allow.
+    ///
+    /// `Texture::destroy` runs `vkDestroySampler`/`vkDestroyImageView` on the null handles, which
+    /// is a defined no-op.
+    pub fn new_transfer_image(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<Self> {
+        let device = &gpu.device;
+
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let mut guard = TextureGuard::new(device);
+        let image =
+            unsafe { device.create_image(&image_ci, None) }.context("transfer-image image")?;
+        guard.image = image;
+        let ireq = unsafe { device.get_image_memory_requirements(image) };
+        let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        guard.memory = memory;
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        guard.disarm();
+        Ok(Self {
+            image,
+            view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+            memory,
+            width,
+            height,
+        })
+    }
+
     /// Create a blank `width*height` color target that is **both** renderable and sampleable: a
     /// device-local `COLOR_ATTACHMENT | SAMPLED | TRANSFER_SRC` image plus a view and sampler, with
     /// no upload. The image is left in `UNDEFINED` layout — the caller's render pass performs the
