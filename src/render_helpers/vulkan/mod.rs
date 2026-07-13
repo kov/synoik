@@ -29,7 +29,7 @@ pub(crate) use backdrop_blur::BackdropBlur;
 pub(crate) use custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
 pub(crate) use effect_blur::EffectBlur;
 pub use error::VulkanError;
-pub(crate) use frame::ClipParams;
 pub use frame::VulkanFrame;
+pub(crate) use frame::{pack_mat3, ClipParams};
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub use types::{VkMapping, VkTexture};

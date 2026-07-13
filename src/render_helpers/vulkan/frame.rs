@@ -1447,7 +1447,7 @@ fn ndc_transform(transform: Transform) -> [f32; 4] {
 }
 
 /// Pack a `glam::Mat3` into 3 `vec4` columns (`.xyz` used, `w = 0`) for a `mat3` push field.
-fn pack_mat3(m: Mat3) -> [[f32; 4]; 3] {
+pub(crate) fn pack_mat3(m: Mat3) -> [[f32; 4]; 3] {
     let col = |v: Vec3| [v.x, v.y, v.z, 0.0];
     [col(m.x_axis), col(m.y_axis), col(m.z_axis)]
 }

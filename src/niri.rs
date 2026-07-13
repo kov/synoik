@@ -4587,11 +4587,15 @@ impl Niri {
             }
         }
 
-        // Xray background/backdrop capture is a GLES-only path for now; on the owned Vulkan
-        // renderer this degrades to empty xray buffers (windows referencing xray sample nothing
-        // rather than panicking). Guard here because `as_gles()` panics on evaluation.
+        // Fill the xray background/backdrop capture buffers through whichever renderer is active:
+        // GLES fills the GLES arm, the owned Vulkan renderer fills its own arm (the two are
+        // mutually exclusive — each `try_as_*` returns `Some` for exactly one renderer).
         if let Some(gles_ctx) = ctx.try_as_gles() {
             self.fill_xray_elements(gles_ctx, output);
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(vk_ctx) = ctx.try_as_vulkan() {
+            self.fill_xray_elements_vulkan(vk_ctx, output);
         }
 
         // Reborrow to shorten lifetime to be able to put in xray.
@@ -4963,6 +4967,60 @@ impl Niri {
         }
     }
 
+    /// The owned-Vulkan-renderer dual of [`Self::fill_xray_elements`]: fills the same per-target
+    /// background/backdrop [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s,
+    /// but through the Vulkan arm (`elements_vulkan`). `render_layer_normal` is already generic
+    /// over the renderer, so only the element storage differs.
+    #[cfg(feature = "vulkan")]
+    pub fn fill_xray_elements_vulkan(
+        &self,
+        mut ctx: RenderCtx<crate::render_helpers::vulkan::VulkanRenderer>,
+        output: &Output,
+    ) {
+        let _span = tracy_client::span!("Niri::fill_xray_elements_vulkan");
+
+        // Make sure the xrayed elements themselves cannot use xray by mistake.
+        ctx.xray = None;
+
+        let state = self.output_state.get(output).unwrap();
+        let xray = &state.xray;
+        let layer_map = layer_map_for_output(output);
+
+        let mut buffer = xray.background[ctx.target as usize].borrow_mut();
+        {
+            let elements = buffer.elements_vulkan();
+            elements.clear();
+            self.render_layer_normal(
+                ctx.r(),
+                None,
+                &layer_map,
+                Layer::Background,
+                XrayPos::default(),
+                false,
+                &mut |elem| elements.push(elem.into()),
+            );
+            // Avoid unused capacity remaining forever.
+            elements.shrink_to_fit();
+        }
+
+        let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
+        {
+            let elements = buffer.elements_vulkan();
+            elements.clear();
+            self.render_layer_normal(
+                ctx.r(),
+                None,
+                &layer_map,
+                Layer::Background,
+                XrayPos::default(),
+                true,
+                &mut |elem| elements.push(elem.into()),
+            );
+            // Avoid unused capacity remaining forever.
+            elements.shrink_to_fit();
+        }
+    }
+
     pub fn clear_xray_elements(&self, output: &Output) {
         let state = self.output_state.get(output).unwrap();
         let xray = &state.xray;
@@ -4974,6 +5032,15 @@ impl Niri {
         }
         for buf in &xray.backdrop {
             buf.borrow_mut().elements().clear();
+        }
+        // The owned Vulkan renderer's arm has its own element storage — clear it too.
+        #[cfg(feature = "vulkan")]
+        for buf in &xray.background {
+            buf.borrow_mut().elements_vulkan().clear();
+        }
+        #[cfg(feature = "vulkan")]
+        for buf in &xray.backdrop {
+            buf.borrow_mut().elements_vulkan().clear();
         }
     }
 

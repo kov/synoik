@@ -833,32 +833,28 @@ impl LayoutElement for Mapped {
                 effect.xray = Some(false);
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
-            // The background effect (blur behind the popup) is GLES-only; skip it on the owned
-            // Vulkan renderer (the popup surface itself is already pushed above).
-            if let Some(ctx) = ctx.try_as_gles() {
-                background_effect::render_for_tile(
-                    ctx,
-                    None,
-                    geometry,
-                    scale.x,
-                    false,
-                    surface,
-                    surface_off,
-                    surface_anim_scale,
-                    self.blur_config,
-                    popup_rules.geometry_corner_radius.unwrap_or_default(),
-                    effect,
-                    false,
-                    xray_pos,
-                    &mut |elem| push(elem.into()),
-                );
-            }
+            background_effect::render_for_tile(
+                ctx.r(),
+                None,
+                geometry,
+                scale.x,
+                false,
+                surface,
+                surface_off,
+                surface_anim_scale,
+                self.blur_config,
+                popup_rules.geometry_corner_radius.unwrap_or_default(),
+                effect,
+                false,
+                xray_pos,
+                &mut |elem| push(elem.into()),
+            );
         }
     }
 
-    fn render_background_effect(
+    fn render_background_effect<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,

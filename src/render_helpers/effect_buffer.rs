@@ -594,18 +594,21 @@ impl EffectBuffer {
         Ok(())
     }
 
-    /// The texture the effect element should sample: the blurred output when `blur` is on and
-    /// valid, otherwise the raw offscreen. `None` before the first successful
-    /// [`Self::prepare_vulkan`].
+    /// The texture the effect element should sample: the blurred output when `blur` is requested,
+    /// else the raw offscreen. `None` before the first successful [`Self::prepare_vulkan`] — and,
+    /// when `blur` is requested, also `None` if the blurred output is not valid. We deliberately do
+    /// NOT fall back to the unblurred offscreen there: `prepare_vulkan` runs the blur eagerly, so a
+    /// missing/invalid blur means prepare failed and the caller should draw nothing rather than
+    /// silently sample an unblurred texture that would diverge from the GLES oracle.
     #[cfg(feature = "vulkan")]
     pub fn texture_vulkan(&self, blur: bool) -> Option<VkTexture> {
         let offscreen = self.offscreen_vk.as_ref()?;
         if blur {
-            if let Some(b) = &offscreen.blur {
-                if b.is_valid() {
-                    return Some(b.output().clone());
-                }
-            }
+            return offscreen
+                .blur
+                .as_ref()
+                .filter(|b| b.is_valid())
+                .map(|b| b.output().clone());
         }
         Some(offscreen.texture.clone())
     }

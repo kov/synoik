@@ -1432,22 +1432,19 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         let surface_anim_scale = animated_window_size / window_size;
-        // Background effects (blur behind the window) are a GLES-only path for now; on the owned
-        // Vulkan renderer this degrades to nothing (the window's own surface is drawn above,
-        // unaffected). Guarding here rather than inside `render_background_effect` because
-        // `as_gles()` panics when its argument is evaluated, before the callee can no-op.
-        if let Some(gles_ctx) = ctx.try_as_gles() {
-            self.window.render_background_effect(
-                gles_ctx,
-                area,
-                self.scale,
-                clip_to_geometry,
-                surface_anim_scale,
-                radius,
-                xray_pos,
-                &mut |elem| push(elem.into()),
-            );
-        }
+        // Background effects (blur/xray behind the window) now render on both the GLES and the
+        // owned Vulkan renderer — `render_background_effect` dispatches the effect buffer's
+        // prepare per renderer (see `xray::prepare_effect_buffer`).
+        self.window.render_background_effect(
+            ctx.r(),
+            area,
+            self.scale,
+            clip_to_geometry,
+            surface_anim_scale,
+            radius,
+            xray_pos,
+            &mut |elem| push(elem.into()),
+        );
     }
 
     pub fn render<R: NiriRenderer>(

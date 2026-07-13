@@ -2842,6 +2842,201 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
     );
 }
 
+/// Phase-C slice-5 commit-2: the ported `XrayElement` Vulkan draw against the GLES oracle. This
+/// targets the coordinate-fold trap — GLES feeds `input_to_geo` the full-buffer UV (its `v_coords`
+/// maps the quad to `src` within the texture), while the Vulkan `postprocess.frag` feeds it
+/// quad-local `v_uv` + a separate `src_rect`, so the Vulkan draw must re-base `input_to_clip_geo`
+/// onto `v_uv` using the SAME draw-time `src`. We build a GLES and a Vulkan `XrayElement` sharing
+/// identical geometry / **cropped src (right half)** / identity `input_to_clip_geo` / nonzero
+/// `corner_radius`, over identical red|green offscreen content, and compare the composited output:
+///   - the sampled content is the GREEN right half (proves the cropped `src` is honored: a full src
+///     would sample red on the left);
+///   - only the RIGHT corners are rounded (the geometry maps to `[0.5,1]×[0,1]`); the top-LEFT
+///     corner stays GREEN — this is the fold discriminator: dropping the fold would clip via raw
+///     `v_uv ∈ [0,1]` and round the left corners too, cutting the top-left to transparent.
+///
+/// GLES is the oracle; the two must agree at every probe. Offscreen-only, so it runs on lavapipe.
+#[test]
+fn vulkan_xray_matches_the_gles_oracle() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use glam::{Mat3, Vec2};
+    use niri_config::CornerRadius;
+    use smithay::backend::renderer::element::Kind;
+    use smithay::utils::Logical;
+
+    use crate::render_helpers::effect_buffer::EffectBuffer;
+    use crate::render_helpers::render_to_vec;
+    use crate::render_helpers::shaders::Shaders;
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+    use crate::render_helpers::xray::XrayElement;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_xray_matches_the_gles_oracle: no Vulkan");
+        return;
+    }
+
+    const S: i32 = 64;
+    const R: f32 = 16.0;
+    let size = Size::<i32, Physical>::from((S, S));
+    let scale = Scale::from(1.0);
+
+    // Shared element parameters (identical for both renderers). Identity input_to_clip_geo + a
+    // right-half `src` crop: the fold must map v_uv → [0.5,1]×[0,1] geo, so only the right corners
+    // round. `clip_geo_size` is the geometry size in the rounding coordinate space.
+    let geometry = Rectangle::<f64, Logical>::from_size(Size::from((S as f64, S as f64)));
+    let src = Rectangle::<f64, BufferCoord>::new(
+        (S as f64 / 2.0, 0.0).into(),
+        (S as f64 / 2.0, S as f64).into(),
+    );
+    let i2g = Mat3::IDENTITY;
+    let clip_geo_size = Vec2::new(S as f32, S as f32);
+    let corner_radius = CornerRadius::from(R);
+    let bg = Color32F::TRANSPARENT;
+
+    // Left-red / right-green content for the effect buffer, as this renderer's element type.
+    fn build_edge<E: From<SolidColorRenderElement>>() -> Vec<E> {
+        let red = SolidColorBuffer::new(Size::from((S as f64 / 2.0, S as f64)), [1., 0., 0., 1.]);
+        let green = SolidColorBuffer::new(Size::from((S as f64 / 2.0, S as f64)), [0., 1., 0., 1.]);
+        vec![
+            SolidColorRenderElement::from_buffer(&red, (0., 0.), 1., Kind::Unspecified).into(),
+            SolidColorRenderElement::from_buffer(
+                &green,
+                (S as f64 / 2., 0.),
+                1.,
+                Kind::Unspecified,
+            )
+            .into(),
+        ]
+    }
+
+    let state = f.niri_state();
+
+    // GLES oracle.
+    let gles = state
+        .backend
+        .headless()
+        .with_primary_renderer(|g| {
+            let buffer = Rc::new(RefCell::new(EffectBuffer::new()));
+            {
+                let mut b = buffer.borrow_mut();
+                b.update_size(size, scale);
+                let elements = b.elements();
+                elements.clear();
+                elements.extend(build_edge());
+            }
+            buffer.borrow_mut().prepare(g, false);
+            let program = Shaders::get(g).and_then(|s| s.postprocess_and_clip.clone());
+            let elem = XrayElement::new_for_test(
+                buffer.clone(),
+                geometry,
+                src,
+                i2g,
+                clip_geo_size,
+                corner_radius,
+                scale.x as f32,
+                false,
+                bg,
+                program,
+            );
+            render_to_vec(
+                g,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                [elem].into_iter(),
+            )
+        })
+        .expect("GLES renderer present")
+        .expect("GLES xray render");
+
+    // Vulkan (program = None → draws through render_postprocess).
+    let vk = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|v| {
+            let buffer = Rc::new(RefCell::new(EffectBuffer::new()));
+            {
+                let mut b = buffer.borrow_mut();
+                b.update_size(size, scale);
+                let elements = b.elements_vulkan();
+                elements.clear();
+                elements.extend(build_edge());
+            }
+            buffer.borrow_mut().prepare_vulkan(v, false);
+            let elem = XrayElement::new_for_test(
+                buffer.clone(),
+                geometry,
+                src,
+                i2g,
+                clip_geo_size,
+                corner_radius,
+                scale.x as f32,
+                false,
+                bg,
+                None,
+            );
+            render_to_vec(
+                v,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                [elem].into_iter(),
+            )
+        })
+        .expect("Vulkan renderer present")
+        .expect("Vulkan xray render");
+
+    let green = |p: [u8; 4]| p[1] > 200 && p[0] < 60 && p[3] > 200;
+    let clipped = |p: [u8; 4]| p[3] < 60;
+
+    // Probes: center (green), top-left corner (green — the fold discriminator), top-right corner
+    // (clipped — confirms the right corner IS rounded, so the clip is active, not a no-op).
+    let probes = [
+        ("center", S / 2, S / 2, true),
+        ("top-left", 2, 2, true),
+        ("top-right", S - 3, 2, false),
+    ];
+    for (name, x, y, want_green) in probes {
+        let gp = px(&gles, S, x, y);
+        let vp = px(&vk, S, x, y);
+        assert_eq!(
+            green(gp),
+            green(vp),
+            "{name} ({x},{y}): green mismatch gles={gp:?} vk={vp:?}"
+        );
+        if want_green {
+            assert!(green(gp), "{name} ({x},{y}) should be green, gles={gp:?}");
+            assert!(green(vp), "{name} ({x},{y}) should be green, vk={vp:?}");
+        } else {
+            assert!(
+                clipped(gp),
+                "{name} ({x},{y}) should be clipped, gles={gp:?}"
+            );
+            assert!(clipped(vp), "{name} ({x},{y}) should be clipped, vk={vp:?}");
+        }
+    }
+
+    // No red anywhere: the cropped `src` sampled only the green right half on both renderers.
+    for (label, buf) in [("gles", &gles), ("vk", &vk)] {
+        let red = (0..S * S)
+            .filter(|i| {
+                let p = px(buf, S, i % S, i / S);
+                p[0] > 120 && p[1] < 80 && p[3] > 120
+            })
+            .count();
+        assert_eq!(red, 0, "{label}: cropped src leaked red (count {red})");
+    }
+
+    eprintln!("vulkan_xray_matches_the_gles_oracle: ok (fold + cropped src match the GLES oracle)");
+}
+
 /// A blur-off, saturation-1, noise-0, unclipped framebuffer effect over the *whole* output is a
 /// no-op: it captures the backdrop and redraws it unchanged. That invariant must hold under **any**
 /// output transform — the capture blit grabs the scene in physical orientation, so the postprocess

@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
@@ -11,6 +10,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
+use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -148,9 +148,9 @@ impl BackgroundEffect {
         self.options.is_visible()
     }
 
-    pub fn render(
+    pub fn render<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -281,8 +281,8 @@ pub fn damage_surface(states: &SurfaceData) {
 // Silence, Clippy
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
-pub fn render_for_tile(
-    ctx: RenderCtx<GlesRenderer>,
+pub fn render_for_tile<R: NiriRenderer>(
+    ctx: RenderCtx<R>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,

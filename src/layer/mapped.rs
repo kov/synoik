@@ -237,26 +237,24 @@ impl MappedLayer {
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
-        // The background effect (blur behind the layer surface) is GLES-only; skip it on the owned
-        // Vulkan renderer (the surface itself is already pushed above).
-        if let Some(ctx) = ctx.try_as_gles() {
-            background_effect::render_for_tile(
-                ctx,
-                ns,
-                geometry,
-                self.scale,
-                false,
-                surface,
-                surface_off,
-                surface_anim_scale,
-                self.blur_config,
-                radius,
-                self.rules.background_effect,
-                should_block_out,
-                xray_pos,
-                &mut |elem| push(elem.into()),
-            );
-        }
+        // Background effect (blur/xray behind the layer surface) — renders on the GLES and the
+        // owned Vulkan renderer alike (`render_for_tile` dispatches the prepare per renderer).
+        background_effect::render_for_tile(
+            ctx.r(),
+            ns,
+            geometry,
+            self.scale,
+            false,
+            surface,
+            surface_off,
+            surface_anim_scale,
+            self.blur_config,
+            radius,
+            self.rules.background_effect,
+            should_block_out,
+            xray_pos,
+            &mut |elem| push(elem.into()),
+        );
     }
 
     pub fn render_popups<R: NiriRenderer>(
@@ -310,25 +308,22 @@ impl MappedLayer {
                 effect.xray = Some(false);
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
-            // GLES-only background effect; skip on the owned Vulkan renderer.
-            if let Some(ctx) = ctx.try_as_gles() {
-                background_effect::render_for_tile(
-                    ctx,
-                    ns,
-                    geometry,
-                    self.scale,
-                    false,
-                    surface,
-                    surface_off,
-                    surface_anim_scale,
-                    self.blur_config,
-                    popup_rules.geometry_corner_radius.unwrap_or_default(),
-                    effect,
-                    false,
-                    xray_pos,
-                    &mut |elem| push(elem.into()),
-                );
-            }
+            background_effect::render_for_tile(
+                ctx.r(),
+                ns,
+                geometry,
+                self.scale,
+                false,
+                surface,
+                surface_off,
+                surface_anim_scale,
+                self.blur_config,
+                popup_rules.geometry_corner_radius.unwrap_or_default(),
+                effect,
+                false,
+                xray_pos,
+                &mut |elem| push(elem.into()),
+            );
         }
     }
 }

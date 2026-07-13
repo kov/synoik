@@ -17,7 +17,6 @@ use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
-use crate::render_helpers::xray::XrayElement;
 
 /// Emit a degraded (no-op) `RenderElement<VulkanRenderer>` impl for a niri effect element.
 macro_rules! degraded_vulkan_element {
@@ -68,7 +67,7 @@ degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
 // pipeline) in clipped_surface.rs.
 degraded_vulkan_element!(GradientFadeTextureRenderElement<GlesTexture>);
 // ResizeRenderElement has a real Vulkan draw (render_resize) in render_helpers/resize.rs.
-degraded_vulkan_element!(XrayElement);
+// XrayElement has a real Vulkan draw (offscreen sample + blur + postprocess-and-clip) in xray.rs.
 degraded_vulkan_element!(ShaderRenderElement);
 // FramebufferEffectElement has a real Vulkan draw (backdrop capture + blur + postprocess) in
 // framebuffer_effect.rs.

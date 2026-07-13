@@ -4,20 +4,26 @@ use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
+#[cfg(feature = "vulkan")]
+use niri_vk::render::PostprocessPush;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
+#[cfg(feature = "vulkan")]
+use smithay::backend::renderer::Texture as _;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::{pack_mat3, VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
 
@@ -83,6 +89,37 @@ pub struct XrayElement {
     program: Option<GlesTexProgram>,
 }
 
+/// Prepare an [`EffectBuffer`] through whichever renderer `ctx` wraps — the owned Vulkan renderer's
+/// arm when present, else the GLES arm (a `TtyRenderer` resolves to GLES). Returns whether the
+/// offscreen is ready to be sampled by the pushed [`XrayElement`]s.
+#[cfg(feature = "vulkan")]
+fn prepare_effect_buffer<R: NiriRenderer>(
+    renderer: &mut R,
+    buffer: &mut EffectBuffer,
+    blur: bool,
+) -> bool {
+    if let Some(vk) = renderer.try_as_vulkan_renderer() {
+        buffer.prepare_vulkan(vk, blur)
+    } else if let Some(gles) = renderer.try_as_gles_renderer() {
+        buffer.prepare(gles, blur)
+    } else {
+        false
+    }
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn prepare_effect_buffer<R: NiriRenderer>(
+    renderer: &mut R,
+    buffer: &mut EffectBuffer,
+    blur: bool,
+) -> bool {
+    if let Some(gles) = renderer.try_as_gles_renderer() {
+        buffer.prepare(gles, blur)
+    } else {
+        false
+    }
+}
+
 impl Xray {
     pub fn new() -> Self {
         Self {
@@ -94,9 +131,9 @@ impl Xray {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<R>,
         params: RenderParams,
         xray_pos: XrayPos,
         blur: bool,
@@ -104,10 +141,9 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        let program = Shaders::get(ctx.renderer)
-            .expect("a GlesRenderer is always GLES-backed")
-            .postprocess_and_clip
-            .clone();
+        // The GLES postprocess-and-clip program (`None` on the owned Vulkan renderer, which draws
+        // through `render_postprocess` instead — see the `RenderElement<VulkanRenderer>` impl).
+        let program = Shaders::get(ctx.renderer).and_then(|s| s.postprocess_and_clip.clone());
 
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);
@@ -129,7 +165,7 @@ impl Xray {
 
         let mut background = self.background[ctx.target as usize].borrow_mut();
         let prev = background.commit();
-        if background.prepare(ctx.renderer, blur) {
+        if prepare_effect_buffer(ctx.renderer, &mut background, blur) {
             if background.commit() != prev {
                 trace!("background damaged");
             }
@@ -216,7 +252,7 @@ impl Xray {
         }
 
         let prev = backdrop.commit();
-        if backdrop.prepare(ctx.renderer, blur) {
+        if prepare_effect_buffer(ctx.renderer, &mut backdrop, blur) {
             if backdrop.commit() != prev {
                 trace!("backdrop damaged");
             }
@@ -273,6 +309,80 @@ impl XrayElement {
             Uniform::new("bg_color", self.bg_color.components()),
         ]
     }
+
+    /// Filter `damage` by the effect subregion (the surface blur-region protocol), identically for
+    /// both renderers. Returns the damage to draw, or `None` when the subregion clips it all away
+    /// (the caller's `draw` early-returns).
+    fn filter_subregion_damage<'a>(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &'a [Rectangle<i32, Physical>],
+        scratch: &'a mut Vec<Rectangle<i32, Physical>>,
+    ) -> Option<&'a [Rectangle<i32, Physical>]> {
+        let Some(subregion) = &self.subregion else {
+            return Some(damage);
+        };
+
+        let src_to_geo = self.geometry.size / self.src.size;
+
+        // Compute crop in geometry coordinates.
+        let mut crop = src;
+        crop.loc -= self.src.loc;
+        crop = crop.upscale(src_to_geo);
+        let mut crop = crop.to_logical(1., Transform::Normal, &Size::default());
+
+        // Then convert to subregion coordinates.
+        crop.loc += self.geometry.loc;
+
+        subregion.filter_damage(crop, dst, damage, scratch);
+
+        if scratch.is_empty() {
+            None
+        } else {
+            Some(&scratch[..])
+        }
+    }
+}
+
+// Only the Vulkan xray oracle test uses this; gate it so the default test build doesn't flag it as
+// dead code.
+#[cfg(all(test, feature = "vulkan"))]
+impl XrayElement {
+    /// Construct an `XrayElement` directly for oracle tests (bypassing `Xray::render`'s scene
+    /// math), so a GLES element and a Vulkan element can share identical geometry/src/matrices
+    /// and be compared. `program` is the GLES postprocess-and-clip program (`None` on Vulkan).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test(
+        buffer: Rc<RefCell<EffectBuffer>>,
+        geometry: Rectangle<f64, Logical>,
+        src: Rectangle<f64, Buffer>,
+        input_to_clip_geo: Mat3,
+        clip_geo_size: Vec2,
+        corner_radius: CornerRadius,
+        scale: f32,
+        blur: bool,
+        bg_color: Color32F,
+        program: Option<GlesTexProgram>,
+    ) -> Self {
+        let id = buffer.borrow().id().clone();
+        Self {
+            buffer,
+            id,
+            geometry,
+            src,
+            subregion: None,
+            input_to_clip_geo,
+            clip_geo_size,
+            corner_radius,
+            scale,
+            blur,
+            noise: 0.,
+            saturation: 1.,
+            bg_color,
+            program,
+        }
+    }
 }
 
 impl Element for XrayElement {
@@ -320,26 +430,9 @@ impl RenderElement<GlesRenderer> for XrayElement {
 
         // FIXME: avoid reallocating a fresh Vec here somehow.
         let mut filtered_damage = Vec::new();
-        let damage = if let Some(subregion) = &self.subregion {
-            let src_to_geo = self.geometry.size / self.src.size;
-
-            // Compute crop in geometry coordinates.
-            let mut crop = src;
-            crop.loc -= self.src.loc;
-            crop = crop.upscale(src_to_geo);
-            let mut crop = crop.to_logical(1., Transform::Normal, &Size::default());
-
-            // Then convert to subregion coordinates.
-            crop.loc += self.geometry.loc;
-
-            subregion.filter_damage(crop, dst, damage, &mut filtered_damage);
-
-            if filtered_damage.is_empty() {
-                return Ok(());
-            }
-            &filtered_damage[..]
-        } else {
-            damage
+        let Some(damage) = self.filter_subregion_damage(src, dst, damage, &mut filtered_damage)
+        else {
+            return Ok(());
         };
 
         let uniforms = self.program.is_some().then(|| self.compute_uniforms());
@@ -381,5 +474,73 @@ impl<'render> RenderElement<TtyRenderer<'render>> for XrayElement {
             cache,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl RenderElement<VulkanRenderer> for XrayElement {
+    fn draw(
+        &self,
+        frame: &mut VulkanFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        let buffer = self.buffer.borrow();
+
+        // Sample the offscreen prepared by `prepare_effect_buffer` (Vulkan arm). `None` means the
+        // buffer was never prepared on this renderer (e.g. a zero-size buffer, or a blur that
+        // failed to run) — nothing to draw. The clone is frame-scoped only (the frame
+        // retains it until `finish`); the element never caches it, so the next prepare
+        // keeps the offscreen texture uniquely referenced (else a per-frame recreate +
+        // blur-chain rebuild — Venus blob churn).
+        let Some(texture) = buffer.texture_vulkan(self.blur) else {
+            return Ok(());
+        };
+
+        let mut filtered_damage = Vec::new();
+        let Some(damage) = self.filter_subregion_damage(src, dst, damage, &mut filtered_damage)
+        else {
+            return Ok(());
+        };
+
+        // Trap: GLES feeds `input_to_geo` the full-buffer UV (its `v_coords` maps the quad to `src`
+        // within the texture), while the Vulkan `postprocess.frag` feeds it quad-local `v_uv` plus
+        // a separate `src_rect`. Re-base `input_to_clip_geo` onto `v_uv` using the SAME
+        // draw-time `src` that `render_postprocess` samples with, normalized by the texture
+        // extent exactly as `normalized_src` does, so the rounded clip mask lands on the
+        // sampled content.
+        let tex_size = texture.size();
+        let (tw, th) = (tex_size.w as f32, tex_size.h as f32);
+        let s0 = Vec2::new(src.loc.x as f32 / tw, src.loc.y as f32 / th);
+        let ss = Vec2::new(src.size.w as f32 / tw, src.size.h as f32 / th);
+        let input_to_geo =
+            self.input_to_clip_geo * Mat3::from_translation(s0) * Mat3::from_scale(ss);
+
+        let push = PostprocessPush {
+            // Placement fields (`origin`/`size`/`proj`/`target`/`src_rect`) are filled by
+            // `render_postprocess`.
+            origin: [0.0; 2],
+            size: [0.0; 2],
+            proj: [0.0; 4],
+            target: [0.0; 2],
+            src_rect: [0.0; 4],
+            geo_size: <[f32; 2]>::from(self.clip_geo_size),
+            corner_radius: <[f32; 4]>::from(self.corner_radius),
+            // Both shaders mix bg premultiplied: `color + bg * (1 - color.a)`, so the value passes
+            // through unchanged from the GLES `bg_color` uniform.
+            bg_color: self.bg_color.components(),
+            input_to_geo: pack_mat3(input_to_geo),
+            // The offscreen is Normal-oriented and unflipped, so sampling needs no re-orientation.
+            sample_transform: pack_mat3(Mat3::IDENTITY),
+            niri_scale: self.scale,
+            niri_alpha: 1.,
+            saturation: self.saturation,
+            noise: self.noise,
+        };
+
+        frame.render_postprocess(&texture, src, dst, damage, push)
     }
 }
