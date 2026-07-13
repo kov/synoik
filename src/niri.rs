@@ -5256,21 +5256,64 @@ impl Niri {
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
         self.send_frame_callbacks(output);
-        backend.with_primary_renderer(|renderer| {
-            #[cfg(feature = "xdp-gnome-screencast")]
-            {
-                // Render and send to PipeWire screencast streams.
-                self.render_for_screen_cast(renderer, output, target_presentation_time);
 
-                // FIXME: when a window is hidden, it should probably still receive frame callbacks
-                // and get rendered for screen cast. This is currently
-                // unimplemented, but happens to work by chance, since output
-                // redrawing is more eager than it should be.
-                self.render_windows_for_screen_cast(renderer, output, target_presentation_time);
+        #[cfg(feature = "vulkan")]
+        if backend.using_vulkan() {
+            let rendered = backend.with_vulkan_renderer(|renderer| {
+                self.render_captures_with(renderer, output, target_presentation_time);
+            });
+            if rendered.is_none() {
+                warn!("no Vulkan renderer to render screencast and screencopy with");
             }
+            return;
+        }
 
-            self.render_for_screencopy_with_damage(renderer, output);
+        backend.with_primary_renderer(|renderer| {
+            self.render_captures_with(renderer, output, target_presentation_time);
         });
+    }
+
+    /// Render this output for everything that captures it as a side effect of the redraw: PipeWire
+    /// screencast streams, and screencopy sessions that asked to be woken on damage.
+    ///
+    /// Generic over the renderer so a Vulkan session captures through the renderer that actually
+    /// drew the frame. Capturing through the co-resident GLES renderer instead would quietly
+    /// re-render the scene with a *different* renderer than the one on screen, so a stream could
+    /// disagree with the display.
+    // Two copies because the screencast arm needs an extra `CastRenderElement` bound, and `#[cfg]`
+    // is not allowed on a where-clause predicate.
+    #[cfg(feature = "xdp-gnome-screencast")]
+    fn render_captures_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+        &mut self,
+        renderer: &mut R,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) where
+        OutputRenderElements<R>: RenderElement<R>,
+        crate::screencasting::CastRenderElement<R>: RenderElement<R>,
+    {
+        // Render and send to PipeWire screencast streams.
+        self.render_for_screen_cast(renderer, output, target_presentation_time);
+
+        // FIXME: when a window is hidden, it should probably still receive frame callbacks
+        // and get rendered for screen cast. This is currently
+        // unimplemented, but happens to work by chance, since output
+        // redrawing is more eager than it should be.
+        self.render_windows_for_screen_cast(renderer, output, target_presentation_time);
+
+        self.render_for_screencopy_with_damage(renderer, output);
+    }
+
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    fn render_captures_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+        &mut self,
+        renderer: &mut R,
+        output: &Output,
+        _target_presentation_time: Duration,
+    ) where
+        OutputRenderElements<R>: RenderElement<R>,
+    {
+        self.render_for_screencopy_with_damage(renderer, output);
     }
 
     pub fn refresh_on_demand_vrr(&mut self, backend: &mut Backend, output: &Output) {

@@ -14,7 +14,7 @@ use smithay::backend::renderer::Offscreen;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{Physical, Point, Scale, Size};
+use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
@@ -23,7 +23,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
-use crate::window::mapped::{MappedId, WindowCastRenderElements};
+use crate::window::mapped::{Mapped, MappedId, WindowCastRenderElements};
 
 mod pw_utils;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
@@ -182,11 +182,22 @@ impl State {
 
         let id = match &cast.target {
             CastTarget::Nothing => {
-                self.backend.with_primary_renderer(|renderer| {
-                    if cast.dequeue_buffer_and_clear(renderer) {
-                        cast.last_frame_time = get_monotonic_time();
-                    }
-                });
+                #[cfg(feature = "vulkan")]
+                let cleared = if self.backend.using_vulkan() {
+                    self.backend
+                        .with_vulkan_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer))
+                } else {
+                    self.backend
+                        .with_primary_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer))
+                };
+                #[cfg(not(feature = "vulkan"))]
+                let cleared = self
+                    .backend
+                    .with_primary_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer));
+
+                if cleared == Some(true) {
+                    cast.last_frame_time = get_monotonic_time();
+                }
                 return;
             }
             CastTarget::Output { output, .. } => {
@@ -232,50 +243,27 @@ impl State {
                 }
             }
 
-            self.backend.with_primary_renderer(|renderer| {
-                let mut elements = Vec::new();
-                let mut pointer_location = Point::default();
-
-                if self.niri.pointer_visibility.is_visible() {
-                    if let Some((pointer_pos, win_pos)) =
-                        self.niri.pointer_pos_for_window_cast(mapped)
-                    {
-                        // Pointer location must be relative to the screencast buffer.
-                        // - win_pos is the position of the main window surface in output-local
-                        //   coordinates
-                        // - bbox.loc moves us relative to the screencast buffer
-                        let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
-                        let output_pos =
-                            self.niri.global_space.output_geometry(output).unwrap().loc;
-                        pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
-
-                        let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
-                        self.niri.render_pointer(renderer, output, &mut |elem| {
-                            let elem =
-                                RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
-                            elements.push(CastRenderElement::from(elem));
-                        });
-                    }
-                }
-
-                let main_start = elements.len();
-                mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
-                    elements.push(CastRenderElement::from(elem))
-                });
-
-                let cursor_data =
-                    CursorData::compute(&elements, main_start, pointer_location, scale);
-
-                if cast.dequeue_buffer_and_render(
-                    renderer,
-                    &elements,
-                    &cursor_data,
-                    bbox.size,
-                    scale,
-                ) {
-                    cast.last_frame_time = get_monotonic_time();
-                }
+            #[cfg(feature = "vulkan")]
+            let rendered = if self.backend.using_vulkan() {
+                self.backend.with_vulkan_renderer(|renderer| {
+                    self.niri
+                        .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
+                })
+            } else {
+                self.backend.with_primary_renderer(|renderer| {
+                    self.niri
+                        .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
+                })
+            };
+            #[cfg(not(feature = "vulkan"))]
+            let rendered = self.backend.with_primary_renderer(|renderer| {
+                self.niri
+                    .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
             });
+
+            if rendered.is_none() {
+                warn!("no renderer available to redraw the window cast");
+            }
 
             break;
         }
@@ -501,6 +489,53 @@ impl State {
 }
 
 impl Niri {
+    /// Build the elements for a window cast and push one frame to its PipeWire stream.
+    ///
+    /// Split out of `State::redraw_cast` so the renderer can be chosen at the call site: a Vulkan
+    /// session must cast through the owned renderer, not the co-resident GLES one.
+    fn redraw_window_cast_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+        &self,
+        renderer: &mut R,
+        cast: &mut Cast,
+        mapped: &Mapped,
+        output: &Output,
+        bbox: Rectangle<i32, Physical>,
+        scale: Scale<f64>,
+    ) where
+        CastRenderElement<R>: RenderElement<R>,
+    {
+        let mut elements = Vec::new();
+        let mut pointer_location = Point::default();
+
+        if self.pointer_visibility.is_visible() {
+            if let Some((pointer_pos, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
+                // Pointer location must be relative to the screencast buffer.
+                // - win_pos is the position of the main window surface in output-local coordinates
+                // - bbox.loc moves us relative to the screencast buffer
+                let buf_pos = win_pos + bbox.loc.to_f64().to_logical(scale);
+                let output_pos = self.global_space.output_geometry(output).unwrap().loc;
+                pointer_location = pointer_pos - output_pos.to_f64() - buf_pos;
+
+                let pos = buf_pos.to_physical_precise_round(scale).upscale(-1);
+                self.render_pointer(renderer, output, &mut |elem| {
+                    let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
+                    elements.push(CastRenderElement::from(elem));
+                });
+            }
+        }
+
+        let main_start = elements.len();
+        mapped.render_for_screen_cast(renderer, scale, &mut |elem| {
+            elements.push(CastRenderElement::from(elem))
+        });
+
+        let cursor_data = CursorData::compute(&elements, main_start, pointer_location, scale);
+
+        if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, bbox.size, scale) {
+            cast.last_frame_time = get_monotonic_time();
+        }
+    }
+
     pub fn refresh_mapped_cast_window_rules(&mut self) {
         // O(N^2) but should be fine since there aren't many casts usually.
         self.layout.with_windows_mut(|mapped, _| {

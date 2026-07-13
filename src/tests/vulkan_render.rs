@@ -3589,3 +3589,25 @@ fn vulkan_shm_cache_reimports_on_format_change() {
          cache keyed on size only, not fourcc"
     );
 }
+
+/// Compositing for a screencast must work on the owned Vulkan renderer.
+///
+/// Screencast used to render through the co-resident GLES renderer even on a Vulkan session (the
+/// redraw path handed all capture consumers a `&mut GlesRenderer`), so `RenderTarget::Screencast`
+/// had never been driven through the owned renderer at all. It is its own scene-collection pass —
+/// block-out rules and the per-target element split key off the target — so a Vulkan session could
+/// have been streaming a blank frame while the display looked fine.
+///
+/// The real PipeWire path needs GBM buffers and a consumer, neither of which headless has; what is
+/// testable, and what actually changed, is that the same scene composites for the Screencast
+/// target.
+#[test]
+fn vulkan_composites_for_a_screencast() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+    assert_window_and_background(&pixels, w, h);
+}
