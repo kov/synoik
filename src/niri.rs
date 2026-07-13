@@ -7083,6 +7083,7 @@ impl Niri {
     /// target through the owned renderer (which can't sample a GLES texture), so it uploads this
     /// buffer to a `VkTexture`; capturing it through the Vulkan renderer keeps that path off GLES.
     /// Generic so it serves both the Vulkan capture and the GLES fallback.
+    #[cfg(feature = "vulkan")]
     fn capture_output_neutral<R>(
         &self,
         renderer: &mut R,

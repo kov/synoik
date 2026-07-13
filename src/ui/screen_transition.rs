@@ -27,6 +27,7 @@ pub const DURATION: Duration = Duration::from_millis(500);
 /// Both variants hold one entry per render target: block-out rules key off the target, so a single
 /// shared buffer would show a screencast exactly what block-out exists to hide.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum FrozenScreen {
     /// GLES textures, sampled directly.
     Gles([TextureBuffer<GlesTexture>; RenderTarget::COUNT]),
