@@ -85,11 +85,32 @@ pub struct VulkanRenderer {
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
-    /// Reused R8G8B8A8 shadow for the present-blit scanout path, kept across frames so `bind` does
-    /// not allocate a full-screen device image every frame (which exhausts host memory on Venus
-    /// under sustained rendering). Reallocated only when the target size changes; safe to reuse
-    /// because rendering is synchronous (`finish` CPU-waits, so the shadow is never in flight).
-    present_blit_shadow: Option<VkTexture>,
+    /// Reused R8G8B8A8 shadows for the present-blit path, keyed by target size and kept across
+    /// frames so `bind` does not allocate a full-screen device image every frame (which exhausts
+    /// host memory on Venus under sustained rendering).
+    ///
+    /// Keyed by size rather than held in a single slot because **several differently-sized
+    /// `Argb8888`/`Xrgb8888` targets are bound within one frame**: the scanout buffer of each
+    /// output, a screencast buffer (window casts are sized to the window's bbox, and a rotated
+    /// output's cast is transform-sized), and any screencopy region. A single slot would evict and
+    /// reallocate on every bind as those alternate — the exact per-frame churn that aborts Venus.
+    ///
+    /// Bounded by [`MAX_PRESENT_BLIT_SHADOWS`], evicting least-recently-used, so a stream of new
+    /// sizes (an interactively resized window cast renegotiates its size as it grows) cannot grow
+    /// the cache without bound; the sizes actually bound each frame stay resident and never
+    /// reallocate. Reuse and eviction are safe because rendering is synchronous (`finish`
+    /// CPU-waits, so no shadow is in flight when the next bind reuses or drops it).
+    present_blit_shadows: HashMap<(u32, u32), ShadowEntry>,
+    /// Monotonic tick stamped onto a [`ShadowEntry`] each time it is used, so eviction can pick
+    /// the least-recently-used shadow. Bumped once per `present_blit_shadow_for` call.
+    shadow_clock: u64,
+    /// Count of present-blit shadow images actually allocated (test-only observability): the
+    /// invariant a steady-state render loop must hold is that this stops growing once each bound
+    /// size has been seen. Cache *hits* are invisible to a pixel assertion, so this counter is
+    /// what pins the no-churn invariant — see
+    /// `vulkan_alternating_present_blit_sizes_reuse_shadows`.
+    #[cfg(test)]
+    present_blit_shadow_allocs: usize,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
     /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
     /// creates a host-side resource, so re-importing per frame churns those resources until the
@@ -133,6 +154,19 @@ pub struct VulkanRenderer {
     /// drained (harmless extra acquire) by the next real `begin()`. De-duped by image so a surface
     /// imported twice before a frame records the barrier once.
     pending_dmabuf_acquires: Vec<VkTexture>,
+}
+
+/// How many differently-sized present-blit shadows to keep. Comfortably covers what a live session
+/// binds within one frame (a scanout buffer per output, a screencast buffer, a screencopy region)
+/// while bounding the memory a churn of new sizes can pin — each shadow is a full target-sized
+/// device image. See [`VulkanRenderer::present_blit_shadows`].
+const MAX_PRESENT_BLIT_SHADOWS: usize = 8;
+
+/// A cached present-blit shadow plus the tick it was last used on (for LRU eviction).
+#[derive(Debug)]
+struct ShadowEntry {
+    texture: VkTexture,
+    last_used: u64,
 }
 
 impl VulkanRenderer {
@@ -276,7 +310,10 @@ impl VulkanRenderer {
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
-            present_blit_shadow: None,
+            present_blit_shadows: HashMap::new(),
+            shadow_clock: 0,
+            #[cfg(test)]
+            present_blit_shadow_allocs: 0,
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
             pending_dmabuf_acquires: Vec::new(),
@@ -1034,11 +1071,14 @@ impl VulkanRenderer {
         h: u32,
         filter: vk::Filter,
     ) -> Result<VkTexture, VulkanError> {
-        if let Some(shadow) = &self.present_blit_shadow {
-            if shadow.width() == w && shadow.height() == h {
-                return Ok(shadow.clone());
-            }
+        self.shadow_clock += 1;
+        let now = self.shadow_clock;
+
+        if let Some(entry) = self.present_blit_shadows.get_mut(&(w, h)) {
+            entry.last_used = now;
+            return Ok(entry.texture.clone());
         }
+
         let shadow_tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
         let framebuffer = self.dmabuf_framebuffer(&shadow_tex, w, h)?;
         let shadow = VkTexture::new_dmabuf_target(
@@ -1049,8 +1089,38 @@ impl VulkanRenderer {
             h,
             Fourcc::Abgr8888,
         );
-        self.present_blit_shadow = Some(shadow.clone());
+        #[cfg(test)]
+        {
+            self.present_blit_shadow_allocs += 1;
+        }
+
+        // Evict the least-recently-used shadow first, so a churn of new sizes stays bounded. Only
+        // ever over the cap by one (we insert one per miss), so a single eviction suffices.
+        if self.present_blit_shadows.len() >= MAX_PRESENT_BLIT_SHADOWS {
+            if let Some(&lru) = self
+                .present_blit_shadows
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(size, _)| size)
+            {
+                self.present_blit_shadows.remove(&lru);
+            }
+        }
+        self.present_blit_shadows.insert(
+            (w, h),
+            ShadowEntry {
+                texture: shadow.clone(),
+                last_used: now,
+            },
+        );
         Ok(shadow)
+    }
+
+    /// How many present-blit shadow images have been allocated (test-only observability).
+    /// See [`Self::present_blit_shadow_allocs`].
+    #[cfg(test)]
+    pub(super) fn present_blit_shadow_allocs(&self) -> usize {
+        self.present_blit_shadow_allocs
     }
 
     fn dmabuf_framebuffer(

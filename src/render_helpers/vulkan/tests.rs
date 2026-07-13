@@ -2590,3 +2590,99 @@ fn vulkan_shm_reupload_overwrites_in_place() {
         "re-upload must not leave the original red behind, got {center:?}",
     );
 }
+
+/// Binding two **differently-sized** `Argb8888` targets in the same frame must not reallocate the
+/// present-blit shadow each time. Argb/Xrgb targets do not match the R8G8B8A8 render pass, so they
+/// render into a shadow that is blitted into the dmabuf on `finish`; the shadow used to live in a
+/// single size-keyed slot, which is only safe while exactly one such size is ever bound.
+///
+/// A live session binds several: each output's scanout buffer, a screencast buffer (a window cast
+/// is sized to the window's bbox, a rotated output's cast is transform-sized), and any screencopy
+/// region. Alternating those through one slot reallocates a full target-sized device image on
+/// *every* bind — on Venus that per-frame allocation churn exhausts the host blob pool, poisons the
+/// guest↔host ring and `abort()`s the session.
+///
+/// Pixels cannot see this (every frame renders correctly either way — it just leaks work), so the
+/// invariant is pinned by counting allocations: after each size has been bound once, the count must
+/// stop growing. Venus-only (needs GBM).
+#[test]
+fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_alternating_present_blit_sizes: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let file = match File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("skipping vulkan_alternating_present_blit_sizes: no render node ({e})");
+            return;
+        }
+    };
+    let gbm = match GbmDevice::new(file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping vulkan_alternating_present_blit_sizes: no GBM device ({e})");
+            return;
+        }
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+
+    // Two sizes, as a scanout buffer and a window-sized screencast buffer would be. Argb8888 (the
+    // KMS primary-plane byte order) is what takes the present-blit path.
+    let mut make = |w: i32, h: i32| {
+        alloc
+            .create_buffer(w as u32, h as u32, Fourcc::Argb8888, &[Modifier::Linear])
+            .map(|bo| bo.export().expect("export dmabuf"))
+    };
+    let (big, small) = match (make(256, 128), make(96, 64)) {
+        (Ok(big), Ok(small)) => (big, small),
+        _ => {
+            eprintln!(
+                "skipping vulkan_alternating_present_blit_sizes: GBM cannot allocate Argb8888 \
+                 LINEAR"
+            );
+            return;
+        }
+    };
+    let mut targets = [
+        (big, Size::<i32, Physical>::from((256, 128))),
+        (small, Size::<i32, Physical>::from((96, 64))),
+    ];
+
+    // Frame 1 binds each size once: two shadows, two allocations. Every frame after reuses them.
+    const FRAMES: usize = 6;
+    for frame_no in 0..FRAMES {
+        for (dmabuf, size) in &mut targets {
+            let mut fb = vk.bind(dmabuf).expect("bind");
+            let mut frame = vk
+                .render(&mut fb, *size, Transform::Normal)
+                .expect("render");
+            frame
+                .clear(
+                    Color32F::from([0., 0., 1., 1.]),
+                    &[Rectangle::from_size(*size)],
+                )
+                .expect("clear");
+            let _ = frame.finish().expect("finish");
+        }
+        assert_eq!(
+            vk.present_blit_shadow_allocs(),
+            2,
+            "frame {frame_no}: each bound size must allocate its shadow once and reuse it \
+             thereafter; a growing count is the per-frame churn that aborts Venus",
+        );
+    }
+}
