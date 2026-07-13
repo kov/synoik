@@ -1,4 +1,4 @@
-use std::ptr;
+use std::{ptr, slice};
 
 use anyhow::{ensure, Context as _};
 use niri_config::BlockOutFrom;
@@ -350,9 +350,26 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
     states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
+
+    // The shm pool wants `Xrgb8888` — BGRA byte order. GLES can read a framebuffer back in that
+    // order directly, but the owned Vulkan renderer only renders (and so only reads back) in RGBA
+    // order: asking it for a BGRA-order offscreen fails outright, which is what used to make every
+    // shm screencopy on a Vulkan session error out. Read RGBA back there and swizzle red/blue on
+    // the way into the pool. GLES keeps its straight copy — a per-frame swizzle of a full-screen
+    // buffer is not a cost worth imposing on the path that doesn't need it.
+    #[cfg(feature = "vulkan")]
+    let swizzle = renderer.try_as_vulkan_renderer().is_some();
+    #[cfg(not(feature = "vulkan"))]
+    let swizzle = false;
+
+    let fourcc = if swizzle {
+        Fourcc::Abgr8888
+    } else {
+        Fourcc::Xrgb8888
+    };
+
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
-        let fourcc = Fourcc::Xrgb8888;
 
         ensure!(
             // The buffer prefers pixels in little endian ...
@@ -387,14 +404,37 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
             .map_texture(&mapping)
             .context("error mapping texture")?;
 
-        unsafe {
-            let _span = tracy_client::span!("copy_nonoverlapping");
-            ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
+        if swizzle {
+            let _span = tracy_client::span!("swizzle_rgba_to_bgra");
+            // SAFETY: `shm_len` bytes of `shm_buffer` are mapped and exclusively ours inside
+            // `with_buffer_contents_mut`, and the `ensure!` above pins the layout as tightly
+            // packed 4-byte pixels, so it matches the readback byte for byte.
+            let shm = unsafe { slice::from_raw_parts_mut(shm_buffer.cast::<u8>(), shm_len) };
+            swizzle_rgba_to_bgra(shm, bytes);
+        } else {
+            unsafe {
+                let _span = tracy_client::span!("copy_nonoverlapping");
+                ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
+            }
         }
 
         Ok(())
     })
     .context("expected shm buffer, but didn't get one")?
+}
+
+/// Copy 8-bit RGBA-order pixels into a BGRA-order destination, swapping the red and blue channels.
+///
+/// The owned Vulkan renderer renders and reads back in RGBA order only, while several consumers
+/// (an `Xrgb8888` shm pool, a `SPA_VIDEO_FORMAT_BGRA` cursor bitmap) want BGRA; this is the bridge.
+/// A plain function so the byte order is pinned by a test rather than by eyeballing live output — a
+/// swapped copy just looks "blue-ish", which is easy to miss.
+///
+/// Copies `min(dst, src)` whole pixels; a trailing partial pixel is left alone.
+pub fn swizzle_rgba_to_bgra(dst: &mut [u8], src: &[u8]) {
+    for (dst, src) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+    }
 }
 
 pub fn clear_dmabuf<R: NiriRenderer>(
@@ -455,4 +495,19 @@ where
     }
 
     frame.finish().context("error finishing frame")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swizzle_rgba_to_bgra_swaps_red_and_blue() {
+        // Opaque red, then half-alpha blue: distinct in every channel, so a no-op copy, a reversed
+        // copy (which would also move alpha) and a correct swizzle all disagree.
+        let src = [255, 0, 0, 255, 0, 0, 255, 128];
+        let mut dst = [0u8; 8];
+        swizzle_rgba_to_bgra(&mut dst, &src);
+        assert_eq!(dst, [0, 0, 255, 255, 255, 0, 0, 128]);
+    }
 }

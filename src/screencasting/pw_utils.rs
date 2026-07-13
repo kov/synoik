@@ -52,7 +52,7 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf,
+    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf, swizzle_rgba_to_bgra,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -1605,32 +1605,5 @@ unsafe fn add_cursor_metadata<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
-    }
-}
-
-/// Copy an RGBA-order cursor readback into a BGRA-order SPA bitmap, swapping the red and blue
-/// channels. Split out as a plain function so the byte order is pinned by a test rather than by
-/// eyeballing a live stream — a swapped cursor reads as "blue-ish", which is easy to miss.
-///
-/// Both slices are tightly packed 8-bit RGBA/BGRA and the same length; a trailing partial pixel
-/// (which cannot happen for a `w * h * 4` readback) is left alone.
-fn swizzle_rgba_to_bgra(dst: &mut [u8], src: &[u8]) {
-    for (dst, src) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn swizzle_rgba_to_bgra_swaps_red_and_blue() {
-        // Opaque red, then half-alpha blue: distinct in every channel, so a no-op copy, a reversed
-        // copy (which would also move alpha) and a correct swizzle all disagree.
-        let src = [255, 0, 0, 255, 0, 0, 255, 128];
-        let mut dst = [0u8; 8];
-        swizzle_rgba_to_bgra(&mut dst, &src);
-        assert_eq!(dst, [0, 0, 255, 255, 255, 0, 0, 128]);
     }
 }

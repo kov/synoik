@@ -2686,3 +2686,70 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
         );
     }
 }
+
+/// The `Xrgb8888` shm pool that `render_to_shm` fills wants BGRA-order bytes, but the owned
+/// renderer renders `R8G8B8A8` and so cannot produce a BGRA-order offscreen at all — asking for one
+/// fails, which is what used to make every shm screencopy on a Vulkan session error out.
+///
+/// Pin both halves of the workaround: that the BGRA request really is rejected (so the swizzle is
+/// not cargo cult), and that reading back RGBA and swizzling yields the bytes the pool expects.
+/// Red is the discriminator — it is the channel that moves.
+#[test]
+fn vulkan_shm_readback_swizzles_to_bgra() {
+    use crate::render_helpers::{create_texture, swizzle_rgba_to_bgra};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_shm_readback_swizzles_to_bgra: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let size = Size::<i32, Physical>::from((W, H));
+
+    // The BGRA-order offscreen the shm pool's format would ask for: unsupported, by construction.
+    assert!(
+        Offscreen::<VkTexture>::create_buffer(
+            &mut vk,
+            Fourcc::Xrgb8888,
+            size.to_logical(1).to_buffer(1, Transform::Normal),
+        )
+        .is_err(),
+        "a BGRA-order offscreen must be rejected; if this starts passing, render_to_shm can drop \
+         the swizzle and read Xrgb8888 back directly",
+    );
+
+    // The RGBA-order one we actually use. Clear it red: red is what a red/blue swap moves.
+    let mut texture: VkTexture =
+        create_texture(&mut vk, size, Fourcc::Abgr8888).expect("Abgr8888 offscreen");
+    {
+        let mut fb = vk.bind(&mut texture).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(
+                Color32F::from([1., 0., 0., 1.]),
+                &[Rectangle::from_size(size)],
+            )
+            .expect("clear");
+        let _ = frame.finish().expect("finish");
+    }
+    let fb = vk.bind(&mut texture).expect("rebind for readback");
+    let mapping = vk
+        .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let rgba = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    assert_eq!(
+        &rgba[..4],
+        &[255, 0, 0, 255],
+        "the readback must be RGBA-order red",
+    );
+
+    let mut bgra = vec![0u8; rgba.len()];
+    swizzle_rgba_to_bgra(&mut bgra, &rgba);
+    assert_eq!(
+        &bgra[..4],
+        &[0, 0, 255, 255],
+        "the shm pool wants BGRA-order red",
+    );
+}
