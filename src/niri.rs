@@ -141,7 +141,7 @@ use crate::input::{
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
-use crate::layout::tile::TileRenderElement;
+use crate::layout::tile::{SnapshotRenderer, TileRenderElement};
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
@@ -2229,6 +2229,50 @@ impl State {
         // elements, so they need to be updated.
         self.niri.update_xray_render_elements(output);
 
+        // The snapshot is captured through whichever renderer will later draw the close animation:
+        // the owned Vulkan renderer can't sample a GLES texture, and vice versa.
+        #[cfg(feature = "vulkan")]
+        if self.backend.using_vulkan() {
+            self.backend.with_vulkan_renderer(|renderer| {
+                if let Some(output) = output {
+                    let mut ctx = RenderCtx {
+                        target: RenderTarget::Output,
+                        renderer,
+                        xray: None,
+                    };
+
+                    self.niri.fill_xray_elements_vulkan(ctx.r(), output);
+
+                    let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
+                    if has_blocked_out {
+                        let screencast_ctx = RenderCtx {
+                            target: RenderTarget::Screencast,
+                            ..ctx.r()
+                        };
+                        self.niri.fill_xray_elements_vulkan(screencast_ctx, output);
+                    }
+
+                    let state = self.niri.output_state.get_mut(output).unwrap();
+                    self.niri.layout.store_unmap_snapshot(
+                        &mut SnapshotRenderer::Vulkan(renderer),
+                        Some(&mut state.xray),
+                        has_blocked_out,
+                        window,
+                    );
+
+                    self.niri.clear_xray_elements(output);
+                } else {
+                    self.niri.layout.store_unmap_snapshot(
+                        &mut SnapshotRenderer::Vulkan(renderer),
+                        None,
+                        false,
+                        window,
+                    );
+                }
+            });
+            return;
+        }
+
         self.backend.with_primary_renderer(|renderer| {
             if let Some(output) = output {
                 let mut ctx = RenderCtx {
@@ -2254,7 +2298,7 @@ impl State {
 
                 let state = self.niri.output_state.get_mut(output).unwrap();
                 self.niri.layout.store_unmap_snapshot(
-                    renderer,
+                    &mut SnapshotRenderer::Gles(renderer),
                     Some(&mut state.xray),
                     has_blocked_out,
                     window,
@@ -2262,23 +2306,14 @@ impl State {
 
                 self.niri.clear_xray_elements(output);
             } else {
-                self.niri
-                    .layout
-                    .store_unmap_snapshot(renderer, None, false, window);
+                self.niri.layout.store_unmap_snapshot(
+                    &mut SnapshotRenderer::Gles(renderer),
+                    None,
+                    false,
+                    window,
+                );
             }
         });
-
-        // Second pass: on a Vulkan session, self-host the close animation's neutral by capturing it
-        // through the owned Vulkan renderer (no GLES readback). Runs after the GLES bake above;
-        // leaves the neutral empty (GLES-readback fallback) if Vulkan capture is unavailable.
-        #[cfg(feature = "vulkan")]
-        if self.backend.using_vulkan() {
-            self.backend.with_vulkan_renderer(|renderer| {
-                self.niri
-                    .layout
-                    .capture_unmap_neutral_vulkan(renderer, window);
-            });
-        }
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]

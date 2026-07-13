@@ -8,6 +8,7 @@ use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
+use super::closing_window::ClosingSnapshot;
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
@@ -22,14 +23,20 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuffer};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 #[cfg(feature = "vulkan")]
 use crate::render_helpers::texture::TextureBuffer;
+#[cfg(feature = "vulkan")]
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -111,7 +118,7 @@ pub struct Tile<W: LayoutElement> {
     pub(super) interactive_move_offset: Point<f64, Logical>,
 
     /// Snapshot of the last render for use in the close animation.
-    unmap_snapshot: Option<TileRenderSnapshot>,
+    unmap_snapshot: Option<TileUnmapSnapshot>,
 
     /// Extra damage for clipped surface corner radius changes.
     rounded_corner_damage: RoundedCornerDamage,
@@ -149,6 +156,18 @@ niri_render_elements! {
 
 pub type TileRenderSnapshot =
     RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
+
+/// A tile's stored unmap snapshot, in the form the session's renderer can sample.
+pub type TileUnmapSnapshot = ClosingSnapshot<TileRenderElement<GlesRenderer>>;
+
+/// The renderer an unmap snapshot is captured through, threaded down the layout tree. The two arms
+/// capture different things — GLES render elements vs. renderer-neutral CPU buffers — so this can't
+/// just be a `&mut impl NiriRenderer`.
+pub enum SnapshotRenderer<'a> {
+    Gles(&'a mut GlesRenderer),
+    #[cfg(feature = "vulkan")]
+    Vulkan(&'a mut crate::render_helpers::vulkan::VulkanRenderer),
+}
 
 #[derive(Debug)]
 struct ResizeAnimation {
@@ -1614,7 +1633,7 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -1624,7 +1643,19 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         self.unmap_snapshot =
-            Some(self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos));
+            match renderer {
+                SnapshotRenderer::Gles(renderer) => Some(ClosingSnapshot::Gles(
+                    self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos),
+                )),
+                // A failed capture stores nothing: the close animation is skipped (it warned),
+                // rather than half-captured. Storing a partial snapshot would let
+                // the blocked-out variant fall back to the unblocked contents on a
+                // screencast.
+                #[cfg(feature = "vulkan")]
+                SnapshotRenderer::Vulkan(renderer) => self
+                    .render_snapshot_vulkan(renderer, xray, xray_has_blocked_out_layers, xray_pos)
+                    .map(ClosingSnapshot::Neutral),
+            };
     }
 
     fn render_snapshot(
@@ -1744,86 +1775,116 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
-    pub fn take_unmap_snapshot(&mut self) -> Option<TileRenderSnapshot> {
+    pub fn take_unmap_snapshot(&mut self) -> Option<TileUnmapSnapshot> {
         self.unmap_snapshot.take()
     }
 
-    /// Captures the stored unmap snapshot's neutral CPU buffer by rendering the whole tile through
-    /// the owned Vulkan renderer (the self-hosting path for the close animation — no GLES
-    /// readback). Call after [`Self::store_unmap_snapshot_if_empty`] baked the snapshot. The
-    /// tile is rendered exactly as `render_snapshot` bakes its `contents` (`Output` target,
-    /// origin, `focus_ring` off); `xray_pos`/`xray` are irrelevant on the Vulkan renderer (they
-    /// only feed the GLES-gated background effect at [`Self::render_inner`]), so
-    /// `XrayPos::default()` + no xray is used. `ClosingWindow` places this buffer at the GLES
-    /// `contents` geometry, so the two must share an encompassing geo — and they do: the only
-    /// element the GLES bake can add that this render omits is the background-effect blur, whose
-    /// geometry is bounded by the window surface area, so it can never extend past the
-    /// window/shadow that already define the geo. The blur pixels being absent is a cosmetic
-    /// Vulkan divergence (same class as the GLES-only background effect elsewhere). On failure the
-    /// `neutral` cell is left empty so `ClosingWindow::new` falls back to the GLES readback.
+    /// The Vulkan sibling of [`Self::render_snapshot`]: captures the same three block-out variants,
+    /// but rasterized through the owned renderer into renderer-neutral CPU buffers (the owned
+    /// renderer can't sample the GLES textures the other one bakes).
+    ///
+    /// Mirrors `render_snapshot` element-for-element, xray pointer surgery included — see the long
+    /// comment there for why the buffers are swapped rather than rendered per target.
+    ///
+    /// Returns `None` if any *needed* variant failed to capture, so a partial snapshot can never be
+    /// stored: [`NeutralSnapshot::variant`] distinguishes "not needed" from "missing" only because
+    /// this holds, and if it didn't, a blocked-out window would fall through to its real contents
+    /// on a screencast.
     #[cfg(feature = "vulkan")]
-    pub fn capture_unmap_neutral_vulkan(
+    fn render_snapshot_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
-    ) {
-        use smithay::backend::allocator::Fourcc;
-        use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-        use smithay::utils::Transform;
-
-        use crate::render_helpers::memory::MemoryBuffer;
-        use crate::render_helpers::{encompassing_geo, render_to_vec};
-
-        let Some(snapshot) = self.unmap_snapshot.as_ref() else {
-            return;
-        };
-        if snapshot.neutral.get().is_some() {
-            return;
-        }
+        mut xray: Option<&mut Xray>,
+        xray_has_blocked_out_layers: bool,
+        xray_pos: XrayPos,
+    ) -> Option<NeutralSnapshot> {
+        let _span = tracy_client::span!("Tile::render_snapshot_vulkan");
 
         let scale = Scale::from(self.scale);
-        let mut elements = Vec::new();
-        self.render(
-            RenderCtx {
-                renderer,
-                target: RenderTarget::Output,
-                xray: None,
-            },
-            Point::from((0., 0.)),
-            XrayPos::default(),
-            false,
-            &mut |elem| elements.push(elem),
-        );
+        let block_out_from = self.window.rules().block_out_from;
 
-        let geo = encompassing_geo(scale, elements.iter());
-        if geo.size.is_empty() {
-            return;
-        }
-        let relocated = elements.iter().rev().map(|ele| {
-            RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
-        });
-        match render_to_vec(
-            renderer,
-            geo.size,
-            scale,
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            relocated,
-        ) {
-            Ok(data) => {
-                let buffer_size = geo.size.to_logical(1).to_buffer(1, Transform::Normal);
-                let buffer = MemoryBuffer::new(
-                    data,
-                    Fourcc::Abgr8888,
-                    buffer_size,
-                    scale,
-                    Transform::Normal,
+        let capture =
+            |target: RenderTarget,
+             xray: Option<&Xray>,
+             renderer: &mut crate::render_helpers::vulkan::VulkanRenderer| {
+                let mut elements = Vec::new();
+                self.render(
+                    RenderCtx {
+                        target,
+                        renderer,
+                        xray,
+                    },
+                    Point::from((0., 0.)),
+                    xray_pos,
+                    false,
+                    &mut |elem| elements.push(elem),
                 );
-                let _ = snapshot.neutral.set(Some((buffer, geo)));
-            }
-            Err(err) => {
-                warn!("error capturing closing-window neutral via Vulkan: {err:?}");
+                rasterize_neutral(renderer, scale, &elements)
+            };
+
+        let contents = capture(RenderTarget::Output, xray.as_deref(), renderer)?;
+
+        let mut contents_with_blocked_out_bg = None;
+
+        let output_idx = RenderTarget::Output as usize;
+        let screencast_idx = RenderTarget::Screencast as usize;
+        let mut screencast_background = None;
+        let mut screencast_backdrop = None;
+        let mut output_background = None;
+        let mut output_backdrop = None;
+        if let Some(xray) = &mut xray {
+            screencast_background = Some(Rc::clone(&xray.background[screencast_idx]));
+            screencast_backdrop = Some(Rc::clone(&xray.backdrop[screencast_idx]));
+            output_background = Some(Rc::clone(&xray.background[output_idx]));
+            output_backdrop = Some(Rc::clone(&xray.backdrop[output_idx]));
+
+            if xray_has_blocked_out_layers {
+                xray.background[output_idx] = screencast_background.clone().unwrap();
+                xray.backdrop[output_idx] = screencast_backdrop.clone().unwrap();
+
+                contents_with_blocked_out_bg = capture(RenderTarget::Output, Some(xray), renderer);
+            } else {
+                xray.background[screencast_idx] = output_background.clone().unwrap();
+                xray.backdrop[screencast_idx] = output_backdrop.clone().unwrap();
             }
         }
+
+        // Only bake the blocked-out variant if a target can actually select it: `should_block_out`
+        // is never true when `block_out_from` is `None`, so skipping it is safe — and it's the
+        // common case, which keeps this to a single render.
+        let blocked_out_contents = block_out_from
+            .is_some()
+            .then(|| capture(RenderTarget::Screencast, xray.as_deref(), renderer))
+            .flatten();
+
+        // Put everything back to normal.
+        if let Some(xray) = &mut xray {
+            if xray_has_blocked_out_layers {
+                xray.background[output_idx] = output_background.take().unwrap();
+                xray.backdrop[output_idx] = output_backdrop.take().unwrap();
+            } else {
+                xray.background[screencast_idx] = screencast_background.take().unwrap();
+                xray.backdrop[screencast_idx] = screencast_backdrop.take().unwrap();
+            }
+        }
+
+        // Fail closed: a needed variant that didn't capture throws the whole snapshot away.
+        if xray_has_blocked_out_layers && contents_with_blocked_out_bg.is_none() {
+            warn!("could not capture the blocked-out-background closing snapshot; skipping it");
+            return None;
+        }
+        if block_out_from.is_some() && blocked_out_contents.is_none() {
+            warn!("could not capture the blocked-out closing snapshot; skipping it");
+            return None;
+        }
+
+        Some(NeutralSnapshot {
+            contents,
+            contents_with_blocked_out_bg,
+            blocked_out_contents,
+            block_out_from,
+            size: self.animated_tile_size(),
+        })
     }
 
     pub fn border(&self) -> &FocusRing {
@@ -1854,5 +1915,55 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+}
+
+/// Render `elements` through the owned Vulkan renderer into a renderer-neutral CPU buffer, together
+/// with their encompassing geometry — the same convention `render_to_encompassing_texture` uses for
+/// the GLES bake, so a `ClosingWindow` can place either at the same offset.
+#[cfg(feature = "vulkan")]
+fn rasterize_neutral<E: smithay::backend::renderer::element::RenderElement<VulkanRenderer>>(
+    renderer: &mut VulkanRenderer,
+    scale: Scale<f64>,
+    elements: &[E],
+) -> Option<crate::render_helpers::snapshot::CapturedVariant> {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+    use smithay::utils::Transform;
+
+    use crate::render_helpers::{encompassing_geo, render_to_vec};
+
+    let geo = encompassing_geo(scale, elements.iter());
+    if geo.size.is_empty() {
+        return None;
+    }
+
+    let relocated = elements.iter().rev().map(|ele| {
+        RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
+    });
+
+    match render_to_vec(
+        renderer,
+        geo.size,
+        scale,
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        relocated,
+    ) {
+        Ok(data) => {
+            let buffer_size = geo.size.to_logical(1).to_buffer(1, Transform::Normal);
+            let buffer = MemoryBuffer::new(
+                data,
+                Fourcc::Abgr8888,
+                buffer_size,
+                scale,
+                Transform::Normal,
+            );
+            Some((buffer, geo))
+        }
+        Err(err) => {
+            warn!("error capturing closing-window snapshot via Vulkan: {err:?}");
+            None
+        }
     }
 }

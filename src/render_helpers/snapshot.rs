@@ -53,6 +53,60 @@ pub struct RenderSnapshot<C, B> {
     pub neutral: OnceCell<Option<(MemoryBuffer, Rectangle<i32, Physical>)>>,
 }
 
+/// A captured variant: its pixels, and the encompassing geometry they were rendered at.
+pub type CapturedVariant = (MemoryBuffer, Rectangle<i32, Physical>);
+
+/// A snapshot captured as renderer-neutral CPU buffers — one per block-out variant, each with its
+/// own encompassing geometry (the blocked-out variant is a bare rect, so its box is genuinely
+/// smaller than the contents' box, which includes the shadow).
+///
+/// The owned Vulkan renderer can't sample the GLES textures a [`RenderSnapshot`] bakes, so a Vulkan
+/// session captures the same three variants this way instead and uploads them on demand.
+#[derive(Debug)]
+pub struct NeutralSnapshot {
+    /// Contents for a normal render.
+    pub contents: CapturedVariant,
+
+    /// Contents that are not blocked out, but the background is.
+    ///
+    /// `None` means **not needed** (the background has no blocked-out surfaces) — never "the
+    /// capture failed". A failed capture of a needed variant must throw the whole snapshot away:
+    /// if the two were conflated, [`Self::variant`] would fall through to the unblocked `contents`
+    /// and leak into a screencast exactly what block-out exists to hide.
+    pub contents_with_blocked_out_bg: Option<CapturedVariant>,
+
+    /// Blocked-out contents. `None` means **not needed**: `block_out_from` is `None`, so
+    /// `should_block_out` is never true and this is never selected. Same rule as above.
+    pub blocked_out_contents: Option<CapturedVariant>,
+
+    /// Where the contents were blocked out from at the time of the snapshot.
+    pub block_out_from: Option<BlockOutFrom>,
+
+    /// Visual size of the element at the point of the snapshot.
+    pub size: Size<f64, Logical>,
+}
+
+impl NeutralSnapshot {
+    /// The variant to draw on `target`, and its index (stable, for keying an upload cache).
+    /// Mirrors the GLES selection in `ClosingWindow::render`.
+    ///
+    /// `None` means there is nothing safe to draw — draw nothing. Notably it never falls back to
+    /// the unblocked `contents` for a target that must be blocked out.
+    pub fn variant(&self, target: RenderTarget) -> Option<(usize, &CapturedVariant)> {
+        if target.should_block_out(self.block_out_from) {
+            return Some((2, self.blocked_out_contents.as_ref()?));
+        }
+
+        if target != RenderTarget::Output {
+            if let Some(contents) = &self.contents_with_blocked_out_bg {
+                return Some((1, contents));
+            }
+        }
+
+        Some((0, &self.contents))
+    }
+}
+
 impl<C, B, EC, EB> RenderSnapshot<C, B>
 where
     C: ToRenderElement<RenderElement = EC>,

@@ -10,7 +10,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{Tile, TileRenderElement, TileUnmapSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
@@ -575,7 +575,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
         id: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -590,14 +589,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(
-            renderer,
-            bridge_vulkan,
-            snapshot,
-            tile_size,
-            tile_pos,
-            blocker,
-        );
+        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -633,8 +625,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn start_close_animation_for_tile(
         &mut self,
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
-        snapshot: TileRenderSnapshot,
+        snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
@@ -655,14 +646,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer,
-            bridge_vulkan,
-            snapshot,
-            scale,
-            tile_size,
-            tile_pos,
-            blocker,
-            anim,
+            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
         );
         match res {
             Ok(closing) => {
@@ -1235,8 +1219,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
 
             if let Some(ctx) = ctx.try_as_gles() {
-                let elem = closing.render(ctx, view_rect, scale);
-                push(elem.into());
+                if let Some(elem) = closing.render(ctx, view_rect, scale) {
+                    push(elem.into());
+                }
             }
         }
 

@@ -50,7 +50,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
-use tile::{Tile, TileRenderElement};
+use tile::{SnapshotRenderer, Tile, TileRenderElement};
 use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
 pub use self::monitor::MonitorRenderElement;
@@ -4926,7 +4926,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn store_unmap_snapshot(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         window: &W::Id,
@@ -4989,34 +4989,6 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    /// Fills the stored unmap snapshot's neutral CPU buffer through the owned Vulkan renderer, so
-    /// the close animation can self-host without a GLES readback. Call after
-    /// [`Self::store_unmap_snapshot`] has baked the GLES snapshot; leaves the neutral empty
-    /// (falling back to the GLES readback in `ClosingWindow::new`) if the window is gone or
-    /// capture fails.
-    #[cfg(feature = "vulkan")]
-    pub fn capture_unmap_neutral_vulkan(
-        &self,
-        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
-        window: &W::Id,
-    ) {
-        let _span = tracy_client::span!("Layout::capture_unmap_neutral_vulkan");
-
-        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
-            if move_.tile.window().id() == window {
-                move_.tile.capture_unmap_neutral_vulkan(renderer);
-                return;
-            }
-        }
-
-        for (_, _, ws) in self.workspaces() {
-            if let Some(tile) = ws.tiles().find(|tile| tile.window().id() == window) {
-                tile.capture_unmap_neutral_vulkan(renderer);
-                return;
-            }
-        }
-    }
-
     pub fn clear_unmap_snapshot(&mut self, window: &W::Id) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -5050,7 +5022,6 @@ impl<W: LayoutElement> Layout<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -5082,14 +5053,7 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
 
                 let tile_pos = tile_pos - ws_geo.loc;
-                ws.start_close_animation_for_tile(
-                    renderer,
-                    bridge_vulkan,
-                    snapshot,
-                    tile_size,
-                    tile_pos,
-                    blocker,
-                );
+                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
                 return;
             }
         }
@@ -5099,12 +5063,7 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(
-                                renderer,
-                                bridge_vulkan,
-                                window,
-                                blocker,
-                            );
+                            ws.start_close_animation_for_window(renderer, window, blocker);
                             return;
                         }
                     }
@@ -5113,12 +5072,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        ws.start_close_animation_for_window(
-                            renderer,
-                            bridge_vulkan,
-                            window,
-                            blocker,
-                        );
+                        ws.start_close_animation_for_window(renderer, window, blocker);
                         return;
                     }
                 }

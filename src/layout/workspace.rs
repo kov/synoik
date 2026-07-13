@@ -24,7 +24,7 @@ use super::scrolling::{
     Column, ColumnWidth, ScrollDirection, ScrollingSpace, ScrollingSpaceRenderElement,
 };
 use super::shadow::Shadow;
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{SnapshotRenderer, Tile, TileRenderElement, TileUnmapSnapshot};
 use super::{
     expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
@@ -1970,7 +1970,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -2006,44 +2006,28 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn start_close_animation_for_window(
         &mut self,
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
         if self.floating.has_window(window) {
-            self.floating.start_close_animation_for_window(
-                renderer,
-                bridge_vulkan,
-                window,
-                blocker,
-            );
+            self.floating
+                .start_close_animation_for_window(renderer, window, blocker);
         } else {
-            self.scrolling.start_close_animation_for_window(
-                renderer,
-                bridge_vulkan,
-                window,
-                blocker,
-            );
+            self.scrolling
+                .start_close_animation_for_window(renderer, window, blocker);
         }
     }
 
     pub fn start_close_animation_for_tile(
         &mut self,
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
-        snapshot: TileRenderSnapshot,
+        snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
     ) {
-        self.floating.start_close_animation_for_tile(
-            renderer,
-            bridge_vulkan,
-            snapshot,
-            tile_size,
-            tile_pos,
-            blocker,
-        );
+        self.floating
+            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {

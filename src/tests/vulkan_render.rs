@@ -19,6 +19,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::ClientId;
 use super::fixture::Fixture;
 use crate::backend::RendererKind;
+use crate::layout::closing_window::ClosingSnapshot;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
@@ -1872,22 +1873,12 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
     )
     .clone();
 
-    // Bake the unmap snapshot's GLES contents. `None` output → no xray background, which is all a
-    // plain window needs. (The integrated Vulkan pass inside `store_unmap_snapshot` is a no-op
-    // here: the `Backend` enum only exposes the Vulkan renderer for the Tty backend, so in
-    // tests we drive `Layout::capture_unmap_neutral_vulkan` directly through the headless
-    // accessor below — in production the Tty path runs exactly this via the enum.)
+    // Capture the unmap snapshot. On a Vulkan session this goes through the owned renderer and
+    // bakes no GLES texture at all. `None` output → no xray background, which is all a plain window
+    // needs.
     f.niri_state().store_unmap_snapshot(&window_id, None);
 
-    let state = f.niri_state();
-    state.backend.headless().with_vulkan_renderer(|vk| {
-        state
-            .niri
-            .layout
-            .capture_unmap_neutral_vulkan(vk, &window_id);
-    });
-
-    // Inspect the tile's captured neutral. The window is still mapped (storing a snapshot does not
+    // Inspect the tile's captured snapshot. The window is still mapped (storing a snapshot does not
     // unmap it), so the tile is still in the active workspace.
     let snapshot = f
         .niri_state()
@@ -1900,11 +1891,10 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
         .expect("a tile")
         .take_unmap_snapshot()
         .expect("stored unmap snapshot");
-    let (buffer, geo) = snapshot
-        .neutral
-        .get()
-        .and_then(|n| n.as_ref())
-        .expect("Vulkan close neutral not captured");
+    let ClosingSnapshot::Neutral(snapshot) = &snapshot else {
+        panic!("a Vulkan session must capture the close snapshot as neutral buffers, not GLES");
+    };
+    let (buffer, geo) = &snapshot.contents;
 
     // The tile encloses at least the WIN×WIN window (default config has no border).
     let (w, h) = (buffer.size().w, buffer.size().h);
@@ -3911,5 +3901,150 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
         green > 1000,
         "the frozen screenshot is missing from the screencast ({green} greenish px); the \
          Screencast target fell through to the GLES element, which draws nothing on Vulkan",
+    );
+}
+
+/// Close the mapped window exactly as `XdgShellHandler::toplevel_destroyed` does: capture the unmap
+/// snapshot, start the close animation, and remove the window from the layout. Leaves the layout
+/// with a `ClosingWindow` mid-animation.
+fn close_the_only_window(f: &mut Fixture, output: &Output) {
+    use crate::utils::transaction::Transaction;
+
+    let window_id = crate::layout::LayoutElement::id(
+        f.niri().layout.windows().next().expect("a mapped window").1,
+    )
+    .clone();
+
+    f.niri_state()
+        .store_unmap_snapshot(&window_id, Some(output));
+
+    let transaction = Transaction::new();
+    let blocker = transaction.blocker();
+    let state = f.niri_state();
+    state.backend.with_primary_renderer(|renderer| {
+        state
+            .niri
+            .layout
+            .start_close_animation_for_window(renderer, &window_id, blocker);
+    });
+    state.niri.layout.remove_window(&window_id, transaction);
+}
+
+/// A closing window must draw into a **screencast**, not just on screen.
+///
+/// The close snapshot was captured for the `Output` target only, and `render_vulkan` hard-returned
+/// `None` for every other target — so on a Vulkan session a closing window was simply absent from
+/// casts. It is now captured per block-out variant, like the GLES path always was.
+#[test]
+fn vulkan_draws_a_closing_window_into_a_cast() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    close_the_only_window(&mut f, &output);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected an ongoing close animation to composite",
+    );
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    // Composite the Output target FIRST: its variant gets uploaded and cached. The Screencast
+    // render must then still pick its own variant, not the one already in the cache.
+    let (screen, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let on_screen = count_green(&screen, w, h);
+    assert!(
+        on_screen > 0,
+        "the closing window did not draw on screen at all",
+    );
+
+    let (cast, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+    let in_cast = count_green(&cast, w, h);
+    eprintln!(
+        "vulkan_draws_a_closing_window_into_a_cast: {on_screen} on screen, {in_cast} in cast"
+    );
+    assert!(
+        in_cast > 0,
+        "the closing window is missing from the screencast; the Screencast target had no variant \
+         to draw and fell through to nothing",
+    );
+}
+
+/// ...but a window that is blocked out from screencasts must NOT appear in one while it closes.
+///
+/// This is the failure mode the per-variant capture must not introduce: the naive way to put
+/// closing windows into casts (draw the Output capture on every target) turns today's blank into a
+/// leak of exactly the pixels block-out exists to hide.
+#[test]
+fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!(
+            "skipping vulkan_blocked_out_closing_window_does_not_leak_into_a_cast: no Vulkan device"
+        );
+        return;
+    }
+
+    use niri_config::BlockOutFrom;
+
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        block_out_from: Some(BlockOutFrom::Screencast),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    close_the_only_window(&mut f, &output);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected an ongoing close animation to composite",
+    );
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    let (cast, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+    let leaked = count_green(&cast, w, h);
+    assert_eq!(
+        leaked, 0,
+        "{leaked} window pixels leaked into the screencast while the window was closing",
+    );
+
+    // But the window is still really there: on screen the close animation renders normally.
+    let (screen, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    assert!(
+        count_green(&screen, w, h) > 0,
+        "the closing window vanished from the screen too; block-out must only affect the cast",
     );
 }

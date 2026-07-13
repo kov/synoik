@@ -21,24 +21,72 @@ use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{NeutralSnapshot, RenderSnapshot};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_encompassing_texture, RenderCtx, RenderTarget};
 use crate::utils::transaction::TransactionBlocker;
 
+/// The snapshot a closing window animates from, in the form the session's renderer can sample.
+///
+/// An enum rather than a bag of `Option`s so that a consumer which forgets the Vulkan arm doesn't
+/// compile: a `DualTextureRenderElement::Gles` drawn on the owned Vulkan renderer is a silent
+/// no-op. Exactly one arm is live per session.
+#[derive(Debug)]
+pub enum ClosingSnapshot<C> {
+    /// GLES render elements, baked into textures by [`ClosingWindow::new`].
+    Gles(RenderSnapshot<C, C>),
+    /// Renderer-neutral CPU buffers, captured through the owned Vulkan renderer at snapshot time.
+    Neutral(NeutralSnapshot),
+}
+
+/// The three block-out variants of a neutral snapshot, uploaded to `VkTexture`s on first use.
+#[cfg(feature = "vulkan")]
+type VariantCache =
+    std::cell::RefCell<[Option<TextureBuffer<crate::render_helpers::vulkan::VkTexture>>; 3]>;
+
+/// The window contents a [`ClosingWindow`] samples, per block-out variant.
+#[derive(Debug)]
+enum ClosingBuffers {
+    Gles {
+        /// Contents of the window.
+        buffer: TextureBuffer<GlesTexture>,
+
+        /// Contents that are not blocked out, but the background is blocked out.
+        ///
+        /// If `None` then the background doesn't have any blocked-out surfaces, and normal
+        /// `buffer` can be used instead.
+        buffer_with_blocked_out_bg: Option<TextureBuffer<GlesTexture>>,
+
+        /// Blocked-out contents of the window.
+        blocked_out_buffer: TextureBuffer<GlesTexture>,
+
+        /// How much the texture should be offset.
+        buffer_offset: Point<f64, Logical>,
+
+        /// How much the texture with blocked-out bg should be offset.
+        buffer_with_blocked_out_bg_offset: Point<f64, Logical>,
+
+        /// How much the blocked-out texture should be offset.
+        blocked_out_buffer_offset: Point<f64, Logical>,
+    },
+    Neutral {
+        /// Only read on a Vulkan session; a GLES build never constructs this arm.
+        #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+        snapshot: NeutralSnapshot,
+
+        /// Each variant uploaded to a `VkTexture` on first use, cached across the animation's
+        /// frames — re-uploading every frame would churn virtio-gpu blobs. Keyed strictly by
+        /// variant index (see [`NeutralSnapshot::variant`]); a failed upload never falls back to
+        /// another variant's texture.
+        #[cfg(feature = "vulkan")]
+        vk: VariantCache,
+    },
+}
+
 #[derive(Debug)]
 pub struct ClosingWindow {
-    /// Contents of the window.
-    buffer: TextureBuffer<GlesTexture>,
-
-    /// Contents that are not blocked out, but the background is blocked out.
-    ///
-    /// If `None` then the background doesn't have any blocked-out surfaces, and normal `buffer`
-    /// can be used instead.
-    buffer_with_blocked_out_bg: Option<TextureBuffer<GlesTexture>>,
-
-    /// Blocked-out contents of the window.
-    blocked_out_buffer: TextureBuffer<GlesTexture>,
+    /// The window contents to animate.
+    buffers: ClosingBuffers,
 
     /// Where the window should be blocked out from.
     block_out_from: Option<BlockOutFrom>,
@@ -49,32 +97,11 @@ pub struct ClosingWindow {
     /// Position in the workspace.
     pos: Point<f64, Logical>,
 
-    /// How much the texture should be offset.
-    buffer_offset: Point<f64, Logical>,
-
-    /// How much the texture with blocked-out bg should be offset.
-    buffer_with_blocked_out_bg_offset: Point<f64, Logical>,
-
-    /// How much the blocked-out texture should be offset.
-    blocked_out_buffer_offset: Point<f64, Logical>,
-
     /// The closing animation.
     anim_state: AnimationState,
 
     /// Random seed for the shader.
     random_seed: f32,
-
-    /// The `buffer` contents read back to a renderer-neutral `MemoryBuffer` at capture time, so
-    /// the owned Vulkan renderer can render the closing animation on the on-screen output.
-    /// Only captured when compositing through Vulkan (see `bridge_vulkan` in `new`); the
-    /// block-out variants are never needed on the Output target, so only `buffer` is bridged.
-    #[cfg(feature = "vulkan")]
-    buffer_mem: Option<crate::render_helpers::memory::MemoryBuffer>,
-
-    /// The lazily-uploaded `VkTexture` for [`Self::buffer_mem`], cached across frames (uploaded
-    /// once on the first Vulkan render, like the resize animation's `prev_vk`).
-    #[cfg(feature = "vulkan")]
-    buffer_vk: std::cell::RefCell<Option<TextureBuffer<crate::render_helpers::vulkan::VkTexture>>>,
 }
 
 niri_render_elements! {
@@ -111,8 +138,7 @@ impl ClosingWindow {
     #[allow(clippy::too_many_arguments)]
     pub fn new<E: RenderElement<GlesRenderer>>(
         renderer: &mut GlesRenderer,
-        bridge_vulkan: bool,
-        snapshot: RenderSnapshot<E, E>,
+        snapshot: ClosingSnapshot<E>,
         scale: Scale<f64>,
         geo_size: Size<f64, Logical>,
         pos: Point<f64, Logical>,
@@ -120,21 +146,29 @@ impl ClosingWindow {
         anim: Animation,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("ClosingWindow::new");
-        #[cfg(not(feature = "vulkan"))]
-        let _ = bridge_vulkan;
 
-        // The main contents: on a Vulkan session, read the freshly-rendered GLES texture back to a
-        // MemoryBuffer here (we have the raw texture in hand) so the owned renderer can re-upload
-        // it. Only `buffer` is bridged — the block-out variants are `target != Output`
-        // only, and the Vulkan path only runs for the Output target. Rendered before
-        // `render_to_texture` is defined so its `renderer` borrow doesn't clash with the
-        // closure's.
-        #[cfg(feature = "vulkan")]
-        let mut buffer_mem = None;
+        // A Vulkan session captured the contents as renderer-neutral buffers at snapshot time, and
+        // the owned renderer can't sample a GLES texture anyway — so there is nothing to bake.
+        let snapshot = match snapshot {
+            ClosingSnapshot::Gles(snapshot) => snapshot,
+            ClosingSnapshot::Neutral(snapshot) => {
+                return Ok(Self {
+                    block_out_from: snapshot.block_out_from,
+                    geo_size,
+                    pos,
+                    buffers: ClosingBuffers::Neutral {
+                        snapshot,
+                        #[cfg(feature = "vulkan")]
+                        vk: std::cell::RefCell::new(Default::default()),
+                    },
+                    anim_state: AnimationState::new(blocker, anim),
+                    random_seed: fastrand::f32(),
+                });
+            }
+        };
+
         let (buffer, buffer_offset) = {
-            // `mut` is only needed for the Vulkan readback bind below.
-            #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
-            let (mut texture, _sync_point, geo) = render_to_encompassing_texture(
+            let (texture, _sync_point, geo) = render_to_encompassing_texture(
                 renderer,
                 scale,
                 Transform::Normal,
@@ -142,24 +176,6 @@ impl ClosingWindow {
                 &snapshot.contents,
             )
             .context("error rendering contents")?;
-            #[cfg(feature = "vulkan")]
-            if bridge_vulkan {
-                // Prefer the neutral captured through the Vulkan renderer at snapshot time
-                // (self-hosting, no GLES readback); fall back to reading the freshly-rendered GLES
-                // texture back when the Vulkan capture was unavailable.
-                buffer_mem = snapshot
-                    .neutral
-                    .get()
-                    .and_then(|n| n.as_ref())
-                    .map(|(buf, _)| buf.clone());
-                if buffer_mem.is_none() {
-                    buffer_mem = readback_snapshot(renderer, &mut texture, scale)
-                        .map_err(|err| {
-                            warn!("error reading back closing snapshot for Vulkan: {err:?}")
-                        })
-                        .ok();
-                }
-            }
             let buffer = TextureBuffer::from_texture(
                 renderer,
                 texture,
@@ -206,21 +222,19 @@ impl ClosingWindow {
                 .context("error rendering blocked-out contents")?;
 
         Ok(Self {
-            buffer,
-            buffer_with_blocked_out_bg,
-            blocked_out_buffer,
+            buffers: ClosingBuffers::Gles {
+                buffer,
+                buffer_with_blocked_out_bg,
+                blocked_out_buffer,
+                buffer_offset,
+                buffer_with_blocked_out_bg_offset,
+                blocked_out_buffer_offset,
+            },
             block_out_from: snapshot.block_out_from,
             geo_size,
             pos,
-            buffer_offset,
-            buffer_with_blocked_out_bg_offset,
-            blocked_out_buffer_offset,
             anim_state: AnimationState::new(blocker, anim),
             random_seed: fastrand::f32(),
-            #[cfg(feature = "vulkan")]
-            buffer_mem,
-            #[cfg(feature = "vulkan")]
-            buffer_vk: std::cell::RefCell::new(None),
         })
     }
 
@@ -243,21 +257,36 @@ impl ClosingWindow {
         }
     }
 
+    /// Draws the closing animation on GLES. `None` on a Vulkan session, whose snapshot is a set of
+    /// CPU buffers a GLES renderer has nothing to sample — see [`Self::render_vulkan`].
     pub fn render(
         &self,
         ctx: RenderCtx<GlesRenderer>,
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
-    ) -> ClosingWindowRenderElement {
+    ) -> Option<ClosingWindowRenderElement> {
+        let ClosingBuffers::Gles {
+            buffer: contents,
+            buffer_with_blocked_out_bg,
+            blocked_out_buffer,
+            buffer_offset,
+            buffer_with_blocked_out_bg_offset,
+            blocked_out_buffer_offset,
+        } = &self.buffers
+        else {
+            error!("a closing window captured for Vulkan cannot render on GLES");
+            return None;
+        };
+
         let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
-            (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
-        } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
+            (blocked_out_buffer, *blocked_out_buffer_offset)
+        } else if ctx.target != RenderTarget::Output && buffer_with_blocked_out_bg.is_some() {
             (
-                self.buffer_with_blocked_out_bg.as_ref().unwrap(),
-                self.buffer_with_blocked_out_bg_offset,
+                buffer_with_blocked_out_bg.as_ref().unwrap(),
+                *buffer_with_blocked_out_bg_offset,
             )
         } else {
-            (&self.buffer, self.buffer_offset)
+            (contents, *buffer_offset)
         };
 
         let anim = match &self.anim_state {
@@ -283,7 +312,7 @@ impl ClosingWindow {
                     Relocate::Relative,
                 );
 
-                return elem.into();
+                return Some(elem.into());
             }
             AnimationState::Animating(anim) => anim,
         };
@@ -306,10 +335,10 @@ impl ClosingWindow {
             let input_to_geo = Mat3::from_scale(area_size / geo_size)
                 * Mat3::from_translation((area_loc - geo_loc) / area_size);
 
-            let tex_scale = self.buffer.texture_scale();
+            let tex_scale = contents.texture_scale();
             let tex_scale = Vec2::new(tex_scale.x as f32, tex_scale.y as f32);
             let tex_loc = Vec2::new(offset.x as f32, offset.y as f32);
-            let tex_size = self.buffer.texture().size();
+            let tex_size = contents.texture().size();
             let tex_size = Vec2::new(tex_size.w as f32, tex_size.h as f32) / tex_scale;
 
             let geo_to_tex =
@@ -333,7 +362,7 @@ impl ClosingWindow {
                 Kind::Unspecified,
             )
             .with_location(Point::from((0., 0.)));
-            return CustomAnimRenderElement::Gles(elem).into();
+            return Some(CustomAnimRenderElement::Gles(elem).into());
         }
 
         let elem = TextureRenderElement::from_texture_buffer(
@@ -363,17 +392,18 @@ impl ClosingWindow {
             Relocate::Relative,
         );
 
-        elem.into()
+        Some(elem.into())
     }
 
     /// The Vulkan sibling of [`render`](Self::render): draws the closing animation on the owned
-    /// renderer, using the `buffer` contents read back at capture time (see `new`'s
-    /// `bridge_vulkan`) and lazily re-uploaded to a cached `VkTexture`. Applies the user's
-    /// custom `close` shader if one is installed, else the built-in scale + fade.
+    /// renderer from the neutral buffers captured at snapshot time, uploaded once each to a cached
+    /// `VkTexture`. Applies the user's custom `close` shader if one is installed, else the built-in
+    /// scale + fade.
     ///
-    /// Only valid for [`RenderTarget::Output`]: the block-out / blocked-out-bg variants are never
-    /// captured for Vulkan (see `new`), so a non-Output target — where GLES may need them — returns
-    /// `None`. Returns `None` too if there was nothing to read back or the upload failed.
+    /// Picks the block-out variant for `target` exactly as the GLES path does. `None` on a GLES
+    /// session, when the target has no variant safe to draw, or when the upload failed — never a
+    /// substitute, which for a blocked-out target would mean drawing the real window into a
+    /// screencast.
     #[cfg(feature = "vulkan")]
     pub fn render_vulkan(
         &self,
@@ -384,26 +414,27 @@ impl ClosingWindow {
     ) -> Option<ClosingWindowRenderElement> {
         use crate::render_helpers::vulkan::{pack_affine, CustomAnimPush, CustomShaderType};
 
-        // The privacy safeguard: only `buffer` is bridged to Vulkan (never the blocked-out
-        // variants), so we must not run for a target that would select one of those.
-        if target != RenderTarget::Output {
+        let ClosingBuffers::Neutral { snapshot, vk } = &self.buffers else {
+            // A GLES session's snapshot is a set of GLES textures the owned renderer can't sample.
             return None;
-        }
+        };
 
-        let offset = self.buffer_offset;
+        // Select the variant *before* the animation state below: the Waiting branch draws too, and
+        // must be just as target-correct as the animating one.
+        let (idx, (mem, geo)) = snapshot.variant(target)?;
+        let offset = geo.loc.to_f64().to_logical(scale);
 
-        // Lazily upload the captured snapshot to a cached VkTexture (like the resize `prev_vk`).
-        let mem = self.buffer_mem.as_ref()?;
-        if self.buffer_vk.borrow().is_none() {
+        // Lazily upload this variant to its own cached VkTexture (like the resize `prev_vk`).
+        if vk.borrow()[idx].is_none() {
             match TextureBuffer::from_memory_buffer(renderer, mem) {
-                Ok(tb) => *self.buffer_vk.borrow_mut() = Some(tb),
+                Ok(tb) => vk.borrow_mut()[idx] = Some(tb),
                 Err(err) => {
                     warn!("error uploading closing snapshot to Vulkan: {err:?}");
                     return None;
                 }
             }
         }
-        let buffer = self.buffer_vk.borrow().clone()?;
+        let buffer = vk.borrow()[idx].clone()?;
 
         let anim = match &self.anim_state {
             AnimationState::Waiting { .. } => {
@@ -513,40 +544,4 @@ impl ClosingWindow {
 
         Some(elem.into())
     }
-}
-
-/// Read a freshly-rendered GLES snapshot texture back into a renderer-neutral [`MemoryBuffer`], so
-/// the owned Vulkan renderer can re-upload it at render time. Called once at capture (see
-/// [`ClosingWindow::new`]); mirrors
-/// [`RenderSnapshot::capture_neutral`](crate::render_helpers::snapshot).
-#[cfg(feature = "vulkan")]
-fn readback_snapshot(
-    renderer: &mut GlesRenderer,
-    texture: &mut GlesTexture,
-    scale: Scale<f64>,
-) -> anyhow::Result<crate::render_helpers::memory::MemoryBuffer> {
-    use smithay::backend::renderer::{Bind as _, ExportMem as _};
-
-    use crate::render_helpers::copy_framebuffer;
-    use crate::render_helpers::memory::MemoryBuffer;
-
-    let fourcc = Fourcc::Abgr8888;
-    let buffer_size = texture.size();
-    let mapping = {
-        let target = renderer
-            .bind(texture)
-            .context("error binding closing snapshot for readback")?;
-        copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")?
-    };
-    let bytes = renderer
-        .map_texture(&mapping)
-        .context("error mapping closing snapshot")?;
-
-    Ok(MemoryBuffer::new(
-        bytes.to_vec(),
-        fourcc,
-        buffer_size,
-        scale,
-        Transform::Normal,
-    ))
 }
