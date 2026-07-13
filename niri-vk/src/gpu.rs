@@ -4,10 +4,26 @@
 //! (virtio-gpu, no zink) and on lavapipe (CPU, deterministic test baseline). Nothing here
 //! touches a Wayland socket / DRM master / swapchain, so it runs headless from any shell.
 
+use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
+
+/// Whether a `(format, modifier)` pair is one the driver vouches for. See
+/// [`Gpu::check_modifier_features`] — both variants mean "go ahead", but [`Self::Unlisted`] means
+/// we are proceeding on an assumption we could not check, and the caller should say so in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModifierSupport {
+    /// Enumerated, and it has every feature the caller asked for.
+    Ok,
+    /// The driver enumerates no modifiers for this format at all, so there was nothing to check
+    /// against. Proceeding is what we did before this check existed — see the warning on
+    /// [`Gpu::check_modifier_features`]: it is best-effort, and nothing downstream will catch it
+    /// if the modifier really is unsupported.
+    Unlisted,
+}
 
 pub struct Gpu {
     // Field order matters for Drop: device before instance before entry.
@@ -26,6 +42,8 @@ pub struct Gpu {
     // Device extensions we asked for AND the device advertised (so lavapipe, which lacks the
     // dmabuf ones, still builds a device — the dmabuf demo checks these and skips if absent).
     enabled_extensions: Vec<String>,
+    // Memoized DRM-modifier tiling features per format. See `modifier_features`.
+    modifier_features: Mutex<HashMap<vk::Format, Vec<(u64, vk::FormatFeatureFlags)>>>,
     pub instance: ash::Instance,
     // Owns the loaded Vulkan library; must outlive `instance`/`device`.
     #[allow(dead_code)]
@@ -200,9 +218,110 @@ impl Gpu {
             device_type: props.device_type,
             drm_render_node: drm_render_node(&instance, phys),
             enabled_extensions,
+            modifier_features: Mutex::new(HashMap::new()),
             instance,
             entry,
         })
+    }
+
+    /// The DRM-modifier tiling features this device reports for `(format, modifier)`, or `None` if
+    /// the driver does not enumerate that modifier for that format.
+    ///
+    /// For an image created with `DRM_FORMAT_MODIFIER_EXT` tiling, *these* — not the linear/optimal
+    /// tiling features — are the "format features" every command's VUs are written against. Nothing
+    /// in them is mandated by the spec, so an operation that is guaranteed at `OPTIMAL` tiling
+    /// (`vkCmdBlitImage` on `R8G8B8A8_UNORM`, say) is pure driver goodwill on a modifier. Use
+    /// [`Self::check_modifier_features`] rather than reading this directly.
+    ///
+    /// Memoized: the list is static per `(physical device, format)`, and importing a dmabuf is not
+    /// a per-frame operation but is not rare either.
+    pub fn modifier_features(
+        &self,
+        format: vk::Format,
+        modifier: u64,
+    ) -> Option<vk::FormatFeatureFlags> {
+        self.with_modifier_list(format, |list| {
+            list.iter().find(|(m, _)| *m == modifier).map(|(_, f)| *f)
+        })
+    }
+
+    /// Does this device enumerate *any* DRM modifier for `format`? An empty list means the driver
+    /// told us nothing — no `VK_EXT_image_drm_format_modifier`, or it lists none — which is very
+    /// different from a list that exists and omits a particular modifier.
+    fn enumerates_modifiers(&self, format: vk::Format) -> bool {
+        self.with_modifier_list(format, |list| !list.is_empty())
+    }
+
+    fn with_modifier_list<R>(
+        &self,
+        format: vk::Format,
+        f: impl FnOnce(&[(u64, vk::FormatFeatureFlags)]) -> R,
+    ) -> R {
+        let mut cache = self.modifier_features.lock().unwrap();
+        let list = cache
+            .entry(format)
+            .or_insert_with(|| drm_modifier_features(&self.instance, self.phys, format));
+        f(list)
+    }
+
+    /// Fail closed unless this device can actually perform `required` on an image of
+    /// `(format, modifier)`.
+    ///
+    /// `required` must be derived from the commands we will *record* against the image, never from
+    /// its `usage`: the two are independent axes. `TRANSFER_DST` usage is necessary but not
+    /// sufficient for `vkCmdBlitImage` (VUID-vkCmdBlitImage-dstImage-02000 additionally demands the
+    /// `BLIT_DST` *feature*), and a driver may legally offer the `TRANSFER_DST` feature — copies —
+    /// without `BLIT_DST`, or the reverse.
+    ///
+    /// The three cases, and why:
+    ///
+    /// - **Enumerated, a required bit missing** → `Err`. The driver has affirmatively told us the
+    ///   operation is undefined. Failing means no picture, but nothing works in that world either;
+    ///   the difference is that an error naming the format, the modifier and the missing bit is one
+    ///   a bug report can act on, where garbage pixels or a device loss ten frames later is not.
+    /// - **Enumerated with every bit** → `Ok`.
+    /// - **A non-empty list that omits this modifier** → `Err`. The list is the driver's own
+    ///   statement of what it supports for the format, so an absence in a list that exists is
+    ///   evidence against the modifier, not evidence of nothing. (A dmabuf's modifier comes from
+    ///   GBM, which need not be the same driver stack as the ICD — on split render/scanout hardware
+    ///   this is how we would find out, and that import would not have worked anyway.)
+    /// - **No list at all** — no `VK_EXT_image_drm_format_modifier`, or the driver enumerates none
+    ///   → [`ModifierSupport::Unlisted`], for the caller to warn about and proceed. Here we know
+    ///   nothing, so refusing would be inventing a failure.
+    ///
+    /// **`Unlisted` is best-effort, not a safety net.** Importing on an unenumerated modifier
+    /// violates VUID-VkImageDrmFormatModifierExplicitCreateInfoEXT-drmFormatModifier-02264 — it is
+    /// undefined behavior a driver is under no obligation to diagnose, and *nothing downstream
+    /// reliably catches it*. Measured on this VM: for a vendor-`0xff` modifier no device can back,
+    /// both Venus and lavapipe report the image as creatable via
+    /// `vkGetPhysicalDeviceImageFormatProperties2`, and `vkCreateImage` then creates it happily. So
+    /// there is no second query to lean on — this enumeration is the only honest gate, which is
+    /// exactly why an absence from a *populated* list is treated as an answer.
+    pub fn check_modifier_features(
+        &self,
+        format: vk::Format,
+        modifier: u64,
+        required: vk::FormatFeatureFlags,
+    ) -> Result<ModifierSupport> {
+        let Some(features) = self.modifier_features(format, modifier) else {
+            if !self.enumerates_modifiers(format) {
+                return Ok(ModifierSupport::Unlisted);
+            }
+            return Err(anyhow!(
+                "this device does not support DRM modifier {modifier:#018x} for {format:?} (it \
+                 enumerates others), so an image imported with it would be undefined"
+            ));
+        };
+
+        let missing = required & !features;
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "{format:?} with DRM modifier {modifier:#018x} lacks the format features \
+                 {missing:?} this image needs (device reports {features:?}) — the operations we \
+                 record against it would be undefined"
+            ));
+        }
+        Ok(ModifierSupport::Ok)
     }
 
     /// Was this device extension enabled at device creation? (Used to gate the dmabuf demo.)
@@ -355,6 +474,38 @@ fn drm_render_node(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<(
     Some((drm.render_major as u32, drm.render_minor as u32))
 }
 
+/// Every DRM modifier this device enumerates for `format`, with its tiling features. Empty if the
+/// driver has no `VK_EXT_image_drm_format_modifier` (lavapipe builds without it in some configs) or
+/// simply lists none. Two-call idiom: query the count, then the entries.
+fn drm_modifier_features(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    format: vk::Format,
+) -> Vec<(u64, vk::FormatFeatureFlags)> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    {
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe { instance.get_physical_device_format_properties2(pd, format, &mut props) };
+    }
+    let count = list.drm_format_modifier_count;
+    if count == 0 {
+        return Vec::new();
+    }
+
+    // push_next only stored a pointer to `list`, so the second query writes through it into `buf`.
+    let mut buf = vec![vk::DrmFormatModifierPropertiesEXT::default(); count as usize];
+    list.p_drm_format_modifier_properties = buf.as_mut_ptr();
+    list.drm_format_modifier_count = count;
+    {
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe { instance.get_physical_device_format_properties2(pd, format, &mut props) };
+    }
+
+    buf.iter()
+        .map(|m| (m.drm_format_modifier, m.drm_format_modifier_tiling_features))
+        .collect()
+}
+
 fn graphics_queue_family(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<u32> {
     let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
     families
@@ -449,5 +600,107 @@ mod tests {
             res.is_err(),
             "selected a device for a render node nothing backs",
         );
+    }
+
+    const LINEAR: u64 = 0;
+
+    /// The present-blit path blits into a modifier-tiled `B8G8R8A8_UNORM` scanout buffer, and the
+    /// direct path renders into one and reads it back. Both rest on features the spec does not
+    /// mandate for a modifier, so pin that the drivers we ship on really do report them — if this
+    /// ever fails, the scanout path was undefined behavior that happened to work.
+    #[test]
+    fn the_scanout_modifier_supports_what_the_scanout_path_records() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        if gpu
+            .modifier_features(vk::Format::B8G8R8A8_UNORM, LINEAR)
+            .is_none()
+        {
+            eprintln!("skipping: driver enumerates no LINEAR modifier for B8G8R8A8_UNORM");
+            return;
+        }
+
+        gpu.check_modifier_features(
+            vk::Format::B8G8R8A8_UNORM,
+            LINEAR,
+            vk::FormatFeatureFlags::BLIT_DST
+                | vk::FormatFeatureFlags::TRANSFER_SRC
+                | vk::FormatFeatureFlags::BLIT_SRC,
+        )
+        .expect("the present-blit target's operations must be defined on the LINEAR modifier");
+
+        gpu.check_modifier_features(
+            vk::Format::R8G8B8A8_UNORM,
+            LINEAR,
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::TRANSFER_SRC
+                | vk::FormatFeatureFlags::BLIT_SRC,
+        )
+        .expect("the direct scanout target's operations must be defined on the LINEAR modifier");
+    }
+
+    /// Fail closed when the driver says the operation is undefined. Ask an enumerated modifier for
+    /// a feature no 8-bit color format has (`DISJOINT` is a multi-planar YCbCr bit) and require
+    /// an error — a check that cannot fail would pin nothing.
+    #[test]
+    fn refuses_a_modifier_missing_a_required_feature() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        let Some(features) = gpu.modifier_features(vk::Format::B8G8R8A8_UNORM, LINEAR) else {
+            eprintln!("skipping: driver enumerates no LINEAR modifier for B8G8R8A8_UNORM");
+            return;
+        };
+        assert!(
+            !features.contains(vk::FormatFeatureFlags::DISJOINT),
+            "DISJOINT was picked as a feature B8G8R8A8_UNORM cannot have; pick another",
+        );
+
+        let res = gpu.check_modifier_features(
+            vk::Format::B8G8R8A8_UNORM,
+            LINEAR,
+            vk::FormatFeatureFlags::BLIT_DST | vk::FormatFeatureFlags::DISJOINT,
+        );
+        assert!(
+            res.is_err(),
+            "imported a modifier the driver says cannot support the commands we record",
+        );
+    }
+
+    /// A modifier the driver neither enumerates nor can create an image with is a hard error, not
+    /// an `Unlisted` wave-through: the wave-through exists for incomplete enumeration, not for
+    /// a modifier that genuinely is not there.
+    #[test]
+    fn refuses_a_modifier_that_does_not_exist() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping: no Vulkan device");
+            return;
+        };
+        if gpu
+            .modifier_features(vk::Format::B8G8R8A8_UNORM, LINEAR)
+            .is_none()
+        {
+            eprintln!("skipping: driver enumerates no modifiers at all, so nothing to contrast");
+            return;
+        }
+
+        // Vendor 0xff is unassigned, so no driver backs this.
+        let bogus = 0xff00_0000_0000_0001;
+        assert!(
+            gpu.modifier_features(vk::Format::B8G8R8A8_UNORM, bogus)
+                .is_none(),
+            "the bogus modifier turned out to be real; pick another",
+        );
+
+        let res = gpu.check_modifier_features(
+            vk::Format::B8G8R8A8_UNORM,
+            bogus,
+            vk::FormatFeatureFlags::BLIT_DST,
+        );
+        assert!(res.is_err(), "accepted a modifier no device can import");
     }
 }

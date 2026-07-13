@@ -70,12 +70,32 @@ fn drm_modifiers(gpu: &Gpu, format: vk::Format, label: &str) {
     eprintln!("  {label}: {count} DRM modifiers");
     for m in &buf {
         let f = m.drm_format_modifier_tiling_features;
+        let bits = [
+            (vk::FormatFeatureFlags::SAMPLED_IMAGE, "sampled"),
+            (
+                vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+                "sampled_linear",
+            ),
+            (vk::FormatFeatureFlags::COLOR_ATTACHMENT, "color_attachment"),
+            (
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+                "color_attachment_blend",
+            ),
+            (vk::FormatFeatureFlags::BLIT_SRC, "blit_src"),
+            (vk::FormatFeatureFlags::BLIT_DST, "blit_dst"),
+            (vk::FormatFeatureFlags::TRANSFER_SRC, "transfer_src"),
+            (vk::FormatFeatureFlags::TRANSFER_DST, "transfer_dst"),
+        ];
+        let have: Vec<_> = bits
+            .iter()
+            .filter(|(bit, _)| f.contains(*bit))
+            .map(|(_, name)| *name)
+            .collect();
         eprintln!(
-            "    modifier {:#018x}  planes={}  sampled={} color_attachment={}",
+            "    modifier {:#018x}  planes={}  {}",
             m.drm_format_modifier,
             m.drm_format_modifier_plane_count,
-            f.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE),
-            f.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
+            have.join(" "),
         );
     }
 }

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
 use ash::vk;
 use niri_vk::blur::BlurChain;
-use niri_vk::gpu::{DeviceSelector, Gpu};
+use niri_vk::gpu::{DeviceSelector, Gpu, ModifierSupport};
 use niri_vk::render::{
     load_module, sampler_set_layout, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush,
     ResizePush, ShadowPush, COLOR_RANGE,
@@ -167,6 +167,11 @@ pub struct VulkanRenderer {
     /// reuses or drops it; pipelined present would need per-texture fence tracking + deferred
     /// destruction here.
     dmabuf_import_cache: HashMap<WeakDmabuf, VkTexture>,
+
+    /// `(format, modifier)` pairs we have already warned about being absent from the driver's
+    /// modifier list. See [`Self::check_modifier`] — the warning is per pair, not per import,
+    /// since a buffer pool cycling through the caches would otherwise reprint it forever.
+    warned_modifiers: HashSet<(vk::Format, u64)>,
 
     /// Cache-hit client dmabuf-imports awaiting their re-acquire barrier (Part 2: fold the barrier
     /// into the frame submit instead of a per-commit standalone submit + fence-wait). Populated on
@@ -378,6 +383,7 @@ impl VulkanRenderer {
             readback_staging_allocs: 0,
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
+            warned_modifiers: HashSet::new(),
             pending_dmabuf_acquires: Vec::new(),
         })
     }
@@ -619,6 +625,21 @@ impl VulkanRenderer {
             }
             return Ok(tex);
         }
+        // Client buffers are the imports most likely to arrive on a modifier we have never seen, so
+        // this is the check's widest exposure. A linear sampler is gated on its own feature bit,
+        // not on SAMPLED_IMAGE — and we require it unconditionally rather than only when
+        // `filter` is linear today: the import is cached per buffer, not per filter, so a
+        // texture imported under NEAREST keeps its cached sampler (and skips this check) if
+        // `upscale_filter` later flips to LINEAR. A conditional requirement would quietly
+        // stop guarding at exactly that moment.
+        self.check_modifier(
+            format.code,
+            vk_format,
+            format.modifier.into(),
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "client buffer",
+        )?;
         let tex = NiriTexture::import_dmabuf_sampled(
             &self.gpu,
             self.command_pool,
@@ -1034,8 +1055,8 @@ impl Bind<Dmabuf> for VulkanRenderer {
     /// Bind a (GBM-allocated) dmabuf as a render target — the KMS-scanout path (Stage 3). Imports
     /// the dmabuf's memory as a `VkImage`; a frame then renders into it (directly for RGBA-order
     /// buffers, or via a shadow + present-blit for `Argb8888`/`Xrgb8888` planes) so a display
-    /// controller can scan it out. A fresh import per bind (no cache yet — a follow-up); the
-    /// returned framebuffer owns the import(s) and frees them on drop.
+    /// controller can scan it out. The import is cached per buffer (`dmabuf_target_cache`) — a
+    /// fresh import per bind exhausts the host blob pool on Venus.
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<VkFramebuffer<'a>, VulkanError> {
         self.import_dmabuf_target(target)
     }
@@ -1081,6 +1102,23 @@ impl VulkanRenderer {
             let buffer = match self.cached_dmabuf_target(dmabuf) {
                 Some(buffer) => buffer,
                 None => {
+                    // We draw into it with the blending pipelines, and read it back either by copy
+                    // (same byte order) or by blit (`copy_framebuffer` converting to the other
+                    // order).
+                    const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+                        vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+                            | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+                    );
+                    self.check_modifier(
+                        fourcc,
+                        IMAGE_VK_FORMAT,
+                        modifier,
+                        vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                            | vk::FormatFeatureFlags::TRANSFER_SRC
+                            | vk::FormatFeatureFlags::BLIT_SRC,
+                        "scanout target",
+                    )?;
                     let tex = NiriTexture::import_dmabuf_render_target(
                         &self.gpu,
                         w,
@@ -1090,7 +1128,7 @@ impl VulkanRenderer {
                         stride,
                         modifier,
                         IMAGE_VK_FORMAT,
-                        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+                        USAGE,
                         filter,
                     )?;
                     let framebuffer = self.dmabuf_framebuffer(&tex, w, h)?;
@@ -1121,6 +1159,25 @@ impl VulkanRenderer {
         let present = match self.cached_dmabuf_target(dmabuf) {
             Some(present) => present,
             None => {
+                // TRANSFER_DST for the blit; TRANSFER_SRC so the scanout buffer can be read back
+                // (ExportMem / the scanout test). It is never a render-pass attachment — the shadow
+                // is — so it needs no COLOR_ATTACHMENT.
+                const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+                    vk::ImageUsageFlags::TRANSFER_DST.as_raw()
+                        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+                );
+                // BLIT_DST is the bit this whole check exists for: the present blit is a
+                // `vkCmdBlitImage` into a modifier-tiled image, and only the modifier's features
+                // say whether that is defined. Readback of the scanout buffer needs the other two.
+                self.check_modifier(
+                    fourcc,
+                    present_format,
+                    modifier,
+                    vk::FormatFeatureFlags::BLIT_DST
+                        | vk::FormatFeatureFlags::TRANSFER_SRC
+                        | vk::FormatFeatureFlags::BLIT_SRC,
+                    "present-blit target",
+                )?;
                 let present_tex = NiriTexture::import_dmabuf_render_target(
                     &self.gpu,
                     w,
@@ -1130,11 +1187,7 @@ impl VulkanRenderer {
                     stride,
                     modifier,
                     present_format,
-                    // TRANSFER_DST for the blit; TRANSFER_SRC so the scanout buffer can be read
-                    // back (ExportMem / the scanout test).
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    USAGE,
                     filter,
                 )?;
                 let present =
@@ -1173,6 +1226,44 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn dmabuf_import_cache_len(&self) -> usize {
         self.dmabuf_import_cache.len()
+    }
+
+    /// Refuse to import a dmabuf whose DRM modifier cannot support the commands we will record
+    /// against it.
+    ///
+    /// An image with `DRM_FORMAT_MODIFIER_EXT` tiling takes its format features from the modifier,
+    /// and *none* of them are mandated by the spec — so the `BLIT_DST` that `R8G8B8A8_UNORM` is
+    /// guaranteed at `OPTIMAL` tiling is only ever a promise the driver chose to make about a
+    /// modifier. `required` therefore has to come from the commands (a blit needs `BLIT_DST`, a
+    /// copy needs the unrelated `TRANSFER_DST`), never from the image's usage flags, which gate
+    /// creation and nothing else.
+    ///
+    /// Failing here means no picture, which is the point: the alternative to a legible error at
+    /// import is undefined pixels, or a device loss several frames later with no way back to the
+    /// cause. A modifier the driver never enumerated is the one soft case — see
+    /// [`ModifierSupport::Unlisted`].
+    fn check_modifier(
+        &mut self,
+        fourcc: Fourcc,
+        format: vk::Format,
+        modifier: u64,
+        required: vk::FormatFeatureFlags,
+        role: &str,
+    ) -> Result<(), VulkanError> {
+        let support = self
+            .gpu
+            .check_modifier_features(format, modifier, required)
+            .map_err(|e| VulkanError::Other(format!("{role} ({fourcc:?}): {e:#}")))?;
+
+        if support == ModifierSupport::Unlisted && self.warned_modifiers.insert((format, modifier))
+        {
+            warn!(
+                "{role}: this driver enumerates no DRM modifiers for {fourcc:?}, so we cannot \
+                 confirm that modifier {modifier:#018x} supports {required:?}; importing anyway, \
+                 but if the image comes out wrong this is the first thing to suspect"
+            );
+        }
+        Ok(())
     }
 
     /// Record every queued client-dmabuf re-acquire barrier into `cbuf` (a frame's command buffer),
