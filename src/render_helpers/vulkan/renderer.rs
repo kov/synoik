@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use niri_vk::blur::BlurChain;
-use niri_vk::gpu::Gpu;
+use niri_vk::gpu::{DeviceSelector, Gpu};
 use niri_vk::render::{
     load_module, sampler_set_layout, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush,
     ResizePush, ShadowPush, COLOR_RANGE,
@@ -171,9 +171,23 @@ struct ShadowEntry {
 
 impl VulkanRenderer {
     /// Bring up a fresh device (Venus/lavapipe depending on `VK_DRIVER_FILES`) and build the
-    /// renderer. Returns an error (rather than panicking) if no usable Vulkan device is present.
+    /// renderer, picking the best device by type rank. Returns an error (rather than panicking) if
+    /// no usable Vulkan device is present.
+    ///
+    /// For headless and test use. A real session must go through [`Self::for_drm_render_node`], so
+    /// that we render on the device we advertise to clients.
     pub fn new() -> Result<Self, VulkanError> {
         let gpu = Arc::new(Gpu::new()?);
+        Self::with_gpu(gpu)
+    }
+
+    /// Bring up the renderer on the device backing this DRM **render** node — the one we advertise
+    /// to clients in dmabuf feedback, and therefore the one their buffers will be allocated for.
+    pub fn for_drm_render_node(major: u32, minor: u32) -> Result<Self, VulkanError> {
+        let gpu = Arc::new(Gpu::with_selector(DeviceSelector::DrmRenderNode {
+            major,
+            minor,
+        })?);
         Self::with_gpu(gpu)
     }
 

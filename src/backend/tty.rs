@@ -507,14 +507,19 @@ impl Tty {
         }
         info!("using as the render node: {node_path}");
 
-        // Bring up the owned Vulkan renderer if requested. It self-enumerates its device (the
-        // single virtio-gpu on our target VM), independent of the GLES `gpu_manager`. GBM
-        // buffers allocated by `device.allocator` are imported into it via `Bind<Dmabuf>`
-        // for scanout.
+        // Bring up the owned Vulkan renderer if requested, on the device backing the primary render
+        // node — the same node we advertise to clients in dmabuf feedback, so their buffers are
+        // allocated for the device we actually render on. (Picking by device-type rank instead,
+        // as this used to, happens to agree on a single-GPU machine and silently disagrees on any
+        // other.) GBM buffers allocated by `device.allocator` are imported into it via
+        // `Bind<Dmabuf>` for scanout.
         #[cfg(feature = "vulkan")]
         let vulkan_renderer = if renderer == crate::backend::RendererKind::Vulkan {
-            let vk = crate::render_helpers::vulkan::VulkanRenderer::new()
-                .context("error creating the Vulkan renderer")?;
+            let vk = crate::render_helpers::vulkan::VulkanRenderer::for_drm_render_node(
+                primary_render_node.major(),
+                primary_render_node.minor(),
+            )
+            .context("error creating the Vulkan renderer")?;
             info!("using the owned Vulkan renderer for the TTY backend");
             Some(vk)
         } else {
