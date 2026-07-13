@@ -1057,14 +1057,16 @@ impl VulkanRenderer {
         self.pending_dmabuf_acquires.len()
     }
 
-    /// A render-pass framebuffer over `tex`'s view, for a `w`×`h` scanout/shadow target.
-    /// The reused present-blit shadow sized `w`×`h`, (re)allocating it only when the cached one is
-    /// absent or a different size. Returns an `Arc`-clone: the caller's [`VkFramebuffer`] holds one
-    /// reference and the renderer's cache the other, so dropping the frame does not free the image
-    /// — it is reused next frame. This keeps `bind` from allocating a full-screen device image
-    /// every frame (the memory churn that aborts Venus under sustained rendering). Safe because
-    /// rendering is synchronous (`finish` CPU-waits), so the shadow is never read/written by
-    /// two frames at once.
+    /// The reused present-blit shadow sized `w`×`h`, allocating one only when no shadow of that
+    /// size is cached. Returns an `Arc`-clone: the caller's [`VkFramebuffer`] holds one reference
+    /// and the renderer's cache the other, so dropping the frame does not free the image — it is
+    /// reused next frame, and an eviction here cannot pull an image out from under a live frame.
+    ///
+    /// This keeps `bind` from allocating a target-sized device image every frame (the memory churn
+    /// that aborts Venus under sustained rendering). Safe because rendering is synchronous
+    /// (`finish` CPU-waits), so no shadow is read or written by two frames at once — including
+    /// the shadow two *different* consumers of the same size share. See
+    /// [`Self::present_blit_shadows`].
     fn present_blit_shadow_for(
         &mut self,
         w: u32,
@@ -1096,6 +1098,10 @@ impl VulkanRenderer {
 
         // Evict the least-recently-used shadow first, so a churn of new sizes stays bounded. Only
         // ever over the cap by one (we insert one per miss), so a single eviction suffices.
+        //
+        // Evicting a size that is still bound every frame would put us back to reallocating it on
+        // the next frame — the churn this cache exists to prevent — so say so: if this logs every
+        // frame, more than `MAX_PRESENT_BLIT_SHADOWS` sizes are live and the cap is too low.
         if self.present_blit_shadows.len() >= MAX_PRESENT_BLIT_SHADOWS {
             if let Some(&lru) = self
                 .present_blit_shadows
@@ -1103,6 +1109,10 @@ impl VulkanRenderer {
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(size, _)| size)
             {
+                debug!(
+                    "evicting the {}x{} present-blit shadow to make room for {w}x{h}",
+                    lru.0, lru.1,
+                );
                 self.present_blit_shadows.remove(&lru);
             }
         }

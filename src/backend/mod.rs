@@ -120,8 +120,11 @@ impl Backend {
 
     /// Run `f` with the owned Vulkan renderer if this backend composites through it, else `None`.
     /// The dual of [`Self::with_primary_renderer`] (which yields the always-GLES primary renderer)
-    /// for owned-renderer-only setup such as installing custom animation shaders. Only the Tty
-    /// backend on the Vulkan path has one.
+    /// for owned-renderer-only setup such as installing custom animation shaders.
+    ///
+    /// Must yield a renderer for every backend [`Self::using_vulkan`] reports true for: the capture
+    /// paths dispatch on that flag and have no GLES fallback once it is set, so a backend that
+    /// claims Vulkan but hands out nothing here silently loses screencast and screencopy.
     #[cfg(feature = "vulkan")]
     pub fn with_vulkan_renderer<T>(
         &mut self,
@@ -129,7 +132,8 @@ impl Backend {
     ) -> Option<T> {
         match self {
             Backend::Tty(tty) => tty.with_vulkan_renderer(f),
-            _ => None,
+            Backend::Headless(headless) => headless.with_vulkan_renderer(f),
+            Backend::Winit(_) => None,
         }
     }
 

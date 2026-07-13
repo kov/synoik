@@ -1074,8 +1074,18 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
         // Copy only the regions this frame touched (`present_damage`); the cycled dmabuf already
         // holds the rest from its own age-N-ago presentation. Clamp to the image and dedup exact
-        // duplicates (many elements can share one damage rect). An empty set (nothing
-        // drawn/cleared) falls back to a whole-frame copy.
+        // duplicates (many elements can share one damage rect).
+        //
+        // An empty set means this frame drew nothing, so copy nothing: the shadow is shared between
+        // every present-blit target of the same size (scanout, a screencast buffer, a screencopy
+        // region — see `present_blit_shadows`), and a whole-frame fallback here would copy whatever
+        // the *previous* consumer rendered into this one's buffer. Leaving the target untouched is
+        // also just what "nothing was drawn" means for a cycled buffer.
+        //
+        // Returning skips the layout transitions below, which keeps `present.layout()` accurate (it
+        // is only advanced when we actually blit). A never-blitted buffer therefore stays
+        // `UNDEFINED` — fine, because a buffer we have not rendered into before is age-0, which
+        // damages the full frame and so never lands here.
         let mut rects: Vec<vk::Rect2D> = self
             .present_damage
             .iter()
@@ -1096,13 +1106,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         rects.sort_unstable_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
         rects.dedup_by_key(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height));
         if rects.is_empty() {
-            rects.push(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: w,
-                    height: h,
-                },
-            });
+            return;
         }
         let blits: Vec<vk::ImageBlit> = rects
             .iter()

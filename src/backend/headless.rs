@@ -189,9 +189,10 @@ impl Headless {
         }
     }
 
-    /// Test-only access to the owned Vulkan renderer, so a headless test can drive the real
-    /// `Niri::render`/`Niri::screenshot` path through it. Returns `None` for a GLES backend.
-    #[cfg(all(test, feature = "vulkan"))]
+    /// Access to the owned Vulkan renderer, so the capture paths (screencopy, screenshot) and the
+    /// headless tests can drive the real `Niri::render` through it. Returns `None` for a GLES
+    /// backend.
+    #[cfg(feature = "vulkan")]
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
