@@ -9,9 +9,7 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
-};
+use smithay::backend::renderer::{Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
@@ -399,7 +397,10 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
     .context("expected shm buffer, but didn't get one")?
 }
 
-pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+pub fn clear_dmabuf<R: NiriRenderer>(
+    renderer: &mut R,
+    mut dmabuf: Dmabuf,
+) -> anyhow::Result<SyncPoint> {
     let size = dmabuf.size();
     let size = size.to_logical(1, Transform::Normal).to_physical(1);
     let mut target = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;

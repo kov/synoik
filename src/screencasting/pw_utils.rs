@@ -39,9 +39,8 @@ use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::ExportMem;
+use smithay::backend::renderer::Offscreen;
 use smithay::output::{Output, OutputModeSource};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
@@ -51,6 +50,7 @@ use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
+use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf,
 };
@@ -1059,14 +1059,17 @@ impl Cast {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn dequeue_buffer_and_render(
+    pub fn dequeue_buffer_and_render<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
-        mut elements: &[CastRenderElement<GlesRenderer>],
-        cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
+        renderer: &mut R,
+        mut elements: &[CastRenderElement<R>],
+        cursor_data: &CursorData<CastRenderElement<R>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
-    ) -> bool {
+    ) -> bool
+    where
+        CastRenderElement<R>: RenderElement<R>,
+    {
         let mut inner = self.inner.borrow_mut();
 
         let CastState::Ready {
@@ -1173,7 +1176,7 @@ impl Cast {
         }
     }
 
-    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
+    pub fn dequeue_buffer_and_clear<R: NiriRenderer>(&mut self, renderer: &mut R) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1489,10 +1492,10 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
     }
 }
 
-unsafe fn add_cursor_metadata(
-    renderer: &mut GlesRenderer,
+unsafe fn add_cursor_metadata<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    renderer: &mut R,
     spa_buffer: *mut spa_buffer,
-    cursor_data: &CursorData<impl RenderElement<GlesRenderer>>,
+    cursor_data: &CursorData<impl RenderElement<R>>,
     redraw: bool,
 ) {
     unsafe {
@@ -1554,12 +1557,16 @@ unsafe fn add_cursor_metadata(
         //
         // Reliable buffers should be available starting from 1.6.0:
         // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/4885
+        // Read back as `Abgr8888` (byte order R,G,B,A) rather than the `Argb8888` (B,G,R,A) the
+        // bitmap wants: the owned Vulkan renderer only offers RGBA-order offscreens, so asking for
+        // a BGRA-order one fails outright and the cursor silently disappears from the stream. Both
+        // renderers read RGBA back fine, so take that one path and swizzle below.
         let mapping = match render_and_download(
             renderer,
             size,
             cursor_data.scale,
             Transform::Normal,
-            Fourcc::Argb8888,
+            Fourcc::Abgr8888,
             cursor_data.relocated.iter().rev(),
         ) {
             Ok(mapping) => mapping,
@@ -1576,11 +1583,39 @@ unsafe fn add_cursor_metadata(
             }
         };
 
-        bitmap_slice[..pixels.len()].copy_from_slice(pixels);
+        // R,G,B,A -> B,G,R,A, the `CURSOR_FORMAT` (`SPA_VIDEO_FORMAT_BGRA`) the bitmap declares.
+        swizzle_rgba_to_bgra(&mut bitmap_slice[..pixels.len()], pixels);
 
         // Fill the metadata now that everything succeeded.
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
+    }
+}
+
+/// Copy an RGBA-order cursor readback into a BGRA-order SPA bitmap, swapping the red and blue
+/// channels. Split out as a plain function so the byte order is pinned by a test rather than by
+/// eyeballing a live stream — a swapped cursor reads as "blue-ish", which is easy to miss.
+///
+/// Both slices are tightly packed 8-bit RGBA/BGRA and the same length; a trailing partial pixel
+/// (which cannot happen for a `w * h * 4` readback) is left alone.
+fn swizzle_rgba_to_bgra(dst: &mut [u8], src: &[u8]) {
+    for (dst, src) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swizzle_rgba_to_bgra_swaps_red_and_blue() {
+        // Opaque red, then half-alpha blue: distinct in every channel, so a no-op copy, a reversed
+        // copy (which would also move alpha) and a correct swizzle all disagree.
+        let src = [255, 0, 0, 255, 0, 0, 255, 128];
+        let mut dst = [0u8; 8];
+        swizzle_rgba_to_bgra(&mut dst, &src);
+        assert_eq!(dst, [0, 0, 255, 255, 255, 0, 0, 128]);
     }
 }

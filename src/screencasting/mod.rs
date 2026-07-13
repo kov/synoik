@@ -9,7 +9,8 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::Offscreen;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
@@ -19,6 +20,7 @@ use zbus::object_server::SignalEmitter;
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
+use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
@@ -532,12 +534,14 @@ impl Niri {
         }
     }
 
-    pub fn render_for_screen_cast(
+    pub fn render_for_screen_cast<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        CastRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_for_screen_cast");
 
         let weak = output.downgrade();
@@ -620,12 +624,14 @@ impl Niri {
         }
     }
 
-    pub fn render_windows_for_screen_cast(
+    pub fn render_windows_for_screen_cast<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut R,
         output: &Output,
         target_presentation_time: Duration,
-    ) {
+    ) where
+        CastRenderElement<R>: RenderElement<R>,
+    {
         let _span = tracy_client::span!("Niri::render_windows_for_screen_cast");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
