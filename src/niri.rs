@@ -4919,6 +4919,7 @@ impl Niri {
         let state = self.output_state.get(output).unwrap();
         let xray = &state.xray;
         let layer_map = layer_map_for_output(output);
+        let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
 
         // FIXME: it would be cool to call this code on-demand. It's even relatively simple to do:
         // move this function to after the render_inner() call, check if
@@ -4934,6 +4935,8 @@ impl Niri {
 
         let mut buffer = xray.background[ctx.target as usize].borrow_mut();
         {
+            let buf_logical = buffer.logical_size();
+            let buf_scale = buffer.scale();
             let elements = buffer.elements();
             elements.clear();
             self.render_layer_normal(
@@ -4944,6 +4947,19 @@ impl Niri {
                 XrayPos::default(),
                 false,
                 &mut |elem| elements.push(elem.into()),
+            );
+            // In GNOME (Floating) mode the wallpaper is drawn in-compositor rather than as a
+            // layer-shell background surface, so `render_layer_normal` above doesn't pick it up.
+            // Bake it into the output-sized background buffer, filling it at the origin (the
+            // XrayElement applies the per-window mapping and corner clip when sampling), pushed
+            // last so it sits below the background-layer surfaces — matching `render_inner`.
+            push_gnome_wallpaper_into_xray(
+                gnome_mode,
+                &self.wallpaper,
+                ctx.renderer,
+                buf_logical,
+                buf_scale,
+                elements,
             );
             // Avoid unused capacity remaining forever.
             elements.shrink_to_fit();
@@ -4985,9 +5001,12 @@ impl Niri {
         let state = self.output_state.get(output).unwrap();
         let xray = &state.xray;
         let layer_map = layer_map_for_output(output);
+        let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
 
         let mut buffer = xray.background[ctx.target as usize].borrow_mut();
         {
+            let buf_logical = buffer.logical_size();
+            let buf_scale = buffer.scale();
             let elements = buffer.elements_vulkan();
             elements.clear();
             self.render_layer_normal(
@@ -4998,6 +5017,17 @@ impl Niri {
                 XrayPos::default(),
                 false,
                 &mut |elem| elements.push(elem.into()),
+            );
+            // As in `fill_xray_elements`: bake the in-compositor GNOME wallpaper into the
+            // background buffer (through the Vulkan arm's element storage) so the owned Vulkan
+            // renderer's xray samples the wallpaper behind translucent windows.
+            push_gnome_wallpaper_into_xray(
+                gnome_mode,
+                &self.wallpaper,
+                ctx.renderer,
+                buf_logical,
+                buf_scale,
+                elements,
             );
             // Avoid unused capacity remaining forever.
             elements.shrink_to_fit();
@@ -7314,6 +7344,42 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Bake the in-compositor GNOME wallpaper into an xray
+/// [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)'s element list.
+///
+/// In GNOME (Floating) mode the wallpaper is drawn directly by `render_inner`, not as a layer-shell
+/// background surface, so `render_layer_normal(Layer::Background)` — which fills the xray buffers —
+/// never sees it. Without this the xray/blur samples an empty buffer and shows only the flat
+/// `bg_color`. We fill the output-sized buffer at its origin with `zoom = 1` (the `XrayElement`
+/// applies the per-window mapping and rounded clip when it samples), pushed last so the wallpaper
+/// sits below the background-layer surfaces, matching `render_inner`'s draw order.
+/// Renderer-agnostic via [`Wallpaper::render_dual`], so both fill paths (GLES and the owned Vulkan
+/// arm) share it.
+fn push_gnome_wallpaper_into_xray<R: NiriRenderer>(
+    gnome_mode: bool,
+    wallpaper: &Wallpaper,
+    renderer: &mut R,
+    buf_logical: Size<f64, Logical>,
+    buf_scale: Scale<f64>,
+    elements: &mut Vec<OutputRenderElements<R>>,
+) {
+    if !gnome_mode {
+        return;
+    }
+
+    // Radius 0: the buffer holds the raw wallpaper; the sampling `XrayElement` does the rounded
+    // clip itself.
+    let Some(elem) = wallpaper.render_dual(renderer, buf_logical, 0., buf_scale) else {
+        return;
+    };
+    // Wrap into the same `CropRenderElement<Relocate<Rescale<…>>>` the on-screen path builds, but
+    // as a no-op transform (zoom 1, origin) that only crops to the buffer bounds.
+    if let Some(elem) = scale_relocate_crop(elem, buf_scale, 1., Rectangle::from_size(buf_logical))
+    {
+        elements.push(elem.into());
+    }
 }
 
 fn scale_relocate_crop<E: Element>(
