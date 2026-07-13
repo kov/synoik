@@ -453,9 +453,9 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
     );
 }
 
-/// The screen-transition crossfade captures the screen through GLES (which the owned Vulkan
-/// renderer can't sample), so on a Vulkan session it uploads that neutral capture to a `VkTexture`
-/// for the Output target. Freeze a green-window screen, recolor the live window red, then composite
+/// The screen-transition crossfade holds GLES textures (which the owned Vulkan renderer can't
+/// sample), so on a Vulkan session it uploads a renderer-neutral capture to a `VkTexture` instead —
+/// one per render target. Freeze a green-window screen, recolor the live window red, then composite
 /// the Output target through Vulkan: the frozen green frame must draw and occlude the live red
 /// window (a blank no-op overlay — the old behavior — would leak the live red window through
 /// instead).
@@ -501,9 +501,8 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
         "screen transition must be active after DoScreenTransition"
     );
 
-    // The Output target must take the Vulkan upload path; the screencast/screen-capture targets
-    // keep the GLES texture (a degraded no-op on the Vulkan renderer — in production they
-    // render through GLES, so only Output needs the upload).
+    // *Every* target must take the Vulkan upload path. The Gles arm draws nothing on the owned
+    // renderer, so a target that fell through to it would crossfade from a blank screen.
     {
         let state = f.niri_state();
         state
@@ -516,20 +515,20 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
                     .values()
                     .find_map(|s| s.screen_transition.as_ref())
                     .expect("active transition");
-                assert!(
-                    matches!(
-                        transition.render(vk, RenderTarget::Output),
-                        DualTextureRenderElement::Vulkan(_)
-                    ),
-                    "Output target did not upload the capture to a VkTexture"
-                );
-                assert!(
-                    matches!(
-                        transition.render(vk, RenderTarget::ScreenCapture),
-                        DualTextureRenderElement::Gles(_)
-                    ),
-                    "ScreenCapture target should keep the GLES texture"
-                );
+                for target in [
+                    RenderTarget::Output,
+                    RenderTarget::Screencast,
+                    RenderTarget::ScreenCapture,
+                ] {
+                    assert!(
+                        matches!(
+                            transition.render(vk, target),
+                            DualTextureRenderElement::Vulkan(_)
+                        ),
+                        "{target:?} did not upload the capture to a VkTexture; the Gles arm it \
+                         fell through to draws nothing on Vulkan"
+                    );
+                }
             })
             .expect("headless backend must hold a Vulkan renderer");
     }
@@ -558,6 +557,81 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     assert!(
         red < 100,
         "the live red window leaked through the frozen transition ({red} red px)"
+    );
+}
+
+/// The frozen screen-transition frame must also draw into a **screencast**, not just on screen.
+///
+/// `ScreenTransition::render` had a neutral for the `Output` target only; the other targets fell
+/// through to a `DualTextureRenderElement::Gles`, which is a silent no-op on the owned renderer. So
+/// on a Vulkan session a cast running across a screen transition showed *nothing* where the frozen
+/// screen should be — and, worse, the live window straight through it. Neutrals are now captured
+/// per target.
+///
+/// Same shape as `vulkan_screen_transition_draws_the_captured_frame`, but compositing Screencast.
+#[test]
+fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!(
+            "skipping vulkan_screen_transition_draws_the_captured_frame_into_a_cast: no Vulkan device"
+        );
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+
+    // Freeze the green-window screen into a transition (delay 0 → alpha ≈ 1, fully the capture).
+    f.niri_state()
+        .do_action(Action::DoScreenTransition(Some(0)), false);
+
+    // Recolor the live window red. The frozen transition still holds the green capture.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(RED[0], RED[1], RED[2], RED[3]);
+    window.commit();
+    f.double_roundtrip(id);
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!(
+        "vulkan_screen_transition_draws_the_captured_frame_into_a_cast: {green} green px, {red} red px"
+    );
+    assert!(
+        green > 0,
+        "the frozen transition frame is missing from the screencast; the Screencast target fell \
+         through to the GLES element, which draws nothing on Vulkan"
+    );
+    assert!(
+        red < 100,
+        "the live red window leaked into the cast through the frozen transition ({red} red px)"
     );
 }
 
@@ -609,9 +683,9 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
             .expect("headless backend must hold a Vulkan renderer")
     };
 
-    let neutral = neutrals
+    let neutral = &neutrals
         .get(&output)
-        .expect("no Vulkan-captured neutral for the output");
+        .expect("no Vulkan-captured neutral for the output")[RenderTarget::Output as usize];
     let (w, h) = (neutral.size().w, neutral.size().h);
     assert_eq!(
         (w, h),

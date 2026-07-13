@@ -198,9 +198,10 @@ use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
-/// The render targets a frozen screen is captured for, in `RenderTarget as usize` order — so a
-/// `[T; RenderTarget::COUNT]` can be indexed by target.
-const SCREENSHOT_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
+/// Every render target, in `RenderTarget as usize` order — so a `[T; RenderTarget::COUNT]` built
+/// by mapping over this can be indexed by target. A frozen screen (screenshot UI, screen
+/// transition) must be captured once per target, since block-out rules key off the target.
+const ALL_RENDER_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
     RenderTarget::Output,
     RenderTarget::Screencast,
     RenderTarget::ScreenCapture,
@@ -6102,7 +6103,7 @@ impl Niri {
 
                 // One capture per target, not just `Output`: the frozen screen is drawn into
                 // screencasts and screen captures too, and those targets differ (block-out rules).
-                let neutrals = SCREENSHOT_TARGETS.map(|target| ScreenshotNeutral {
+                let neutrals = ALL_RENDER_TARGETS.map(|target| ScreenshotNeutral {
                     screen: self.capture_screenshot_screen_neutral(renderer, &output, target),
                     pointer: pointer.clone(),
                 });
@@ -6238,7 +6239,7 @@ impl Niri {
                 let size = transform.transform_size(size);
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
-                let screenshot = SCREENSHOT_TARGETS.map(|target| {
+                let screenshot = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
                         renderer,
                         target,
@@ -7080,7 +7081,12 @@ impl Niri {
     /// target through the owned renderer (which can't sample a GLES texture), so it uploads this
     /// buffer to a `VkTexture`; capturing it through the Vulkan renderer keeps that path off GLES.
     /// Generic so it serves both the Vulkan capture and the GLES fallback.
-    fn capture_output_neutral<R>(&self, renderer: &mut R, output: &Output) -> Option<MemoryBuffer>
+    fn capture_output_neutral<R>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        target: RenderTarget,
+    ) -> Option<MemoryBuffer>
     where
         R: NiriRenderer + Offscreen<R::NiriTextureId>,
         R::NiriError: Send + Sync + 'static,
@@ -7092,7 +7098,7 @@ impl Niri {
 
         let ctx = RenderCtx {
             renderer,
-            target: RenderTarget::Output,
+            target,
             xray: None,
         };
         let elements = self.render_to_vec(ctx, output, false);
@@ -7118,22 +7124,30 @@ impl Niri {
         }
     }
 
-    /// Vulkan pass for [`Self::do_screen_transition`]: capture every output's `Output`-target
-    /// neutral buffer through the owned Vulkan renderer (so the crossfade needs no GLES), keyed by
-    /// output. `do_screen_transition` (the GLES pass) consumes the map; outputs whose Vulkan
-    /// capture failed are absent and fall back to the GLES capture there.
+    /// Vulkan pass for [`Self::do_screen_transition`]: capture every output's frozen screen through
+    /// the owned Vulkan renderer (so the crossfade needs no GLES), keyed by output.
+    ///
+    /// One neutral per render target: block-out rules key off the target, so the buffer the
+    /// crossfade shows a screencast must not be the one it shows the output. An output is only
+    /// entered if all of its targets captured; a partial entry would silently crossfade from
+    /// nothing on the missing targets.
     #[cfg(feature = "vulkan")]
     pub fn capture_screen_transition_neutrals(
         &mut self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
-    ) -> std::collections::HashMap<Output, MemoryBuffer> {
+    ) -> std::collections::HashMap<Output, [MemoryBuffer; RenderTarget::COUNT]> {
         self.update_render_elements(None);
         let outputs: Vec<Output> = self.output_state.keys().cloned().collect();
         outputs
             .into_iter()
             .filter_map(|output| {
-                let neutral = self.capture_output_neutral(renderer, &output)?;
-                Some((output, neutral))
+                let neutrals = ALL_RENDER_TARGETS
+                    .map(|target| self.capture_output_neutral(renderer, &output, target));
+                // Only keep the output if every target captured.
+                if neutrals.iter().any(Option::is_none) {
+                    return None;
+                }
+                Some((output, neutrals.map(Option::unwrap)))
             })
             .collect()
     }
@@ -7142,7 +7156,7 @@ impl Niri {
         &mut self,
         renderer: &mut GlesRenderer,
         using_vulkan: bool,
-        mut neutrals: std::collections::HashMap<Output, MemoryBuffer>,
+        mut neutrals: std::collections::HashMap<Output, [MemoryBuffer; RenderTarget::COUNT]>,
         delay_ms: Option<u16>,
     ) {
         let _span = tracy_client::span!("Niri::do_screen_transition");
@@ -7159,26 +7173,26 @@ impl Niri {
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
 
-                // On a Vulkan session the Output target composites through the owned renderer,
-                // which can't sample a GLES texture, so it uploads a renderer-neutral CPU capture
-                // to a VkTexture. That capture is taken through the Vulkan renderer up front (in
-                // `capture_screen_transition_neutrals`, the `neutrals` map); if it's missing for
-                // this output (the Vulkan capture failed), fall back to capturing through GLES
-                // here. Screencast/screen-capture still render through GLES.
-                let output_neutral = if using_vulkan {
-                    neutrals
-                        .remove(&output)
-                        .or_else(|| self.capture_output_neutral(renderer, &output))
+                // On a Vulkan session every target composites through the owned renderer, which
+                // can't sample a GLES texture, so it uploads a renderer-neutral CPU capture to a
+                // VkTexture instead. Those captures are taken through the Vulkan renderer up front
+                // (in `capture_screen_transition_neutrals`, the `neutrals` map); if they're missing
+                // for this output (the Vulkan capture failed), fall back to capturing through GLES
+                // here — the buffers are renderer-neutral either way.
+                let neutrals = if using_vulkan {
+                    neutrals.remove(&output).or_else(|| {
+                        let captured = ALL_RENDER_TARGETS
+                            .map(|target| self.capture_output_neutral(renderer, &output, target));
+                        if captured.iter().any(Option::is_none) {
+                            return None;
+                        }
+                        Some(captured.map(Option::unwrap))
+                    })
                 } else {
                     None
                 };
 
-                let targets = [
-                    RenderTarget::Output,
-                    RenderTarget::Screencast,
-                    RenderTarget::ScreenCapture,
-                ];
-                let textures = targets.map(|target| {
+                let textures = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
                         renderer,
                         target,
@@ -7218,7 +7232,7 @@ impl Niri {
                     )
                 });
 
-                Some((output, textures, output_neutral))
+                Some((output, textures, neutrals))
             })
             .collect();
 
@@ -7226,11 +7240,11 @@ impl Niri {
             Duration::from_millis(u64::from(d))
         });
 
-        for (output, from_texture, output_neutral) in textures {
+        for (output, from_texture, neutrals) in textures {
             let state = self.output_state.get_mut(&output).unwrap();
             state.screen_transition = Some(ScreenTransition::new(
                 from_texture,
-                output_neutral,
+                neutrals,
                 delay,
                 self.clock.clone(),
             ));
