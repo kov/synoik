@@ -359,6 +359,14 @@ first-class constraint on this work.
   structurally can't cross virtio).
 - **(4) cut over at parity; delete GLES/pango/cairo.**
 
+**Known gaps of the owned renderer vs GLES — see `docs/fork/renderer-gaps.md`.** Deleting GLES is
+**not** a one-way door: single-device / LINEAR-only / single-plane are configurations of the Vulkan
+renderer, not its architecture, and Smithay's multi-GPU machinery is GLES-typed top to bottom, so
+keeping it would buy no head start on a Vulkan implementation. The gap that bites **first, and on
+every machine including the VM**, is not multi-GPU but **multi-planar dmabuf import (NV12/P010 →
+zero-copy hardware video decode)**; multi-GPU is bounded, mostly-mechanical work whose real cost is
+driver validation on bare metal we don't have.
+
 **HDR/wide-gamut/color-management stays deferred** — an industry-wide moving target
 (cosmic-comp's own Vulkan/HDR work is Epoch 2–3, 2026–27), and Vulkan alone ≠ HDR (color-mgmt
 is still WIP upstream). **Night Light is cheap and mostly reusable**: consume `gsd-color`'s
