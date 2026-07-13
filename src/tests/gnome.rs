@@ -2618,3 +2618,46 @@ fn panel_activities_click_toggles_overview() {
         "Activities must be unchecked once the overview closes"
     );
 }
+
+/// A client must not be able to kill the compositor with a malformed `wl_region`.
+///
+/// `wl_region.add` takes plain ints and the protocol does not forbid a negative extent, so clients
+/// send one: Firefox emits a `-1` height while being resized. Smithay fed it straight to `Size`,
+/// whose `debug_assert!` fired *inside* the libwayland request callback — a panic that cannot
+/// unwind, so it aborted the whole session. Any client could take the desktop down; this one did,
+/// by accident, on a window resize.
+///
+/// The compositor must instead ignore the empty rectangle and keep serving. Reaching the asserts
+/// below at all is the test: before the fix, the `roundtrip` aborts the process.
+#[test]
+fn negative_wl_region_does_not_kill_the_compositor() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(200, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Exactly what Firefox sent: a sane width, a negative height.
+    f.client(id).set_opaque_region(&surface, 0, 0, 997, -1);
+    f.double_roundtrip(id);
+
+    // Still alive, still serving this client, and the window is still mapped.
+    assert_eq!(
+        f.niri().layout.windows().count(),
+        1,
+        "the window must survive a negative opaque region",
+    );
+
+    // And a subsequent, well-formed region is still honoured.
+    f.client(id).set_opaque_region(&surface, 0, 0, 200, 200);
+    f.double_roundtrip(id);
+}

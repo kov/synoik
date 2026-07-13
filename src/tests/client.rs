@@ -31,6 +31,7 @@ use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -247,6 +248,17 @@ impl Client {
         self.state.window(surface)
     }
 
+    pub fn set_opaque_region(
+        &mut self,
+        surface: &WlSurface,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        self.state.set_opaque_region(surface, x, y, width, height)
+    }
+
     pub fn create_layer(
         &mut self,
         output: Option<&WlOutput>,
@@ -295,6 +307,27 @@ impl Client {
 }
 
 impl State {
+    /// Set an opaque region on `surface` built from one `wl_region.add` rectangle, then commit.
+    ///
+    /// `width`/`height` go on the wire verbatim, so a test can send a **negative** extent — which
+    /// the protocol permits and real clients do send (Firefox, while resizing). Used to pin that
+    /// the compositor survives it.
+    pub fn set_opaque_region(
+        &mut self,
+        surface: &WlSurface,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        let compositor = self.compositor.as_ref().unwrap();
+        let region = compositor.create_region(&self.qh, ());
+        region.add(x, y, width, height);
+        surface.set_opaque_region(Some(&region));
+        surface.commit();
+        region.destroy();
+    }
+
     pub fn create_window(&mut self) -> &mut Window {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
@@ -695,6 +728,19 @@ impl Dispatch<WlOutput, ()> for State {
             wl_output::Event::Description { .. } => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<WlRegion, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlRegion,
+        _event: <WlRegion as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
     }
 }
 
