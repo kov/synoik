@@ -1,4 +1,4 @@
-use std::{ptr, slice};
+use std::ptr;
 
 use anyhow::{ensure, Context as _};
 use niri_config::BlockOutFrom;
@@ -351,22 +351,21 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
 
-    // The shm pool wants `Xrgb8888` — BGRA byte order. GLES can read a framebuffer back in that
-    // order directly, but the owned Vulkan renderer only renders (and so only reads back) in RGBA
-    // order: asking it for a BGRA-order offscreen fails outright, which is what used to make every
-    // shm screencopy on a Vulkan session error out. Read RGBA back there and swizzle red/blue on
-    // the way into the pool. GLES keeps its straight copy — a per-frame swizzle of a full-screen
-    // buffer is not a cost worth imposing on the path that doesn't need it.
+    // The shm pool wants `Xrgb8888` — BGRA byte order, which is what we read back below on either
+    // renderer, straight into the pool.
+    //
+    // The *render target* still differs: GLES can render into a BGRA-order offscreen, while the
+    // owned Vulkan renderer's render pass is R8G8B8A8 and cannot. So ask each for the order it can
+    // actually render, and let the readback do the conversion — on Vulkan `copy_framebuffer` blits
+    // through a staging image of the requested format, so the channel swap happens on the GPU.
     #[cfg(feature = "vulkan")]
-    let swizzle = renderer.try_as_vulkan_renderer().is_some();
-    #[cfg(not(feature = "vulkan"))]
-    let swizzle = false;
-
-    let fourcc = if swizzle {
+    let render_fourcc = if renderer.try_as_vulkan_renderer().is_some() {
         Fourcc::Abgr8888
     } else {
         Fourcc::Xrgb8888
     };
+    #[cfg(not(feature = "vulkan"))]
+    let render_fourcc = Fourcc::Xrgb8888;
 
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
@@ -382,7 +381,7 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         );
 
         let mut texture =
-            create_texture(renderer, size, fourcc).context("error creating texture")?;
+            create_texture(renderer, size, render_fourcc).context("error creating texture")?;
         let mut target = renderer
             .bind(&mut texture)
             .context("error binding texture")?;
@@ -398,24 +397,16 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
             )
             .context("error rendering")?;
 
-        let mapping =
-            copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")?;
+        // Read back in the pool's own order on both renderers, so this is a straight copy.
+        let mapping = copy_framebuffer(renderer, &target, Fourcc::Xrgb8888)
+            .context("error copying framebuffer")?;
         let bytes = renderer
             .map_texture(&mapping)
             .context("error mapping texture")?;
 
-        if swizzle {
-            let _span = tracy_client::span!("swizzle_rgba_to_bgra");
-            // SAFETY: `shm_len` bytes of `shm_buffer` are mapped and exclusively ours inside
-            // `with_buffer_contents_mut`, and the `ensure!` above pins the layout as tightly
-            // packed 4-byte pixels, so it matches the readback byte for byte.
-            let shm = unsafe { slice::from_raw_parts_mut(shm_buffer.cast::<u8>(), shm_len) };
-            swizzle_rgba_to_bgra(shm, bytes);
-        } else {
-            unsafe {
-                let _span = tracy_client::span!("copy_nonoverlapping");
-                ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
-            }
+        unsafe {
+            let _span = tracy_client::span!("copy_nonoverlapping");
+            ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
         }
 
         Ok(())
