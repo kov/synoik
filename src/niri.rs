@@ -198,6 +198,14 @@ use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
+/// The render targets a frozen screen is captured for, in `RenderTarget as usize` order — so a
+/// `[T; RenderTarget::COUNT]` can be indexed by target.
+const SCREENSHOT_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
+    RenderTarget::Output,
+    RenderTarget::Screencast,
+    RenderTarget::ScreenCapture,
+];
+
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
@@ -6082,58 +6090,73 @@ impl Niri {
     pub fn capture_screenshot_neutrals(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
-    ) -> std::collections::HashMap<Output, ScreenshotNeutral> {
+    ) -> std::collections::HashMap<Output, [ScreenshotNeutral; RenderTarget::COUNT]> {
         let _span = tracy_client::span!("Niri::capture_screenshot_neutrals");
         self.global_space
             .outputs()
             .cloned()
             .map(|output| {
-                let size = output.current_mode().unwrap().size;
-                let transform = output.current_transform();
-                let size = transform.transform_size(size);
-                let scale = Scale::from(output.current_scale().fractional_scale());
-
-                let screen = {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target: RenderTarget::Output,
-                        xray: None,
-                    };
-                    let elements = self.render_to_vec(ctx, &output, false);
-                    let elements = elements.iter().rev();
-                    match render_to_vec(
-                        renderer,
-                        size,
-                        scale,
-                        Transform::Normal,
-                        Fourcc::Abgr8888,
-                        elements,
-                    ) {
-                        Ok(data) => {
-                            let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
-                            Some(MemoryBuffer::new(
-                                data,
-                                Fourcc::Abgr8888,
-                                buffer_size,
-                                scale,
-                                Transform::Normal,
-                            ))
-                        }
-                        Err(err) => {
-                            warn!(
-                                "error capturing screenshot neutral for {}: {err:?}",
-                                output.name()
-                            );
-                            None
-                        }
-                    }
-                };
-
+                // The pointer is the same on every target — a cursor is never blocked out — so
+                // capture it once. `MemoryBuffer` is `Arc`-shared, so the clones are cheap.
                 let pointer = self.capture_screenshot_pointer_neutral(renderer, &output);
 
-                (output, ScreenshotNeutral { screen, pointer })
+                // One capture per target, not just `Output`: the frozen screen is drawn into
+                // screencasts and screen captures too, and those targets differ (block-out rules).
+                let neutrals = SCREENSHOT_TARGETS.map(|target| ScreenshotNeutral {
+                    screen: self.capture_screenshot_screen_neutral(renderer, &output, target),
+                    pointer: pointer.clone(),
+                });
+
+                (output, neutrals)
             })
             .collect()
+    }
+
+    /// The screen half of [`Self::capture_screenshot_neutrals`], for one render target.
+    #[cfg(feature = "vulkan")]
+    fn capture_screenshot_screen_neutral(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+        output: &Output,
+        target: RenderTarget,
+    ) -> Option<MemoryBuffer> {
+        let size = output.current_mode().unwrap().size;
+        let size = output.current_transform().transform_size(size);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        let ctx = RenderCtx {
+            renderer,
+            target,
+            xray: None,
+        };
+        let elements = self.render_to_vec(ctx, output, false);
+        let elements = elements.iter().rev();
+        match render_to_vec(
+            renderer,
+            size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements,
+        ) {
+            Ok(data) => {
+                let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+                Some(MemoryBuffer::new(
+                    data,
+                    Fourcc::Abgr8888,
+                    buffer_size,
+                    scale,
+                    Transform::Normal,
+                ))
+            }
+            Err(err) => {
+                warn!(
+                    "error capturing {target:?} screenshot neutral for {}: {err:?}",
+                    output.name()
+                );
+                None
+            }
+        }
     }
 
     /// The pointer half of [`Self::capture_screenshot_neutrals`]: mirrors
@@ -6195,29 +6218,27 @@ impl Niri {
         &'a self,
         renderer: &'a mut GlesRenderer,
         using_vulkan: bool,
-        // On a Vulkan session, the Output-target neutrals captured up front through the owned
-        // renderer (`capture_screenshot_neutrals`), keyed by output. Consumed here; a missing
-        // output/field falls back to the GLES readback in `OutputScreenshot::from_textures`.
-        mut vk_neutrals: std::collections::HashMap<Output, ScreenshotNeutral>,
+        // On a Vulkan session, the per-target neutrals captured up front through the owned
+        // renderer (`capture_screenshot_neutrals`), keyed by output. Consumed here; a
+        // missing output/field falls back to the GLES readback in
+        // `OutputScreenshot::from_textures`.
+        mut vk_neutrals: std::collections::HashMap<
+            Output,
+            [ScreenshotNeutral; RenderTarget::COUNT],
+        >,
     ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a {
         self.global_space
             .outputs()
             .cloned()
             .filter_map(move |output| {
-                // Take this output's Vulkan neutrals; the closure below consumes the two fields for
-                // the Output target only (the other targets never get a Vulkan neutral).
+                // Take this output's Vulkan neutrals, one per render target.
                 let mut vk_neutral = vk_neutrals.remove(&output).unwrap_or_default();
                 let size = output.current_mode().unwrap().size;
                 let transform = output.current_transform();
                 let size = transform.transform_size(size);
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
-                let targets = [
-                    RenderTarget::Output,
-                    RenderTarget::Screencast,
-                    RenderTarget::ScreenCapture,
-                ];
-                let screenshot = targets.map(|target| {
+                let screenshot = SCREENSHOT_TARGETS.map(|target| {
                     let ctx = RenderCtx {
                         renderer,
                         target,
@@ -6265,17 +6286,16 @@ impl Niri {
                         res.ok()
                     };
 
-                    // Only the on-screen (Output) target composites through the owned Vulkan
-                    // renderer, so only it needs a renderer-neutral readback for re-upload.
-                    let capture_neutral = using_vulkan && target == RenderTarget::Output;
+                    // Every target composites through the owned Vulkan renderer — the frozen screen
+                    // is drawn into screencasts and screen captures, not just on screen — so each
+                    // one needs a renderer-neutral copy to re-upload.
+                    let capture_neutral = using_vulkan;
 
-                    // Hand the Output target its Vulkan-captured neutrals (if any); a `None` field
-                    // falls back to the GLES readback in `from_textures`.
-                    let (vk_neutral, vk_pointer_neutral) = if target == RenderTarget::Output {
-                        (vk_neutral.screen.take(), vk_neutral.pointer.take())
-                    } else {
-                        (None, None)
-                    };
+                    // Hand this target its Vulkan-captured neutrals (if any); a `None` field falls
+                    // back to the GLES readback in `from_textures`.
+                    let this = &mut vk_neutral[target as usize];
+                    let (vk_neutral, vk_pointer_neutral) =
+                        (this.screen.take(), this.pointer.take());
 
                     res_output.map(|(texture, _)| {
                         OutputScreenshot::from_textures(

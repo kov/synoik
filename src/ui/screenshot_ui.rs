@@ -118,7 +118,8 @@ pub struct OutputData {
 /// An output's on-screen (`Output`-target) screenshot neutrals captured through the owned Vulkan
 /// renderer up front, so [`OutputScreenshot::from_textures`] need not read them back through GLES.
 /// `screen` and `pointer` capture independently; a `None` field falls back to the GLES readback.
-/// Empty (via `Default`) on a GLES session and on non-`Output` targets.
+/// Captured once per render target (the frozen screen is drawn into screencasts and screen captures
+/// too, and those differ by block-out rules). Empty (via `Default`) on a GLES session.
 #[derive(Default)]
 pub struct ScreenshotNeutral {
     pub screen: Option<MemoryBuffer>,

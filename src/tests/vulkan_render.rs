@@ -429,7 +429,8 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
     let neutral = neutrals
         .get(&output)
         .expect("no Vulkan-captured neutral for the output");
-    let screen = neutral
+    // One neutral per render target; check the on-screen one.
+    let screen = neutral[RenderTarget::Output as usize]
         .screen
         .as_ref()
         .expect("no Vulkan-captured screen neutral");
@@ -3795,5 +3796,46 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
     assert!(
         count_green(&screen, w, h) > 0,
         "the window vanished from the screen too; block-out must only affect the cast",
+    );
+}
+
+/// The frozen screenshot-UI screen must also draw into a **screencast**, not just on screen.
+///
+/// `OutputScreenshot` prefers the renderer-neutral capture on Vulkan and otherwise falls back to a
+/// GLES element, which no-ops on the owned renderer. The neutral was captured for the `Output`
+/// target only, so on a Vulkan session the Screencast and ScreenCapture targets fell through to
+/// that no-op: with the screenshot UI open, a cast showed *nothing* where the frozen screen should
+/// be. Neutrals are now captured per target.
+///
+/// Same shape as `vulkan_screenshot_ui_draws_the_frozen_screen`, but compositing the Screencast
+/// target.
+#[test]
+fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    assert!(
+        f.niri().screenshot_ui.is_open(),
+        "screenshot UI must be open"
+    );
+    f.niri_complete_animations();
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+
+    let is_greenish = |p: [u8; 4]| {
+        let (r, g, b) = (p[0] as i16, p[1] as i16, p[2] as i16);
+        g > 60 && g > r + 30 && g > b + 30
+    };
+    let green = (0..w * h)
+        .filter(|i| is_greenish(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast: {green} greenish px");
+    assert!(
+        green > 1000,
+        "the frozen screenshot is missing from the screencast ({green} greenish px); the \
+         Screencast target fell through to the GLES element, which draws nothing on Vulkan",
     );
 }
