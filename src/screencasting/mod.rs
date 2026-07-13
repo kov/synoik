@@ -95,20 +95,51 @@ impl State {
             self.niri.casting.pipewire = Some(pw);
         }
 
-        let mut render_formats = self
-            .backend
-            .with_primary_renderer(|renderer| {
-                renderer.egl_context().dmabuf_render_formats().clone()
-            })
-            .unwrap_or_default();
+        let using_vulkan = self.backend.using_vulkan();
+
+        // Offer the formats the renderer that will actually render into the negotiated buffers can
+        // bind. The owned Vulkan renderer imports a narrower set than GLES/EGL advertises (the four
+        // 8888 byte orders, LINEAR only), so handing a consumer the EGL set on a Vulkan session
+        // would let it pick a modifier we then fail to bind on every single frame.
+        let owned_vulkan_formats: Option<FormatSet> = {
+            #[cfg(feature = "vulkan")]
+            {
+                using_vulkan.then(crate::render_helpers::vulkan::dmabuf_formats)
+            }
+            #[cfg(not(feature = "vulkan"))]
+            {
+                None
+            }
+        };
+
+        let mut render_formats = match owned_vulkan_formats {
+            Some(formats) => formats,
+            None => self
+                .backend
+                .with_primary_renderer(|renderer| {
+                    renderer.egl_context().dmabuf_render_formats().clone()
+                })
+                .unwrap_or_default(),
+        };
 
         {
             let config = self.niri.config.borrow();
             if config.debug.force_pipewire_invalid_modifier {
-                render_formats = render_formats
-                    .into_iter()
-                    .filter(|f| f.modifier == Modifier::Invalid)
-                    .collect();
+                if using_vulkan {
+                    // The owned renderer can only import an explicit LINEAR modifier, so filtering
+                    // the offer down to INVALID would leave nothing to negotiate and the cast could
+                    // not start at all. The flag exists to exercise the GLES/EGL implicit-modifier
+                    // path, which does not apply here.
+                    warn!(
+                        "ignoring debug.force_pipewire_invalid_modifier: the owned Vulkan renderer \
+                         imports explicit LINEAR modifiers only"
+                    );
+                } else {
+                    render_formats = render_formats
+                        .into_iter()
+                        .filter(|f| f.modifier == Modifier::Invalid)
+                        .collect();
+                }
             }
         }
 

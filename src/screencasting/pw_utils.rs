@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::{mem, slice};
 
-use anyhow::Context as _;
+use anyhow::{ensure, Context as _};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
 use pipewire::context::ContextRc;
@@ -289,6 +289,21 @@ impl PipeWire {
         signal_ctx: SignalEmitter<'static>,
     ) -> anyhow::Result<Cast> {
         let _span = tracy_client::span!("PipeWire::start_cast");
+
+        // Every format pod offers the modifiers `formats` holds for the fourcc it picks, and needs
+        // at least one of them: an empty offer would index out of bounds, and a stream with no
+        // modifier to negotiate could not produce a buffer anyway. Fail the cast instead, so a
+        // renderer that advertises nothing usable is a stopped cast and a log line rather than a
+        // compositor panic.
+        for fourcc in [Fourcc::Xrgb8888]
+            .into_iter()
+            .chain(alpha.then_some(Fourcc::Argb8888))
+        {
+            ensure!(
+                formats.iter().any(|f| f.code == fourcc),
+                "the renderer advertises no {fourcc:?} dmabuf modifier to offer",
+            );
+        }
 
         let to_niri_ = self.to_niri.clone();
         let stop_cast = move || {
