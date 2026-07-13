@@ -82,6 +82,19 @@ pub struct VulkanRenderer {
     /// Reused staging buffer for shm-client texture uploads (grown on demand), so the shm cache's
     /// hit path refreshes a client buffer every commit without churning a mappable allocation.
     shm_staging: niri_vk::texture::Staging,
+    /// The host-visible buffer every readback copies into, grown on demand and reused.
+    ///
+    /// This used to be a fresh `VkBuffer` + `HOST_VISIBLE` allocation per call. On Venus
+    /// host-visible memory is a virtio-gpu blob, and shm screencopy reads back **every frame** —
+    /// exactly the per-frame mappable-blob churn that exhausts the host pool and aborts the
+    /// session. Grow-only, so a steady stream of same-size reads allocates once; a larger read
+    /// grows it and smaller ones then reuse the larger buffer.
+    readback_staging_buffer: niri_vk::texture::Staging,
+    /// Count of readback host-buffer (re)allocations (test-only): the no-churn invariant is that
+    /// this stops growing once the largest read size has been seen. See
+    /// `vulkan_repeated_readbacks_reuse_the_host_buffer`.
+    #[cfg(test)]
+    readback_buffer_allocs: usize,
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
@@ -349,6 +362,9 @@ impl VulkanRenderer {
             sampler_set_layout,
             command_pool,
             shm_staging: niri_vk::texture::Staging::new(),
+            readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
+            #[cfg(test)]
+            readback_buffer_allocs: 0,
             downscale_filter: TextureFilter::Linear,
             upscale_filter: TextureFilter::Linear,
             debug_flags: DebugFlags::empty(),
@@ -643,7 +659,7 @@ impl VulkanRenderer {
     /// no CPU pass over the pixels. Same-size, `NEAREST`: an exact copy, and it needs no linear
     /// filter support.
     fn download_region(
-        &self,
+        &mut self,
         tex: &VkTexture,
         x: i32,
         y: i32,
@@ -651,22 +667,21 @@ impl VulkanRenderer {
         h: u32,
         via: Option<&VkTexture>,
     ) -> Result<Vec<u8>, VulkanError> {
-        let dev = &self.gpu.device;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
         let image = tex.image();
         let old_layout = tex.layout();
 
-        let buf_ci = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { dev.create_buffer(&buf_ci, None) }?;
-        let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
-        let mem = self.gpu.allocate(
-            req,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        unsafe { dev.bind_buffer_memory(buffer, mem, 0) }?;
+        // Reuse the host-visible readback buffer rather than allocating a mappable blob per call.
+        #[cfg(test)]
+        let grew = size > self.readback_staging_buffer.capacity();
+        self.readback_staging_buffer.ensure(&self.gpu, size)?;
+        #[cfg(test)]
+        if grew {
+            self.readback_buffer_allocs += 1;
+        }
+        let buffer = self.readback_staging_buffer.buffer();
+
+        let dev = &self.gpu.device;
 
         // Without a staging image we copy straight out of `tex` at the region's origin; with one we
         // blit the region into it first and then copy the whole staging image from its origin.
@@ -787,15 +802,9 @@ impl VulkanRenderer {
             staging.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         }
 
-        let mut pixels = vec![0u8; size as usize];
-        unsafe {
-            let ptr = dev.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *const u8;
-            std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), size as usize);
-            dev.unmap_memory(mem);
-            dev.destroy_buffer(buffer, None);
-            dev.free_memory(mem, None);
-        }
-        Ok(pixels)
+        Ok(self
+            .readback_staging_buffer
+            .read(&self.gpu, size as usize)?)
     }
 
     /// Transition an offscreen [`VkTexture`] into `SHADER_READ_ONLY_OPTIMAL` so it can be sampled
@@ -925,6 +934,7 @@ impl Drop for VulkanRenderer {
             let dev = &self.gpu.device;
             let _ = dev.device_wait_idle();
             self.shm_staging.destroy(dev);
+            self.readback_staging_buffer.destroy(dev);
             self.solid_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
@@ -1316,6 +1326,11 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn readback_staging_allocs(&self) -> usize {
         self.readback_staging_allocs
+    }
+
+    #[cfg(test)]
+    pub(super) fn readback_buffer_allocs(&self) -> usize {
+        self.readback_buffer_allocs
     }
 
     fn dmabuf_framebuffer(

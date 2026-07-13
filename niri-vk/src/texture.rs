@@ -947,25 +947,48 @@ impl Texture {
     }
 }
 
-/// A reusable `HOST_VISIBLE | HOST_COHERENT` staging buffer for repeated texture uploads. Grown on
-/// demand and never shrunk; the buffer + memory persist across uploads, so re-uploading a client's
-/// shm buffer every commit doesn't churn a fresh mappable allocation each time (the mappable-blob
-/// type that pressures the Venus host). Not internally synchronized — the renderer serializes
-/// access via `&mut self`, and each upload is fence-waited before the next, so overwriting the
-/// mapped bytes is safe. Call [`Staging::destroy`] before dropping (it holds raw Vulkan handles).
+/// A reusable `HOST_VISIBLE | HOST_COHERENT` staging buffer for repeated transfers, in either
+/// direction. Grown on demand and never shrunk; the buffer + memory persist, so re-uploading a
+/// client's shm buffer every commit — or reading a frame back every commit — doesn't churn a fresh
+/// mappable allocation each time (the mappable-blob type that pressures the Venus host). Not
+/// internally synchronized — the renderer serializes access via `&mut self`, and each transfer is
+/// fence-waited before the next, so overwriting the mapped bytes is safe. Call [`Staging::destroy`]
+/// before dropping (it holds raw Vulkan handles).
 pub struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     capacity: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
 }
 
 impl Staging {
+    /// An upload staging buffer (`TRANSFER_SRC`): host writes, GPU reads.
     pub const fn new() -> Self {
+        Self::with_usage(vk::BufferUsageFlags::TRANSFER_SRC)
+    }
+
+    /// A readback staging buffer (`TRANSFER_DST`): GPU writes, host reads.
+    pub const fn new_readback() -> Self {
+        Self::with_usage(vk::BufferUsageFlags::TRANSFER_DST)
+    }
+
+    const fn with_usage(usage: vk::BufferUsageFlags) -> Self {
         Self {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             capacity: 0,
+            usage,
         }
+    }
+
+    /// The underlying buffer handle. Null until the first [`Staging::ensure`].
+    pub fn buffer(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    /// Bytes currently allocated. `ensure` only reallocates when it must grow past this.
+    pub fn capacity(&self) -> vk::DeviceSize {
+        self.capacity
     }
 
     /// Ensure the staging holds at least `size` bytes, (re)allocating grow-only if needed. Safe to
@@ -979,7 +1002,7 @@ impl Staging {
         let device = &gpu.device;
         let ci = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .usage(self.usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&ci, None) }.context("staging buffer")?;
         // `buffer` is live but not yet owned by `self`, so destroy it on any error before
@@ -1030,6 +1053,28 @@ impl Staging {
             device.unmap_memory(self.memory);
         }
         Ok(())
+    }
+
+    /// Copy `len` bytes out of the staging into a fresh `Vec` (caller must have `ensure`d `len`
+    /// capacity, and the GPU write must already be complete — the renderer fence-waits). Maps and
+    /// unmaps around the copy; `HOST_COHERENT` means no explicit invalidate is needed.
+    pub fn read(&self, gpu: &Gpu, len: usize) -> Result<Vec<u8>> {
+        assert!(len as vk::DeviceSize <= self.capacity);
+        let device = &gpu.device;
+        let mut out = vec![0u8; len];
+        unsafe {
+            let ptr = device
+                .map_memory(
+                    self.memory,
+                    0,
+                    len as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .context("map staging for readback")? as *const u8;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
+            device.unmap_memory(self.memory);
+        }
+        Ok(out)
     }
 
     /// Free the underlying buffer + memory (idempotent; leaves the staging empty — a later `ensure`

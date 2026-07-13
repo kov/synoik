@@ -2798,4 +2798,63 @@ fn vulkan_repeated_converting_readbacks_reuse_staging() {
         "a converting readback of one size must allocate its staging image once, not per call \
          (this is what aborts Venus)",
     );
+
+    // The host-visible buffer the pixels land in is the *other* per-call allocation, and the more
+    // dangerous one: on Venus host-visible memory is a mappable blob.
+    assert_eq!(
+        vk.readback_buffer_allocs(),
+        1,
+        "the host readback buffer must be allocated once and reused, not per call",
+    );
+}
+
+/// The host readback buffer grows on demand and is never reallocated for a size it already covers —
+/// so alternating a big and a small readback (a full-screen screencopy and a cursor bitmap, say)
+/// must not churn a mappable blob per frame.
+#[test]
+fn vulkan_readback_host_buffer_grows_then_reuses() {
+    use crate::render_helpers::create_texture;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_readback_host_buffer_grows_then_reuses: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    let read = |vk: &mut VulkanRenderer, w: i32, h: i32| {
+        let size = Size::<i32, Physical>::from((w, h));
+        let mut texture: VkTexture = create_texture(vk, size, Fourcc::Abgr8888).expect("offscreen");
+        let fb = vk.bind(&mut texture).expect("bind");
+        let mapping = vk
+            .copy_framebuffer(&fb, Rectangle::from_size((w, h).into()), Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let _ = vk.map_texture(&mapping).expect("map_texture");
+    };
+
+    read(&mut vk, 32, 32);
+    assert_eq!(vk.readback_buffer_allocs(), 1, "first read allocates");
+
+    read(&mut vk, 32, 32);
+    assert_eq!(vk.readback_buffer_allocs(), 1, "same size must reuse");
+
+    read(&mut vk, 128, 128);
+    assert_eq!(
+        vk.readback_buffer_allocs(),
+        2,
+        "a larger read must grow it once"
+    );
+
+    // The small read now fits in the grown buffer, and the large one is already covered: neither
+    // may reallocate again, however many times they alternate.
+    for _ in 0..4 {
+        read(&mut vk, 32, 32);
+        read(&mut vk, 128, 128);
+    }
+    assert_eq!(
+        vk.readback_buffer_allocs(),
+        2,
+        "alternating sizes must reuse the grown buffer, not churn a blob per frame",
+    );
 }
