@@ -195,7 +195,23 @@ impl Backend {
         }
     }
 
+    /// Prefetch a just-committed client buffer into the renderer's texture cache.
+    ///
+    /// Skipped entirely on a Vulkan session: this uploads into the *GLES* texture cache, keyed by
+    /// the GLES context, and nothing a Vulkan session displays ever samples it — the owned renderer
+    /// imports through its own `ImportAll`. Left in, it is a full client-buffer upload per surface
+    /// per commit (every frame, for every animating client) into a renderer that draws nothing.
+    ///
+    /// It is a prefetch, not a correctness dependency: the GLES paths that do still run on a Vulkan
+    /// session (the snapshot bakes) import lazily themselves via `import_surface`
+    /// (`render_helpers/surface.rs`), so at worst they pay a cold import instead of a warm one.
+    ///
+    /// Gated here rather than inside `Tty` so the headless Vulkan suite exercises the same skip.
     pub fn early_import(&mut self, surface: &WlSurface) {
+        if self.using_vulkan() {
+            return;
+        }
+
         match self {
             Backend::Tty(tty) => tty.early_import(surface),
             Backend::Winit(_) => (),

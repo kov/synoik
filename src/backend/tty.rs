@@ -880,11 +880,18 @@ impl Tty {
                 .single_renderer(&render_node)
                 .context("error creating renderer")?;
 
-            if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
-                // wl_drm is on its way out so this is expected on most modern distros.
-                trace!("error binding legacy EGL to wl_display: {err}");
-            } else {
-                debug!("bound legacy EGL to wl_display");
+            // Not on a Vulkan session. This binds the legacy EGL `wl_drm` global, and a `wl_drm`
+            // buffer is importable only through EGL into the GLES renderer — the owned Vulkan
+            // renderer's `bind_wl_display` is a no-op and it cannot sample one. Advertising it
+            // would offer clients a buffer type we then cannot display, so a legacy client would
+            // render *invisible*; without it they fall back to shm or linux-dmabuf, which work.
+            if !use_vulkan {
+                if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
+                    // wl_drm is on its way out so this is expected on most modern distros.
+                    trace!("error binding legacy EGL to wl_display: {err}");
+                } else {
+                    debug!("bound legacy EGL to wl_display");
+                }
             }
 
             let gles_renderer = renderer
