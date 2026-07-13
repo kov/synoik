@@ -3703,3 +3703,97 @@ fn vulkan_draws_a_window_shadow() {
         "the shadow must fade with distance from the window, got near={near} mid={mid} far={far}",
     );
 }
+
+/// A window blocked out from screencast must not leak its contents into a cast *while resizing*.
+///
+/// The resize crossfade draws the snapshot taken when the resize started. The GLES path bakes a
+/// blocked-out variant of that snapshot and picks it per target, but the neutral the Vulkan path
+/// uses holds the window's real contents and has no per-target variant. Once screencast started
+/// rendering through the owned renderer, a blocked-out window being resized during a cast drew its
+/// real pre-resize pixels crossfading into the blocked-out solid — showing exactly what block-out
+/// exists to hide.
+///
+/// Render the Screencast target mid-resize and assert no window pixels appear. The Output target is
+/// checked too, so a fix that simply blanks the window everywhere can't pass.
+#[test]
+fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
+    use niri_config::animations::{Curve, EasingParams, Kind};
+    use niri_config::BlockOutFrom;
+    use niri_ipc::SizeChange;
+
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_blocked_out_window_does_not_leak_while_resizing: no Vulkan");
+        return;
+    }
+
+    const LINEAR: Kind = Kind::Easing(EasingParams {
+        duration_ms: 1000,
+        curve: Curve::Linear,
+    });
+    let mut config = Config::default();
+    config.animations.window_resize.anim.kind = LINEAR;
+    config.window_rules.push(WindowRule {
+        block_out_from: Some(BlockOutFrom::Screencast),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the GLES + Vulkan renderers");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    // Start an animated resize, and let the client commit the new size so the crossfade begins.
+    f.niri().layout.set_column_width(SizeChange::SetFixed(900));
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(900, WIN as i32, 0, 255, 0, 255);
+    window.set_size(900, WIN);
+    window.ack_last_and_commit();
+    f.roundtrip(id);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected an ongoing resize animation to composite",
+    );
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    // The cast must not show the window at all — neither the live surface nor the crossfade's
+    // pre-resize snapshot of it.
+    let (cast, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
+    let leaked = count_green(&cast, w, h);
+    assert_eq!(
+        leaked, 0,
+        "{leaked} window pixels leaked into the screencast while the window was resizing",
+    );
+
+    // But the window is still really there: on screen it renders normally.
+    let (screen, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    assert!(
+        count_green(&screen, w, h) > 0,
+        "the window vanished from the screen too; block-out must only affect the cast",
+    );
+}

@@ -1129,9 +1129,24 @@ impl<W: LayoutElement> Tile<W> {
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
-            if ResizeRenderElement::has_shader(ctx.renderer) {
-                let mut ctx = ctx.as_gles();
+            // Whether this window must be hidden from the target we're rendering for.
+            //
+            // The crossfade's "before" texture is the snapshot taken when the resize started. The
+            // GLES path bakes a blocked-out variant of it and picks that per target
+            // (`RenderSnapshot::texture`), so it is safe on any target. The *neutral* the Vulkan
+            // path uses below holds the window's real contents and has no per-target variant, so
+            // drawing that crossfade on a blocked-out target would show exactly what block-out
+            // exists to hide. Skip it there (and the red fallback with it) and let the plain window
+            // render further down substitute the block-out buffer, as it does with no resize
+            // running: a blocked-out window loses its crossfade in a capture, rather than leaking.
+            let blocked_out = ctx.target.should_block_out(resize.snapshot.block_out_from)
+                || ctx.target.should_block_out(rules.block_out_from);
 
+            // `try_as_gles` rather than the infallible `as_gles`: what keeps that from panicking on
+            // Vulkan is only that `has_shader` is false there (`Shaders` live in the GLES context)
+            // — far too subtle a thing to rest a panic on.
+            let has_resize_shader = ResizeRenderElement::has_shader(ctx.renderer);
+            if let Some(mut ctx) = ctx.try_as_gles().filter(|_| has_resize_shader) {
                 if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
                     let mut window_elements = Vec::new();
                     self.window.render_normal(
@@ -1198,7 +1213,7 @@ impl<W: LayoutElement> Tile<W> {
             // (uploaded once); `tex_next` is the current window rendered into the
             // reused Vulkan offscreen.
             #[cfg(feature = "vulkan")]
-            if !pushed_resize {
+            if !pushed_resize && !blocked_out {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     if let Some((prev_mem, prev_geo)) =
                         resize.snapshot.neutral.get().and_then(|o| o.as_ref())
@@ -1274,7 +1289,11 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
 
-            if !pushed_resize {
+            // Not for a blocked-out target: leaving `pushed_resize` false there falls through to
+            // the plain window render below, which substitutes the block-out buffer.
+            // Painting the red placeholder instead would replace a blocked-out window
+            // with a solid red rectangle in every capture taken during a resize.
+            if !pushed_resize && !blocked_out {
                 let fallback_buffer = SolidColorBuffer::new(area.size, [1., 0., 0., 1.]);
                 let elem = SolidColorRenderElement::from_buffer(
                     &fallback_buffer,
