@@ -7165,6 +7165,19 @@ impl Niri {
 
         self.update_render_elements(None);
 
+        /// The frozen screen, in the form the session's renderer can sample. Mirrors
+        /// `ScreenTransition`'s own (private) enum; kept here so the borrow of `self` ends before
+        /// we take `&mut self.output_state` below.
+        enum FrozenScene {
+            Gles(
+                Box<
+                    [TextureBuffer<smithay::backend::renderer::gles::GlesTexture>;
+                        RenderTarget::COUNT],
+                >,
+            ),
+            Neutral([MemoryBuffer; RenderTarget::COUNT]),
+        }
+
         let textures: Vec<_> = self
             .output_state
             .keys()
@@ -7176,23 +7189,16 @@ impl Niri {
                 let scale = Scale::from(output.current_scale().fractional_scale());
 
                 // On a Vulkan session every target composites through the owned renderer, which
-                // can't sample a GLES texture, so it uploads a renderer-neutral CPU capture to a
-                // VkTexture instead. Those captures are taken through the Vulkan renderer up front
-                // (in `capture_screen_transition_neutrals`, the `neutrals` map); if they're missing
-                // for this output (the Vulkan capture failed), fall back to capturing through GLES
-                // here — the buffers are renderer-neutral either way.
-                let neutrals = if using_vulkan {
-                    neutrals.remove(&output).or_else(|| {
-                        let captured = ALL_RENDER_TARGETS
-                            .map(|target| self.capture_output_neutral(renderer, &output, target));
-                        if captured.iter().any(Option::is_none) {
-                            return None;
-                        }
-                        Some(captured.map(Option::unwrap))
-                    })
-                } else {
-                    None
-                };
+                // can't sample a GLES texture. The frozen screen was already captured into
+                // renderer-neutral buffers through the Vulkan renderer up front (in
+                // `capture_screen_transition_neutrals`), so don't render the scene again through
+                // GLES — nothing would ever sample it. An output whose capture failed is dropped:
+                // it gets no crossfade (the failure warned there), rather than a GLES bake nothing
+                // can draw.
+                if using_vulkan {
+                    let neutrals = neutrals.remove(&output)?;
+                    return Some((output, FrozenScene::Neutral(neutrals), scale, transform));
+                }
 
                 let textures = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
@@ -7234,7 +7240,12 @@ impl Niri {
                     )
                 });
 
-                Some((output, textures, neutrals, scale, transform))
+                Some((
+                    output,
+                    FrozenScene::Gles(Box::new(textures)),
+                    scale,
+                    transform,
+                ))
             })
             .collect();
 
@@ -7242,16 +7253,17 @@ impl Niri {
             Duration::from_millis(u64::from(d))
         });
 
-        for (output, from_texture, neutrals, scale, transform) in textures {
+        for (output, from, scale, transform) in textures {
             let state = self.output_state.get_mut(&output).unwrap();
-            state.screen_transition = Some(ScreenTransition::new(
-                from_texture,
-                neutrals,
-                scale,
-                transform,
-                delay,
-                self.clock.clone(),
-            ));
+            let clock = self.clock.clone();
+            state.screen_transition = Some(match from {
+                FrozenScene::Gles(textures) => {
+                    ScreenTransition::from_gles(*textures, scale, transform, delay, clock)
+                }
+                FrozenScene::Neutral(buffers) => {
+                    ScreenTransition::from_neutrals(buffers, scale, transform, delay, clock)
+                }
+            });
         }
 
         // We don't actually need to queue a redraw because the point is to freeze the screen for a

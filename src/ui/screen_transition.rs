@@ -61,23 +61,47 @@ pub struct ScreenTransition {
 }
 
 impl ScreenTransition {
-    pub fn new(
+    /// Crossfade from GLES textures of the frozen screen (a GLES session).
+    pub fn from_gles(
         from_texture: [TextureBuffer<GlesTexture>; RenderTarget::COUNT],
-        neutrals: Option<[MemoryBuffer; RenderTarget::COUNT]>,
         scale: Scale<f64>,
         transform: Transform,
         delay: Duration,
         clock: Clock,
     ) -> Self {
-        let from = match neutrals {
-            Some(buffers) => FrozenScreen::Neutral {
-                buffers,
-                #[cfg(feature = "vulkan")]
-                vk: RefCell::new(Default::default()),
-            },
-            None => FrozenScreen::Gles(from_texture),
-        };
+        Self::new(
+            FrozenScreen::Gles(from_texture),
+            scale,
+            transform,
+            delay,
+            clock,
+        )
+    }
 
+    /// Crossfade from renderer-neutral captures of the frozen screen (a Vulkan session). The owned
+    /// renderer can't sample a GLES texture, so no GLES texture is baked in the first place.
+    pub fn from_neutrals(
+        buffers: [MemoryBuffer; RenderTarget::COUNT],
+        scale: Scale<f64>,
+        transform: Transform,
+        delay: Duration,
+        clock: Clock,
+    ) -> Self {
+        let from = FrozenScreen::Neutral {
+            buffers,
+            #[cfg(feature = "vulkan")]
+            vk: RefCell::new(Default::default()),
+        };
+        Self::new(from, scale, transform, delay, clock)
+    }
+
+    fn new(
+        from: FrozenScreen,
+        scale: Scale<f64>,
+        transform: Transform,
+        delay: Duration,
+        clock: Clock,
+    ) -> Self {
         Self {
             from,
             scale,
