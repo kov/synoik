@@ -275,6 +275,28 @@ where
     R: Renderer<TextureId = T> + Offscreen<T> + ExportMem,
     R::Error: Send + Sync + 'static,
 {
+    render_and_download_as(renderer, size, scale, transform, fourcc, fourcc, elements)
+}
+
+/// [`render_and_download`], but reading the frame back in a byte order that need not be the one it
+/// was rendered in — the renderer converts on the way out.
+///
+/// The two are separate because a renderer can only render the orders it has a render pass for (the
+/// owned Vulkan renderer: RGBA only), while a consumer wants whatever order *it* declared.
+/// Rendering RGBA and reading BGRA is one GPU blit, versus a CPU pass over every pixel.
+pub fn render_and_download_as<R, T>(
+    renderer: &mut R,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    render_fourcc: Fourcc,
+    read_fourcc: Fourcc,
+    elements: impl Iterator<Item = impl RenderElement<R>>,
+) -> anyhow::Result<R::TextureMapping>
+where
+    R: Renderer<TextureId = T> + Offscreen<T> + ExportMem,
+    R::Error: Send + Sync + 'static,
+{
     let _span = tracy_client::span!();
 
     // Render into a fresh offscreen, then bind a new framebuffer over it for readback. Factored
@@ -283,13 +305,13 @@ where
     // finished and its resources released. Both GLES and the owned Vulkan renderer read back
     // correctly this way.
     let (mut texture, _sync) =
-        render_to_texture(renderer, size, scale, transform, fourcc, elements)
+        render_to_texture(renderer, size, scale, transform, render_fourcc, elements)
             .context("error rendering")?;
     let target = renderer
         .bind(&mut texture)
         .context("error binding texture for readback")?;
 
-    copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
+    copy_framebuffer(renderer, &target, read_fourcc).context("error copying framebuffer")
 }
 
 pub fn render_to_vec<R, T>(
@@ -414,20 +436,6 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
     .context("expected shm buffer, but didn't get one")?
 }
 
-/// Copy 8-bit RGBA-order pixels into a BGRA-order destination, swapping the red and blue channels.
-///
-/// The owned Vulkan renderer renders and reads back in RGBA order only, while several consumers
-/// (an `Xrgb8888` shm pool, a `SPA_VIDEO_FORMAT_BGRA` cursor bitmap) want BGRA; this is the bridge.
-/// A plain function so the byte order is pinned by a test rather than by eyeballing live output — a
-/// swapped copy just looks "blue-ish", which is easy to miss.
-///
-/// Copies `min(dst, src)` whole pixels; a trailing partial pixel is left alone.
-pub fn swizzle_rgba_to_bgra(dst: &mut [u8], src: &[u8]) {
-    for (dst, src) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-        dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
-    }
-}
-
 pub fn clear_dmabuf<R: NiriRenderer>(
     renderer: &mut R,
     mut dmabuf: Dmabuf,
@@ -486,19 +494,4 @@ where
     }
 
     frame.finish().context("error finishing frame")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn swizzle_rgba_to_bgra_swaps_red_and_blue() {
-        // Opaque red, then half-alpha blue: distinct in every channel, so a no-op copy, a reversed
-        // copy (which would also move alpha) and a correct swizzle all disagree.
-        let src = [255, 0, 0, 255, 0, 0, 255, 128];
-        let mut dst = [0u8; 8];
-        swizzle_rgba_to_bgra(&mut dst, &src);
-        assert_eq!(dst, [0, 0, 255, 255, 255, 0, 0, 128]);
-    }
 }

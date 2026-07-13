@@ -52,7 +52,7 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_to_dmabuf, swizzle_rgba_to_bgra,
+    clear_dmabuf, encompassing_geo, render_and_download_as, render_to_dmabuf,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -1572,16 +1572,18 @@ unsafe fn add_cursor_metadata<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
         //
         // Reliable buffers should be available starting from 1.6.0:
         // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/4885
-        // Read back as `Abgr8888` (byte order R,G,B,A) rather than the `Argb8888` (B,G,R,A) the
-        // bitmap wants: the owned Vulkan renderer only offers RGBA-order offscreens, so asking for
-        // a BGRA-order one fails outright and the cursor silently disappears from the stream. Both
-        // renderers read RGBA back fine, so take that one path and swizzle below.
-        let mapping = match render_and_download(
+        // Render RGBA but read back `Argb8888` — byte order B,G,R,A, the `CURSOR_FORMAT`
+        // (`SPA_VIDEO_FORMAT_BGRA`) the bitmap declares. The owned Vulkan renderer can only render
+        // RGBA-order offscreens (asking for a BGRA one fails outright, and the cursor used to
+        // silently disappear from the stream), but it converts on readback, so the channel swap
+        // happens on the GPU instead of in a CPU pass over the bitmap.
+        let mapping = match render_and_download_as(
             renderer,
             size,
             cursor_data.scale,
             Transform::Normal,
             Fourcc::Abgr8888,
+            Fourcc::Argb8888,
             cursor_data.relocated.iter().rev(),
         ) {
             Ok(mapping) => mapping,
@@ -1598,8 +1600,7 @@ unsafe fn add_cursor_metadata<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
             }
         };
 
-        // R,G,B,A -> B,G,R,A, the `CURSOR_FORMAT` (`SPA_VIDEO_FORMAT_BGRA`) the bitmap declares.
-        swizzle_rgba_to_bgra(&mut bitmap_slice[..pixels.len()], pixels);
+        bitmap_slice[..pixels.len()].copy_from_slice(pixels);
 
         // Fill the metadata now that everything succeeded.
         bitmap_meta.size.width = size.w as _;
