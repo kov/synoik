@@ -184,7 +184,15 @@ impl ShadowRenderElement {
         self
     }
 
+    /// Whether `renderer` can draw a drop shadow. Callers skip emitting shadow elements entirely
+    /// when this is false. True when the GLES shadow program is loaded, **or** on the owned Vulkan
+    /// renderer — which draws shadows procedurally ([`VulkanFrame::render_shadow`]) and needs no
+    /// GLES program, exactly as [`BorderRenderElement::has_shader`] already does.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
+        #[cfg(feature = "vulkan")]
+        if renderer.try_as_vulkan_renderer().is_some() {
+            return true;
+        }
         Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Shadow).is_some())
     }
 }

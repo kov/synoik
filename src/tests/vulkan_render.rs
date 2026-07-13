@@ -3611,3 +3611,95 @@ fn vulkan_composites_for_a_screencast() {
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
     assert_window_and_background(&pixels, w, h);
 }
+
+/// Drop shadows must draw on Vulkan. `Shadow::render` skips emitting any element at all unless
+/// `ShadowRenderElement::has_shader`, which only asked the GLES shader registry — so a Vulkan
+/// session drew no shadow whatsoever, even though the owned renderer has the material
+/// (`VulkanFrame::render_shadow`) and `ShadowRenderElement` a real `RenderElement<VulkanRenderer>`
+/// draw. Exactly the gap `BorderRenderElement::has_shader` had (see
+/// `vulkan_draws_a_rounded_focus_ring`).
+///
+/// Assert it by darkening: the backdrop just outside the window must be strictly darker than the
+/// backdrop far away from it, and shade off with distance. A missing shadow makes those equal.
+#[test]
+fn vulkan_draws_a_window_shadow() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_draws_a_window_shadow: no Vulkan device");
+        return;
+    }
+
+    let mut config = Config::default();
+    // Isolate the shadow: no ring/border pixels to confuse "darker than the backdrop".
+    config.layout.border.off = true;
+    config.layout.focus_ring.off = true;
+    config.layout.shadow.on = true;
+    config.layout.shadow.softness = 40.;
+    config.layout.shadow.spread = 10.;
+    // Straight down-and-right offset would bias the sampling; keep it centered.
+    config.layout.shadow.offset = niri_config::ShadowOffset {
+        x: niri_config::FloatOrInt(0.),
+        y: niri_config::FloatOrInt(0.),
+    };
+
+    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // Find the green window, then walk left from its edge along its vertical centre.
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let (mut gx0, mut gy0, mut gy1) = (w, h, -1);
+    for y in 0..h {
+        for x in 0..w {
+            if is_green(px(&pixels, w, x, y)) {
+                gx0 = gx0.min(x);
+                gy0 = gy0.min(y);
+                gy1 = gy1.max(y);
+            }
+        }
+    }
+    assert!(
+        gx0 < w && gy1 >= 0,
+        "the green window is absent from the frame"
+    );
+
+    let cy = (gy0 + gy1) / 2;
+    let lum = |x: i32| {
+        let p = px(&pixels, w, x, cy);
+        p[0] as i32 + p[1] as i32 + p[2] as i32
+    };
+
+    // Just outside the window edge (inside the shadow), vs far away (clean backdrop).
+    let near = lum(gx0 - 3);
+    let far = lum(gx0 - 250);
+    let mid = lum(gx0 - 30);
+
+    assert!(
+        near < far,
+        "no shadow: the backdrop next to the window ({near}) is not darker than the backdrop far \
+         from it ({far})",
+    );
+    assert!(
+        near < mid && mid <= far,
+        "the shadow must fade with distance from the window, got near={near} mid={mid} far={far}",
+    );
+}
