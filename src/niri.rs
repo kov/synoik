@@ -6082,13 +6082,13 @@ impl Niri {
         self.queue_redraw_all();
     }
 
-    /// Vulkan pass for [`Self::capture_screenshots`]: capture each output's on-screen
-    /// (`Output`-target) screen + pointer neutrals through the owned Vulkan renderer, matching
+    /// Vulkan pass for [`Self::capture_screenshots`]: capture each output's screen + pointer
+    /// neutrals through the owned Vulkan renderer, one per render target, keeping
     /// `capture_screenshots`' render convention (transform folded into the size, render transform
-    /// `Normal`) and `read_texture_to_memory`'s buffer metadata exactly, so the two feed
-    /// `from_memory_buffer` identically. `capture_screenshots` consumes the map; outputs/fields
-    /// whose capture failed fall back to the GLES readback there. Assumes render elements are
-    /// already up to date (the caller primes them before both passes).
+    /// `Normal`). `capture_screenshots` consumes the map, and on a Vulkan session it is the *only*
+    /// source of the frozen screen — an output missing any target's capture is dropped there rather
+    /// than baked through GLES. Assumes render elements are already up to date (the caller primes
+    /// them before both passes).
     #[cfg(feature = "vulkan")]
     pub fn capture_screenshot_neutrals(
         &self,
@@ -6241,6 +6241,31 @@ impl Niri {
                 let size = transform.transform_size(size);
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
+
+                // On a Vulkan session the frozen screen was already captured into renderer-neutral
+                // buffers through the owned renderer (`capture_screenshot_neutrals`), and every
+                // consumer — on-screen, screencast, save-to-disk — works off those. Don't render
+                // the scene again through GLES: nothing would sample it. An output missing any
+                // target's capture is dropped rather than opened with a screen it cannot draw or
+                // save (the failure warned there).
+                if using_vulkan {
+                    let screenshot = ALL_RENDER_TARGETS.map(|target| {
+                        let this = &mut vk_neutral[target as usize];
+                        let screen = this.screen.take()?;
+                        Some(OutputScreenshot::from_neutrals(screen, this.pointer.take()))
+                    });
+
+                    if screenshot.iter().any(Option::is_none) {
+                        warn!(
+                            "no Vulkan screenshot capture for output {}; skipping it",
+                            output.name()
+                        );
+                        return None;
+                    }
+
+                    return Some((output, screenshot.map(Option::unwrap)));
+                }
+
                 let screenshot = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
                         renderer,
@@ -6289,26 +6314,12 @@ impl Niri {
                         res.ok()
                     };
 
-                    // Every target composites through the owned Vulkan renderer — the frozen screen
-                    // is drawn into screencasts and screen captures, not just on screen — so each
-                    // one needs a renderer-neutral copy to re-upload.
-                    let capture_neutral = using_vulkan;
-
-                    // Hand this target its Vulkan-captured neutrals (if any); a `None` field falls
-                    // back to the GLES readback in `from_textures`.
-                    let this = &mut vk_neutral[target as usize];
-                    let (vk_neutral, vk_pointer_neutral) =
-                        (this.screen.take(), this.pointer.take());
-
                     res_output.map(|(texture, _)| {
                         OutputScreenshot::from_textures(
                             renderer,
                             scale,
                             texture,
                             res_pointer.map(|(texture, _, geo)| (texture, geo)),
-                            capture_neutral,
-                            vk_neutral,
-                            vk_pointer_neutral,
                         )
                     })
                 });

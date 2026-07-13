@@ -104,6 +104,9 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
+    // TODO(phase-c): the capture button's hit test reads its size off this GLES texture
+    // (`pointer_down`/`pointer_up`). Before the GLES panel bake can go, those must read
+    // `panel_neutral`'s `MemoryBuffer::size()` instead, or the button stops responding on Vulkan.
     panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
     /// The (show, hide) help panels captured as renderer-neutral CPU buffers, populated only on
     /// Vulkan sessions (the owned Vulkan renderer can't sample the GLES panel textures above). The
@@ -115,11 +118,12 @@ pub struct OutputData {
     panel_vk: (VkCache, VkCache),
 }
 
-/// An output's on-screen (`Output`-target) screenshot neutrals captured through the owned Vulkan
-/// renderer up front, so [`OutputScreenshot::from_textures`] need not read them back through GLES.
-/// `screen` and `pointer` capture independently; a `None` field falls back to the GLES readback.
-/// Captured once per render target (the frozen screen is drawn into screencasts and screen captures
-/// too, and those differ by block-out rules). Empty (via `Default`) on a GLES session.
+/// An output's screenshot captured through the owned Vulkan renderer up front, so a Vulkan session
+/// never bakes (nor reads back) a GLES texture for the screenshot UI at all.
+///
+/// Captured once per render target — the frozen screen is drawn into screencasts and screen
+/// captures too, and those differ by block-out rules. A missing `screen` drops the output; a
+/// missing `pointer` only costs the cursor. Empty (via `Default`) on a GLES session.
 #[derive(Default)]
 pub struct ScreenshotNeutral {
     pub screen: Option<MemoryBuffer>,
@@ -198,6 +202,9 @@ impl ScreenshotUi {
         using_vulkan: bool,
     ) -> bool {
         if screenshots.is_empty() {
+            // Every output's capture failed (each warned individually). Say so, or the keybind
+            // just silently does nothing.
+            warn!("no output could be captured; not opening the screenshot UI");
             return false;
         }
 
@@ -1141,55 +1148,14 @@ impl ScreenshotUi {
 }
 
 impl OutputScreenshot {
-    #[allow(clippy::too_many_arguments)]
+    /// The frozen screen as GLES textures (a GLES session). A Vulkan session never bakes these —
+    /// the owned renderer can't sample them — and uses [`Self::from_neutrals`] instead.
     pub fn from_textures(
         renderer: &mut GlesRenderer,
         scale: Scale<f64>,
         texture: GlesTexture,
         pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
-        // The owned Vulkan renderer can't sample a GlesTexture, so the on-screen Output target
-        // needs a renderer-neutral CPU copy. On a Vulkan session these are captured through the
-        // Vulkan renderer up front (`Niri::capture_screenshot_neutrals`) and passed in here; a
-        // `None` field falls back to reading the GLES texture back below (gated on
-        // `capture_neutral`, which is only set for the Output target on a Vulkan session).
-        capture_neutral: bool,
-        vk_neutral: Option<MemoryBuffer>,
-        vk_pointer_neutral: Option<(MemoryBuffer, Point<f64, Logical>)>,
     ) -> Self {
-        // Read the neutrals off the source textures before they're moved into the GLES elements.
-        // Prefer the Vulkan-captured buffer; fall back to a GLES readback per field.
-        let neutral = vk_neutral.or_else(|| {
-            if capture_neutral {
-                read_texture_to_memory(renderer, &texture, scale)
-                    .map_err(|err| warn!("error reading screenshot back for Vulkan: {err:?}"))
-                    .ok()
-            } else {
-                None
-            }
-        });
-        let pointer_neutral = vk_pointer_neutral.or_else(|| {
-            if capture_neutral {
-                pointer.as_ref().and_then(|(ptexture, geo)| {
-                    let loc = geo.to_f64().to_logical(scale).loc;
-                    read_texture_to_memory(renderer, ptexture, scale)
-                        .map_err(|err| {
-                            warn!("error reading screenshot pointer back for Vulkan: {err:?}")
-                        })
-                        .ok()
-                        .map(|mb| (mb, loc))
-                })
-            } else {
-                None
-            }
-        });
-
-        // The owned Vulkan renderer can't sample the GLES textures, so a Vulkan session keeps the
-        // neutral capture and nothing else. Without one there is no frozen screen it can draw at
-        // all — fall back to GLES and let the (invisible) degradation be the same as before.
-        if let Some(screen) = neutral {
-            return Self::from_neutrals(screen, pointer_neutral);
-        }
-
         let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
             TextureBuffer::from_texture(
                 renderer,
@@ -1385,31 +1351,6 @@ fn upload_cached(
         }
     }
     cache.borrow().clone()
-}
-
-/// Read a GLES texture back into a renderer-neutral `MemoryBuffer` (the same `ExportMem` path the
-/// save-to-disk `capture()` uses), so the owned Vulkan renderer can re-upload and sample it.
-fn read_texture_to_memory(
-    renderer: &mut GlesRenderer,
-    texture: &GlesTexture,
-    scale: Scale<f64>,
-) -> anyhow::Result<MemoryBuffer> {
-    use smithay::backend::renderer::Texture as _;
-
-    let size = texture.size();
-    let mapping = renderer
-        .copy_texture(texture, Rectangle::from_size(size), Fourcc::Abgr8888)
-        .context("error copying texture")?;
-    let data = renderer
-        .map_texture(&mapping)
-        .context("error mapping texture")?;
-    Ok(MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Abgr8888,
-        size,
-        scale,
-        Transform::Normal,
-    ))
 }
 
 fn action(raw: Keysym, mods: ModifiersState) -> Option<Action> {
