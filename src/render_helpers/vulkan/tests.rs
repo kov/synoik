@@ -1141,7 +1141,7 @@ fn vulkan_resize_crossfades() {
     );
 }
 
-/// The live `ResizeRenderElement::new_vulkan` constructor: it lowers the resize geometry to a
+/// The live `ResizeRenderElement::new` constructor: it lowers the resize geometry to a
 /// `ResizePush` and draws through `render_resize` (the path `tile.rs` takes on a Vulkan session,
 /// replacing the red placeholder). A spatially-distinct 4-quadrant "prev" with identity geometry
 /// must be reproduced **1:1 at progress 0** — proving the affine-diagonal transforms carry no flip
@@ -1184,7 +1184,7 @@ fn vulkan_new_vulkan_resize_element_crossfades() {
         let tex_next = vk
             .import_memory(&next, Fourcc::Abgr8888, Size::from((W, H)), false)
             .expect("import next");
-        let elem = ResizeRenderElement::new_vulkan(
+        let elem = ResizeRenderElement::new(
             full_logical,
             Scale::from(1.0),
             (tex_prev, full_phys),
@@ -1306,7 +1306,7 @@ fn vulkan_resize_element_uses_custom_shader_when_installed() {
     let tex_next = vk
         .import_memory(&next, Fourcc::Abgr8888, Size::from((W, H)), false)
         .expect("import next");
-    let elem = ResizeRenderElement::new_vulkan(
+    let elem = ResizeRenderElement::new(
         full_logical,
         Scale::from(1.0),
         (tex_prev, full_phys),

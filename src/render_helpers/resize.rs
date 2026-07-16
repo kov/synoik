@@ -1,33 +1,47 @@
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
+use niri_vk::render::ResizePush;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::gpu_span_location;
+use smithay::backend::renderer::Texture as _;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
-use super::shader_element::ShaderRenderElement;
+use crate::render_helpers::vulkan::{
+    CustomResizePush, VkTexture, VulkanError, VulkanFrame, VulkanRenderer,
+};
 
 /// The resize cross-fade element. Blends a "prev" (pre-resize) and "next" (current) window snapshot
 /// by the animation progress, clipping/rounding to the current geometry.
 ///
-/// On GLES/Tty it wraps a runtime-GLSL [`ShaderRenderElement`] (`ProgramType::Resize`). On the
-/// owned Vulkan renderer it carries the two `VkTexture`s + a prebuilt `ResizePush` and draws
-/// through [`VulkanFrame::render_resize`](super::vulkan::VulkanFrame::render_resize) — the same
-/// transforms, packed affine-diagonal (see `niri-vk/shaders/resize.frag`). One enum, dispatched per
-/// concrete renderer, mirroring the `BorderRenderElement` dual-impl pattern (but texture-carrying).
+/// Carries the two `VkTexture`s plus a prebuilt push and draws through
+/// [`VulkanFrame::render_resize`](crate::render_helpers::vulkan::VulkanFrame::render_resize), with
+/// the transforms packed affine-diagonal (see `niri-vk/shaders/resize.frag`).
 #[derive(Debug)]
-pub enum ResizeRenderElement {
-    Gles(ShaderRenderElement),
-    Vulkan(VulkanResizeRenderElement),
+pub struct ResizeRenderElement {
+    id: Id,
+    commit: CommitCounter,
+    area: Rectangle<f64, Logical>,
+    alpha: f32,
+    kind: Kind,
+    tex_prev: VkTexture,
+    tex_next: VkTexture,
+    push: ResizePushKind,
 }
 
-/// Shared geometry/transform math for the resize crossfade, computed once and lowered to either the
-/// GLES shader uniforms (mat3) or the Vulkan `ResizePush` (affine-diagonal). See the GLES
-/// `resize.frag` / `niri-vk/shaders/resize.frag`: only `input_to_curr_geo`, `geo_to_tex_prev`,
-/// `geo_to_tex_next` are sampled; `curr_geo_to_{prev,next}_geo` are dead uniforms kept for GLES
-/// only.
+/// Which resize material the element draws: the built-in crossfade (`render_resize`) or the user's
+/// custom resize shader (`render_custom_resize`), chosen at construction by whether a custom resize
+/// shader is installed.
+#[derive(Debug)]
+enum ResizePushKind {
+    Builtin(ResizePush),
+    Custom(CustomResizePush),
+}
+
+/// Shared geometry/transform math for the resize crossfade, computed once and lowered to the
+/// `ResizePush` (affine-diagonal). See `niri-vk/shaders/resize.frag`: only `input_to_curr_geo`,
+/// `geo_to_tex_prev` and `geo_to_tex_next` are sampled by the built-in crossfade;
+/// `curr_geo_to_{prev,next}_geo` are for the custom shader only.
 struct ResizeTransforms {
     /// Encompassing area (loc + size) the quad covers, adjusted to fit both scaled snapshots.
     area: Rectangle<f64, Logical>,
@@ -40,6 +54,12 @@ struct ResizeTransforms {
     /// Corner radius fitted to `curr_geo_size`.
     corner_radius: CornerRadius,
     scale_x: f32,
+}
+
+/// Extract the affine-diagonal `[scale.xy, translate.xy]` from a scale+translate `Mat3` (the resize
+/// transforms carry no rotation/shear). Mirrors `vulkan::custom::pack_affine`.
+fn pack_affine(m: glam::Mat3) -> [f32; 4] {
+    [m.x_axis.x, m.y_axis.y, m.z_axis.x, m.z_axis.y]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -111,40 +131,105 @@ fn resize_transforms(
     }
 }
 
+impl ResizeRenderElement {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        area: Rectangle<f64, Logical>,
+        scale: Scale<f64>,
+        texture_prev: (VkTexture, Rectangle<i32, Physical>),
+        size_prev: Size<f64, Logical>,
+        texture_next: (VkTexture, Rectangle<i32, Physical>),
+        size_next: Size<f64, Logical>,
+        progress: f32,
+        clamped_progress: f32,
+        corner_radius: CornerRadius,
+        clip_to_geometry: bool,
+        result_alpha: f32,
+        use_custom: bool,
+    ) -> Self {
+        let (tex_prev, tex_prev_geo) = texture_prev;
+        let (tex_next, tex_next_geo) = texture_next;
+
+        let t = resize_transforms(
+            area,
+            scale,
+            tex_prev_geo,
+            glam::Vec2::new(tex_prev.width() as f32, tex_prev.height() as f32),
+            size_prev,
+            tex_next_geo,
+            glam::Vec2::new(tex_next.width() as f32, tex_next.height() as f32),
+            size_next,
+            corner_radius,
+        );
+
+        let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
+        let push = if use_custom {
+            // The user's custom resize shader: the extra curr_geo_to_{prev,next}_geo matrices
+            // and unclamped progress the built-in crossfade doesn't use.
+            // origin/size/target/proj are filled by render_custom_resize.
+            ResizePushKind::Custom(CustomResizePush {
+                curr_geo_size: t.curr_geo_size.to_array(),
+                input_to_curr_geo: pack_affine(t.input_to_curr_geo),
+                curr_geo_to_prev_geo: pack_affine(t.curr_geo_to_prev_geo),
+                curr_geo_to_next_geo: pack_affine(t.curr_geo_to_next_geo),
+                geo_to_tex_prev: pack_affine(t.geo_to_tex_prev),
+                geo_to_tex_next: pack_affine(t.geo_to_tex_next),
+                corner_radius: <[f32; 4]>::from(t.corner_radius),
+                progress,
+                clamped_progress,
+                clip_to_geometry,
+                alpha: result_alpha,
+                scale: t.scale_x,
+                ..Default::default()
+            })
+        } else {
+            ResizePushKind::Builtin(ResizePush {
+                curr_geo_size: t.curr_geo_size.to_array(),
+                input_to_curr_geo: pack_affine(t.input_to_curr_geo),
+                geo_to_tex_prev: pack_affine(t.geo_to_tex_prev),
+                geo_to_tex_next: pack_affine(t.geo_to_tex_next),
+                corner_radius: <[f32; 4]>::from(t.corner_radius),
+                clamped_progress,
+                clip_to_geometry,
+                niri_scale: t.scale_x,
+                niri_alpha: result_alpha,
+                // origin/size/target are filled by render_resize.
+                ..Default::default()
+            })
+        };
+
+        Self {
+            id: Id::new(),
+            commit: CommitCounter::default(),
+            area: t.area,
+            alpha: result_alpha,
+            kind: Kind::Unspecified,
+            tex_prev,
+            tex_next,
+            push,
+        }
+    }
+}
+
 impl Element for ResizeRenderElement {
     fn id(&self) -> &Id {
-        match self {
-            ResizeRenderElement::Gles(e) => e.id(),
-            ResizeRenderElement::Vulkan(e) => &e.id,
-        }
+        &self.id
     }
 
     fn current_commit(&self) -> CommitCounter {
-        match self {
-            ResizeRenderElement::Gles(e) => e.current_commit(),
-            ResizeRenderElement::Vulkan(e) => e.commit,
-        }
+        self.commit
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.geometry(scale),
-            ResizeRenderElement::Vulkan(e) => e.area.to_physical_precise_round(scale),
-        }
+        self.area.to_physical_precise_round(scale)
     }
 
     fn transform(&self) -> Transform {
-        match self {
-            ResizeRenderElement::Gles(e) => e.transform(),
-            ResizeRenderElement::Vulkan(_) => Transform::Normal,
-        }
+        Transform::Normal
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.src(),
-            ResizeRenderElement::Vulkan(_) => Rectangle::from_size(Size::from((1., 1.))),
-        }
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn damage_since(
@@ -152,231 +237,47 @@ impl Element for ResizeRenderElement {
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.damage_since(scale, commit),
-            ResizeRenderElement::Vulkan(e) => {
-                if commit != Some(e.commit) {
-                    DamageSet::from_slice(&[e.area.to_physical_precise_round(scale)])
-                } else {
-                    DamageSet::default()
-                }
-            }
+        if commit != Some(self.commit) {
+            DamageSet::from_slice(&[self.area.to_physical_precise_round(scale)])
+        } else {
+            DamageSet::default()
         }
     }
 
-    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.opaque_regions(scale),
-            ResizeRenderElement::Vulkan(_) => OpaqueRegions::default(),
-        }
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
     }
 
     fn alpha(&self) -> f32 {
-        match self {
-            ResizeRenderElement::Gles(e) => e.alpha(),
-            ResizeRenderElement::Vulkan(e) => e.alpha,
-        }
+        self.alpha
     }
 
     fn kind(&self) -> Kind {
-        match self {
-            ResizeRenderElement::Gles(e) => e.kind(),
-            ResizeRenderElement::Vulkan(e) => e.kind,
-        }
+        self.kind
     }
 }
 
-impl RenderElement<GlesRenderer> for ResizeRenderElement {
+impl RenderElement<VulkanRenderer> for ResizeRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
+        frame: &mut VulkanFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        // The `Vulkan` arm only exists with the `vulkan` feature; without it this is irrefutable.
-        #[allow(irrefutable_let_patterns)]
-        let ResizeRenderElement::Gles(inner) = self
-        else {
-            return Ok(());
-        };
-        let _span = tracy_client::span!("ResizeRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("ResizeRenderElement::draw"), |frame| {
-            RenderElement::<GlesRenderer>::draw(
-                inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
-    }
-
-    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.underlying_storage(renderer),
-            ResizeRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-mod vulkan {
-    use niri_vk::render::ResizePush;
-    use smithay::backend::renderer::element::{Id, Kind, RenderElement, UnderlyingStorage};
-    use smithay::backend::renderer::utils::CommitCounter;
-    use smithay::backend::renderer::Texture as _;
-    use smithay::utils::user_data::UserDataMap;
-    use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size};
-
-    use super::{resize_transforms, ResizeRenderElement};
-    use crate::render_helpers::vulkan::{
-        CustomResizePush, VkTexture, VulkanError, VulkanFrame, VulkanRenderer,
-    };
-
-    /// Which resize material the element draws: the built-in crossfade (`render_resize`) or the
-    /// user's custom resize shader (`render_custom_resize`), chosen at construction by whether a
-    /// custom resize shader is installed — the Vulkan analogue of GLES's `ProgramType::Resize`
-    /// resolving to `custom_resize.or(resize)`.
-    #[derive(Debug)]
-    enum ResizePushKind {
-        Builtin(ResizePush),
-        Custom(CustomResizePush),
-    }
-
-    /// The Vulkan arm of [`ResizeRenderElement`]: two `VkTexture` snapshots + a prebuilt push,
-    /// drawn via `VulkanFrame::render_resize` or `render_custom_resize`.
-    #[derive(Debug)]
-    pub struct VulkanResizeRenderElement {
-        pub(super) id: Id,
-        pub(super) commit: CommitCounter,
-        pub(super) area: Rectangle<f64, Logical>,
-        pub(super) alpha: f32,
-        pub(super) kind: Kind,
-        tex_prev: VkTexture,
-        tex_next: VkTexture,
-        push: ResizePushKind,
-    }
-
-    /// Extract the affine-diagonal `[scale.xy, translate.xy]` from a scale+translate `Mat3` (the
-    /// resize transforms carry no rotation/shear). Mirrors `vulkan::custom::pack_affine`.
-    fn pack_affine(m: glam::Mat3) -> [f32; 4] {
-        [m.x_axis.x, m.y_axis.y, m.z_axis.x, m.z_axis.y]
-    }
-
-    impl ResizeRenderElement {
-        #[allow(clippy::too_many_arguments)]
-        pub fn new_vulkan(
-            area: Rectangle<f64, Logical>,
-            scale: Scale<f64>,
-            texture_prev: (VkTexture, Rectangle<i32, Physical>),
-            size_prev: Size<f64, Logical>,
-            texture_next: (VkTexture, Rectangle<i32, Physical>),
-            size_next: Size<f64, Logical>,
-            progress: f32,
-            clamped_progress: f32,
-            corner_radius: niri_config::CornerRadius,
-            clip_to_geometry: bool,
-            result_alpha: f32,
-            use_custom: bool,
-        ) -> Self {
-            let (tex_prev, tex_prev_geo) = texture_prev;
-            let (tex_next, tex_next_geo) = texture_next;
-
-            let t = resize_transforms(
-                area,
-                scale,
-                tex_prev_geo,
-                glam::Vec2::new(tex_prev.width() as f32, tex_prev.height() as f32),
-                size_prev,
-                tex_next_geo,
-                glam::Vec2::new(tex_next.width() as f32, tex_next.height() as f32),
-                size_next,
-                corner_radius,
-            );
-
-            let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
-            let push = if use_custom {
-                // The user's custom resize shader: the extra curr_geo_to_{prev,next}_geo matrices
-                // and unclamped progress the built-in crossfade doesn't use.
-                // origin/size/target/proj are filled by render_custom_resize.
-                ResizePushKind::Custom(CustomResizePush {
-                    curr_geo_size: t.curr_geo_size.to_array(),
-                    input_to_curr_geo: pack_affine(t.input_to_curr_geo),
-                    curr_geo_to_prev_geo: pack_affine(t.curr_geo_to_prev_geo),
-                    curr_geo_to_next_geo: pack_affine(t.curr_geo_to_next_geo),
-                    geo_to_tex_prev: pack_affine(t.geo_to_tex_prev),
-                    geo_to_tex_next: pack_affine(t.geo_to_tex_next),
-                    corner_radius: <[f32; 4]>::from(t.corner_radius),
-                    progress,
-                    clamped_progress,
-                    clip_to_geometry,
-                    alpha: result_alpha,
-                    scale: t.scale_x,
-                    ..Default::default()
-                })
-            } else {
-                ResizePushKind::Builtin(ResizePush {
-                    curr_geo_size: t.curr_geo_size.to_array(),
-                    input_to_curr_geo: pack_affine(t.input_to_curr_geo),
-                    geo_to_tex_prev: pack_affine(t.geo_to_tex_prev),
-                    geo_to_tex_next: pack_affine(t.geo_to_tex_next),
-                    corner_radius: <[f32; 4]>::from(t.corner_radius),
-                    clamped_progress,
-                    clip_to_geometry,
-                    niri_scale: t.scale_x,
-                    niri_alpha: result_alpha,
-                    // origin/size/target are filled by render_resize.
-                    ..Default::default()
-                })
-            };
-
-            Self::Vulkan(VulkanResizeRenderElement {
-                id: Id::new(),
-                commit: CommitCounter::default(),
-                area: t.area,
-                alpha: result_alpha,
-                kind: Kind::Unspecified,
-                tex_prev,
-                tex_next,
-                push,
-            })
-        }
-    }
-
-    impl RenderElement<VulkanRenderer> for ResizeRenderElement {
-        fn draw(
-            &self,
-            frame: &mut VulkanFrame<'_, '_>,
-            _src: Rectangle<f64, Buffer>,
-            dst: Rectangle<i32, Physical>,
-            damage: &[Rectangle<i32, Physical>],
-            _opaque_regions: &[Rectangle<i32, Physical>],
-            _cache: Option<&UserDataMap>,
-        ) -> Result<(), VulkanError> {
-            let ResizeRenderElement::Vulkan(inner) = self else {
-                return Ok(());
-            };
-            match &inner.push {
-                ResizePushKind::Builtin(push) => {
-                    frame.render_resize(&inner.tex_prev, &inner.tex_next, dst, damage, *push)
-                }
-                ResizePushKind::Custom(push) => {
-                    frame.render_custom_resize(&inner.tex_prev, &inner.tex_next, dst, damage, *push)
-                }
+        _opaque_regions: &[Rectangle<i32, Physical>],
+        _cache: Option<&UserDataMap>,
+    ) -> Result<(), VulkanError> {
+        match &self.push {
+            ResizePushKind::Builtin(push) => {
+                frame.render_resize(&self.tex_prev, &self.tex_next, dst, damage, *push)
+            }
+            ResizePushKind::Custom(push) => {
+                frame.render_custom_resize(&self.tex_prev, &self.tex_next, dst, damage, *push)
             }
         }
+    }
 
-        fn underlying_storage(
-            &self,
-            _renderer: &mut VulkanRenderer,
-        ) -> Option<UnderlyingStorage<'_>> {
-            None
-        }
+    fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
     }
 }
-
-pub use vulkan::VulkanResizeRenderElement;

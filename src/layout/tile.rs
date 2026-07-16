@@ -160,11 +160,8 @@ struct ResizeAnimation {
     anim: Animation,
     size_from: Size<f64, Logical>,
     snapshot: LayoutElementRenderSnapshot,
-    offscreen: OffscreenBuffer,
-    /// The "current window" snapshot rendered through the owned Vulkan renderer (the GLES
-    /// `offscreen` above has an incompatible texture type). Reused across frames — its texture is
-    /// re-rendered in place, never reallocated (matters on Venus, where per-frame allocation
-    /// exhausts host blobs).
+    /// The "current window" snapshot. Reused across frames — its texture is re-rendered in place,
+    /// never reallocated (matters on Venus, where per-frame allocation exhausts host blobs).
     offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
     /// The pre-resize snapshot uploaded to a `VkTexture`, cached for the whole animation (the
     /// source `MemoryBuffer` in `snapshot.neutral` never changes), so it is imported once, not
@@ -335,14 +332,7 @@ impl<W: LayoutElement> Tile<W> {
                     .map(|anim| anim.clamped_value().clamp(0., 1.))
                     .unwrap_or(if prev_sizing_mode.is_normal() { 0. } else { 1. });
 
-                // Also try to reuse the existing offscreen buffer if we have one.
-                (
-                    size,
-                    tile_size,
-                    fullscreen_from,
-                    expanded_from,
-                    resize.offscreen,
-                )
+                (size, tile_size, fullscreen_from, expanded_from)
             } else {
                 let size = animate_from.size;
 
@@ -365,15 +355,9 @@ impl<W: LayoutElement> Tile<W> {
 
                 let expanded_from = if prev_sizing_mode.is_normal() { 0. } else { 1. };
 
-                (
-                    size,
-                    tile_size,
-                    fullscreen_from,
-                    expanded_from,
-                    OffscreenBuffer::default(),
-                )
+                (size, tile_size, fullscreen_from, expanded_from)
             };
-            let (size_from, tile_size_from, fullscreen_from, expanded_from, offscreen) = params;
+            let (size_from, tile_size_from, fullscreen_from, expanded_from) = params;
 
             let change = self.window.size().to_f64().to_point() - size_from.to_point();
             let change = f64::max(change.x.abs(), change.y.abs());
@@ -404,7 +388,6 @@ impl<W: LayoutElement> Tile<W> {
                     anim,
                     size_from,
                     snapshot: animate_from,
-                    offscreen,
                     // Fresh per resize-start (persists across the animation's frames, reused
                     // there); prev_vk starts empty since the pre-resize
                     // snapshot just changed.
@@ -1180,7 +1163,7 @@ impl<W: LayoutElement> Tile<W> {
                                 let use_custom = vctx.renderer.has_custom_shader(
                                     crate::render_helpers::vulkan::CustomShaderType::Resize,
                                 );
-                                let elem = ResizeRenderElement::new_vulkan(
+                                let elem = ResizeRenderElement::new(
                                     area,
                                     scale,
                                     (prev_tex, *prev_geo),
