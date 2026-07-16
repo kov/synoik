@@ -21,7 +21,6 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::ClientId;
 use super::fixture::Fixture;
 use crate::niri::OutputRenderElements;
-use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 use crate::ui::mru::WindowMruUiRenderElement;
@@ -622,12 +621,9 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
                     RenderTarget::ScreenCapture,
                 ] {
                     assert!(
-                        matches!(
-                            transition.render(vk, target),
-                            Some(DualTextureRenderElement::Vulkan(_))
-                        ),
-                        "{target:?} did not upload the capture to a VkTexture; the Gles arm it \
-                         fell through to draws nothing on Vulkan"
+                        transition.render(vk, target).is_some(),
+                        "{target:?} has no neutral capture to upload, so the crossfade draws \
+                         nothing there"
                     );
                 }
             })
@@ -663,11 +659,10 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
 
 /// The frozen screen-transition frame must also draw into a **screencast**, not just on screen.
 ///
-/// `ScreenTransition::render` had a neutral for the `Output` target only; the other targets fell
-/// through to a `DualTextureRenderElement::Gles`, which is a silent no-op on the owned renderer. So
-/// on a Vulkan session a cast running across a screen transition showed *nothing* where the frozen
-/// screen should be — and, worse, the live window straight through it. Neutrals are now captured
-/// per target.
+/// `ScreenTransition::render` once had a neutral for the `Output` target only; the other targets
+/// fell through to a GLES element, a silent no-op on the owned renderer. So a cast running across a
+/// screen transition showed *nothing* where the frozen screen should be — and, worse, the live
+/// window straight through it. Neutrals are now captured per target.
 ///
 /// Same shape as `vulkan_screen_transition_draws_the_captured_frame`, but compositing Screencast.
 #[test]
@@ -944,7 +939,7 @@ where
 
 /// Buffer-transform (`src_transform`) conformance: a texture with a non-Normal buffer transform
 /// must sample identically to the GLES oracle — the second, independent transform axis from the
-/// output projection. This is what un-blanks the DualTexture capture overlays (screen-transition /
+/// output projection. This is what un-blanks the capture overlays (screen-transition /
 /// screenshot / MRU) on a rotated output, where they carry `src_transform == output_transform`.
 /// Renders a 4-colour-quadrant texture through `render_texture_from_to` via BOTH renderers at all 8
 /// buffer transforms (Normal output) plus a few buffer×output crosses, on a non-square target.

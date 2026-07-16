@@ -19,7 +19,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
-use crate::render_helpers::dual_texture::DualTextureRenderElement;
+use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -134,7 +134,7 @@ pub enum OutputScreenshot {
 
 niri_render_elements! {
     ScreenshotUiRenderElement => {
-        Screenshot = DualTextureRenderElement,
+        Screenshot = CapturedTextureRenderElement,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -1037,14 +1037,14 @@ impl OutputScreenshot {
     fn buffer_element<R: NiriRenderer>(
         &self,
         renderer: &mut R,
-    ) -> Option<DualTextureRenderElement> {
+    ) -> Option<CapturedTextureRenderElement> {
         let Self::Neutral {
             screen, screen_vk, ..
         } = self;
 
         let vk = renderer.try_as_vulkan_renderer()?;
         let tb = upload_cached(vk, screen, screen_vk)?;
-        Some(DualTextureRenderElement::Vulkan(
+        Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 tb,
                 (0., 0.),
@@ -1061,7 +1061,7 @@ impl OutputScreenshot {
     fn pointer_element<R: NiriRenderer>(
         &self,
         renderer: &mut R,
-    ) -> Option<DualTextureRenderElement> {
+    ) -> Option<CapturedTextureRenderElement> {
         let Self::Neutral {
             pointer,
             pointer_vk,
@@ -1071,7 +1071,7 @@ impl OutputScreenshot {
         let vk = renderer.try_as_vulkan_renderer()?;
         let (neutral, location) = pointer.as_ref()?;
         let tb = upload_cached(vk, neutral, pointer_vk)?;
-        Some(DualTextureRenderElement::Vulkan(
+        Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 tb,
                 *location,
@@ -1098,7 +1098,7 @@ impl OutputData {
         show_pointer: bool,
         location: Point<f64, Logical>,
         alpha: f32,
-    ) -> Option<DualTextureRenderElement> {
+    ) -> Option<CapturedTextureRenderElement> {
         let vk = renderer.try_as_vulkan_renderer()?;
         let (show_mem, hide_mem) = self.panel_neutral.as_ref()?;
         let (neutral, cache) = if show_pointer {
@@ -1107,7 +1107,7 @@ impl OutputData {
             (show_mem, &self.panel_vk.0)
         };
         let tb = upload_cached(vk, neutral, cache)?;
-        Some(DualTextureRenderElement::Vulkan(
+        Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 tb,
                 location,

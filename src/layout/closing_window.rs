@@ -9,8 +9,8 @@ use smithay::wayland::compositor::{Blocker, BlockerState};
 
 use crate::animation::Animation;
 use crate::niri_render_elements;
+use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::custom_anim::CustomAnimRenderElement;
-use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderTarget;
@@ -52,7 +52,7 @@ pub struct ClosingWindow {
 
 niri_render_elements! {
     ClosingWindowRenderElement => {
-        Texture = RelocateRenderElement<RescaleRenderElement<DualTextureRenderElement>>,
+        Texture = RelocateRenderElement<RescaleRenderElement<CapturedTextureRenderElement>>,
         Shader = CustomAnimRenderElement,
     }
 }
@@ -169,7 +169,7 @@ impl ClosingWindow {
                     Kind::Unspecified,
                 );
 
-                let elem = DualTextureRenderElement::Vulkan(elem);
+                let elem = CapturedTextureRenderElement(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), 1.);
 
                 let mut location = self.pos + offset;
@@ -247,7 +247,7 @@ impl ClosingWindow {
             Kind::Unspecified,
         );
 
-        let elem = DualTextureRenderElement::Vulkan(elem);
+        let elem = CapturedTextureRenderElement(elem);
 
         let center = self.geo_size.to_point().downscale(2.);
         let elem = RescaleRenderElement::from_element(

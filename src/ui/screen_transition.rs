@@ -5,7 +5,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Scale, Transform};
 
 use crate::animation::Clock;
-use crate::render_helpers::dual_texture::DualTextureRenderElement;
+use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -113,7 +113,7 @@ impl ScreenTransition {
         &self,
         renderer: &mut R,
         target: RenderTarget,
-    ) -> Option<DualTextureRenderElement> {
+    ) -> Option<CapturedTextureRenderElement> {
         let alpha = self.alpha();
         let idx = target as usize;
 
@@ -134,7 +134,7 @@ impl ScreenTransition {
         // Keep the uploaded texture full-screen under the current scale/transform.
         tb.set_texture_scale(self.scale);
         tb.set_texture_transform(self.transform);
-        Some(DualTextureRenderElement::Vulkan(
+        Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 tb,
                 (0., 0.),
