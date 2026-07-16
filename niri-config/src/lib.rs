@@ -1279,6 +1279,7 @@ mod tests {
                 },
             ],
             layout: Layout {
+                windowing_mode: Floating,
                 focus_ring: FocusRing {
                     off: false,
                     width: 5.0,
@@ -2261,7 +2262,6 @@ mod tests {
                     "/dev/dri/renderD128",
                     "/dev/dri/renderD130",
                 ],
-                force_pipewire_invalid_modifier: false,
                 emulate_zero_presentation_time: false,
                 disable_resize_throttling: false,
                 disable_transactions: false,
