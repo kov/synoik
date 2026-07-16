@@ -861,7 +861,7 @@ impl XdgShellHandler for State {
         // the animation without a renderer rather than through one it ignores.
         self.niri
             .layout
-            .start_close_animation_for_window(None, &window, blocker);
+            .start_close_animation_for_window(&window, blocker);
 
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);

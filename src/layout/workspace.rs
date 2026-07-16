@@ -10,7 +10,6 @@ use niri_config::{
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -1970,7 +1969,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut SnapshotRenderer,
+        renderer: SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -2005,29 +2004,27 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: Option<&mut GlesRenderer>,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
         if self.floating.has_window(window) {
             self.floating
-                .start_close_animation_for_window(renderer, window, blocker);
+                .start_close_animation_for_window(window, blocker);
         } else {
             self.scrolling
-                .start_close_animation_for_window(renderer, window, blocker);
+                .start_close_animation_for_window(window, blocker);
         }
     }
 
     pub fn start_close_animation_for_tile(
         &mut self,
-        renderer: Option<&mut GlesRenderer>,
         snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
     ) {
         self.floating
-            .start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+            .start_close_animation_for_tile(snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {

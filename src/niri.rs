@@ -140,7 +140,7 @@ use crate::input::{
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
-use crate::layout::tile::{SnapshotRenderer, TileRenderElement};
+use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
@@ -2176,7 +2176,7 @@ impl State {
 
                 let state = self.niri.output_state.get_mut(output).unwrap();
                 self.niri.layout.store_unmap_snapshot(
-                    &mut SnapshotRenderer::Vulkan(renderer),
+                    renderer,
                     Some(&mut state.xray),
                     has_blocked_out,
                     window,
@@ -2184,12 +2184,9 @@ impl State {
 
                 self.niri.clear_xray_elements(output);
             } else {
-                self.niri.layout.store_unmap_snapshot(
-                    &mut SnapshotRenderer::Vulkan(renderer),
-                    None,
-                    false,
-                    window,
-                );
+                self.niri
+                    .layout
+                    .store_unmap_snapshot(renderer, None, false, window);
             }
         });
     }

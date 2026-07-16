@@ -7,7 +7,6 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -1447,7 +1446,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: Option<&mut GlesRenderer>,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -1503,12 +1501,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             tile_pos.x -= offset;
         }
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(snapshot, tile_size, tile_pos, blocker);
     }
 
     fn start_close_animation_for_tile(
         &mut self,
-        renderer: Option<&mut GlesRenderer>,
         snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
@@ -1528,18 +1525,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             blocker
         };
 
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
-        );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
+        self.closing_windows.push(ClosingWindow::new(
+            snapshot, tile_size, tile_pos, blocker, anim,
+        ));
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
@@ -2915,13 +2903,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 if let Some(elem) =
                     closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)
                 {
-                    push(elem.into());
-                }
-                continue;
-            }
-
-            if let Some(ctx) = ctx.try_as_gles() {
-                if let Some(elem) = closing.render(ctx, view_rect, scale) {
                     push(elem.into());
                 }
             }

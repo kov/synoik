@@ -20,7 +20,6 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::fixture::Fixture;
-use crate::layout::closing_window::ClosingSnapshot;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
@@ -2101,9 +2100,6 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
         .expect("a tile")
         .take_unmap_snapshot()
         .expect("stored unmap snapshot");
-    let ClosingSnapshot::Neutral(snapshot) = &snapshot else {
-        panic!("a Vulkan session must capture the close snapshot as neutral buffers, not GLES");
-    };
     let (buffer, geo) = &snapshot.contents;
 
     // The tile encloses at least the WIN×WIN window (default config has no border).
@@ -4223,7 +4219,7 @@ fn close_the_only_window(f: &mut Fixture, output: &Output) {
     state
         .niri
         .layout
-        .start_close_animation_for_window(None, &window_id, blocker);
+        .start_close_animation_for_window(&window_id, blocker);
     state.niri.layout.remove_window(&window_id, transaction);
 }
 

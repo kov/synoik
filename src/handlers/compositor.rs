@@ -376,7 +376,7 @@ impl CompositorHandler for State {
                     // renderer — and must not depend on one being available.
                     self.niri
                         .layout
-                        .start_close_animation_for_window(None, &window, blocker);
+                        .start_close_animation_for_window(&window, blocker);
                 }
 
                 window.on_commit();

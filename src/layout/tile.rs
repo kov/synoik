@@ -5,10 +5,8 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
-use super::closing_window::ClosingSnapshot;
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
@@ -28,7 +26,7 @@ use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuff
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::snapshot::{NeutralSnapshot, RenderSnapshot};
+use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::VulkanRenderer;
@@ -149,19 +147,13 @@ niri_render_elements! {
     }
 }
 
-pub type TileRenderSnapshot =
-    RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
+/// A tile's stored unmap snapshot: renderer-neutral CPU buffers, one per block-out variant.
+pub type TileUnmapSnapshot = NeutralSnapshot;
 
-/// A tile's stored unmap snapshot, in the form the session's renderer can sample.
-pub type TileUnmapSnapshot = ClosingSnapshot<TileRenderElement<GlesRenderer>>;
-
-/// The renderer an unmap snapshot is captured through, threaded down the layout tree. The two arms
-/// capture different things — GLES render elements vs. renderer-neutral CPU buffers — so this can't
-/// just be a `&mut impl NiriRenderer`.
-pub enum SnapshotRenderer<'a> {
-    Gles(&'a mut GlesRenderer),
-    Vulkan(&'a mut crate::render_helpers::vulkan::VulkanRenderer),
-}
+/// The renderer an unmap snapshot is captured through, threaded down the layout tree. A concrete
+/// renderer rather than `&mut impl NiriRenderer`: capturing reads back pixels, which is not
+/// something the generic render path does.
+pub type SnapshotRenderer<'a> = &'a mut crate::render_helpers::vulkan::VulkanRenderer;
 
 #[derive(Debug)]
 struct ResizeAnimation {
@@ -1543,7 +1535,7 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut SnapshotRenderer,
+        renderer: SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -1552,145 +1544,18 @@ impl<W: LayoutElement> Tile<W> {
             return;
         }
 
+        // A failed capture stores nothing: the close animation is skipped (it warned), rather than
+        // half-captured. Storing a partial snapshot would let the blocked-out variant fall back to
+        // the unblocked contents on a screencast.
         self.unmap_snapshot =
-            match renderer {
-                SnapshotRenderer::Gles(renderer) => Some(ClosingSnapshot::Gles(
-                    self.render_snapshot(renderer, xray, xray_has_blocked_out_layers, xray_pos),
-                )),
-                // A failed capture stores nothing: the close animation is skipped (it warned),
-                // rather than half-captured. Storing a partial snapshot would let
-                // the blocked-out variant fall back to the unblocked contents on a
-                // screencast.
-                SnapshotRenderer::Vulkan(renderer) => self
-                    .render_snapshot_vulkan(renderer, xray, xray_has_blocked_out_layers, xray_pos)
-                    .map(ClosingSnapshot::Neutral),
-            };
-    }
-
-    fn render_snapshot(
-        &self,
-        renderer: &mut GlesRenderer,
-        mut xray: Option<&mut Xray>,
-        xray_has_blocked_out_layers: bool,
-        xray_pos: XrayPos,
-    ) -> TileRenderSnapshot {
-        let _span = tracy_client::span!("Tile::render_snapshot");
-
-        let mut contents = Vec::new();
-        self.render(
-            RenderCtx {
-                target: RenderTarget::Output,
-                renderer,
-                xray: xray.as_deref(),
-            },
-            Point::from((0., 0.)),
-            xray_pos,
-            false,
-            &mut |elem| contents.push(elem),
-        );
-
-        let mut contents_with_blocked_out_bg = None;
-
-        // Do a bit of pointer surgery on Xray.
-        //
-        // The idea is to avoid the combinatorial combination of rendering snapshots for target
-        // (Output, Screencast) × Xray target (Output, Screencast, ScreenCapture).
-        //
-        // Our main goals:
-        // - Everything must look unblocked for RenderTarget::Output.
-        // - If anything is potentially blocked-out, it must not show up on any screen capture.
-        //
-        // Right above we rendered a fully-unblocked snapshot for the Output, so that's covered.
-        //
-        // Next, *only if Xray has any blocked-out surfaces* (which is a rare case), we will render
-        // a snapshot where the window itself is unblocked, but the Xray background is blocked. To
-        // do this, we swap the Output target buffers in Xray with the Screencast target buffers
-        // (which were prepared for us higher up the stack).
-        //
-        // Finally, we render a fully blocked-out snapshot. If Xray has blocked-out surfaces, then
-        // Xray's Screencast buffers are already filled-in, but if not, then we swap in the Output
-        // buffers, to avoid an extra render. This is safe since we know there are no blocked
-        // surfaces there.
-        let output_idx = RenderTarget::Output as usize;
-        let screencast_idx = RenderTarget::Screencast as usize;
-        let mut screencast_background = None;
-        let mut screencast_backdrop = None;
-        let mut output_background = None;
-        let mut output_backdrop = None;
-        if let Some(xray) = &mut xray {
-            screencast_background = Some(Rc::clone(&xray.background[screencast_idx]));
-            screencast_backdrop = Some(Rc::clone(&xray.backdrop[screencast_idx]));
-            output_background = Some(Rc::clone(&xray.background[output_idx]));
-            output_backdrop = Some(Rc::clone(&xray.backdrop[output_idx]));
-
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = screencast_background.clone().unwrap();
-                xray.backdrop[output_idx] = screencast_backdrop.clone().unwrap();
-
-                let mut contents = Vec::new();
-                self.render(
-                    RenderCtx {
-                        target: RenderTarget::Output,
-                        renderer,
-                        xray: Some(xray),
-                    },
-                    Point::from((0., 0.)),
-                    xray_pos,
-                    false,
-                    &mut |elem| contents.push(elem),
-                );
-                contents_with_blocked_out_bg = Some(contents);
-            } else {
-                xray.background[screencast_idx] = output_background.clone().unwrap();
-                xray.backdrop[screencast_idx] = output_backdrop.clone().unwrap();
-            }
-        }
-
-        // A bit of a hack to render blocked out as for screencast, but I think it's fine here.
-        let mut blocked_out_contents = Vec::new();
-        self.render(
-            RenderCtx {
-                target: RenderTarget::Screencast,
-                renderer,
-                xray: xray.as_deref(),
-            },
-            Point::from((0., 0.)),
-            xray_pos,
-            false,
-            &mut |elem| blocked_out_contents.push(elem),
-        );
-
-        // Put everything back to normal.
-        if let Some(xray) = &mut xray {
-            if xray_has_blocked_out_layers {
-                xray.background[output_idx] = output_background.take().unwrap();
-                xray.backdrop[output_idx] = output_backdrop.take().unwrap();
-            } else {
-                xray.background[screencast_idx] = screencast_background.take().unwrap();
-                xray.backdrop[screencast_idx] = screencast_backdrop.take().unwrap();
-            }
-        }
-
-        RenderSnapshot {
-            contents,
-            contents_with_blocked_out_bg,
-            blocked_out_contents,
-            block_out_from: self.window.rules().block_out_from,
-            size: self.animated_tile_size(),
-            neutral: Default::default(),
-        }
+            self.render_snapshot_vulkan(renderer, xray, xray_has_blocked_out_layers, xray_pos);
     }
 
     pub fn take_unmap_snapshot(&mut self) -> Option<TileUnmapSnapshot> {
         self.unmap_snapshot.take()
     }
 
-    /// The Vulkan sibling of [`Self::render_snapshot`]: captures the same three block-out variants,
-    /// but rasterized through the owned renderer into renderer-neutral CPU buffers (the owned
-    /// renderer can't sample the GLES textures the other one bakes).
-    ///
-    /// Mirrors `render_snapshot` element-for-element, xray pointer surgery included — see the long
-    /// comment there for why the buffers are swapped rather than rendered per target.
+    /// Capture the tile's three block-out variants, rasterized into renderer-neutral CPU buffers.
     ///
     /// Returns `None` if any *needed* variant failed to capture, so a partial snapshot can never be
     /// stored: [`NeutralSnapshot::variant`] distinguishes "not needed" from "missing" only because
@@ -1731,6 +1596,26 @@ impl<W: LayoutElement> Tile<W> {
 
         let mut contents_with_blocked_out_bg = None;
 
+        // Do a bit of pointer surgery on Xray.
+        //
+        // The idea is to avoid the combinatorial combination of capturing snapshots for target
+        // (Output, Screencast) × Xray target (Output, Screencast, ScreenCapture).
+        //
+        // Our main goals:
+        // - Everything must look unblocked for RenderTarget::Output.
+        // - If anything is potentially blocked-out, it must not show up on any screen capture.
+        //
+        // Right above we captured a fully-unblocked snapshot for the Output, so that's covered.
+        //
+        // Next, *only if Xray has any blocked-out surfaces* (which is a rare case), we will capture
+        // a snapshot where the window itself is unblocked, but the Xray background is blocked. To
+        // do this, we swap the Output target buffers in Xray with the Screencast target buffers
+        // (which were prepared for us higher up the stack).
+        //
+        // Finally, we capture a fully blocked-out snapshot. If Xray has blocked-out surfaces, then
+        // Xray's Screencast buffers are already filled-in, but if not, then we swap in the Output
+        // buffers, to avoid an extra render. This is safe since we know there are no blocked
+        // surfaces there.
         let output_idx = RenderTarget::Output as usize;
         let screencast_idx = RenderTarget::Screencast as usize;
         let mut screencast_background = None;

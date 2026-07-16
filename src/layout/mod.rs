@@ -46,7 +46,7 @@ use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::GlesTexture;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -4926,7 +4926,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn store_unmap_snapshot(
         &mut self,
-        renderer: &mut SnapshotRenderer,
+        renderer: SnapshotRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         window: &W::Id,
@@ -5021,7 +5021,6 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        mut renderer: Option<&mut GlesRenderer>,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -5053,7 +5052,7 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
 
                 let tile_pos = tile_pos - ws_geo.loc;
-                ws.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+                ws.start_close_animation_for_tile(snapshot, tile_size, tile_pos, blocker);
                 return;
             }
         }
@@ -5063,11 +5062,7 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(
-                                renderer.as_deref_mut(),
-                                window,
-                                blocker,
-                            );
+                            ws.start_close_animation_for_window(window, blocker);
                             return;
                         }
                     }
@@ -5076,7 +5071,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
                     if ws.has_window(window) {
-                        ws.start_close_animation_for_window(renderer, window, blocker);
+                        ws.start_close_animation_for_window(window, blocker);
                         return;
                     }
                 }

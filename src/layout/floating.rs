@@ -5,7 +5,6 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{PresetSize, RelativeTo, WindowingMode};
 use niri_ipc::{PositionChange, SizeChange, WindowLayout};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -572,12 +571,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
-        &mut self,
-        renderer: Option<&mut GlesRenderer>,
-        id: &W::Id,
-        blocker: TransactionBlocker,
-    ) {
+    pub fn start_close_animation_for_window(&mut self, id: &W::Id, blocker: TransactionBlocker) {
         let (tile, tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == id)
@@ -589,7 +583,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         let tile_size = tile.tile_size();
 
-        self.start_close_animation_for_tile(renderer, snapshot, tile_size, tile_pos, blocker);
+        self.start_close_animation_for_tile(snapshot, tile_size, tile_pos, blocker);
     }
 
     pub fn activate_window_without_raising(&mut self, id: &W::Id) -> bool {
@@ -624,7 +618,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn start_close_animation_for_tile(
         &mut self,
-        renderer: Option<&mut GlesRenderer>,
         snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
@@ -644,18 +637,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
             blocker
         };
 
-        let scale = Scale::from(self.scale);
-        let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
-        );
-        match res {
-            Ok(closing) => {
-                self.closing_windows.push(closing);
-            }
-            Err(err) => {
-                warn!("error creating a closing window animation: {err:?}");
-            }
-        }
+        self.closing_windows.push(ClosingWindow::new(
+            snapshot, tile_size, tile_pos, blocker, anim,
+        ));
     }
 
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {
@@ -1212,13 +1196,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 if let Some(elem) =
                     closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)
                 {
-                    push(elem.into());
-                }
-                continue;
-            }
-
-            if let Some(ctx) = ctx.try_as_gles() {
-                if let Some(elem) = closing.render(ctx, view_rect, scale) {
                     push(elem.into());
                 }
             }
