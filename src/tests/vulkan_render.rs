@@ -279,11 +279,25 @@ fn vulkan_composites_the_run_dialog() {
     eprintln!("vulkan_composites_the_run_dialog: {w}x{h} frame changed with the dialog open");
 }
 
+/// White pixels in the strip `y ∈ [h/16, h/8)`, where the MRU's scope panel draws its text.
+///
+/// Deliberately *below* the GNOME top panel, whose own white clock text sits in `y < h/16` and
+/// would otherwise mask the MRU's absence — the caller asserts this strip is empty with the
+/// switcher closed, so the measurement cannot quietly become vacuous.
+fn white_px_in_scope_panel_strip(pixels: &[u8], w: i32, h: i32) -> usize {
+    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    ((h / 16) * w..(h / 8) * w)
+        .filter(|i| is_white(px(pixels, w, i % w, i / w)))
+        .count()
+}
+
 /// The alt-tab MRU draws its window titles and scope panel as CPU/cairo text that was uploaded
 /// through GLES-locked elements — blank on the owned Vulkan renderer. Now the text is a
-/// renderer-neutral buffer uploaded through the active renderer. Open the MRU over a window and
-/// composite the Output target through Vulkan: the white scope-panel text must be present (before,
-/// only the thumbnails and dark backdrop drew).
+/// renderer-neutral buffer uploaded through the active renderer, so the scope panel must appear.
+///
+/// Measured against a closed-MRU baseline on purpose: the GNOME top panel draws its own white clock
+/// text in the same strip, so a bare "white pixels exist up top" assert passes with the MRU absent
+/// entirely — this test did exactly that until the clock pinning in `open_mru` landed.
 #[test]
 fn vulkan_mru_draws_the_scope_panel() {
     let Some(mut f) = green_window_fixture() else {
@@ -291,45 +305,36 @@ fn vulkan_mru_draws_the_scope_panel() {
     };
     let output = f.niri_output(1);
 
-    let clock = f.niri().clock.clone();
-    let wmru = crate::ui::mru::WindowMru::new(f.niri());
-    f.niri().window_mru_ui.open(clock, wmru, output.clone());
-    assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
-    // Settle the open animation so the MRU renders directly (alpha == 1).
-    f.niri_complete_animations();
+    let (before, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let baseline = white_px_in_scope_panel_strip(&before, w, h);
+    // Guards the measurement itself: if anything else ever draws white here, the assert below stops
+    // meaning "the MRU drew" and this fails instead of silently passing.
+    assert_eq!(
+        baseline, 0,
+        "the scope-panel strip must be empty with the MRU closed, else it cannot witness the MRU"
+    );
 
-    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    open_mru(&mut f, &output);
 
-    // The scope panel ("Scope: All Output Workspace") sits in a strip near the top, well above the
-    // centered thumbnails and their focus ring. Its white text over the dark backdrop is
-    // unambiguous there — white pixels in the top strip ⟹ the CPU panel uploaded and drew on
-    // Vulkan.
-    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
-    let top = h / 8;
-    let white = (0..top * w)
-        .filter(|i| is_white(px(&pixels, w, i % w, i / w)))
-        .count();
-    eprintln!("vulkan_mru_draws_the_scope_panel: {white} white px in the top strip");
-    // The blank (old) behavior leaves ~0 white in this strip, so a low threshold still
-    // discriminates clearly while tolerating font-metric variation.
+    let (after, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let white = white_px_in_scope_panel_strip(&after, w, h);
+
+    eprintln!("vulkan_mru_draws_the_scope_panel: {white} white px in the scope-panel strip");
     assert!(
-        white > 40,
+        white > 10,
         "the MRU scope panel text did not draw on Vulkan (blank overlay?): {white} white px"
     );
 }
 
-/// Open the alt-tab MRU over `output` and return the `WindowMruUiRenderElement`s it contributes to
-/// the composited frame.
+/// Open the alt-tab MRU over `output` and leave it fully open, so it actually composites.
 ///
 /// The MRU renders nothing until `Inner::is_fully_open()`, which compares against the clock's
 /// *unadjusted* time — `niri_complete_animations`'s `complete_instantly` does not move it, so the
 /// switcher stays invisible for `recent_windows.open_delay_ms` (150ms by default) of real time.
 /// Pinning the clock past the delay is what actually puts it on screen; without this, a test that
-/// "opens" the MRU composites a frame that has never contained it.
-fn open_mru_and_collect(
-    f: &mut Fixture,
-    output: &Output,
-) -> Vec<WindowMruUiRenderElement<VulkanRenderer>> {
+/// "opens" the MRU composites a frame the switcher has never appeared in, and every assertion
+/// about its contents is vacuous.
+fn open_mru(f: &mut Fixture, output: &Output) {
     let mut clock = f.niri().clock.clone();
     let wmru = crate::ui::mru::WindowMru::new(f.niri());
     f.niri()
@@ -337,10 +342,17 @@ fn open_mru_and_collect(
         .open(clock.clone(), wmru, output.clone());
     assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
 
-    // Past open_delay_ms, so the switcher is fully open and renders at alpha == 1.
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + Duration::from_millis(500));
     f.niri_complete_animations();
+}
+
+/// [`open_mru`], returning the `WindowMruUiRenderElement`s the switcher contributes to the frame.
+fn open_mru_and_collect(
+    f: &mut Fixture,
+    output: &Output,
+) -> Vec<WindowMruUiRenderElement<VulkanRenderer>> {
+    open_mru(f, output);
 
     let state = f.niri_state();
     let elements = state
@@ -417,12 +429,14 @@ fn vulkan_mru_closing_fade_draws_through_the_offscreen() {
     };
     let output = f.niri_output(1);
 
-    let clock = f.niri().clock.clone();
-    let wmru = crate::ui::mru::WindowMru::new(f.niri());
-    f.niri().window_mru_ui.open(clock, wmru, output.clone());
-    // Settle the open animation so the MRU is fully open — a close before that skips the fade.
-    f.niri_complete_animations();
-    assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
+    let (before, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    assert_eq!(
+        white_px_in_scope_panel_strip(&before, w, h),
+        0,
+        "the scope-panel strip must be empty with the MRU closed, else it cannot witness the fade"
+    );
+
+    open_mru(&mut f, &output);
 
     // Start the close, then advance ~16 ms into the critically-damped fade spring so `alpha` is a
     // little below 1 (≈0.9) — enough to take the offscreen path yet keep the text bright.
@@ -432,25 +446,22 @@ fn vulkan_mru_closing_fade_draws_through_the_offscreen() {
     let now = f.niri().clock.now_unadjusted();
     f.niri()
         .clock
-        .set_unadjusted(now + std::time::Duration::from_millis(16));
+        .set_unadjusted(now + Duration::from_millis(16));
     f.niri().advance_animations();
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
-    // Same white-text discriminator as the open case: at ~0.9 alpha the scope-panel text stays well
-    // above 200, while the old blank-offscreen fade leaves ~0 white here (only the dark backdrop
-    // faded over the desktop).
-    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
-    let top = h / 8;
-    let white = (0..top * w)
-        .filter(|i| is_white(px(&pixels, w, i % w, i / w)))
-        .count();
+    // Same discriminator as the open case: at ~0.9 alpha the scope-panel text stays well above 200,
+    // while the old blank-offscreen fade left only the backdrop faded over the desktop.
+    let white = white_px_in_scope_panel_strip(&pixels, w, h);
     eprintln!(
-        "vulkan_mru_closing_fade_draws_through_the_offscreen: {white} white px in the top strip"
+        "vulkan_mru_closing_fade_draws_through_the_offscreen: {white} white px in the \
+         scope-panel strip"
     );
     assert!(
-        white > 40,
-        "the MRU closing fade did not render through the Vulkan offscreen (blank fade?): {white} white px"
+        white > 10,
+        "the MRU closing fade did not render through the Vulkan offscreen (blank fade?): {white} \
+         white px"
     );
 }
 
