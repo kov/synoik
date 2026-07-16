@@ -5021,7 +5021,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        mut renderer: Option<&mut GlesRenderer>,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -5063,7 +5063,11 @@ impl<W: LayoutElement> Layout<W> {
                 for mon in monitors {
                     for ws in &mut mon.workspaces {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(renderer, window, blocker);
+                            ws.start_close_animation_for_window(
+                                renderer.as_deref_mut(),
+                                window,
+                                blocker,
+                            );
                             return;
                         }
                     }

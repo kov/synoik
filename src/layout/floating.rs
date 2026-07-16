@@ -574,7 +574,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: Option<&mut GlesRenderer>,
         id: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -624,7 +624,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn start_close_animation_for_tile(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: Option<&mut GlesRenderer>,
         snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,

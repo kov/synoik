@@ -2005,7 +2005,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: Option<&mut GlesRenderer>,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -2020,7 +2020,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn start_close_animation_for_tile(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: Option<&mut GlesRenderer>,
         snapshot: TileUnmapSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,

@@ -857,11 +857,19 @@ impl XdgShellHandler for State {
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
-        self.backend.with_primary_renderer(|renderer| {
+        // As in `CompositorHandler::commit`: a Vulkan session's close snapshot is renderer-neutral,
+        // so it starts the animation without a GLES renderer rather than through one it ignores.
+        if self.backend.using_vulkan() {
             self.niri
                 .layout
-                .start_close_animation_for_window(renderer, &window, blocker);
-        });
+                .start_close_animation_for_window(None, &window, blocker);
+        } else {
+            self.backend.with_primary_renderer(|renderer| {
+                self.niri
+                    .layout
+                    .start_close_animation_for_window(Some(renderer), &window, blocker);
+            });
+        }
 
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);

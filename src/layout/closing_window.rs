@@ -132,9 +132,11 @@ impl AnimationState {
 }
 
 impl ClosingWindow {
+    /// `renderer` is `None` on a Vulkan session, which needs no GLES renderer here: its snapshot is
+    /// already renderer-neutral. A `Gles` snapshot without one is a caller bug, not a fallback.
     #[allow(clippy::too_many_arguments)]
     pub fn new<E: RenderElement<GlesRenderer>>(
-        renderer: &mut GlesRenderer,
+        renderer: Option<&mut GlesRenderer>,
         snapshot: ClosingSnapshot<E>,
         scale: Scale<f64>,
         geo_size: Size<f64, Logical>,
@@ -162,6 +164,9 @@ impl ClosingWindow {
                 });
             }
         };
+
+        let renderer =
+            renderer.context("a GLES closing snapshot needs a GLES renderer to bake it")?;
 
         let (buffer, buffer_offset) = {
             let (texture, _sync_point, geo) = render_to_encompassing_texture(

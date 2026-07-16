@@ -373,13 +373,21 @@ impl CompositorHandler for State {
                 let transaction = Transaction::new();
                 if !is_mapped {
                     let blocker = transaction.blocker();
-                    // Owned Vulkan sessions read the GLES snapshot back to a MemoryBuffer here so
-                    // the closing animation can render on the Vulkan path (see ClosingWindow::new).
-                    self.backend.with_primary_renderer(|renderer| {
+                    // A Vulkan session's snapshot is already renderer-neutral, so it needs no GLES
+                    // renderer to start the animation — and must not depend on one being available.
+                    if self.backend.using_vulkan() {
                         self.niri
                             .layout
-                            .start_close_animation_for_window(renderer, &window, blocker);
-                    });
+                            .start_close_animation_for_window(None, &window, blocker);
+                    } else {
+                        self.backend.with_primary_renderer(|renderer| {
+                            self.niri.layout.start_close_animation_for_window(
+                                Some(renderer),
+                                &window,
+                                blocker,
+                            );
+                        });
+                    }
                 }
 
                 window.on_commit();

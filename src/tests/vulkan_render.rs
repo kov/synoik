@@ -4120,12 +4120,12 @@ fn close_the_only_window(f: &mut Fixture, output: &Output) {
     let transaction = Transaction::new();
     let blocker = transaction.blocker();
     let state = f.niri_state();
-    state.backend.with_primary_renderer(|renderer| {
-        state
-            .niri
-            .layout
-            .start_close_animation_for_window(renderer, &window_id, blocker);
-    });
+    // `None`, as a Vulkan session does: the snapshot is renderer-neutral and no GLES renderer is
+    // involved in starting the animation.
+    state
+        .niri
+        .layout
+        .start_close_animation_for_window(None, &window_id, blocker);
     state.niri.layout.remove_window(&window_id, transaction);
 }
 
