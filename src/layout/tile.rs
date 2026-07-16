@@ -1211,27 +1211,13 @@ impl<W: LayoutElement> Tile<W> {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
-            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
-            // On the owned Vulkan renderer there is no GLES clip shader; clip in its own pipeline.
-            let vulkan_clip = ctx.try_as_vulkan().is_some();
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry
                         && ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius)
                     {
-                        if let Some(shader) = clip_shader.clone() {
-                            return ClippedSurfaceRenderElement::new(
-                                elem, scale, geo, shader, radius,
-                            )
-                            .into();
-                        }
-                        if vulkan_clip {
-                            return ClippedSurfaceRenderElement::new_vulkan(
-                                elem, scale, geo, radius,
-                            )
-                            .into();
-                        }
+                        return ClippedSurfaceRenderElement::new(elem, scale, geo, radius).into();
                     }
 
                     // Otherwise, render it normally.
@@ -1273,12 +1259,10 @@ impl<W: LayoutElement> Tile<W> {
                 }
             };
 
-            // Gate on whichever clip leg the `clip` closure above will actually take: the radius is
-            // not part of any surface's own damage, so this element is the only thing that reports
-            // a radius change. Gating it on the GLES `clip_shader` alone — as this used to — meant
-            // the owned Vulkan renderer, which carries no GLES program, never pushed it and so
-            // never damaged on a radius change.
-            if clip_to_geometry && (clip_shader.is_some() || vulkan_clip) {
+            // The radius is not part of any surface's own damage, so this element is the only thing
+            // that reports a radius change. It must be pushed whenever the `clip` closure above
+            // will clip.
+            if clip_to_geometry {
                 let damage = self.rounded_corner_damage.render(geo);
                 push(damage.into());
             }

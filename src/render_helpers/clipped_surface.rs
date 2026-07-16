@@ -1,25 +1,16 @@
-use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
-use smithay::backend::renderer::buffer_y_inverted;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::damage::ExtraDamage;
 use super::renderer::NiriRenderer;
-use super::shaders::{mat3_uniform, Shaders};
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    /// The GLES clip shader, carried for the GLES/Tty draw. `None` on the owned Vulkan renderer,
-    /// which clips in its own pipeline (`clipped_texture.frag`) and needs no GLES program.
-    program: Option<GlesTexProgram>,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -32,95 +23,21 @@ pub struct RoundedCornerDamage {
 }
 
 impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
+    /// Build a clipped-surface element. The renderer clips in its own pipeline
+    /// (`clipped_texture.frag`); the `RenderElement` draw folds the geometry and radius into that
+    /// pipeline's push constants.
     pub fn new(
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        program: GlesTexProgram,
         corner_radius: CornerRadius,
     ) -> Self {
         Self {
             inner: elem,
-            program: Some(program),
             corner_radius,
             geometry,
             scale: scale.x as f32,
         }
-    }
-
-    /// Build a clipped-surface element for the owned Vulkan renderer, which clips in its own
-    /// pipeline (`clipped_texture.frag`) and needs no GLES program. Same clip geometry / radius as
-    /// [`Self::new`]; the Vulkan `RenderElement` draw folds them into the pipeline's push
-    /// constants.
-    pub fn new_vulkan(
-        elem: WaylandSurfaceRenderElement<R>,
-        scale: Scale<f64>,
-        geometry: Rectangle<f64, Logical>,
-        corner_radius: CornerRadius,
-    ) -> Self {
-        Self {
-            inner: elem,
-            program: None,
-            corner_radius,
-            geometry,
-            scale: scale.x as f32,
-        }
-    }
-
-    fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
-        let scale = Scale::from(f64::from(self.scale));
-        let elem_geo = self.inner.geometry(scale);
-
-        let elem_geo_loc = Vec2::new(elem_geo.loc.x as f32, elem_geo.loc.y as f32);
-        let elem_geo_size = Vec2::new(elem_geo.size.w as f32, elem_geo.size.h as f32);
-
-        let geo = self.geometry.to_physical_precise_round(scale);
-        let geo_loc = Vec2::new(geo.loc.x, geo.loc.y);
-        let geo_size = Vec2::new(geo.size.w, geo.size.h);
-
-        let buf_size = self.inner.buffer_size();
-        let buf_size = Vec2::new(buf_size.w as f32, buf_size.h as f32);
-
-        let view = self.inner.view();
-        let src_loc = Vec2::new(view.src.loc.x as f32, view.src.loc.y as f32);
-        let src_size = Vec2::new(view.src.size.w as f32, view.src.size.h as f32);
-
-        let transform = self.inner.transform();
-        // HACK: ??? for some reason flipped ones are fine.
-        let transform = match transform {
-            Transform::_90 => Transform::_270,
-            Transform::_270 => Transform::_90,
-            x => x,
-        };
-        let transform_matrix = Mat3::from_translation(Vec2::new(0.5, 0.5))
-            * Mat3::from_cols_array(transform.matrix().as_ref())
-            * Mat3::from_translation(-Vec2::new(0.5, 0.5));
-
-        let y_invert = if buffer_y_inverted(self.inner.buffer()).unwrap_or(false) {
-            Mat3::from_scale(Vec2::new(1., -1.))
-        } else {
-            Mat3::IDENTITY
-        };
-
-        let input_to_geo = transform_matrix * Mat3::from_scale(elem_geo_size / geo_size)
-            * Mat3::from_translation((elem_geo_loc - geo_loc) / elem_geo_size)
-            // Apply viewporter src.
-            * Mat3::from_scale(buf_size / src_size)
-            * Mat3::from_translation(-src_loc / buf_size)
-            * y_invert;
-
-        let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
-
-        vec![
-            Uniform::new("niri_scale", self.scale),
-            Uniform::new("geo_size", geo_size),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", input_to_geo),
-        ]
-    }
-
-    pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
-        Shaders::get(renderer).and_then(|s| s.clipped_surface.as_ref())
     }
 
     pub fn will_clip(
@@ -248,46 +165,9 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
     }
 }
 
-impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        let program = self
-            .program
-            .clone()
-            .expect("a GLES clipped-surface element always carries its program");
-        frame.override_default_tex_program(program, self.compute_uniforms());
-        RenderElement::<GlesRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        frame.clear_tex_program_override();
-        Ok(())
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-// The owned Vulkan renderer clips the surface in its own `clipped_texture` pipeline (M3): the draw
-// arms the clip on the frame, then draws the inner `WaylandSurfaceRenderElement`, whose sampling
-// (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline. Mirrors the GLES
-// `override_default_tex_program` mechanism. The `GlesTexture`-carrying specializations keep the
-// GLES/Tty impls above.
+// The renderer clips the surface in its own `clipped_texture` pipeline: the draw arms the clip on
+// the frame, then draws the inner `WaylandSurfaceRenderElement`, whose sampling
+// (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline.
 use crate::render_helpers::vulkan::{ClipParams, VulkanError, VulkanFrame, VulkanRenderer};
 
 impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement<VulkanRenderer> {

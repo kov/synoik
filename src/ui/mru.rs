@@ -378,22 +378,13 @@ impl Thumbnail {
         };
 
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
-        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
-        // On the owned Vulkan renderer there is no GLES clip shader; clip in its own pipeline.
-        let vulkan_clip = ctx.try_as_vulkan().is_some();
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
         let clip = move |elem| match elem {
             LayoutElementRenderElement::Wayland(elem) => {
                 if ClippedSurfaceRenderElement::will_clip(&elem, s, geo, radius) {
-                    if let Some(shader) = clip_shader.clone() {
-                        let elem = ClippedSurfaceRenderElement::new(elem, s, geo, shader, radius);
-                        return ThumbnailRenderElement::ClippedSurface(elem);
-                    }
-                    if vulkan_clip {
-                        let elem = ClippedSurfaceRenderElement::new_vulkan(elem, s, geo, radius);
-                        return ThumbnailRenderElement::ClippedSurface(elem);
-                    }
+                    let elem = ClippedSurfaceRenderElement::new(elem, s, geo, radius);
+                    return ThumbnailRenderElement::ClippedSurface(elem);
                 }
 
                 // If we don't have a clip path, render it normally.
