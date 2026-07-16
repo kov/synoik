@@ -44,7 +44,7 @@
             fileset = lib.fileset.unions [
               ./niri-config
               ./niri-ipc
-              ./niri-visual-tests
+              ./niri-vk
               ./resources
               ./src
               ./Cargo.toml
@@ -190,12 +190,9 @@
             nativeBuildInputs = [
               pkgs.rustPlatform.bindgenHook
               pkgs.pkg-config
-              pkgs.wrapGAppsHook4 # For `niri-visual-tests`
             ];
 
-            buildInputs = niri.buildInputs ++ [
-              pkgs.libadwaita # For `niri-visual-tests`
-            ];
+            buildInputs = niri.buildInputs;
 
             env = {
               # WARN: Do not overwrite this variable in your shell!

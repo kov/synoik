@@ -148,7 +148,7 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_niri
 
 %if %{with check}
 %check
-%cargo_test -- --workspace --exclude niri-visual-tests
+%cargo_test -- --workspace
 %endif
 
 %files
