@@ -8,6 +8,8 @@
 //! Skips gracefully when no Vulkan device is present. The scanout test additionally needs a real
 //! GBM device (the render node), so it is Venus-only (lavapipe/CPU has no GBM).
 
+use std::time::Duration;
+
 use niri_config::{Action, Config, CornerRadius, WindowRule};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, RenderElement};
@@ -23,6 +25,7 @@ use crate::niri::OutputRenderElements;
 use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+use crate::ui::mru::WindowMruUiRenderElement;
 use crate::utils::{output_size, to_physical_precise_round};
 
 const OUT_W: u16 = 1280;
@@ -47,12 +50,12 @@ fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
 /// message) when there is no Vulkan device — smithay renders the single-pixel buffer as a solid
 /// color, so the window needs no client-buffer import.
 fn window_fixture(color: [u32; 4]) -> Option<Fixture> {
-    window_fixture_settled(color, true)
+    window_fixture_settled(color, true, None)
 }
 
 /// As [`window_fixture`], but `settle` controls whether the map/open animation is completed. Pass
 /// `false` to leave the tile open animation active (the guarded GLES-offscreen render path).
-fn window_fixture_settled(color: [u32; 4], settle: bool) -> Option<Fixture> {
+fn window_fixture_settled(color: [u32; 4], settle: bool, title: Option<&str>) -> Option<Fixture> {
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
@@ -69,6 +72,9 @@ fn window_fixture_settled(color: [u32; 4], settle: bool) -> Option<Fixture> {
     let id = f.add_client();
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
+    if let Some(title) = title {
+        window.set_title(title);
+    }
     window.commit();
     f.roundtrip(id);
 
@@ -309,6 +315,91 @@ fn vulkan_mru_draws_the_scope_panel() {
     assert!(
         white > 40,
         "the MRU scope panel text did not draw on Vulkan (blank overlay?): {white} white px"
+    );
+}
+
+/// Open the alt-tab MRU over `output` and return the `WindowMruUiRenderElement`s it contributes to
+/// the composited frame.
+///
+/// The MRU renders nothing until `Inner::is_fully_open()`, which compares against the clock's
+/// *unadjusted* time — `niri_complete_animations`'s `complete_instantly` does not move it, so the
+/// switcher stays invisible for `recent_windows.open_delay_ms` (150ms by default) of real time.
+/// Pinning the clock past the delay is what actually puts it on screen; without this, a test that
+/// "opens" the MRU composites a frame that has never contained it.
+fn open_mru_and_collect(
+    f: &mut Fixture,
+    output: &Output,
+) -> Vec<WindowMruUiRenderElement<VulkanRenderer>> {
+    let mut clock = f.niri().clock.clone();
+    let wmru = crate::ui::mru::WindowMru::new(f.niri());
+    f.niri()
+        .window_mru_ui
+        .open(clock.clone(), wmru, output.clone());
+    assert!(f.niri().window_mru_ui.is_open(), "MRU must be open");
+
+    // Past open_delay_ms, so the switcher is fully open and renders at alpha == 1.
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + Duration::from_millis(500));
+    f.niri_complete_animations();
+
+    let state = f.niri_state();
+    let elements = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let mut collected = Vec::new();
+            niri.window_mru_ui
+                .render_output(niri, output, ctx, &mut |elem| collected.push(elem));
+            collected
+        })
+        .expect("headless backend must hold a Vulkan renderer");
+
+    assert!(
+        !elements.is_empty(),
+        "the MRU contributed no render elements at all — it is not actually on screen, so any \
+         assertion about its contents would be vacuous"
+    );
+    elements
+}
+
+/// The MRU soft-fades the right edge of a window title too long for its preview. A complete Vulkan
+/// gradient-fade pipeline existed, but `mru.rs` only built the element inside a `try_as_gles()`
+/// branch — always `None` once the GLES renderer went, so every title silently fell through to the
+/// plain, hard-clipped texture. The fade itself is covered element-level in `vulkan/tests.rs`; what
+/// was missing is the *wiring*, so assert the composited element list carries the Vulkan variant.
+#[test]
+fn vulkan_mru_titles_use_the_gradient_fade_element() {
+    // A title far wider than the preview, so the element's cutoff is a real fade band rather than
+    // the no-op `(1, 1)` a title that fits produces.
+    let Some(mut f) = window_fixture_settled(
+        GREEN,
+        true,
+        Some("A window title long enough to overflow its alt-tab preview and need fading"),
+    ) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let mru_elements = open_mru_and_collect(&mut f, &output);
+
+    let fades = mru_elements
+        .iter()
+        .filter(|elem| matches!(elem, WindowMruUiRenderElement::GradientFadeVk(_)))
+        .count();
+
+    // One per window preview title. The GLES-gated (broken) path emits zero — every title took the
+    // plain, hard-clipped `UiTexture` arm instead.
+    assert!(
+        fades > 0,
+        "the MRU emitted no Vulkan gradient-fade element ({} MRU elements total); titles are \
+         hard-clipped",
+        mru_elements.len(),
     );
 }
 
@@ -2363,7 +2454,7 @@ fn vulkan_renders_a_window_mid_open_animation() {
     // frame (full window): the open animation must make the early frame markedly dimmer than the
     // settled one. The old degraded path showed FULL alpha even unsettled, so this also proves the
     // offscreen animation path is taken (not a fallback plain render) — and that it doesn't panic.
-    let Some(mut f) = window_fixture_settled(GREEN, false) else {
+    let Some(mut f) = window_fixture_settled(GREEN, false, None) else {
         return;
     };
     let output = f.niri_output(1);

@@ -123,6 +123,7 @@ niri_render_elements! {
         // RenderElement<R> for any R: Renderer<TextureId = T>).
         UiTexture = TextureRenderElement<R::TextureId>,
         GradientFadeElem = GradientFadeTextureRenderElement,
+        GradientFadeVk = GradientFadeTextureRenderElement<VkTexture>,
         FocusRing = FocusRingRenderElement,
         Offscreen = DualOffscreenRenderElement,
         Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement<R>>>,
@@ -490,12 +491,26 @@ impl Thumbnail {
                 );
             let loc = loc.to_physical_precise_round(scale).to_logical(scale);
 
-            // On GLES, soft-fade the right edge with the gradient shader. Built entirely inside the
-            // GLES branch so the concrete `GlesTexture` element matches the gradient wrapper; the
-            // owned Vulkan renderer has no such shader, so it degrades to the plain (hard-clipped)
-            // texture below.
+            // Soft-fade the right edge of a title too long for its preview. Each branch is built
+            // entirely inside itself so the concrete texture type matches the gradient wrapper. A
+            // title that fits gets a no-op cutoff, so this is safe to take unconditionally; the
+            // plain (hard-clipped) texture below is only for when the upload fails.
             let mut pushed = false;
-            if let Some(gles) = ctx.try_as_gles() {
+            if let Some(vk) = ctx.try_as_vulkan() {
+                if let Ok(buffer) = TextureBuffer::from_memory_buffer(vk.renderer, &texture) {
+                    let elem = TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        loc,
+                        preview_alpha,
+                        Some(src),
+                        None,
+                        Kind::Unspecified,
+                    );
+                    let elem = GradientFadeTextureRenderElement::new_vulkan(elem);
+                    push(WindowMruUiRenderElement::GradientFadeVk(elem));
+                    pushed = true;
+                }
+            } else if let Some(gles) = ctx.try_as_gles() {
                 if let Some(program) = GradientFadeTextureRenderElement::shader(gles.renderer) {
                     if let Ok(buffer) = TextureBuffer::from_memory_buffer(gles.renderer, &texture) {
                         let elem = TextureRenderElement::from_texture_buffer(
