@@ -1619,13 +1619,19 @@ impl Tty {
         }
 
         let mut dmabuf_feedback = None;
-        if let Ok(primary_renderer) = self.gpu_manager.single_renderer(&self.primary_render_node) {
-            let primary_formats = if use_vulkan {
-                owned_vulkan_dmabuf_formats()
-            } else {
-                primary_renderer.dmabuf_formats()
-            };
-
+        // A Vulkan session's formats come from the owned renderer, so don't make the feedback
+        // conditional on a GLES renderer it never consults: failing that gate would advertise no
+        // dmabuf feedback at all.
+        let primary_formats = if use_vulkan {
+            Some(owned_vulkan_dmabuf_formats())
+        } else {
+            self.gpu_manager
+                .single_renderer(&self.primary_render_node)
+                .map(|renderer| renderer.dmabuf_formats())
+                .map_err(|err| warn!("no primary GLES renderer for dmabuf feedback: {err:?}"))
+                .ok()
+        };
+        if let Some(primary_formats) = primary_formats {
             match surface_dmabuf_feedback(
                 &compositor,
                 primary_formats,
