@@ -8,8 +8,8 @@
 //!
 //! Rendering mirrors the other in-compositor overlays (see
 //! `config_error_notification.rs`): pango/cairo paints the bar into an
-//! `ImageSurface`, which is uploaded to a `TextureBuffer` and wrapped in a
-//! `PrimaryGpuTextureRenderElement`. The panel's *logical* state (the clock
+//! `ImageSurface`, which is uploaded to a `TextureBuffer` and drawn as a
+//! `TextureRenderElement`. The panel's *logical* state (the clock
 //! string, whether Activities is checked, the hit rectangles) is kept separate
 //! from that render path so headless tests can assert it without a GPU.
 

@@ -157,7 +157,6 @@ use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -7158,7 +7157,6 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement<R>,
         RunDialog = RunDialogRenderElement<R>,
-        Texture = PrimaryGpuTextureRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).

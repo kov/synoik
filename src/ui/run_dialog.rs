@@ -57,9 +57,7 @@ type BuffersByScale = HashMap<NotNan<f64>, (u64, Option<MemoryBuffer>)>;
 
 niri_render_elements! {
     RunDialogRenderElement<R> => {
-        // A plain memory-uploaded texture drawn through the active renderer's `ImportMem`, so the
-        // dialog composites on any renderer (GLES, Tty, or the owned Vulkan renderer) — unlike the
-        // GLES-locked `PrimaryGpuTextureRenderElement`.
+        // A plain memory-uploaded texture drawn through the active renderer's `ImportMem`.
         Texture = TextureRenderElement<R::TextureId>,
         SolidColor = SolidColorRenderElement,
     }

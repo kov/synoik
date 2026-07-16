@@ -6,7 +6,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
+use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _};
@@ -15,10 +15,7 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
-use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
-use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
-use self::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
 use crate::render_helpers::xray::Xray;
 
@@ -35,7 +32,6 @@ pub mod framebuffer_effect;
 pub mod gradient_fade_texture;
 pub mod memory;
 pub mod offscreen;
-pub mod primary_gpu_texture;
 pub mod render_elements;
 pub mod renderer;
 pub mod resize;
@@ -126,18 +122,6 @@ pub struct BakedBuffer<B> {
     pub dst: Option<Size<i32, Logical>>,
 }
 
-pub trait ToRenderElement {
-    type RenderElement;
-
-    fn to_render_element(
-        &self,
-        location: Point<f64, Logical>,
-        scale: Scale<f64>,
-        alpha: f32,
-        kind: Kind,
-    ) -> Self::RenderElement;
-}
-
 impl RenderTarget {
     pub const COUNT: usize = 3;
 
@@ -147,42 +131,6 @@ impl RenderTarget {
             Some(BlockOutFrom::Screencast) => self == RenderTarget::Screencast,
             Some(BlockOutFrom::ScreenCapture) => self != RenderTarget::Output,
         }
-    }
-}
-
-impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
-    type RenderElement = PrimaryGpuTextureRenderElement;
-
-    fn to_render_element(
-        &self,
-        location: Point<f64, Logical>,
-        _scale: Scale<f64>,
-        alpha: f32,
-        kind: Kind,
-    ) -> Self::RenderElement {
-        let elem = TextureRenderElement::from_texture_buffer(
-            self.buffer.clone(),
-            location + self.location,
-            alpha,
-            self.src,
-            self.dst.map(|dst| dst.to_f64()),
-            kind,
-        );
-        PrimaryGpuTextureRenderElement(elem)
-    }
-}
-
-impl ToRenderElement for BakedBuffer<SolidColorBuffer> {
-    type RenderElement = SolidColorRenderElement;
-
-    fn to_render_element(
-        &self,
-        location: Point<f64, Logical>,
-        _scale: Scale<f64>,
-        alpha: f32,
-        kind: Kind,
-    ) -> Self::RenderElement {
-        SolidColorRenderElement::from_buffer(&self.buffer, location + self.location, alpha, kind)
     }
 }
 
