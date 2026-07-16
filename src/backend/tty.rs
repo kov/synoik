@@ -33,7 +33,7 @@ use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{DebugFlags, ImportDma, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -67,8 +67,8 @@ use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
-use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
+use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 8] = [
@@ -850,38 +850,18 @@ impl Tty {
             let render_node = self.primary_render_node;
             debug!("initializing the primary renderer");
 
-            let mut renderer = self
-                .gpu_manager
-                .single_renderer(&render_node)
-                .context("error creating renderer")?;
-
             // The legacy EGL `wl_drm` global is deliberately never bound: a `wl_drm` buffer is
-            // importable only through EGL into the GLES renderer — the owned Vulkan renderer's
-            // `bind_wl_display` is a no-op and it cannot sample one. Advertising it would offer
-            // clients a buffer type we then cannot display, so a legacy client would render
-            // *invisible*; without it they fall back to shm or linux-dmabuf, which work.
+            // importable only through EGL, and the owned Vulkan renderer cannot sample one.
+            // Advertising it would offer clients a buffer type we then cannot display, so a legacy
+            // client would render *invisible*; without it they fall back to shm or linux-dmabuf,
+            // which work.
 
-            let gles_renderer = renderer
-                .try_as_gles_renderer()
-                .expect("the Tty backend is always GLES-backed");
-            resources::init(gles_renderer);
-            shaders::init(gles_renderer);
-
+            // Compile the custom animation shaders into the owned renderer, so the wired custom
+            // animation paths (`render_custom_{resize,anim}`) have pipelines to draw with.
             let config = self.config.borrow();
             let resize_shader = config.animations.window_resize.custom_shader.as_deref();
             let close_shader = config.animations.window_close.custom_shader.as_deref();
             let open_shader = config.animations.window_open.custom_shader.as_deref();
-            if let Some(src) = resize_shader {
-                shaders::set_custom_resize_program(gles_renderer, Some(src));
-            }
-            if let Some(src) = close_shader {
-                shaders::set_custom_close_program(gles_renderer, Some(src));
-            }
-            if let Some(src) = open_shader {
-                shaders::set_custom_open_program(gles_renderer, Some(src));
-            }
-            // Also compile them into the owned Vulkan renderer, if present, so the wired custom
-            // animation paths (`render_custom_{resize,anim}`) have pipelines to draw with.
             if let Some(vk) = self.vulkan_renderer.as_mut() {
                 vk.set_custom_resize_shader(resize_shader);
                 vk.set_custom_close_shader(close_shader);
@@ -1231,13 +1211,6 @@ impl Tty {
 
             if was_last && render_node == self.primary_render_node {
                 debug!("destroying the primary renderer");
-
-                match self.gpu_manager.single_renderer(&self.primary_render_node) {
-                    Ok(mut renderer) => renderer.unbind_wl_display(),
-                    Err(err) => {
-                        warn!("error creating renderer during device removal: {err}");
-                    }
-                }
 
                 // Disable and destroy the dmabuf global.
                 if let Some(global) = self.dmabuf_global.take() {
@@ -1909,10 +1882,10 @@ impl Tty {
             return rv;
         }
 
-        // Composite and scan out through the owned Vulkan renderer, if enabled; otherwise the GLES
-        // multi-GPU renderer. Both feed the same `DrmCompositor` (renderer-agnostic at the struct
-        // level; `render_frame` is generic over the renderer).
-        if let Some(vk) = self.vulkan_renderer.as_mut() {
+        // Composite and scan out through the owned Vulkan renderer, feeding `DrmCompositor`
+        // (renderer-agnostic at the struct level; `render_frame` is generic over the renderer).
+        let vk = self.vulkan_renderer.as_mut().expect("the Vulkan renderer");
+        {
             // Hardware cursor, overlay, and primary-plane direct scanout all work with the owned
             // Vulkan renderer because those scanout paths bypass the renderer entirely: the cursor
             // goes into DrmCompositor's own gbm Argb8888/Linear buffer (CPU copy or its internal
@@ -1933,7 +1906,7 @@ impl Tty {
             // (off by default, same as GLES); `debug.disable_direct_scanout` drops primary+overlay.
             let flags =
                 compositor_frame_flags(&config, niri, output, /* allow_primary */ true);
-            return render_surface_with(
+            render_surface_with(
                 niri,
                 output,
                 vk,
@@ -1946,34 +1919,8 @@ impl Tty {
                 // surfaces the shared shadow makes that unsafe, so force a full redraw there.
                 !single_scanout_surface,
                 target_presentation_time,
-            );
+            )
         }
-
-        let mut renderer = match self.gpu_manager.renderer(
-            &self.primary_render_node,
-            &device.render_node.unwrap_or(self.primary_render_node),
-            surface.compositor.format(),
-        ) {
-            Ok(renderer) => renderer,
-            Err(err) => {
-                warn!("error creating renderer for primary GPU: {err:?}");
-                return rv;
-            }
-        };
-
-        let flags = compositor_frame_flags(&config, niri, output, /* allow_primary */ true);
-
-        render_surface_with(
-            niri,
-            output,
-            &mut renderer,
-            surface,
-            &config,
-            flags,
-            // GLES preserves buffer-age content, so keep DrmCompositor's partial-damage rendering.
-            false,
-            target_presentation_time,
-        )
     }
 
     pub fn change_vt(&mut self, vt: i32) {
@@ -2011,34 +1958,14 @@ impl Tty {
         // the owned renderer (which only imports single-plane LINEAR 8888), or a client
         // that ignores the dmabuf feedback could get a tiled/multiplanar buffer accepted
         // here and then fail at render (a blank window and per-frame error spam).
-        if let Some(vk) = self.vulkan_renderer.as_mut() {
-            return match ImportDma::import_dmabuf(vk, dmabuf, None) {
-                Ok(_texture) => {
-                    dmabuf.set_node(Some(primary_render_node));
-                    true
-                }
-                Err(err) => {
-                    debug!("error importing dmabuf into the Vulkan renderer: {err:?}");
-                    false
-                }
-            };
-        }
-
-        let mut renderer = match self.gpu_manager.single_renderer(&primary_render_node) {
-            Ok(renderer) => renderer,
-            Err(err) => {
-                debug!("error creating renderer for primary GPU: {err:?}");
-                return false;
-            }
-        };
-
-        match renderer.import_dmabuf(dmabuf, None) {
+        let vk = self.vulkan_renderer.as_mut().expect("the Vulkan renderer");
+        match ImportDma::import_dmabuf(vk, dmabuf, None) {
             Ok(_texture) => {
                 dmabuf.set_node(Some(primary_render_node));
                 true
             }
             Err(err) => {
-                debug!("error importing dmabuf: {err:?}");
+                debug!("error importing dmabuf into the Vulkan renderer: {err:?}");
                 false
             }
         }
