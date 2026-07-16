@@ -1857,22 +1857,7 @@ impl Tty {
         self.session.seat()
     }
 
-    pub fn with_primary_renderer<T>(
-        &mut self,
-        f: impl FnOnce(&mut GlesRenderer) -> T,
-    ) -> Option<T> {
-        let mut renderer = self
-            .gpu_manager
-            .single_renderer(&self.primary_render_node)
-            .ok()?;
-        Some(f(renderer
-            .try_as_gles_renderer()
-            .expect("the Tty backend is always GLES-backed")))
-    }
-
-    /// Run `f` with the owned Vulkan renderer if this Tty composites through it, else `None`.
-    /// The dual of [`Self::with_primary_renderer`] for owned-renderer-only setup (installing the
-    /// custom animation shaders into the owned renderer alongside the GLES ones).
+    /// Run `f` with the owned Vulkan renderer — the only renderer this Tty composites through.
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,

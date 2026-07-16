@@ -167,8 +167,7 @@ use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
-    encompassing_geo, render_to_dmabuf, render_to_shm, render_to_vec, shaders, RenderCtx,
-    RenderTarget,
+    encompassing_geo, render_to_dmabuf, render_to_shm, render_to_vec, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -1661,9 +1660,6 @@ impl State {
             != old_config.animations.window_resize.custom_shader
         {
             let src = config.animations.window_resize.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_resize_program(renderer, src);
-            });
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_resize_shader(src));
             shaders_changed = true;
@@ -1673,9 +1669,6 @@ impl State {
             != old_config.animations.window_close.custom_shader
         {
             let src = config.animations.window_close.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_close_program(renderer, src);
-            });
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_close_shader(src));
             shaders_changed = true;
@@ -1685,9 +1678,6 @@ impl State {
             != old_config.animations.window_open.custom_shader
         {
             let src = config.animations.window_open.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_open_program(renderer, src);
-            });
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_open_shader(src));
             shaders_changed = true;
@@ -2138,30 +2128,16 @@ impl State {
         };
         let path = path.take();
 
-        // On a Vulkan session, save from the frozen-screen neutral CPU buffer (a pure crop +
-        // pointer composite) so this path never renders/reads back through GLES (Phase C). Falls
-        // back to the GLES capture when no neutral was captured (GLES session).
-        let captured = self.niri.screenshot_ui.capture_from_neutral();
-
-        if let Some((size, pixels)) = captured {
-            if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
-                warn!("error saving screenshot: {err:?}");
-            }
-        } else {
-            self.backend.with_primary_renderer(|renderer| {
-                match self.niri.screenshot_ui.capture(renderer) {
-                    Ok((size, pixels)) => {
-                        if let Err(err) =
-                            self.niri.save_screenshot(size, pixels, write_to_disk, path)
-                        {
-                            warn!("error saving screenshot: {err:?}");
-                        }
-                    }
-                    Err(err) => {
-                        warn!("error capturing screenshot: {err:?}");
-                    }
+        // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
+        // render or readback. The neutral is captured when the UI opens, so a missing one means
+        // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
+        match self.niri.screenshot_ui.capture_from_neutral() {
+            Some((size, pixels)) => {
+                if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                    warn!("error saving screenshot: {err:?}");
                 }
-            });
+            }
+            None => warn!("no frozen-screen capture to save the screenshot from"),
         }
 
         self.niri.screenshot_ui.close();

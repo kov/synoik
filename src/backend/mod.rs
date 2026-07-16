@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use niri_config::{Config, ModKey};
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 
 use crate::niri::Niri;
@@ -75,16 +74,6 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.seat_name(),
             Backend::Headless(headless) => headless.seat_name(),
-        }
-    }
-
-    pub fn with_primary_renderer<T>(
-        &mut self,
-        f: impl FnOnce(&mut GlesRenderer) -> T,
-    ) -> Option<T> {
-        match self {
-            Backend::Tty(tty) => tty.with_primary_renderer(f),
-            Backend::Headless(headless) => headless.with_primary_renderer(f),
         }
     }
 

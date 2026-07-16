@@ -901,25 +901,6 @@ fn vulkan_buffer_transform_follows_the_transform_spec() {
                 buffer_transform_corners(v, &pattern, tex, out_size, src_t, out_t)
             })
             .expect("Vulkan renderer present");
-        // TEMPORARY (removed once GLES goes): the expectation is derived from the Transform spec,
-        // so the *production-correct* GLES renderer must satisfy it too. If it doesn't, the
-        // derivation is wrong -- do not "fix" the expectation to match Vulkan.
-        let gles = state
-            .backend
-            .headless()
-            .with_primary_renderer(|g| {
-                buffer_transform_corners(g, &pattern, tex, out_size, src_t, out_t)
-            })
-            .expect("GLES renderer present");
-        for (i, (got, want)) in gles.iter().zip(want.iter()).enumerate() {
-            let corner = ["TL", "TR", "BL", "BR"][i];
-            assert!(
-                near(*got, *want),
-                "GLES CROSSCHECK src={src_t:?} out={out_t:?}: {corner} is {got:?}, spec says \
-                 {want:?} -- the derivation is wrong"
-            );
-        }
-
         for (i, (got, want)) in vk.iter().zip(want.iter()).enumerate() {
             let corner = ["TL", "TR", "BL", "BR"][i];
             assert!(
@@ -1033,23 +1014,6 @@ fn vulkan_output_transform_follows_the_transform_spec() {
             .expect("Vulkan render must succeed");
         let vbox = red_bbox(&vk).unwrap_or_else(|| panic!("Vulkan marker missing at {t:?}"));
         let want = expected_bbox(t);
-
-        // TEMPORARY (removed once GLES goes): the expectation is derived from the Transform spec,
-        // so the *production-correct* GLES renderer must satisfy it too. If it doesn't, the
-        // derivation is wrong -- do not "fix" the expectation to match Vulkan.
-        let gles = state
-            .backend
-            .headless()
-            .with_primary_renderer(|g| {
-                render_to_vec(g, size, scale, t, Fourcc::Abgr8888, build().into_iter())
-            })
-            .expect("GLES renderer present")
-            .expect("GLES render must succeed");
-        let gbox = red_bbox(&gles).unwrap_or_else(|| panic!("GLES marker missing at {t:?}"));
-        assert_eq!(
-            gbox, want,
-            "GLES CROSSCHECK at {t:?}: bbox {gbox:?}, spec says {want:?} -- derivation is wrong"
-        );
 
         // Placement catches a wrong rotation/flip; the area catches a wrong aspect (e.g. logical
         // w/h not swapped for 90/270) -- a rigid transform preserves the marker's 80x40 = 3200 px.
@@ -2144,27 +2108,11 @@ fn vulkan_picks_a_color_through_vulkan() {
             })
             .flatten();
 
-        // TEMPORARY (removed once GLES goes): the reference is the full-frame render, so the
-        // production-correct GLES pick must land on it too.
-        let gles_color = state
-            .backend
-            .with_primary_renderer(|g| {
-                crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
-                    &state.niri,
-                    g,
-                    &output,
-                    probe,
-                    scale,
-                )
-            })
-            .flatten();
-
         eprintln!(
             "vulkan_picks_a_color_through_vulkan {name} at {probe:?}: vk={vk_color:?} \
-             gles={gles_color:?} frame={want:?}"
+             frame={want:?}"
         );
         let vk_color = vk_color.expect("Vulkan pick returned a color");
-        let gles_color = gles_color.expect("GLES pick returned a color");
 
         // The picked pixel must be the pixel the full frame drew there, within a rounding step.
         for (i, &w) in want.iter().enumerate().take(3) {
@@ -2172,11 +2120,6 @@ fn vulkan_picks_a_color_through_vulkan() {
             assert!(
                 (got - i32::from(w)).abs() <= 1,
                 "{name} channel {i}: pick says {got}, the full frame drew {w} at {probe:?}",
-            );
-            let gles_got = (gles_color.rgb[i] * 255.0).round() as i32;
-            assert!(
-                (gles_got - i32::from(w)).abs() <= 1,
-                "GLES CROSSCHECK {name} channel {i}: pick says {gles_got}, the frame drew {w}",
             );
         }
     }
