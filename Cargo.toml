@@ -112,7 +112,6 @@ features = [
     "backend_libinput",
     "backend_session_libseat",
     "backend_udev",
-    "backend_winit",
     "desktop",
     "renderer_gl",
     "renderer_pixman",
@@ -129,6 +128,12 @@ proptest = "1.11.0"
 proptest-derive = { version = "0.8.0", features = ["boxed_union"] }
 rayon = "1.12.0"
 wayland-client = "0.31.14"
+# The test client speaks these protocols through `smithay::reexports`, which only exposes their
+# `client` modules if something in the graph enables the feature. That used to be `winit` (via
+# smithay's `backend_winit`) purely by Cargo feature unification — an accident that broke the moment
+# the winit backend was deleted. Ask for it directly instead.
+wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 xshell = "0.2.7"
 
 [build-dependencies]

@@ -14,23 +14,20 @@ use crate::utils::id::IdCounter;
 pub mod tty;
 pub use tty::Tty;
 
-pub mod winit;
-pub use winit::Winit;
-
 pub mod headless;
 pub use headless::Headless;
 
 #[allow(clippy::large_enum_variant)]
 pub enum Backend {
     Tty(Tty),
-    Winit(Winit),
     Headless(Headless),
 }
 
 /// Which backend to start the compositor with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendMode {
-    /// Winit when nested inside a session, TTY on a bare VT.
+    /// TTY on a bare VT. (Nested-in-a-session was the winit backend, now removed --
+    /// see the Wayland-client backend task.)
     Auto,
     /// Headless: no display or input devices, driven over IPC.
     Headless,
@@ -41,10 +38,9 @@ pub enum BackendMode {
 
 /// Which renderer draws the compositor's output.
 ///
-/// GLES is the default production path. Vulkan selects the fork's experimental owned Vulkan
-/// renderer (`docs/fork/STRATEGY.md` §3.10) and requires a build with the `vulkan` feature; it is
-/// currently only wired on the headless backend (Winit/TTY reject it — no live present path yet,
-/// that's Stage 3).
+/// GLES is the default production path. Vulkan selects the fork's owned Vulkan renderer
+/// (`docs/fork/STRATEGY.md` §3.10), wired on the headless and TTY backends (TTY scans out through
+/// it). Both are being collapsed to Vulkan-only — this enum goes with GLES.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum RendererKind {
     #[default]
@@ -84,7 +80,6 @@ impl Backend {
         let _span = tracy_client::span!("Backend::init");
         match self {
             Backend::Tty(tty) => tty.init(niri),
-            Backend::Winit(winit) => winit.init(niri),
             Backend::Headless(headless) => headless.init(niri),
         }
     }
@@ -92,7 +87,6 @@ impl Backend {
     pub fn seat_name(&self) -> String {
         match self {
             Backend::Tty(tty) => tty.seat_name(),
-            Backend::Winit(winit) => winit.seat_name(),
             Backend::Headless(headless) => headless.seat_name(),
         }
     }
@@ -102,7 +96,6 @@ impl Backend {
     pub fn using_vulkan(&self) -> bool {
         match self {
             Backend::Tty(tty) => tty.using_vulkan(),
-            Backend::Winit(_) => false,
             Backend::Headless(headless) => headless.using_vulkan(),
         }
     }
@@ -113,7 +106,6 @@ impl Backend {
     ) -> Option<T> {
         match self {
             Backend::Tty(tty) => tty.with_primary_renderer(f),
-            Backend::Winit(winit) => winit.with_primary_renderer(f),
             Backend::Headless(headless) => headless.with_primary_renderer(f),
         }
     }
@@ -132,7 +124,6 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.with_vulkan_renderer(f),
             Backend::Headless(headless) => headless.with_vulkan_renderer(f),
-            Backend::Winit(_) => None,
         }
     }
 
@@ -144,20 +135,12 @@ impl Backend {
     ) -> RenderResult {
         match self {
             Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
-            Backend::Winit(winit) => winit.render(niri, output),
             Backend::Headless(headless) => headless.render(niri, output),
         }
     }
 
     pub fn mod_key(&self, config: &Config) -> ModKey {
         match self {
-            Backend::Winit(_) => config.input.mod_key_nested.unwrap_or({
-                if let Some(ModKey::Alt) = config.input.mod_key {
-                    ModKey::Super
-                } else {
-                    ModKey::Alt
-                }
-            }),
             Backend::Tty(_) | Backend::Headless(_) => config.input.mod_key.unwrap_or(ModKey::Super),
         }
     }
@@ -165,7 +148,6 @@ impl Backend {
     pub fn change_vt(&mut self, vt: i32) {
         match self {
             Backend::Tty(tty) => tty.change_vt(vt),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -173,7 +155,6 @@ impl Backend {
     pub fn suspend(&mut self) {
         match self {
             Backend::Tty(tty) => tty.suspend(),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -181,7 +162,6 @@ impl Backend {
     pub fn toggle_debug_tint(&mut self) {
         match self {
             Backend::Tty(tty) => tty.toggle_debug_tint(),
-            Backend::Winit(winit) => winit.toggle_debug_tint(),
             Backend::Headless(_) => (),
         }
     }
@@ -189,7 +169,6 @@ impl Backend {
     pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
         match self {
             Backend::Tty(tty) => tty.import_dmabuf(dmabuf),
-            Backend::Winit(winit) => winit.import_dmabuf(dmabuf),
             Backend::Headless(headless) => headless.import_dmabuf(dmabuf),
         }
     }
@@ -213,7 +192,6 @@ impl Backend {
 
         match self {
             Backend::Tty(tty) => tty.early_import(surface),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -221,7 +199,6 @@ impl Backend {
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
         match self {
             Backend::Tty(tty) => tty.ipc_outputs(),
-            Backend::Winit(winit) => winit.ipc_outputs(),
             Backend::Headless(headless) => headless.ipc_outputs(),
         }
     }
@@ -233,7 +210,6 @@ impl Backend {
     {
         match self {
             Backend::Tty(tty) => tty.primary_gbm_device(),
-            Backend::Winit(_) => None,
             Backend::Headless(_) => None,
         }
     }
@@ -241,7 +217,6 @@ impl Backend {
     pub fn set_monitors_active(&mut self, active: bool) {
         match self {
             Backend::Tty(tty) => tty.set_monitors_active(active),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -249,7 +224,6 @@ impl Backend {
     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
         match self {
             Backend::Tty(tty) => tty.set_output_on_demand_vrr(niri, output, enable_vrr),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -257,7 +231,6 @@ impl Backend {
     pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
         match self {
             Backend::Tty(tty) => tty.update_ignored_nodes_config(niri),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -265,7 +238,6 @@ impl Backend {
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
         match self {
             Backend::Tty(tty) => tty.on_output_config_changed(niri),
-            Backend::Winit(_) => (),
             Backend::Headless(_) => (),
         }
     }
@@ -283,14 +255,6 @@ impl Backend {
             v
         } else {
             panic!("backend is not Tty");
-        }
-    }
-
-    pub fn winit(&mut self) -> &mut Winit {
-        if let Self::Winit(v) = self {
-            v
-        } else {
-            panic!("backend is not Winit")
         }
     }
 

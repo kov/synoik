@@ -118,7 +118,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, BackendMode, Headless, RenderResult, RendererKind, Tty, Winit};
+use crate::backend::{Backend, BackendMode, Headless, RenderResult, RendererKind, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -774,28 +774,15 @@ impl State {
 
         let config = Rc::new(RefCell::new(config));
 
-        // The Vulkan renderer is opt-in and wired on the headless and TTY backends (the TTY path
-        // scans out through the owned renderer — Stage 3); the Winit backend has no live Vulkan
-        // present path yet. Reject impossible combinations up front rather than degrading silently.
-        let has_display = env::var_os("WAYLAND_DISPLAY").is_some()
-            || env::var_os("WAYLAND_SOCKET").is_some()
-            || env::var_os("DISPLAY").is_some();
-
         let mut backend = match mode {
             BackendMode::Headless | BackendMode::HeadlessTest => {
                 Backend::Headless(Headless::new(renderer))
             }
-            BackendMode::Auto if has_display => {
-                if renderer == RendererKind::Vulkan {
-                    return Err(
-                        "the Vulkan renderer is not yet supported on the winit backend; \
-                                run with --headless"
-                            .into(),
-                    );
-                }
-                let winit = Winit::new(config.clone(), event_loop.clone())?;
-                Backend::Winit(winit)
-            }
+            // `Auto` used to pick the winit backend when nested inside a session. Winit was
+            // EGL/GLES to the bone (Smithay's `WinitGraphicsBackend` needs
+            // `Bind<EGLSurface>`), so it went with GLES; nested mode returns as a
+            // Wayland-client backend. Auto is TTY-only for now, and running inside a
+            // session fails in TTY init rather than silently nesting.
             BackendMode::Auto => {
                 let tty = Tty::new(config.clone(), event_loop.clone(), renderer)
                     .context("error initializing the TTY backend")?;
@@ -1868,14 +1855,10 @@ impl State {
                 });
             let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-            let mut transform = panel_orientation(output)
+            let transform = panel_orientation(output)
                 + config
                     .map(|c| ipc_transform_to_smithay(c.transform))
                     .unwrap_or(Transform::Normal);
-            // FIXME: fix winit damage on other transforms.
-            if name.connector == "winit" {
-                transform = Transform::Flipped180;
-            }
 
             if output.current_scale().fractional_scale() != scale
                 || output.current_transform() != transform
@@ -3189,7 +3172,7 @@ impl Niri {
         });
         let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-        let mut transform = panel_orientation(&output)
+        let transform = panel_orientation(&output)
             + c.map(|c| ipc_transform_to_smithay(c.transform))
                 .unwrap_or(Transform::Normal);
 
@@ -3198,11 +3181,6 @@ impl Niri {
             .unwrap_or(config.overview.backdrop_color)
             .to_array_unpremul();
         backdrop_color[3] = 1.;
-
-        // FIXME: fix winit damage on other transforms.
-        if name.connector == "winit" {
-            transform = Transform::Flipped180;
-        }
 
         let mut layout_config = c.and_then(|c| c.layout.clone());
         // Support the deprecated non-layout background-color key.

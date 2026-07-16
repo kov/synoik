@@ -74,8 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.session {
         // If we're starting as a session, assume that the intention is to start on a TTY unless
         // this is a WSL environment. Remove DISPLAY, WAYLAND_DISPLAY or WAYLAND_SOCKET from our
-        // environment if they are set, since they will cause the winit backend to be selected
-        // instead.
+        // environment if they are set: they'd be inherited by everything we spawn, pointing our
+        // own clients at whatever display we were launched from. (They also used to select the
+        // winit backend, which no longer exists.)
         if env::var_os("WSL_DISTRO_NAME").is_none() {
             if env::var_os("DISPLAY").is_some() {
                 warn!("running as a session but DISPLAY is set, removing it");
