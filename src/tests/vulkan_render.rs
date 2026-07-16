@@ -13,7 +13,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
@@ -710,6 +710,81 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
     );
 }
 
+/// The four colours [`buffer_transform_corners`] must read back, derived from smithay's own
+/// `Transform` definition rather than from any renderer's output — so a renderer bug cannot be
+/// mistaken for the expectation.
+///
+/// [`render_helpers::render_elements`] renders the scene with `out_transform.invert()`, so the
+/// physical readback point `p` is the logical/element point
+/// `out_transform.transform_point_in(p, out_size)`. The texture buffer sits at the logical origin
+/// with displayed size `src_transform.transform_size(tex)`, and a displayed point `q` shows the
+/// buffer texel `src_transform.invert().transform_point_in(q, displayed)`. Anything outside the
+/// displayed rect shows the `Color32F::TRANSPARENT` clear.
+///
+/// Worked example (the anchor this replaced asserted by hand): `src_transform = _90` has point
+/// inverse `_270`, and `_270.transform_point_in((6,6), (100,160))` is `(6,94)` — the buffer's
+/// bottom-left quadrant, i.e. blue.
+/// The transform that undoes `t`'s [`Transform::transform_point_in`] mapping.
+///
+/// **Not** `Transform::invert()**: that inverts the rotation but keeps the flip, which is only the
+/// point-map inverse for the pure rotations. Every flipped variant is a *reflection*
+/// (`Flipped90` is the transpose `(x,y) -> (y,x)`; `Flipped270` the anti-transpose), and a
+/// reflection is its own inverse — `Flipped90.invert()` is `Flipped270`, and composing those two
+/// point maps yields `_180`, not the identity. Confirmed against the GLES renderer before GLES was
+/// removed: using `invert()` here mispredicted every flipped-diagonal case.
+fn point_inverse(t: Transform) -> Transform {
+    match t {
+        Transform::_90 => Transform::_270,
+        Transform::_270 => Transform::_90,
+        // Normal, _180 and all four flips are self-inverse as point maps.
+        other => other,
+    }
+}
+
+fn expected_transform_corners(
+    tex: Size<i32, BufferCoord>,
+    out_size: Size<i32, Physical>,
+    src_transform: Transform,
+    out_transform: Transform,
+) -> [[u8; 4]; 4] {
+    let (w, h) = (out_size.w, out_size.h);
+    let m = 6;
+    let samples = [
+        (m, m),
+        (w - 1 - m, m),
+        (m, h - 1 - m),
+        (w - 1 - m, h - 1 - m),
+    ];
+
+    let displayed = src_transform.transform_size(tex);
+
+    samples.map(|(x, y)| {
+        // `render_elements` renders with `out_transform.invert()`, so undo that frame transform to
+        // get back to the element/logical point.
+        let frame_t = point_inverse(out_transform.invert());
+        let l = frame_t.transform_point_in(Point::<i32, Physical>::from((x, y)), &out_size);
+        if l.x < 0 || l.y < 0 || l.x >= displayed.w || l.y >= displayed.h {
+            return TRANSFORM_CLEAR;
+        }
+        let q = Point::<i32, BufferCoord>::from((l.x, l.y));
+        let b = point_inverse(src_transform).transform_point_in(q, &displayed);
+        match (b.x < tex.w / 2, b.y < tex.h / 2) {
+            (true, true) => TRANSFORM_RED,
+            (false, true) => TRANSFORM_GREEN,
+            (true, false) => TRANSFORM_BLUE,
+            (false, false) => TRANSFORM_WHITE,
+        }
+    })
+}
+
+/// The 4-quadrant buffer pattern, in buffer (top-left origin) space.
+const TRANSFORM_RED: [u8; 4] = [255, 0, 0, 255];
+const TRANSFORM_GREEN: [u8; 4] = [0, 255, 0, 255];
+const TRANSFORM_BLUE: [u8; 4] = [0, 0, 255, 255];
+const TRANSFORM_WHITE: [u8; 4] = [255, 255, 255, 255];
+/// `render_elements` clears to `Color32F::TRANSPARENT`.
+const TRANSFORM_CLEAR: [u8; 4] = [0, 0, 0, 0];
+
 /// Import `pattern` (an `out_size`-shaped `Abgr8888` buffer... actually `tex`-shaped) as a texture
 /// with buffer transform `src_transform`, render it full-screen through `render_texture_from_to`
 /// at output transform `out_transform`, and return the four (inset) corner pixels of the readback.
@@ -773,7 +848,7 @@ where
 /// Renders a 4-colour-quadrant texture through `render_texture_from_to` via BOTH renderers at all 8
 /// buffer transforms (Normal output) plus a few buffer×output crosses, on a non-square target.
 #[test]
-fn vulkan_buffer_transform_matches_the_gles_oracle() {
+fn vulkan_buffer_transform_follows_the_transform_spec() {
     use smithay::utils::Transform::*;
 
     let Some(mut f) = window_fixture(GREEN) else {
@@ -787,18 +862,14 @@ fn vulkan_buffer_transform_matches_the_gles_oracle() {
     let out_size = Size::<i32, Physical>::from((W, H));
 
     // 4-quadrant pattern in buffer (top-left origin) space: TL red, TR green, BL blue, BR white.
-    let red = [255u8, 0, 0, 255];
-    let green = [0u8, 255, 0, 255];
-    let blue = [0u8, 0, 255, 255];
-    let white = [255u8, 255, 255, 255];
     let mut pattern = Vec::with_capacity((W * H * 4) as usize);
     for y in 0..H {
         for x in 0..W {
             let c = match (x < W / 2, y < H / 2) {
-                (true, true) => red,
-                (false, true) => green,
-                (true, false) => blue,
-                (false, false) => white,
+                (true, true) => TRANSFORM_RED,
+                (false, true) => TRANSFORM_GREEN,
+                (true, false) => TRANSFORM_BLUE,
+                (false, false) => TRANSFORM_WHITE,
             };
             pattern.extend_from_slice(&c);
         }
@@ -815,16 +886,14 @@ fn vulkan_buffer_transform_matches_the_gles_oracle() {
         .chain([(_90, _270), (Flipped90, _90), (_180, Flipped)])
         .collect();
 
+    // Each corner is compared against `expected_transform_corners`, computed from smithay's own
+    // `Transform` definition. The quadrant colours (plus the transparent clear) are maximally
+    // distinct, so a 50/channel tolerance still catches sampling the wrong quadrant.
+    let near = |p: [u8; 4], c: [u8; 4]| (0..4).all(|i| (p[i] as i32 - c[i] as i32).abs() < 50);
+
     let state = f.niri_state();
-    let mut normal_out = Vec::new();
     for (src_t, out_t) in combos {
-        let gles = state
-            .backend
-            .headless()
-            .with_primary_renderer(|g| {
-                buffer_transform_corners(g, &pattern, tex, out_size, src_t, out_t)
-            })
-            .expect("GLES renderer present");
+        let want = expected_transform_corners(tex, out_size, src_t, out_t);
         let vk = state
             .backend
             .headless()
@@ -832,37 +901,48 @@ fn vulkan_buffer_transform_matches_the_gles_oracle() {
                 buffer_transform_corners(v, &pattern, tex, out_size, src_t, out_t)
             })
             .expect("Vulkan renderer present");
-        assert_eq!(
-            gles, vk,
-            "Vulkan corners != GLES at src_transform={src_t:?} out_transform={out_t:?}"
-        );
-        eprintln!("vulkan_buffer_transform src={src_t:?} out={out_t:?}: corners {vk:?} match GLES");
-        if out_t == Normal {
-            normal_out.push((src_t, vk));
+        // TEMPORARY (removed once GLES goes): the expectation is derived from the Transform spec,
+        // so the *production-correct* GLES renderer must satisfy it too. If it doesn't, the
+        // derivation is wrong -- do not "fix" the expectation to match Vulkan.
+        let gles = state
+            .backend
+            .headless()
+            .with_primary_renderer(|g| {
+                buffer_transform_corners(g, &pattern, tex, out_size, src_t, out_t)
+            })
+            .expect("GLES renderer present");
+        for (i, (got, want)) in gles.iter().zip(want.iter()).enumerate() {
+            let corner = ["TL", "TR", "BL", "BR"][i];
+            assert!(
+                near(*got, *want),
+                "GLES CROSSCHECK src={src_t:?} out={out_t:?}: {corner} is {got:?}, spec says \
+                 {want:?} -- the derivation is wrong"
+            );
         }
-    }
 
-    // Absolute anchors (no GLES) so a shared misunderstanding can't pass: Normal keeps the source
-    // top-left (red) at the physical top-left; a _90 *buffer* rotation makes the physical top-left
-    // sample the source bottom-left quadrant (blue).
-    let corners = |t: Transform| normal_out.iter().find(|(s, _)| *s == t).unwrap().1;
-    let near = |p: [u8; 4], c: [u8; 4]| (0..3).all(|i| (p[i] as i32 - c[i] as i32).abs() < 50);
-    assert!(near(corners(Normal)[0], red), "Normal TL should be red");
-    assert!(
-        near(corners(_90)[0], blue),
-        "_90 buffer transform: physical TL should sample source bottom-left (blue), got {:?}",
-        corners(_90)[0]
-    );
+        for (i, (got, want)) in vk.iter().zip(want.iter()).enumerate() {
+            let corner = ["TL", "TR", "BL", "BR"][i];
+            assert!(
+                near(*got, *want),
+                "src_transform={src_t:?} out_transform={out_t:?}: {corner} is {got:?}, the \
+                 transform says {want:?}"
+            );
+        }
+        eprintln!(
+            "vulkan_buffer_transform src={src_t:?} out={out_t:?}: corners {vk:?} as specified"
+        );
+    }
 }
 
-/// Output-transform conformance: the owned Vulkan renderer must place geometry identically to the
-/// GLES oracle under every rotation/flip. Render an asymmetric marker (a wide red rect anchored at
-/// the logical top-left) through *both* renderers at all 8 transforms and compare — GLES is the
-/// production-correct renderer, so byte-for-agreement proves the Vulkan `proj` projection +
-/// logical-`target` math. The framebuffer is **non-square** (240×120), so 90/270 genuinely swap
-/// logical w/h — that's what exercises `target_dims`/`output_size` returning the logical size.
+/// Output-transform conformance: the owned Vulkan renderer must place geometry where smithay's
+/// `Transform` says, under every rotation/flip. Render an asymmetric marker (a wide red rect
+/// anchored at the logical top-left) at all 8 transforms and check its bbox against
+/// `transform_rect_in` — the spec, so this proves the Vulkan `proj` projection + logical-`target`
+/// math rather than merely agreeing with another renderer. The framebuffer is **non-square**
+/// (240×120), so 90/270 genuinely swap logical w/h — that's what exercises
+/// `target_dims`/`output_size` returning the logical size.
 #[test]
-fn vulkan_output_transform_matches_the_gles_oracle() {
+fn vulkan_output_transform_follows_the_transform_spec() {
     use smithay::backend::renderer::element::Kind;
 
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -924,17 +1004,25 @@ fn vulkan_output_transform_matches_the_gles_oracle() {
         Transform::Flipped270,
     ];
 
+    // Where the marker must land, from smithay's own `Transform`. `render_elements` renders with
+    // `t.invert()`, so the logical space is `t.invert().transform_size(size)` and the marker's
+    // logical rect maps to physical through `t.invert().transform_rect_in`.
+    let expected_bbox = |t: Transform| -> (i32, i32, i32, i32) {
+        let frame_t = t.invert();
+        let logical = frame_t.transform_size(size);
+        let marker_rect = Rectangle::<i32, Physical>::from_size(Size::from((80, 40)));
+        let r = frame_t.transform_rect_in(marker_rect, &logical);
+        (
+            r.loc.x,
+            r.loc.y,
+            r.loc.x + r.size.w - 1,
+            r.loc.y + r.size.h - 1,
+        )
+    };
+
     let state = f.niri_state();
     let mut vk_boxes = Vec::new();
     for t in all {
-        let gles = state
-            .backend
-            .headless()
-            .with_primary_renderer(|g| {
-                render_to_vec(g, size, scale, t, Fourcc::Abgr8888, build().into_iter())
-            })
-            .expect("GLES renderer present")
-            .expect("GLES render must succeed");
         let vk = state
             .backend
             .headless()
@@ -943,27 +1031,44 @@ fn vulkan_output_transform_matches_the_gles_oracle() {
             })
             .expect("Vulkan renderer present")
             .expect("Vulkan render must succeed");
-
-        let gbox = red_bbox(&gles).unwrap_or_else(|| panic!("GLES marker missing at {t:?}"));
         let vbox = red_bbox(&vk).unwrap_or_else(|| panic!("Vulkan marker missing at {t:?}"));
-        // Oracle agreement: the marker must land at the same place and cover the same area as the
-        // production GLES renderer. Placement (bbox) catches a wrong rotation/flip; area (count)
-        // catches a wrong aspect (e.g. logical w/h not swapped for 90/270).
+        let want = expected_bbox(t);
+
+        // TEMPORARY (removed once GLES goes): the expectation is derived from the Transform spec,
+        // so the *production-correct* GLES renderer must satisfy it too. If it doesn't, the
+        // derivation is wrong -- do not "fix" the expectation to match Vulkan.
+        let gles = state
+            .backend
+            .headless()
+            .with_primary_renderer(|g| {
+                render_to_vec(g, size, scale, t, Fourcc::Abgr8888, build().into_iter())
+            })
+            .expect("GLES renderer present")
+            .expect("GLES render must succeed");
+        let gbox = red_bbox(&gles).unwrap_or_else(|| panic!("GLES marker missing at {t:?}"));
         assert_eq!(
-            gbox, vbox,
-            "Vulkan marker bbox {vbox:?} != GLES {gbox:?} at {t:?}"
+            gbox, want,
+            "GLES CROSSCHECK at {t:?}: bbox {gbox:?}, spec says {want:?} -- derivation is wrong"
+        );
+
+        // Placement catches a wrong rotation/flip; the area catches a wrong aspect (e.g. logical
+        // w/h not swapped for 90/270) -- a rigid transform preserves the marker's 80x40 = 3200 px.
+        assert_eq!(
+            vbox, want,
+            "Vulkan marker bbox {vbox:?} != {want:?} at {t:?}"
         );
         assert_eq!(
-            red_count(&gles),
             red_count(&vk),
-            "Vulkan red-pixel count != GLES at {t:?}"
+            80 * 40,
+            "Vulkan red-pixel count != the marker's area at {t:?}"
         );
-        eprintln!("vulkan_output_transform {t:?}: marker bbox {vbox:?} matches GLES");
+        eprintln!("vulkan_output_transform {t:?}: marker bbox {vbox:?} as specified");
         vk_boxes.push(vbox);
     }
 
     // Absolute anchor: Normal places the 80×40 marker flush in the physical top-left. `x1`/`y1` are
-    // the inclusive max coords, hence 79/39.
+    // the inclusive max coords, hence 79/39. Pins the spec derivation itself to a hand-checked
+    // case.
     assert_eq!(
         vk_boxes[0],
         (0, 0, 79, 39),
