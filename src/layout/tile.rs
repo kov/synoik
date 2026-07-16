@@ -1273,7 +1273,12 @@ impl<W: LayoutElement> Tile<W> {
                 }
             };
 
-            if clip_to_geometry && clip_shader.is_some() {
+            // Gate on whichever clip leg the `clip` closure above will actually take: the radius is
+            // not part of any surface's own damage, so this element is the only thing that reports
+            // a radius change. Gating it on the GLES `clip_shader` alone — as this used to — meant
+            // the owned Vulkan renderer, which carries no GLES program, never pushed it and so
+            // never damaged on a radius change.
+            if clip_to_geometry && (clip_shader.is_some() || vulkan_clip) {
                 let damage = self.rounded_corner_damage.render(geo);
                 push(damage.into());
             }

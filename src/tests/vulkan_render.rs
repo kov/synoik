@@ -3684,6 +3684,54 @@ fn vulkan_clips_a_window_to_rounded_geometry() {
     eprintln!("vulkan_clips_a_window_to_rounded_geometry: bbox {vbox:?} ({bw}x{bh})");
 }
 
+/// A clipped tile must push its [`RoundedCornerDamage`] element, or a corner-radius change damages
+/// nothing and leaves stale corners on screen.
+///
+/// The radius is not part of any surface's damage (`ClippedSurfaceRenderElement::damage_since` has
+/// a standing FIXME saying so), so `Tile::rounded_corner_damage` is the *only* thing that reports
+/// it: `update_config` bumps its commit counter, and the tile pushes it into the element list. A
+/// `queue_redraw` alone cannot stand in — the damage tracker still derives damage from element
+/// commit counters, so with the element absent the redraw computes empty damage and repaints
+/// nothing.
+///
+/// This is a structural check (is the element in the list?), not a pixel one, because the test
+/// render path composites unconditionally and would repaint the corners either way — hiding
+/// exactly the bug this pins.
+#[test]
+fn vulkan_clipped_tile_pushes_its_rounded_corner_damage() {
+    let Some(mut f) = clipped_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let state = f.niri_state();
+    let found = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            // Same `{elem:?}`-sniffing idiom as `render_helpers::debug::push_opaque_regions`: the
+            // element list is an opaque enum tree, and `ExtraDamage` is the only thing in this
+            // scene that prints as one (blur/background-effect, the other user, is off here).
+            niri.render_to_vec(ctx, &output, false)
+                .iter()
+                .any(|elem| format!("{elem:?}").contains("ExtraDamage"))
+        })
+        .expect("headless backend must hold a Vulkan renderer");
+
+    assert!(
+        found,
+        "the clipped tile pushed no ExtraDamage element — a corner-radius change would damage \
+         nothing and leave stale corners"
+    );
+}
+
 /// A clipped window must render correctly through an outer placement wrapper. The overview draws
 /// every window through a `RelocateRenderElement<RescaleRenderElement<…>>`, which forwards a
 /// rescaled/relocated `dst` (smithay `element/utils/elements.rs`) to the inner clipped surface. The
