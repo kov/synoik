@@ -107,12 +107,7 @@ impl Wallpaper {
             Some(view_size),
             Kind::Unspecified,
         );
-        Some(RoundedTextureRenderElement::new_vulkan(
-            elem,
-            corner_radius,
-            Rectangle::from_size(view_size),
-            scale,
-        ))
+        Some(RoundedTextureRenderElement::new(elem, corner_radius, scale))
     }
 }
 

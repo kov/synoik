@@ -14,7 +14,6 @@ use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::offscreen::OffscreenRenderElement;
-use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
 
 /// Emit a degraded (no-op) `RenderElement<VulkanRenderer>` impl for a niri effect element.
@@ -59,9 +58,8 @@ macro_rules! degraded_vulkan_element {
 }
 
 // BorderRenderElement and ShadowRenderElement have real (procedural) Vulkan draws in their modules.
-// The `VkTexture` specialization has a real (SDF-rounding) impl in `rounded_texture.rs`; the
-// `GlesTexture` one (carried by `OutputRenderElements<VulkanRenderer>`) stays a no-op.
-degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
+// RoundedTextureRenderElement<VkTexture> has a real (SDF-rounding) Vulkan draw in
+// rounded_texture.rs.
 // ClippedSurfaceRenderElement<VulkanRenderer> has a real Vulkan draw (clip via the clipped_texture
 // pipeline) in clipped_surface.rs.
 // GradientFadeTextureRenderElement<VkTexture> has a real Vulkan draw (render_gradient_fade) in

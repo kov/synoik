@@ -379,12 +379,7 @@ fn render_rounded_src(
         Some(Size::<f64, _>::from((W as f64, H as f64))),
         Kind::Unspecified,
     );
-    let elem = RoundedTextureRenderElement::new_vulkan(
-        inner,
-        corner_radius,
-        Rectangle::from_size(Size::<f64, _>::from((W as f64, H as f64))),
-        Scale::from(1.0),
-    );
+    let elem = RoundedTextureRenderElement::new(inner, corner_radius, Scale::from(1.0));
 
     let mut target = vk
         .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
