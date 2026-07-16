@@ -1173,15 +1173,6 @@ impl<W: LayoutElement> Tile<W> {
                                 })
                                 .ok();
 
-                            let clip_to_geometry =
-                                if vctx.target.should_block_out(resize.snapshot.block_out_from)
-                                    && vctx.target.should_block_out(rules.block_out_from)
-                                {
-                                    true
-                                } else {
-                                    clip_to_geometry
-                                };
-
                             if let Some((elem_current, _sync_point, mut data)) = current {
                                 let texture_current = elem_current.texture().clone();
                                 let texture_current_geo = elem_current.geometry(scale);
