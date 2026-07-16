@@ -3402,7 +3402,6 @@ fn vulkan_xray_honors_the_cropped_src_fold() {
                 scale.x as f32,
                 false,
                 bg,
-                None,
             );
             render_to_vec(
                 v,

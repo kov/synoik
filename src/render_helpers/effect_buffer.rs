@@ -1,18 +1,17 @@
 use std::mem;
 
-use anyhow::{ensure, Context as _};
+use anyhow::Context as _;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::{Id, RenderElementStates};
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, FrameContext as _, Offscreen as _, Renderer as _, Texture,
+    Bind as _, Color32F, ContextId, Offscreen as _, Renderer as _, Texture,
 };
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
 use crate::niri::OutputRenderElements;
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::renderer::OffscreenRenderer as _;
 use crate::render_helpers::vulkan::{EffectBlur, VkTexture, VulkanRenderer};
 
@@ -29,18 +28,8 @@ pub struct EffectBuffer {
     blur_options: BlurOptions,
 
     /// Elements to be rendered on demand.
-    elements: Elements,
-    /// Offscreen buffer where elements get rendered.
-    offscreen: Option<Offscreen>,
-    /// Blurring program, if available.
-    blur: Option<Blur>,
-
-    /// Vulkan elements to be rendered on demand (the owned Vulkan renderer's arm — see
-    /// [`Self::elements_vulkan`]). Coexists with the GLES `elements`: on a Vulkan session a
-    /// window-close still bakes the same Output xray buffer through GLES while normal redraws fill
-    /// it through Vulkan, so both arms stay live and never tear each other down.
     elements_vk: ElementsVk,
-    /// Vulkan offscreen (+ its blur), the owned-renderer dual of `offscreen`.
+    /// Offscreen buffer where elements get rendered, plus its blur.
     offscreen_vk: Option<OffscreenVk>,
 
     /// Commit counter that takes into account both original and blurred texture changes.
@@ -48,45 +37,12 @@ pub struct EffectBuffer {
 }
 
 #[derive(Debug)]
-enum Elements {
+enum ElementsVk {
     /// Contents remain unchanged.
     Unchanged(
         // Storage to avoid reallocating it every time.
-        Vec<OutputRenderElements<GlesRenderer>>,
+        Vec<OutputRenderElements<VulkanRenderer>>,
     ),
-    /// New contents, need to check damage and render.
-    New(Vec<OutputRenderElements<GlesRenderer>>),
-}
-
-#[derive(Debug)]
-struct Offscreen {
-    /// The texture with the offscreen contents.
-    texture: GlesTexture,
-    /// Id of the renderer context that the texture comes from.
-    renderer_context_id: ContextId<GlesTexture>,
-    /// Scale of the texture.
-    scale: Scale<f64>,
-    /// Damage tracker for drawing to the texture.
-    damage: OutputDamageTracker,
-    /// Render element states from the last render into the offscreen.
-    states: RenderElementStates,
-    /// Rendered blurred version of the texture.
-    ///
-    /// When texture needs to be reblurred, this field must be reset to `None`.
-    blurred: Option<GlesTexture>,
-}
-
-impl Default for Elements {
-    fn default() -> Self {
-        Self::Unchanged(Vec::new())
-    }
-}
-
-/// The Vulkan dual of [`Elements`].
-#[derive(Debug)]
-enum ElementsVk {
-    /// Contents remain unchanged.
-    Unchanged(Vec<OutputRenderElements<VulkanRenderer>>),
     /// New contents, need to check damage and render.
     New(Vec<OutputRenderElements<VulkanRenderer>>),
 }
@@ -97,7 +53,7 @@ impl Default for ElementsVk {
     }
 }
 
-/// The Vulkan dual of [`Offscreen`]. Its [`EffectBlur`] lives here (not beside it) so recreating
+/// The offscreen and its blur. The [`EffectBlur`] lives here (rather than beside it) so recreating
 /// the offscreen texture — which sets `offscreen_vk = None` — drops and rebuilds the blur chain
 /// against the new texture view atomically (the chain binds a fixed source view and has no `Drop`).
 #[derive(Debug)]
@@ -125,9 +81,6 @@ impl EffectBuffer {
             size: Size::default(),
             scale: Scale::from(1.),
             blur_options: BlurOptions::default(),
-            elements: Elements::default(),
-            offscreen: None,
-            blur: None,
             elements_vk: ElementsVk::default(),
             offscreen_vk: None,
             commit_counter: CommitCounter::default(),
@@ -174,15 +127,8 @@ impl EffectBuffer {
         self.blur_options = options;
 
         let mut had_blur = false;
-        if let Some(offscreen) = &mut self.offscreen {
-            if offscreen.blurred.is_some() {
-                offscreen.blurred = None;
-                had_blur = true;
-            }
-        }
-        // Reset the Vulkan arm's blur too; a pass-count change is picked up by
-        // `prepare_blur_vulkan` (it rebuilds the chain when `passes` differs), so
-        // invalidating is enough here.
+        // A pass-count change is picked up by `prepare_blur_vulkan` (it rebuilds the chain when
+        // `passes` differs), so invalidating is enough here.
         if let Some(offscreen) = &mut self.offscreen_vk {
             if let Some(blur) = &mut offscreen.blur {
                 if blur.is_valid() {
@@ -196,206 +142,7 @@ impl EffectBuffer {
         }
     }
 
-    pub fn elements(&mut self) -> &mut Vec<OutputRenderElements<GlesRenderer>> {
-        // Assume we're going to insert new elements, switch to New.
-        match mem::take(&mut self.elements) {
-            Elements::Unchanged(elements) | Elements::New(elements) => {
-                self.elements = Elements::New(elements);
-            }
-        }
-        let Elements::New(elements) = &mut self.elements else {
-            unreachable!();
-        };
-        elements
-    }
-
-    pub fn prepare(&mut self, renderer: &mut GlesRenderer, blur: bool) -> bool {
-        if let Err(err) = self.prepare_offscreen(renderer) {
-            warn!("error preparing offscreen: {err:?}");
-            return false;
-        };
-
-        if blur {
-            if let Err(err) = self.prepare_blur(renderer) {
-                warn!("error preparing blur: {err:?}");
-                return false;
-            }
-        }
-
-        true
-    }
-
-    fn prepare_offscreen(&mut self, renderer: &mut GlesRenderer) -> anyhow::Result<()> {
-        let _span = tracy_client::span!("EffectBuffer::prepare_offscreen");
-
-        // Check if we need to create or recreate the texture.
-        let size_string;
-        let mut reason = "";
-        if let Some(Offscreen {
-            texture,
-            renderer_context_id,
-            ..
-        }) = &mut self.offscreen
-        {
-            let old_size = texture.size();
-            if old_size != self.size {
-                size_string = format!(
-                    "size changed from {} × {} to {} × {}",
-                    old_size.w, old_size.h, self.size.w, self.size.h
-                );
-                reason = &size_string;
-
-                self.offscreen = None;
-            } else if !texture.is_unique_reference() {
-                reason = "not unique";
-
-                self.offscreen = None;
-            } else if *renderer_context_id != renderer.context_id() {
-                reason = "renderer id changed";
-
-                self.offscreen = None;
-            }
-        } else {
-            reason = "first render";
-        }
-
-        let offscreen = if let Some(offscreen) = &mut self.offscreen {
-            offscreen
-        } else {
-            trace!("creating new offscreen texture: {reason}");
-            let span = tracy_client::span!("creating effect offscreen texture");
-            span.emit_text(reason);
-
-            let texture: GlesTexture = renderer
-                .create_buffer(Fourcc::Abgr8888, self.size)
-                .context("error creating texture")?;
-
-            let buffer_size = self.size.to_logical(1, Transform::Normal).to_physical(1);
-            let damage = OutputDamageTracker::new(buffer_size, self.scale, Transform::Normal);
-
-            self.offscreen.insert(Offscreen {
-                texture,
-                renderer_context_id: renderer.context_id(),
-                scale: self.scale,
-                damage,
-                states: RenderElementStates::default(),
-                blurred: None,
-            })
-        };
-
-        // Recreate the damage tracker if the scale changes. We already recreate it for buffer size
-        // changes, and transform is always Normal.
-        if offscreen.scale != self.scale {
-            offscreen.scale = self.scale;
-
-            trace!("recreating damage tracker due to scale change");
-            let buffer_size = self.size.to_logical(1, Transform::Normal).to_physical(1);
-            offscreen.damage = OutputDamageTracker::new(buffer_size, self.scale, Transform::Normal);
-
-            self.commit_counter.increment();
-            offscreen.blurred = None;
-        }
-
-        // Render the elements if any.
-        let mut elements = match mem::take(&mut self.elements) {
-            Elements::New(elements) => elements,
-            x @ Elements::Unchanged(_) => {
-                // No redrawing necessary.
-                self.elements = x;
-                return Ok(());
-            }
-        };
-
-        let res = {
-            let mut target = renderer
-                .bind(&mut offscreen.texture)
-                .context("error binding texture")?;
-            offscreen
-                .damage
-                .render_output(renderer, &mut target, 1, &elements, Color32F::TRANSPARENT)
-                .context("error rendering")?
-        };
-
-        offscreen.states = res.states;
-
-        if res.damage.is_some() {
-            self.commit_counter.increment();
-
-            // Original texture changed; reset the blurred texture.
-            offscreen.blurred = None;
-        }
-
-        // Clear and put the storage back.
-        elements.clear();
-        self.elements = Elements::Unchanged(elements);
-
-        Ok(())
-    }
-
-    fn prepare_blur(&mut self, renderer: &mut GlesRenderer) -> anyhow::Result<()> {
-        let offscreen = self.offscreen.as_mut().context("missing offscreen")?;
-        if offscreen.blurred.is_some() {
-            // Already rendered.
-            return Ok(());
-        }
-
-        if let Some(blur) = &self.blur {
-            if blur.context_id() != renderer.context_id() {
-                debug!("recreating blur: renderer changed");
-                self.blur = None;
-            }
-        }
-
-        let blur = if let Some(blur) = &mut self.blur {
-            blur
-        } else {
-            let Some(blur) = Blur::new(renderer) else {
-                // Missing blur shader.
-                return Ok(());
-            };
-            self.blur.insert(blur)
-        };
-
-        ensure!(
-            offscreen.renderer_context_id == renderer.context_id(),
-            "wrong renderer context id"
-        );
-
-        blur.prepare_textures(
-            |fourcc, size| renderer.create_buffer(fourcc, size),
-            &offscreen.texture,
-            self.blur_options,
-        )
-        .context("error preparing blur textures")?;
-
-        Ok(())
-    }
-
-    pub fn render(&mut self, frame: &mut GlesFrame, blur: bool) -> anyhow::Result<GlesTexture> {
-        let offscreen = self.offscreen.as_mut().context("offscreen is missing")?;
-
-        if !blur {
-            return Ok(offscreen.texture.clone());
-        }
-
-        let texture = if let Some(texture) = &offscreen.blurred {
-            texture.clone()
-        } else {
-            let blur = self.blur.as_mut().context("blur is missing")?;
-            let mut guard = frame.renderer();
-            let renderer = guard.as_mut();
-            let blurred = blur
-                .render(renderer, &offscreen.texture, self.blur_options)
-                .context("error rendering blur")?;
-            offscreen.blurred.insert(blurred).clone()
-        };
-
-        Ok(texture)
-    }
-
-    /// The owned Vulkan renderer's dual of [`Self::elements`] — the storage the caller pushes
-    /// Vulkan render elements into before [`Self::prepare_vulkan`]. Coexists with the GLES
-    /// `elements` arm.
+    /// The storage the caller pushes render elements into before [`Self::prepare_vulkan`].
     pub fn elements_vulkan(&mut self) -> &mut Vec<OutputRenderElements<VulkanRenderer>> {
         // Assume we're going to insert new elements, switch to New.
         match mem::take(&mut self.elements_vk) {

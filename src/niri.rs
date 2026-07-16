@@ -32,7 +32,6 @@ use smithay::backend::renderer::element::{
     default_primary_scanout_output_compare, Element, Id, Kind, PrimaryScanoutOutput, RenderElement,
     RenderElementStates,
 };
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, Offscreen};
 use smithay::desktop::utils::{
@@ -2160,7 +2159,7 @@ impl State {
                     xray: None,
                 };
 
-                self.niri.fill_xray_elements_vulkan(ctx.r(), output);
+                self.niri.fill_xray_elements(ctx.r(), output);
 
                 // If any background layer has block_out_from, also fill the Screencast xray
                 // buffer so the unmap snapshot can render a buffer with blocked-out background.
@@ -2172,7 +2171,7 @@ impl State {
                         target: RenderTarget::Screencast,
                         ..ctx.r()
                     };
-                    self.niri.fill_xray_elements_vulkan(screencast_ctx, output);
+                    self.niri.fill_xray_elements(screencast_ctx, output);
                 }
 
                 let state = self.niri.output_state.get_mut(output).unwrap();
@@ -4481,14 +4480,9 @@ impl Niri {
             }
         }
 
-        // Fill the xray background/backdrop capture buffers through whichever renderer is active:
-        // GLES fills the GLES arm, the owned Vulkan renderer fills its own arm (the two are
-        // mutually exclusive — each `try_as_*` returns `Some` for exactly one renderer).
-        if let Some(gles_ctx) = ctx.try_as_gles() {
-            self.fill_xray_elements(gles_ctx, output);
-        }
+        // Fill the xray background/backdrop capture buffers.
         if let Some(vk_ctx) = ctx.try_as_vulkan() {
-            self.fill_xray_elements_vulkan(vk_ctx, output);
+            self.fill_xray_elements(vk_ctx, output);
         }
 
         // Reborrow to shorten lifetime to be able to put in xray.
@@ -4805,89 +4799,15 @@ impl Niri {
         push(backdrop);
     }
 
-    pub fn fill_xray_elements(&self, mut ctx: RenderCtx<GlesRenderer>, output: &Output) {
-        let _span = tracy_client::span!("Niri::fill_xray_elements");
-
-        // Make sure the xrayed elements themselves cannot use xray by mistake.
-        ctx.xray = None;
-
-        let state = self.output_state.get(output).unwrap();
-        let xray = &state.xray;
-        let layer_map = layer_map_for_output(output);
-        let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
-
-        // FIXME: it would be cool to call this code on-demand. It's even relatively simple to do:
-        // move this function to after the render_inner() call, check if
-        // Rc::strong_count(&xray.background) > 1, and only then construct the elements. This way,
-        // only if something referenced the xray buffer will the elements get constructed.
-        //
-        // Unfortunately, currently this runs into an important limitation: offscreens are rendered
-        // immediately deep inside render_inner(), and when they are, they already need the xray
-        // elements filled.
-        //
-        // Perhaps in the future when offscreen rendering becomes on-demand, this optimization will
-        // be possible.
-
-        let mut buffer = xray.background[ctx.target as usize].borrow_mut();
-        {
-            let buf_logical = buffer.logical_size();
-            let buf_scale = buffer.scale();
-            let elements = buffer.elements();
-            elements.clear();
-            self.render_layer_normal(
-                ctx.r(),
-                None,
-                &layer_map,
-                Layer::Background,
-                XrayPos::default(),
-                false,
-                &mut |elem| elements.push(elem.into()),
-            );
-            // In GNOME (Floating) mode the wallpaper is drawn in-compositor rather than as a
-            // layer-shell background surface, so `render_layer_normal` above doesn't pick it up.
-            // Bake it into the output-sized background buffer, filling it at the origin (the
-            // XrayElement applies the per-window mapping and corner clip when sampling), pushed
-            // last so it sits below the background-layer surfaces — matching `render_inner`.
-            push_gnome_wallpaper_into_xray(
-                gnome_mode,
-                &self.wallpaper,
-                ctx.renderer,
-                buf_logical,
-                buf_scale,
-                elements,
-            );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-
-        let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
-        {
-            let elements = buffer.elements();
-            elements.clear();
-            self.render_layer_normal(
-                ctx.r(),
-                None,
-                &layer_map,
-                Layer::Background,
-                XrayPos::default(),
-                true,
-                &mut |elem| elements.push(elem.into()),
-            );
-            // Avoid unused capacity remaining forever.
-            elements.shrink_to_fit();
-        }
-    }
-
-    /// The owned-Vulkan-renderer dual of [`Self::fill_xray_elements`]: fills the same per-target
-    /// background/backdrop [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s,
-    /// but through the Vulkan arm (`elements_vulkan`). `render_layer_normal` is already generic
-    /// over the renderer, so only the element storage differs.
-    pub fn fill_xray_elements_vulkan(
+    /// Fill the per-target background/backdrop
+    /// [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s that the
+    /// [`XrayElement`](crate::render_helpers::xray::XrayElement)s sample.
+    pub fn fill_xray_elements(
         &self,
         mut ctx: RenderCtx<crate::render_helpers::vulkan::VulkanRenderer>,
         output: &Output,
     ) {
-        let _span = tracy_client::span!("Niri::fill_xray_elements_vulkan");
+        let _span = tracy_client::span!("Niri::fill_xray_elements");
 
         // Make sure the xrayed elements themselves cannot use xray by mistake.
         ctx.xray = None;
@@ -4951,13 +4871,6 @@ impl Niri {
 
         // Clear the xray elements for all render targets after all rendering that could use them
         // did so.
-        for buf in &xray.background {
-            buf.borrow_mut().elements().clear();
-        }
-        for buf in &xray.backdrop {
-            buf.borrow_mut().elements().clear();
-        }
-        // The owned Vulkan renderer's arm has its own element storage — clear it too.
         for buf in &xray.background {
             buf.borrow_mut().elements_vulkan().clear();
         }

@@ -6,9 +6,7 @@ use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use niri_vk::render::PostprocessPush;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
@@ -17,7 +15,6 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
 use crate::render_helpers::renderer::NiriRenderer;
-use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::render_helpers::vulkan::{pack_mat3, VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
@@ -81,12 +78,10 @@ pub struct XrayElement {
     noise: f32,
     saturation: f32,
     bg_color: Color32F,
-    program: Option<GlesTexProgram>,
 }
 
-/// Prepare an [`EffectBuffer`] through whichever renderer `ctx` wraps — the owned Vulkan renderer's
-/// arm when present, else the GLES arm. Returns whether the
-/// offscreen is ready to be sampled by the pushed [`XrayElement`]s.
+/// Prepare an [`EffectBuffer`] through the renderer `ctx` wraps. Returns whether the offscreen is
+/// ready to be sampled by the pushed [`XrayElement`]s.
 fn prepare_effect_buffer<R: NiriRenderer>(
     renderer: &mut R,
     buffer: &mut EffectBuffer,
@@ -94,8 +89,6 @@ fn prepare_effect_buffer<R: NiriRenderer>(
 ) -> bool {
     if let Some(vk) = renderer.try_as_vulkan_renderer() {
         buffer.prepare_vulkan(vk, blur)
-    } else if let Some(gles) = renderer.try_as_gles_renderer() {
-        buffer.prepare(gles, blur)
     } else {
         false
     }
@@ -122,10 +115,6 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        // The GLES postprocess-and-clip program (`None` on the owned Vulkan renderer, which draws
-        // through `render_postprocess` instead — see the `RenderElement<VulkanRenderer>` impl).
-        let program = Shaders::get(ctx.renderer).and_then(|s| s.postprocess_and_clip.clone());
-
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);
 
@@ -221,7 +210,6 @@ impl Xray {
                     noise,
                     saturation,
                     bg_color: *bg_color,
-                    program: program.clone(),
                 };
                 push(elem);
             }
@@ -271,7 +259,6 @@ impl Xray {
                 noise,
                 saturation,
                 bg_color: self.backdrop_color,
-                program: program.clone(),
             };
             push(elem);
         }
@@ -279,18 +266,6 @@ impl Xray {
 }
 
 impl XrayElement {
-    fn compute_uniforms(&self) -> [Uniform<'static>; 7] {
-        [
-            Uniform::new("niri_scale", self.scale),
-            Uniform::new("geo_size", <[f32; 2]>::from(self.clip_geo_size)),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", self.input_to_clip_geo),
-            Uniform::new("noise", self.noise),
-            Uniform::new("saturation", self.saturation),
-            Uniform::new("bg_color", self.bg_color.components()),
-        ]
-    }
-
     /// Filter `damage` by the effect subregion (the surface blur-region protocol), identically for
     /// both renderers. Returns the damage to draw, or `None` when the subregion clips it all away
     /// (the caller's `draw` early-returns).
@@ -332,7 +307,7 @@ impl XrayElement {
 impl XrayElement {
     /// Construct an `XrayElement` directly for oracle tests (bypassing `Xray::render`'s scene
     /// math), so a GLES element and a Vulkan element can share identical geometry/src/matrices
-    /// and be compared. `program` is the GLES postprocess-and-clip program (`None` on Vulkan).
+    /// and be compared.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_test(
         buffer: Rc<RefCell<EffectBuffer>>,
@@ -344,7 +319,6 @@ impl XrayElement {
         scale: f32,
         blur: bool,
         bg_color: Color32F,
-        program: Option<GlesTexProgram>,
     ) -> Self {
         let id = buffer.borrow().id().clone();
         Self {
@@ -361,7 +335,6 @@ impl XrayElement {
             noise: 0.,
             saturation: 1.,
             bg_color,
-            program,
         }
     }
 }
@@ -390,47 +363,20 @@ impl Element for XrayElement {
     }
 }
 
+/// Lets `XrayElement` ride the generic `<R>` enum arms, which need a `RenderElement` impl for every
+/// renderer they are emitted for. Never drawn: the `EffectBuffer` it samples only has a Vulkan arm.
 impl RenderElement<GlesRenderer> for XrayElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
+        _frame: &mut GlesFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        _dst: Rectangle<i32, Physical>,
+        _damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let mut buffer = self.buffer.borrow_mut();
-        let texture = match buffer.render(frame, self.blur) {
-            Ok(x) => x,
-            Err(err) => {
-                warn!("error rendering effect buffer: {err:?}");
-                return Ok(());
-            }
-        };
-
-        // FIXME: avoid reallocating a fresh Vec here somehow.
-        let mut filtered_damage = Vec::new();
-        let Some(damage) = self.filter_subregion_damage(src, dst, damage, &mut filtered_damage)
-        else {
-            return Ok(());
-        };
-
-        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
-        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
-
-        frame.render_texture_from_to(
-            &texture,
-            src,
-            dst,
-            damage,
-            // FIXME: opaque regions need to be filtered like damage.
-            &[],
-            Transform::Normal,
-            1.,
-            self.program.as_ref(),
-            uniforms,
-        )
+        debug_assert!(false, "XrayElement drawn through GLES");
+        Ok(())
     }
 }
 
