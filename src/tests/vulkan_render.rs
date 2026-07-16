@@ -3166,11 +3166,25 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
     );
 
     let mut buffer = EffectBuffer::new();
+    assert!(
+        buffer.render_element_states().is_none(),
+        "no states before the first render"
+    );
     buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
     fill_edge(&mut buffer, S);
     assert!(
         buffer.prepare_vulkan(&mut vk, false),
         "prepare_vulkan (no blur) failed"
+    );
+
+    // The states of the Vulkan render must be observable: `Niri::update_primary_scanout_output`
+    // reads them to remap a background layer surface that is visible only through this xray buffer
+    // onto the xray element's id. Reading the GLES arm here returned `None` on every real frame, so
+    // that remap silently never fired and such a surface had its frame callbacks throttled.
+    assert!(
+        buffer.render_element_states().is_some(),
+        "the Vulkan render's element states must be observable, else the background-layer id \
+         remap in update_primary_scanout_output silently never fires"
     );
 
     // (a) full src → left red, right green; (b) cropped src = right half → all green.

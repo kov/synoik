@@ -150,8 +150,15 @@ impl EffectBuffer {
         self.scale
     }
 
+    /// States from the last render into the offscreen, or `None` before the first one.
+    ///
+    /// Reads the Vulkan arm: it is the one the live session fills. Reading the GLES arm here meant
+    /// this returned `None` on every real frame, which silently disabled the background-layer id
+    /// remap in `Niri::update_primary_scanout_output` (niri.rs) — a background layer surface
+    /// visible only through an xray blur was then treated as un-presented and its frame callbacks
+    /// throttled.
     pub fn render_element_states(&self) -> Option<&RenderElementStates> {
-        self.offscreen.as_ref().map(|o| &o.states)
+        self.offscreen_vk.as_ref().map(|o| &o.states)
     }
 
     pub fn update_size(&mut self, size: Size<i32, Physical>, scale: Scale<f64>) {
