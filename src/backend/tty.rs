@@ -26,13 +26,11 @@ use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
 };
-use smithay::backend::egl::context::ContextPriority;
-use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
-use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
+use smithay::backend::renderer::multigpu::{MultiFrame, MultiRenderer};
 use smithay::backend::renderer::{DebugFlags, ImportDma, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -87,7 +85,6 @@ pub struct Tty {
     session: LibSeatSession,
     udev_dispatcher: Dispatcher<'static, UdevBackend, State>,
     libinput: Libinput,
-    gpu_manager: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     // DRM node corresponding to the primary GPU. May or may not be the same as
     // primary_render_node.
     primary_node: DrmNode,
@@ -472,9 +469,6 @@ impl Tty {
             })
             .unwrap();
 
-        let api = GbmGlesBackend::with_context_priority(ContextPriority::High);
-        let gpu_manager = GpuManager::new(api).context("error creating the GPU manager")?;
-
         let (primary_node, primary_render_node) = primary_node_from_config(&config.borrow())
             .ok_or(())
             .or_else(|()| {
@@ -526,7 +520,6 @@ impl Tty {
             session,
             udev_dispatcher,
             libinput,
-            gpu_manager,
             primary_node,
             primary_render_node,
             ignored_nodes: HashSet::new(),
@@ -810,41 +803,24 @@ impl Tty {
             GbmDevice::new(device_fd)
         }?;
 
-        let mut try_initialize_gpu = || {
-            let display = unsafe { EGLDisplay::new(gbm.clone())? };
-            let egl_device = EGLDevice::device_for_display(&display)?;
-
-            // Software EGL devices (e.g., llvmpipe/softpipe) are rejected for now. They have some
-            // problems (segfault on importing dmabufs from other renderers) and need to be
-            // excluded from some places like DRM leasing.
-            ensure!(
-                !egl_device.is_software(),
-                "software EGL renderers are skipped"
-            );
-
-            let render_node = egl_device
-                .try_get_render_node()
-                .ok()
-                .flatten()
-                .unwrap_or(node);
-            self.gpu_manager
-                .as_mut()
-                .add_node(render_node, gbm.clone())
-                .context("error adding render node to GPU manager")?;
-
-            Ok(render_node)
-        };
-
-        let render_node = match try_initialize_gpu() {
-            Ok(render_node) => {
-                debug!("got render node: {render_node}");
-                Some(render_node)
-            }
-            Err(err) => {
-                debug!("failed to initialize renderer, falling back to primary gpu: {err:?}");
+        // Ask DRM for this device's render node, the same way `Tty::new` derives the primary one.
+        // This used to go through an EGL probe (`EGLDevice::device_for_display`), which also
+        // rejected *software* renderers -- llvmpipe and friends, which reportedly segfault
+        // importing dmabufs from other renderers. DRM cannot tell us a node is software, so that
+        // skip is gone: a software DRM device is now accepted rather than passed over. Nothing in
+        // the fork renders through EGL any more, and the owned Vulkan renderer's dmabuf import is
+        // its own code path, so the original hazard may not even apply -- but it is a real
+        // behaviour change on any machine that has such a device.
+        let render_node = node
+            .node_with_type(NodeType::Render)
+            .and_then(Result::ok)
+            .or_else(|| {
+                debug!("no render node for {node}, falling back to the primary gpu");
                 None
-            }
-        };
+            });
+        if let Some(render_node) = render_node {
+            debug!("got render node: {render_node}");
+        }
 
         if render_node == Some(self.primary_render_node) && self.dmabuf_global.is_none() {
             let render_node = self.primary_render_node;
@@ -1261,12 +1237,6 @@ impl Tty {
                         )
                         .unwrap();
                 }
-            }
-
-            if was_last {
-                self.gpu_manager.as_mut().remove_node(&render_node);
-                // Trigger re-enumeration in order to remove the device from gpu_manager.
-                let _ = self.gpu_manager.devices();
             }
         }
 
