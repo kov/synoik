@@ -2318,6 +2318,80 @@ fn vulkan_renders_a_window_mid_open_animation() {
     );
 }
 
+/// A configured custom **open** shader must actually be reached by `Tile::render`, not merely
+/// compile. `vulkan_custom_anim_element_draws_the_open_shader` builds the element by hand, so it
+/// proves the shader works while saying nothing about whether the compositor ever gets there.
+///
+/// The wiring is what is fragile: the install runs inside `reload_config`
+/// (`niri.rs:1717` — `with_vulkan_renderer(|vk| vk.set_custom_open_shader(src))`), and
+/// `opening_window.rs:167` gates on `has_custom_shader`. If that install is skipped — a
+/// `with_vulkan_renderer` returning `None`, or the line going out with the GLES one beside it —
+/// `has_custom_shader` is false and the built-in scale+fade runs instead. No error; the user's
+/// shader silently stops existing.
+///
+/// Install a shader that paints the opening window solid BLUE, then composite mid-open. Nothing
+/// else in the scene is blue, and the built-in animation fades the window's own GREEN, so blue
+/// pixels appear only if the config → install → `has_custom_shader` → custom-element path holds
+/// end to end.
+#[test]
+fn vulkan_reaches_the_configured_custom_open_shader() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping vulkan_reaches_the_configured_custom_open_shader: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    // Install the custom shader through the real config-reload path, before any window maps. The
+    // install is diffed against the old config, so it must differ from the `Config::default()`
+    // above (which has no custom shader).
+    let mut config = Config::default();
+    config.animations.window_open.custom_shader = Some(
+        "vec4 open_color(vec3 coords_geo, vec3 size_geo) {\n\
+         return vec4(0.0, 0.0, 1.0, 1.0);\n\
+         }"
+        .to_owned(),
+    );
+    f.niri_state().reload_config(Ok(config));
+
+    // Map a green window and leave its open animation running.
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected the window open animation to be active"
+    );
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let is_blue = |p: [u8; 4]| p[0] < 40 && p[1] < 40 && p[2] > 200;
+    let blue = (0..w * h)
+        .filter(|i| is_blue(px(&pixels, w, i % w, i / w)))
+        .count();
+
+    eprintln!("vulkan_reaches_the_configured_custom_open_shader: {blue} blue px");
+    assert!(
+        blue > 0,
+        "the configured custom open shader never reached Tile::render (fell back to the built-in \
+         animation?): {blue} blue px"
+    );
+}
+
 /// The tile **alpha** animation (window movement fades, interactive move) renders the tile into an
 /// offscreen and composites it at the animated alpha. It is the open animation's sibling one branch
 /// down in `Tile::render`, and it fails the same silent way: `alpha.offscreen_vk.render` erroring
