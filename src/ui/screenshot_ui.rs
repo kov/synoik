@@ -5,18 +5,13 @@ use std::f64::consts::TAU;
 use std::iter::zip;
 use std::rc::Rc;
 
-use anyhow::{bail, Context};
-use arrayvec::ArrayVec;
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
 use pango::{Alignment, FontDescription};
 use pangocairo::cairo::{self, ImageSurface};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
-use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::ExportMem;
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -26,12 +21,11 @@ use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::dual_texture::DualTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::render_helpers::{render_to_texture, RenderTarget};
+use crate::render_helpers::RenderTarget;
 use crate::utils::to_physical_precise_round;
 
 /// Per-element cache of a neutral CPU buffer uploaded once to a `VkTexture` (see
@@ -102,12 +96,9 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
     /// The (show, hide) help panels as renderer-neutral CPU buffers. The panel is CPU/cairo-drawn,
-    /// so these are the source bytes — no GPU readback.
-    ///
-    /// These, not `panel`, are what the capture button's hit test measures: the button must keep
-    /// responding once the GLES panel bake goes away, and the two carry the same size.
+    /// so these are the source bytes — no GPU readback. They are also what the capture button's
+    /// hit test measures.
     panel_neutral: Option<(MemoryBuffer, MemoryBuffer)>,
     /// `panel_neutral` uploaded once each to `VkTexture`s, cached across frames.
     panel_vk: (VkCache, VkCache),
@@ -125,23 +116,13 @@ pub struct ScreenshotNeutral {
     pub pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
 }
 
-/// One output's frozen screen (and pointer), in the form the session's renderer can sample.
-///
-/// An enum rather than a bag of `Option`s so that a consumer which forgets the Vulkan arm doesn't
-/// compile: a `DualTextureRenderElement::Gles` drawn on the owned Vulkan renderer is a silent
-/// no-op, and a GLES readback of a texture that was never baked is a blank screenshot. Exactly one
-/// arm is live per session.
+/// One output's frozen screen (and pointer), as renderer-neutral CPU buffers. Saving to disk crops
+/// these on the CPU rather than reading back from the GPU.
+//
+// TODO: one variant left — collapse to a struct with the dual enums (#43 commit 5).
 #[allow(clippy::large_enum_variant)]
 pub enum OutputScreenshot {
-    /// GLES textures, sampled (and read back, to save) directly.
-    Gles {
-        texture: GlesTexture,
-        buffer: PrimaryGpuTextureRenderElement,
-        pointer: Option<PrimaryGpuTextureRenderElement>,
-    },
-    /// The frozen screen (and pointer + its logical location) as renderer-neutral CPU buffers. The
-    /// owned Vulkan renderer can't sample a GLES texture, so a Vulkan session captures the screen
-    /// this way — and saves to disk by cropping these on the CPU, never reading back through GLES.
+    /// The frozen screen (and pointer + its logical location) as renderer-neutral CPU buffers.
     Neutral {
         screen: MemoryBuffer,
         pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
@@ -183,11 +164,8 @@ impl ScreenshotUi {
         }
     }
 
-    /// `renderer` is `None` on a Vulkan session, which bakes no GLES panel texture: it draws the
-    /// panel from `panel_neutral`, which is produced either way.
     pub fn open(
         &mut self,
-        mut renderer: Option<&mut GlesRenderer>,
         // Output, screencast, screen capture.
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
         default_output: Output,
@@ -255,26 +233,13 @@ impl ScreenshotUi {
                 ];
                 let locations = [Default::default(); 8];
 
-                let mut render_panel_ = |text| {
-                    render_panel(renderer.as_deref_mut(), scale, text)
+                let render_panel_ = |text| {
+                    render_panel(scale, text)
                         .map_err(|err| warn!("error rendering help panel: {err:?}"))
                         .ok()
                 };
-                let panel_show = render_panel_(TEXT_SHOW_P);
-                let panel_hide = render_panel_(TEXT_HIDE_P);
-                // Each render_panel yields (optional GLES texture, neutral CPU buffer); split them
-                // apart. The neutral is kept on every session, not just Vulkan: it is the hit
-                // test's measuring stick, and it is already drawn either way.
-                //
-                // The texture being `None` means "not baked" (a Vulkan session), NOT "the panel
-                // failed" — a failure is the whole `render_panel_` returning `None`, which drops
-                // the neutral with it.
-                let (panel, panel_neutral) = match Option::zip(panel_show, panel_hide) {
-                    Some(((show_tex, show_mem), (hide_tex, hide_mem))) => {
-                        (Option::zip(show_tex, hide_tex), Some((show_mem, hide_mem)))
-                    }
-                    None => (None, None),
-                };
+                let panel_neutral =
+                    Option::zip(render_panel_(TEXT_SHOW_P), render_panel_(TEXT_HIDE_P));
 
                 let data = OutputData {
                     size,
@@ -283,7 +248,6 @@ impl ScreenshotUi {
                     screenshot,
                     buffers,
                     locations,
-                    panel,
                     panel_neutral,
                     panel_vk: (RefCell::new(None), RefCell::new(None)),
                 };
@@ -727,18 +691,9 @@ impl ScreenshotUi {
                 .to_f64()
                 .to_logical(scale);
 
-            let gles_buffer = output_data
-                .panel
-                .as_ref()
-                .map(|(show, hide)| if *show_pointer { hide } else { show }.clone());
-
-            if let Some(elem) = output_data.panel_element(
-                renderer,
-                *show_pointer,
-                gles_buffer,
-                location,
-                alpha * progress,
-            ) {
+            if let Some(elem) =
+                output_data.panel_element(renderer, *show_pointer, location, alpha * progress)
+            {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
         }
@@ -771,89 +726,6 @@ impl ScreenshotUi {
         }
     }
 
-    pub fn capture(
-        &self,
-        renderer: &mut GlesRenderer,
-    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
-        let _span = tracy_client::span!("ScreenshotUi::capture");
-
-        let Self::Open {
-            selection,
-            output_data,
-            show_pointer,
-            ..
-        } = self
-        else {
-            panic!("screenshot UI must be open to capture");
-        };
-
-        let data = &output_data[&selection.0];
-        let rect = rect_from_corner_points(selection.1, selection.2);
-
-        // A Vulkan session has no GLES texture to read back — it saves through
-        // `capture_from_neutral`, which `confirm_screenshot` tries first.
-        let OutputScreenshot::Gles {
-            texture,
-            buffer,
-            pointer: screenshot_pointer,
-        } = &data.screenshot[0]
-        else {
-            bail!("the frozen screen was captured for Vulkan; save it with capture_from_neutral");
-        };
-
-        // Composite the pointer on top if needed.
-        let mut tex_rect = None;
-        if *show_pointer {
-            if let Some(pointer) = screenshot_pointer.clone() {
-                let scale = pointer.0.buffer().texture_scale();
-                let offset = rect.loc.upscale(-1);
-
-                let mut elements = ArrayVec::<_, 2>::new();
-                elements.push(pointer);
-                elements.push(buffer.clone());
-                let elements = elements.iter().rev().map(|elem| {
-                    RelocateRenderElement::from_element(elem, offset, Relocate::Relative)
-                });
-
-                let res = render_to_texture(
-                    renderer,
-                    rect.size,
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elements,
-                );
-                match res {
-                    Ok((texture, _)) => {
-                        tex_rect = Some((texture, Rectangle::from_size(rect.size)));
-                    }
-                    Err(err) => {
-                        warn!("error compositing pointer onto screenshot: {err:?}");
-                    }
-                }
-            }
-        }
-
-        let (texture, rect) = tex_rect.unwrap_or_else(|| (texture.clone(), rect));
-        // The size doesn't actually matter because we're not transforming anything.
-        let buf_rect = rect
-            .to_logical(1)
-            .to_buffer(1, Transform::Normal, &Size::from((1, 1)));
-
-        let mapping = renderer
-            .copy_texture(&texture, buf_rect, Fourcc::Abgr8888)
-            .context("error copying texture")?;
-        let copy = renderer
-            .map_texture(&mapping)
-            .context("error mapping texture")?;
-
-        Ok((rect.size, copy.to_vec()))
-    }
-
-    /// Save-to-disk capture through the frozen-screen neutral `MemoryBuffer` (captured through the
-    /// owned Vulkan renderer at open time) — a pure CPU crop + pointer composite, so this path
-    /// never reads back through GLES (Phase C). Returns `None` on a GLES session, where the frozen
-    /// screen is a GLES texture and [`Self::capture`] reads it back instead.
     pub fn capture_from_neutral(&self) -> Option<(Size<i32, Physical>, Vec<u8>)> {
         let _span = tracy_client::span!("ScreenshotUi::capture_from_neutral");
 
@@ -872,10 +744,7 @@ impl ScreenshotUi {
             screen,
             pointer: screenshot_pointer,
             ..
-        } = &data.screenshot[0]
-        else {
-            return None;
-        };
+        } = &data.screenshot[0];
 
         let rect = rect_from_corner_points(selection.1, selection.2);
 
@@ -1150,53 +1019,6 @@ impl ScreenshotUi {
 }
 
 impl OutputScreenshot {
-    /// The frozen screen as GLES textures (a GLES session). A Vulkan session never bakes these —
-    /// the owned renderer can't sample them — and uses [`Self::from_neutrals`] instead.
-    pub fn from_textures(
-        renderer: &mut GlesRenderer,
-        scale: Scale<f64>,
-        texture: GlesTexture,
-        pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
-    ) -> Self {
-        let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-            TextureBuffer::from_texture(
-                renderer,
-                texture.clone(),
-                scale,
-                Transform::Normal,
-                Vec::new(),
-            ),
-            (0., 0.),
-            1.,
-            None,
-            None,
-            Kind::Unspecified,
-        ));
-
-        let pointer = pointer.map(|(texture, geo)| {
-            PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                ),
-                geo.to_f64().to_logical(scale).loc,
-                1.,
-                None,
-                None,
-                Kind::Unspecified,
-            ))
-        });
-
-        Self::Gles {
-            texture,
-            buffer,
-            pointer,
-        }
-    }
-
     /// The frozen screen as renderer-neutral captures (a Vulkan session).
     pub fn from_neutrals(
         screen: MemoryBuffer,
@@ -1210,71 +1032,55 @@ impl OutputScreenshot {
         }
     }
 
-    /// The frozen-screen element, or `None` if it can't be drawn on `renderer` — a failed Vulkan
-    /// upload, or a neutral capture asked to draw on GLES. Callers must skip it rather than
-    /// substitute anything: there is no second copy of the frozen screen.
+    /// The frozen-screen element, or `None` if it can't be drawn — a failed Vulkan upload. Callers
+    /// must skip it rather than substitute anything: there is no second copy of the frozen screen.
     fn buffer_element<R: NiriRenderer>(
         &self,
         renderer: &mut R,
     ) -> Option<DualTextureRenderElement> {
-        match self {
-            Self::Gles { buffer, .. } => Some(DualTextureRenderElement::Gles(buffer.clone())),
+        let Self::Neutral {
+            screen, screen_vk, ..
+        } = self;
 
-            Self::Neutral {
-                screen, screen_vk, ..
-            } => {
-                if let Some(vk) = renderer.try_as_vulkan_renderer() {
-                    let tb = upload_cached(vk, screen, screen_vk)?;
-                    return Some(DualTextureRenderElement::Vulkan(
-                        TextureRenderElement::from_texture_buffer(
-                            tb,
-                            (0., 0.),
-                            1.,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
-
-                None
-            }
-        }
+        let vk = renderer.try_as_vulkan_renderer()?;
+        let tb = upload_cached(vk, screen, screen_vk)?;
+        Some(DualTextureRenderElement::Vulkan(
+            TextureRenderElement::from_texture_buffer(
+                tb,
+                (0., 0.),
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            ),
+        ))
     }
 
-    /// The composited-pointer element, at the same location the GLES element uses. `None` when no
-    /// pointer was captured, or when it can't be drawn on `renderer` (see
-    /// [`Self::buffer_element`]).
+    /// The composited-pointer element. `None` when no pointer was captured, or when it can't be
+    /// drawn (see [`Self::buffer_element`]).
     fn pointer_element<R: NiriRenderer>(
         &self,
         renderer: &mut R,
     ) -> Option<DualTextureRenderElement> {
-        match self {
-            Self::Gles { pointer, .. } => pointer.clone().map(DualTextureRenderElement::Gles),
+        let Self::Neutral {
+            pointer,
+            pointer_vk,
+            ..
+        } = self;
 
-            Self::Neutral {
-                pointer,
-                pointer_vk,
-                ..
-            } => {
-                if let Some(vk) = renderer.try_as_vulkan_renderer() {
-                    let (neutral, location) = pointer.as_ref()?;
-                    let tb = upload_cached(vk, neutral, pointer_vk)?;
-                    return Some(DualTextureRenderElement::Vulkan(
-                        TextureRenderElement::from_texture_buffer(
-                            tb,
-                            *location,
-                            1.,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
-
-                None
-            }
-        }
+        let vk = renderer.try_as_vulkan_renderer()?;
+        let (neutral, location) = pointer.as_ref()?;
+        let tb = upload_cached(vk, neutral, pointer_vk)?;
+        Some(DualTextureRenderElement::Vulkan(
+            TextureRenderElement::from_texture_buffer(
+                tb,
+                *location,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            ),
+        ))
     }
 }
 
@@ -1290,40 +1096,26 @@ impl OutputData {
         &self,
         renderer: &mut R,
         show_pointer: bool,
-        gles_buffer: Option<TextureBuffer<GlesTexture>>,
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<DualTextureRenderElement> {
-        if let Some(vk) = renderer.try_as_vulkan_renderer() {
-            if let Some((show_mem, hide_mem)) = &self.panel_neutral {
-                let (neutral, cache) = if show_pointer {
-                    (hide_mem, &self.panel_vk.1)
-                } else {
-                    (show_mem, &self.panel_vk.0)
-                };
-                if let Some(tb) = upload_cached(vk, neutral, cache) {
-                    return Some(DualTextureRenderElement::Vulkan(
-                        TextureRenderElement::from_texture_buffer(
-                            tb,
-                            location,
-                            alpha,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
-            }
-        }
-        Some(DualTextureRenderElement::Gles(
-            PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
-                gles_buffer?,
+        let vk = renderer.try_as_vulkan_renderer()?;
+        let (show_mem, hide_mem) = self.panel_neutral.as_ref()?;
+        let (neutral, cache) = if show_pointer {
+            (hide_mem, &self.panel_vk.1)
+        } else {
+            (show_mem, &self.panel_vk.0)
+        };
+        let tb = upload_cached(vk, neutral, cache)?;
+        Some(DualTextureRenderElement::Vulkan(
+            TextureRenderElement::from_texture_buffer(
+                tb,
                 location,
                 alpha,
                 None,
                 None,
                 Kind::Unspecified,
-            )),
+            ),
         ))
     }
 }
@@ -1471,14 +1263,9 @@ fn is_within_capture_button(
     (pos.x - xc) * (pos.x - xc) + (pos.y - yc) * (pos.y - yc) <= radius * radius
 }
 
-/// Draws the help panel with cairo and hands back both a GLES texture (skipped when `renderer` is
-/// `None` — a Vulkan session draws from the neutral buffer instead) and the CPU bytes it was drawn
-/// from. The neutral is produced either way: it is what the capture button's hit test measures.
-fn render_panel(
-    renderer: Option<&mut GlesRenderer>,
-    scale: f64,
-    text: &str,
-) -> anyhow::Result<(Option<TextureBuffer<GlesTexture>>, MemoryBuffer)> {
+/// Draws the help panel with cairo and hands back the CPU bytes it was drawn from. They are what
+/// the capture button's hit test measures, and what the panel is uploaded from.
+fn render_panel(scale: f64, text: &str) -> anyhow::Result<MemoryBuffer> {
     let _span = tracy_client::span!("screenshot_ui::render_panel");
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);
@@ -1559,29 +1346,12 @@ fn render_panel(
 
     let data = surface.take_data().unwrap();
     // `None` on a Vulkan session: it draws the panel from `neutral` below, and never samples this.
-    let buffer = match renderer {
-        Some(renderer) => Some(TextureBuffer::from_memory(
-            renderer,
-            &data,
-            Fourcc::Argb8888,
-            (width, height),
-            false,
-            scale,
-            Transform::Normal,
-            Vec::new(),
-        )?),
-        None => None,
-    };
-
-    // The same CPU bytes as a renderer-neutral buffer, so a Vulkan session can re-upload them
-    // (cairo ARGB32 is premultiplied Argb8888, matching the GLES upload above).
-    let neutral = MemoryBuffer::new(
+    // Cairo ARGB32 is premultiplied Argb8888, which is what the upload expects.
+    Ok(MemoryBuffer::new(
         data.to_vec(),
         Fourcc::Argb8888,
         Size::from((width, height)),
         Scale::from(scale),
         Transform::Normal,
-    );
-
-    Ok((buffer, neutral))
+    ))
 }

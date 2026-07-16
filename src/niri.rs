@@ -2093,11 +2093,9 @@ impl State {
             touch.unset_grab(self);
         }
 
-        // The panel is cairo-drawn; only its GLES upload needed a renderer, and nothing samples
-        // that texture any more.
         self.niri
             .screenshot_ui
-            .open(None, screenshots, default_output, show_pointer, path);
+            .open(screenshots, default_output, show_pointer, path);
 
         self.niri
             .cursor_manager
