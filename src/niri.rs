@@ -2134,11 +2134,23 @@ impl State {
             touch.unset_grab(self);
         }
 
-        self.backend.with_primary_renderer(|renderer| {
+        // The panel is cairo-drawn either way; only its GLES upload needs a renderer, and a Vulkan
+        // session never samples that texture.
+        if using_vulkan {
             self.niri
                 .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
-        });
+                .open(None, screenshots, default_output, show_pointer, path);
+        } else {
+            self.backend.with_primary_renderer(|renderer| {
+                self.niri.screenshot_ui.open(
+                    Some(renderer),
+                    screenshots,
+                    default_output,
+                    show_pointer,
+                    path,
+                )
+            });
+        }
 
         self.niri
             .cursor_manager
