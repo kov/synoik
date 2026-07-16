@@ -1,18 +1,13 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture, Uniform};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::backend::renderer::Texture as _;
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
 use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType};
 
 /// The resize cross-fade element. Blends a "prev" (pre-resize) and "next" (current) window snapshot
 /// by the animation progress, clipping/rounding to the current geometry.
@@ -113,69 +108,6 @@ fn resize_transforms(
         curr_geo_size,
         corner_radius,
         scale_x: scale.x,
-    }
-}
-
-impl ResizeRenderElement {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        area: Rectangle<f64, Logical>,
-        scale: Scale<f64>,
-        texture_prev: (GlesTexture, Rectangle<i32, Physical>),
-        size_prev: Size<f64, Logical>,
-        texture_next: (GlesTexture, Rectangle<i32, Physical>),
-        size_next: Size<f64, Logical>,
-        progress: f32,
-        clamped_progress: f32,
-        corner_radius: CornerRadius,
-        clip_to_geometry: bool,
-        result_alpha: f32,
-    ) -> Self {
-        let (texture_prev, tex_prev_geo) = texture_prev;
-        let (texture_next, tex_next_geo) = texture_next;
-
-        let t = resize_transforms(
-            area,
-            scale,
-            tex_prev_geo,
-            Vec2::new(texture_prev.width() as f32, texture_prev.height() as f32),
-            size_prev,
-            tex_next_geo,
-            Vec2::new(texture_next.width() as f32, texture_next.height() as f32),
-            size_next,
-            corner_radius,
-        );
-
-        let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
-
-        // Create the shader.
-        Self::Gles(
-            ShaderRenderElement::new(
-                ProgramType::Resize,
-                t.area.size,
-                None,
-                t.scale_x,
-                result_alpha,
-                Rc::new([
-                    mat3_uniform("niri_input_to_curr_geo", t.input_to_curr_geo),
-                    mat3_uniform("niri_curr_geo_to_prev_geo", t.curr_geo_to_prev_geo),
-                    mat3_uniform("niri_curr_geo_to_next_geo", t.curr_geo_to_next_geo),
-                    Uniform::new("niri_curr_geo_size", t.curr_geo_size.to_array()),
-                    mat3_uniform("niri_geo_to_tex_prev", t.geo_to_tex_prev),
-                    mat3_uniform("niri_geo_to_tex_next", t.geo_to_tex_next),
-                    Uniform::new("niri_progress", progress),
-                    Uniform::new("niri_clamped_progress", clamped_progress),
-                    Uniform::new("niri_corner_radius", <[f32; 4]>::from(t.corner_radius)),
-                    Uniform::new("niri_clip_to_geometry", clip_to_geometry),
-                ]),
-                HashMap::from([
-                    (String::from("niri_tex_prev"), texture_prev),
-                    (String::from("niri_tex_next"), texture_next),
-                ]),
-                Kind::Unspecified,
-            )
-            .with_location(t.area.loc),
-        )
     }
 }
 
