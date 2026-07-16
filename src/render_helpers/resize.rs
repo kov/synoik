@@ -11,9 +11,8 @@ use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
-use super::renderer::NiriRenderer;
 use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::shaders::{mat3_uniform, ProgramType};
 
 /// The resize cross-fade element. Blends a "prev" (pre-resize) and "next" (current) window snapshot
 /// by the animation progress, clipping/rounding to the current geometry.
@@ -177,10 +176,6 @@ impl ResizeRenderElement {
             )
             .with_location(t.area.loc),
         )
-    }
-
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Resize).is_some())
     }
 }
 

@@ -6,7 +6,6 @@ use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use niri_vk::render::PostprocessPush;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
@@ -360,23 +359,6 @@ impl Element for XrayElement {
         // FIXME: if bg_color alpha is 1 then compute opaque regions here taking corners into
         // account
         OpaqueRegions::default()
-    }
-}
-
-/// Lets `XrayElement` ride the generic `<R>` enum arms, which need a `RenderElement` impl for every
-/// renderer they are emitted for. Never drawn: the `EffectBuffer` it samples only has a Vulkan arm.
-impl RenderElement<GlesRenderer> for XrayElement {
-    fn draw(
-        &self,
-        _frame: &mut GlesFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
-        _dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
-        _opaque_regions: &[Rectangle<i32, Physical>],
-        _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        debug_assert!(false, "XrayElement drawn through GLES");
-        Ok(())
     }
 }
 

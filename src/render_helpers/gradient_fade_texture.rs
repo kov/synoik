@@ -164,31 +164,6 @@ impl GradientFadeTextureRenderElement<VkTexture> {
     }
 }
 
-/// Lets the `VkTexture` element ride a generic `<R>` enum arm, which needs a `RenderElement` impl
-/// for every renderer the arm is emitted for. Never drawn: the element is only built on a Vulkan
-/// session.
-impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement<VkTexture> {
-    fn draw(
-        &self,
-        _frame: &mut GlesFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
-        _dst: Rectangle<i32, Physical>,
-        _damage: &[Rectangle<i32, Physical>],
-        _opaque_regions: &[Rectangle<i32, Physical>],
-        _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        debug_assert!(
-            false,
-            "Vulkan GradientFadeTextureRenderElement drawn through GLES"
-        );
-        Ok(())
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
-    }
-}
-
 impl RenderElement<VulkanRenderer> for GradientFadeTextureRenderElement<VkTexture> {
     fn draw(
         &self,
