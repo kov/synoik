@@ -189,7 +189,6 @@ impl ShadowRenderElement {
     /// renderer — which draws shadows procedurally ([`VulkanFrame::render_shadow`]) and needs no
     /// GLES program, exactly as [`BorderRenderElement::has_shader`] already does.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        #[cfg(feature = "vulkan")]
         if renderer.try_as_vulkan_renderer().is_some() {
             return true;
         }
@@ -300,10 +299,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
 // The owned Vulkan renderer draws the shadow procedurally in its own pipeline (M3), reading the
 // raw `params` rather than the GLES `inner` uniform list. The derivation is trivial (field
 // extraction + the shared `area_size`), so it is inlined here rather than shared.
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
-#[cfg(feature = "vulkan")]
 impl ShadowRenderElement {
     /// Build the shadow material's push constants from `params`, with the quad placed at `dst`.
     /// (`proj`/`target` are filled by `VulkanFrame::render_shadow`.)
@@ -337,7 +334,6 @@ impl ShadowRenderElement {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for ShadowRenderElement {
     fn draw(
         &self,

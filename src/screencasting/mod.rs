@@ -101,16 +101,8 @@ impl State {
         // bind. The owned Vulkan renderer imports a narrower set than GLES/EGL advertises (the four
         // 8888 byte orders, LINEAR only), so handing a consumer the EGL set on a Vulkan session
         // would let it pick a modifier we then fail to bind on every single frame.
-        let owned_vulkan_formats: Option<FormatSet> = {
-            #[cfg(feature = "vulkan")]
-            {
-                using_vulkan.then(crate::render_helpers::vulkan::dmabuf_formats)
-            }
-            #[cfg(not(feature = "vulkan"))]
-            {
-                None
-            }
-        };
+        let owned_vulkan_formats: Option<FormatSet> =
+            { using_vulkan.then(crate::render_helpers::vulkan::dmabuf_formats) };
 
         let mut render_formats = match owned_vulkan_formats {
             Some(formats) => formats,
@@ -182,7 +174,6 @@ impl State {
 
         let id = match &cast.target {
             CastTarget::Nothing => {
-                #[cfg(feature = "vulkan")]
                 let cleared = if self.backend.using_vulkan() {
                     self.backend
                         .with_vulkan_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer))
@@ -190,10 +181,6 @@ impl State {
                     self.backend
                         .with_primary_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer))
                 };
-                #[cfg(not(feature = "vulkan"))]
-                let cleared = self
-                    .backend
-                    .with_primary_renderer(|renderer| cast.dequeue_buffer_and_clear(renderer));
 
                 if cleared == Some(true) {
                     cast.last_frame_time = get_monotonic_time();
@@ -243,7 +230,6 @@ impl State {
                 }
             }
 
-            #[cfg(feature = "vulkan")]
             let rendered = if self.backend.using_vulkan() {
                 self.backend.with_vulkan_renderer(|renderer| {
                     self.niri
@@ -255,11 +241,6 @@ impl State {
                         .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
                 })
             };
-            #[cfg(not(feature = "vulkan"))]
-            let rendered = self.backend.with_primary_renderer(|renderer| {
-                self.niri
-                    .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
-            });
 
             if rendered.is_none() {
                 warn!("no renderer available to redraw the window cast");

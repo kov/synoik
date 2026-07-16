@@ -53,7 +53,6 @@ impl PickColorGrab {
         // never touches GLES (Phase C, dropping the co-resident GLES renderer). Falls through to
         // the GLES primary renderer if the Vulkan renderer is unavailable (e.g. the headless
         // backend, whose Backend-level `with_vulkan_renderer` yields `None`).
-        #[cfg(feature = "vulkan")]
         if data.backend.using_vulkan() {
             if let Some(color) = data.backend.with_vulkan_renderer(|renderer| {
                 Self::pick_color_with_renderer(&data.niri, renderer, &output, pos, scale)

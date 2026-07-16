@@ -452,7 +452,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
 /// shape as the GLES impl above, just driven through `VulkanFrame::capture_backdrop` /
 /// `draw_backdrop`. Rotated outputs are not yet handled (Normal-transform only), matching the rest
 /// of the Vulkan port.
-#[cfg(feature = "vulkan")]
 mod vulkan_impl {
     use std::cell::RefCell;
 

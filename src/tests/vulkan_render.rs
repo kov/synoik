@@ -715,7 +715,6 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
 /// with buffer transform `src_transform`, render it full-screen through `render_texture_from_to`
 /// at output transform `out_transform`, and return the four (inset) corner pixels of the readback.
 /// Generic so it drives GLES and the Vulkan renderer identically.
-#[cfg(feature = "vulkan")]
 fn buffer_transform_corners<R, T>(
     renderer: &mut R,
     pattern: &[u8],

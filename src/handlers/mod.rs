@@ -656,7 +656,6 @@ impl ScreencopyHandler for State {
         } else {
             // On a Vulkan session, render the one-shot screencopy through the owned renderer
             // (Phase C); fall back to GLES only when there is no owned Vulkan renderer.
-            #[cfg(feature = "vulkan")]
             if self.backend.using_vulkan() {
                 let res = self.backend.with_vulkan_renderer(|renderer| {
                     self.niri

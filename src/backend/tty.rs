@@ -110,7 +110,6 @@ pub struct Tty {
     // set, `render()` composites and scans out through it (feeding the same `DrmCompositor`)
     // instead of the GLES `gpu_manager`. GLES stays the default and the A/B correctness
     // oracle.
-    #[cfg(feature = "vulkan")]
     vulkan_renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
 }
 
@@ -513,7 +512,6 @@ impl Tty {
         // as this used to, happens to agree on a single-GPU machine and silently disagrees on any
         // other.) GBM buffers allocated by `device.allocator` are imported into it via
         // `Bind<Dmabuf>` for scanout.
-        #[cfg(feature = "vulkan")]
         let vulkan_renderer = if renderer == crate::backend::RendererKind::Vulkan {
             let vk = crate::render_helpers::vulkan::VulkanRenderer::for_drm_render_node(
                 primary_render_node.major(),
@@ -525,8 +523,6 @@ impl Tty {
         } else {
             None
         };
-        #[cfg(not(feature = "vulkan"))]
-        let _ = renderer;
 
         Ok(Self {
             config,
@@ -542,7 +538,6 @@ impl Tty {
             update_output_config_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "vulkan")]
             vulkan_renderer,
         })
     }
@@ -555,14 +550,7 @@ impl Tty {
     }
 
     fn use_vulkan(&self) -> bool {
-        #[cfg(feature = "vulkan")]
-        {
-            self.vulkan_renderer.is_some()
-        }
-        #[cfg(not(feature = "vulkan"))]
-        {
-            false
-        }
+        self.vulkan_renderer.is_some()
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
@@ -920,7 +908,6 @@ impl Tty {
             }
             // Also compile them into the owned Vulkan renderer, if present, so the wired custom
             // animation paths (`render_custom_{resize,anim}`) have pipelines to draw with.
-            #[cfg(feature = "vulkan")]
             if let Some(vk) = self.vulkan_renderer.as_mut() {
                 vk.set_custom_resize_shader(resize_shader);
                 vk.set_custom_close_shader(close_shader);
@@ -1996,7 +1983,6 @@ impl Tty {
     /// Run `f` with the owned Vulkan renderer if this Tty composites through it, else `None`.
     /// The dual of [`Self::with_primary_renderer`] for owned-renderer-only setup (installing the
     /// custom animation shaders into the owned renderer alongside the GLES ones).
-    #[cfg(feature = "vulkan")]
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
@@ -2023,7 +2009,6 @@ impl Tty {
         // B would LOAD-preserve output A's shadow content. Count the surfaces up front (before the
         // mutable `device` borrow) and fall back to a full redraw whenever more than one exists.
         // FIXME: a per-CRTC shadow (or the seed-blit variant) would lift this to multi-output.
-        #[cfg(feature = "vulkan")]
         let single_scanout_surface = self
             .devices
             .values()
@@ -2052,7 +2037,6 @@ impl Tty {
         // Composite and scan out through the owned Vulkan renderer, if enabled; otherwise the GLES
         // multi-GPU renderer. Both feed the same `DrmCompositor` (renderer-agnostic at the struct
         // level; `render_frame` is generic over the renderer).
-        #[cfg(feature = "vulkan")]
         if let Some(vk) = self.vulkan_renderer.as_mut() {
             // Hardware cursor, overlay, and primary-plane direct scanout all work with the owned
             // Vulkan renderer because those scanout paths bypass the renderer entirely: the cursor
@@ -2152,7 +2136,6 @@ impl Tty {
         // the owned renderer (which only imports single-plane LINEAR 8888), or a client
         // that ignores the dmabuf feedback could get a tiled/multiplanar buffer accepted
         // here and then fail at render (a blank window and per-frame error spam).
-        #[cfg(feature = "vulkan")]
         if let Some(vk) = self.vulkan_renderer.as_mut() {
             return match ImportDma::import_dmabuf(vk, dmabuf, None) {
                 Ok(_texture) => {
@@ -2934,14 +2917,7 @@ fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
 /// of truth — [`crate::render_helpers::vulkan::dmabuf_formats`]). Only ever called on the Vulkan
 /// path (`use_vulkan`), which is impossible without the feature, so the fallback is unreachable.
 fn owned_vulkan_dmabuf_formats() -> FormatSet {
-    #[cfg(feature = "vulkan")]
-    {
-        crate::render_helpers::vulkan::dmabuf_formats()
-    }
-    #[cfg(not(feature = "vulkan"))]
-    {
-        FormatSet::default()
-    }
+    crate::render_helpers::vulkan::dmabuf_formats()
 }
 
 fn surface_dmabuf_feedback(

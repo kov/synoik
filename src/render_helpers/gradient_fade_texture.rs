@@ -186,10 +186,8 @@ impl<'render> RenderElement<TtyRenderer<'render>>
 
 // The owned Vulkan renderer fades a `VkTexture` in its own pipeline (M3). Like rounded-texture,
 // the `GlesTexture` specialization keeps a degraded no-op `RenderElement<VulkanRenderer>`.
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
-#[cfg(feature = "vulkan")]
 impl GradientFadeTextureRenderElement<VkTexture> {
     /// Build a gradient-fade element for the owned Vulkan renderer, which fades in its own
     /// pipeline and needs no GLES shader program.
@@ -203,7 +201,6 @@ impl GradientFadeTextureRenderElement<VkTexture> {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for GradientFadeTextureRenderElement<VkTexture> {
     fn draw(
         &self,

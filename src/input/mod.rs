@@ -854,7 +854,6 @@ impl State {
                 // On a Vulkan session, capture the Output-target neutral buffers through the owned
                 // renderer first (so that path never touches GLES); the GLES pass below consumes
                 // them and captures the screencast/screen-capture textures.
-                #[cfg(feature = "vulkan")]
                 let neutrals = if using_vulkan {
                     self.backend
                         .with_vulkan_renderer(|vk| self.niri.capture_screen_transition_neutrals(vk))
@@ -862,8 +861,6 @@ impl State {
                 } else {
                     Default::default()
                 };
-                #[cfg(not(feature = "vulkan"))]
-                let neutrals = Default::default();
                 self.backend.with_primary_renderer(|renderer| {
                     self.niri
                         .do_screen_transition(renderer, using_vulkan, neutrals, delay_ms);
@@ -875,7 +872,6 @@ impl State {
                     // On a Vulkan session, render the screenshot through the owned renderer so this
                     // path never touches GLES (Phase C). Falls back to GLES only when there is no
                     // owned Vulkan renderer (i.e. not a Vulkan session).
-                    #[cfg(feature = "vulkan")]
                     if self.backend.using_vulkan() {
                         let res = self.backend.with_vulkan_renderer(|renderer| {
                             self.niri.screenshot(
@@ -931,7 +927,6 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
-                    #[cfg(feature = "vulkan")]
                     if self.backend.using_vulkan() {
                         let res = self.backend.with_vulkan_renderer(|renderer| {
                             self.niri.screenshot_window(
@@ -974,7 +969,6 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
-                    #[cfg(feature = "vulkan")]
                     if self.backend.using_vulkan() {
                         let res = self.backend.with_vulkan_renderer(|renderer| {
                             self.niri.screenshot_window(

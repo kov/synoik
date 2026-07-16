@@ -57,7 +57,7 @@ accesskit = { version = "0.24", optional = true }
 accesskit_unix = { version = "0.22", optional = true }
 anyhow.workspace = true
 arrayvec = "0.7.6"
-ash = { version = "0.38.0", optional = true }
+ash = "0.38.0"
 async-channel = "2.5.0"
 async-io = { version = "2.6.0", optional = true }
 atomic = "0.6.1"
@@ -83,7 +83,7 @@ libdisplay-info = "0.3.0"
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
-niri-vk = { version = "0.0.0", path = "niri-vk", optional = true }
+niri-vk = { version = "0.0.0", path = "niri-vk" }
 ordered-float = "5.3.0"
 pango = { version = "0.22.8", features = ["v1_44"] }
 pangocairo = "0.22.8"
@@ -150,8 +150,6 @@ profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "t
 profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
-# Enables the experimental owned Vulkan renderer (opt-in via --renderer=vulkan); GLES stays default.
-vulkan = ["dep:ash", "dep:niri-vk"]
 
 [lints.clippy]
 new_without_default = "allow"

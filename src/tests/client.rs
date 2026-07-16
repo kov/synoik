@@ -37,7 +37,6 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
-#[cfg(feature = "vulkan")]
 use wayland_client::protocol::wl_shm;
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
@@ -81,9 +80,7 @@ pub struct State {
 pub struct Window {
     pub qh: QueueHandle<State>,
     pub spbm: WpSinglePixelBufferManagerV1,
-    // Only read by the `#[cfg(feature = "vulkan")]` `attach_shm_buffer*` helpers; still bound
-    // unconditionally from `State.shm` so the field exists on both builds.
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    // Only read by the `attach_shm_buffer*` helpers; bound unconditionally from `State.shm`.
     pub shm: Option<WlShm>,
 
     pub surface: WlSurface,
@@ -442,7 +439,6 @@ impl Window {
     /// protocol expects), so the mapped window has visible content in a screenshot.
     // Only the `vulkan` render tests map client buffers, so gate the attach helpers on it to avoid
     // a dead-code warning in the default build.
-    #[cfg(feature = "vulkan")]
     pub fn attach_solid_buffer(&self, r: u32, g: u32, b: u32, a: u32) {
         let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
@@ -453,7 +449,6 @@ impl Window {
     /// (`render_snapshot_from_surface_tree`) can bake it and the renderer's shm import/cache path
     /// runs — required to exercise resize/close animations and the shm texture cache. Uses `wl_shm`
     /// `Argb8888` (0xAARRGGBB little-endian ⇒ bytes `[B, G, R, A]`).
-    #[cfg(feature = "vulkan")]
     pub fn attach_shm_buffer(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
         self.attach_shm_buffer_with_format(w, h, [b, g, r, a], wl_shm::Format::Argb8888);
     }
@@ -462,13 +457,11 @@ impl Window {
     /// order — a *different* fourcc at the same size, to exercise the renderer's format-change
     /// re-import: Argb/Abgr map to different VkFormats, so a wrong same-size cache reuse would
     /// sample the new bytes through the old view and swap R↔B (red would read back as blue).
-    #[cfg(feature = "vulkan")]
     pub fn attach_shm_buffer_abgr(&self, w: i32, h: i32, r: u8, g: u8, b: u8, a: u8) {
         self.attach_shm_buffer_with_format(w, h, [r, g, b, a], wl_shm::Format::Abgr8888);
     }
 
     /// Attach a `w`×`h` shm buffer tiling the 4-byte `texel` (already in `format`'s memory order).
-    #[cfg(feature = "vulkan")]
     fn attach_shm_buffer_with_format(
         &self,
         w: i32,

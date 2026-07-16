@@ -345,8 +345,7 @@ first-class constraint on this work.
   pixel-invariant `cargo test` (no golden images), plus forward-looking DRM-modifier /
   external-semaphore probes. Lives in `niri-vk/` (workspace member, promoted from the spike into a
   reusable ash primitive **library** + a headless bring-up/CI binary, so the Stage-2 Vulkan
-  renderer consumes the same low-level pieces; its ash/png deps reach the niri binary only behind
-  the opt-in `vulkan` feature). **Text at 1× must stay crisp → hinted glyph atlas, not
+  renderer consumes the same low-level pieces). **Text at 1× must stay crisp → hinted glyph atlas, not
   GPU-raster-into-atlas.**
 - **(1) dmabuf import with DRM modifiers on Venus** — the #1 front-loaded risk. Probes show
   Venus exposes only the LINEAR modifier here, so scope the importer to linear.

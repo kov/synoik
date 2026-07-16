@@ -27,7 +27,6 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 #[derive(Debug)]
 pub enum ResizeRenderElement {
     Gles(ShaderRenderElement),
-    #[cfg(feature = "vulkan")]
     Vulkan(VulkanResizeRenderElement),
 }
 
@@ -190,7 +189,6 @@ impl Element for ResizeRenderElement {
     fn id(&self) -> &Id {
         match self {
             ResizeRenderElement::Gles(e) => e.id(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => &e.id,
         }
     }
@@ -198,7 +196,6 @@ impl Element for ResizeRenderElement {
     fn current_commit(&self) -> CommitCounter {
         match self {
             ResizeRenderElement::Gles(e) => e.current_commit(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => e.commit,
         }
     }
@@ -206,7 +203,6 @@ impl Element for ResizeRenderElement {
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             ResizeRenderElement::Gles(e) => e.geometry(scale),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => e.area.to_physical_precise_round(scale),
         }
     }
@@ -214,7 +210,6 @@ impl Element for ResizeRenderElement {
     fn transform(&self) -> Transform {
         match self {
             ResizeRenderElement::Gles(e) => e.transform(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(_) => Transform::Normal,
         }
     }
@@ -222,7 +217,6 @@ impl Element for ResizeRenderElement {
     fn src(&self) -> Rectangle<f64, Buffer> {
         match self {
             ResizeRenderElement::Gles(e) => e.src(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(_) => Rectangle::from_size(Size::from((1., 1.))),
         }
     }
@@ -234,7 +228,6 @@ impl Element for ResizeRenderElement {
     ) -> DamageSet<i32, Physical> {
         match self {
             ResizeRenderElement::Gles(e) => e.damage_since(scale, commit),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => {
                 if commit != Some(e.commit) {
                     DamageSet::from_slice(&[e.area.to_physical_precise_round(scale)])
@@ -248,7 +241,6 @@ impl Element for ResizeRenderElement {
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             ResizeRenderElement::Gles(e) => e.opaque_regions(scale),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(_) => OpaqueRegions::default(),
         }
     }
@@ -256,7 +248,6 @@ impl Element for ResizeRenderElement {
     fn alpha(&self) -> f32 {
         match self {
             ResizeRenderElement::Gles(e) => e.alpha(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => e.alpha,
         }
     }
@@ -264,7 +255,6 @@ impl Element for ResizeRenderElement {
     fn kind(&self) -> Kind {
         match self {
             ResizeRenderElement::Gles(e) => e.kind(),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(e) => e.kind,
         }
     }
@@ -303,7 +293,6 @@ impl RenderElement<GlesRenderer> for ResizeRenderElement {
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
             ResizeRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(_) => None,
         }
     }
@@ -330,13 +319,11 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ResizeRenderElement {
     ) -> Option<UnderlyingStorage<'_>> {
         match self {
             ResizeRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             ResizeRenderElement::Vulkan(_) => None,
         }
     }
 }
 
-#[cfg(feature = "vulkan")]
 mod vulkan {
     use niri_vk::render::ResizePush;
     use smithay::backend::renderer::element::{Id, Kind, RenderElement, UnderlyingStorage};
@@ -492,5 +479,4 @@ mod vulkan {
     }
 }
 
-#[cfg(feature = "vulkan")]
 pub use vulkan::VulkanResizeRenderElement;

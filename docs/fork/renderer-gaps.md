@@ -50,7 +50,7 @@ readable in the read-only checkouts.
 
 ### Where single-device is actually baked in
 
-Shallowly. There is no global/static state in the `vulkan` feature; each `Gpu` owns its instance and
+Shallowly. There is no global/static state in the Vulkan renderer; each `Gpu` owns its instance and
 device, each `VulkanRenderer` carries its own `ContextId` (which is what Smithay's texture caches key
 on), and every cache (`dmabuf_target_cache`, `dmabuf_import_cache`, `present_blit_shadows`) is a
 per-instance field. `NiriRenderer` is a generic blanket impl, not a singleton. **`VulkanRenderer`

@@ -26,7 +26,6 @@ pub struct OpenAnimation {
     random_seed: f32,
     buffer: OffscreenBuffer,
     /// The same offscreen for the owned Vulkan renderer (distinct `VkTexture` type).
-    #[cfg(feature = "vulkan")]
     buffer_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
 }
 
@@ -43,7 +42,6 @@ impl OpenAnimation {
             anim,
             random_seed: fastrand::f32(),
             buffer: OffscreenBuffer::default(),
-            #[cfg(feature = "vulkan")]
             buffer_vk: OffscreenBuffer::default(),
         }
     }
@@ -152,7 +150,6 @@ impl OpenAnimation {
 
     /// The Vulkan sibling of [`render`](Self::render): renders into a `VkTexture` offscreen and
     /// applies the user's custom `open` shader if one is installed, else the default scale + fade.
-    #[cfg(feature = "vulkan")]
     pub fn render_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,

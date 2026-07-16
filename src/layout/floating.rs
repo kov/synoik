@@ -1208,7 +1208,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         for closing in self.closing_windows.iter().rev() {
-            #[cfg(feature = "vulkan")]
             if let Some(vctx) = ctx.try_as_vulkan() {
                 if let Some(elem) =
                     closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)

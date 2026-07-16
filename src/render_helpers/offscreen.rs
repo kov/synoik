@@ -21,7 +21,6 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use super::encompassing_geo;
 use super::renderer::{AsGlesFrame as _, OffscreenRenderer};
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// Buffer for offscreen rendering.
@@ -385,7 +384,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement<Gle
 
 // The `VkTexture` specialization samples the offscreen through the owned Vulkan renderer (the
 // sampleable-offscreen bridge); the render tree's `<GlesTexture>` variant stays a degraded no-op.
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
     fn draw(
         &self,
@@ -428,7 +426,6 @@ impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
 #[derive(Debug)]
 pub enum DualOffscreenRenderElement {
     Gles(OffscreenRenderElement<GlesTexture>),
-    #[cfg(feature = "vulkan")]
     Vulkan(OffscreenRenderElement<VkTexture>),
 }
 
@@ -436,7 +433,6 @@ impl DualOffscreenRenderElement {
     fn inner(&self) -> &dyn Element {
         match self {
             DualOffscreenRenderElement::Gles(e) => e,
-            #[cfg(feature = "vulkan")]
             DualOffscreenRenderElement::Vulkan(e) => e,
         }
     }
@@ -505,7 +501,6 @@ impl RenderElement<GlesRenderer> for DualOffscreenRenderElement {
                 cache,
             ),
             // The Vulkan arm is only ever constructed on a Vulkan session, never here.
-            #[cfg(feature = "vulkan")]
             DualOffscreenRenderElement::Vulkan(_) => {
                 debug_assert!(
                     false,
@@ -519,7 +514,6 @@ impl RenderElement<GlesRenderer> for DualOffscreenRenderElement {
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualOffscreenRenderElement::Vulkan(_) => None,
         }
     }
@@ -545,7 +539,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualOffscreenRenderElement
                 opaque_regions,
                 cache,
             ),
-            #[cfg(feature = "vulkan")]
             DualOffscreenRenderElement::Vulkan(_) => {
                 debug_assert!(
                     false,
@@ -562,13 +555,11 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualOffscreenRenderElement
     ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualOffscreenRenderElement::Vulkan(_) => None,
         }
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for DualOffscreenRenderElement {
     fn draw(
         &self,

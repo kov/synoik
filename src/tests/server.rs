@@ -13,10 +13,6 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(config: Config) -> Self {
-        Self::new_with_renderer(config, RendererKind::Gles)
-    }
-
     pub fn new_with_renderer(config: Config, renderer: RendererKind) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
@@ -72,13 +68,6 @@ fn vulkan_renderer_matches_backend_support() {
         .expect("Vulkan on the auto backend cannot succeed in a headless test");
     let msg = err.to_string().to_lowercase();
 
-    #[cfg(not(feature = "vulkan"))]
-    {
-        let _ = has_display;
-        // No feature: rejected before any backend selection, with a clear "vulkan" message.
-        assert!(msg.contains("vulkan"), "unexpected error: {err}");
-    }
-    #[cfg(feature = "vulkan")]
     if has_display {
         // Auto picks the winit backend, which has no Vulkan present path yet.
         assert!(msg.contains("winit"), "unexpected error: {err}");

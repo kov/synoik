@@ -35,7 +35,6 @@ use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuff
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
@@ -175,7 +174,6 @@ struct Inner {
     offscreen: OffscreenBuffer,
 
     /// The same, for the owned Vulkan renderer (whose `VkTexture` offscreen is a distinct type).
-    #[cfg(feature = "vulkan")]
     offscreen_vk: OffscreenBuffer<VkTexture>,
 }
 
@@ -384,7 +382,6 @@ impl Thumbnail {
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
         // On the owned Vulkan renderer there is no GLES clip shader; clip in its own pipeline.
-        #[cfg(feature = "vulkan")]
         let vulkan_clip = ctx.try_as_vulkan().is_some();
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
@@ -395,7 +392,6 @@ impl Thumbnail {
                         let elem = ClippedSurfaceRenderElement::new(elem, s, geo, shader, radius);
                         return ThumbnailRenderElement::ClippedSurface(elem);
                     }
-                    #[cfg(feature = "vulkan")]
                     if vulkan_clip {
                         let elem = ClippedSurfaceRenderElement::new_vulkan(elem, s, geo, radius);
                         return ThumbnailRenderElement::ClippedSurface(elem);
@@ -977,7 +973,6 @@ impl WindowMruUi {
             scope_panel: Default::default(),
             backdrop_buffers: Default::default(),
             offscreen: OffscreenBuffer::default(),
-            #[cfg(feature = "vulkan")]
             offscreen_vk: OffscreenBuffer::default(),
         };
         inner.view_pos = ViewPos::Static(inner.compute_view_pos());
@@ -1200,7 +1195,6 @@ impl WindowMruUi {
                 }
             }
 
-            #[cfg(feature = "vulkan")]
             if !pushed_offscreen {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     let mut elems = Vec::new();

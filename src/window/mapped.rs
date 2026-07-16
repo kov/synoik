@@ -500,7 +500,6 @@ impl Mapped {
     /// neutral buffer is now populated (either just captured or already present), `false` if
     /// capture failed — in which case the crossfade is skipped and the plain window renders
     /// instead.
-    #[cfg(feature = "vulkan")]
     pub fn capture_neutral_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,

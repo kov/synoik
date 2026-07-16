@@ -23,19 +23,14 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuffer};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
-#[cfg(feature = "vulkan")]
-use crate::render_helpers::snapshot::NeutralSnapshot;
-use crate::render_helpers::snapshot::RenderSnapshot;
+use crate::render_helpers::snapshot::{NeutralSnapshot, RenderSnapshot};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::texture::TextureBuffer;
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -165,7 +160,6 @@ pub type TileUnmapSnapshot = ClosingSnapshot<TileRenderElement<GlesRenderer>>;
 /// just be a `&mut impl NiriRenderer`.
 pub enum SnapshotRenderer<'a> {
     Gles(&'a mut GlesRenderer),
-    #[cfg(feature = "vulkan")]
     Vulkan(&'a mut crate::render_helpers::vulkan::VulkanRenderer),
 }
 
@@ -179,12 +173,10 @@ struct ResizeAnimation {
     /// `offscreen` above has an incompatible texture type). Reused across frames — its texture is
     /// re-rendered in place, never reallocated (matters on Venus, where per-frame allocation
     /// exhausts host blobs).
-    #[cfg(feature = "vulkan")]
     offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
     /// The pre-resize snapshot uploaded to a `VkTexture`, cached for the whole animation (the
     /// source `MemoryBuffer` in `snapshot.neutral` never changes), so it is imported once, not
     /// per frame.
-    #[cfg(feature = "vulkan")]
     prev_vk: std::cell::RefCell<Option<crate::render_helpers::vulkan::VkTexture>>,
     tile_size_from: Size<f64, Logical>,
     // If the resize involved the fullscreen state at some point, this is the progress toward the
@@ -215,7 +207,6 @@ pub(super) struct AlphaAnimation {
     offscreen: OffscreenBuffer,
     /// The same offscreen for the owned Vulkan renderer (distinct `VkTexture` type). Reused across
     /// frames like the GLES one.
-    #[cfg(feature = "vulkan")]
     offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
 }
 
@@ -425,9 +416,7 @@ impl<W: LayoutElement> Tile<W> {
                     // Fresh per resize-start (persists across the animation's frames, reused
                     // there); prev_vk starts empty since the pre-resize
                     // snapshot just changed.
-                    #[cfg(feature = "vulkan")]
                     offscreen_vk: OffscreenBuffer::default(),
-                    #[cfg(feature = "vulkan")]
                     prev_vk: std::cell::RefCell::new(None),
                     tile_size_from,
                     fullscreen_progress,
@@ -693,18 +682,14 @@ impl<W: LayoutElement> Tile<W> {
         let current = taken.as_ref().map_or(from, |a| a.anim.clamped_value());
 
         // Reuse the existing offscreen buffers (reallocation churns virtio-gpu blobs).
-        #[cfg(feature = "vulkan")]
         let (offscreen, offscreen_vk) = taken
             .map(|a| (a.offscreen, a.offscreen_vk))
             .unwrap_or_default();
-        #[cfg(not(feature = "vulkan"))]
-        let offscreen = taken.map(|a| a.offscreen).unwrap_or_default();
 
         self.alpha_animation = Some(AlphaAnimation {
             anim: Animation::new(self.clock.clone(), current, to, 0., config),
             hold_after_done: false,
             offscreen,
-            #[cfg(feature = "vulkan")]
             offscreen_vk,
         });
     }
@@ -1231,7 +1216,6 @@ impl<W: LayoutElement> Tile<W> {
             // fallback. `tex_prev` comes from the neutral snapshot captured at resize-start
             // (uploaded once); `tex_next` is the current window rendered into the
             // reused Vulkan offscreen.
-            #[cfg(feature = "vulkan")]
             if !pushed_resize && !blocked_out {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     if let Some((prev_mem, prev_geo)) =
@@ -1333,7 +1317,6 @@ impl<W: LayoutElement> Tile<W> {
 
             let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
             // On the owned Vulkan renderer there is no GLES clip shader; clip in its own pipeline.
-            #[cfg(feature = "vulkan")]
             let vulkan_clip = ctx.try_as_vulkan().is_some();
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
@@ -1347,7 +1330,6 @@ impl<W: LayoutElement> Tile<W> {
                             )
                             .into();
                         }
-                        #[cfg(feature = "vulkan")]
                         if vulkan_clip {
                             return ClippedSurfaceRenderElement::new_vulkan(
                                 elem, scale, geo, radius,
@@ -1537,7 +1519,6 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
 
-            #[cfg(feature = "vulkan")]
             if !pushed {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     let mut elements = Vec::new();
@@ -1595,7 +1576,6 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
 
-            #[cfg(feature = "vulkan")]
             if !pushed {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     let mut elements = Vec::new();
@@ -1651,7 +1631,6 @@ impl<W: LayoutElement> Tile<W> {
                 // rather than half-captured. Storing a partial snapshot would let
                 // the blocked-out variant fall back to the unblocked contents on a
                 // screencast.
-                #[cfg(feature = "vulkan")]
                 SnapshotRenderer::Vulkan(renderer) => self
                     .render_snapshot_vulkan(renderer, xray, xray_has_blocked_out_layers, xray_pos)
                     .map(ClosingSnapshot::Neutral),
@@ -1790,7 +1769,6 @@ impl<W: LayoutElement> Tile<W> {
     /// stored: [`NeutralSnapshot::variant`] distinguishes "not needed" from "missing" only because
     /// this holds, and if it didn't, a blocked-out window would fall through to its real contents
     /// on a screencast.
-    #[cfg(feature = "vulkan")]
     fn render_snapshot_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
@@ -1921,7 +1899,6 @@ impl<W: LayoutElement> Tile<W> {
 /// Render `elements` through the owned Vulkan renderer into a renderer-neutral CPU buffer, together
 /// with their encompassing geometry — the same convention `render_to_encompassing_texture` uses for
 /// the GLES bake, so a `ClosingWindow` can place either at the same offset.
-#[cfg(feature = "vulkan")]
 fn rasterize_neutral<E: smithay::backend::renderer::element::RenderElement<VulkanRenderer>>(
     renderer: &mut VulkanRenderer,
     scale: Scale<f64>,

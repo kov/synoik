@@ -38,7 +38,6 @@ use crate::utils::{get_monotonic_time, logical_output};
 #[allow(clippy::large_enum_variant)]
 enum HeadlessRenderer {
     Gles(GlesRenderer),
-    #[cfg(feature = "vulkan")]
     Vulkan {
         gles: GlesRenderer,
         // Read by the test-only `with_vulkan_renderer`; the live headless `render` is a no-op.
@@ -87,7 +86,6 @@ impl Headless {
                 shaders::init(&mut renderer);
                 HeadlessRenderer::Gles(renderer)
             }
-            #[cfg(feature = "vulkan")]
             RendererKind::Vulkan => {
                 // The owned Vulkan renderer brings up its own instance/device (no EGL, no
                 // surface) and manages its own pipelines — no resources/shaders init needed.
@@ -105,11 +103,6 @@ impl Headless {
                 resources::init(&mut gles);
                 shaders::init(&mut gles);
                 HeadlessRenderer::Vulkan { gles, vulkan }
-            }
-            #[cfg(not(feature = "vulkan"))]
-            RendererKind::Vulkan => {
-                // Unreachable: State::new rejects --renderer=vulkan without the feature.
-                anyhow::bail!("niri was built without the `vulkan` feature");
             }
         });
         Ok(())
@@ -186,7 +179,6 @@ impl Headless {
         // capture — keep working.
         match &mut self.renderer {
             Some(HeadlessRenderer::Gles(renderer)) => Some(f(renderer)),
-            #[cfg(feature = "vulkan")]
             Some(HeadlessRenderer::Vulkan { gles, .. }) => Some(f(gles)),
             None => None,
         }
@@ -195,7 +187,6 @@ impl Headless {
     /// Access to the owned Vulkan renderer, so the capture paths (screencopy, screenshot) and the
     /// headless tests can drive the real `Niri::render` through it. Returns `None` for a GLES
     /// backend.
-    #[cfg(feature = "vulkan")]
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
@@ -247,7 +238,7 @@ impl Default for Headless {
     }
 }
 
-#[cfg(all(test, feature = "vulkan"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::render_helpers::vulkan::VulkanRenderer;

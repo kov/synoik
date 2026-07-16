@@ -53,7 +53,6 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
     /// pipeline (`clipped_texture.frag`) and needs no GLES program. Same clip geometry / radius as
     /// [`Self::new`]; the Vulkan `RenderElement` draw folds them into the pipeline's push
     /// constants.
-    #[cfg(feature = "vulkan")]
     pub fn new_vulkan(
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
@@ -324,10 +323,8 @@ impl<'render> RenderElement<TtyRenderer<'render>>
 // (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline. Mirrors the GLES
 // `override_default_tex_program` mechanism. The `GlesTexture`-carrying specializations keep the
 // GLES/Tty impls above.
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{ClipParams, VulkanError, VulkanFrame, VulkanRenderer};
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement<VulkanRenderer> {
     fn draw(
         &self,

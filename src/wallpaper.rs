@@ -23,7 +23,6 @@ use crate::render_helpers::dual_texture::DualRoundedTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 
 /// Larger pictures are downscaled to this bound before upload; it comfortably
@@ -39,7 +38,6 @@ pub struct Wallpaper {
     texture: RefCell<Option<Option<TextureBuffer<GlesTexture>>>>,
     /// The same lazy upload for the owned Vulkan renderer, which can't sample the `GlesTexture`
     /// above; same double-`Option` "not tried yet" / "failed, don't retry" encoding.
-    #[cfg(feature = "vulkan")]
     vk_texture: RefCell<Option<Option<TextureBuffer<VkTexture>>>>,
 }
 
@@ -57,7 +55,6 @@ impl Wallpaper {
             self.picture = settings.picture.clone();
             self.image = self.picture.as_deref().and_then(decode);
             self.texture.replace(None);
-            #[cfg(feature = "vulkan")]
             self.vk_texture.replace(None);
         }
 
@@ -130,7 +127,6 @@ impl Wallpaper {
                 .map(DualRoundedTextureRenderElement::Gles);
         }
 
-        #[cfg(feature = "vulkan")]
         if let Some(vk) = renderer.try_as_vulkan_renderer() {
             return self
                 .render_vulkan(vk, view_size, corner_radius, scale)
@@ -143,7 +139,6 @@ impl Wallpaper {
     /// The Vulkan sibling of [`render`](Self::render): uploads the decoded picture to a `VkTexture`
     /// (cached across frames like the GLES texture) and returns an element the owned Vulkan
     /// renderer rounds in its own pipeline.
-    #[cfg(feature = "vulkan")]
     pub fn render_vulkan(
         &self,
         renderer: &mut VulkanRenderer,
@@ -198,7 +193,6 @@ fn upload(renderer: &mut GlesRenderer, image: &Image) -> Option<TextureBuffer<Gl
     .ok()
 }
 
-#[cfg(feature = "vulkan")]
 fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<TextureBuffer<VkTexture>> {
     let opaque_regions = if image.opaque {
         vec![Rectangle::from_size(image.size)]

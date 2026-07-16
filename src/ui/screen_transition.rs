@@ -1,4 +1,3 @@
-#[cfg(feature = "vulkan")]
 use std::cell::RefCell;
 use std::time::Duration;
 
@@ -12,7 +11,6 @@ use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::RenderTarget;
 
@@ -41,7 +39,6 @@ enum FrozenScreen {
         /// captured contents never change during a transition, so one upload per target
         /// suffices. Uploaded lazily: a session with no cast never pays for the screencast
         /// targets.
-        #[cfg(feature = "vulkan")]
         vk: RefCell<[Option<TextureBuffer<VkTexture>>; RenderTarget::COUNT]>,
     },
 }
@@ -90,7 +87,6 @@ impl ScreenTransition {
     ) -> Self {
         let from = FrozenScreen::Neutral {
             buffers,
-            #[cfg(feature = "vulkan")]
             vk: RefCell::new(Default::default()),
         };
         Self::new(from, scale, transform, delay, clock)
@@ -145,7 +141,6 @@ impl ScreenTransition {
     /// The element to crossfade from, or `None` if the frozen screen can't be drawn on `renderer` —
     /// a failed Vulkan upload, or a neutral capture asked to draw on GLES. Callers must skip the
     /// crossfade rather than substitute anything: there is no second copy of the frozen screen.
-    #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
     pub fn render<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -158,13 +153,7 @@ impl ScreenTransition {
             FrozenScreen::Gles(from_texture) => from_texture,
 
             // Upload this target's captured neutral buffer once and draw that.
-            #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
-            FrozenScreen::Neutral {
-                buffers,
-                #[cfg(feature = "vulkan")]
-                vk,
-            } => {
-                #[cfg(feature = "vulkan")]
+            FrozenScreen::Neutral { buffers, vk } => {
                 if let Some(renderer) = renderer.try_as_vulkan_renderer() {
                     if vk.borrow()[idx].is_none() {
                         match TextureBuffer::from_memory_buffer(renderer, &buffers[idx]) {

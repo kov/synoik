@@ -4,16 +4,13 @@ use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
-#[cfg(feature = "vulkan")]
 use niri_vk::render::PostprocessPush;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
-use smithay::backend::renderer::Color32F;
-#[cfg(feature = "vulkan")]
-use smithay::backend::renderer::Texture as _;
+use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -22,7 +19,6 @@ use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
 use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{pack_mat3, VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
@@ -92,7 +88,6 @@ pub struct XrayElement {
 /// Prepare an [`EffectBuffer`] through whichever renderer `ctx` wraps — the owned Vulkan renderer's
 /// arm when present, else the GLES arm (a `TtyRenderer` resolves to GLES). Returns whether the
 /// offscreen is ready to be sampled by the pushed [`XrayElement`]s.
-#[cfg(feature = "vulkan")]
 fn prepare_effect_buffer<R: NiriRenderer>(
     renderer: &mut R,
     buffer: &mut EffectBuffer,
@@ -101,19 +96,6 @@ fn prepare_effect_buffer<R: NiriRenderer>(
     if let Some(vk) = renderer.try_as_vulkan_renderer() {
         buffer.prepare_vulkan(vk, blur)
     } else if let Some(gles) = renderer.try_as_gles_renderer() {
-        buffer.prepare(gles, blur)
-    } else {
-        false
-    }
-}
-
-#[cfg(not(feature = "vulkan"))]
-fn prepare_effect_buffer<R: NiriRenderer>(
-    renderer: &mut R,
-    buffer: &mut EffectBuffer,
-    blur: bool,
-) -> bool {
-    if let Some(gles) = renderer.try_as_gles_renderer() {
         buffer.prepare(gles, blur)
     } else {
         false
@@ -347,7 +329,7 @@ impl XrayElement {
 
 // Only the Vulkan xray oracle test uses this; gate it so the default test build doesn't flag it as
 // dead code.
-#[cfg(all(test, feature = "vulkan"))]
+#[cfg(test)]
 impl XrayElement {
     /// Construct an `XrayElement` directly for oracle tests (bypassing `Xray::render`'s scene
     /// math), so a GLES element and a Vulkan element can share identical geometry/src/matrices
@@ -477,7 +459,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for XrayElement {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for XrayElement {
     fn draw(
         &self,

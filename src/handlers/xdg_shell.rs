@@ -17,9 +17,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
-#[cfg(feature = "vulkan")]
-use smithay::utils::Scale;
-use smithay::utils::{Logical, Rectangle, Serial};
+use smithay::utils::{Logical, Rectangle, Scale, Serial};
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
     HookId, SurfaceAttributes,
@@ -1587,17 +1585,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
-                #[cfg(feature = "vulkan")]
                 let vulkan = state.backend.using_vulkan();
-                #[cfg(not(feature = "vulkan"))]
-                let vulkan = false;
 
                 if vulkan {
                     // Nothing on a Vulkan session ever samples the GLES bake, so skip it and take
                     // the crossfade's "before" pixels through the owned renderer instead. The
                     // snapshot struct is still stored: the capture below needs it to exist.
                     mapped.store_animation_snapshot_neutral();
-                    #[cfg(feature = "vulkan")]
                     {
                         let scale = Scale::from(
                             output

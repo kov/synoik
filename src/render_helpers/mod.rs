@@ -48,7 +48,6 @@ pub mod snapshot;
 pub mod solid_color;
 pub mod surface;
 pub mod texture;
-#[cfg(feature = "vulkan")]
 pub mod vulkan;
 pub mod xray;
 
@@ -92,7 +91,6 @@ impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl<'a, R: crate::render_helpers::renderer::AsVulkanRenderer> RenderCtx<'a, R> {
     /// Reborrows this context as a concrete `VulkanRenderer` context, if the renderer is the owned
     /// Vulkan renderer. Returns `None` otherwise, so Vulkan-only render paths (e.g. the resize
@@ -380,14 +378,11 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
     // owned Vulkan renderer's render pass is R8G8B8A8 and cannot. So ask each for the order it can
     // actually render, and let the readback do the conversion — on Vulkan `copy_framebuffer` blits
     // through a staging image of the requested format, so the channel swap happens on the GPU.
-    #[cfg(feature = "vulkan")]
     let render_fourcc = if renderer.try_as_vulkan_renderer().is_some() {
         Fourcc::Abgr8888
     } else {
         Fourcc::Xrgb8888
     };
-    #[cfg(not(feature = "vulkan"))]
-    let render_fourcc = Fourcc::Xrgb8888;
 
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();

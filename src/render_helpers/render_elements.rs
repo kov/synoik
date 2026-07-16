@@ -187,7 +187,6 @@ macro_rules! niri_render_elements {
         // The owned Vulkan renderer arm (only when the `vulkan` feature is enabled). Every variant
         // implements `RenderElement<VulkanRenderer>` — plain Smithay elements generically, the niri
         // effects via degraded (no-op) impls until they are ported (M3).
-        #[cfg(feature = "vulkan")]
         impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>
             for $($name_R<$crate::render_helpers::vulkan::VulkanRenderer>)? $($name_no_R)?
         {

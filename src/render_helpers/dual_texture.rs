@@ -17,10 +17,8 @@ use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
 use super::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use super::rounded_texture::RoundedTextureRenderElement;
-#[cfg(feature = "vulkan")]
 use super::texture::TextureRenderElement;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// See the module docs. `Gles` wraps the existing GLES-locked element (a degraded no-op on the
@@ -28,7 +26,6 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanR
 #[derive(Debug)]
 pub enum DualTextureRenderElement {
     Gles(PrimaryGpuTextureRenderElement),
-    #[cfg(feature = "vulkan")]
     Vulkan(TextureRenderElement<VkTexture>),
 }
 
@@ -36,7 +33,6 @@ impl Element for DualTextureRenderElement {
     fn id(&self) -> &Id {
         match self {
             DualTextureRenderElement::Gles(e) => e.id(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.id(),
         }
     }
@@ -44,7 +40,6 @@ impl Element for DualTextureRenderElement {
     fn current_commit(&self) -> CommitCounter {
         match self {
             DualTextureRenderElement::Gles(e) => e.current_commit(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.current_commit(),
         }
     }
@@ -52,7 +47,6 @@ impl Element for DualTextureRenderElement {
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             DualTextureRenderElement::Gles(e) => e.geometry(scale),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.geometry(scale),
         }
     }
@@ -60,7 +54,6 @@ impl Element for DualTextureRenderElement {
     fn transform(&self) -> Transform {
         match self {
             DualTextureRenderElement::Gles(e) => e.transform(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.transform(),
         }
     }
@@ -68,7 +61,6 @@ impl Element for DualTextureRenderElement {
     fn src(&self) -> Rectangle<f64, Buffer> {
         match self {
             DualTextureRenderElement::Gles(e) => e.src(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.src(),
         }
     }
@@ -80,7 +72,6 @@ impl Element for DualTextureRenderElement {
     ) -> DamageSet<i32, Physical> {
         match self {
             DualTextureRenderElement::Gles(e) => e.damage_since(scale, commit),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.damage_since(scale, commit),
         }
     }
@@ -88,7 +79,6 @@ impl Element for DualTextureRenderElement {
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             DualTextureRenderElement::Gles(e) => e.opaque_regions(scale),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.opaque_regions(scale),
         }
     }
@@ -96,7 +86,6 @@ impl Element for DualTextureRenderElement {
     fn alpha(&self) -> f32 {
         match self {
             DualTextureRenderElement::Gles(e) => e.alpha(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.alpha(),
         }
     }
@@ -104,7 +93,6 @@ impl Element for DualTextureRenderElement {
     fn kind(&self) -> Kind {
         match self {
             DualTextureRenderElement::Gles(e) => e.kind(),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(e) => e.kind(),
         }
     }
@@ -131,7 +119,6 @@ impl RenderElement<GlesRenderer> for DualTextureRenderElement {
                 cache,
             ),
             // The Vulkan arm is only ever constructed on a Vulkan session, never here.
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(_) => {
                 debug_assert!(false, "Vulkan DualTextureRenderElement drawn through GLES");
                 Ok(())
@@ -142,7 +129,6 @@ impl RenderElement<GlesRenderer> for DualTextureRenderElement {
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(_) => None,
         }
     }
@@ -168,7 +154,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualTextureRenderElement {
                 opaque_regions,
                 cache,
             ),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(_) => {
                 debug_assert!(
                     false,
@@ -185,13 +170,11 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualTextureRenderElement {
     ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualTextureRenderElement::Vulkan(_) => None,
         }
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for DualTextureRenderElement {
     fn draw(
         &self,
@@ -240,7 +223,6 @@ impl RenderElement<VulkanRenderer> for DualTextureRenderElement {
 #[derive(Debug)]
 pub enum DualRoundedTextureRenderElement {
     Gles(RoundedTextureRenderElement<GlesTexture>),
-    #[cfg(feature = "vulkan")]
     Vulkan(RoundedTextureRenderElement<VkTexture>),
 }
 
@@ -248,7 +230,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn id(&self) -> &Id {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.id(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.id(),
         }
     }
@@ -256,7 +237,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn current_commit(&self) -> CommitCounter {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.current_commit(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.current_commit(),
         }
     }
@@ -264,7 +244,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.geometry(scale),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.geometry(scale),
         }
     }
@@ -272,7 +251,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn transform(&self) -> Transform {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.transform(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.transform(),
         }
     }
@@ -280,7 +258,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn src(&self) -> Rectangle<f64, Buffer> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.src(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.src(),
         }
     }
@@ -292,7 +269,6 @@ impl Element for DualRoundedTextureRenderElement {
     ) -> DamageSet<i32, Physical> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.damage_since(scale, commit),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.damage_since(scale, commit),
         }
     }
@@ -300,7 +276,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.opaque_regions(scale),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.opaque_regions(scale),
         }
     }
@@ -308,7 +283,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn alpha(&self) -> f32 {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.alpha(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.alpha(),
         }
     }
@@ -316,7 +290,6 @@ impl Element for DualRoundedTextureRenderElement {
     fn kind(&self) -> Kind {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.kind(),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(e) => e.kind(),
         }
     }
@@ -343,7 +316,6 @@ impl RenderElement<GlesRenderer> for DualRoundedTextureRenderElement {
                 cache,
             ),
             // The Vulkan arm is only ever constructed on a Vulkan session, never here.
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(_) => {
                 debug_assert!(
                     false,
@@ -357,7 +329,6 @@ impl RenderElement<GlesRenderer> for DualRoundedTextureRenderElement {
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(_) => None,
         }
     }
@@ -383,7 +354,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualRoundedTextureRenderEl
                 opaque_regions,
                 cache,
             ),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(_) => {
                 debug_assert!(
                     false,
@@ -400,13 +370,11 @@ impl<'render> RenderElement<TtyRenderer<'render>> for DualRoundedTextureRenderEl
     ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            #[cfg(feature = "vulkan")]
             DualRoundedTextureRenderElement::Vulkan(_) => None,
         }
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for DualRoundedTextureRenderElement {
     fn draw(
         &self,

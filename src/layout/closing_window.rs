@@ -40,7 +40,6 @@ pub enum ClosingSnapshot<C> {
 }
 
 /// The three block-out variants of a neutral snapshot, uploaded to `VkTexture`s on first use.
-#[cfg(feature = "vulkan")]
 type VariantCache =
     std::cell::RefCell<[Option<TextureBuffer<crate::render_helpers::vulkan::VkTexture>>; 3]>;
 
@@ -71,14 +70,12 @@ enum ClosingBuffers {
     },
     Neutral {
         /// Only read on a Vulkan session; a GLES build never constructs this arm.
-        #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
         snapshot: NeutralSnapshot,
 
         /// Each variant uploaded to a `VkTexture` on first use, cached across the animation's
         /// frames — re-uploading every frame would churn virtio-gpu blobs. Keyed strictly by
         /// variant index (see [`NeutralSnapshot::variant`]); a failed upload never falls back to
         /// another variant's texture.
-        #[cfg(feature = "vulkan")]
         vk: VariantCache,
     },
 }
@@ -158,7 +155,6 @@ impl ClosingWindow {
                     pos,
                     buffers: ClosingBuffers::Neutral {
                         snapshot,
-                        #[cfg(feature = "vulkan")]
                         vk: std::cell::RefCell::new(Default::default()),
                     },
                     anim_state: AnimationState::new(blocker, anim),
@@ -404,7 +400,6 @@ impl ClosingWindow {
     /// session, when the target has no variant safe to draw, or when the upload failed — never a
     /// substitute, which for a blocked-out target would mean drawing the real window into a
     /// screencast.
-    #[cfg(feature = "vulkan")]
     pub fn render_vulkan(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,

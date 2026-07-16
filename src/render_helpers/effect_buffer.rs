@@ -13,9 +13,7 @@ use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::{Blur, BlurOptions};
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::renderer::OffscreenRenderer as _;
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{EffectBlur, VkTexture, VulkanRenderer};
 
 #[derive(Debug)]
@@ -41,10 +39,8 @@ pub struct EffectBuffer {
     /// [`Self::elements_vulkan`]). Coexists with the GLES `elements`: on a Vulkan session a
     /// window-close still bakes the same Output xray buffer through GLES while normal redraws fill
     /// it through Vulkan, so both arms stay live and never tear each other down.
-    #[cfg(feature = "vulkan")]
     elements_vk: ElementsVk,
     /// Vulkan offscreen (+ its blur), the owned-renderer dual of `offscreen`.
-    #[cfg(feature = "vulkan")]
     offscreen_vk: Option<OffscreenVk>,
 
     /// Commit counter that takes into account both original and blurred texture changes.
@@ -87,7 +83,6 @@ impl Default for Elements {
 }
 
 /// The Vulkan dual of [`Elements`].
-#[cfg(feature = "vulkan")]
 #[derive(Debug)]
 enum ElementsVk {
     /// Contents remain unchanged.
@@ -96,7 +91,6 @@ enum ElementsVk {
     New(Vec<OutputRenderElements<VulkanRenderer>>),
 }
 
-#[cfg(feature = "vulkan")]
 impl Default for ElementsVk {
     fn default() -> Self {
         Self::Unchanged(Vec::new())
@@ -106,7 +100,6 @@ impl Default for ElementsVk {
 /// The Vulkan dual of [`Offscreen`]. Its [`EffectBlur`] lives here (not beside it) so recreating
 /// the offscreen texture — which sets `offscreen_vk = None` — drops and rebuilds the blur chain
 /// against the new texture view atomically (the chain binds a fixed source view and has no `Drop`).
-#[cfg(feature = "vulkan")]
 #[derive(Debug)]
 struct OffscreenVk {
     /// The texture with the offscreen contents.
@@ -135,9 +128,7 @@ impl EffectBuffer {
             elements: Elements::default(),
             offscreen: None,
             blur: None,
-            #[cfg(feature = "vulkan")]
             elements_vk: ElementsVk::default(),
-            #[cfg(feature = "vulkan")]
             offscreen_vk: None,
             commit_counter: CommitCounter::default(),
         }
@@ -185,7 +176,6 @@ impl EffectBuffer {
         // Reset the Vulkan arm's blur too; a pass-count change is picked up by
         // `prepare_blur_vulkan` (it rebuilds the chain when `passes` differs), so
         // invalidating is enough here.
-        #[cfg(feature = "vulkan")]
         if let Some(offscreen) = &mut self.offscreen_vk {
             if let Some(blur) = &mut offscreen.blur {
                 if blur.is_valid() {
@@ -399,7 +389,6 @@ impl EffectBuffer {
     /// The owned Vulkan renderer's dual of [`Self::elements`] — the storage the caller pushes
     /// Vulkan render elements into before [`Self::prepare_vulkan`]. Coexists with the GLES
     /// `elements` arm.
-    #[cfg(feature = "vulkan")]
     pub fn elements_vulkan(&mut self) -> &mut Vec<OutputRenderElements<VulkanRenderer>> {
         // Assume we're going to insert new elements, switch to New.
         match mem::take(&mut self.elements_vk) {
@@ -419,7 +408,6 @@ impl EffectBuffer {
     /// Unlike the GLES arm (which blurs lazily inside `render`, skipping culled elements), the blur
     /// is run **eagerly** here — the owned renderer's blur runs on its own fenced submission, and
     /// keeping it in `prepare` matches the offscreen render's synchronous model.
-    #[cfg(feature = "vulkan")]
     pub fn prepare_vulkan(&mut self, renderer: &mut VulkanRenderer, blur: bool) -> bool {
         if let Err(err) = self.prepare_offscreen_vulkan(renderer) {
             warn!("error preparing Vulkan offscreen: {err:?}");
@@ -436,7 +424,6 @@ impl EffectBuffer {
         true
     }
 
-    #[cfg(feature = "vulkan")]
     fn prepare_offscreen_vulkan(&mut self, renderer: &mut VulkanRenderer) -> anyhow::Result<()> {
         let _span = tracy_client::span!("EffectBuffer::prepare_offscreen_vulkan");
 
@@ -571,7 +558,6 @@ impl EffectBuffer {
         Ok(())
     }
 
-    #[cfg(feature = "vulkan")]
     fn prepare_blur_vulkan(&mut self, renderer: &mut VulkanRenderer) -> anyhow::Result<()> {
         let passes = (self.blur_options.passes as usize).clamp(1, 31);
         let offset = self.blur_options.offset as f32;
@@ -600,7 +586,6 @@ impl EffectBuffer {
     /// NOT fall back to the unblurred offscreen there: `prepare_vulkan` runs the blur eagerly, so a
     /// missing/invalid blur means prepare failed and the caller should draw nothing rather than
     /// silently sample an unblurred texture that would diverge from the GLES oracle.
-    #[cfg(feature = "vulkan")]
     pub fn texture_vulkan(&self, blur: bool) -> Option<VkTexture> {
         let offscreen = self.offscreen_vk.as_ref()?;
         if blur {

@@ -269,7 +269,6 @@ impl BorderRenderElement {
     /// loaded, **or** on the owned Vulkan renderer — which draws borders procedurally
     /// (`VulkanFrame::render_border`, always with rounded corners) and needs no GLES program.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        #[cfg(feature = "vulkan")]
         if renderer.try_as_vulkan_renderer().is_some() {
             return true;
         }
@@ -379,10 +378,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for BorderRenderElement {
 
 // The owned Vulkan renderer draws the border procedurally in its own pipeline (M3); it reads the
 // raw `params` (not the GLES `inner` uniform list), sharing the derivation via `computed()`.
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
-#[cfg(feature = "vulkan")]
 impl BorderRenderElement {
     /// Build the border material's push constants from `params`, with the quad placed at `dst`.
     /// (`target` is filled by `VulkanFrame::render_border`.)
@@ -413,7 +410,6 @@ impl BorderRenderElement {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for BorderRenderElement {
     fn draw(
         &self,

@@ -242,10 +242,8 @@ impl<'render> RenderElement<TtyRenderer<'render>> for RoundedTextureRenderElemen
 // be sampled by Vulkan), so `OutputRenderElements<VulkanRenderer>`, which carries the
 // `GlesTexture` variant, still composes; only elements built directly with a `VkTexture` (the
 // M3 tests, and later the Vulkan wallpaper path) take this real draw.
-#[cfg(feature = "vulkan")]
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
-#[cfg(feature = "vulkan")]
 impl RoundedTextureRenderElement<VkTexture> {
     /// Build a rounded-texture element for the owned Vulkan renderer, which rounds in its own
     /// pipeline and needs no GLES shader program.
@@ -265,7 +263,6 @@ impl RoundedTextureRenderElement<VkTexture> {
     }
 }
 
-#[cfg(feature = "vulkan")]
 impl RenderElement<VulkanRenderer> for RoundedTextureRenderElement<VkTexture> {
     fn draw(
         &self,

@@ -2,16 +2,13 @@ use std::cell::OnceCell;
 
 use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
-#[cfg(feature = "vulkan")]
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::memory::MemoryBuffer;
-#[cfg(feature = "vulkan")]
-use super::{encompassing_geo, render_to_vec};
-use super::{render_to_encompassing_texture, ToRenderElement};
+use super::{encompassing_geo, render_to_encompassing_texture, render_to_vec, ToRenderElement};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 /// Snapshot of a render.
@@ -219,7 +216,6 @@ where
 /// [`RenderSnapshot::capture_neutral`]'s geometry so the resulting `(buffer, geo)` places
 /// `tex_prev` identically. Returns `None` on empty geometry or a render error, leaving the caller
 /// free to fall back to the GLES path.
-#[cfg(feature = "vulkan")]
 pub fn capture_neutral_from_surface_tree(
     renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,

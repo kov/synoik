@@ -777,15 +777,6 @@ impl State {
         // The Vulkan renderer is opt-in and wired on the headless and TTY backends (the TTY path
         // scans out through the owned renderer — Stage 3); the Winit backend has no live Vulkan
         // present path yet. Reject impossible combinations up front rather than degrading silently.
-        #[cfg(not(feature = "vulkan"))]
-        if renderer == RendererKind::Vulkan {
-            return Err(
-                "the Vulkan renderer requires niri to be built with the `vulkan` feature; \
-                        rebuild with `--features vulkan`"
-                    .into(),
-            );
-        }
-
         let has_display = env::var_os("WAYLAND_DISPLAY").is_some()
             || env::var_os("WAYLAND_SOCKET").is_some()
             || env::var_os("DISPLAY").is_some();
@@ -1689,7 +1680,6 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_resize_program(renderer, src);
             });
-            #[cfg(feature = "vulkan")]
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_resize_shader(src));
             shaders_changed = true;
@@ -1702,7 +1692,6 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
-            #[cfg(feature = "vulkan")]
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_close_shader(src));
             shaders_changed = true;
@@ -1715,7 +1704,6 @@ impl State {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });
-            #[cfg(feature = "vulkan")]
             self.backend
                 .with_vulkan_renderer(|vk| vk.set_custom_open_shader(src));
             shaders_changed = true;
@@ -2121,7 +2109,6 @@ impl State {
         // On a Vulkan session, capture the Output-target neutrals through the owned renderer first
         // (so that path never touches GLES); the GLES pass below consumes them and captures the
         // screencast/screen-capture textures.
-        #[cfg(feature = "vulkan")]
         let vk_neutrals = if using_vulkan {
             self.backend
                 .with_vulkan_renderer(|vk| self.niri.capture_screenshot_neutrals(vk))
@@ -2129,8 +2116,6 @@ impl State {
         } else {
             Default::default()
         };
-        #[cfg(not(feature = "vulkan"))]
-        let vk_neutrals = Default::default();
         let Some(screenshots) = self.backend.with_primary_renderer(|renderer| {
             self.niri
                 .capture_screenshots(renderer, using_vulkan, vk_neutrals)
@@ -2186,10 +2171,7 @@ impl State {
         // On a Vulkan session, save from the frozen-screen neutral CPU buffer (a pure crop +
         // pointer composite) so this path never renders/reads back through GLES (Phase C). Falls
         // back to the GLES capture when no neutral was captured (GLES session).
-        #[cfg(feature = "vulkan")]
         let captured = self.niri.screenshot_ui.capture_from_neutral();
-        #[cfg(not(feature = "vulkan"))]
-        let captured: Option<(Size<i32, Physical>, Vec<u8>)> = None;
 
         if let Some((size, pixels)) = captured {
             if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
@@ -2226,7 +2208,6 @@ impl State {
 
         // The snapshot is captured through whichever renderer will later draw the close animation:
         // the owned Vulkan renderer can't sample a GLES texture, and vice versa.
-        #[cfg(feature = "vulkan")]
         if self.backend.using_vulkan() {
             self.backend.with_vulkan_renderer(|renderer| {
                 if let Some(output) = output {
@@ -2341,7 +2322,6 @@ impl State {
         // On a Vulkan session, render the screenshot through the owned renderer (Phase C); the
         // helper is renderer-agnostic and `to_screenshot` is passed by reference, so neither branch
         // moves anything the other needs.
-        #[cfg(feature = "vulkan")]
         let rv = if self.backend.using_vulkan() {
             self.backend.with_vulkan_renderer(|renderer| {
                 Self::take_screenshot_with_renderer(
@@ -2361,15 +2341,6 @@ impl State {
                 )
             })
         };
-        #[cfg(not(feature = "vulkan"))]
-        let rv = self.backend.with_primary_renderer(|renderer| {
-            Self::take_screenshot_with_renderer(
-                &mut self.niri,
-                renderer,
-                include_cursor,
-                to_screenshot,
-            )
-        });
 
         if rv.is_none() {
             let msg = NiriToScreenshot::ScreenshotResult(None);
@@ -4632,7 +4603,6 @@ impl Niri {
         if let Some(gles_ctx) = ctx.try_as_gles() {
             self.fill_xray_elements(gles_ctx, output);
         }
-        #[cfg(feature = "vulkan")]
         if let Some(vk_ctx) = ctx.try_as_vulkan() {
             self.fill_xray_elements_vulkan(vk_ctx, output);
         }
@@ -5028,7 +4998,6 @@ impl Niri {
     /// background/backdrop [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s,
     /// but through the Vulkan arm (`elements_vulkan`). `render_layer_normal` is already generic
     /// over the renderer, so only the element storage differs.
-    #[cfg(feature = "vulkan")]
     pub fn fill_xray_elements_vulkan(
         &self,
         mut ctx: RenderCtx<crate::render_helpers::vulkan::VulkanRenderer>,
@@ -5105,11 +5074,9 @@ impl Niri {
             buf.borrow_mut().elements().clear();
         }
         // The owned Vulkan renderer's arm has its own element storage — clear it too.
-        #[cfg(feature = "vulkan")]
         for buf in &xray.background {
             buf.borrow_mut().elements_vulkan().clear();
         }
-        #[cfg(feature = "vulkan")]
         for buf in &xray.backdrop {
             buf.borrow_mut().elements_vulkan().clear();
         }
@@ -5298,7 +5265,6 @@ impl Niri {
         // to err on the safe side.
         self.send_frame_callbacks(output);
 
-        #[cfg(feature = "vulkan")]
         if backend.using_vulkan() {
             let rendered = backend.with_vulkan_renderer(|renderer| {
                 self.render_captures_with(renderer, output, target_presentation_time);
@@ -6119,7 +6085,6 @@ impl Niri {
     /// source of the frozen screen — an output missing any target's capture is dropped there rather
     /// than baked through GLES. Assumes render elements are already up to date (the caller primes
     /// them before both passes).
-    #[cfg(feature = "vulkan")]
     pub fn capture_screenshot_neutrals(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
@@ -6146,7 +6111,6 @@ impl Niri {
     }
 
     /// The screen half of [`Self::capture_screenshot_neutrals`], for one render target.
-    #[cfg(feature = "vulkan")]
     fn capture_screenshot_screen_neutral(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
@@ -6194,7 +6158,6 @@ impl Niri {
 
     /// The pointer half of [`Self::capture_screenshot_neutrals`]: mirrors
     /// `render_to_encompassing_texture` + `read_texture_to_memory` for the cursor, through Vulkan.
-    #[cfg(feature = "vulkan")]
     fn capture_screenshot_pointer_neutral(
         &self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
@@ -7124,7 +7087,6 @@ impl Niri {
     /// target through the owned renderer (which can't sample a GLES texture), so it uploads this
     /// buffer to a `VkTexture`; capturing it through the Vulkan renderer keeps that path off GLES.
     /// Generic so it serves both the Vulkan capture and the GLES fallback.
-    #[cfg(feature = "vulkan")]
     fn capture_output_neutral<R>(
         &self,
         renderer: &mut R,
@@ -7175,7 +7137,6 @@ impl Niri {
     /// crossfade shows a screencast must not be the one it shows the output. An output is only
     /// entered if all of its targets captured; a partial entry would silently crossfade from
     /// nothing on the missing targets.
-    #[cfg(feature = "vulkan")]
     pub fn capture_screen_transition_neutrals(
         &mut self,
         renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,

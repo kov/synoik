@@ -125,7 +125,6 @@ impl Backend {
     /// Must yield a renderer for every backend [`Self::using_vulkan`] reports true for: the capture
     /// paths dispatch on that flag and have no GLES fallback once it is set, so a backend that
     /// claims Vulkan but hands out nothing here silently loses screencast and screencopy.
-    #[cfg(feature = "vulkan")]
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
