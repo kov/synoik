@@ -2150,14 +2150,9 @@ impl State {
         }
 
         self.backend.with_primary_renderer(|renderer| {
-            self.niri.screenshot_ui.open(
-                renderer,
-                screenshots,
-                default_output,
-                show_pointer,
-                path,
-                using_vulkan,
-            )
+            self.niri
+                .screenshot_ui
+                .open(renderer, screenshots, default_output, show_pointer, path)
         });
 
         self.niri

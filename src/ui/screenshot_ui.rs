@@ -104,14 +104,12 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    // TODO(phase-c): the capture button's hit test reads its size off this GLES texture
-    // (`pointer_down`/`pointer_up`). Before the GLES panel bake can go, those must read
-    // `panel_neutral`'s `MemoryBuffer::size()` instead, or the button stops responding on Vulkan.
     panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
-    /// The (show, hide) help panels captured as renderer-neutral CPU buffers, populated only on
-    /// Vulkan sessions (the owned Vulkan renderer can't sample the GLES panel textures above). The
-    /// panel is CPU/cairo-drawn, so these are the source bytes — no GPU readback.
-    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+    /// The (show, hide) help panels as renderer-neutral CPU buffers. The panel is CPU/cairo-drawn,
+    /// so these are the source bytes — no GPU readback.
+    ///
+    /// These, not `panel`, are what the capture button's hit test measures: the button must keep
+    /// responding once the GLES panel bake goes away, and the two carry the same size.
     panel_neutral: Option<(MemoryBuffer, MemoryBuffer)>,
     /// `panel_neutral` uploaded once each to `VkTexture`s, cached across frames.
     #[cfg(feature = "vulkan")]
@@ -198,8 +196,6 @@ impl ScreenshotUi {
         default_output: Output,
         show_pointer: bool,
         path: Option<String>,
-        // Whether this is a Vulkan session — keep the CPU-side panel buffers for re-upload.
-        using_vulkan: bool,
     ) -> bool {
         if screenshots.is_empty() {
             // Every output's capture failed (each warned individually). Say so, or the keybind
@@ -269,12 +265,12 @@ impl ScreenshotUi {
                 };
                 let panel_show = render_panel_(TEXT_SHOW_P);
                 let panel_hide = render_panel_(TEXT_HIDE_P);
-                // Each render_panel yields (GLES texture, neutral CPU buffer); split them into the
-                // GLES panel and the Vulkan-only neutral pair.
+                // Each render_panel yields (GLES texture, neutral CPU buffer); split them apart.
+                // The neutral is kept on every session, not just Vulkan: it is the hit test's
+                // measuring stick, and it is already drawn either way.
                 let (panel, panel_neutral) = match Option::zip(panel_show, panel_hide) {
                     Some(((show_tex, show_mem), (hide_tex, hide_mem))) => {
-                        let neutral = using_vulkan.then_some((show_mem, hide_mem));
-                        (Some((show_tex, hide_tex)), neutral)
+                        (Some((show_tex, hide_tex)), Some((show_mem, hide_mem)))
                     }
                     None => (None, None),
                 };
@@ -1034,9 +1030,9 @@ impl ScreenshotUi {
             return false;
         };
 
-        if let Some((show, hide)) = &output_data.panel {
+        if let Some((show, hide)) = &output_data.panel_neutral {
             let buffer = if *show_pointer { hide } else { show };
-            let panel_size = buffer.texture().size();
+            let panel_size = buffer.size();
             let location = panel_location(output_data, panel_size);
 
             if is_within_capture_button(output_data.scale, panel_size, point - location) {
@@ -1114,9 +1110,9 @@ impl ScreenshotUi {
                 return None;
             };
 
-            if let Some((show, hide)) = &output_data.panel {
+            if let Some((show, hide)) = &output_data.panel_neutral {
                 let buffer = if *show_pointer { hide } else { show };
-                let panel_size = buffer.texture().size();
+                let panel_size = buffer.size();
                 let location = panel_location(output_data, panel_size);
 
                 if is_within_capture_button(output_data.scale, panel_size, point - location) {
