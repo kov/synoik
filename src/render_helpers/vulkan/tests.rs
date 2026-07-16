@@ -714,6 +714,61 @@ fn vulkan_shadow_gaussian_falloff() {
     );
 }
 
+/// `ShadowRenderElement::with_alpha` must actually fade the drawn shadow.
+///
+/// It used to write only `inner.alpha` — the `Element` bookkeeping — while the Vulkan push reads
+/// `params.alpha`, so the fade was a silent no-op on the live renderer and workspace shadows
+/// popped in at full strength instead of fading with the overview
+/// (`Monitor::render_workspace_shadows` is the caller). Renders the same shadow at full and at a
+/// quarter alpha and asserts the faded one is visibly lighter; before the fix both were identical.
+#[test]
+fn vulkan_shadow_with_alpha_fades_the_draw() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_shadow_with_alpha_fades_the_draw: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let shadow = |alpha: f32| {
+        ShadowRenderElement::new(
+            Size::<f64, Logical>::from((W as f64, H as f64)),
+            Rectangle::new(
+                Point::<f64, Logical>::from((16.0, 16.0)),
+                Size::<f64, Logical>::from((32.0, 32.0)),
+            ),
+            Color::new_unpremul(0.0, 0.0, 0.0, 1.0),
+            4.0,
+            CornerRadius::from(0.0),
+            1.0,
+            Rectangle::default(),
+            CornerRadius::from(0.0),
+            1.0,
+        )
+        .with_alpha(alpha)
+    };
+
+    let render = |vk: &mut VulkanRenderer, elem: ShadowRenderElement| {
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+            .expect("vulkan offscreen");
+        render_elements_into(vk, &mut target, std::slice::from_ref(&elem))
+    };
+
+    let full = render(&mut vk, shadow(1.0));
+    let faded = render(&mut vk, shadow(0.25));
+
+    // At the box centre the shadow is at its darkest, so the fade shows up most clearly.
+    let full_c = px(&full, 32, 32);
+    let faded_c = px(&faded, 32, 32);
+    assert!(
+        faded_c[0] as i32 > full_c[0] as i32 + 40,
+        "with_alpha(0.25) must draw a markedly lighter shadow than with_alpha(1.0), \
+         got faded={faded_c:?} vs full={full_c:?}"
+    );
+}
+
 /// A zero radius exercises the delegate-to-`inner` branch: no corners are cut, so the whole quad —
 /// corners included — is the opaque source texture, identical to a plain textured draw.
 #[test]

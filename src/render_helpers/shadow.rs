@@ -177,7 +177,13 @@ impl ShadowRenderElement {
         self
     }
 
+    /// Fade the shadow.
+    ///
+    /// Feeds `params`, which is what the Vulkan push reads, as well as `inner`, which backs the
+    /// `Element` alpha. Setting only `inner` — as this used to — left the draw at full alpha, so
+    /// the fade silently did nothing.
     pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.params.alpha = alpha;
         self.inner = self.inner.with_alpha(alpha);
         self
     }
