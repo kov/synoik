@@ -51,7 +51,6 @@ use smithay::reexports::gbm::Modifier;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{DeviceFd, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
@@ -540,17 +539,6 @@ impl Tty {
         })
     }
 
-    /// Whether this backend composites and scans out through the owned Vulkan renderer (rather than
-    /// the GLES `gpu_manager`). Always `false` unless built with the `vulkan` feature and started
-    /// with `--renderer=vulkan`.
-    pub fn using_vulkan(&self) -> bool {
-        self.use_vulkan()
-    }
-
-    fn use_vulkan(&self) -> bool {
-        self.vulkan_renderer.is_some()
-    }
-
     pub fn init(&mut self, niri: &mut Niri) {
         // If the session is inactive, skip initialization because we won't be able to do much with
         // the devices anyway. We'll get ActivateSession and add the devices there instead.
@@ -862,28 +850,16 @@ impl Tty {
             let render_node = self.primary_render_node;
             debug!("initializing the primary renderer");
 
-            // Computed before borrowing the GLES renderer below (avoids a &self / &mut borrow
-            // clash).
-            let use_vulkan = self.use_vulkan();
-
             let mut renderer = self
                 .gpu_manager
                 .single_renderer(&render_node)
                 .context("error creating renderer")?;
 
-            // Not on a Vulkan session. This binds the legacy EGL `wl_drm` global, and a `wl_drm`
-            // buffer is importable only through EGL into the GLES renderer — the owned Vulkan
-            // renderer's `bind_wl_display` is a no-op and it cannot sample one. Advertising it
-            // would offer clients a buffer type we then cannot display, so a legacy client would
-            // render *invisible*; without it they fall back to shm or linux-dmabuf, which work.
-            if !use_vulkan {
-                if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
-                    // wl_drm is on its way out so this is expected on most modern distros.
-                    trace!("error binding legacy EGL to wl_display: {err}");
-                } else {
-                    debug!("bound legacy EGL to wl_display");
-                }
-            }
+            // The legacy EGL `wl_drm` global is deliberately never bound: a `wl_drm` buffer is
+            // importable only through EGL into the GLES renderer — the owned Vulkan renderer's
+            // `bind_wl_display` is a no-op and it cannot sample one. Advertising it would offer
+            // clients a buffer type we then cannot display, so a legacy client would render
+            // *invisible*; without it they fall back to shm or linux-dmabuf, which work.
 
             let gles_renderer = renderer
                 .try_as_gles_renderer()
@@ -915,14 +891,9 @@ impl Tty {
 
             niri.update_shaders();
 
-            // Create the dmabuf global. On the Vulkan path advertise the owned renderer's
-            // importable formats (LINEAR 8888) instead of the GLES/EGL set, so clients
-            // allocate buffers the Vulkan renderer can actually import.
-            let primary_formats = if use_vulkan {
-                owned_vulkan_dmabuf_formats()
-            } else {
-                renderer.dmabuf_formats()
-            };
+            // Create the dmabuf global advertising the owned renderer's importable formats
+            // (LINEAR 8888), so clients allocate buffers the Vulkan renderer can actually import.
+            let primary_formats = owned_vulkan_dmabuf_formats();
             let default_feedback =
                 DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
                     .build()
@@ -1354,7 +1325,6 @@ impl Tty {
         let connector_name = format_connector_name(&connector);
         debug!("connecting connector: {connector_name}");
 
-        let use_vulkan = self.use_vulkan();
         let device = self.devices.get_mut(&node).context("missing device")?;
 
         let disable_monitor_names = self.config.borrow().debug.disable_monitor_names;
@@ -1506,60 +1476,17 @@ impl Tty {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
 
-        let render_formats = if use_vulkan {
-            // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888): Venus GBM
-            // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier (not
-            // INVALID). The renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order
-            // ones (Argb/Xrgb — the usual KMS primary-plane byte order) via a present-blit.
-            // DrmCompositor intersects these with the plane's formats and `SUPPORTED_COLOR_FORMATS`
-            // to pick the buffer format, then allocates via `device.allocator` and imports each
-            // into the renderer via `Bind`. Same set advertised to clients (single
-            // source of truth).
-            owned_vulkan_dmabuf_formats()
-        } else {
-            let render_node = device.render_node.unwrap_or(self.primary_render_node);
-            let renderer = self.gpu_manager.single_renderer(&render_node)?;
-            let egl_context = renderer.as_ref().egl_context();
-            let render_formats = egl_context.dmabuf_render_formats();
-
-            // Filter out the CCS modifiers as they have increased bandwidth, causing some monitor
-            // configurations to stop working.
-            //
-            // For display only devices, restrict to linear buffers for best compatibility.
-            //
-            // The invalid modifier attempt below should make this unnecessary in some cases, but it
-            // would still be a bad idea to remove this until Smithay has some kind of full-device
-            // modesetting test that is able to "downgrade" existing connector modifiers to get
-            // enough bandwidth for a newly connected one.
-            render_formats
-                .iter()
-                .copied()
-                .filter(|format| {
-                    if device.render_node.is_none() {
-                        return format.modifier == Modifier::Linear;
-                    }
-
-                    let is_ccs = matches!(
-                        format.modifier,
-                        Modifier::I915_y_tiled_ccs
-                        // I915_FORMAT_MOD_Yf_TILED_CCS
-                        | Modifier::Unrecognized(0x100000000000005)
-                        | Modifier::I915_y_tiled_gen12_rc_ccs
-                        | Modifier::I915_y_tiled_gen12_mc_ccs
-                        // I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS_CC
-                        | Modifier::Unrecognized(0x100000000000008)
-                        // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS
-                        | Modifier::Unrecognized(0x10000000000000a)
-                        // I915_FORMAT_MOD_4_TILED_DG2_MC_CCS
-                        | Modifier::Unrecognized(0x10000000000000b)
-                        // I915_FORMAT_MOD_4_TILED_DG2_RC_CCS_CC
-                        | Modifier::Unrecognized(0x10000000000000c)
-                    );
-
-                    !is_ccs
-                })
-                .collect::<FormatSet>()
-        };
+        // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888): Venus GBM
+        // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier (not
+        // INVALID). The renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order
+        // ones (Argb/Xrgb — the usual KMS primary-plane byte order) via a present-blit.
+        // DrmCompositor intersects these with the plane's formats and `SUPPORTED_COLOR_FORMATS` to
+        // pick the buffer format, then allocates via `device.allocator` and imports each into the
+        // renderer via `Bind`. Same set advertised to clients (single source of truth).
+        //
+        // The GLES path used to filter CCS modifiers out of the EGL set here for bandwidth
+        // reasons; LINEAR-only sidesteps that entirely.
+        let render_formats = owned_vulkan_dmabuf_formats();
 
         // Create the compositor.
         let res = DrmCompositor::new(
@@ -1576,60 +1503,19 @@ impl Tty {
             Some(device.gbm.clone()),
         );
 
-        let mut compositor = match res {
-            Ok(x) => x,
-            // The owned Vulkan renderer cannot import an INVALID-modifier buffer, so the fallback
-            // below doesn't apply — surface the error instead (e.g. KMS rejecting LINEAR scanout).
-            Err(err) if use_vulkan => {
-                return Err(err).context("error creating DRM compositor for the Vulkan renderer");
-            }
-            Err(err) => {
-                warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
-
-                let render_formats = render_formats
-                    .iter()
-                    .copied()
-                    .filter(|format| format.modifier == Modifier::Invalid)
-                    .collect::<FormatSet>();
-
-                // DrmCompositor::new() consumed the surface...
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector.handle()])?;
-
-                DrmCompositor::new(
-                    OutputModeSource::Auto(output.downgrade()),
-                    surface,
-                    None,
-                    device.allocator.clone(),
-                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    SUPPORTED_COLOR_FORMATS,
-                    render_formats,
-                    device.drm.cursor_size(),
-                    Some(device.gbm.clone()),
-                )
-                .context("error creating DRM compositor")?
-            }
-        };
+        // The owned Vulkan renderer cannot import an INVALID-modifier buffer, so the GLES path's
+        // retry-with-invalid-modifier fallback does not apply — surface the error instead (e.g.
+        // KMS rejecting LINEAR scanout).
+        let mut compositor =
+            res.context("error creating DRM compositor for the Vulkan renderer")?;
 
         if self.debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
         }
 
         let mut dmabuf_feedback = None;
-        // A Vulkan session's formats come from the owned renderer, so don't make the feedback
-        // conditional on a GLES renderer it never consults: failing that gate would advertise no
-        // dmabuf feedback at all.
-        let primary_formats = if use_vulkan {
-            Some(owned_vulkan_dmabuf_formats())
-        } else {
-            self.gpu_manager
-                .single_renderer(&self.primary_render_node)
-                .map(|renderer| renderer.dmabuf_formats())
-                .map_err(|err| warn!("no primary GLES renderer for dmabuf feedback: {err:?}"))
-                .ok()
-        };
-        if let Some(primary_formats) = primary_formats {
+        {
+            let primary_formats = owned_vulkan_dmabuf_formats();
             match surface_dmabuf_feedback(
                 &compositor,
                 primary_formats,
@@ -2170,16 +2056,6 @@ impl Tty {
                 debug!("error importing dmabuf: {err:?}");
                 false
             }
-        }
-    }
-
-    pub fn early_import(&mut self, surface: &WlSurface) {
-        if let Err(err) = self.gpu_manager.early_import(
-            // We always render on the primary GPU.
-            self.primary_render_node,
-            surface,
-        ) {
-            warn!("error doing early import: {err:?}");
         }
     }
 
@@ -2916,10 +2792,9 @@ fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     disabled_nodes
 }
 
-/// The DRM formats to advertise to clients (dmabuf feedback) and feed the DrmCompositor when
-/// compositing through the owned Vulkan renderer: the renderer's own importable set (single source
-/// of truth — [`crate::render_helpers::vulkan::dmabuf_formats`]). Only ever called on the Vulkan
-/// path (`use_vulkan`), which is impossible without the feature, so the fallback is unreachable.
+/// The DRM formats to advertise to clients (dmabuf feedback) and feed the DrmCompositor: the
+/// owned Vulkan renderer's own importable set (single source of truth —
+/// [`crate::render_helpers::vulkan::dmabuf_formats`]).
 fn owned_vulkan_dmabuf_formats() -> FormatSet {
     crate::render_helpers::vulkan::dmabuf_formats()
 }

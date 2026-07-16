@@ -63,7 +63,6 @@ impl CompositorHandler for State {
         trace!("commit");
 
         on_commit_buffer_handler::<Self>(surface);
-        self.backend.early_import(surface);
 
         let mut root_surface = surface.clone();
         while let Some(parent) = get_parent(&root_surface) {
@@ -373,21 +372,11 @@ impl CompositorHandler for State {
                 let transaction = Transaction::new();
                 if !is_mapped {
                     let blocker = transaction.blocker();
-                    // A Vulkan session's snapshot is already renderer-neutral, so it needs no GLES
-                    // renderer to start the animation — and must not depend on one being available.
-                    if self.backend.using_vulkan() {
-                        self.niri
-                            .layout
-                            .start_close_animation_for_window(None, &window, blocker);
-                    } else {
-                        self.backend.with_primary_renderer(|renderer| {
-                            self.niri.layout.start_close_animation_for_window(
-                                Some(renderer),
-                                &window,
-                                blocker,
-                            );
-                        });
-                    }
+                    // The snapshot is renderer-neutral, so starting the animation needs no
+                    // renderer — and must not depend on one being available.
+                    self.niri
+                        .layout
+                        .start_close_animation_for_window(None, &window, blocker);
                 }
 
                 window.on_commit();

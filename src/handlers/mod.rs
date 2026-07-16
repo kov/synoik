@@ -654,28 +654,15 @@ impl ScreencopyHandler for State {
         if screencopy.with_damage() {
             self.niri.screencopy_state.push(manager, screencopy);
         } else {
-            // On a Vulkan session, render the one-shot screencopy through the owned renderer
-            // (Phase C); fall back to GLES only when there is no owned Vulkan renderer.
-            if self.backend.using_vulkan() {
-                let res = self.backend.with_vulkan_renderer(|renderer| {
-                    self.niri
-                        .render_for_screencopy_without_damage(renderer, manager, screencopy)
-                });
-                match res {
-                    Some(Err(err)) => warn!("error rendering for screencopy: {err:?}"),
-                    None => warn!("owned Vulkan renderer unavailable for screencopy"),
-                    Some(Ok(())) => {}
-                }
-                return;
-            }
-            self.backend.with_primary_renderer(|renderer| {
-                if let Err(err) = self
-                    .niri
+            let res = self.backend.with_vulkan_renderer(|renderer| {
+                self.niri
                     .render_for_screencopy_without_damage(renderer, manager, screencopy)
-                {
-                    warn!("error rendering for screencopy: {err:?}");
-                }
             });
+            match res {
+                Some(Err(err)) => warn!("error rendering for screencopy: {err:?}"),
+                None => warn!("renderer unavailable for screencopy"),
+                Some(Ok(())) => {}
+            }
         }
     }
 

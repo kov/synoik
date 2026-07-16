@@ -6,7 +6,6 @@ use niri_config::{Config, ModKey};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
@@ -79,15 +78,6 @@ impl Backend {
         }
     }
 
-    /// Whether this backend composites through the owned Vulkan renderer (rather than GLES).
-    /// Governs Vulkan-only capture paths such as the resize crossfade's neutral snapshot buffer.
-    pub fn using_vulkan(&self) -> bool {
-        match self {
-            Backend::Tty(tty) => tty.using_vulkan(),
-            Backend::Headless(headless) => headless.using_vulkan(),
-        }
-    }
-
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
@@ -98,13 +88,11 @@ impl Backend {
         }
     }
 
-    /// Run `f` with the owned Vulkan renderer if this backend composites through it, else `None`.
-    /// The dual of [`Self::with_primary_renderer`] (which yields the always-GLES primary renderer)
-    /// for owned-renderer-only setup such as installing custom animation shaders.
+    /// Run `f` with the owned Vulkan renderer, or `None` if the backend has not built one yet
+    /// (the headless backend before `add_renderer`).
     ///
-    /// Must yield a renderer for every backend [`Self::using_vulkan`] reports true for: the capture
-    /// paths dispatch on that flag and have no GLES fallback once it is set, so a backend that
-    /// claims Vulkan but hands out nothing here silently loses screencast and screencopy.
+    /// The capture paths — screencast, screencopy, screenshot — have no fallback: a backend that
+    /// hands out nothing here silently loses them.
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
@@ -158,29 +146,6 @@ impl Backend {
         match self {
             Backend::Tty(tty) => tty.import_dmabuf(dmabuf),
             Backend::Headless(headless) => headless.import_dmabuf(dmabuf),
-        }
-    }
-
-    /// Prefetch a just-committed client buffer into the renderer's texture cache.
-    ///
-    /// Skipped entirely on a Vulkan session: this uploads into the *GLES* texture cache, keyed by
-    /// the GLES context, and nothing a Vulkan session displays ever samples it — the owned renderer
-    /// imports through its own `ImportAll`. Left in, it is a full client-buffer upload per surface
-    /// per commit (every frame, for every animating client) into a renderer that draws nothing.
-    ///
-    /// It is a prefetch, not a correctness dependency: the GLES paths that do still run on a Vulkan
-    /// session (the snapshot bakes) import lazily themselves via `import_surface`
-    /// (`render_helpers/surface.rs`), so at worst they pay a cold import instead of a warm one.
-    ///
-    /// Gated here rather than inside `Tty` so the headless Vulkan suite exercises the same skip.
-    pub fn early_import(&mut self, surface: &WlSurface) {
-        if self.using_vulkan() {
-            return;
-        }
-
-        match self {
-            Backend::Tty(tty) => tty.early_import(surface),
-            Backend::Headless(_) => (),
         }
     }
 

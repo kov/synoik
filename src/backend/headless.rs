@@ -54,12 +54,6 @@ impl Headless {
         }
     }
 
-    // Vulkan is the only renderer now. The predicate stays until the GLES dispatch branches it
-    // guards are deleted, at which point it and they go together.
-    pub fn using_vulkan(&self) -> bool {
-        true
-    }
-
     pub fn init(&mut self, _niri: &mut Niri) {}
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {

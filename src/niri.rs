@@ -164,11 +164,11 @@ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
-    encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
+    encompassing_geo, render_to_dmabuf, render_to_shm, render_to_vec, shaders, RenderCtx,
+    RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -2085,35 +2085,14 @@ impl State {
 
         self.niri.update_render_elements(None);
 
-        let using_vulkan = self.backend.using_vulkan();
-        // On a Vulkan session, capture the Output-target neutrals through the owned renderer first
-        // (so that path never touches GLES); the GLES pass below consumes them and captures the
-        // screencast/screen-capture textures.
-        let vk_neutrals = if using_vulkan {
-            self.backend
-                .with_vulkan_renderer(|vk| self.niri.capture_screenshot_neutrals(vk))
-                .unwrap_or_default()
-        } else {
-            Default::default()
-        };
-        // A Vulkan session has its captures already; it must not depend on a GLES renderer being
-        // available, or the UI would silently never open.
-        let screenshots = if using_vulkan {
-            Some(
-                self.niri
-                    .capture_screenshots(None, true, vk_neutrals)
-                    .collect(),
-            )
-        } else {
-            self.backend.with_primary_renderer(|renderer| {
-                self.niri
-                    .capture_screenshots(Some(renderer), false, vk_neutrals)
-                    .collect()
-            })
-        };
-        let Some(screenshots) = screenshots else {
-            return;
-        };
+        // Capture the Output-target neutrals through the owned renderer first.
+        let vk_neutrals = self
+            .backend
+            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_neutrals(vk))
+            .unwrap_or_default();
+        // The captures are already taken, so opening the UI must not depend on a renderer being
+        // available here, or it would silently never open.
+        let screenshots = self.niri.capture_screenshots(vk_neutrals).collect();
 
         // Now that we captured the screenshots, clear grabs like drag-and-drop, etc.
         self.niri.seat.get_pointer().unwrap().unset_grab(
@@ -2125,23 +2104,11 @@ impl State {
             touch.unset_grab(self);
         }
 
-        // The panel is cairo-drawn either way; only its GLES upload needs a renderer, and a Vulkan
-        // session never samples that texture.
-        if using_vulkan {
-            self.niri
-                .screenshot_ui
-                .open(None, screenshots, default_output, show_pointer, path);
-        } else {
-            self.backend.with_primary_renderer(|renderer| {
-                self.niri.screenshot_ui.open(
-                    Some(renderer),
-                    screenshots,
-                    default_output,
-                    show_pointer,
-                    path,
-                )
-            });
-        }
+        // The panel is cairo-drawn; only its GLES upload needed a renderer, and nothing samples
+        // that texture any more.
+        self.niri
+            .screenshot_ui
+            .open(None, screenshots, default_output, show_pointer, path);
 
         self.niri
             .cursor_manager
@@ -2209,50 +2176,7 @@ impl State {
         // elements, so they need to be updated.
         self.niri.update_xray_render_elements(output);
 
-        // The snapshot is captured through whichever renderer will later draw the close animation:
-        // the owned Vulkan renderer can't sample a GLES texture, and vice versa.
-        if self.backend.using_vulkan() {
-            self.backend.with_vulkan_renderer(|renderer| {
-                if let Some(output) = output {
-                    let mut ctx = RenderCtx {
-                        target: RenderTarget::Output,
-                        renderer,
-                        xray: None,
-                    };
-
-                    self.niri.fill_xray_elements_vulkan(ctx.r(), output);
-
-                    let has_blocked_out = self.niri.has_blocked_out_background_layers(output);
-                    if has_blocked_out {
-                        let screencast_ctx = RenderCtx {
-                            target: RenderTarget::Screencast,
-                            ..ctx.r()
-                        };
-                        self.niri.fill_xray_elements_vulkan(screencast_ctx, output);
-                    }
-
-                    let state = self.niri.output_state.get_mut(output).unwrap();
-                    self.niri.layout.store_unmap_snapshot(
-                        &mut SnapshotRenderer::Vulkan(renderer),
-                        Some(&mut state.xray),
-                        has_blocked_out,
-                        window,
-                    );
-
-                    self.niri.clear_xray_elements(output);
-                } else {
-                    self.niri.layout.store_unmap_snapshot(
-                        &mut SnapshotRenderer::Vulkan(renderer),
-                        None,
-                        false,
-                        window,
-                    );
-                }
-            });
-            return;
-        }
-
-        self.backend.with_primary_renderer(|renderer| {
+        self.backend.with_vulkan_renderer(|renderer| {
             if let Some(output) = output {
                 let mut ctx = RenderCtx {
                     target: RenderTarget::Output,
@@ -2260,7 +2184,7 @@ impl State {
                     xray: None,
                 };
 
-                self.niri.fill_xray_elements(ctx.r(), output);
+                self.niri.fill_xray_elements_vulkan(ctx.r(), output);
 
                 // If any background layer has block_out_from, also fill the Screencast xray
                 // buffer so the unmap snapshot can render a buffer with blocked-out background.
@@ -2272,12 +2196,12 @@ impl State {
                         target: RenderTarget::Screencast,
                         ..ctx.r()
                     };
-                    self.niri.fill_xray_elements(screencast_ctx, output);
+                    self.niri.fill_xray_elements_vulkan(screencast_ctx, output);
                 }
 
                 let state = self.niri.output_state.get_mut(output).unwrap();
                 self.niri.layout.store_unmap_snapshot(
-                    &mut SnapshotRenderer::Gles(renderer),
+                    &mut SnapshotRenderer::Vulkan(renderer),
                     Some(&mut state.xray),
                     has_blocked_out,
                     window,
@@ -2286,7 +2210,7 @@ impl State {
                 self.niri.clear_xray_elements(output);
             } else {
                 self.niri.layout.store_unmap_snapshot(
-                    &mut SnapshotRenderer::Gles(renderer),
+                    &mut SnapshotRenderer::Vulkan(renderer),
                     None,
                     false,
                     window,
@@ -2322,28 +2246,14 @@ impl State {
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
-        // On a Vulkan session, render the screenshot through the owned renderer (Phase C); the
-        // helper is renderer-agnostic and `to_screenshot` is passed by reference, so neither branch
-        // moves anything the other needs.
-        let rv = if self.backend.using_vulkan() {
-            self.backend.with_vulkan_renderer(|renderer| {
-                Self::take_screenshot_with_renderer(
-                    &mut self.niri,
-                    renderer,
-                    include_cursor,
-                    to_screenshot,
-                )
-            })
-        } else {
-            self.backend.with_primary_renderer(|renderer| {
-                Self::take_screenshot_with_renderer(
-                    &mut self.niri,
-                    renderer,
-                    include_cursor,
-                    to_screenshot,
-                )
-            })
-        };
+        let rv = self.backend.with_vulkan_renderer(|renderer| {
+            Self::take_screenshot_with_renderer(
+                &mut self.niri,
+                renderer,
+                include_cursor,
+                to_screenshot,
+            )
+        });
 
         if rv.is_none() {
             let msg = NiriToScreenshot::ScreenshotResult(None);
@@ -5263,19 +5173,12 @@ impl Niri {
         // to err on the safe side.
         self.send_frame_callbacks(output);
 
-        if backend.using_vulkan() {
-            let rendered = backend.with_vulkan_renderer(|renderer| {
-                self.render_captures_with(renderer, output, target_presentation_time);
-            });
-            if rendered.is_none() {
-                warn!("no Vulkan renderer to render screencast and screencopy with");
-            }
-            return;
-        }
-
-        backend.with_primary_renderer(|renderer| {
+        let rendered = backend.with_vulkan_renderer(|renderer| {
             self.render_captures_with(renderer, output, target_presentation_time);
         });
+        if rendered.is_none() {
+            warn!("no renderer to render screencast and screencopy with");
+        }
     }
 
     /// Render this output for everything that captures it as a side effect of the redraw: PipeWire
@@ -6208,16 +6111,11 @@ impl Niri {
         }
     }
 
-    /// `renderer` is `None` on a Vulkan session, which captured every target's frozen screen
-    /// through the owned renderer up front and re-renders nothing through GLES here.
+    /// The frozen screen was already captured into renderer-neutral buffers through the owned
+    /// renderer (`capture_screenshot_neutrals`); this just packages them per output.
     pub fn capture_screenshots<'a>(
         &'a self,
-        mut renderer: Option<&'a mut GlesRenderer>,
-        using_vulkan: bool,
-        // On a Vulkan session, the per-target neutrals captured up front through the owned
-        // renderer (`capture_screenshot_neutrals`), keyed by output. Consumed here; a
-        // missing output/field falls back to the GLES readback in
-        // `OutputScreenshot::from_textures`.
+        // The per-target neutrals captured up front, keyed by output. Consumed here.
         mut vk_neutrals: std::collections::HashMap<
             Output,
             [ScreenshotNeutral; RenderTarget::COUNT],
@@ -6227,110 +6125,26 @@ impl Niri {
             .outputs()
             .cloned()
             .filter_map(move |output| {
-                // Take this output's Vulkan neutrals, one per render target.
+                // Take this output's neutrals, one per render target.
                 let mut vk_neutral = vk_neutrals.remove(&output).unwrap_or_default();
-                let size = output.current_mode().unwrap().size;
-                let transform = output.current_transform();
-                let size = transform.transform_size(size);
 
-                let scale = Scale::from(output.current_scale().fractional_scale());
+                // An output missing any target's capture is dropped rather than opened with a
+                // screen it cannot draw or save (the failure warned there).
+                let screenshot = ALL_RENDER_TARGETS.map(|target| {
+                    let this = &mut vk_neutral[target as usize];
+                    let screen = this.screen.take()?;
+                    Some(OutputScreenshot::from_neutrals(screen, this.pointer.take()))
+                });
 
-                // On a Vulkan session the frozen screen was already captured into renderer-neutral
-                // buffers through the owned renderer (`capture_screenshot_neutrals`), and every
-                // consumer — on-screen, screencast, save-to-disk — works off those. Don't render
-                // the scene again through GLES: nothing would sample it. An output missing any
-                // target's capture is dropped rather than opened with a screen it cannot draw or
-                // save (the failure warned there).
-                if using_vulkan {
-                    let screenshot = ALL_RENDER_TARGETS.map(|target| {
-                        let this = &mut vk_neutral[target as usize];
-                        let screen = this.screen.take()?;
-                        Some(OutputScreenshot::from_neutrals(screen, this.pointer.take()))
-                    });
-
-                    if screenshot.iter().any(Option::is_none) {
-                        warn!(
-                            "no Vulkan screenshot capture for output {}; skipping it",
-                            output.name()
-                        );
-                        return None;
-                    }
-
-                    return Some((output, screenshot.map(Option::unwrap)));
-                }
-
-                let Some(renderer) = renderer.as_deref_mut() else {
+                if screenshot.iter().any(Option::is_none) {
                     warn!(
-                        "no GLES renderer to capture output {}; skipping it",
+                        "no screenshot capture for output {}; skipping it",
                         output.name()
                     );
                     return None;
-                };
-
-                let screenshot = ALL_RENDER_TARGETS.map(|target| {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target,
-                        xray: None,
-                    };
-                    let elements = self.render_to_vec(ctx, &output, false);
-                    let elements = elements.iter().rev();
-
-                    let res = render_to_texture(
-                        renderer,
-                        size,
-                        scale,
-                        Transform::Normal,
-                        Fourcc::Abgr8888,
-                        elements,
-                    );
-                    if let Err(err) = &res {
-                        warn!("error rendering output {}: {err:?}", output.name());
-                    }
-                    let res_output = res.ok();
-
-                    let mut pointer = Vec::new();
-
-                    // We check the pointer visibility for Disabled (and not .is_visible()) in order
-                    // to show the pointer even when it's hidden through cursor
-                    // {} options. The user can then toggle it in the screenshot
-                    // UI as needed.
-                    if self.pointer_visibility != PointerVisibility::Disabled {
-                        self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
-                    }
-
-                    let res_pointer = if pointer.is_empty() {
-                        None
-                    } else {
-                        let res = render_to_encompassing_texture(
-                            renderer,
-                            scale,
-                            Transform::Normal,
-                            Fourcc::Abgr8888,
-                            &pointer,
-                        );
-                        if let Err(err) = &res {
-                            warn!("error rendering pointer for {}: {err:?}", output.name());
-                        }
-                        res.ok()
-                    };
-
-                    res_output.map(|(texture, _)| {
-                        OutputScreenshot::from_textures(
-                            renderer,
-                            scale,
-                            texture,
-                            res_pointer.map(|(texture, _, geo)| (texture, geo)),
-                        )
-                    })
-                });
-
-                if screenshot.iter().any(|res| res.is_none()) {
-                    return None;
                 }
 
-                let screenshot = screenshot.map(|res| res.unwrap());
-                Some((output, screenshot))
+                Some((output, screenshot.map(Option::unwrap)))
             })
     }
 
@@ -7165,12 +6979,11 @@ impl Niri {
             .collect()
     }
 
-    /// `renderer` is `None` on a Vulkan session, which captured the frozen screen through the owned
-    /// renderer up front and re-renders nothing through GLES here.
+    /// The frozen screen was captured through the owned renderer up front
+    /// (`capture_screen_transition_neutrals`); this just hands the buffers to each output's
+    /// transition.
     pub fn do_screen_transition(
         &mut self,
-        mut renderer: Option<&mut GlesRenderer>,
-        using_vulkan: bool,
         mut neutrals: std::collections::HashMap<Output, [MemoryBuffer; RenderTarget::COUNT]>,
         delay_ms: Option<u16>,
     ) {
@@ -7178,98 +6991,19 @@ impl Niri {
 
         self.update_render_elements(None);
 
-        /// The frozen screen, in the form the session's renderer can sample. Mirrors
-        /// `ScreenTransition`'s own (private) enum; kept here so the borrow of `self` ends before
-        /// we take `&mut self.output_state` below.
-        enum FrozenScene {
-            Gles(
-                Box<
-                    [TextureBuffer<smithay::backend::renderer::gles::GlesTexture>;
-                        RenderTarget::COUNT],
-                >,
-            ),
-            Neutral([MemoryBuffer; RenderTarget::COUNT]),
-        }
-
         let textures: Vec<_> = self
             .output_state
             .keys()
             .cloned()
             .filter_map(|output| {
-                let size = output.current_mode().unwrap().size;
                 let transform = output.current_transform();
 
                 let scale = Scale::from(output.current_scale().fractional_scale());
 
-                // On a Vulkan session every target composites through the owned renderer, which
-                // can't sample a GLES texture. The frozen screen was already captured into
-                // renderer-neutral buffers through the Vulkan renderer up front (in
-                // `capture_screen_transition_neutrals`), so don't render the scene again through
-                // GLES — nothing would ever sample it. An output whose capture failed is dropped:
-                // it gets no crossfade (the failure warned there), rather than a GLES bake nothing
-                // can draw.
-                if using_vulkan {
-                    let neutrals = neutrals.remove(&output)?;
-                    return Some((output, FrozenScene::Neutral(neutrals), scale, transform));
-                }
-
-                let renderer = match renderer.as_deref_mut() {
-                    Some(renderer) => renderer,
-                    None => {
-                        warn!(
-                            "no GLES renderer for the screen transition on output {}; skipping it",
-                            output.name()
-                        );
-                        return None;
-                    }
-                };
-
-                let textures = ALL_RENDER_TARGETS.map(|target| {
-                    let ctx = RenderCtx {
-                        renderer,
-                        target,
-                        xray: None,
-                    };
-                    let elements = self.render_to_vec(ctx, &output, false);
-                    let elements = elements.iter().rev();
-
-                    let res = render_to_texture(
-                        renderer,
-                        size,
-                        scale,
-                        transform,
-                        Fourcc::Abgr8888,
-                        elements,
-                    );
-
-                    if let Err(err) = &res {
-                        warn!("error rendering output {}: {err:?}", output.name());
-                    }
-
-                    res
-                });
-
-                if textures.iter().any(|res| res.is_err()) {
-                    return None;
-                }
-
-                let textures = textures.map(|res| {
-                    let texture = res.unwrap().0;
-                    TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        transform,
-                        Vec::new(), // We want windows below to get frame callbacks.
-                    )
-                });
-
-                Some((
-                    output,
-                    FrozenScene::Gles(Box::new(textures)),
-                    scale,
-                    transform,
-                ))
+                // An output whose capture failed is dropped: it gets no crossfade (the failure
+                // warned there).
+                let neutrals = neutrals.remove(&output)?;
+                Some((output, neutrals, scale, transform))
             })
             .collect();
 
@@ -7277,17 +7011,12 @@ impl Niri {
             Duration::from_millis(u64::from(d))
         });
 
-        for (output, from, scale, transform) in textures {
+        for (output, buffers, scale, transform) in textures {
             let state = self.output_state.get_mut(&output).unwrap();
             let clock = self.clock.clone();
-            state.screen_transition = Some(match from {
-                FrozenScene::Gles(textures) => {
-                    ScreenTransition::from_gles(*textures, scale, transform, delay, clock)
-                }
-                FrozenScene::Neutral(buffers) => {
-                    ScreenTransition::from_neutrals(buffers, scale, transform, delay, clock)
-                }
-            });
+            state.screen_transition = Some(ScreenTransition::from_neutrals(
+                buffers, scale, transform, delay, clock,
+            ));
         }
 
         // We don't actually need to queue a redraw because the point is to freeze the screen for a

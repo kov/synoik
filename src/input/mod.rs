@@ -850,63 +850,27 @@ impl State {
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
-                let using_vulkan = self.backend.using_vulkan();
-                // On a Vulkan session, capture the Output-target neutral buffers through the owned
-                // renderer first (so that path never touches GLES); the GLES pass below consumes
-                // them and captures the screencast/screen-capture textures.
-                let neutrals = if using_vulkan {
-                    self.backend
-                        .with_vulkan_renderer(|vk| self.niri.capture_screen_transition_neutrals(vk))
-                        .unwrap_or_default()
-                } else {
-                    Default::default()
-                };
-                // A Vulkan session has its neutrals already; it must not depend on a GLES renderer
-                // being available, or the transition would silently never run.
-                if using_vulkan {
-                    self.niri
-                        .do_screen_transition(None, true, neutrals, delay_ms);
-                } else {
-                    self.backend.with_primary_renderer(|renderer| {
-                        self.niri
-                            .do_screen_transition(Some(renderer), false, neutrals, delay_ms);
-                    });
-                }
+                // Capture the Output-target neutral buffers through the owned renderer first.
+                let neutrals = self
+                    .backend
+                    .with_vulkan_renderer(|vk| self.niri.capture_screen_transition_neutrals(vk))
+                    .unwrap_or_default();
+                // The neutrals are already captured, so the transition must not depend on a
+                // renderer being available here, or it would silently never run.
+                self.niri.do_screen_transition(neutrals, delay_ms);
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();
                 if let Some(active) = active {
-                    // On a Vulkan session, render the screenshot through the owned renderer so this
-                    // path never touches GLES (Phase C). Falls back to GLES only when there is no
-                    // owned Vulkan renderer (i.e. not a Vulkan session).
-                    if self.backend.using_vulkan() {
-                        let res = self.backend.with_vulkan_renderer(|renderer| {
-                            self.niri.screenshot(
-                                renderer,
-                                &active,
-                                write_to_disk,
-                                show_pointer,
-                                path,
-                            )
-                        });
-                        match res {
-                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
-                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
-                            Some(Ok(())) => {}
-                        }
-                        return;
-                    }
-                    self.backend.with_primary_renderer(|renderer| {
-                        if let Err(err) = self.niri.screenshot(
-                            renderer,
-                            &active,
-                            write_to_disk,
-                            show_pointer,
-                            path,
-                        ) {
-                            warn!("error taking screenshot: {err:?}");
-                        }
+                    let res = self.backend.with_vulkan_renderer(|renderer| {
+                        self.niri
+                            .screenshot(renderer, &active, write_to_disk, show_pointer, path)
                     });
+                    match res {
+                        Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                        None => warn!("renderer unavailable for screenshot"),
+                        Some(Ok(())) => {}
+                    }
                 }
             }
             Action::ConfirmScreenshot { write_to_disk } => {
@@ -934,36 +898,21 @@ impl State {
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
-                    if self.backend.using_vulkan() {
-                        let res = self.backend.with_vulkan_renderer(|renderer| {
-                            self.niri.screenshot_window(
-                                renderer,
-                                output,
-                                mapped,
-                                write_to_disk,
-                                show_pointer,
-                                path,
-                            )
-                        });
-                        match res {
-                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
-                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
-                            Some(Ok(())) => {}
-                        }
-                        return;
-                    }
-                    self.backend.with_primary_renderer(|renderer| {
-                        if let Err(err) = self.niri.screenshot_window(
+                    let res = self.backend.with_vulkan_renderer(|renderer| {
+                        self.niri.screenshot_window(
                             renderer,
                             output,
                             mapped,
                             write_to_disk,
                             show_pointer,
                             path,
-                        ) {
-                            warn!("error taking screenshot: {err:?}");
-                        }
+                        )
                     });
+                    match res {
+                        Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                        None => warn!("renderer unavailable for screenshot"),
+                        Some(Ok(())) => {}
+                    }
                 }
             }
             Action::ScreenshotWindowById {
@@ -976,36 +925,21 @@ impl State {
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
-                    if self.backend.using_vulkan() {
-                        let res = self.backend.with_vulkan_renderer(|renderer| {
-                            self.niri.screenshot_window(
-                                renderer,
-                                output,
-                                mapped,
-                                write_to_disk,
-                                show_pointer,
-                                path,
-                            )
-                        });
-                        match res {
-                            Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
-                            None => warn!("owned Vulkan renderer unavailable for screenshot"),
-                            Some(Ok(())) => {}
-                        }
-                        return;
-                    }
-                    self.backend.with_primary_renderer(|renderer| {
-                        if let Err(err) = self.niri.screenshot_window(
+                    let res = self.backend.with_vulkan_renderer(|renderer| {
+                        self.niri.screenshot_window(
                             renderer,
                             output,
                             mapped,
                             write_to_disk,
                             show_pointer,
                             path,
-                        ) {
-                            warn!("error taking screenshot: {err:?}");
-                        }
+                        )
                     });
+                    match res {
+                        Some(Err(err)) => warn!("error taking screenshot: {err:?}"),
+                        None => warn!("renderer unavailable for screenshot"),
+                        Some(Ok(())) => {}
+                    }
                 }
             }
             Action::ToggleKeyboardShortcutsInhibit => {

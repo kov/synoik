@@ -857,19 +857,11 @@ impl XdgShellHandler for State {
 
         let transaction = Transaction::new();
         let blocker = transaction.blocker();
-        // As in `CompositorHandler::commit`: a Vulkan session's close snapshot is renderer-neutral,
-        // so it starts the animation without a GLES renderer rather than through one it ignores.
-        if self.backend.using_vulkan() {
-            self.niri
-                .layout
-                .start_close_animation_for_window(None, &window, blocker);
-        } else {
-            self.backend.with_primary_renderer(|renderer| {
-                self.niri
-                    .layout
-                    .start_close_animation_for_window(Some(renderer), &window, blocker);
-            });
-        }
+        // As in `CompositorHandler::commit`: the close snapshot is renderer-neutral, so it starts
+        // the animation without a renderer rather than through one it ignores.
+        self.niri
+            .layout
+            .start_close_animation_for_window(None, &window, blocker);
 
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
@@ -1593,31 +1585,20 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             state.store_unmap_snapshot(&window, output.as_ref());
         } else {
             if animate {
-                let vulkan = state.backend.using_vulkan();
+                // The snapshot struct is still stored: the capture below needs it to exist.
+                mapped.store_animation_snapshot_neutral();
 
-                if vulkan {
-                    // Nothing on a Vulkan session ever samples the GLES bake, so skip it and take
-                    // the crossfade's "before" pixels through the owned renderer instead. The
-                    // snapshot struct is still stored: the capture below needs it to exist.
-                    mapped.store_animation_snapshot_neutral();
-                    {
-                        let scale = Scale::from(
-                            output
-                                .map(|o| o.current_scale().fractional_scale())
-                                .unwrap_or(1.),
-                        );
-                        state
-                            .backend
-                            .with_vulkan_renderer(|vk| mapped.capture_neutral_vulkan(vk, scale));
-                        // A failed capture leaves `neutral` unset, which costs this resize its
-                        // crossfade — the plain window renders instead. That is the same
-                        // fail-closed trade the blocked-out target already makes in `Tile::render`.
-                    }
-                } else {
-                    state.backend.with_primary_renderer(|renderer| {
-                        mapped.store_animation_snapshot(renderer);
-                    });
-                }
+                let scale = Scale::from(
+                    output
+                        .map(|o| o.current_scale().fractional_scale())
+                        .unwrap_or(1.),
+                );
+                state
+                    .backend
+                    .with_vulkan_renderer(|vk| mapped.capture_neutral_vulkan(vk, scale));
+                // A failed capture leaves `neutral` unset, which costs this resize its crossfade —
+                // the plain window renders instead. That is the same fail-closed trade the
+                // blocked-out target already makes in `Tile::render`.
             }
 
             // The toplevel remains mapped; clear any stored unmap snapshot.

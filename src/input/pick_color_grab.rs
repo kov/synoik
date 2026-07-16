@@ -49,20 +49,8 @@ impl PickColorGrab {
         // at the bottom/right edges of the monitors.
         let pos = pos_within_output.to_physical_precise_floor(scale);
 
-        // On a Vulkan session, read the pixel back through the owned Vulkan renderer so this path
-        // never touches GLES (Phase C, dropping the co-resident GLES renderer). Falls through to
-        // the GLES primary renderer if the Vulkan renderer is unavailable (e.g. the headless
-        // backend, whose Backend-level `with_vulkan_renderer` yields `None`).
-        if data.backend.using_vulkan() {
-            if let Some(color) = data.backend.with_vulkan_renderer(|renderer| {
-                Self::pick_color_with_renderer(&data.niri, renderer, &output, pos, scale)
-            }) {
-                return color;
-            }
-        }
-
         data.backend
-            .with_primary_renderer(|renderer| {
+            .with_vulkan_renderer(|renderer| {
                 Self::pick_color_with_renderer(&data.niri, renderer, &output, pos, scale)
             })
             .flatten()
