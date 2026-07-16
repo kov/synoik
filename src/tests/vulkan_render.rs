@@ -2062,10 +2062,14 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
 
 #[test]
 fn vulkan_picks_a_color_through_vulkan() {
-    // Phase C: pick-color reads back a single pixel through the *active* renderer. On a Vulkan
-    // session it must go through the owned Vulkan renderer (1x1 offscreen render + copy_framebuffer
-    // readback), not GLES. Assert the Vulkan pick equals the GLES oracle at the same point — a
-    // divergence (blank/wrong/None) can only mean the Vulkan 1x1 readback path is broken.
+    // Phase C: pick-color reads back a single pixel through the *active* renderer — a 1x1 offscreen
+    // render of the scene, relocated so `pos` lands in it, plus a copy_framebuffer readback.
+    //
+    // The pick is a crop of the very scene the full-frame render draws, through the same renderer
+    // at the same `RenderTarget::Output`, so the picked pixel must equal the full frame's pixel at
+    // `pos`. That is the correctness proof for the 1x1 path (a blank/wrong/None result diverges),
+    // and it compares two genuinely independent paths through one renderer rather than leaning on a
+    // second renderer to be the reference.
     if VulkanRenderer::new().is_err() {
         eprintln!("skipping vulkan_picks_a_color_through_vulkan: no Vulkan device");
         return;
@@ -2099,51 +2103,82 @@ fn vulkan_picks_a_color_through_vulkan() {
     let scale = Scale::from(output.current_scale().fractional_scale());
     let pos = smithay::utils::Point::<i32, Physical>::from((OUT_W as i32 / 2, OUT_H as i32 / 2));
 
+    // The reference: the same scene, same renderer, same target, rendered whole.
+    let (frame, fw, fh) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // Probe the backdrop AND a pixel of the green window. The backdrop alone cannot catch a pick
+    // that reads the *wrong* position: it is a uniform field, so any offset still reads 46. The
+    // window pixel is far from the backdrop in value, so a mislocated pick shows up.
+    let green_at = (0..fh)
+        .flat_map(|y| (0..fw).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            let p = px(&frame, fw, x, y);
+            p[1] > 200 && p[0] < 50 && p[2] < 50
+        })
+        .expect("the mapped green window must be somewhere in the frame");
+    let probes = [
+        (pos, "backdrop"),
+        (
+            smithay::utils::Point::<i32, Physical>::from(green_at),
+            "window",
+        ),
+    ];
+
     let state = f.niri_state();
     state.niri.update_render_elements(Some(&output));
 
-    let vk_color = state
-        .backend
-        .headless()
-        .with_vulkan_renderer(|vk| {
-            crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
-                &state.niri,
-                vk,
-                &output,
-                pos,
-                scale,
-            )
-        })
-        .flatten();
+    for (probe, name) in probes {
+        let want = px(&frame, fw, probe.x, probe.y);
 
-    let gles_color = state
-        .backend
-        .with_primary_renderer(|g| {
-            crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
-                &state.niri,
-                g,
-                &output,
-                pos,
-                scale,
-            )
-        })
-        .flatten();
+        let vk_color = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
+                    &state.niri,
+                    vk,
+                    &output,
+                    probe,
+                    scale,
+                )
+            })
+            .flatten();
 
-    eprintln!("vulkan_picks_a_color_through_vulkan: vk={vk_color:?} gles={gles_color:?}");
-    let vk_color = vk_color.expect("Vulkan pick returned a color");
-    let gles_color = gles_color.expect("GLES pick returned a color");
+        // TEMPORARY (removed once GLES goes): the reference is the full-frame render, so the
+        // production-correct GLES pick must land on it too.
+        let gles_color = state
+            .backend
+            .with_primary_renderer(|g| {
+                crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
+                    &state.niri,
+                    g,
+                    &output,
+                    probe,
+                    scale,
+                )
+            })
+            .flatten();
 
-    // Same scene, same point: the owned renderer must match the GLES oracle within a rounding step.
-    // This is the correctness proof for the pick path — the 1x1 Vulkan offscreen render +
-    // copy_framebuffer readback + map_texture. A blank/wrong/None Vulkan result diverges here.
-    // (Client-texture compositing on Vulkan is proven separately by the whole-scene tests above.)
-    for i in 0..3 {
-        assert!(
-            (vk_color.rgb[i] - gles_color.rgb[i]).abs() < 2.0 / 255.0,
-            "channel {i} diverged: vk={:?} gles={:?}",
-            vk_color.rgb,
-            gles_color.rgb,
+        eprintln!(
+            "vulkan_picks_a_color_through_vulkan {name} at {probe:?}: vk={vk_color:?} \
+             gles={gles_color:?} frame={want:?}"
         );
+        let vk_color = vk_color.expect("Vulkan pick returned a color");
+        let gles_color = gles_color.expect("GLES pick returned a color");
+
+        // The picked pixel must be the pixel the full frame drew there, within a rounding step.
+        for (i, &w) in want.iter().enumerate().take(3) {
+            let got = (vk_color.rgb[i] * 255.0).round() as i32;
+            assert!(
+                (got - i32::from(w)).abs() <= 1,
+                "{name} channel {i}: pick says {got}, the full frame drew {w} at {probe:?}",
+            );
+            let gles_got = (gles_color.rgb[i] * 255.0).round() as i32;
+            assert!(
+                (gles_got - i32::from(w)).abs() <= 1,
+                "GLES CROSSCHECK {name} channel {i}: pick says {gles_got}, the frame drew {w}",
+            );
+        }
     }
 }
 
@@ -3214,18 +3249,19 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
 /// targets the coordinate-fold trap — GLES feeds `input_to_geo` the full-buffer UV (its `v_coords`
 /// maps the quad to `src` within the texture), while the Vulkan `postprocess.frag` feeds it
 /// quad-local `v_uv` + a separate `src_rect`, so the Vulkan draw must re-base `input_to_clip_geo`
-/// onto `v_uv` using the SAME draw-time `src`. We build a GLES and a Vulkan `XrayElement` sharing
-/// identical geometry / **cropped src (right half)** / identity `input_to_clip_geo` / nonzero
-/// `corner_radius`, over identical red|green offscreen content, and compare the composited output:
+/// onto `v_uv` using the SAME draw-time `src`. Build a Vulkan `XrayElement` with a **cropped src
+/// (right half)** / identity `input_to_clip_geo` / nonzero `corner_radius`, over red|green
+/// offscreen content, and assert the composited output directly:
 ///   - the sampled content is the GREEN right half (proves the cropped `src` is honored: a full src
 ///     would sample red on the left);
 ///   - only the RIGHT corners are rounded (the geometry maps to `[0.5,1]×[0,1]`); the top-LEFT
 ///     corner stays GREEN — this is the fold discriminator: dropping the fold would clip via raw
 ///     `v_uv ∈ [0,1]` and round the left corners too, cutting the top-left to transparent.
 ///
-/// GLES is the oracle; the two must agree at every probe. Offscreen-only, so it runs on lavapipe.
+/// The probes state what the fold must produce, so they hold without a second renderer to compare
+/// against. Offscreen-only, so it runs on lavapipe.
 #[test]
-fn vulkan_xray_matches_the_gles_oracle() {
+fn vulkan_xray_honors_the_cropped_src_fold() {
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3236,7 +3272,6 @@ fn vulkan_xray_matches_the_gles_oracle() {
 
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::render_to_vec;
-    use crate::render_helpers::shaders::Shaders;
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
     use crate::render_helpers::xray::XrayElement;
 
@@ -3244,7 +3279,7 @@ fn vulkan_xray_matches_the_gles_oracle() {
         return;
     };
     if VulkanRenderer::new().is_err() {
-        eprintln!("skipping vulkan_xray_matches_the_gles_oracle: no Vulkan");
+        eprintln!("skipping vulkan_xray_honors_the_cropped_src_fold: no Vulkan");
         return;
     }
 
@@ -3283,45 +3318,6 @@ fn vulkan_xray_matches_the_gles_oracle() {
     }
 
     let state = f.niri_state();
-
-    // GLES oracle.
-    let gles = state
-        .backend
-        .headless()
-        .with_primary_renderer(|g| {
-            let buffer = Rc::new(RefCell::new(EffectBuffer::new()));
-            {
-                let mut b = buffer.borrow_mut();
-                b.update_size(size, scale);
-                let elements = b.elements();
-                elements.clear();
-                elements.extend(build_edge());
-            }
-            buffer.borrow_mut().prepare(g, false);
-            let program = Shaders::get(g).and_then(|s| s.postprocess_and_clip.clone());
-            let elem = XrayElement::new_for_test(
-                buffer.clone(),
-                geometry,
-                src,
-                i2g,
-                clip_geo_size,
-                corner_radius,
-                scale.x as f32,
-                false,
-                bg,
-                program,
-            );
-            render_to_vec(
-                g,
-                size,
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                [elem].into_iter(),
-            )
-        })
-        .expect("GLES renderer present")
-        .expect("GLES xray render");
 
     // Vulkan (program = None → draws through render_postprocess).
     let vk = state
@@ -3372,35 +3368,22 @@ fn vulkan_xray_matches_the_gles_oracle() {
         ("top-right", S - 3, 2, false),
     ];
     for (name, x, y, want_green) in probes {
-        let gp = px(&gles, S, x, y);
         let vp = px(&vk, S, x, y);
-        assert_eq!(
-            green(gp),
-            green(vp),
-            "{name} ({x},{y}): green mismatch gles={gp:?} vk={vp:?}"
-        );
         if want_green {
-            assert!(green(gp), "{name} ({x},{y}) should be green, gles={gp:?}");
             assert!(green(vp), "{name} ({x},{y}) should be green, vk={vp:?}");
         } else {
-            assert!(
-                clipped(gp),
-                "{name} ({x},{y}) should be clipped, gles={gp:?}"
-            );
             assert!(clipped(vp), "{name} ({x},{y}) should be clipped, vk={vp:?}");
         }
     }
 
-    // No red anywhere: the cropped `src` sampled only the green right half on both renderers.
-    for (label, buf) in [("gles", &gles), ("vk", &vk)] {
-        let red = (0..S * S)
-            .filter(|i| {
-                let p = px(buf, S, i % S, i / S);
-                p[0] > 120 && p[1] < 80 && p[3] > 120
-            })
-            .count();
-        assert_eq!(red, 0, "{label}: cropped src leaked red (count {red})");
-    }
+    // No red anywhere: the cropped `src` sampled only the green right half.
+    let red = (0..S * S)
+        .filter(|i| {
+            let p = px(&vk, S, i % S, i / S);
+            p[0] > 120 && p[1] < 80 && p[3] > 120
+        })
+        .count();
+    assert_eq!(red, 0, "cropped src leaked red (count {red})");
 
     eprintln!("vulkan_xray_matches_the_gles_oracle: ok (fold + cropped src match the GLES oracle)");
 }
@@ -3524,43 +3507,6 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
     }
 }
 
-/// Composite `output` through the fixture's GLES oracle renderer (the `with_primary_renderer`
-/// path), returning the tight `Abgr8888` readback and its dimensions. The GLES sibling of
-/// [`render_output_vulkan`], for oracle comparisons of the full `Niri::render_to_vec` scene.
-fn render_output_gles(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
-    let state = f.niri_state();
-    state
-        .backend
-        .headless()
-        .with_primary_renderer(|g| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(output));
-
-            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
-            let size = output.current_transform().transform_size(size);
-            let scale = Scale::from(output.current_scale().fractional_scale());
-
-            let ctx = RenderCtx {
-                renderer: g,
-                target: RenderTarget::ScreenCapture,
-                xray: None,
-            };
-            let elements = niri.render_to_vec(ctx, output, false);
-            let elements = elements.iter().rev();
-            let pixels = render_to_vec(
-                g,
-                size,
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elements,
-            )?;
-            Ok((pixels, size.w, size.h))
-        })
-        .expect("headless backend must hold a GLES renderer")
-        .expect("compositing through GLES must not error")
-}
-
 /// A green window with a corner radius + `clip-to-geometry`, so the tile clips it to a rounded
 /// rectangle — exercising [`ClippedSurfaceRenderElement`]. Mirrors [`window_fixture`] but installs
 /// a matches-all window rule. `None` (skip) when there is no Vulkan device.
@@ -3676,27 +3622,17 @@ fn vulkan_clips_a_window_to_rounded_geometry() {
     };
 
     let (vk, vw, vh) = render_output_vulkan(&mut f, &output);
-    let (gl, gw, gh) = render_output_gles(&mut f, &output);
-    assert_eq!((vw, vh), (gw, gh), "readback dimensions differ");
-
-    // Print both before asserting, so a failure shows the oracle side too.
-    let gbox = check("gles", &gl, gw, gh);
     let vbox = check("vulkan", &vk, vw, vh);
 
-    // Oracle agreement: the clipped window lands at the same place and size on both renderers (a
-    // few px of AA slack on the rounded edges).
-    for (v, g) in [
-        (vbox.0, gbox.0),
-        (vbox.1, gbox.1),
-        (vbox.2, gbox.2),
-        (vbox.3, gbox.3),
-    ] {
-        assert!(
-            (v - g).abs() <= 2,
-            "clipped window bbox disagrees with the GLES oracle: vulkan={vbox:?} gles={gbox:?}"
-        );
-    }
-    eprintln!("vulkan_clips_a_window_to_rounded_geometry: bbox vulkan={vbox:?} gles={gbox:?}");
+    // Only the corners were cut, so the green bbox still spans the window's own size. Pins the
+    // clip to the window's geometry -- an over-eager clip (or a rounding radius applied to the
+    // wrong space) shrinks it.
+    let (bw, bh) = (vbox.2 - vbox.0 + 1, vbox.3 - vbox.1 + 1);
+    assert!(
+        (bw - WIN as i32).abs() <= 2 && (bh - WIN as i32).abs() <= 2,
+        "clipped window bbox {vbox:?} is {bw}x{bh}, not the window's {WIN}x{WIN}"
+    );
+    eprintln!("vulkan_clips_a_window_to_rounded_geometry: bbox {vbox:?} ({bw}x{bh})");
 }
 
 /// A clipped window must render correctly through an outer placement wrapper. The overview draws
