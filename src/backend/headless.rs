@@ -28,10 +28,13 @@ use crate::utils::{get_monotonic_time, logical_output};
 /// GLES renderer or — behind `--renderer=vulkan` + the `vulkan` feature — the owned Vulkan one.
 ///
 /// The `Vulkan` variant keeps a GLES renderer **alongside** the Vulkan one, mirroring the Tty
-/// backend (where the GLES `gpu_manager` coexists with `vulkan_renderer`). Snapshot-based
-/// animations — the resize crossfade in particular — capture through the GLES renderer even on a
-/// Vulkan session (`with_primary_renderer`), so a Vulkan-only headless backend could never
-/// exercise or test that path.
+/// backend (where the GLES `gpu_manager` coexists with `vulkan_renderer`). That coexistence is on
+/// its way out (slice 8): the snapshot-based animations that used to bake through GLES here — the
+/// resize crossfade in particular — are Vulkan-native now. What still holds it up is the set of
+/// `with_primary_renderer` call sites listed in `docs/fork/renderer-gaps.md`.
+///
+/// Note the EGL display this drags in is also what keeps the suite from running on lavapipe (Mesa
+/// redirects Zink's EGL and it fails to pick a pdev); dropping the GLES half is what frees it.
 #[allow(clippy::large_enum_variant)]
 enum HeadlessRenderer {
     Gles(GlesRenderer),

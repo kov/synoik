@@ -421,7 +421,11 @@ impl Mapped {
     }
 
     /// Renders a snapshot of the window without popups.
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> LayoutElementRenderSnapshot {
+    ///
+    /// `renderer` is `None` on a Vulkan session, which bakes no GLES textures: `contents` is left
+    /// empty and only the renderer-neutral parts (size, block-out policy, block-out buffer) are
+    /// filled in. See [`Self::store_animation_snapshot_neutral`] for why that is enough.
+    fn render_snapshot(&self, renderer: Option<&mut GlesRenderer>) -> LayoutElementRenderSnapshot {
         let _span = tracy_client::span!("Mapped::render_snapshot");
 
         let size = self.size().to_f64();
@@ -439,8 +443,10 @@ impl Mapped {
 
         let mut contents = vec![];
 
-        let surface = self.toplevel().wl_surface();
-        render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
+        if let Some(renderer) = renderer {
+            let surface = self.toplevel().wl_surface();
+            render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
+        }
 
         RenderSnapshot {
             contents,
@@ -468,27 +474,32 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        scale: Scale<f64>,
-        capture_neutral: bool,
-    ) {
-        let snapshot = self.render_snapshot(renderer);
-        // On a Vulkan session the resize crossfade has no GLES renderer at render time, so capture
-        // a renderer-neutral CPU copy of the pre-resize contents now, to upload to a VkTexture
-        // later.
-        if capture_neutral {
-            snapshot.capture_neutral(renderer, scale);
-        }
-        self.animation_snapshot = Some(snapshot);
+    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
+        self.animation_snapshot = Some(self.render_snapshot(Some(renderer)));
+    }
+
+    /// Store the animation snapshot without baking the window contents into GLES textures — the
+    /// Vulkan session's counterpart to [`Self::store_animation_snapshot`].
+    ///
+    /// A Vulkan session never samples `contents`: its only reader is `RenderSnapshot::texture`,
+    /// reached solely behind the `try_as_gles` in `Tile::render` that yields `None` there. What it
+    /// does need is `neutral`, filled right after this by [`Self::capture_neutral_vulkan`].
+    ///
+    /// The snapshot struct itself is still load-bearing, which is easy to miss:
+    /// `capture_neutral_vulkan` bails unless `animation_snapshot` is already `Some`, and
+    /// `Tile::update_window` only starts a resize animation when `take_animation_snapshot`
+    /// returns one. Skipping this call — rather than just its GLES bake — silently costs the
+    /// crossfade.
+    pub fn store_animation_snapshot_neutral(&mut self) {
+        self.animation_snapshot = Some(self.render_snapshot(None));
     }
 
     /// Captures the stored animation snapshot's neutral CPU buffer through the owned Vulkan
-    /// renderer (the self-hosting path — no GLES). Call after [`Self::store_animation_snapshot`]
-    /// has stored the snapshot. Returns `true` if the neutral buffer is now populated (either just
-    /// captured or already present), `false` if capture failed — in which case the cell is left
-    /// uninitialized so the caller can fall back to the GLES capture.
+    /// renderer (the self-hosting path — no GLES). Call after
+    /// [`Self::store_animation_snapshot_neutral`] has stored the snapshot. Returns `true` if the
+    /// neutral buffer is now populated (either just captured or already present), `false` if
+    /// capture failed — in which case the crossfade is skipped and the plain window renders
+    /// instead.
     #[cfg(feature = "vulkan")]
     pub fn capture_neutral_vulkan(
         &self,
@@ -512,20 +523,6 @@ impl Mapped {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Fallback for [`Self::capture_neutral_vulkan`]: capture the stored snapshot's neutral buffer
-    /// through GLES (rendering the already-baked `contents`), so the resize crossfade always has a
-    /// prev texture even if the Vulkan capture was unavailable.
-    #[cfg(feature = "vulkan")]
-    pub fn capture_animation_snapshot_neutral_gles(
-        &self,
-        renderer: &mut GlesRenderer,
-        scale: Scale<f64>,
-    ) {
-        if let Some(snapshot) = self.animation_snapshot.as_ref() {
-            snapshot.capture_neutral(renderer, scale);
         }
     }
 

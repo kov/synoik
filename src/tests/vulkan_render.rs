@@ -1662,12 +1662,14 @@ fn vulkan_renders_the_top_panel() {
 /// maximizing/restoring" bug: map a window, issue a niri-driven (animated) resize, commit the new
 /// size, and composite mid-animation — the frame must show window content with no pure-red fill.
 ///
-/// This exercises the resize path end-to-end: the pre-resize neutral snapshot is now captured
-/// through the owned Vulkan renderer (`capture_neutral_vulkan`), then composited through Vulkan.
+/// This exercises the resize path end-to-end: the pre-resize neutral snapshot is captured through
+/// the owned Vulkan renderer (`capture_neutral_vulkan`), then composited through Vulkan.
 /// A failed neutral capture falls through to `!pushed_resize` → the red placeholder, so `red < 100`
-/// discriminates the crossfade path. (Because a broken Vulkan capture would be masked by the GLES
-/// fallback here, `vulkan_captures_the_resize_neutral_through_vulkan` proves the Vulkan path
-/// directly.)
+/// discriminates the crossfade path.
+///
+/// There is no GLES fallback behind this any more, so the assert now bites directly on the Vulkan
+/// path: it fails if `store_animation_snapshot_neutral` stops storing the snapshot struct, which is
+/// the silent way to lose the crossfade (verified by negative control).
 #[test]
 fn vulkan_resize_animation_is_not_a_red_rect() {
     use niri_config::animations::{Curve, EasingParams, Kind};

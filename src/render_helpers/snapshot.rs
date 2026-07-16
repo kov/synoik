@@ -2,13 +2,16 @@ use std::cell::OnceCell;
 
 use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
+#[cfg(feature = "vulkan")]
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::memory::MemoryBuffer;
-use super::{encompassing_geo, render_to_encompassing_texture, render_to_vec, ToRenderElement};
+#[cfg(feature = "vulkan")]
+use super::{encompassing_geo, render_to_vec};
+use super::{render_to_encompassing_texture, ToRenderElement};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 /// Snapshot of a render.
@@ -46,10 +49,11 @@ pub struct RenderSnapshot<C, B> {
     pub blocked_out_texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
 
     /// Non-blocked-out contents rendered into a renderer-neutral CPU buffer, captured eagerly at
-    /// snapshot time (see [`RenderSnapshot::capture_neutral`]). The Vulkan resize crossfade has no
-    /// GLES renderer in its render path to lazily rasterize the GLES `texture` above, so it
-    /// uploads this buffer to a `VkTexture` instead. `(buffer, encompassing geo)`; `None`
-    /// unless captured.
+    /// snapshot time through the owned Vulkan renderer (`Mapped::capture_neutral_vulkan`). The
+    /// Vulkan resize crossfade has no GLES renderer in its render path to lazily rasterize the
+    /// GLES `texture` above, so it uploads this buffer to a `VkTexture` instead. `(buffer,
+    /// encompassing geo)`; `None` unless captured — a Vulkan session leaves `contents` empty
+    /// and fills only this.
     pub neutral: OnceCell<Option<(MemoryBuffer, Rectangle<i32, Physical>)>>,
 }
 
@@ -114,56 +118,6 @@ where
     EC: RenderElement<GlesRenderer>,
     EB: RenderElement<GlesRenderer>,
 {
-    /// Render the non-blocked-out contents into a renderer-neutral CPU buffer, once. Called at
-    /// capture time (when a GLES renderer is still on hand, even on a Vulkan session) so the
-    /// Vulkan resize crossfade — which has no GLES renderer at render time — can later upload it
-    /// to a `VkTexture`. Mirrors the `else` branch of [`Self::texture`], minus the target-dependent
-    /// blocked-out / blocked-out-bg variants (unwired on Vulkan; the crossfade uses plain
-    /// contents).
-    pub fn capture_neutral(&self, renderer: &mut GlesRenderer, scale: Scale<f64>) {
-        self.neutral.get_or_init(|| {
-            let _span = tracy_client::span!("RenderSnapshot::capture_neutral");
-
-            let elements: Vec<_> = self
-                .contents
-                .iter()
-                .map(|baked| {
-                    baked.to_render_element(Point::from((0., 0.)), scale, 1., Kind::Unspecified)
-                })
-                .collect();
-
-            let geo = encompassing_geo(scale, elements.iter());
-            if geo.size.is_empty() {
-                return None;
-            }
-
-            let relocated = elements.iter().rev().map(|ele| {
-                RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
-            });
-
-            let fourcc = Fourcc::Abgr8888;
-            match render_to_vec(
-                renderer,
-                geo.size,
-                scale,
-                Transform::Normal,
-                fourcc,
-                relocated,
-            ) {
-                Ok(data) => {
-                    let buffer_size = geo.size.to_logical(1).to_buffer(1, Transform::Normal);
-                    let buffer =
-                        MemoryBuffer::new(data, fourcc, buffer_size, scale, Transform::Normal);
-                    Some((buffer, geo))
-                }
-                Err(err) => {
-                    warn!("error capturing neutral snapshot buffer: {err:?}");
-                    None
-                }
-            }
-        });
-    }
-
     pub fn texture(
         &self,
         ctx: RenderCtx<GlesRenderer>,
