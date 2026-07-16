@@ -24,10 +24,11 @@ use crate::animation::{Animation, Clock};
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
-use crate::render_helpers::dual_texture::DualRoundedTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
+use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -218,7 +219,7 @@ niri_render_elements! {
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
         // The wallpaper in a workspace thumbnail.
-        RoundedTexture = DualRoundedTextureRenderElement,
+        RoundedTexture = RoundedTextureRenderElement<VkTexture>,
     }
 }
 
@@ -2037,7 +2038,7 @@ impl<W: LayoutElement> Monitor<W> {
             let mut wallpapered = false;
             if let Some(wallpaper) = wallpaper {
                 let radius = 6. / strip.scale;
-                if let Some(elem) = wallpaper.render_dual(
+                if let Some(elem) = wallpaper.render(
                     ctx.renderer,
                     ws.view_size(),
                     radius,

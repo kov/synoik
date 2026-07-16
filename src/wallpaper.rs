@@ -15,11 +15,9 @@ use std::path::{Path, PathBuf};
 use image::ImageReader;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::gnome::{BackgroundOptions, BackgroundSettings};
-use crate::render_helpers::dual_texture::DualRoundedTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -33,11 +31,8 @@ const MAX_TEXTURE_EDGE: u32 = 8192;
 pub struct Wallpaper {
     picture: Option<PathBuf>,
     image: Option<Image>,
-    /// Lazily uploaded from `image`; the outer `Option` is "not tried yet",
-    /// the inner one records a failed upload so we don't retry every frame.
-    texture: RefCell<Option<Option<TextureBuffer<GlesTexture>>>>,
-    /// The same lazy upload for the owned Vulkan renderer, which can't sample the `GlesTexture`
-    /// above; same double-`Option` "not tried yet" / "failed, don't retry" encoding.
+    /// Lazily uploaded from `image`; the outer `Option` is "not tried yet", the inner one records
+    /// a failed upload so we don't retry every frame.
     vk_texture: RefCell<Option<Option<TextureBuffer<VkTexture>>>>,
 }
 
@@ -54,7 +49,6 @@ impl Wallpaper {
         if settings.picture != self.picture {
             self.picture = settings.picture.clone();
             self.image = self.picture.as_deref().and_then(decode);
-            self.texture.replace(None);
             self.vk_texture.replace(None);
         }
 
@@ -71,69 +65,18 @@ impl Wallpaper {
         }
     }
 
-    /// Returns the wallpaper covering a `view_size` workspace, corners
-    /// rounded by `corner_radius` (logical units; 0 disables), or `None` when
-    /// there's no usable picture.
-    pub fn render(
-        &self,
-        renderer: &mut GlesRenderer,
-        view_size: Size<f64, Logical>,
-        corner_radius: f64,
-        scale: Scale<f64>,
-    ) -> Option<RoundedTextureRenderElement> {
-        let image = self.image.as_ref()?;
-
-        let mut texture = self.texture.borrow_mut();
-        let buffer = texture
-            .get_or_insert_with(|| upload(renderer, image))
-            .as_ref()?
-            .clone();
-
-        // Texture scale is 1, so buffer logical size == pixel size.
-        let src = zoom_crop(buffer.logical_size(), view_size);
-        let elem = TextureRenderElement::from_texture_buffer(
-            buffer,
-            (0., 0.),
-            1.,
-            Some(src),
-            Some(view_size),
-            Kind::Unspecified,
-        );
-        Some(RoundedTextureRenderElement::new(
-            renderer,
-            elem,
-            corner_radius,
-            Rectangle::from_size(view_size),
-            scale,
-        ))
-    }
-
-    /// Renderer-agnostic entry point: produces a wallpaper element for whichever renderer backs
-    /// `renderer`. On GLES it samples the baked `GlesTexture`; on the owned Vulkan renderer it
-    /// uploads the decoded picture to a `VkTexture` (the `GlesTexture` can't be sampled there), so
-    /// the wallpaper draws on Vulkan sessions instead of degrading to the solid background color.
-    /// Returns `None` (letting the caller draw the solid backstop) when there's no usable picture
-    /// or the upload fails — never a wrong-renderer element.
-    pub fn render_dual<R: NiriRenderer>(
+    /// Returns the wallpaper covering a `view_size` workspace, corners rounded by `corner_radius`
+    /// (logical units; 0 disables). `None` — letting the caller draw the solid backstop — when
+    /// there is no usable picture or the upload fails.
+    pub fn render<R: NiriRenderer>(
         &self,
         renderer: &mut R,
         view_size: Size<f64, Logical>,
         corner_radius: f64,
         scale: Scale<f64>,
-    ) -> Option<DualRoundedTextureRenderElement> {
-        if let Some(gles) = renderer.try_as_gles_renderer() {
-            return self
-                .render(gles, view_size, corner_radius, scale)
-                .map(DualRoundedTextureRenderElement::Gles);
-        }
-
-        if let Some(vk) = renderer.try_as_vulkan_renderer() {
-            return self
-                .render_vulkan(vk, view_size, corner_radius, scale)
-                .map(DualRoundedTextureRenderElement::Vulkan);
-        }
-
-        None
+    ) -> Option<RoundedTextureRenderElement<VkTexture>> {
+        let vk = renderer.try_as_vulkan_renderer()?;
+        self.render_vulkan(vk, view_size, corner_radius, scale)
     }
 
     /// The Vulkan sibling of [`render`](Self::render): uploads the decoded picture to a `VkTexture`
@@ -171,26 +114,6 @@ impl Wallpaper {
             scale,
         ))
     }
-}
-
-fn upload(renderer: &mut GlesRenderer, image: &Image) -> Option<TextureBuffer<GlesTexture>> {
-    let opaque_regions = if image.opaque {
-        vec![Rectangle::from_size(image.size)]
-    } else {
-        Vec::new()
-    };
-    TextureBuffer::from_memory(
-        renderer,
-        &image.data,
-        Fourcc::Abgr8888,
-        image.size,
-        false,
-        1.,
-        Transform::Normal,
-        opaque_regions,
-    )
-    .map_err(|err| warn!("error uploading wallpaper texture: {err}"))
-    .ok()
 }
 
 fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<TextureBuffer<VkTexture>> {
