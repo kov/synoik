@@ -10,8 +10,6 @@ The defaults however should work fine for most distributions.
 > Some features are meant only for development use.
 > For example, one of the features enables collection of profiling data into a memory buffer that will grow indefinitely until you run out of memory.
 
-The `niri-visual-tests` sub-crate/binary is development-only and should not be packaged.
-
 The recommended way to package niri is so that it runs as a standalone desktop session.
 To do that, put files into the correct directories according to this table.
 
@@ -60,8 +58,6 @@ If you run into this problem, you may need to limit not just the Rust test harne
 $ export RAYON_NUM_THREADS=2
 ...proceed to run cargo test, perhaps with --test-threads=2
 ```
-
-Don't forget to exclude the development-only `niri-visual-tests` crate when running tests.
 
 Some tests require surfaceless EGL to be available at test time.
 If this is problematic, you can skip them like so:

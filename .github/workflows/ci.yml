@@ -36,10 +36,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build tests
-        run: cargo test --no-run --all --exclude niri-visual-tests
+        run: cargo test --no-run --all
 
       - name: Test
-        run: cargo test --all --exclude niri-visual-tests -- --nocapture
+        run: cargo test --all -- --nocapture
 
   build:
     strategy:
@@ -135,34 +135,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build tests
-        run: cargo test --no-run --all --exclude niri-visual-tests --release
+        run: cargo test --no-run --all --release
 
       - name: Test
-        run: cargo test --all --exclude niri-visual-tests --release
-
-  visual-tests:
-    strategy:
-      fail-fast: false
-
-    name: visual tests
-    runs-on: ubuntu-24.04
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          show-progress: false
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ${{ env.DEPS_APT }} libadwaita-1-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --package niri-visual-tests
+        run: cargo test --all --release
 
   msrv:
     strategy:
@@ -179,7 +155,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ${{ env.DEPS_APT }} libadwaita-1-dev
+          sudo apt-get install -y ${{ env.DEPS_APT }}
 
       - uses: dtolnay/rust-toolchain@1.85.0
 
@@ -202,7 +178,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ${{ env.DEPS_APT }} libadwaita-1-dev
+          sudo apt-get install -y ${{ env.DEPS_APT }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -240,7 +216,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo dnf update -y
-          sudo dnf install -y ${{ env.DEPS_DNF }} libadwaita-devel
+          sudo dnf install -y ${{ env.DEPS_DNF }}
 
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all

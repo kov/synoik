@@ -1409,21 +1409,21 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
-        // The open / alpha animations render the tile through a GLES offscreen. On a non-GLES
-        // renderer (the owned Vulkan one) they degrade: skip the offscreen effect and fall through
-        // to the plain render below, so the window still shows (just without the animation).
+        // The open / alpha animations render the tile through an offscreen. If that fails they
+        // degrade: skip the offscreen effect and fall through to the plain render below, so the
+        // window still shows (just without the animation).
         if let Some(open) = &self.open_animation {
-            if let Some(mut gctx) = ctx.try_as_gles() {
+            if let Some(mut vctx) = ctx.try_as_vulkan() {
                 let mut elements = Vec::new();
                 self.render_inner(
-                    gctx.r(),
+                    vctx.r(),
                     Point::new(0., 0.),
                     xray_pos,
                     focus_ring,
                     &mut |elem| elements.push(elem),
                 );
-                match open.render(
-                    gctx.renderer,
+                match open.render_vulkan(
+                    vctx.renderer,
                     &elements,
                     self.animated_tile_size(),
                     location,
@@ -1436,69 +1436,14 @@ impl<W: LayoutElement> Tile<W> {
                         pushed = true;
                     }
                     Err(err) => {
-                        warn!("error rendering window opening animation: {err:?}");
-                    }
-                }
-            }
-
-            if !pushed {
-                if let Some(mut vctx) = ctx.try_as_vulkan() {
-                    let mut elements = Vec::new();
-                    self.render_inner(
-                        vctx.r(),
-                        Point::new(0., 0.),
-                        xray_pos,
-                        focus_ring,
-                        &mut |elem| elements.push(elem),
-                    );
-                    match open.render_vulkan(
-                        vctx.renderer,
-                        &elements,
-                        self.animated_tile_size(),
-                        location,
-                        scale,
-                        tile_alpha,
-                    ) {
-                        Ok((elem, data)) => {
-                            self.window().set_offscreen_data(Some(data));
-                            push(elem.into());
-                            pushed = true;
-                        }
-                        Err(err) => {
-                            warn!("error rendering window opening animation on Vulkan: {err:?}");
-                        }
+                        warn!("error rendering window opening animation on Vulkan: {err:?}");
                     }
                 }
             }
         } else if let Some(alpha) = &self.alpha_animation {
-            // Render the tile into an offscreen and composite it at the animated alpha. Works on
-            // GLES and, via a VkTexture offscreen, on the owned Vulkan renderer; falls through to
-            // the plain render below if neither offscreen renders.
-            if let Some(mut gctx) = ctx.try_as_gles() {
-                let mut elements = Vec::new();
-                self.render_inner(
-                    gctx.r(),
-                    Point::new(0., 0.),
-                    xray_pos,
-                    focus_ring,
-                    &mut |elem| elements.push(elem),
-                );
-                match alpha.offscreen.render(gctx.renderer, scale, &elements) {
-                    Ok((elem, _sync, data)) => {
-                        let offset = elem.offset();
-                        let elem = elem.with_alpha(tile_alpha).with_offset(location + offset);
-
-                        self.window().set_offscreen_data(Some(data));
-                        push(DualOffscreenRenderElement::Gles(elem).into());
-                        pushed = true;
-                    }
-                    Err(err) => {
-                        warn!("error rendering tile to offscreen for alpha animation: {err:?}");
-                    }
-                }
-            }
-
-            if !pushed {
+            // Render the tile into a VkTexture offscreen and composite it at the animated alpha;
+            // falls through to the plain render below if the offscreen does not render.
+            {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     let mut elements = Vec::new();
                     self.render_inner(

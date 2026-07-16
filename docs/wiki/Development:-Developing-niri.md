@@ -40,10 +40,6 @@ It also usually helps to run the randomized tests for a longer period, so that t
 env RUN_SLOW_TESTS=1 PROPTEST_CASES=200000 PROPTEST_MAX_GLOBAL_REJECTS=200000 RUST_BACKTRACE=1 cargo test --release --all
 ```
 
-### Visual Tests
-
-The `niri-visual-tests` sub-crate is a GTK application that runs hard-coded test cases so that you can visually check that they look right. It uses mock windows with the real layout and rendering code. It is especially helpful when working on animations.
-
 ## Profiling
 
 We have integration with the [Tracy](https://github.com/wolfpld/tracy) profiler which you can enable by building niri with a feature flag:

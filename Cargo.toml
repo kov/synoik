@@ -2,7 +2,6 @@
 members = [
     "niri-config",
     "niri-ipc",
-    "niri-visual-tests",
     "niri-vk",
 ]
 

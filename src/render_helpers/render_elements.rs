@@ -101,46 +101,6 @@ macro_rules! niri_render_elements {
             }
         }
 
-        impl smithay::backend::renderer::element::RenderElement<smithay::backend::renderer::gles::GlesRenderer>
-            for $($name_R<smithay::backend::renderer::gles::GlesRenderer>)? $($name_no_R)?
-        {
-            fn capture_framebuffer(
-                &self,
-                frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                cache: &smithay::utils::user_data::UserDataMap,
-            ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<smithay::backend::renderer::gles::GlesRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
-                    })+
-                }
-            }
-
-            fn draw(
-                &self,
-                frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                cache: Option<&smithay::utils::user_data::UserDataMap>,
-            ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<smithay::backend::renderer::gles::GlesRenderer>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                    })+
-                }
-            }
-
-            fn underlying_storage(&self, renderer: &mut smithay::backend::renderer::gles::GlesRenderer) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
-                match self {
-                    $($name::$variant(elem) => elem.underlying_storage(renderer)),+
-                }
-            }
-        }
-
         impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>
             for $($name_R<$crate::render_helpers::vulkan::VulkanRenderer>)? $($name_no_R)?
         {

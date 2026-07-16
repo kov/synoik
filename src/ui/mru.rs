@@ -172,9 +172,6 @@ struct Inner {
     backdrop_buffers: RefCell<HashMap<Output, SolidColorBuffer>>,
 
     /// Offscreen buffer for the closing fade animation on the main output.
-    offscreen: OffscreenBuffer,
-
-    /// The same, for the owned Vulkan renderer (whose `VkTexture` offscreen is a distinct type).
     offscreen_vk: OffscreenBuffer<VkTexture>,
 }
 
@@ -987,7 +984,6 @@ impl WindowMruUi {
             output,
             scope_panel: Default::default(),
             backdrop_buffers: Default::default(),
-            offscreen: OffscreenBuffer::default(),
             offscreen_vk: OffscreenBuffer::default(),
         };
         inner.view_pos = ViewPos::Static(inner.compute_view_pos());
@@ -1192,40 +1188,20 @@ impl WindowMruUi {
         if *output == inner.output && alpha < 1. {
             let scale = Scale::from(output.current_scale().fractional_scale());
 
-            if let Some(mut gctx) = ctx.try_as_gles() {
+            if let Some(mut vctx) = ctx.try_as_vulkan() {
                 let mut elems = Vec::new();
-                inner.render(niri, gctx.r(), &mut |elem| elems.push(elem));
+                inner.render(niri, vctx.r(), &mut |elem| elems.push(elem));
                 elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
 
-                match inner.offscreen.render(gctx.renderer, scale, &elems) {
+                match inner.offscreen_vk.render(vctx.renderer, scale, &elems) {
                     Ok((elem, _sync, _data)) => {
                         push(WindowMruUiRenderElement::Offscreen(
-                            DualOffscreenRenderElement::Gles(elem.with_alpha(alpha)),
+                            DualOffscreenRenderElement::Vulkan(elem.with_alpha(alpha)),
                         ));
                         pushed_offscreen = true;
                     }
                     Err(err) => {
-                        warn!("error rendering MRU to offscreen for fade-out: {err:?}");
-                    }
-                }
-            }
-
-            if !pushed_offscreen {
-                if let Some(mut vctx) = ctx.try_as_vulkan() {
-                    let mut elems = Vec::new();
-                    inner.render(niri, vctx.r(), &mut |elem| elems.push(elem));
-                    elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
-
-                    match inner.offscreen_vk.render(vctx.renderer, scale, &elems) {
-                        Ok((elem, _sync, _data)) => {
-                            push(WindowMruUiRenderElement::Offscreen(
-                                DualOffscreenRenderElement::Vulkan(elem.with_alpha(alpha)),
-                            ));
-                            pushed_offscreen = true;
-                        }
-                        Err(err) => {
-                            warn!("error rendering MRU to Vulkan offscreen for fade-out: {err:?}");
-                        }
+                        warn!("error rendering MRU to Vulkan offscreen for fade-out: {err:?}");
                     }
                 }
             }
