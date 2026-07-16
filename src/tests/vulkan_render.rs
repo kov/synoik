@@ -1727,22 +1727,61 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
         "expected an ongoing resize animation to composite"
     );
 
-    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
-
     let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40;
-    let red = (0..w * h)
-        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+    let mut mid_green = Vec::new();
+
+    // Check every target the crossfade is supposed to reach, not just the default one. The
+    // `blocked_out` gate in `Tile::render` is per-target, so a regression that widened it would
+    // blank the crossfade in casts while an Output/ScreenCapture-only check stayed green — the
+    // positive half of the pair `vulkan_blocked_out_window_does_not_leak_while_resizing` forms.
+    for target in [
+        RenderTarget::Output,
+        RenderTarget::ScreenCapture,
+        RenderTarget::Screencast,
+    ] {
+        let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, target);
+        let red = (0..w * h)
+            .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+            .count();
+        let green = (0..w * h)
+            .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+            .count();
+        eprintln!(
+            "vulkan_resize_animation_is_not_a_red_rect: {target:?}: {green} green px, {red} red px"
+        );
+        assert!(
+            green > 0,
+            "no window content in the {target:?} resize frame"
+        );
+        assert!(
+            red < 100,
+            "resize rendered the red placeholder ({red} red px) instead of the cross-fade \
+             on {target:?}"
+        );
+        mid_green.push((target, green));
+    }
+
+    // `red < 100` only discriminates while `blocked_out` is false: a regression that widened it
+    // skips the crossfade AND the red placeholder, falling through to a plain render that is still
+    // green and still red-free. What gives it away is the size — the crossfade shows the window
+    // fading from its OLD geometry, while the fall-through draws it at its settled one. Measured:
+    // 40k green mid-crossfade, vs 131k for the fall-through, which is exactly the settled count.
+    f.niri_complete_animations();
+    let (settled, w, h) = render_output_vulkan(&mut f, &output);
+    let green_settled = (0..w * h)
+        .filter(|i| is_green(px(&settled, w, i % w, i / w)))
         .count();
-    let green = (0..w * h)
-        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
-        .count();
-    eprintln!("vulkan_resize_animation_is_not_a_red_rect: {green} green px, {red} red px");
-    assert!(green > 0, "no window content in the resize frame");
-    assert!(
-        red < 100,
-        "resize rendered the red placeholder ({red} red px) instead of the cross-fade"
-    );
+    eprintln!("vulkan_resize_animation_is_not_a_red_rect: settled {green_settled} green px");
+    assert!(green_settled > 0, "the settled window is absent");
+
+    for (target, green) in mid_green {
+        assert!(
+            green < green_settled / 2,
+            "the {target:?} resize frame is as large as the settled window ({green} vs \
+             {green_settled}) — the crossfade was skipped and the plain window rendered instead"
+        );
+    }
 }
 
 /// The resize crossfade's pre-resize neutral buffer is captured through the owned Vulkan renderer
@@ -2276,6 +2315,91 @@ fn vulkan_renders_a_window_mid_open_animation() {
         green_early < green_settled / 2,
         "the open animation did not fade the window in on Vulkan (degraded to a plain render?): \
          early={green_early} settled={green_settled}"
+    );
+}
+
+/// The tile **alpha** animation (window movement fades, interactive move) renders the tile into an
+/// offscreen and composites it at the animated alpha. It is the open animation's sibling one branch
+/// down in `Tile::render`, and it fails the same silent way: `alpha.offscreen_vk.render` erroring
+/// only `warn!`s and leaves `pushed = false` (`tile.rs:1618`), so the tile falls through to the
+/// plain render **at full alpha** — the window is still there, fully opaque, and nothing errors.
+///
+/// Settle the window, then fade it toward invisible and composite mid-fade: the faded frame must be
+/// markedly less green than the settled one. A fall-through to the plain render composites full
+/// alpha even mid-fade, so this fails if the Vulkan offscreen arm stops being reached.
+#[test]
+fn vulkan_renders_a_tile_mid_alpha_animation() {
+    use niri_config::animations::{Curve, EasingParams, Kind};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let count_green = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_green(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    // Settled: full alpha, the whole window is opaque green.
+    let (settled, w, h) = render_output_vulkan(&mut f, &output);
+    let green_settled = assert_window_and_background(&settled, w, h);
+
+    // Fade the tile out over 1s, linearly, and stop half way.
+    let anim = niri_config::Animation {
+        off: false,
+        kind: Kind::Easing(EasingParams {
+            duration_ms: 1000,
+            curve: Curve::Linear,
+        }),
+    };
+    f.niri_state()
+        .niri
+        .layout
+        .active_workspace_mut()
+        .expect("active workspace")
+        .tiles_mut()
+        .next()
+        .expect("a tile")
+        .animate_alpha(1., 0., anim);
+
+    let now = f.niri().clock.now_unadjusted();
+    f.niri()
+        .clock
+        .set_unadjusted(now + std::time::Duration::from_millis(500));
+    f.niri().advance_animations();
+    assert!(
+        f.niri().layout.are_animations_ongoing(Some(&output)),
+        "expected the alpha animation to still be running at the half-way point"
+    );
+
+    let (mid, _, _) = render_output_vulkan(&mut f, &output);
+    let green_mid = count_green(&mid, w, h);
+
+    // Fully-green pixels alone can't tell a fade from a disappearance: both score 0. So also count
+    // pixels merely *dominated* by green — a half-faded green tile over the backdrop still is, a
+    // vanished tile is not. The fade must dim the window without removing it.
+    let is_greenish = |p: [u8; 4]| p[1] as i32 > p[0] as i32 + 40 && p[1] as i32 > p[2] as i32 + 40;
+    let greenish_mid = (0..w * h)
+        .filter(|i| is_greenish(px(&mid, w, i % w, i / w)))
+        .count();
+
+    eprintln!(
+        "vulkan_renders_a_tile_mid_alpha_animation: green settled={green_settled} mid={green_mid} \
+         greenish_mid={greenish_mid}"
+    );
+    assert!(green_settled > 0, "the settled window is absent");
+    assert!(
+        green_mid < green_settled / 2,
+        "the alpha animation did not fade the tile on Vulkan (fell through to a plain full-alpha \
+         render?): settled={green_settled} mid={green_mid}"
+    );
+    assert!(
+        greenish_mid > green_settled / 2,
+        "the fading tile vanished instead of dimming (blank offscreen?): greenish={greenish_mid} \
+         settled={green_settled}"
     );
 }
 
