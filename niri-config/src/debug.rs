@@ -14,7 +14,6 @@ pub struct Debug {
     pub force_disable_connectors_on_resume: bool,
     pub render_drm_device: Option<PathBuf>,
     pub ignored_drm_devices: Vec<PathBuf>,
-    pub force_pipewire_invalid_modifier: bool,
     pub emulate_zero_presentation_time: bool,
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -49,8 +48,6 @@ pub struct DebugPart {
     #[knuffel(children(name = "ignore-drm-device"), unwrap(argument))]
     pub ignored_drm_devices: Vec<PathBuf>,
     #[knuffel(child)]
-    pub force_pipewire_invalid_modifier: Option<Flag>,
-    #[knuffel(child)]
     pub emulate_zero_presentation_time: Option<Flag>,
     #[knuffel(child)]
     pub disable_resize_throttling: Option<Flag>,
@@ -81,7 +78,6 @@ impl MergeWith<DebugPart> for Debug {
             disable_direct_scanout,
             restrict_primary_scanout_to_matching_format,
             force_disable_connectors_on_resume,
-            force_pipewire_invalid_modifier,
             emulate_zero_presentation_time,
             disable_resize_throttling,
             disable_transactions,

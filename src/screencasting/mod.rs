@@ -100,20 +100,6 @@ impl State {
         // bind on every single frame.
         let render_formats: FormatSet = crate::render_helpers::vulkan::dmabuf_formats();
 
-        {
-            let config = self.niri.config.borrow();
-            if config.debug.force_pipewire_invalid_modifier {
-                // The owned renderer can only import an explicit LINEAR modifier, so filtering the
-                // offer down to INVALID would leave nothing to negotiate and the cast could not
-                // start at all. The flag existed to exercise the GLES/EGL implicit-modifier path,
-                // which no longer exists; it is inert now.
-                warn!(
-                    "ignoring debug.force_pipewire_invalid_modifier: the owned Vulkan renderer \
-                     imports explicit LINEAR modifiers only"
-                );
-            }
-        }
-
         Ok((gbm, render_formats))
     }
 
