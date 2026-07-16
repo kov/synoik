@@ -28,10 +28,7 @@ use smithay::backend::drm::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
-use smithay::backend::renderer::multigpu::{MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, RendererSuper};
+use smithay::backend::renderer::{DebugFlags, ImportDma};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -102,30 +99,11 @@ pub struct Tty {
     // Whether the debug tinting is enabled.
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-    // The owned Vulkan renderer, present only when niri was started with `--renderer=vulkan`. When
-    // set, `render()` composites and scans out through it (feeding the same `DrmCompositor`)
-    // instead of the GLES `gpu_manager`. GLES stays the default and the A/B correctness
-    // oracle.
+    // The owned Vulkan renderer: the only renderer. `render()` composites and scans out through
+    // it, feeding `DrmCompositor`. Built in `Tty::new`, so this is always `Some` -- it stays an
+    // Option only because the field is moved through by `with_vulkan_renderer`.
     vulkan_renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
 }
-
-pub type TtyRenderer<'render> = MultiRenderer<
-    'render,
-    'render,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
->;
-
-pub type TtyFrame<'render, 'frame, 'buffer> = MultiFrame<
-    'render,
-    'render,
-    'frame,
-    'buffer,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
-    GbmGlesBackend<GlesRenderer, DrmDeviceFd>,
->;
-
-pub type TtyRendererError<'render> = <TtyRenderer<'render> as RendererSuper>::Error;
 
 type GbmDrmCompositor = DrmCompositor<
     GbmAllocator<DrmDeviceFd>,

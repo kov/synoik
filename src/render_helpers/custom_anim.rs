@@ -13,9 +13,7 @@ use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
-use super::renderer::AsGlesFrame as _;
 use super::shader_element::ShaderRenderElement;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 #[derive(Debug)]
 pub enum CustomAnimRenderElement {
@@ -131,32 +129,6 @@ impl RenderElement<GlesRenderer> for CustomAnimRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            CustomAnimRenderElement::Gles(e) => e.underlying_storage(renderer),
-            CustomAnimRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for CustomAnimRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         match self {
             CustomAnimRenderElement::Gles(e) => e.underlying_storage(renderer),
             CustomAnimRenderElement::Vulkan(_) => None,

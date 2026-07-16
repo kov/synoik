@@ -14,10 +14,9 @@ use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::renderer::{AsGlesFrame as _, NiriRenderer};
+use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::render_helpers::vulkan::{pack_mat3, VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -86,7 +85,7 @@ pub struct XrayElement {
 }
 
 /// Prepare an [`EffectBuffer`] through whichever renderer `ctx` wraps — the owned Vulkan renderer's
-/// arm when present, else the GLES arm (a `TtyRenderer` resolves to GLES). Returns whether the
+/// arm when present, else the GLES arm. Returns whether the
 /// offscreen is ready to be sampled by the pushed [`XrayElement`]s.
 fn prepare_effect_buffer<R: NiriRenderer>(
     renderer: &mut R,
@@ -432,30 +431,6 @@ impl RenderElement<GlesRenderer> for XrayElement {
             self.program.as_ref(),
             uniforms,
         )
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for XrayElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
     }
 }
 

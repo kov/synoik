@@ -16,10 +16,8 @@ use smithay::backend::renderer::Texture;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
-use super::renderer::AsGlesFrame as _;
 use super::shaders::{mat3_uniform, Shaders};
 use super::texture::TextureRenderElement;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 /// Generic over the stored texture `T` so the same element can be built for GLES (`GlesTexture`,
 /// the default — every bare mention across the enum definitions resolves to it unchanged) and for
@@ -202,37 +200,6 @@ impl RenderElement<GlesRenderer> for RoundedTextureRenderElement<GlesTexture> {
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for RoundedTextureRenderElement<GlesTexture> {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'render, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }

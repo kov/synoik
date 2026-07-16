@@ -18,7 +18,6 @@ use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 use super::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use super::rounded_texture::RoundedTextureRenderElement;
 use super::texture::TextureRenderElement;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// See the module docs. `Gles` wraps the existing GLES-locked element (a degraded no-op on the
@@ -127,47 +126,6 @@ impl RenderElement<GlesRenderer> for DualTextureRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            DualTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            DualTextureRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for DualTextureRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        match self {
-            DualTextureRenderElement::Gles(e) => RenderElement::<TtyRenderer>::draw(
-                e,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            ),
-            DualTextureRenderElement::Vulkan(_) => {
-                debug_assert!(
-                    false,
-                    "Vulkan DualTextureRenderElement drawn through Tty GLES"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
             DualTextureRenderElement::Vulkan(_) => None,
@@ -327,47 +285,6 @@ impl RenderElement<GlesRenderer> for DualRoundedTextureRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            DualRoundedTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
-            DualRoundedTextureRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for DualRoundedTextureRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        match self {
-            DualRoundedTextureRenderElement::Gles(e) => RenderElement::<TtyRenderer>::draw(
-                e,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            ),
-            DualRoundedTextureRenderElement::Vulkan(_) => {
-                debug_assert!(
-                    false,
-                    "Vulkan DualRoundedTextureRenderElement drawn through Tty GLES"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualRoundedTextureRenderElement::Gles(e) => e.underlying_storage(renderer),
             DualRoundedTextureRenderElement::Vulkan(_) => None,

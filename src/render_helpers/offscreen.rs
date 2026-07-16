@@ -19,8 +19,7 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::encompassing_geo;
-use super::renderer::{AsGlesFrame as _, OffscreenRenderer};
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use super::renderer::OffscreenRenderer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// Buffer for offscreen rendering.
@@ -349,39 +348,6 @@ impl RenderElement<GlesRenderer> for OffscreenRenderElement<GlesTexture> {
     }
 }
 
-impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement<GlesTexture> {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
 // The `VkTexture` specialization samples the offscreen through the owned Vulkan renderer (the
 // sampleable-offscreen bridge); the render tree's `<GlesTexture>` variant stays a degraded no-op.
 impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
@@ -512,47 +478,6 @@ impl RenderElement<GlesRenderer> for DualOffscreenRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
-            DualOffscreenRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for DualOffscreenRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        match self {
-            DualOffscreenRenderElement::Gles(e) => RenderElement::<TtyRenderer>::draw(
-                e,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            ),
-            DualOffscreenRenderElement::Vulkan(_) => {
-                debug_assert!(
-                    false,
-                    "Vulkan DualOffscreenRenderElement drawn through Tty GLES"
-                );
-                Ok(())
-            }
-        }
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         match self {
             DualOffscreenRenderElement::Gles(e) => e.underlying_storage(renderer),
             DualOffscreenRenderElement::Vulkan(_) => None,

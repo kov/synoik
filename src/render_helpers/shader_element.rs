@@ -16,7 +16,6 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 use super::renderer::AsGlesFrame;
 use super::resources::Resources;
 use super::shaders::{ProgramType, Shaders};
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 /// Renders a shader with optional texture input, on the primary GPU.
 #[derive(Debug, Clone)]
@@ -515,33 +514,6 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for ShaderRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
-
-        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
-
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

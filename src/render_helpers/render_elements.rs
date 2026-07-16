@@ -141,52 +141,6 @@ macro_rules! niri_render_elements {
             }
         }
 
-        impl<'render> smithay::backend::renderer::element::RenderElement<$crate::backend::tty::TtyRenderer<'render>>
-            for $($name_R<$crate::backend::tty::TtyRenderer<'render>>)? $($name_no_R)?
-        {
-            fn capture_framebuffer(
-                &self,
-                frame: &mut $crate::backend::tty::TtyFrame<'render, '_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                cache: &smithay::utils::user_data::UserDataMap,
-            ) -> Result<(), $crate::backend::tty::TtyRendererError<'render>> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<$crate::backend::tty::TtyRenderer<'render>>::capture_framebuffer(elem, frame, src, dst, cache)
-                    })+
-                }
-            }
-
-            fn draw(
-                &self,
-                frame: &mut $crate::backend::tty::TtyFrame<'render, '_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                cache: Option<&smithay::utils::user_data::UserDataMap>,
-            ) -> Result<(), $crate::backend::tty::TtyRendererError<'render>> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<$crate::backend::tty::TtyRenderer<'render>>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                    })+
-                }
-            }
-
-            fn underlying_storage(
-                &self,
-                renderer: &mut $crate::backend::tty::TtyRenderer<'render>,
-            ) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
-                match self {
-                    $($name::$variant(elem) => elem.underlying_storage(renderer)),+
-                }
-            }
-        }
-
-        // The owned Vulkan renderer arm (only when the `vulkan` feature is enabled). Every variant
-        // implements `RenderElement<VulkanRenderer>` — plain Smithay elements generically, the niri
-        // effects via degraded (no-op) impls until they are ported (M3).
         impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>
             for $($name_R<$crate::render_helpers::vulkan::VulkanRenderer>)? $($name_no_R)?
         {

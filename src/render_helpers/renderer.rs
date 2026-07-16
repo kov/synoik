@@ -4,8 +4,6 @@ use smithay::backend::renderer::{
     Bind, ExportMem, ImportAll, ImportMem, Renderer, RendererSuper, Texture,
 };
 
-use crate::backend::tty::{TtyFrame, TtyRenderer};
-
 /// Core renderer requirements shared by every niri renderer, independent of the concrete graphics
 /// API. This is what generic code that *builds* and *composites* render elements needs.
 ///
@@ -46,32 +44,18 @@ where
 
 /// Fallible access to an underlying `GlesRenderer`.
 ///
-/// GLES-backed renderers (`GlesRenderer` itself, and the Tty `MultiRenderer`) return `Some`; a
-/// non-GLES renderer (the owned Vulkan renderer) returns `None`. Generic render code uses this to
+/// `GlesRenderer` returns `Some`; a non-GLES renderer (the owned Vulkan renderer, and Pixman)
+/// returns `None`. Generic render code uses this to
 /// gate GLES-only features — custom shaders, the GNOME wallpaper, xray, CPU→`GlesTexture` UI
 /// uploads — degrading them (rendering nothing) rather than failing to compile on a Vulkan
 /// renderer.
 pub trait AsGlesRenderer {
     fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer>;
-
-    /// Infallible access, for code paths only reached on GLES-backed renderers. **Panics** on a
-    /// non-GLES renderer — generic render code that must also support the Vulkan renderer should
-    /// use [`AsGlesRenderer::try_as_gles_renderer`] and degrade the GLES-only feature instead.
-    fn as_gles_renderer(&mut self) -> &mut GlesRenderer {
-        self.try_as_gles_renderer()
-            .expect("this render path requires a GLES-backed renderer")
-    }
 }
 
 impl AsGlesRenderer for GlesRenderer {
     fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
         Some(self)
-    }
-}
-
-impl AsGlesRenderer for TtyRenderer<'_> {
-    fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
-        Some(self.as_mut())
     }
 }
 
@@ -86,14 +70,6 @@ pub trait AsVulkanRenderer {
 }
 
 impl AsVulkanRenderer for GlesRenderer {
-    fn try_as_vulkan_renderer(
-        &mut self,
-    ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer> {
-        None
-    }
-}
-
-impl AsVulkanRenderer for TtyRenderer<'_> {
     fn try_as_vulkan_renderer(
         &mut self,
     ) -> Option<&mut crate::render_helpers::vulkan::VulkanRenderer> {
@@ -138,8 +114,7 @@ impl OffscreenRenderer for GlesRenderer {
 
 /// Trait for getting the underlying `GlesFrame`.
 ///
-/// Only used by the concrete `RenderElement<TtyRenderer>` bridges (unwrapping the Tty
-/// `MultiRenderer` frame to a `GlesFrame`), so it stays infallible.
+/// Only used by the concrete `RenderElement<GlesRenderer>` bridges, so it stays infallible.
 pub trait AsGlesFrame<'frame, 'buffer>
 where
     Self: 'frame,
@@ -150,11 +125,5 @@ where
 impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for GlesFrame<'frame, 'buffer> {
     fn as_gles_frame(&mut self) -> &mut GlesFrame<'frame, 'buffer> {
         self
-    }
-}
-
-impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for TtyFrame<'_, 'frame, 'buffer> {
-    fn as_gles_frame(&mut self) -> &mut GlesFrame<'frame, 'buffer> {
-        self.as_mut()
     }
 }

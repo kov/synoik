@@ -11,10 +11,9 @@ use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
-use super::renderer::{AsGlesFrame, NiriRenderer};
+use super::renderer::NiriRenderer;
 use super::shader_element::ShaderRenderElement;
 use super::shaders::{mat3_uniform, ProgramType, Shaders};
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 /// The resize cross-fade element. Blends a "prev" (pre-resize) and "next" (current) window snapshot
 /// by the animation progress, clipping/rounding to the current geometry.
@@ -291,32 +290,6 @@ impl RenderElement<GlesRenderer> for ResizeRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self {
-            ResizeRenderElement::Gles(e) => e.underlying_storage(renderer),
-            ResizeRenderElement::Vulkan(_) => None,
-        }
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for ResizeRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
         match self {
             ResizeRenderElement::Gles(e) => e.underlying_storage(renderer),
             ResizeRenderElement::Vulkan(_) => None,
