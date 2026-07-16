@@ -16,7 +16,7 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
 
-use crate::render_helpers::renderer::{AsGlesRenderer, NiriRenderer};
+use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
@@ -65,25 +65,6 @@ impl<'a, R> RenderCtx<'a, R> {
             target: self.target,
             xray: self.xray,
         }
-    }
-}
-
-impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
-    /// Reborrows this context as a concrete `GlesRenderer` context, if the renderer is GLES-backed.
-    /// Returns `None` for a non-GLES renderer, so GLES-only render paths degrade gracefully.
-    pub fn try_as_gles<'b>(&'b mut self) -> Option<RenderCtx<'b, GlesRenderer>> {
-        Some(RenderCtx {
-            renderer: self.renderer.try_as_gles_renderer()?,
-            target: self.target,
-            xray: self.xray,
-        })
-    }
-
-    /// Infallible [`RenderCtx::try_as_gles`], for GLES-only render paths. **Panics** on a non-GLES
-    /// renderer; generic paths that must support Vulkan should use `try_as_gles` and degrade.
-    pub fn as_gles<'b>(&'b mut self) -> RenderCtx<'b, GlesRenderer> {
-        self.try_as_gles()
-            .expect("this render path requires a GLES-backed renderer")
     }
 }
 

@@ -546,7 +546,7 @@ fn vulkan_gradient_fade_clipped_texture() {
         Some(Size::<f64, _>::from((W as f64, H as f64))),
         Kind::Unspecified,
     );
-    let elem = GradientFadeTextureRenderElement::new_vulkan(inner);
+    let elem = GradientFadeTextureRenderElement::new(inner);
 
     let mut target = vk
         .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))

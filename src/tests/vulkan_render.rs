@@ -400,7 +400,7 @@ fn vulkan_mru_titles_use_the_gradient_fade_element() {
 
     let fades = mru_elements
         .iter()
-        .filter(|elem| matches!(elem, WindowMruUiRenderElement::GradientFadeVk(_)))
+        .filter(|elem| matches!(elem, WindowMruUiRenderElement::GradientFade(_)))
         .count();
 
     // One per window preview title. The GLES-gated (broken) path emits zero — every title took the

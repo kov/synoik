@@ -1,28 +1,18 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
-};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::Texture;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
 use super::texture::TextureRenderElement;
-use crate::render_helpers::shaders::Shaders;
 
-/// Generic over the stored texture `T` (mirrors
-/// [`super::rounded_texture::RoundedTextureRenderElement`]): `GlesTexture` (the default — every
-/// bare mention resolves to it) fades via the `gradient_fade` shader in `program`; the owned Vulkan
-/// renderer fades in its own pipeline and leaves `program` `None`.
+/// Generic over the stored texture `T`, mirroring
+/// [`super::rounded_texture::RoundedTextureRenderElement`]. The renderer fades in its own pipeline.
 #[derive(Debug, Clone)]
-pub struct GradientFadeTextureRenderElement<T: Texture = GlesTexture> {
+pub struct GradientFadeTextureRenderElement<T: Texture> {
     inner: TextureRenderElement<T>,
-    program: Option<GradientFadeShader>,
     cutoff: (f32, f32),
 }
-
-#[derive(Debug, Clone)]
-pub struct GradientFadeShader(GlesTexProgram);
 
 impl<T: Texture> GradientFadeTextureRenderElement<T> {
     /// The horizontal fade band `(left, right)` in the sampled texture's u coordinate — `(1, 1)`
@@ -40,25 +30,6 @@ impl<T: Texture> GradientFadeTextureRenderElement<T> {
             // Texture is displayed full-size, no cutoff necessary.
             (1., 1.)
         }
-    }
-}
-
-impl GradientFadeTextureRenderElement<GlesTexture> {
-    pub fn new(texture: TextureRenderElement<GlesTexture>, program: GradientFadeShader) -> Self {
-        let cutoff = Self::compute_cutoff(&texture);
-        Self {
-            inner: texture,
-            program: Some(program),
-            cutoff,
-        }
-    }
-
-    pub fn shader(renderer: &mut GlesRenderer) -> Option<GradientFadeShader> {
-        let program = Shaders::get(renderer)
-            .expect("a GlesRenderer is always GLES-backed")
-            .gradient_fade
-            .clone();
-        program.map(GradientFadeShader)
     }
 }
 
@@ -104,61 +75,13 @@ impl<T: Texture> Element for GradientFadeTextureRenderElement<T> {
     }
 }
 
-impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement<GlesTexture> {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        let Some(program) = self.program.as_ref() else {
-            return RenderElement::<GlesRenderer>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            );
-        };
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
-        frame.override_default_tex_program(program.0.clone(), uniforms);
-        RenderElement::<GlesRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        frame.clear_tex_program_override();
-        Ok(())
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-// The owned Vulkan renderer fades a `VkTexture` in its own pipeline (M3). Like rounded-texture,
-// the `GlesTexture` specialization keeps a degraded no-op `RenderElement<VulkanRenderer>`.
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 impl GradientFadeTextureRenderElement<VkTexture> {
-    /// Build a gradient-fade element for the owned Vulkan renderer, which fades in its own
-    /// pipeline and needs no GLES shader program.
-    pub fn new_vulkan(texture: TextureRenderElement<VkTexture>) -> Self {
+    pub fn new(texture: TextureRenderElement<VkTexture>) -> Self {
         let cutoff = Self::compute_cutoff(&texture);
         Self {
             inner: texture,
-            program: None,
             cutoff,
         }
     }

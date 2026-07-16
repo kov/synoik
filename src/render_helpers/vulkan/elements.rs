@@ -13,7 +13,6 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
-use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
@@ -65,7 +64,8 @@ macro_rules! degraded_vulkan_element {
 degraded_vulkan_element!(RoundedTextureRenderElement<GlesTexture>);
 // ClippedSurfaceRenderElement<VulkanRenderer> has a real Vulkan draw (clip via the clipped_texture
 // pipeline) in clipped_surface.rs.
-degraded_vulkan_element!(GradientFadeTextureRenderElement<GlesTexture>);
+// GradientFadeTextureRenderElement<VkTexture> has a real Vulkan draw (render_gradient_fade) in
+// gradient_fade_texture.rs.
 // ResizeRenderElement has a real Vulkan draw (render_resize) in render_helpers/resize.rs.
 // XrayElement has a real Vulkan draw (offscreen sample + blur + postprocess-and-clip) in xray.rs.
 degraded_vulkan_element!(ShaderRenderElement);

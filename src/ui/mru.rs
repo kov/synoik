@@ -122,8 +122,7 @@ niri_render_elements! {
         // GLES and the owned Vulkan renderer alike (the M1 escape hatch: TextureRenderElement impls
         // RenderElement<R> for any R: Renderer<TextureId = T>).
         UiTexture = TextureRenderElement<R::TextureId>,
-        GradientFadeElem = GradientFadeTextureRenderElement,
-        GradientFadeVk = GradientFadeTextureRenderElement<VkTexture>,
+        GradientFade = GradientFadeTextureRenderElement<VkTexture>,
         FocusRing = FocusRingRenderElement,
         Offscreen = OffscreenRenderElement<VkTexture>,
         Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement<R>>>,
@@ -494,25 +493,9 @@ impl Thumbnail {
                         None,
                         Kind::Unspecified,
                     );
-                    let elem = GradientFadeTextureRenderElement::new_vulkan(elem);
-                    push(WindowMruUiRenderElement::GradientFadeVk(elem));
+                    let elem = GradientFadeTextureRenderElement::new(elem);
+                    push(WindowMruUiRenderElement::GradientFade(elem));
                     pushed = true;
-                }
-            } else if let Some(gles) = ctx.try_as_gles() {
-                if let Some(program) = GradientFadeTextureRenderElement::shader(gles.renderer) {
-                    if let Ok(buffer) = TextureBuffer::from_memory_buffer(gles.renderer, &texture) {
-                        let elem = TextureRenderElement::from_texture_buffer(
-                            buffer,
-                            loc,
-                            preview_alpha,
-                            Some(src),
-                            None,
-                            Kind::Unspecified,
-                        );
-                        let elem = GradientFadeTextureRenderElement::new(elem, program);
-                        push(WindowMruUiRenderElement::GradientFadeElem(elem));
-                        pushed = true;
-                    }
                 }
             }
 
