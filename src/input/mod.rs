@@ -861,10 +861,17 @@ impl State {
                 } else {
                     Default::default()
                 };
-                self.backend.with_primary_renderer(|renderer| {
+                // A Vulkan session has its neutrals already; it must not depend on a GLES renderer
+                // being available, or the transition would silently never run.
+                if using_vulkan {
                     self.niri
-                        .do_screen_transition(renderer, using_vulkan, neutrals, delay_ms);
-                });
+                        .do_screen_transition(None, true, neutrals, delay_ms);
+                } else {
+                    self.backend.with_primary_renderer(|renderer| {
+                        self.niri
+                            .do_screen_transition(Some(renderer), false, neutrals, delay_ms);
+                    });
+                }
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
                 let active = self.niri.layout.active_output().cloned();

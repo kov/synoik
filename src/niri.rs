@@ -2116,11 +2116,22 @@ impl State {
         } else {
             Default::default()
         };
-        let Some(screenshots) = self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .capture_screenshots(renderer, using_vulkan, vk_neutrals)
-                .collect()
-        }) else {
+        // A Vulkan session has its captures already; it must not depend on a GLES renderer being
+        // available, or the UI would silently never open.
+        let screenshots = if using_vulkan {
+            Some(
+                self.niri
+                    .capture_screenshots(None, true, vk_neutrals)
+                    .collect(),
+            )
+        } else {
+            self.backend.with_primary_renderer(|renderer| {
+                self.niri
+                    .capture_screenshots(Some(renderer), false, vk_neutrals)
+                    .collect()
+            })
+        };
+        let Some(screenshots) = screenshots else {
             return;
         };
 
@@ -6222,9 +6233,11 @@ impl Niri {
         }
     }
 
+    /// `renderer` is `None` on a Vulkan session, which captured every target's frozen screen
+    /// through the owned renderer up front and re-renders nothing through GLES here.
     pub fn capture_screenshots<'a>(
         &'a self,
-        renderer: &'a mut GlesRenderer,
+        mut renderer: Option<&'a mut GlesRenderer>,
         using_vulkan: bool,
         // On a Vulkan session, the per-target neutrals captured up front through the owned
         // renderer (`capture_screenshot_neutrals`), keyed by output. Consumed here; a
@@ -6270,6 +6283,14 @@ impl Niri {
 
                     return Some((output, screenshot.map(Option::unwrap)));
                 }
+
+                let Some(renderer) = renderer.as_deref_mut() else {
+                    warn!(
+                        "no GLES renderer to capture output {}; skipping it",
+                        output.name()
+                    );
+                    return None;
+                };
 
                 let screenshot = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
@@ -7169,9 +7190,11 @@ impl Niri {
             .collect()
     }
 
+    /// `renderer` is `None` on a Vulkan session, which captured the frozen screen through the owned
+    /// renderer up front and re-renders nothing through GLES here.
     pub fn do_screen_transition(
         &mut self,
-        renderer: &mut GlesRenderer,
+        mut renderer: Option<&mut GlesRenderer>,
         using_vulkan: bool,
         mut neutrals: std::collections::HashMap<Output, [MemoryBuffer; RenderTarget::COUNT]>,
         delay_ms: Option<u16>,
@@ -7214,6 +7237,17 @@ impl Niri {
                     let neutrals = neutrals.remove(&output)?;
                     return Some((output, FrozenScene::Neutral(neutrals), scale, transform));
                 }
+
+                let renderer = match renderer.as_deref_mut() {
+                    Some(renderer) => renderer,
+                    None => {
+                        warn!(
+                            "no GLES renderer for the screen transition on output {}; skipping it",
+                            output.name()
+                        );
+                        return None;
+                    }
+                };
 
                 let textures = ALL_RENDER_TARGETS.map(|target| {
                     let ctx = RenderCtx {
