@@ -1135,88 +1135,18 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(resize) = &self.resize_animation {
             // Whether this window must be hidden from the target we're rendering for.
             //
-            // The crossfade's "before" texture is the snapshot taken when the resize started. The
-            // GLES path bakes a blocked-out variant of it and picks that per target
-            // (`RenderSnapshot::texture`), so it is safe on any target. The *neutral* the Vulkan
-            // path uses below holds the window's real contents and has no per-target variant, so
-            // drawing that crossfade on a blocked-out target would show exactly what block-out
+            // The crossfade's "before" texture is the neutral snapshot taken when the resize
+            // started. It holds the window's real contents and has no per-target variant, so
+            // drawing the crossfade on a blocked-out target would show exactly what block-out
             // exists to hide. Skip it there (and the red fallback with it) and let the plain window
             // render further down substitute the block-out buffer, as it does with no resize
             // running: a blocked-out window loses its crossfade in a capture, rather than leaking.
             let blocked_out = ctx.target.should_block_out(resize.snapshot.block_out_from)
                 || ctx.target.should_block_out(rules.block_out_from);
 
-            // `try_as_gles` rather than the infallible `as_gles`: what keeps that from panicking on
-            // Vulkan is only that `has_shader` is false there (`Shaders` live in the GLES context)
-            // — far too subtle a thing to rest a panic on.
-            let has_resize_shader = ResizeRenderElement::has_shader(ctx.renderer);
-            if let Some(mut ctx) = ctx.try_as_gles().filter(|_| has_resize_shader) {
-                if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
-                    let mut window_elements = Vec::new();
-                    self.window.render_normal(
-                        ctx.r(),
-                        Point::from((0., 0.)),
-                        scale,
-                        1.,
-                        &mut |elem| window_elements.push(elem),
-                    );
-
-                    let current = resize
-                        .offscreen
-                        .render(ctx.renderer, scale, &window_elements)
-                        .map_err(|err| warn!("error rendering window to texture: {err:?}"))
-                        .ok();
-
-                    // Clip blocked-out resizes unconditionally because they use solid color render
-                    // elements.
-                    let clip_to_geometry =
-                        if ctx.target.should_block_out(resize.snapshot.block_out_from)
-                            && ctx.target.should_block_out(rules.block_out_from)
-                        {
-                            true
-                        } else {
-                            clip_to_geometry
-                        };
-
-                    if let Some((elem_current, _sync_point, mut data)) = current {
-                        let texture_current = elem_current.texture().clone();
-                        // The offset and size are computed in physical pixels and converted to
-                        // logical with the same `scale`, so converting them back with rounding
-                        // inside the geometry() call gives us the same physical result back.
-                        let texture_current_geo = elem_current.geometry(scale);
-
-                        let elem = ResizeRenderElement::new(
-                            area,
-                            scale,
-                            texture_from.clone(),
-                            resize.snapshot.size,
-                            (texture_current, texture_current_geo),
-                            window_size,
-                            resize.anim.value() as f32,
-                            resize.anim.clamped_value().clamp(0., 1.) as f32,
-                            radius,
-                            clip_to_geometry,
-                            win_alpha,
-                        );
-
-                        // We're drawing the resize shader, not the offscreen directly.
-                        data.id = elem.id().clone();
-
-                        // This is not a problem for split popups as the code will look for them by
-                        // original id when it doesn't find them on the offscreen.
-                        self.window.set_offscreen_data(Some(data));
-                        push(elem.into());
-                        pushed_resize = true;
-                    }
-                }
-            }
-
-            // Owned Vulkan renderer: the GLES `has_shader` gate above is false (Shaders live in the
-            // GLES context), so drive the same crossfade through `render_resize` instead of the red
-            // fallback. `tex_prev` comes from the neutral snapshot captured at resize-start
-            // (uploaded once); `tex_next` is the current window rendered into the
-            // reused Vulkan offscreen.
-            if !pushed_resize && !blocked_out {
+            // `tex_prev` comes from the neutral snapshot captured at resize-start (uploaded once);
+            // `tex_next` is the current window rendered into the reused Vulkan offscreen.
+            if !blocked_out {
                 if let Some(mut vctx) = ctx.try_as_vulkan() {
                     if let Some((prev_mem, prev_geo)) =
                         resize.snapshot.neutral.get().and_then(|o| o.as_ref())
@@ -1747,9 +1677,6 @@ impl<W: LayoutElement> Tile<W> {
             blocked_out_contents,
             block_out_from: self.window.rules().block_out_from,
             size: self.animated_tile_size(),
-            texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
-            blocked_out_texture: Default::default(),
             neutral: Default::default(),
         }
     }

@@ -454,9 +454,6 @@ impl Mapped {
             blocked_out_contents,
             block_out_from: self.rules().block_out_from,
             size,
-            texture: Default::default(),
-            texture_with_blocked_out_bg: Default::default(),
-            blocked_out_texture: Default::default(),
             neutral: Default::default(),
         }
     }

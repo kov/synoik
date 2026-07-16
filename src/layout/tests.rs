@@ -120,9 +120,6 @@ impl TestWindow {
                         blocked_out_contents: Vec::new(),
                         block_out_from: None,
                         size: self.0.bbox.get().size.to_f64(),
-                        texture: OnceCell::new(),
-                        texture_with_blocked_out_bg: Default::default(),
-                        blocked_out_texture: OnceCell::new(),
                         neutral: OnceCell::new(),
                     }));
                 }
