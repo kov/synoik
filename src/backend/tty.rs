@@ -424,7 +424,6 @@ impl Tty {
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
-        renderer: crate::backend::RendererKind,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("Tty::new");
 
@@ -506,23 +505,22 @@ impl Tty {
         }
         info!("using as the render node: {node_path}");
 
-        // Bring up the owned Vulkan renderer if requested, on the device backing the primary render
-        // node — the same node we advertise to clients in dmabuf feedback, so their buffers are
-        // allocated for the device we actually render on. (Picking by device-type rank instead,
-        // as this used to, happens to agree on a single-GPU machine and silently disagrees on any
-        // other.) GBM buffers allocated by `device.allocator` are imported into it via
-        // `Bind<Dmabuf>` for scanout.
-        let vulkan_renderer = if renderer == crate::backend::RendererKind::Vulkan {
-            let vk = crate::render_helpers::vulkan::VulkanRenderer::for_drm_render_node(
-                primary_render_node.major(),
-                primary_render_node.minor(),
-            )
-            .context("error creating the Vulkan renderer")?;
-            info!("using the owned Vulkan renderer for the TTY backend");
-            Some(vk)
-        } else {
-            None
-        };
+        // Bring up the owned Vulkan renderer on the device backing the primary render node — the
+        // same node we advertise to clients in dmabuf feedback, so their buffers are allocated for
+        // the device we actually render on. (Picking by device-type rank instead, as this used to,
+        // happens to agree on a single-GPU machine and silently disagrees on any other.) GBM
+        // buffers allocated by `device.allocator` are imported into it via `Bind<Dmabuf>` for
+        // scanout.
+        //
+        // It is the only renderer, so failing to build it fails the backend rather than quietly
+        // falling back.
+        let vulkan_renderer = crate::render_helpers::vulkan::VulkanRenderer::for_drm_render_node(
+            primary_render_node.major(),
+            primary_render_node.minor(),
+        )
+        .context("error creating the Vulkan renderer")?;
+        info!("using the owned Vulkan renderer for the TTY backend");
+        let vulkan_renderer = Some(vulkan_renderer);
 
         Ok(Self {
             config,

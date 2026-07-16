@@ -118,7 +118,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, BackendMode, Headless, RenderResult, RendererKind, Tty};
+use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -766,7 +766,6 @@ impl State {
         stop_signal: LoopSignal,
         display: Display<State>,
         mode: BackendMode,
-        renderer: RendererKind,
         create_wayland_socket: bool,
         is_session_instance: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -775,16 +774,14 @@ impl State {
         let config = Rc::new(RefCell::new(config));
 
         let mut backend = match mode {
-            BackendMode::Headless | BackendMode::HeadlessTest => {
-                Backend::Headless(Headless::new(renderer))
-            }
+            BackendMode::Headless | BackendMode::HeadlessTest => Backend::Headless(Headless::new()),
             // `Auto` used to pick the winit backend when nested inside a session. Winit was
             // EGL/GLES to the bone (Smithay's `WinitGraphicsBackend` needs
             // `Bind<EGLSurface>`), so it went with GLES; nested mode returns as a
             // Wayland-client backend. Auto is TTY-only for now, and running inside a
             // session fails in TTY init rather than silently nesting.
             BackendMode::Auto => {
-                let tty = Tty::new(config.clone(), event_loop.clone(), renderer)
+                let tty = Tty::new(config.clone(), event_loop.clone())
                     .context("error initializing the TTY backend")?;
                 Backend::Tty(tty)
             }

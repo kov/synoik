@@ -18,51 +18,46 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
 
-use super::{IpcOutputMap, OutputId, RenderResult, RendererKind};
+use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
 use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
 /// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
-/// the compositor logic itself is driveable over IPC with none. It can be either the default
-/// GLES renderer or — behind `--renderer=vulkan` + the `vulkan` feature — the owned Vulkan one.
+/// the compositor logic itself is driveable over IPC with none.
 ///
-/// The `Vulkan` variant keeps a GLES renderer **alongside** the Vulkan one, mirroring the Tty
-/// backend (where the GLES `gpu_manager` coexists with `vulkan_renderer`). That coexistence is on
-/// its way out (slice 8): the snapshot-based animations that used to bake through GLES here — the
-/// resize crossfade in particular — are Vulkan-native now. What still holds it up is the set of
-/// `with_primary_renderer` call sites listed in `docs/fork/renderer-gaps.md`.
+/// This keeps a GLES renderer **alongside** the Vulkan one, mirroring the Tty backend (where the
+/// GLES `gpu_manager` coexists with `vulkan_renderer`). That coexistence is on its way out (slice
+/// 8): the snapshot-based animations that used to bake through GLES here — the resize crossfade in
+/// particular — are Vulkan-native now. What still holds it up is the set of `with_primary_renderer`
+/// call sites listed in `docs/fork/renderer-gaps.md`.
 ///
-/// Note the EGL display this drags in is also what keeps the suite from running on lavapipe (Mesa
-/// redirects Zink's EGL and it fails to pick a pdev); dropping the GLES half is what frees it.
-#[allow(clippy::large_enum_variant)]
-enum HeadlessRenderer {
-    Gles(GlesRenderer),
-    Vulkan {
-        gles: GlesRenderer,
-        // Read by the test-only `with_vulkan_renderer`; the live headless `render` is a no-op.
-        #[cfg_attr(not(test), allow(dead_code))]
-        vulkan: crate::render_helpers::vulkan::VulkanRenderer,
-    },
+/// Note the EGL display the GLES half drags in is also what keeps the suite from running on
+/// lavapipe (Mesa redirects Zink's EGL and it fails to pick a pdev); dropping it is what frees it.
+struct HeadlessRenderer {
+    gles: GlesRenderer,
+    // Read by the test-only `with_vulkan_renderer`; the live headless `render` is a no-op.
+    #[cfg_attr(not(test), allow(dead_code))]
+    vulkan: crate::render_helpers::vulkan::VulkanRenderer,
 }
 
 pub struct Headless {
-    kind: RendererKind,
     renderer: Option<HeadlessRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
 impl Headless {
-    pub fn new(kind: RendererKind) -> Self {
+    pub fn new() -> Self {
         Self {
-            kind,
             renderer: None,
             ipc_outputs: Default::default(),
         }
     }
 
+    // Vulkan is the only renderer now. The predicate stays until the GLES dispatch branches it
+    // guards are deleted, at which point it and they go together.
     pub fn using_vulkan(&self) -> bool {
-        self.kind == RendererKind::Vulkan
+        true
     }
 
     pub fn init(&mut self, _niri: &mut Niri) {}
@@ -73,38 +68,22 @@ impl Headless {
             return Ok(());
         }
 
-        self.renderer = Some(match self.kind {
-            RendererKind::Gles => {
-                let mut renderer = unsafe {
-                    let display = EGLDisplay::new(EGLSurfacelessDisplay)
-                        .context("error creating EGL display")?;
-                    let context =
-                        EGLContext::new(&display).context("error creating EGL context")?;
-                    GlesRenderer::new(context).context("error creating renderer")?
-                };
-                resources::init(&mut renderer);
-                shaders::init(&mut renderer);
-                HeadlessRenderer::Gles(renderer)
-            }
-            RendererKind::Vulkan => {
-                // The owned Vulkan renderer brings up its own instance/device (no EGL, no
-                // surface) and manages its own pipelines — no resources/shaders init needed.
-                let vulkan = crate::render_helpers::vulkan::VulkanRenderer::new()
-                    .context("error creating the Vulkan renderer")?;
-                // Also build a GLES renderer, as the Tty backend does, for snapshot capture (the
-                // resize crossfade's neutral buffer is rendered through it even on Vulkan).
-                let mut gles = unsafe {
-                    let display = EGLDisplay::new(EGLSurfacelessDisplay)
-                        .context("error creating EGL display")?;
-                    let context =
-                        EGLContext::new(&display).context("error creating EGL context")?;
-                    GlesRenderer::new(context).context("error creating GLES renderer")?
-                };
-                resources::init(&mut gles);
-                shaders::init(&mut gles);
-                HeadlessRenderer::Vulkan { gles, vulkan }
-            }
-        });
+        // The owned Vulkan renderer brings up its own instance/device (no EGL, no surface) and
+        // manages its own pipelines — no resources/shaders init needed.
+        let vulkan = crate::render_helpers::vulkan::VulkanRenderer::new()
+            .context("error creating the Vulkan renderer")?;
+        // Also build a GLES renderer, as the Tty backend does, for snapshot capture (the resize
+        // crossfade's neutral buffer is rendered through it even on Vulkan).
+        let mut gles = unsafe {
+            let display =
+                EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
+            let context = EGLContext::new(&display).context("error creating EGL context")?;
+            GlesRenderer::new(context).context("error creating GLES renderer")?
+        };
+        resources::init(&mut gles);
+        shaders::init(&mut gles);
+
+        self.renderer = Some(HeadlessRenderer { gles, vulkan });
         Ok(())
     }
 
@@ -174,27 +153,19 @@ impl Headless {
         &mut self,
         f: impl FnOnce(&mut GlesRenderer) -> T,
     ) -> Option<T> {
-        // This accessor is GLES-typed. On a Vulkan session it hands out the coexisting GLES
-        // renderer (as the Tty backend does), so GLES-only tasks — screencast setup, snapshot
-        // capture — keep working.
-        match &mut self.renderer {
-            Some(HeadlessRenderer::Gles(renderer)) => Some(f(renderer)),
-            Some(HeadlessRenderer::Vulkan { gles, .. }) => Some(f(gles)),
-            None => None,
-        }
+        // This accessor is GLES-typed. It hands out the coexisting GLES renderer (as the Tty
+        // backend does), so GLES-only tasks — screencast setup, snapshot capture — keep working.
+        self.renderer.as_mut().map(|r| f(&mut r.gles))
     }
 
     /// Access to the owned Vulkan renderer, so the capture paths (screencopy, screenshot) and the
-    /// headless tests can drive the real `Niri::render` through it. Returns `None` for a GLES
-    /// backend.
+    /// headless tests can drive the real `Niri::render` through it. Returns `None` before
+    /// `add_renderer`.
     pub fn with_vulkan_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut crate::render_helpers::vulkan::VulkanRenderer) -> T,
     ) -> Option<T> {
-        match &mut self.renderer {
-            Some(HeadlessRenderer::Vulkan { vulkan, .. }) => Some(f(vulkan)),
-            _ => None,
-        }
+        self.renderer.as_mut().map(|r| f(&mut r.vulkan))
     }
 
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
@@ -234,7 +205,7 @@ impl Headless {
 
 impl Default for Headless {
     fn default() -> Self {
-        Self::new(RendererKind::default())
+        Self::new()
     }
 }
 
@@ -243,8 +214,7 @@ mod tests {
     use super::*;
     use crate::render_helpers::vulkan::VulkanRenderer;
 
-    // `--renderer=vulkan` end-to-end on the headless backend: the stored kind drives
-    // `add_renderer` to build the owned Vulkan renderer plus a coexisting GLES renderer (mirroring
+    // `add_renderer` builds the owned Vulkan renderer plus a coexisting GLES renderer (mirroring
     // Tty), so the GLES-typed primary-renderer accessor still hands one out. Skips with no device,
     // matching the other Vulkan tests.
     #[test]
@@ -254,14 +224,11 @@ mod tests {
             return;
         }
 
-        let mut backend = Headless::new(RendererKind::Vulkan);
+        let mut backend = Headless::new();
         backend
             .add_renderer()
             .expect("headless should build the Vulkan renderer");
-        assert!(matches!(
-            backend.renderer,
-            Some(HeadlessRenderer::Vulkan { .. })
-        ));
+        assert!(backend.with_vulkan_renderer(|_| ()).is_some());
         // The coexisting GLES renderer is available for snapshot capture.
         assert!(backend.with_primary_renderer(|_| ()).is_some());
     }

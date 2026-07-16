@@ -4,7 +4,7 @@ use calloop::EventLoop;
 use niri_config::Config;
 use smithay::reexports::wayland_server::Display;
 
-use crate::backend::{BackendMode, RendererKind};
+use crate::backend::BackendMode;
 use crate::niri::State;
 
 pub struct Server {
@@ -13,7 +13,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new_with_renderer(config: Config, renderer: RendererKind) -> Self {
+    pub fn new(config: Config) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
         let display = Display::new().unwrap();
@@ -23,7 +23,6 @@ impl Server {
             event_loop.get_signal(),
             display,
             BackendMode::HeadlessTest,
-            renderer,
             false,
             false,
         )

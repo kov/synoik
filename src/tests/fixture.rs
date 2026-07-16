@@ -37,17 +37,10 @@ impl Fixture {
     }
 
     pub fn with_config(config: Config) -> Self {
-        Self::with_config_and_renderer(config, crate::backend::RendererKind::Gles)
-    }
-
-    pub fn with_config_and_renderer(
-        config: Config,
-        renderer: crate::backend::RendererKind,
-    ) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
 
-        let server = Server::new_with_renderer(config, renderer);
+        let server = Server::new(config);
         let fd = server.event_loop.as_fd().try_clone_to_owned().unwrap();
         let source = Generic::new(fd, Interest::READ, Mode::Level);
         handle

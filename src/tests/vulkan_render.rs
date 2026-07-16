@@ -18,7 +18,6 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::fixture::Fixture;
-use crate::backend::RendererKind;
 use crate::layout::closing_window::ClosingSnapshot;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::dual_texture::DualTextureRenderElement;
@@ -59,7 +58,7 @@ fn window_fixture_settled(color: [u32; 4], settle: bool) -> Option<Fixture> {
         return None;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -467,7 +466,7 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -579,7 +578,7 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -650,7 +649,7 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -1686,7 +1685,7 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     let mut config = Config::default();
     config.animations.window_resize.anim.kind = LINEAR;
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
@@ -1798,7 +1797,7 @@ fn vulkan_captures_the_resize_neutral_through_vulkan() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -1884,7 +1883,7 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -1967,7 +1966,7 @@ fn vulkan_picks_a_color_through_vulkan() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -2054,7 +2053,7 @@ fn vulkan_screenshots_a_window_through_vulkan() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -2339,7 +2338,7 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
         return;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -3478,7 +3477,7 @@ fn clipped_window_fixture() -> Option<Fixture> {
         ..Default::default()
     });
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
@@ -3679,7 +3678,7 @@ fn vulkan_draws_a_rounded_focus_ring() {
         ..Default::default()
     });
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
@@ -3749,7 +3748,7 @@ fn shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
         return None;
     }
 
-    let mut f = Fixture::with_config_and_renderer(Config::default(), RendererKind::Vulkan);
+    let mut f = Fixture::new();
     f.niri_state()
         .backend
         .headless()
@@ -3905,7 +3904,7 @@ fn vulkan_draws_a_window_shadow() {
         y: niri_config::FloatOrInt(0.),
     };
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
@@ -4001,7 +4000,7 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
         ..Default::default()
     });
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
@@ -4197,7 +4196,7 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
         ..Default::default()
     });
 
-    let mut f = Fixture::with_config_and_renderer(config, RendererKind::Vulkan);
+    let mut f = Fixture::with_config(config);
     f.niri_state()
         .backend
         .headless()
