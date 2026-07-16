@@ -10,9 +10,8 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use crate::animation::Animation;
 use crate::niri_render_elements;
 use crate::render_helpers::custom_anim::CustomAnimRenderElement;
-use crate::render_helpers::offscreen::{
-    DualOffscreenRenderElement, OffscreenBuffer, OffscreenData,
-};
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
+use crate::render_helpers::vulkan::VkTexture;
 
 #[derive(Debug)]
 pub struct OpenAnimation {
@@ -23,7 +22,7 @@ pub struct OpenAnimation {
 
 niri_render_elements! {
     OpeningWindowRenderElement => {
-        Offscreen = RelocateRenderElement<RescaleRenderElement<DualOffscreenRenderElement>>,
+        Offscreen = RelocateRenderElement<RescaleRenderElement<OffscreenRenderElement<VkTexture>>>,
         Shader = CustomAnimRenderElement,
     }
 }
@@ -116,7 +115,6 @@ impl OpenAnimation {
         }
 
         let elem = elem.with_alpha(clamped_progress as f32 * alpha);
-        let elem = DualOffscreenRenderElement::Vulkan(elem);
 
         let center = geo_size.to_point().downscale(2.);
         let elem = RescaleRenderElement::from_element(

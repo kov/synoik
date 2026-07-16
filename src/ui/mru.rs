@@ -31,7 +31,7 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuffer};
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -125,7 +125,7 @@ niri_render_elements! {
         GradientFadeElem = GradientFadeTextureRenderElement,
         GradientFadeVk = GradientFadeTextureRenderElement<VkTexture>,
         FocusRing = FocusRingRenderElement,
-        Offscreen = DualOffscreenRenderElement,
+        Offscreen = OffscreenRenderElement<VkTexture>,
         Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement<R>>>,
     }
 }
@@ -1195,9 +1195,7 @@ impl WindowMruUi {
 
                 match inner.offscreen_vk.render(vctx.renderer, scale, &elems) {
                     Ok((elem, _sync, _data)) => {
-                        push(WindowMruUiRenderElement::Offscreen(
-                            DualOffscreenRenderElement::Vulkan(elem.with_alpha(alpha)),
-                        ));
+                        push(WindowMruUiRenderElement::Offscreen(elem.with_alpha(alpha)));
                         pushed_offscreen = true;
                     }
                     Err(err) => {

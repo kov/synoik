@@ -22,14 +22,14 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::offscreen::{DualOffscreenRenderElement, OffscreenBuffer};
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureBuffer;
-use crate::render_helpers::vulkan::VulkanRenderer;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -141,7 +141,7 @@ niri_render_elements! {
         Border = BorderRenderElement,
         Shadow = ShadowRenderElement,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
-        Offscreen = DualOffscreenRenderElement,
+        Offscreen = OffscreenRenderElement<VkTexture>,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
     }
@@ -1433,7 +1433,7 @@ impl<W: LayoutElement> Tile<W> {
                             let elem = elem.with_alpha(tile_alpha).with_offset(location + offset);
 
                             self.window().set_offscreen_data(Some(data));
-                            push(DualOffscreenRenderElement::Vulkan(elem).into());
+                            push(elem.into());
                             pushed = true;
                         }
                         Err(err) => {
