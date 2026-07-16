@@ -110,6 +110,11 @@ impl EffectBuffer {
     /// remap in `Niri::update_primary_scanout_output` (niri.rs) — a background layer surface
     /// visible only through an xray blur was then treated as un-presented and its frame callbacks
     /// throttled.
+    ///
+    /// Callers must have filled and prepared this buffer during the frame they read it in: the
+    /// states are only rewritten on the `ElementsVk::New` path, so a caller that skipped its
+    /// `elements_vulkan()` + `prepare_vulkan()` would silently get the previous frame's states and
+    /// gate frame callbacks on them. Today `Niri::fill_xray_elements` does both on every frame.
     pub fn render_element_states(&self) -> Option<&RenderElementStates> {
         self.offscreen_vk.as_ref().map(|o| &o.states)
     }
@@ -156,12 +161,14 @@ impl EffectBuffer {
         elements
     }
 
-    /// The owned Vulkan renderer's dual of [`Self::prepare`]: (re)render the offscreen and, when
-    /// `blur`, its blurred version. Returns `false` on error (the caller skips drawing the effect).
+    /// (Re)render the offscreen and, when `blur`, its blurred version. Returns `false` on error
+    /// (the caller skips drawing the effect).
     ///
-    /// Unlike the GLES arm (which blurs lazily inside `render`, skipping culled elements), the blur
-    /// is run **eagerly** here — the owned renderer's blur runs on its own fenced submission, and
-    /// keeping it in `prepare` matches the offscreen render's synchronous model.
+    /// The blur is run **eagerly** here rather than lazily at draw time: the owned renderer's blur
+    /// runs on its own fenced submission, and keeping it in `prepare` matches the offscreen
+    /// render's synchronous model. Both are damage-gated ([`Self::prepare_blur_vulkan`] only
+    /// runs the blur when the offscreen actually re-rendered), so a steady frame does no work
+    /// here.
     pub fn prepare_vulkan(&mut self, renderer: &mut VulkanRenderer, blur: bool) -> bool {
         if let Err(err) = self.prepare_offscreen_vulkan(renderer) {
             warn!("error preparing Vulkan offscreen: {err:?}");
@@ -339,7 +346,8 @@ impl EffectBuffer {
     /// when `blur` is requested, also `None` if the blurred output is not valid. We deliberately do
     /// NOT fall back to the unblurred offscreen there: `prepare_vulkan` runs the blur eagerly, so a
     /// missing/invalid blur means prepare failed and the caller should draw nothing rather than
-    /// silently sample an unblurred texture that would diverge from the GLES oracle.
+    /// silently sample an unblurred texture — which, behind an xray, would show through content the
+    /// blur was meant to obscure.
     pub fn texture_vulkan(&self, blur: bool) -> Option<VkTexture> {
         let offscreen = self.offscreen_vk.as_ref()?;
         if blur {

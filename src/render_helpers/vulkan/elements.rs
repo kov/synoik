@@ -1,10 +1,11 @@
 //! `RenderElement<VulkanRenderer>` impls for niri's custom effect elements.
 //!
-//! For the Stage 2 seam these are **degraded no-ops**: the element draws nothing on Vulkan (a
-//! visible gap), so `OutputRenderElements<VulkanRenderer>` composes and renders while the effects
-//! are ported one by one in the material tail (M3). The plain Smithay elements
-//! (`SolidColorRenderElement`, `WaylandSurfaceRenderElement`, `TextureRenderElement`, …) already
-//! implement `RenderElement<R>` generically, so they render correctly through Vulkan today.
+//! What remains here are **degraded no-ops** for the GLES-texture specializations of elements whose
+//! Vulkan variants live elsewhere: they draw nothing, and exist only so those types satisfy
+//! `RenderElement<VulkanRenderer>` where a generic bound demands it. They go with the GLES
+//! specializations themselves. The plain Smithay elements (`SolidColorRenderElement`,
+//! `WaylandSurfaceRenderElement`, `TextureRenderElement`, …) implement `RenderElement<R>`
+//! generically, so they render through Vulkan directly.
 
 use smithay::backend::renderer::element::{RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::GlesTexture;

@@ -475,12 +475,11 @@ impl Mapped {
         self.animation_snapshot = Some(self.render_snapshot(Some(renderer)));
     }
 
-    /// Store the animation snapshot without baking the window contents into GLES textures — the
-    /// Vulkan session's counterpart to [`Self::store_animation_snapshot`].
+    /// Store the animation snapshot without baking the window contents into GLES textures.
     ///
-    /// A Vulkan session never samples `contents`: its only reader is `RenderSnapshot::texture`,
-    /// reached solely behind the `try_as_gles` in `Tile::render` that yields `None` there. What it
-    /// does need is `neutral`, filled right after this by [`Self::capture_neutral_vulkan`].
+    /// `contents` is never sampled — nothing reads it any more, so passing `None` here costs
+    /// nothing. What the crossfade does need is `neutral`, filled right after this by
+    /// [`Self::capture_neutral_vulkan`].
     ///
     /// The snapshot struct itself is still load-bearing, which is easy to miss:
     /// `capture_neutral_vulkan` bails unless `animation_snapshot` is already `Some`, and

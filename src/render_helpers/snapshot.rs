@@ -37,10 +37,8 @@ pub struct RenderSnapshot<C, B> {
 
     /// Non-blocked-out contents rendered into a renderer-neutral CPU buffer, captured eagerly at
     /// snapshot time through the owned Vulkan renderer (`Mapped::capture_neutral_vulkan`). The
-    /// Vulkan resize crossfade has no GLES renderer in its render path to lazily rasterize the
-    /// GLES `texture` above, so it uploads this buffer to a `VkTexture` instead. `(buffer,
-    /// encompassing geo)`; `None` unless captured — a Vulkan session leaves `contents` empty
-    /// and fills only this.
+    /// resize crossfade uploads this buffer to a `VkTexture`. `(buffer, encompassing geo)`; `None`
+    /// unless captured.
     pub neutral: OnceCell<Option<(MemoryBuffer, Rectangle<i32, Physical>)>>,
 }
 
@@ -51,8 +49,7 @@ pub type CapturedVariant = (MemoryBuffer, Rectangle<i32, Physical>);
 /// own encompassing geometry (the blocked-out variant is a bare rect, so its box is genuinely
 /// smaller than the contents' box, which includes the shadow).
 ///
-/// The owned Vulkan renderer can't sample the GLES textures a [`RenderSnapshot`] bakes, so a Vulkan
-/// session captures the same three variants this way instead and uploads them on demand.
+/// Captured eagerly at snapshot time and uploaded to `VkTexture`s on demand.
 #[derive(Debug)]
 pub struct NeutralSnapshot {
     /// Contents for a normal render.
@@ -79,10 +76,12 @@ pub struct NeutralSnapshot {
 
 impl NeutralSnapshot {
     /// The variant to draw on `target`, and its index (stable, for keying an upload cache).
-    /// Mirrors the GLES selection in `ClosingWindow::render`.
     ///
-    /// `None` means there is nothing safe to draw — draw nothing. Notably it never falls back to
-    /// the unblocked `contents` for a target that must be blocked out.
+    /// This is the single point where the fail-closed block-out rule is enforced: `None` means
+    /// there is nothing safe to draw — draw nothing. Notably it never falls back to the
+    /// unblocked `contents` for a target that must be blocked out, and callers must never
+    /// substitute another variant when this returns `None` or when their own upload of the
+    /// chosen variant fails.
     pub fn variant(&self, target: RenderTarget) -> Option<(usize, &CapturedVariant)> {
         if target.should_block_out(self.block_out_from) {
             return Some((2, self.blocked_out_contents.as_ref()?));
@@ -101,15 +100,13 @@ impl NeutralSnapshot {
 /// Vulkan-native neutral capture: import a surface tree through the owned Vulkan renderer and
 /// render it into a renderer-neutral CPU [`MemoryBuffer`], at snapshot time.
 ///
-/// The Vulkan analogue of [`RenderSnapshot::capture_neutral`] — used on a Vulkan session so the
-/// resize crossfade's pre-resize snapshot never touches GLES. Rather than re-render the GLES-baked
-/// `contents` (whose `PrimaryGpuTextureRenderElement` is a no-op on Vulkan), it re-imports the
-/// surface tree directly through the Vulkan renderer via the already-generic
+/// Re-imports the surface tree directly through the Vulkan renderer via the already-generic
 /// [`push_elements_from_surface_tree`] (a cache hit — the window has been compositing through this
-/// renderer). `buf_pos` is the window-geometry origin (logical, negated), matching
-/// [`RenderSnapshot::capture_neutral`]'s geometry so the resulting `(buffer, geo)` places
-/// `tex_prev` identically. Returns `None` on empty geometry or a render error, leaving the caller
-/// free to fall back to the GLES path.
+/// renderer). `buf_pos` is the window-geometry origin (logical, negated), chosen so the resulting
+/// `(buffer, geo)` places `tex_prev` at the same position the window occupied pre-resize.
+///
+/// Returns `None` on empty geometry or a render error; a needed variant that returns `None` must
+/// fail the whole snapshot closed rather than be substituted (see [`NeutralSnapshot::variant`]).
 pub fn capture_neutral_from_surface_tree(
     renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,

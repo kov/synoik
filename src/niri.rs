@@ -4829,9 +4829,9 @@ impl Niri {
                 false,
                 &mut |elem| elements.push(elem.into()),
             );
-            // As in `fill_xray_elements`: bake the in-compositor GNOME wallpaper into the
-            // background buffer (through the Vulkan arm's element storage) so the owned Vulkan
-            // renderer's xray samples the wallpaper behind translucent windows.
+            // Bake the in-compositor GNOME wallpaper into the background buffer (through the
+            // Vulkan arm's element storage) so the xray samples the wallpaper behind translucent
+            // windows.
             push_gnome_wallpaper_into_xray(
                 gnome_mode,
                 &self.wallpaper,
@@ -7087,8 +7087,7 @@ impl ClientData for ClientState {
 /// `bg_color`. We fill the output-sized buffer at its origin with `zoom = 1` (the `XrayElement`
 /// applies the per-window mapping and rounded clip when it samples), pushed last so the wallpaper
 /// sits below the background-layer surfaces, matching `render_inner`'s draw order.
-/// Renderer-agnostic via [`Wallpaper::render_dual`], so both fill paths (GLES and the owned Vulkan
-/// arm) share it.
+/// Renderer-agnostic via [`Wallpaper::render_dual`].
 fn push_gnome_wallpaper_into_xray<R: NiriRenderer>(
     gnome_mode: bool,
     wallpaper: &Wallpaper,

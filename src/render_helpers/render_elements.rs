@@ -1,5 +1,5 @@
-// We need to implement RenderElement manually due to AsGlesFrame requirement.
-// This macro does it for us.
+// Generates the element enums the render tree passes around: an `Element` impl that forwards to
+// each variant, plus the `RenderElement<VulkanRenderer>` impl and the `From` impls.
 #[macro_export]
 macro_rules! niri_render_elements {
     // The two callable variants: with <R> and without <R>. They include From impls because nested
