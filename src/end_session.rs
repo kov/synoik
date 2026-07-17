@@ -1,9 +1,10 @@
-//! The state machine behind `org.gnome.SessionManager.EndSessionDialog` (see `dbus::gnome_session`).
+//! The state machine behind `org.gnome.SessionManager.EndSessionDialog` (see
+//! `dbus::gnome_session`).
 //!
 //! When the user asks to log out, power off, or restart, gnome-session doesn't do it directly: it
 //! asks the shell to put up a confirmation dialog by calling `Open(type, timestamp, seconds,
-//! inhibitors)` on this interface, then waits for us to emit `ConfirmedLogout` / `ConfirmedReboot` /
-//! `ConfirmedShutdown` (proceed) or `Canceled` (abort). gnome-shell implements this in
+//! inhibitors)` on this interface, then waits for us to emit `ConfirmedLogout` / `ConfirmedReboot`
+//! / `ConfirmedShutdown` (proceed) or `Canceled` (abort). gnome-shell implements this in
 //! `js/ui/endSessionDialog.js`; this is the compositor-side equivalent of its dialog lifecycle,
 //! kept pure so the semantics are unit-testable without a bus, a clock, or a renderer.
 //!
@@ -11,8 +12,8 @@
 //!
 //! - Each dialog type has exactly one confirm button (plus Cancel): logout → `ConfirmedLogout`,
 //!   shutdown → `ConfirmedShutdown`, restart → `ConfirmedReboot`.
-//! - The dialog counts down from `seconds` and, on expiry, auto-confirms its default (only) action —
-//!   the same thing clicking the button does. gnome-session always passes a non-zero timeout in
+//! - The dialog counts down from `seconds` and, on expiry, auto-confirms its default (only) action
+//!   — the same thing clicking the button does. gnome-session always passes a non-zero timeout in
 //!   practice; we treat `0` as "no countdown, stay open" rather than "confirm immediately", so an
 //!   unexpected `0` can never trigger a surprise power-off.
 //!
@@ -32,8 +33,8 @@ pub enum EndSessionType {
 }
 
 impl EndSessionType {
-    /// Map the `Open` `type` argument. gnome-session only ever sends 0/1/2; anything else falls back
-    /// to the least-destructive action (logout) rather than guessing a power-off.
+    /// Map the `Open` `type` argument. gnome-session only ever sends 0/1/2; anything else falls
+    /// back to the least-destructive action (logout) rather than guessing a power-off.
     pub fn from_u32(ty: u32) -> Self {
         match ty {
             1 => EndSessionType::Shutdown,
@@ -45,6 +46,27 @@ impl EndSessionType {
             }
         }
     }
+
+    /// The D-Bus signal name that confirms this action, which gnome-session waits for. Restart maps
+    /// to `ConfirmedReboot` (mutter's naming), not `ConfirmedRestart`.
+    pub fn confirmed_signal(self) -> &'static str {
+        match self {
+            EndSessionType::Logout => "ConfirmedLogout",
+            EndSessionType::Shutdown => "ConfirmedShutdown",
+            EndSessionType::Restart => "ConfirmedReboot",
+        }
+    }
+}
+
+/// A session action to ask gnome-session to *start* — the compositor's `Logout` / `PowerOff` /
+/// `Reboot` actions. Maps to the like-named method on `org.gnome.SessionManager`, which then calls
+/// `EndSessionDialog.Open` back on us. (This is the trigger side; [`EndSession`] is the dialog
+/// side.)
+#[derive(Debug, Clone, Copy)]
+pub enum SessionRequest {
+    Logout,
+    PowerOff,
+    Reboot,
 }
 
 #[derive(Debug)]
@@ -82,8 +104,8 @@ impl EndSession {
         self.dialog.as_ref().map(|d| d.kind)
     }
 
-    /// Whole seconds until the countdown auto-confirms, for the dialog's description. `None` when no
-    /// dialog is open or `Open` requested no timeout.
+    /// Whole seconds until the countdown auto-confirms, for the dialog's description. `None` when
+    /// no dialog is open or `Open` requested no timeout.
     pub fn seconds_left(&self, now: Duration) -> Option<u64> {
         let deadline = self.dialog.as_ref()?.deadline?;
         Some(deadline.saturating_sub(now).as_secs())
@@ -113,8 +135,8 @@ impl EndSession {
         expired.then(|| self.dialog.take().unwrap().kind)
     }
 
-    /// The user cancelled (Cancel button or Esc): close the dialog. Returns whether one was open, so
-    /// the caller emits `Canceled` (then `Closed`) only when there was something to cancel.
+    /// The user cancelled (Cancel button or Esc): close the dialog. Returns whether one was open,
+    /// so the caller emits `Canceled` (then `Closed`) only when there was something to cancel.
     pub fn cancel(&mut self) -> bool {
         self.dialog.take().is_some()
     }
@@ -210,6 +232,28 @@ mod tests {
         e.open(EndSessionType::Restart, 30, s(5));
         assert_eq!(e.kind(), Some(EndSessionType::Restart));
         assert_eq!(e.deadline(), Some(s(35)));
+    }
+
+    #[test]
+    fn confirmed_signal_matches_the_protocol_names() {
+        assert_eq!(EndSessionType::Logout.confirmed_signal(), "ConfirmedLogout");
+        assert_eq!(
+            EndSessionType::Shutdown.confirmed_signal(),
+            "ConfirmedShutdown"
+        );
+        // Restart confirms with ConfirmedReboot, not ConfirmedRestart.
+        assert_eq!(
+            EndSessionType::Restart.confirmed_signal(),
+            "ConfirmedReboot"
+        );
+    }
+
+    #[test]
+    fn from_u32_maps_known_types_and_defaults_to_logout() {
+        assert_eq!(EndSessionType::from_u32(0), EndSessionType::Logout);
+        assert_eq!(EndSessionType::from_u32(1), EndSessionType::Shutdown);
+        assert_eq!(EndSessionType::from_u32(2), EndSessionType::Restart);
+        assert_eq!(EndSessionType::from_u32(99), EndSessionType::Logout);
     }
 
     #[test]

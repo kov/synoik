@@ -169,6 +169,7 @@ use crate::render_helpers::{
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
 use crate::ui::config_error_notification::ConfigErrorNotification;
+use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
@@ -330,6 +331,12 @@ pub struct Niri {
     /// The single timer re-armed to the next idle watch's deadline (see
     /// `IdleMonitor::next_wakeup`).
     pub idle_monitor_timer: Option<RegistrationToken>,
+    /// `org.gnome.SessionManager.EndSessionDialog` lifecycle: gnome-session's logout/shutdown/
+    /// restart confirmation. The interactive surface is `end_session_dialog`;
+    /// `Confirmed*`/`Canceled` go out via `emit_end_session_signal`.
+    pub end_session: crate::end_session::EndSession,
+    /// The timer armed to the countdown's auto-confirm deadline (see `EndSession::deadline`).
+    pub end_session_timer: Option<RegistrationToken>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
@@ -447,6 +454,7 @@ pub struct Niri {
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
     pub run_dialog: RunDialog,
+    pub end_session_dialog: EndSessionDialog,
     pub panel: Panel,
 
     pub window_mru_ui: WindowMruUi,
@@ -579,6 +587,7 @@ pub enum KeyboardFocus {
     ScreenshotUi,
     ExitConfirmDialog,
     RunDialog,
+    EndSessionDialog,
     Overview,
     Mru,
 }
@@ -729,6 +738,7 @@ impl KeyboardFocus {
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
+            KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -742,6 +752,7 @@ impl KeyboardFocus {
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
+            KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -1249,6 +1260,8 @@ impl State {
             KeyboardFocus::ExitConfirmDialog
         } else if self.niri.run_dialog.is_open() {
             KeyboardFocus::RunDialog
+        } else if self.niri.end_session_dialog.is_open() {
+            KeyboardFocus::EndSessionDialog
         } else if self.niri.is_locked() {
             KeyboardFocus::LockScreen {
                 surface: self.niri.lock_surface_focus(),
@@ -2412,6 +2425,36 @@ impl State {
         }
     }
 
+    /// gnome-session's `EndSessionDialog.Open`/`Close` land here (see `dbus::gnome_session`): raise
+    /// or dismiss the logout/shutdown/restart confirmation. Confirm/cancel come from input, not the
+    /// bus (`confirm_end_session`/`cancel_end_session`).
+    #[cfg(feature = "dbus")]
+    pub fn on_end_session_msg(&mut self, msg: crate::dbus::gnome_session::EndSessionDialogToNiri) {
+        use crate::dbus::gnome_session::EndSessionDialogToNiri;
+        use crate::end_session::EndSessionType;
+
+        let now = self.niri.clock.now_unadjusted();
+        match msg {
+            EndSessionDialogToNiri::Open { kind, seconds } => {
+                let kind = EndSessionType::from_u32(kind);
+                self.niri.end_session.open(kind, seconds, now);
+                self.niri.end_session_dialog.show(kind);
+                self.niri
+                    .end_session_dialog
+                    .set_content(kind, self.niri.end_session.seconds_left(now));
+                self.niri.reschedule_end_session_timer();
+                self.niri.queue_redraw_all();
+            }
+            EndSessionDialogToNiri::Close => {
+                if self.niri.end_session.close() {
+                    self.niri.end_session_dialog.hide();
+                    self.niri.reschedule_end_session_timer();
+                    self.niri.queue_redraw_all();
+                }
+            }
+        }
+    }
+
     /// Register an external accelerator grab, mirroring
     /// `meta_display_grab_accelerator`: an unparseable accelerator or one that
     /// already resolves to an existing keybinding or grab is refused with 0
@@ -2666,6 +2709,7 @@ impl Niri {
         }
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
+        let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
 
         #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
@@ -2813,6 +2857,8 @@ impl Niri {
             idle_notifier_state,
             idle_monitor,
             idle_monitor_timer: None,
+            end_session: crate::end_session::EndSession::new(),
+            end_session_timer: None,
             idle_inhibit_manager_state,
             data_device_state,
             primary_selection_state,
@@ -2879,6 +2925,7 @@ impl Niri {
             hotkey_overlay,
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
+            end_session_dialog,
             panel: Panel::new(),
 
             window_mru_ui,
@@ -3481,6 +3528,7 @@ impl Niri {
     ) -> Option<(Output, &Workspace<Mapped>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
+            || self.end_session_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
         {
@@ -3524,6 +3572,7 @@ impl Niri {
     ) -> Option<(Output, &Workspace<Mapped>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
+            || self.end_session_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
         {
@@ -3552,6 +3601,7 @@ impl Niri {
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
+            || self.end_session_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             || self.window_mru_ui.is_open()
@@ -3607,7 +3657,10 @@ impl Niri {
         // The ordering here must be consistent with the ordering in render() so that input is
         // consistent with the visuals.
 
-        if self.exit_confirm_dialog.is_open() || self.run_dialog.is_open() {
+        if self.exit_confirm_dialog.is_open()
+            || self.run_dialog.is_open()
+            || self.end_session_dialog.is_open()
+        {
             return rv;
         } else if self.is_locked() {
             let Some(state) = self.output_state.get(output) else {
@@ -4326,6 +4379,7 @@ impl Niri {
             KeyboardFocus::ScreenshotUi => true,
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::RunDialog => true,
+            KeyboardFocus::EndSessionDialog => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Mru => true,
         };
@@ -4398,6 +4452,7 @@ impl Niri {
         self.layout.advance_animations();
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
+        self.end_session_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
 
@@ -4576,6 +4631,10 @@ impl Niri {
 
         // Next, the run dialog.
         self.run_dialog
+            .render(ctx.renderer, output, &mut |elem| push(elem.into()));
+
+        // Next, the end-session (logout/shutdown/restart) confirmation dialog.
+        self.end_session_dialog
             .render(ctx.renderer, output, &mut |elem| push(elem.into()));
 
         // Next, the config error notification too.
@@ -5011,6 +5070,7 @@ impl Niri {
             state.unfinished_animations_remain |=
                 self.config_error_notification.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
@@ -7108,6 +7168,108 @@ impl Niri {
     #[cfg(not(feature = "dbus"))]
     pub fn emit_idle_watch_fired(&self, _fired: &[crate::idle_monitor::Fired]) {}
 
+    /// The user confirmed the end-session dialog (clicked the action button, pressed Enter on it,
+    /// or the countdown expired): tell gnome-session to proceed and close the dialog.
+    pub fn confirm_end_session(&mut self) {
+        if let Some(kind) = self.end_session.confirm() {
+            self.emit_end_session_signal(kind.confirmed_signal());
+        }
+        self.end_session_dialog.hide();
+        self.reschedule_end_session_timer();
+        self.queue_redraw_all();
+    }
+
+    /// The user cancelled the end-session dialog (Cancel button or Esc): tell gnome-session to
+    /// abort (`Canceled` then `Closed`, like gnome-shell) and close the dialog.
+    pub fn cancel_end_session(&mut self) {
+        if self.end_session.cancel() {
+            self.emit_end_session_signal("Canceled");
+            self.emit_end_session_signal("Closed");
+        }
+        self.end_session_dialog.hide();
+        self.reschedule_end_session_timer();
+        self.queue_redraw_all();
+    }
+
+    /// Re-arm the countdown timer: fire once a second to refresh the displayed seconds and, at the
+    /// deadline, auto-confirm. Cancels the timer when no dialog is counting down.
+    pub fn reschedule_end_session_timer(&mut self) {
+        if let Some(token) = self.end_session_timer.take() {
+            self.event_loop.remove(token);
+        }
+        if self.end_session.deadline().is_none() {
+            return;
+        }
+        let timer = Timer::from_duration(Duration::from_secs(1));
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.on_end_session_timer();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.end_session_timer = Some(token);
+    }
+
+    fn on_end_session_timer(&mut self) {
+        self.end_session_timer = None;
+        let now = self.clock.now_unadjusted();
+
+        if let Some(kind) = self.end_session.tick(now) {
+            // Countdown expired: auto-confirm the default action, exactly as clicking it would.
+            self.emit_end_session_signal(kind.confirmed_signal());
+            self.end_session_dialog.hide();
+            self.queue_redraw_all();
+            return;
+        }
+
+        // Still counting down: update the displayed seconds and tick again in a second.
+        if let Some(kind) = self.end_session.kind() {
+            self.end_session_dialog
+                .set_content(kind, self.end_session.seconds_left(now));
+        }
+        self.queue_redraw_all();
+        self.reschedule_end_session_timer();
+    }
+
+    #[cfg(feature = "dbus")]
+    pub fn emit_end_session_signal(&self, signal: &str) {
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_end_session.clone()) else {
+            return;
+        };
+        // Broadcast (no destination) — gnome-session listens on the object, like gnome-shell's
+        // `this._dbusImpl.emit_signal(...)`.
+        let res = async_io::block_on(conn.inner().emit_signal(
+            None::<zbus::names::BusName>,
+            "/org/gnome/SessionManager/EndSessionDialog",
+            "org.gnome.SessionManager.EndSessionDialog",
+            signal,
+            &(),
+        ));
+        if let Err(err) = res {
+            warn!("error emitting EndSessionDialog.{signal}: {err:?}");
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn emit_end_session_signal(&self, _signal: &str) {}
+
+    /// Ask gnome-session to start a logout/power-off/restart (the `Logout`/`PowerOff`/`Reboot`
+    /// actions). gnome-session then calls `EndSessionDialog.Open` back on us.
+    #[cfg(feature = "dbus")]
+    pub fn request_session_action(&self, request: crate::end_session::SessionRequest) {
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_end_session.clone()) else {
+            warn!("cannot request {request:?}: no session bus connection");
+            return;
+        };
+        crate::dbus::gnome_session::request_session_action(&conn, request);
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn request_session_action(&self, _request: crate::end_session::SessionRequest) {
+        warn!("session actions require the dbus feature");
+    }
+
     pub fn close_mru(&mut self, close_request: MruCloseRequest) -> Option<Window> {
         if !self.window_mru_ui.is_open() {
             return None;
@@ -7253,6 +7415,7 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
+        EndSessionDialog = EndSessionDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).

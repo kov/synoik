@@ -271,6 +271,12 @@ pub enum Action {
     PowerOffMonitors {},
     /// Power on all monitors via DPMS.
     PowerOnMonitors {},
+    /// Log out of the session, via gnome-session's confirmation dialog.
+    Logout {},
+    /// Power off the system, via gnome-session's confirmation dialog.
+    PowerOff {},
+    /// Restart the system, via gnome-session's confirmation dialog.
+    Reboot {},
     /// Spawn a command.
     Spawn {
         /// Command to spawn.

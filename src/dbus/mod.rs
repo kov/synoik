@@ -7,6 +7,7 @@ pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
 pub mod freedesktop_screensaver;
+pub mod gnome_session;
 pub mod gnome_shell;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
@@ -21,6 +22,7 @@ use mutter_screen_cast::ScreenCast;
 
 use self::freedesktop_a11y::KeyboardMonitor;
 use self::freedesktop_screensaver::ScreenSaver;
+use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
 use self::gnome_shell_introspect::Introspect;
 use self::mutter_display_config::DisplayConfig;
@@ -40,6 +42,7 @@ pub struct DBusServers {
     pub conn_introspect: Option<Connection>,
     pub conn_gnome_shell: Option<Connection>,
     pub conn_idle_monitor: Option<Connection>,
+    pub conn_end_session: Option<Connection>,
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_screen_cast: Option<Connection>,
     pub conn_login1: Option<Connection>,
@@ -141,6 +144,16 @@ impl DBusServers {
                 .unwrap();
             let idle_monitor = IdleMonitor::new(to_niri);
             dbus.conn_idle_monitor = try_start(idle_monitor);
+
+            let (to_niri, from_end_session) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_end_session, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_end_session_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let end_session = EndSessionDialog::new(to_niri);
+            dbus.conn_end_session = try_start(end_session);
 
             #[cfg(feature = "xdp-gnome-screencast")]
             {

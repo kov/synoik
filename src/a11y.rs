@@ -21,6 +21,7 @@ const ID_EXIT_CONFIRM_DIALOG: NodeId = NodeId(3);
 const ID_OVERVIEW: NodeId = NodeId(4);
 const ID_MRU: NodeId = NodeId(5);
 const ID_RUN_DIALOG: NodeId = NodeId(6);
+const ID_END_SESSION_DIALOG: NodeId = NodeId(7);
 
 pub struct A11y {
     event_loop: LoopHandle<'static, State>,
@@ -276,6 +277,7 @@ impl Niri {
             KeyboardFocus::ScreenshotUi => ID_SCREENSHOT_UI,
             KeyboardFocus::ExitConfirmDialog => ID_EXIT_CONFIRM_DIALOG,
             KeyboardFocus::RunDialog => ID_RUN_DIALOG,
+            KeyboardFocus::EndSessionDialog => ID_END_SESSION_DIALOG,
             KeyboardFocus::Overview => ID_OVERVIEW,
             KeyboardFocus::Mru => ID_MRU,
             _ => ID_ROOT,
@@ -307,6 +309,7 @@ impl Niri {
 
         let exit_confirm_dialog = crate::ui::exit_confirm_dialog::a11y_node();
         let run_dialog = crate::ui::run_dialog::a11y_node();
+        let end_session_dialog = crate::ui::end_session_dialog::a11y_node();
 
         let mut overview = Node::new(Role::Group);
         overview.set_label("Overview");
@@ -320,6 +323,7 @@ impl Niri {
             ID_SCREENSHOT_UI,
             ID_EXIT_CONFIRM_DIALOG,
             ID_RUN_DIALOG,
+            ID_END_SESSION_DIALOG,
             ID_OVERVIEW,
             ID_MRU,
         ]);
@@ -342,6 +346,7 @@ impl Niri {
                 (ID_SCREENSHOT_UI, screenshot_ui),
                 (ID_EXIT_CONFIRM_DIALOG, exit_confirm_dialog),
                 (ID_RUN_DIALOG, run_dialog),
+                (ID_END_SESSION_DIALOG, end_session_dialog),
                 (ID_OVERVIEW, overview),
                 (ID_MRU, mru),
             ],

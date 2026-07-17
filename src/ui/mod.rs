@@ -1,4 +1,5 @@
 pub mod config_error_notification;
+pub mod end_session_dialog;
 pub mod exit_confirm_dialog;
 pub mod hotkey_overlay;
 pub mod mru;

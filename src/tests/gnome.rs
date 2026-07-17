@@ -2762,3 +2762,68 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
         "the watch must fire again after activity re-armed it",
     );
 }
+
+/// gnome-session drives logout/shutdown/restart by calling `EndSessionDialog.Open` on the shell and
+/// waiting for a `Confirmed*` (or `Canceled`) signal. Drive that entry point (`on_end_session_msg`)
+/// and the input-side confirm/cancel: `Open` raises both the lifecycle state and the visible
+/// dialog; confirming closes both and would emit the type's confirm signal; cancelling and
+/// gnome-session's own `Close` also close it. The countdown auto-confirm and signal-name mapping
+/// are unit-tested in `crate::end_session`.
+#[cfg(feature = "dbus")]
+#[test]
+fn end_session_dialog_open_confirm_and_cancel() {
+    use crate::dbus::gnome_session::EndSessionDialogToNiri;
+    use crate::end_session::EndSessionType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // gnome-session raises the shutdown dialog with a 60s countdown.
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Open {
+            kind: 1,
+            seconds: 60,
+        });
+    assert!(
+        f.niri().end_session.is_open(),
+        "Open must raise the end-session lifecycle",
+    );
+    assert!(
+        f.niri().end_session_dialog.is_open(),
+        "Open must raise the visible dialog too",
+    );
+    assert_eq!(f.niri().end_session.kind(), Some(EndSessionType::Shutdown));
+    assert_eq!(
+        f.niri().end_session.kind().unwrap().confirmed_signal(),
+        "ConfirmedShutdown",
+        "confirming a shutdown dialog must emit ConfirmedShutdown",
+    );
+
+    // Confirming (Enter / clicking Power Off) closes the dialog; gnome-session then powers off.
+    f.niri_state().niri.confirm_end_session();
+    assert!(!f.niri().end_session.is_open(), "confirm must close it");
+    assert!(!f.niri().end_session_dialog.is_open());
+
+    // A fresh dialog can be cancelled (Esc / Cancel), which aborts the request.
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    assert_eq!(f.niri().end_session.kind(), Some(EndSessionType::Logout));
+    f.niri_state().niri.cancel_end_session();
+    assert!(!f.niri().end_session.is_open(), "cancel must close it");
+
+    // gnome-session withdrawing the request (Close) also dismisses the dialog.
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Open {
+            kind: 2,
+            seconds: 60,
+        });
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Close);
+    assert!(
+        !f.niri().end_session.is_open(),
+        "gnome-session's Close must dismiss the dialog",
+    );
+}

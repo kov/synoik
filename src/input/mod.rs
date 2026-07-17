@@ -53,11 +53,12 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
-use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
 pub mod move_grab;
@@ -586,6 +587,27 @@ impl State {
                     }
                 }
 
+                // The end-session (logout/shutdown/restart) confirmation is modal like the run
+                // dialog: while open, every key goes to it and none reach the clients.
+                if this.niri.end_session_dialog.is_open() {
+                    match this.niri.end_session_dialog.handle_key(raw, pressed) {
+                        DialogOutcome::Handled => this.niri.queue_redraw_all(),
+                        DialogOutcome::Confirm => this.niri.confirm_end_session(),
+                        DialogOutcome::Cancel => this.niri.cancel_end_session(),
+                    }
+
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // Release of a key pressed before the dialog opened; the client saw the
+                        // press, give it the release.
+                        return FilterResult::Forward;
+                    }
+                }
+
                 // Check if all modifiers were released while the MRU UI was open. If so, close the
                 // UI (which will also transfer the focus to the current MRU UI selection).
                 if this.niri.window_mru_ui.is_open() && !pressed && modifiers.is_empty() {
@@ -830,6 +852,15 @@ impl State {
             Action::PowerOnMonitors => {
                 self.niri.activate_monitors(&mut self.backend);
             }
+            Action::Logout => self
+                .niri
+                .request_session_action(crate::end_session::SessionRequest::Logout),
+            Action::PowerOff => self
+                .niri
+                .request_session_action(crate::end_session::SessionRequest::PowerOff),
+            Action::Reboot => self
+                .niri
+                .request_session_action(crate::end_session::SessionRequest::Reboot),
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.niri.queue_redraw_all();
@@ -2737,6 +2768,19 @@ impl State {
             }
         }
 
+        if self.niri.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+                let output_size = output_size(output);
+                if self
+                    .niri
+                    .end_session_dialog
+                    .pointer_motion(output_size, pos_within_output)
+                {
+                    self.niri.queue_redraw_all();
+                }
+            }
+        }
+
         let under = self.niri.contents_under(new_pos);
 
         // Handle confined pointer.
@@ -2868,6 +2912,19 @@ impl State {
             }
         }
 
+        if self.niri.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                let output_size = output_size(output);
+                if self
+                    .niri
+                    .end_session_dialog
+                    .pointer_motion(output_size, pos_within_output)
+                {
+                    self.niri.queue_redraw_all();
+                }
+            }
+        }
+
         let under = self.niri.contents_under(pos);
 
         self.niri.handle_focus_follows_mouse(&under);
@@ -2966,6 +3023,29 @@ impl State {
                     self.niri.suppressed_buttons.insert(button_code);
                     return;
                 }
+            }
+
+            // The end-session dialog is modal: a left-click activates the button under the cursor,
+            // and every button is swallowed so nothing reaches the windows behind it.
+            if self.niri.end_session_dialog.is_open() {
+                if button == Some(MouseButton::Left) {
+                    let location = pointer.current_location();
+                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                        let output_size = output_size(output);
+                        match self
+                            .niri
+                            .end_session_dialog
+                            .pointer_click(output_size, pos_within_output)
+                        {
+                            DialogOutcome::Handled => {}
+                            DialogOutcome::Confirm => self.niri.confirm_end_session(),
+                            DialogOutcome::Cancel => self.niri.cancel_end_session(),
+                        }
+                    }
+                }
+
+                self.niri.suppressed_buttons.insert(button_code);
+                return;
             }
 
             // GNOME top panel: a left-click on the Activities button toggles the
@@ -3813,6 +3893,19 @@ impl State {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 if mru_output == output {
                     self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                }
+            }
+        }
+
+        if self.niri.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                let output_size = output_size(output);
+                if self
+                    .niri
+                    .end_session_dialog
+                    .pointer_motion(output_size, pos_within_output)
+                {
+                    self.niri.queue_redraw_all();
                 }
             }
         }
