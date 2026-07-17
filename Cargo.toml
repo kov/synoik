@@ -106,15 +106,15 @@ zbus = { version = "5.13.2", optional = true }
 workspace = true
 features = [
     "backend_drm",
-    "backend_egl",
     "backend_gbm",
     "backend_libinput",
     "backend_session_libseat",
     "backend_udev",
     "desktop",
-    "renderer_gl",
+    # The compositor renders through the owned Vulkan renderer (niri-vk), so smithay's GL renderer
+    # and the EGL backend under it are not built. `renderer_pixman` stays: it is the CPU oracle the
+    # Vulkan render tests compare against.
     "renderer_pixman",
-    "renderer_multi",
     "use_system_lib",
     "wayland_frontend",
 ]

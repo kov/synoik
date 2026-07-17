@@ -1,23 +1,24 @@
 //! The niri-side renderer trait impls that make [`VulkanRenderer`] a [`NiriRenderer`]: the client
-//! buffer imports ([`ImportMemWl`]/[`ImportEgl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
+//! buffer imports ([`ImportMemWl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
 //!
 //! shm ([`ImportMemWl`]) and single-plane LINEAR dmabuf ([`ImportDma`]) client buffers import for
-//! real; EGL client-buffer import ([`ImportEgl`]) still returns an error (clients use dmabuf/shm on
-//! this stack). The dmabuf-target [`Bind`] (KMS scanout) lives in `renderer.rs`.
+//! real; clients use dmabuf/shm on this stack. There is no `ImportEgl` impl because smithay only
+//! folds that trait into [`ImportAll`] when built with `backend_egl` + `use_system_lib`, and this
+//! build has no EGL at all — a `wl_drm` buffer can never arrive, since advertising that global is
+//! itself an EGL-backend job. The dmabuf-target [`Bind`] (KMS scanout) lives in `renderer.rs`.
+//!
+//! [`ImportAll`]: smithay::backend::renderer::ImportAll
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::egl::display::EGLBufferReader;
-use smithay::backend::egl::Error as EglError;
 use smithay::backend::renderer::{
-    ContextId, ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl, Renderer, Texture,
+    ContextId, ImportDma, ImportDmaWl, ImportMem, ImportMemWl, Renderer, Texture,
 };
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{Buffer as BufferCoord, Rectangle, Size};
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::shm::with_buffer_contents;
@@ -157,27 +158,6 @@ fn repack_shm(
         packed[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src);
     }
     Ok(packed)
-}
-
-impl ImportEgl for VulkanRenderer {
-    fn bind_wl_display(&mut self, _display: &DisplayHandle) -> Result<(), EglError> {
-        Err(EglError::NoEGLDisplayBound)
-    }
-
-    fn unbind_wl_display(&mut self) {}
-
-    fn egl_reader(&self) -> Option<&EGLBufferReader> {
-        None
-    }
-
-    fn import_egl_buffer(
-        &mut self,
-        _buffer: &WlBuffer,
-        _surface: Option<&SurfaceData>,
-        _damage: &[Rectangle<i32, BufferCoord>],
-    ) -> Result<VkTexture, VulkanError> {
-        Err(VulkanError::Unsupported("egl client-buffer import"))
-    }
 }
 
 impl ImportDma for VulkanRenderer {
