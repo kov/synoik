@@ -1,23 +1,21 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
-use glam::{Mat3, Vec2};
 use niri_config::{Color, CornerRadius};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
-use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::gpu_span_location;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
 use super::renderer::NiriRenderer;
-use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
 
 /// Renders a rounded rectangle shadow.
+///
+/// Cloned per frame by its owners with the `Id` carried along, so clones share one damage identity.
 #[derive(Debug, Clone)]
 pub struct ShadowRenderElement {
-    inner: ShaderRenderElement,
+    id: Id,
+    commit_counter: CommitCounter,
+    /// Where the element is drawn. Its size is [`Parameters::size`]; only [`Self::with_location`]
+    /// sets the location, and it deliberately does not bump the commit counter.
+    location: Point<f64, Logical>,
     params: Parameters,
 }
 
@@ -49,9 +47,10 @@ impl ShadowRenderElement {
         window_corner_radius: CornerRadius,
         alpha: f32,
     ) -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Shadow, Kind::Unspecified);
-        let mut rv = Self {
-            inner,
+        Self {
+            id: Id::new(),
+            commit_counter: CommitCounter::default(),
+            location: Point::default(),
             params: Parameters {
                 size,
                 geometry,
@@ -63,15 +62,14 @@ impl ShadowRenderElement {
                 window_geometry,
                 window_corner_radius,
             },
-        };
-        rv.update_inner();
-        rv
+        }
     }
 
     pub fn empty() -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Shadow, Kind::Unspecified);
         Self {
-            inner,
+            id: Id::new(),
+            commit_counter: CommitCounter::default(),
+            location: Point::default(),
             params: Parameters {
                 size: Default::default(),
                 geometry: Default::default(),
@@ -87,7 +85,7 @@ impl ShadowRenderElement {
     }
 
     pub fn damage_all(&mut self) {
-        self.inner.damage_all();
+        self.commit_counter.increment();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -114,89 +112,35 @@ impl ShadowRenderElement {
             window_geometry,
             window_corner_radius,
         };
+        // Only bump the commit counter when something actually changed: this is called every frame,
+        // so incrementing unconditionally would report damage over the whole element every frame.
         if self.params == params {
             return;
         }
 
         self.params = params;
-        self.update_inner();
+        self.commit_counter.increment();
     }
 
-    fn update_inner(&mut self) {
-        let Parameters {
-            size,
-            geometry,
-            color,
-            sigma,
-            alpha,
-            corner_radius,
-            scale,
-            window_geometry,
-            window_corner_radius,
-        } = self.params;
-
-        let area_size = Vec2::new(size.w as f32, size.h as f32);
-
-        let geo_loc = Vec2::new(geometry.loc.x as f32, geometry.loc.y as f32);
-        let geo_size = Vec2::new(geometry.size.w as f32, geometry.size.h as f32);
-
-        let input_to_geo =
-            Mat3::from_scale(area_size) * Mat3::from_translation(-geo_loc / area_size);
-
-        let window_geo_loc = Vec2::new(window_geometry.loc.x as f32, window_geometry.loc.y as f32);
-        let window_geo_size =
-            Vec2::new(window_geometry.size.w as f32, window_geometry.size.h as f32);
-
-        let window_input_to_geo =
-            Mat3::from_scale(area_size) * Mat3::from_translation(-window_geo_loc / area_size);
-
-        self.inner.update(
-            size,
-            None,
-            scale,
-            alpha,
-            Rc::new([
-                Uniform::new("shadow_color", color.to_array_premul()),
-                Uniform::new("sigma", sigma),
-                mat3_uniform("input_to_geo", input_to_geo),
-                Uniform::new("geo_size", geo_size.to_array()),
-                Uniform::new("corner_radius", <[f32; 4]>::from(corner_radius)),
-                mat3_uniform("window_input_to_geo", window_input_to_geo),
-                Uniform::new("window_geo_size", window_geo_size.to_array()),
-                Uniform::new(
-                    "window_corner_radius",
-                    <[f32; 4]>::from(window_corner_radius),
-                ),
-            ]),
-            HashMap::new(),
-        );
-    }
-
+    /// Moves the element. Deliberately does not bump the commit counter: the owners re-place a
+    /// cloned element every frame, and treating a move as damage here would defeat damage tracking.
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
-        self.inner = self.inner.with_location(location);
+        self.location = location;
         self
     }
 
-    /// Fade the shadow.
-    ///
-    /// Feeds `params`, which is what the Vulkan push reads, as well as `inner`, which backs the
-    /// `Element` alpha. Setting only `inner` — as this used to — left the draw at full alpha, so
-    /// the fade silently did nothing.
+    /// Fade the shadow. `params.alpha` is both what the draw reads and what `Element::alpha`
+    /// reports, so there is only one place left to write.
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.params.alpha = alpha;
-        self.inner = self.inner.with_alpha(alpha);
         self
     }
 
     /// Whether `renderer` can draw a drop shadow. Callers skip emitting shadow elements entirely
-    /// when this is false. True when the GLES shadow program is loaded, **or** on the owned Vulkan
-    /// renderer — which draws shadows procedurally ([`VulkanFrame::render_shadow`]) and needs no
-    /// GLES program, exactly as [`BorderRenderElement::has_shader`] already does.
+    /// when this is false, so this must keep reporting what the renderer in hand can actually do
+    /// rather than a blanket `true`.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        if renderer.try_as_vulkan_renderer().is_some() {
-            return true;
-        }
-        Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Shadow).is_some())
+        renderer.try_as_vulkan_renderer().is_some()
     }
 }
 
@@ -206,80 +150,35 @@ impl Default for ShadowRenderElement {
     }
 }
 
+// `transform` and `damage_since` are deliberately not overridden — the element this was promoted
+// from did not override them either, so both keep the `Element` defaults.
 impl Element for ShadowRenderElement {
     fn id(&self) -> &Id {
-        self.inner.id()
+        &self.id
     }
 
     fn current_commit(&self) -> CommitCounter {
-        self.inner.current_commit()
+        self.commit_counter
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.inner.geometry(scale)
-    }
-
-    fn transform(&self) -> Transform {
-        self.inner.transform()
+        Rectangle::new(self.location, self.params.size).to_physical_precise_round(scale)
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        self.inner.src()
-    }
-
-    fn damage_since(
-        &self,
-        scale: Scale<f64>,
-        commit: Option<CommitCounter>,
-    ) -> DamageSet<i32, Physical> {
-        self.inner.damage_since(scale, commit)
-    }
-
-    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.inner.opaque_regions(scale)
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn alpha(&self) -> f32 {
-        self.inner.alpha()
+        self.params.alpha
     }
 
     fn kind(&self) -> Kind {
-        self.inner.kind()
+        Kind::Unspecified
     }
 }
 
-impl RenderElement<GlesRenderer> for ShadowRenderElement {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        let _span = tracy_client::span!("ShadowRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("ShadowRenderElement::draw"), |frame| {
-            RenderElement::<GlesRenderer>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
-    }
-
-    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        self.inner.underlying_storage(renderer)
-    }
-}
-
-// The owned Vulkan renderer draws the shadow procedurally in its own pipeline (M3), reading the
-// raw `params` rather than the GLES `inner` uniform list. The derivation is trivial (field
-// extraction + the shared `area_size`), so it is inlined here rather than shared.
+// The renderer draws the shadow procedurally in its own pipeline, reading `params`.
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
 impl ShadowRenderElement {
@@ -330,5 +229,83 @@ impl RenderElement<VulkanRenderer> for ShadowRenderElement {
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(alpha: f32) -> ShadowRenderElement {
+        ShadowRenderElement::new(
+            Size::from((100., 100.)),
+            Rectangle::from_size(Size::from((100., 100.))),
+            Color::new_unpremul(0., 0., 0., 1.),
+            8.,
+            CornerRadius::default(),
+            1.,
+            Rectangle::from_size(Size::from((80., 80.))),
+            CornerRadius::default(),
+            alpha,
+        )
+    }
+
+    /// The owners call `update` every frame with mostly-unchanged parameters and re-place a clone
+    /// via `with_location`. Both must leave the commit counter alone, or every frame reports damage
+    /// over the whole element. Only a real parameter change may bump it.
+    #[test]
+    fn only_a_real_parameter_change_damages() {
+        let mut e = elem(1.);
+        let base = e.current_commit();
+
+        let same = |e: &mut ShadowRenderElement, alpha: f32| {
+            e.update(
+                Size::from((100., 100.)),
+                Rectangle::from_size(Size::from((100., 100.))),
+                Color::new_unpremul(0., 0., 0., 1.),
+                8.,
+                CornerRadius::default(),
+                1.,
+                Rectangle::from_size(Size::from((80., 80.))),
+                CornerRadius::default(),
+                alpha,
+            );
+        };
+
+        same(&mut e, 1.);
+        assert_eq!(
+            e.current_commit(),
+            base,
+            "an update with identical parameters must not damage"
+        );
+
+        let moved = e.clone().with_location(Point::from((7., 9.)));
+        assert_eq!(
+            moved.current_commit(),
+            base,
+            "with_location must not damage"
+        );
+        assert_eq!(
+            moved.id(),
+            e.id(),
+            "a relocated clone must keep the damage identity"
+        );
+
+        same(&mut e, 0.5);
+        assert_ne!(
+            e.current_commit(),
+            base,
+            "a changed parameter must damage the element"
+        );
+    }
+
+    /// The alpha the draw reads must be the one `with_alpha` sets and the one `Element` reports.
+    /// This is the exact split that made the fade a silent no-op before the promotion.
+    #[test]
+    fn with_alpha_reaches_both_the_draw_and_the_element() {
+        let e = elem(1.).with_alpha(0.25);
+        assert_eq!(e.alpha(), 0.25, "Element::alpha must see the fade");
+        let push = e.vulkan_push(Rectangle::from_size(smithay::utils::Size::from((100, 100))));
+        assert_eq!(push.niri_alpha, 0.25, "the draw must see the fade");
     }
 }
