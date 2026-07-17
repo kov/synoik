@@ -145,6 +145,9 @@ impl DBusServers {
             let idle_monitor = IdleMonitor::new(to_niri);
             dbus.conn_idle_monitor = try_start(idle_monitor);
 
+            // gnome-session calls `EndSessionDialog.Open` on the `org.gnome.Shell` bus name, so the
+            // object must live on that same connection (gnome-shell likewise exports it on its own
+            // session connection), not a separate one — otherwise the Open lands as UnknownObject.
             let (to_niri, from_end_session) = calloop::channel::channel();
             niri.event_loop
                 .insert_source(from_end_session, move |event, _, state| match event {
@@ -152,8 +155,16 @@ impl DBusServers {
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            let end_session = EndSessionDialog::new(to_niri);
-            dbus.conn_end_session = try_start(end_session);
+            if let Some(conn) = &dbus.conn_gnome_shell {
+                let end_session = EndSessionDialog::new(to_niri);
+                match conn
+                    .object_server()
+                    .at("/org/gnome/SessionManager/EndSessionDialog", end_session)
+                {
+                    Ok(_) => dbus.conn_end_session = Some(conn.clone()),
+                    Err(err) => warn!("error exporting EndSessionDialog: {err:?}"),
+                }
+            }
 
             #[cfg(feature = "xdp-gnome-screencast")]
             {

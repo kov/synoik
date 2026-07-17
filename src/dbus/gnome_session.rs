@@ -5,12 +5,14 @@
 //! of the session lifecycle the shell owns is the logout/shutdown/restart confirmation dialog:
 //!
 //! - **We implement** `org.gnome.SessionManager.EndSessionDialog` at
-//!   `/org/gnome/SessionManager/EndSessionDialog`. gnome-session calls `Open(type, timestamp,
-//!   seconds, inhibitors)` on us to raise the dialog and waits for us to emit `ConfirmedLogout` /
-//!   `ConfirmedReboot` / `ConfirmedShutdown` (proceed) or `Canceled` (abort). Those signals are
-//!   broadcast (gnome-session listens on the object), and emitted from the main loop by
-//!   [`crate::niri::Niri::emit_end_session_signal`]; the [`crate::end_session::EndSession`] state
-//!   machine holds the dialog lifecycle.
+//!   `/org/gnome/SessionManager/EndSessionDialog`. gnome-session addresses that object on the
+//!   `org.gnome.Shell` bus name, so the object is exported on *that* connection (`dbus::mod` adds
+//!   it to the `gnome_shell` connection), not a private one — else `Open` lands as UnknownObject.
+//!   gnome-session calls `Open(type, timestamp, seconds, inhibitors)` on us to raise the dialog and
+//!   waits for us to emit `ConfirmedLogout` / `ConfirmedReboot` / `ConfirmedShutdown` (proceed) or
+//!   `Canceled` (abort). Those signals are broadcast (gnome-session listens on the object), and
+//!   emitted from the main loop by [`crate::niri::Niri::emit_end_session_signal`]; the
+//!   [`crate::end_session::EndSession`] state machine holds the dialog lifecycle.
 //! - **We call** `org.gnome.SessionManager.{Logout,Shutdown,Reboot}` to *start* that flow, from the
 //!   `Logout` / `PowerOff` / `Reboot` actions — the same methods gnome-shell's systemActions.js
 //!   invokes. gnome-session then calls `Open` back on us, closing the loop.
@@ -21,7 +23,6 @@
 use zbus::interface;
 use zbus::zvariant::OwnedObjectPath;
 
-use super::Start;
 use crate::end_session::SessionRequest;
 
 pub struct EndSessionDialog {
@@ -86,15 +87,6 @@ impl EndSessionDialog {
     pub async fn canceled(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
     #[zbus(signal)]
     pub async fn closed(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
-}
-
-impl Start for EndSessionDialog {
-    fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
-        let conn = zbus::blocking::Connection::session()?;
-        conn.object_server()
-            .at("/org/gnome/SessionManager/EndSessionDialog", self)?;
-        Ok(conn)
-    }
 }
 
 /// Fire-and-forget the matching `org.gnome.SessionManager` method — the trigger the `Logout` /

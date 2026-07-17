@@ -5241,6 +5241,9 @@ fn allowed_when_locked(action: &Action) -> bool {
             | Action::Suspend
             | Action::PowerOffMonitors
             | Action::PowerOnMonitors
+            | Action::Logout
+            | Action::PowerOff
+            | Action::Reboot
             | Action::SwitchLayout(_)
             | Action::ToggleKeyboardShortcutsInhibit
     )
