@@ -593,7 +593,7 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -701,7 +701,7 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -772,7 +772,7 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -1866,7 +1866,7 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -1978,7 +1978,7 @@ fn vulkan_captures_the_resize_neutral_through_vulkan() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -2064,7 +2064,7 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -2148,7 +2148,7 @@ fn vulkan_picks_a_color_through_vulkan() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -2245,7 +2245,7 @@ fn vulkan_screenshots_a_window_through_vulkan() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -4383,7 +4383,7 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
@@ -4579,7 +4579,7 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
         .backend
         .headless()
         .add_renderer()
-        .expect("build the GLES + Vulkan renderers");
+        .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
 
     let id = f.add_client();
