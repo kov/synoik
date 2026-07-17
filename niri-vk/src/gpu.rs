@@ -4,12 +4,58 @@
 //! (virtio-gpu, no zink) and on lavapipe (CPU, deterministic test baseline). Nothing here
 //! touches a Wayland socket / DRM master / swapchain, so it runs headless from any shell.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
+
+/// The Khronos validation layer. Opt-in via `NIRI_VK_VALIDATION`; see [`Gpu::with_selector`].
+const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+/// Validation **errors** reported in this process, across every [`Gpu`].
+///
+/// Process-wide rather than per-`Gpu` because the messenger is per-instance while a test run builds
+/// well over a hundred of them, and an error is a defect wherever it surfaced.
+static VALIDATION_ERRORS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many validation errors the layer has reported so far. Always 0 unless `NIRI_VK_VALIDATION`
+/// is set, since without it no layer is loaded and nothing reports.
+pub fn validation_errors() -> usize {
+    VALIDATION_ERRORS.load(Ordering::Relaxed)
+}
+
+/// The validation layer's message sink.
+///
+/// Called on the offending Vulkan call's own thread, from inside the loader's FFI frame: unwinding
+/// out of here would cross an `extern "system"` boundary, so every panic is swallowed. Returning
+/// `vk::FALSE` means "do not abort the call" — we record and keep going, so one error does not mask
+/// the rest of the run.
+unsafe extern "system" fn debug_callback(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    types: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _user_data: *mut c_void,
+) -> vk::Bool32 {
+    let _ = std::panic::catch_unwind(|| {
+        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+            VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let message = unsafe { (*data).p_message };
+        let message = if message.is_null() {
+            Cow::Borrowed("<no message>")
+        } else {
+            unsafe { CStr::from_ptr(message) }.to_string_lossy()
+        };
+        eprintln!("VULKAN {severity:?} {types:?}: {message}");
+    });
+
+    vk::FALSE
+}
 
 /// Whether a `(format, modifier)` pair is one the driver vouches for. See
 /// [`Gpu::check_modifier_features`] — both variants mean "go ahead", but [`Self::Unlisted`] means
@@ -44,6 +90,9 @@ pub struct Gpu {
     enabled_extensions: Vec<String>,
     // Memoized DRM-modifier tiling features per format. See `modifier_features`.
     modifier_features: Mutex<HashMap<vk::Format, Vec<(u64, vk::FormatFeatureFlags)>>>,
+    // The validation layer's messenger, when `NIRI_VK_VALIDATION` is set. Destroyed before the
+    // instance in `Drop`.
+    debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     pub instance: ash::Instance,
     // Owns the loaded Vulkan library; must outlive `instance`/`device`.
     #[allow(dead_code)]
@@ -86,9 +135,58 @@ impl Gpu {
         let app = vk::ApplicationInfo::default()
             .application_name(c"niri-vk")
             .api_version(vk::make_api_version(0, 1, 3, 0));
-        let create_info = vk::InstanceCreateInfo::default().application_info(&app);
+
+        // Validation is opt-in: the layer costs real time on every call and is a dev/CI dependency
+        // that need not exist on a user's machine, so a session never loads it. Asking for it and
+        // not getting it is an error, not a warning — a run that silently validates nothing while
+        // you believe it does is worse than no run at all.
+        let validate = std::env::var_os("NIRI_VK_VALIDATION").is_some();
+        let mut layers: Vec<*const c_char> = Vec::new();
+        let mut instance_extensions: Vec<*const c_char> = Vec::new();
+        if validate {
+            let available = unsafe { entry.enumerate_instance_layer_properties() }
+                .context("enumerating instance layers")?;
+            if !available
+                .iter()
+                .any(|l| l.layer_name_as_c_str() == Ok(VALIDATION_LAYER))
+            {
+                return Err(anyhow!(
+                    "NIRI_VK_VALIDATION is set but the {VALIDATION_LAYER:?} layer is not installed \
+                     (dnf install vulkan-validation-layers)"
+                ));
+            }
+            layers.push(VALIDATION_LAYER.as_ptr());
+            instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+            eprintln!("  validation: {VALIDATION_LAYER:?} enabled");
+        }
+
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_layer_names(&layers)
+            .enabled_extension_names(&instance_extensions);
         let instance =
             unsafe { entry.create_instance(&create_info, None) }.context("vkCreateInstance")?;
+
+        // Must outlive nothing but the instance, and be destroyed before it (see `Drop`).
+        let debug = validate
+            .then(|| -> Result<_> {
+                let loader = ash::ext::debug_utils::Instance::new(&entry, &instance);
+                let info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+                    .message_severity(
+                        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                            | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+                    )
+                    .message_type(
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                    )
+                    .pfn_user_callback(Some(debug_callback));
+                let handle = unsafe { loader.create_debug_utils_messenger(&info, None) }
+                    .context("vkCreateDebugUtilsMessengerEXT")?;
+                Ok((loader, handle))
+            })
+            .transpose()?;
 
         let devices = unsafe { instance.enumerate_physical_devices() }
             .context("enumerate physical devices")?;
@@ -219,6 +317,7 @@ impl Gpu {
             drm_render_node: drm_render_node(&instance, phys),
             enabled_extensions,
             modifier_features: Mutex::new(HashMap::new()),
+            debug,
             instance,
             entry,
         })
@@ -443,6 +542,11 @@ impl Drop for Gpu {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_device(None);
+            // Before the instance it was created from, and after the device so it can still report
+            // on teardown.
+            if let Some((loader, handle)) = &self.debug {
+                loader.destroy_debug_utils_messenger(*handle, None);
+            }
             self.instance.destroy_instance(None);
         }
     }
