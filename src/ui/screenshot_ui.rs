@@ -643,6 +643,34 @@ impl ScreenshotUi {
         }
     }
 
+    /// The help panel's on-screen rect on `output`, or `None` if it has no panel.
+    ///
+    /// Test-only. The panel is cairo-drawn from real text, so its size depends on the font the
+    /// machine actually has — a test cannot hardcode this rect. Measuring *inside* it is also the
+    /// only way to tell the panel apart from the UI's other chrome: the four selection-border
+    /// buffers alone score thousands of white pixels with the panel entirely absent.
+    #[cfg(test)]
+    pub fn panel_rect(&self, output: &Output) -> Option<Rectangle<i32, Physical>> {
+        let Self::Open {
+            output_data,
+            show_pointer,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        let output_data = output_data.get(output)?;
+        let (show_mem, hide_mem) = output_data.panel_neutral.as_ref()?;
+        let neutral = if *show_pointer { hide_mem } else { show_mem };
+        let size = neutral.size();
+
+        Some(Rectangle::new(
+            panel_location(output_data, size),
+            Size::from((size.w, size.h)),
+        ))
+    }
+
     pub fn render_output(
         &self,
         renderer: &mut VulkanRenderer,

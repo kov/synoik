@@ -54,6 +54,17 @@ fn window_fixture(color: [u32; 4]) -> Option<Fixture> {
 /// As [`window_fixture`], but `settle` controls whether the map/open animation is completed. Pass
 /// `false` to leave the tile open animation active (the guarded GLES-offscreen render path).
 fn window_fixture_settled(color: [u32; 4], settle: bool, title: Option<&str>) -> Option<Fixture> {
+    window_fixture_with_client(color, settle, title).map(|(f, _, _)| f)
+}
+
+/// As [`window_fixture_settled`], but also returns the client and surface, so a test can keep
+/// driving the window after the fixture is built (e.g. recolour it to tell the live window apart
+/// from a frozen capture of it).
+fn window_fixture_with_client(
+    color: [u32; 4],
+    settle: bool,
+    title: Option<&str>,
+) -> Option<(Fixture, ClientId, WlSurface)> {
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
@@ -88,7 +99,38 @@ fn window_fixture_settled(color: [u32; 4], settle: bool, title: Option<&str>) ->
         f.double_roundtrip(id);
     }
 
-    Some(f)
+    Some((f, id, surface))
+}
+
+/// Put the screenshot UI's chrome on screen by settling its open animation.
+///
+/// **`niri_complete_animations` does NOT settle this one.** It sets the clock's
+/// `complete_instantly` only for the duration of `advance_animations` and then resets it, so by
+/// render time `Animation::is_clamped_done` is false again and the value is back to
+/// `value_at(clock.now())` — and the lazy clock is still frozen at the moment the UI opened, so
+/// `clock.now() == start_time` and `value_at` returns `from`, i.e. **0**.
+///
+/// At progress 0 every `progress`-gated element — the help panel and all eight dim/selection
+/// buffers — draws at alpha 0, so the UI's entire chrome is invisible. Only the frozen screenshot
+/// survives, because it is pushed ungated. A test that "opens" the UI without this is asserting
+/// against a frame the chrome never appeared in.
+///
+/// Pinning the clock past the 200ms `screenshot-ui-open` animation is what actually puts it on
+/// screen. Must be called after the last roundtrip and immediately before rendering, since the
+/// event loop clears the clock (`Niri::refresh`).
+fn settle_screenshot_ui_open(f: &mut Fixture) {
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + Duration::from_millis(500));
+    f.niri_complete_animations();
+}
+
+/// Recolour the live window built by [`window_fixture_with_client`].
+fn recolor_window(f: &mut Fixture, id: ClientId, surface: &WlSurface, color: [u32; 4]) {
+    let window = f.client(id).window(surface);
+    window.attach_solid_buffer(color[0], color[1], color[2], color[3]);
+    window.commit();
+    f.double_roundtrip(id);
 }
 
 /// The green-window fixture used by the offscreen/direct-scanout tests.
@@ -467,7 +509,7 @@ fn vulkan_mru_closing_fade_draws_through_the_offscreen() {
 /// blank no-op overlay — the old behavior — would leave only the dark backdrop).
 #[test]
 fn vulkan_screenshot_ui_draws_the_frozen_screen() {
-    let Some(mut f) = green_window_fixture() else {
+    let Some((mut f, id, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
     let output = f.niri_output(1);
@@ -477,8 +519,13 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
         f.niri().screenshot_ui.is_open(),
         "screenshot UI must be open"
     );
-    // Settle the open animation so the UI is at full opacity.
-    f.niri_complete_animations();
+
+    // Recolour the live window red. `Niri::render` early-returns after the screenshot UI's
+    // elements, above the layout, so the live window is not in this frame at all: every green pixel
+    // below therefore comes from the UI's frozen capture, and any red would mean the UI drew
+    // nothing and we are looking at the live scene.
+    recolor_window(&mut f, id, &surface, RED);
+    settle_screenshot_ui_open(&mut f);
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -491,10 +538,72 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
     let green = (0..w * h)
         .filter(|i| is_greenish(px(&pixels, w, i % w, i / w)))
         .count();
-    eprintln!("vulkan_screenshot_ui_draws_the_frozen_screen: {green} greenish px");
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let red = (0..w * h)
+        .filter(|i| is_red(px(&pixels, w, i % w, i / w)))
+        .count();
+    eprintln!("vulkan_screenshot_ui_draws_the_frozen_screen: {green} greenish px, {red} red px");
     assert!(
         green > 1000,
         "the frozen screenshot did not draw on Vulkan (blank overlay?): {green} greenish px"
+    );
+    assert!(
+        red < 100,
+        "the recoloured live window is on screen ({red} red px), so this frame is the live scene, \
+         not the UI's frozen capture — the green above would have proved nothing"
+    );
+}
+
+/// The screenshot UI's help panel must actually draw.
+///
+/// The panel is the UI's most fragile element: cairo-drawn on the CPU, uploaded as a neutral, and
+/// gated on the open animation's progress — three chances to end up invisible while the frozen
+/// screenshot (which is *not* progress-gated) still draws and makes the frame look right. Measure
+/// inside [`ScreenshotUi::panel_rect`]: whole-frame white does not discriminate the panel, since
+/// the four selection-border buffers alone score thousands of white px without it.
+#[test]
+fn vulkan_screenshot_ui_draws_the_help_panel() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+
+    let rect = f
+        .niri()
+        .screenshot_ui
+        .panel_rect(&output)
+        .expect("the open screenshot UI must have a help panel");
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // `render_panel` fills the panel with rgb(0.1) — 26/255 — and writes the help text in white.
+    let mut background = 0;
+    let mut text = 0;
+    for y in rect.loc.y..(rect.loc.y + rect.size.h).min(h) {
+        for x in rect.loc.x..(rect.loc.x + rect.size.w).min(w) {
+            let p = px(&pixels, w, x, y);
+            if p[0] < 40 && p[1] < 40 && p[2] < 40 {
+                background += 1;
+            }
+            if p[0] > 200 && p[1] > 200 && p[2] > 200 {
+                text += 1;
+            }
+        }
+    }
+    eprintln!(
+        "vulkan_screenshot_ui_draws_the_help_panel: {background} panel-bg px, {text} text px in \
+         {rect:?}"
+    );
+    assert!(
+        background > 1000,
+        "the help panel's background did not draw ({background} px in {rect:?})"
+    );
+    assert!(
+        text > 100,
+        "the help panel drew no text or capture button ({text} white px in {rect:?})"
     );
 }
 
@@ -4461,7 +4570,7 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
         f.niri().screenshot_ui.is_open(),
         "screenshot UI must be open"
     );
-    f.niri_complete_animations();
+    settle_screenshot_ui_open(&mut f);
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
 
