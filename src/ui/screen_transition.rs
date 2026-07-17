@@ -19,20 +19,16 @@ pub const DURATION: Duration = Duration::from_millis(500);
 /// Holds one entry per render target: block-out rules key off the target, so a single shared buffer
 /// would show a screencast exactly what block-out exists to hide.
 //
-// TODO: one variant left — collapse to a struct with the dual enums (#43 commit 5).
+/// The screen to crossfade from: renderer-neutral CPU captures, uploaded to `VkTexture`s on
+/// demand.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-enum FrozenScreen {
-    /// Renderer-neutral CPU captures, uploaded to `VkTexture`s on demand.
-    Neutral {
-        buffers: [MemoryBuffer; RenderTarget::COUNT],
-        /// `buffers` uploaded to `VkTexture`s, cached across the crossfade's frames.
-        /// Re-uploading a full-screen buffer every frame would churn virtio-gpu blobs; the
-        /// captured contents never change during a transition, so one upload per target
-        /// suffices. Uploaded lazily: a session with no cast never pays for the screencast
-        /// targets.
-        vk: RefCell<[Option<TextureBuffer<VkTexture>>; RenderTarget::COUNT]>,
-    },
+struct FrozenScreen {
+    buffers: [MemoryBuffer; RenderTarget::COUNT],
+    /// `buffers` uploaded to `VkTexture`s, cached across the crossfade's frames. Re-uploading a
+    /// full-screen buffer every frame would churn virtio-gpu blobs; the captured contents never
+    /// change during a transition, so one upload per target suffices. Uploaded lazily: a session
+    /// with no cast never pays for the screencast targets.
+    vk: RefCell<[Option<TextureBuffer<VkTexture>>; RenderTarget::COUNT]>,
 }
 
 #[derive(Debug)]
@@ -60,7 +56,7 @@ impl ScreenTransition {
         delay: Duration,
         clock: Clock,
     ) -> Self {
-        let from = FrozenScreen::Neutral {
+        let from = FrozenScreen {
             buffers,
             vk: RefCell::new(Default::default()),
         };
@@ -116,7 +112,7 @@ impl ScreenTransition {
         let alpha = self.alpha();
         let idx = target as usize;
 
-        let FrozenScreen::Neutral { buffers, vk } = &self.from;
+        let FrozenScreen { buffers, vk } = &self.from;
 
         // Upload this target's captured neutral buffer once and draw that.
         if vk.borrow()[idx].is_none() {

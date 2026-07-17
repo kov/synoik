@@ -115,20 +115,14 @@ pub struct ScreenshotNeutral {
     pub pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
 }
 
-/// One output's frozen screen (and pointer), as renderer-neutral CPU buffers. Saving to disk crops
-/// these on the CPU rather than reading back from the GPU.
-//
-// TODO: one variant left — collapse to a struct with the dual enums (#43 commit 5).
-#[allow(clippy::large_enum_variant)]
-pub enum OutputScreenshot {
-    /// The frozen screen (and pointer + its logical location) as renderer-neutral CPU buffers.
-    Neutral {
-        screen: MemoryBuffer,
-        pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
-        /// `screen` / `pointer` uploaded once to `VkTexture`s, cached across frames.
-        screen_vk: VkCache,
-        pointer_vk: VkCache,
-    },
+/// One output's frozen screen (and pointer + its logical location), as renderer-neutral CPU
+/// buffers. Saving to disk crops these on the CPU rather than reading back from the GPU.
+pub struct OutputScreenshot {
+    screen: MemoryBuffer,
+    pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
+    /// `screen` / `pointer` uploaded once to `VkTexture`s, cached across frames.
+    screen_vk: VkCache,
+    pointer_vk: VkCache,
 }
 
 niri_render_elements! {
@@ -739,7 +733,7 @@ impl ScreenshotUi {
         };
 
         let data = &output_data[&selection.0];
-        let OutputScreenshot::Neutral {
+        let OutputScreenshot {
             screen,
             pointer: screenshot_pointer,
             ..
@@ -1023,7 +1017,7 @@ impl OutputScreenshot {
         screen: MemoryBuffer,
         pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
     ) -> Self {
-        Self::Neutral {
+        Self {
             screen,
             pointer,
             screen_vk: RefCell::new(None),
@@ -1037,7 +1031,7 @@ impl OutputScreenshot {
         &self,
         renderer: &mut VulkanRenderer,
     ) -> Option<CapturedTextureRenderElement> {
-        let Self::Neutral {
+        let Self {
             screen, screen_vk, ..
         } = self;
 
@@ -1061,7 +1055,7 @@ impl OutputScreenshot {
         &self,
         renderer: &mut VulkanRenderer,
     ) -> Option<CapturedTextureRenderElement> {
-        let Self::Neutral {
+        let Self {
             pointer,
             pointer_vk,
             ..
