@@ -55,89 +55,128 @@ pub struct GlyphAtlas {
     pub side: u32,
 }
 
-/// Shape `text` at `px` pixels-per-em, rasterize hinted, and pack into an R8 coverage atlas.
-pub fn build_text(gpu: &Gpu, pool: vk::CommandPool, text: &str, px: f32) -> Result<GlyphAtlas> {
-    let mut fonts = FontSystem::new();
+/// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
+/// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and
+/// cheap to reuse, so the compositor holds ONE `TextContext` for the life of the renderer and
+/// rebuilds only the per-string atlas. (The atlas itself is still per-call for now — a shared
+/// growing atlas is deferred until dynamic text needs it.)
+pub struct TextContext {
+    fonts: FontSystem,
+    scale: ScaleContext,
+}
 
-    let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
-    buffer.set_hinting(Hinting::Enabled);
-    {
-        let mut b = buffer.borrow_with(&mut fonts);
-        b.set_size(None, None);
-        let attrs = Attrs::new().family(Family::SansSerif);
-        b.set_text(text, &attrs, Shaping::Advanced, None);
-        b.shape_until_scroll(false);
+impl Default for TextContext {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    let side: u32 = 256;
-    let mut atlas_pixels = vec![0u8; (side * side) as usize];
-    let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
-    let mut ctx = ScaleContext::new();
-    let mut glyphs = Vec::new();
-
-    for run in buffer.layout_runs() {
-        let baseline = run.line_y.round() as i32;
-        for glyph in run.glyphs {
-            // Whole-pixel origin: round X, then physical() truncates Y (its own hinting).
-            let mut lg = glyph.clone();
-            lg.x = lg.x.round();
-            let phys = lg.physical((0.0, 0.0), 1.0);
-            let key = phys.cache_key;
-
-            // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
-            let Some(font) = fonts.get_font(key.font_id, key.font_weight) else {
-                continue;
-            };
-            let mut scaler = ctx
-                .builder(font.as_swash())
-                .size(f32::from_bits(key.font_size_bits))
-                .hint(true)
-                .build();
-
-            // Subpixel remainder from the cache key (0 once fully snapped).
-            let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
-            let rendered = Render::new(&[Source::Outline])
-                .format(Format::Alpha)
-                .offset(offset)
-                .render(&mut scaler, key.glyph_id);
-            let Some(image) = rendered else { continue };
-
-            let (w, h) = (image.placement.width, image.placement.height);
-            if w == 0 || h == 0 {
-                continue; // whitespace: no bitmap, pen still advances via the next glyph
-            }
-            debug_assert!(matches!(image.content, Content::Mask));
-
-            // +1px padding around each slot to keep neighbours from bleeding.
-            let alloc = atlas
-                .allocate(size2(w as i32 + 1, h as i32 + 1))
-                .context("glyph atlas full")?;
-            let (ax, ay) = (alloc.rectangle.min.x as u32, alloc.rectangle.min.y as u32);
-            for row in 0..h {
-                let src = &image.data[(row * w) as usize..((row + 1) * w) as usize];
-                let dst = ((ay + row) * side + ax) as usize;
-                atlas_pixels[dst..dst + w as usize].copy_from_slice(src);
-            }
-
-            glyphs.push(PlacedGlyph {
-                x: phys.x + image.placement.left,
-                y: baseline + phys.y - image.placement.top,
-                w,
-                h,
-                atlas_x: ax,
-                atlas_y: ay,
-            });
+impl TextContext {
+    pub fn new() -> Self {
+        TextContext {
+            fonts: FontSystem::new(),
+            scale: ScaleContext::new(),
         }
     }
 
-    // 1:1 glyph-px to screen-px with integer placement, so NEAREST sampling is pixel-exact.
-    let texture =
-        Texture::from_coverage(gpu, pool, side, side, &atlas_pixels, vk::Filter::NEAREST)?;
-    Ok(GlyphAtlas {
-        texture,
-        glyphs,
-        side,
-    })
+    /// Shape `text` at `px` pixels-per-em, rasterize hinted, and pack into an R8 coverage atlas,
+    /// reusing this context's font system and scaler cache.
+    pub fn build_atlas(
+        &mut self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        text: &str,
+        px: f32,
+    ) -> Result<GlyphAtlas> {
+        let fonts = &mut self.fonts;
+        let ctx = &mut self.scale;
+
+        let mut buffer = Buffer::new(fonts, Metrics::new(px, (px * 1.25).round()));
+        buffer.set_hinting(Hinting::Enabled);
+        {
+            let mut b = buffer.borrow_with(fonts);
+            b.set_size(None, None);
+            let attrs = Attrs::new().family(Family::SansSerif);
+            b.set_text(text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(false);
+        }
+
+        let side: u32 = 256;
+        let mut atlas_pixels = vec![0u8; (side * side) as usize];
+        let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
+        let mut glyphs = Vec::new();
+
+        for run in buffer.layout_runs() {
+            let baseline = run.line_y.round() as i32;
+            for glyph in run.glyphs {
+                // Whole-pixel origin: round X, then physical() truncates Y (its own hinting).
+                let mut lg = glyph.clone();
+                lg.x = lg.x.round();
+                let phys = lg.physical((0.0, 0.0), 1.0);
+                let key = phys.cache_key;
+
+                // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
+                let Some(font) = fonts.get_font(key.font_id, key.font_weight) else {
+                    continue;
+                };
+                let mut scaler = ctx
+                    .builder(font.as_swash())
+                    .size(f32::from_bits(key.font_size_bits))
+                    .hint(true)
+                    .build();
+
+                // Subpixel remainder from the cache key (0 once fully snapped).
+                let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
+                let rendered = Render::new(&[Source::Outline])
+                    .format(Format::Alpha)
+                    .offset(offset)
+                    .render(&mut scaler, key.glyph_id);
+                let Some(image) = rendered else { continue };
+
+                let (w, h) = (image.placement.width, image.placement.height);
+                if w == 0 || h == 0 {
+                    continue; // whitespace: no bitmap, pen still advances via the next glyph
+                }
+                debug_assert!(matches!(image.content, Content::Mask));
+
+                // +1px padding around each slot to keep neighbours from bleeding.
+                let alloc = atlas
+                    .allocate(size2(w as i32 + 1, h as i32 + 1))
+                    .context("glyph atlas full")?;
+                let (ax, ay) = (alloc.rectangle.min.x as u32, alloc.rectangle.min.y as u32);
+                for row in 0..h {
+                    let src = &image.data[(row * w) as usize..((row + 1) * w) as usize];
+                    let dst = ((ay + row) * side + ax) as usize;
+                    atlas_pixels[dst..dst + w as usize].copy_from_slice(src);
+                }
+
+                glyphs.push(PlacedGlyph {
+                    x: phys.x + image.placement.left,
+                    y: baseline + phys.y - image.placement.top,
+                    w,
+                    h,
+                    atlas_x: ax,
+                    atlas_y: ay,
+                });
+            }
+        }
+
+        // 1:1 glyph-px to screen-px with integer placement, so NEAREST sampling is pixel-exact.
+        let texture =
+            Texture::from_coverage(gpu, pool, side, side, &atlas_pixels, vk::Filter::NEAREST)?;
+        Ok(GlyphAtlas {
+            texture,
+            glyphs,
+            side,
+        })
+    }
+}
+
+/// Shape `text` at `px` pixels-per-em, rasterize hinted, and pack into an R8 coverage atlas.
+/// One-shot: builds a throwaway [`TextContext`]. Callers drawing repeatedly should hold a
+/// `TextContext` and call [`TextContext::build_atlas`] to reuse the font system.
+pub fn build_text(gpu: &Gpu, pool: vk::CommandPool, text: &str, px: f32) -> Result<GlyphAtlas> {
+    TextContext::new().build_atlas(gpu, pool, text, px)
 }
 
 /// Graphics pipeline for glyph quads: `text.vert` + `text.frag`, alpha blending on, one sampler.
@@ -294,5 +333,127 @@ impl TextRenderer {
             d.destroy_shader_module(self.vert, None);
             d.destroy_shader_module(self.frag, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::Gpu;
+    use crate::render::{sampler_set_layout, RenderTarget};
+
+    const BG: [u8; 4] = [24, 24, 28, 255];
+    const FG: [u8; 4] = [235, 235, 235, 255];
+
+    fn unorm(c: [u8; 4]) -> [f32; 4] {
+        [
+            c[0] as f32 / 255.,
+            c[1] as f32 / 255.,
+            c[2] as f32 / 255.,
+            c[3] as f32 / 255.,
+        ]
+    }
+
+    /// Render one string through `ctx` into a `tw`x`th` RGBA target and read it back.
+    fn render_string(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        ctx: &mut TextContext,
+        text: &str,
+        px: f32,
+        tw: u32,
+        th: u32,
+    ) -> Result<Vec<u8>> {
+        let atlas = ctx.build_atlas(gpu, pool, text, px)?;
+        anyhow::ensure!(!atlas.glyphs.is_empty(), "no glyphs shaped for {text:?}");
+
+        let target = RenderTarget::new(gpu, tw, th)?;
+        let set_layout = sampler_set_layout(gpu)?;
+        let renderer = TextRenderer::new(gpu, target.render_pass, target.extent(), set_layout)?;
+
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)];
+        let dp_ci = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&sizes);
+        let desc_pool = unsafe { gpu.device.create_descriptor_pool(&dp_ci, None) }?;
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(desc_pool)
+            .set_layouts(std::slice::from_ref(&set_layout));
+        let set = unsafe { gpu.device.allocate_descriptor_sets(&alloc) }?[0];
+        let img = vk::DescriptorImageInfo::default()
+            .sampler(atlas.texture.sampler)
+            .image_view(atlas.texture.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&img));
+        unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
+
+        let dims = [tw as f32, th as f32];
+        gpu.run_commands(pool, |cbuf| {
+            target.begin(gpu, cbuf, unorm(BG));
+            renderer.draw(gpu, cbuf, set, &atlas, (10.0, 8.0), dims, unorm(FG));
+            unsafe { gpu.device.cmd_end_render_pass(cbuf) };
+        })?;
+        let pixels = target.read_back(gpu, pool)?;
+
+        unsafe {
+            gpu.device.destroy_descriptor_pool(desc_pool, None);
+            gpu.device.destroy_descriptor_set_layout(set_layout, None);
+        }
+        renderer.destroy(gpu);
+        atlas.texture.destroy(gpu);
+        target.destroy(gpu);
+        Ok(pixels)
+    }
+
+    /// Count pixels close to white — glyph ink over the dark background.
+    fn bright(pixels: &[u8]) -> usize {
+        pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+            .count()
+    }
+
+    /// The persistent context rasterizes crisp coverage, and reusing it for a second string —
+    /// without rebuilding the font system — still produces ink. Guards the compositor's long-lived
+    /// `TextContext` against a stale-cache regression. Skips cleanly on a machine with no Vulkan.
+    #[test]
+    fn text_context_reuse_rasterizes_coverage() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("no Vulkan device — skipping text_context_reuse_rasterizes_coverage");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.unwrap();
+
+        let mut ctx = TextContext::new();
+
+        // First string.
+        let a = render_string(&gpu, pool, &mut ctx, "12:34", 26.0, 128, 40).unwrap();
+        // The top-left corner is well clear of the glyph origin (10, 8): still background.
+        let corner = a[0..4].to_vec();
+        for (c, b) in corner.iter().zip(BG.iter()) {
+            assert!(
+                (*c as i32 - *b as i32).abs() <= 3,
+                "bg corner drifted: {corner:?}"
+            );
+        }
+        let a_bright = bright(&a);
+        assert!(a_bright > 40, "first string had too little ink: {a_bright}");
+
+        // Second string through the SAME context (font system reused).
+        let b = render_string(&gpu, pool, &mut ctx, "Activities", 22.0, 256, 40).unwrap();
+        let b_bright = bright(&b);
+        assert!(
+            b_bright > 60,
+            "reused context produced too little ink: {b_bright}"
+        );
+
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 }
