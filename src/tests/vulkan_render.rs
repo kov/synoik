@@ -3027,6 +3027,132 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     );
 }
 
+/// A surface that sets a blur region (`ext-background-effect-v1` `set_blur_region`) must get blur
+/// **only inside that region**. The subregion restricts the drawn damage, so the scene outside it
+/// stays untouched.
+///
+/// Same red|green hard-edge scene as [`vulkan_backdrop_blur_softens_a_hard_edge`], with the effect
+/// covering the whole quad but a subregion of only the top half. The edge must soften in the top
+/// half and stay perfectly sharp in the bottom half. Blurring everything — which is what ignoring
+/// the subregion does — fails the bottom-half assert.
+#[test]
+fn vulkan_backdrop_blur_honours_the_subregion() {
+    use std::sync::Arc;
+
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+    use crate::utils::region::TransformedRegion;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_backdrop_blur_honours_the_subregion: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+        .expect("create target");
+
+    let effect = FramebufferEffect::new();
+    let params = RenderParams {
+        geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+        // Blur only the top half.
+        subregion: Some(TransformedRegion {
+            rects: Arc::new(vec![Rectangle::from_size(Size::from((S, S / 2)))]),
+            scale: Scale::from(1.0),
+            offset: Point::from((0., 0.)),
+        }),
+        clip: None,
+        scale: 1.0,
+    };
+    let element = effect.render(
+        None,
+        params,
+        Some(BlurOptions {
+            passes: 3,
+            offset: 2.0,
+        }),
+        0.0,
+        1.0,
+    );
+    let cache = UserDataMap::new();
+    let src = element.src();
+    let dst = element.geometry(Scale::from(1.0));
+
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .draw_solid(
+                Rectangle::new((0, 0).into(), (S / 2, S).into()),
+                &[Rectangle::from_size((S / 2, S).into())],
+                Color32F::from([1., 0., 0., 1.]),
+            )
+            .expect("draw red");
+        frame
+            .draw_solid(
+                Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
+                &[Rectangle::from_size((S / 2, S).into())],
+                Color32F::from([0., 1., 0., 1.]),
+            )
+            .expect("draw green");
+        RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+            .expect("capture_framebuffer");
+        RenderElement::<Vk>::draw(
+            &element,
+            &mut frame,
+            src,
+            dst,
+            &[Rectangle::from_size(size)],
+            &[],
+            Some(&cache),
+        )
+        .expect("draw");
+        let _ = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+
+    // Strongest blend (both channels raised) on a row — only a blurred edge can produce one.
+    let blend_on_row = |y: i32| {
+        (0..S).fold(0u8, |best, x| {
+            let p = px(&pixels, S, x, y);
+            best.max(p[0].min(p[1]))
+        })
+    };
+
+    let inside = blend_on_row(S / 4); // top half — inside the subregion
+    let outside = blend_on_row(3 * S / 4); // bottom half — outside it
+
+    assert!(
+        inside > 40,
+        "the edge did not soften inside the blur subregion (max min(R,G) = {inside})"
+    );
+    assert!(
+        outside <= 40,
+        "the edge softened OUTSIDE the blur subregion (max min(R,G) = {outside}); the \
+         client-requested blur region was ignored and the whole quad was blurred"
+    );
+
+    eprintln!(
+        "vulkan_backdrop_blur_honours_the_subregion: inside blend={inside}, outside blend={outside}"
+    );
+}
+
 /// Phase-C slice-5 (xray port) commit-1: the `EffectBuffer` gained a Vulkan arm that renders its
 /// elements into an owned offscreen and (eagerly) blurs it, sampled through `render_postprocess` —
 /// the exact primitive the ported `XrayElement::draw` will use in commit-2. This pins the whole arm

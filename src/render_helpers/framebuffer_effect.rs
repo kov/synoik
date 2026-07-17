@@ -20,12 +20,8 @@ pub struct FramebufferEffectElement {
     geometry: Rectangle<f64, Logical>,
     clip_geo: Rectangle<f64, Logical>,
     corner_radius: CornerRadius,
-    /// The client-requested blur subregion. Currently unread: the draw blurs the whole clamped
-    /// `dst` instead of restricting to `subregion ∩ damage` — see the KNOWN DIVERGENCE note on the
-    /// draw. Kept because it is the input a per-subregion scissored draw needs, and because
-    /// dropping it would hide that client-provided data is being ignored. `XrayElement` does
-    /// honour its own subregion (`filter_subregion_damage`).
-    #[allow(dead_code)]
+    /// The client-requested blur region (`ext-background-effect-v1` `set_blur_region`). The draw
+    /// intersects the damage with it, so the blur lands only inside it.
     subregion: Option<TransformedRegion>,
     scale: f32,
     blur_options: Option<BlurOptions>,
@@ -248,23 +244,44 @@ mod vulkan_impl {
                 clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
             );
 
-            // KNOWN DIVERGENCE from the GLES draw: `self.subregion` is ignored. GLES restricts the
-            // painted area to `subregion ∩ damage` (a client-requested blur region); here the whole
-            // `clamped_dst` is blurred. Full-geometry backdrop blur (the common GNOME case) is
-            // correct; a client using an explicit blur-region protocol gets blur across its whole
-            // geometry. Per-subregion scissored draws are a follow-up.
+            // Restrict the painted area to the client's blur region (`ext-background-effect-v1`
+            // `set_blur_region`), which reaches us as `subregion`. The damage scissors the draw, so
+            // intersecting it with the region is what confines the blur; without this the whole
+            // quad blurs and the client's region is silently ignored.
+            //
+            // `filter_damage` wants the subregion's own coordinate space — geometry-relative, and
+            // derived from the *unclamped* `src`/`dst`, so this runs before the clamp re-base
+            // below, in the same order as the GLES draw this replaced.
+            let mut filtered: Vec<Rectangle<i32, Physical>> = Vec::new();
+            if let Some(subregion) = &self.subregion {
+                let mut sub_crop = src.to_logical(1., Transform::Normal, &src.size);
+                sub_crop.loc += self.geometry.loc;
+                subregion.filter_damage(sub_crop, dst, damage, &mut filtered);
+            } else {
+                filtered.extend(damage.iter().copied());
+            }
+
             // The damage is element-local to `dst`; the backdrop is placed at `clamped_dst`, so
-            // re-base the rects by the same clamp offset before they scissor the draw.
-            let damage: Vec<Rectangle<i32, Physical>> = damage
-                .iter()
-                .map(|d| {
-                    let mut d = *d;
-                    d.loc -= clamp_offset;
-                    d
-                })
-                .collect();
+            // re-base the rects by the clamp offset, dropping what falls outside, before they
+            // scissor the draw.
+            if clamped_dst != dst {
+                let keep = Rectangle::new(clamp_offset, clamped_dst.size);
+                filtered.retain_mut(|d| match d.intersection(keep) {
+                    Some(mut c) => {
+                        c.loc -= clamp_offset;
+                        *d = c;
+                        true
+                    }
+                    None => false,
+                });
+            }
+
+            if filtered.is_empty() {
+                return Ok(());
+            }
+
             let push = self.postprocess_push(crop, frame.transform());
-            frame.draw_backdrop(blur, clamped_dst, &damage, push)
+            frame.draw_backdrop(blur, clamped_dst, &filtered, push)
         }
 
         fn underlying_storage(
