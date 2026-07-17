@@ -445,14 +445,31 @@ impl Texture {
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported render-target memory")?;
 
-        let view_ci = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(COLOR_RANGE);
-        let view = unsafe { device.create_image_view(&view_ci, None) }
-            .context("dmabuf render-target view")?;
-        guard.view = view;
+        // Only an image whose usage has a view-capable bit may have a view at all
+        // (VUID-VkImageViewCreateInfo-image-04441). The present-blit target is imported
+        // transfer-only — it is blitted into and read back, never attached or sampled (the shadow
+        // is the attachment) — so a view on it is both invalid and useless: a blit takes images,
+        // not views. Leave it null, exactly as `new_transfer_image` does; `Texture::destroy` treats
+        // a null view as a defined no-op.
+        const VIEWABLE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+            vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+                | vk::ImageUsageFlags::SAMPLED.as_raw()
+                | vk::ImageUsageFlags::STORAGE.as_raw()
+                | vk::ImageUsageFlags::INPUT_ATTACHMENT.as_raw(),
+        );
+        let view = if usage.intersects(VIEWABLE) {
+            let view_ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(COLOR_RANGE);
+            let view = unsafe { device.create_image_view(&view_ci, None) }
+                .context("dmabuf render-target view")?;
+            guard.view = view;
+            view
+        } else {
+            vk::ImageView::null()
+        };
 
         // Sampler is unused (a scanout target is never sampled) but kept so this fits `Texture`.
         let sampler_ci = vk::SamplerCreateInfo::default()
