@@ -1331,8 +1331,7 @@ fn vulkan_resize_element_uses_custom_shader_when_installed() {
         }
     };
 
-    // Install roundtrip via the config-facing API (the owned-renderer dual of
-    // shaders::set_custom_resize_program).
+    // Install roundtrip via the config-facing API.
     assert!(!vk.has_custom_shader(CustomShaderType::Resize));
     vk.set_custom_resize_shader(Some(
         "vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {\n\

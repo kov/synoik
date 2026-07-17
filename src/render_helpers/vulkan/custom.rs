@@ -23,8 +23,7 @@
 //! exactly as under GLES.
 //!
 //! Live wiring: config snippets are compiled in via
-//! `VulkanRenderer::set_custom_{resize,close,open}_shader` (the owned-renderer side of the
-//! `shaders::set_custom_*_program` install/reload sites), and the **resize**, **open** and
+//! `VulkanRenderer::set_custom_{resize,close,open}_shader`, and the **resize**, **open** and
 //! **close** animations construct their elements through this on a Vulkan session (resize via
 //! `ResizeRenderElement`, open/close via `CustomAnimRenderElement`). The closing-window animation
 //! captures its snapshot to a `MemoryBuffer` at close time and re-uploads it to a `VkTexture`, then

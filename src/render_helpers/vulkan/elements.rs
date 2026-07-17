@@ -14,7 +14,6 @@ use smithay::utils::{Buffer, Physical, Rectangle};
 
 use super::{VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::offscreen::OffscreenRenderElement;
-use crate::render_helpers::shader_element::ShaderRenderElement;
 
 /// Emit a degraded (no-op) `RenderElement<VulkanRenderer>` impl for a niri effect element.
 macro_rules! degraded_vulkan_element {
@@ -33,10 +32,10 @@ macro_rules! degraded_vulkan_element {
                 Ok(())
             }
 
-            // A no-op override of Smithay's `unimplemented!()` default. Only reached for a
-            // framebuffer effect (`FramebufferEffectElement`, degraded here) — without this the
-            // enum's forwarded `capture_framebuffer` would panic on a Vulkan session as soon as any
-            // blur/postprocess element is on screen. Degrading means the effect draws nothing.
+            // A no-op override of Smithay's `unimplemented!()` default, which is only ever reached
+            // via `Element::is_framebuffer_effect`. Nothing degraded here reports that, so this is
+            // belt-and-braces: it keeps the enum's forwarded `capture_framebuffer` from panicking
+            // rather than drawing nothing, should a degraded element ever become one.
             fn capture_framebuffer(
                 &self,
                 _frame: &mut VulkanFrame<'_, '_>,
@@ -66,7 +65,6 @@ macro_rules! degraded_vulkan_element {
 // gradient_fade_texture.rs.
 // ResizeRenderElement has a real Vulkan draw (render_resize) in render_helpers/resize.rs.
 // XrayElement has a real Vulkan draw (offscreen sample + blur + postprocess-and-clip) in xray.rs.
-degraded_vulkan_element!(ShaderRenderElement);
 // FramebufferEffectElement has a real Vulkan draw (backdrop capture + blur + postprocess) in
 // framebuffer_effect.rs.
 degraded_vulkan_element!(OffscreenRenderElement<GlesTexture>);

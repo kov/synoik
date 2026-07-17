@@ -405,9 +405,7 @@ impl VulkanRenderer {
     /// panics or replaces a working shader. The built-in resize crossfade lives separately in
     /// `render_resize`; this slot only holds user overrides.
     ///
-    /// Fed live from the config by [`Self::set_custom_resize_shader`] and friends (the
-    /// owned-renderer side of the `shaders::set_custom_*_program` calls at the GLES
-    /// install/reload sites).
+    /// Fed live from the config by [`Self::set_custom_resize_shader`] and friends.
     pub(super) fn set_custom_shader(
         &mut self,
         ty: CustomShaderType,
@@ -481,10 +479,9 @@ impl VulkanRenderer {
         self.custom_pipeline(ty).is_some()
     }
 
-    /// Install (or clear, with `None`) the user's custom **resize** animation shader — the owned
-    /// renderer's dual of [`crate::render_helpers::shaders::set_custom_resize_program`], called
-    /// from the same config install/reload sites. A compile error is logged and leaves the
-    /// previous shader in place (graceful degrade), matching the GLES path.
+    /// Install (or clear, with `None`) the user's custom **resize** animation shader, from the
+    /// config install/reload sites. A compile error is logged and leaves the previous shader in
+    /// place (graceful degrade).
     pub(crate) fn set_custom_resize_shader(&mut self, src: Option<&str>) {
         self.install_custom_shader(CustomShaderType::Resize, src);
     }
