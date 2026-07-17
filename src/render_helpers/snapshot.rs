@@ -11,24 +11,13 @@ use super::{encompassing_geo, render_to_vec};
 use crate::render_helpers::RenderTarget;
 
 /// Snapshot of a render.
+///
+/// Carries no pixels of its own: the three `Vec<C>`/`Vec<B>` content fields this used to bake into
+/// `GlesTexture`s went unread once the crossfade moved to [`Self::neutral`], so they are gone with
+/// the rest of the GLES machinery. What remains is the policy and geometry the crossfade needs,
+/// plus the neutral buffer that actually holds the picture.
 #[derive(Debug)]
-pub struct RenderSnapshot<C, B> {
-    /// Contents for a normal render.
-    ///
-    /// Relative to the geometry.
-    pub contents: Vec<C>,
-
-    /// Contents that are not blocked out, but the background is blocked out.
-    ///
-    /// If `None` then the background doesn't have any blocked-out surfaces, and normal `contents`
-    /// can be used instead.
-    pub contents_with_blocked_out_bg: Option<Vec<C>>,
-
-    /// Blocked-out contents.
-    ///
-    /// Relative to the geometry.
-    pub blocked_out_contents: Vec<B>,
-
+pub struct RenderSnapshot {
     /// Where the contents were blocked out from at the time of the snapshot.
     pub block_out_from: Option<BlockOutFrom>,
 

@@ -4,7 +4,6 @@ use std::time::Duration;
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -35,11 +34,9 @@ use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::surface::{
-    push_elements_from_surface_tree, render_snapshot_from_surface_tree,
-};
+use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::xray::XrayPos;
-use crate::render_helpers::{background_effect, BakedBuffer, RenderCtx, RenderTarget};
+use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -422,38 +419,15 @@ impl Mapped {
 
     /// Renders a snapshot of the window without popups.
     ///
-    /// `renderer` is `None` on a Vulkan session, which bakes no GLES textures: `contents` is left
-    /// empty and only the renderer-neutral parts (size, block-out policy, block-out buffer) are
-    /// filled in. See [`Self::store_animation_snapshot_neutral`] for why that is enough.
-    fn render_snapshot(&self, renderer: Option<&mut GlesRenderer>) -> LayoutElementRenderSnapshot {
+    /// Renderer-neutral: the picture is captured separately into `neutral` by
+    /// [`Self::capture_neutral_vulkan`], so this only records the policy and geometry the
+    /// crossfade needs. See [`Self::store_animation_snapshot_neutral`] for why that is enough.
+    fn render_snapshot(&self) -> LayoutElementRenderSnapshot {
         let _span = tracy_client::span!("Mapped::render_snapshot");
 
-        let size = self.size().to_f64();
-
-        let mut buffer = self.block_out_buffer.borrow_mut();
-        buffer.resize(size);
-        let blocked_out_contents = vec![BakedBuffer {
-            buffer: buffer.clone(),
-            location: Point::from((0., 0.)),
-            src: None,
-            dst: None,
-        }];
-
-        let buf_pos = self.window.geometry().loc.upscale(-1).to_f64();
-
-        let mut contents = vec![];
-
-        if let Some(renderer) = renderer {
-            let surface = self.toplevel().wl_surface();
-            render_snapshot_from_surface_tree(renderer, surface, buf_pos, &mut contents);
-        }
-
         RenderSnapshot {
-            contents,
-            contents_with_blocked_out_bg: None,
-            blocked_out_contents,
             block_out_from: self.rules().block_out_from,
-            size,
+            size: self.size().to_f64(),
             neutral: Default::default(),
         }
     }
@@ -471,23 +445,15 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
-        self.animation_snapshot = Some(self.render_snapshot(Some(renderer)));
-    }
-
-    /// Store the animation snapshot without baking the window contents into GLES textures.
+    /// Store the animation snapshot. The window contents are not captured here — see
+    /// [`Self::capture_neutral_vulkan`], which fills `neutral` right after.
     ///
-    /// `contents` is never sampled — nothing reads it any more, so passing `None` here costs
-    /// nothing. What the crossfade does need is `neutral`, filled right after this by
-    /// [`Self::capture_neutral_vulkan`].
-    ///
-    /// The snapshot struct itself is still load-bearing, which is easy to miss:
+    /// The snapshot struct itself is load-bearing, which is easy to miss:
     /// `capture_neutral_vulkan` bails unless `animation_snapshot` is already `Some`, and
     /// `Tile::update_window` only starts a resize animation when `take_animation_snapshot`
-    /// returns one. Skipping this call — rather than just its GLES bake — silently costs the
-    /// crossfade.
+    /// returns one. Skipping this call silently costs the crossfade.
     pub fn store_animation_snapshot_neutral(&mut self) {
-        self.animation_snapshot = Some(self.render_snapshot(None));
+        self.animation_snapshot = Some(self.render_snapshot());
     }
 
     /// Captures the stored animation snapshot's neutral CPU buffer through the owned Vulkan

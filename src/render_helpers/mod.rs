@@ -5,9 +5,7 @@ use niri_config::BlockOutFrom;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
@@ -140,24 +138,6 @@ pub fn copy_framebuffer<R: ExportMem>(
     fourcc: Fourcc,
 ) -> Result<R::TextureMapping, R::Error> {
     renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
-}
-
-pub fn render_to_encompassing_texture(
-    renderer: &mut GlesRenderer,
-    scale: Scale<f64>,
-    transform: Transform,
-    fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
-) -> anyhow::Result<(GlesTexture, SyncPoint, Rectangle<i32, Physical>)> {
-    let geo = encompassing_geo(scale, elements.iter());
-    let elements = elements.iter().rev().map(|ele| {
-        RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
-    });
-
-    let (texture, sync_point) =
-        render_to_texture(renderer, geo.size, scale, transform, fourcc, elements)?;
-
-    Ok((texture, sync_point, geo))
 }
 
 pub fn render_to_texture<R, T>(

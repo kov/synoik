@@ -115,9 +115,6 @@ impl TestWindow {
             if self.0.bbox.get() != new_bbox {
                 if self.0.animate_next_configure.get() {
                     self.0.animation_snapshot.replace(Some(RenderSnapshot {
-                        contents: Vec::new(),
-                        contents_with_blocked_out_bg: None,
-                        blocked_out_contents: Vec::new(),
                         block_out_from: None,
                         size: self.0.bbox.get().size.to_f64(),
                         neutral: OnceCell::new(),
