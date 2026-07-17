@@ -550,6 +550,31 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
     );
 }
 
+/// Freeze the current screen into a crossfade, and return the time it starts at — feed that to
+/// [`pin_crossfade_at_start`] before rendering.
+///
+/// `ScreenTransition::alpha` reads the clock's *unadjusted* time, deliberately ignoring animation
+/// slowdown, so neither `niri_complete_animations` nor a zero clock rate holds the crossfade still
+/// — it advances with real monotonic time. Every event-loop iteration also calls `Clock::clear`
+/// (`Niri::refresh`), so the first read after any roundtrip jumps to however long the test really
+/// took. An unpinned test is therefore racing the 500ms crossfade: past ~78ms of real time, enough
+/// of the live window bleeds through that the blend matches *neither* colour, and the test blank-
+/// fails with `0 green, 0 red`. Three full-screen texture uploads fit inside that budget on a bad
+/// day, which is what made this flaky.
+fn start_screen_transition(f: &mut Fixture) -> Duration {
+    // The clock is lazy, so this is the same value the transition records as its start.
+    let start_at = f.niri().clock.now_unadjusted();
+    f.niri_state()
+        .do_action(Action::DoScreenTransition(Some(0)), false);
+    start_at
+}
+
+/// Pin the unadjusted clock to the crossfade's start, fixing alpha at exactly 1.0 (fully the frozen
+/// capture). Must be called after the last roundtrip, since the event loop clears the clock.
+fn pin_crossfade_at_start(f: &mut Fixture, start_at: Duration) {
+    f.niri().clock.clone().set_unadjusted(start_at);
+}
+
 /// The screen-transition crossfade holds GLES textures (which the owned Vulkan renderer can't
 /// sample), so on a Vulkan session it uploads a renderer-neutral capture to a `VkTexture` instead —
 /// one per render target. Freeze a green-window screen, recolor the live window red, then composite
@@ -587,9 +612,8 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
 
     let output = f.niri_output(1);
 
-    // Freeze the green-window screen into a transition (delay 0 → alpha ≈ 1, fully the capture).
-    f.niri_state()
-        .do_action(Action::DoScreenTransition(Some(0)), false);
+    // Freeze the green-window screen into a transition, pinned at alpha = 1.0 (fully the capture).
+    let start_at = start_screen_transition(&mut f);
     assert!(
         f.niri()
             .output_state
@@ -634,6 +658,7 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     f.double_roundtrip(id);
 
     // Composite the Output target: the frozen green frame must occlude the live red window.
+    pin_crossfade_at_start(&mut f, start_at);
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
     let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
@@ -695,9 +720,8 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
 
     let output = f.niri_output(1);
 
-    // Freeze the green-window screen into a transition (delay 0 → alpha ≈ 1, fully the capture).
-    f.niri_state()
-        .do_action(Action::DoScreenTransition(Some(0)), false);
+    // Freeze the green-window screen into a transition, pinned at alpha = 1.0 (fully the capture).
+    let start_at = start_screen_transition(&mut f);
 
     // Recolor the live window red. The frozen transition still holds the green capture.
     let window = f.client(id).window(&surface);
@@ -705,6 +729,7 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
     window.commit();
     f.double_roundtrip(id);
 
+    pin_crossfade_at_start(&mut f, start_at);
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
     let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
