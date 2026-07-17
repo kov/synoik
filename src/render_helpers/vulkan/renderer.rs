@@ -956,6 +956,7 @@ impl Drop for VulkanRenderer {
             self.solid_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
+            self.clipped_texture_pipeline.destroy(dev);
             self.gradient_fade_pipeline.destroy(dev);
             self.border_pipeline.destroy(dev);
             self.shadow_pipeline.destroy(dev);
