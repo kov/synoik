@@ -1,20 +1,13 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
-use glam::{Mat3, Vec2};
+use glam::Vec2;
 use niri_config::{
     Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
-use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::gpu_span_location;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
 use super::renderer::NiriRenderer;
-use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
 
 /// Renders a wide variety of borders and border parts.
 ///
@@ -22,9 +15,16 @@ use super::shaders::{mat3_uniform, ProgramType, Shaders};
 /// * sub- or super-rect of an angled linear gradient like CSS linear-gradient(angle, a, b).
 /// * corner rounding.
 /// * as a background rectangle and as parts of a border line.
+///
+/// Cloned per frame by its owners (focus ring, tab indicator, layout shadow) with the `Id` carried
+/// along, so clones share one damage identity.
 #[derive(Debug, Clone)]
 pub struct BorderRenderElement {
-    inner: ShaderRenderElement,
+    id: Id,
+    commit_counter: CommitCounter,
+    /// Where the element is drawn. Its size is [`Parameters::size`]; only [`Self::with_location`]
+    /// sets the location, and it deliberately does not bump the commit counter.
+    location: Point<f64, Logical>,
     params: Parameters,
 }
 
@@ -72,9 +72,10 @@ impl BorderRenderElement {
         scale: f32,
         alpha: f32,
     ) -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
-        let mut rv = Self {
-            inner,
+        Self {
+            id: Id::new(),
+            commit_counter: CommitCounter::default(),
+            location: Point::default(),
             params: Parameters {
                 size,
                 gradient_area,
@@ -88,15 +89,14 @@ impl BorderRenderElement {
                 scale,
                 alpha,
             },
-        };
-        rv.update_inner();
-        rv
+        }
     }
 
     pub fn empty() -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
         Self {
-            inner,
+            id: Id::new(),
+            commit_counter: CommitCounter::default(),
+            location: Point::default(),
             params: Parameters {
                 size: Default::default(),
                 gradient_area: Default::default(),
@@ -114,7 +114,7 @@ impl BorderRenderElement {
     }
 
     pub fn damage_all(&mut self) {
-        self.inner.damage_all();
+        self.commit_counter.increment();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,17 +145,17 @@ impl BorderRenderElement {
             scale,
             alpha,
         };
+        // Only bump the commit counter when something actually changed: this is called every frame,
+        // so incrementing unconditionally would report damage over the whole element every frame.
         if self.params == params {
             return;
         }
 
         self.params = params;
-        self.update_inner();
+        self.commit_counter.increment();
     }
 
-    /// The renderer-agnostic derived quantities the border shader needs, computed from
-    /// [`Self::params`]. Shared by the GLES uniform build ([`Self::update_inner`]) and the owned
-    /// Vulkan push (`vulkan_push`) so the two never drift.
+    /// The derived quantities the border draw needs, computed from [`Self::params`].
     fn computed(&self) -> ComputedBorder {
         let Parameters {
             size,
@@ -213,59 +213,19 @@ impl BorderRenderElement {
         }
     }
 
-    fn update_inner(&mut self) {
-        let Parameters {
-            size,
-            color_from,
-            color_to,
-            border_width,
-            corner_radius,
-            scale,
-            alpha,
-            ..
-        } = self.params;
-
-        let c = self.computed();
-        let input_to_geo =
-            Mat3::from_scale(c.area_size) * Mat3::from_translation(-c.geo_loc / c.area_size);
-
-        self.inner.update(
-            size,
-            None,
-            scale,
-            alpha,
-            Rc::new([
-                Uniform::new("colorspace", c.colorspace),
-                Uniform::new("hue_interpolation", c.hue_interpolation),
-                Uniform::new("color_from", color_from.to_array_unpremul()),
-                Uniform::new("color_to", color_to.to_array_unpremul()),
-                Uniform::new("grad_offset", c.grad_offset.to_array()),
-                Uniform::new("grad_width", c.grad_width),
-                Uniform::new("grad_vec", c.grad_vec.to_array()),
-                mat3_uniform("input_to_geo", input_to_geo),
-                Uniform::new("geo_size", c.geo_size.to_array()),
-                Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
-                Uniform::new("border_width", border_width),
-            ]),
-            HashMap::new(),
-        );
-    }
-
+    /// Moves the element. Deliberately does not bump the commit counter: the owners re-place a
+    /// cloned element every frame, and treating a move as damage here would defeat damage tracking.
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
-        self.inner = self.inner.with_location(location);
+        self.location = location;
         self
     }
 
     /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than a
     /// plain solid-color fallback. Callers use it to choose `BorderRenderElement` (rounded corners,
-    /// gradients) over pointy `SolidColorRenderElement` quads. True when the GLES border program is
-    /// loaded, **or** on the owned Vulkan renderer — which draws borders procedurally
-    /// (`VulkanFrame::render_border`, always with rounded corners) and needs no GLES program.
+    /// gradients) over pointy `SolidColorRenderElement` quads — so this must keep reporting what
+    /// the renderer in hand can actually do, not a blanket `true`.
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        if renderer.try_as_vulkan_renderer().is_some() {
-            return true;
-        }
-        Shaders::get(renderer).is_some_and(|s| s.program(ProgramType::Border).is_some())
+        renderer.try_as_vulkan_renderer().is_some()
     }
 }
 
@@ -275,79 +235,36 @@ impl Default for BorderRenderElement {
     }
 }
 
+// `transform` and `damage_since` are deliberately not overridden — the element this was promoted
+// from did not override them either, so both keep the `Element` defaults.
 impl Element for BorderRenderElement {
     fn id(&self) -> &Id {
-        self.inner.id()
+        &self.id
     }
 
     fn current_commit(&self) -> CommitCounter {
-        self.inner.current_commit()
+        self.commit_counter
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.inner.geometry(scale)
-    }
-
-    fn transform(&self) -> Transform {
-        self.inner.transform()
+        Rectangle::new(self.location, self.params.size).to_physical_precise_round(scale)
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        self.inner.src()
-    }
-
-    fn damage_since(
-        &self,
-        scale: Scale<f64>,
-        commit: Option<CommitCounter>,
-    ) -> DamageSet<i32, Physical> {
-        self.inner.damage_since(scale, commit)
-    }
-
-    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.inner.opaque_regions(scale)
+        Rectangle::from_size(Size::from((1., 1.)))
     }
 
     fn alpha(&self) -> f32 {
-        self.inner.alpha()
+        self.params.alpha
     }
 
     fn kind(&self) -> Kind {
-        self.inner.kind()
+        Kind::Unspecified
     }
 }
 
-impl RenderElement<GlesRenderer> for BorderRenderElement {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        let _span = tracy_client::span!("BorderRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("BorderRenderElement::draw"), |frame| {
-            RenderElement::<GlesRenderer>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
-    }
-
-    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        self.inner.underlying_storage(renderer)
-    }
-}
-
-// The owned Vulkan renderer draws the border procedurally in its own pipeline (M3); it reads the
-// raw `params` (not the GLES `inner` uniform list), sharing the derivation via `computed()`.
+// The renderer draws the border procedurally in its own pipeline, reading `params` via
+// `computed()`.
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
 impl BorderRenderElement {
@@ -395,5 +312,108 @@ impl RenderElement<VulkanRenderer> for BorderRenderElement {
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(alpha: f32) -> BorderRenderElement {
+        BorderRenderElement::new(
+            Size::from((100., 100.)),
+            Rectangle::from_size(Size::from((100., 100.))),
+            GradientInterpolation::default(),
+            Color::new_unpremul(1., 0., 0., 1.),
+            Color::new_unpremul(0., 0., 1., 1.),
+            0.,
+            Rectangle::from_size(Size::from((100., 100.))),
+            4.,
+            CornerRadius::default(),
+            1.,
+            alpha,
+        )
+    }
+
+    /// The owners call `update` every frame with mostly-unchanged parameters and re-place a clone
+    /// via `with_location`. Both must leave the commit counter alone, or every frame reports damage
+    /// over the whole element and damage tracking stops meaning anything. Only a real parameter
+    /// change may bump it.
+    #[test]
+    fn only_a_real_parameter_change_damages() {
+        let mut e = elem(1.);
+        let base = e.current_commit();
+
+        e.update(
+            Size::from((100., 100.)),
+            Rectangle::from_size(Size::from((100., 100.))),
+            GradientInterpolation::default(),
+            Color::new_unpremul(1., 0., 0., 1.),
+            Color::new_unpremul(0., 0., 1., 1.),
+            0.,
+            Rectangle::from_size(Size::from((100., 100.))),
+            4.,
+            CornerRadius::default(),
+            1.,
+            1.,
+        );
+        assert_eq!(
+            e.current_commit(),
+            base,
+            "an update with identical parameters must not damage"
+        );
+
+        let moved = e.clone().with_location(Point::from((7., 9.)));
+        assert_eq!(
+            moved.current_commit(),
+            base,
+            "with_location must not damage"
+        );
+        assert_eq!(
+            moved.id(),
+            e.id(),
+            "a relocated clone must keep the damage identity"
+        );
+
+        // A changed parameter (alpha) must damage.
+        e.update(
+            Size::from((100., 100.)),
+            Rectangle::from_size(Size::from((100., 100.))),
+            GradientInterpolation::default(),
+            Color::new_unpremul(1., 0., 0., 1.),
+            Color::new_unpremul(0., 0., 1., 1.),
+            0.,
+            Rectangle::from_size(Size::from((100., 100.))),
+            4.,
+            CornerRadius::default(),
+            1.,
+            0.5,
+        );
+        assert_ne!(
+            e.current_commit(),
+            base,
+            "a changed parameter must damage the element"
+        );
+    }
+
+    /// `with_location` sets where the element draws; its size comes from the parameters.
+    #[test]
+    fn geometry_follows_location_and_size() {
+        let e = elem(1.).with_location(Point::from((10., 20.)));
+        let geo = e.geometry(Scale::from(1.));
+        assert_eq!(geo.loc.x, 10);
+        assert_eq!(geo.loc.y, 20);
+        assert_eq!(geo.size.w, 100);
+        assert_eq!(geo.size.h, 100);
+    }
+
+    /// The alpha the draw reads is the one `Element` reports (the trap that bit
+    /// `ShadowRenderElement`).
+    #[test]
+    fn element_alpha_matches_the_draw_alpha() {
+        let e = elem(0.25);
+        assert_eq!(e.alpha(), 0.25);
+        let push = e.vulkan_push(Rectangle::from_size(smithay::utils::Size::from((100, 100))));
+        assert_eq!(push.niri_alpha, 0.25);
     }
 }
