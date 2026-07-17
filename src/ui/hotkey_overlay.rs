@@ -1,30 +1,60 @@
 use std::cell::RefCell;
-use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::iter::zip;
 use std::rc::Rc;
 
 use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
+use niri_vk::text::{SpanFamily, TextSpan};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::{Output, WeakOutput};
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Scale, Transform};
+use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
 
-use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-// const MARGIN: i32 = PADDING * 2;
-const FONT: &str = "sans 14px";
+const FONT_PX: f64 = 14.;
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
+
+/// Dark panel background, light-blue border, the grey patch behind each key, the black patch behind
+/// a spawn command, and the (white) text colour.
+const PANEL_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+const BORDER_COLOR: [f32; 4] = [0.5, 0.8, 1.0, 1.];
+const KEY_BG: [f32; 4] = [0.183, 0.183, 0.183, 1.]; // pango 12000/65535
+const SPAWN_BG: [f32; 4] = [0., 0., 0., 1.];
+const TEXT_COLOR: [f32; 4] = [1., 1., 1., 1.];
+
+/// One run of same-styled text in an action label. The old cairo path carried this as pango markup
+/// in a `String`; we now build it directly so no markup parser (cairo/pango) is needed. Custom
+/// user `hotkey-overlay-title`s render as a single plain span (any markup they contain is
+/// stripped).
+struct LabelSpan {
+    text: String,
+    mono: bool,
+    /// Inline background patch (e.g. the black box behind a spawn command).
+    bg: Option<[f32; 4]>,
+}
+
+impl LabelSpan {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            mono: false,
+            bg: None,
+        }
+    }
+}
+
+type Label = Vec<LabelSpan>;
 
 pub struct HotkeyOverlay {
     is_open: bool,
@@ -34,7 +64,9 @@ pub struct HotkeyOverlay {
 }
 
 pub struct RenderedOverlay {
-    buffer: Option<MemoryBuffer>,
+    texture: Option<VkTexture>,
+    scale: f64,
+    context: Option<ContextId<VkTexture>>,
 }
 
 impl HotkeyOverlay {
@@ -89,32 +121,43 @@ impl HotkeyOverlay {
         let mut buffers = self.buffers.borrow_mut();
         buffers.retain(|output, _| output.is_alive());
 
+        let context = renderer.context_id();
+
         // FIXME: should probably use the working area rather than view size.
         let weak = output.downgrade();
         if let Some(rendered) = buffers.get(&weak) {
-            if let Some(buffer) = &rendered.buffer {
-                if buffer.scale() != Scale::from(scale) {
-                    buffers.remove(&weak);
-                }
+            if rendered.scale != scale || rendered.context.as_ref() != Some(&context) {
+                buffers.remove(&weak);
             }
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            // The overlay is built CPU-side into a renderer-neutral buffer, uploaded through the
-            // active renderer below so it draws on GLES and Vulkan alike.
-            render(&self.config.borrow(), self.mod_key, scale)
-                .unwrap_or(RenderedOverlay { buffer: None })
+            // The overlay is drawn straight into a VkTexture by the owned renderer.
+            let texture = generate(renderer, &self.config.borrow(), self.mod_key, scale).ok();
+            RenderedOverlay {
+                texture,
+                scale,
+                context: Some(context),
+            }
         });
-        let buffer = rendered.buffer.as_ref()?;
+        let texture = rendered.texture.as_ref()?;
 
-        let size = buffer.logical_size();
+        let size = Size::<f64, _>::from((
+            f64::from(texture.width()) / scale,
+            f64::from(texture.height()) / scale,
+        ));
         let location = (output_size.to_f64().to_point() - size.to_point()).downscale(2.);
         let mut location = location.to_physical_precise_round(scale).to_logical(scale);
         location.x = f64::max(0., location.x);
         location.y = f64::max(0., location.y);
 
-        let buffer: TextureBuffer<VkTexture> =
-            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
+        let buffer = TextureBuffer::from_texture(
+            renderer,
+            texture.clone(),
+            scale,
+            Transform::Normal,
+            Vec::new(),
+        );
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
@@ -136,17 +179,14 @@ impl HotkeyOverlay {
         writeln!(&mut buf, "{TITLE}").unwrap();
 
         for action in actions {
-            let Some((key, action)) = format_bind(&config.binds.0, action) else {
+            let Some((key, label)) = format_bind(&config.binds.0, action) else {
                 continue;
             };
 
             let key = key.map(|key| key_name(true, self.mod_key, &key));
             let key = key.as_deref().unwrap_or("not bound");
 
-            let action = match pango::parse_markup(&action, '\0') {
-                Ok((_attrs, text, _accel)) => text,
-                Err(_) => action.into(),
-            };
+            let action: String = label.iter().map(|s| s.text.as_str()).collect();
 
             writeln!(&mut buf, "{key} {action}").unwrap();
         }
@@ -155,7 +195,7 @@ impl HotkeyOverlay {
     }
 }
 
-fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, String)> {
+fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, Label)> {
     let mut bind_with_non_null = None;
     let mut bind_with_custom_title = None;
     let mut found_null_title = false;
@@ -182,19 +222,66 @@ fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, String)>
         return None;
     }
 
-    let mut title = None;
+    let mut custom_title = None;
     let key = if let Some(bind) = bind_with_custom_title.or(bind_with_non_null) {
         if let Some(Some(custom)) = &bind.hotkey_overlay_title {
-            title = Some(custom.clone());
+            custom_title = Some(custom.clone());
         }
 
         Some(bind.key)
     } else {
         None
     };
-    let title = title.unwrap_or_else(|| action_name(action));
+    // A custom title is user text: render it plain (any pango markup it carries is stripped).
+    let label = match custom_title {
+        Some(title) => vec![LabelSpan::plain(strip_markup(&title))],
+        None => action_label(action),
+    };
 
-    Some((key, title))
+    Some((key, label))
+}
+
+/// Styled label for a built-in action. Only spawn actions carry structure (a monospace command on a
+/// black patch); everything else is a single plain span.
+fn action_label(action: &Action) -> Label {
+    match action {
+        Action::Spawn(args) => spawn_label(args.first().map(String::as_str).unwrap_or("")),
+        Action::SpawnSh(command) => {
+            spawn_label(command.split_ascii_whitespace().next().unwrap_or(""))
+        }
+        _ => vec![LabelSpan::plain(action_name(action))],
+    }
+}
+
+fn spawn_label(command: &str) -> Label {
+    vec![
+        LabelSpan::plain("Spawn ".to_string()),
+        LabelSpan {
+            text: command.to_string(),
+            mono: true,
+            bg: Some(SPAWN_BG),
+        },
+    ]
+}
+
+/// Drop pango-markup tags and unescape the basic entities, so a user-supplied title renders as
+/// clean plain text without a markup parser.
+fn strip_markup(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn collect_actions(config: &Config) -> Vec<&Action> {
@@ -306,148 +393,168 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
     actions
 }
 
-fn render(config: &Config, mod_key: ModKey, scale: f64) -> anyhow::Result<RenderedOverlay> {
-    let _span = tracy_client::span!("hotkey_overlay::render");
+/// Draw the whole hotkey table straight into a `VkTexture`: a dark panel with a light-blue border,
+/// a centered bold title, then one row per action — a monospace key on a grey patch (a black patch
+/// behind a spawn command) and the action label. No cairo/pango.
+fn generate(
+    renderer: &mut VulkanRenderer,
+    config: &Config,
+    mod_key: ModKey,
+    scale: f64,
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("hotkey_overlay::generate");
 
-    // let margin = MARGIN * scale;
+    let px = (FONT_PX * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
     let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
+    // Keep the border width even to avoid blurry edges.
+    let border: i32 = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
+    // Horizontal / vertical breathing room around the grey/black inline patches.
+    let hpad: i32 = (px * 0.3).round() as i32;
+    let vpad: i32 = (px * 0.12).round() as i32;
 
-    // FIXME: if it doesn't fit, try splitting in two columns or something.
-    // let mut target_size = output_size;
-    // target_size.w -= margin * 2;
-    // target_size.h -= margin * 2;
-    // anyhow::ensure!(target_size.w > 0 && target_size.h > 0);
-
-    let strings = collect_actions(config)
+    let rows: Vec<(String, Label)> = collect_actions(config)
         .into_iter()
         .filter_map(|action| format_bind(&config.binds.0, action))
-        .map(|(key, action)| {
+        .map(|(key, label)| {
             let key = key.map(|key| key_name(false, mod_key, &key));
-            let key = key.as_deref().unwrap_or("(not bound)");
-            let key = format!(" {key} ");
-            (key, action)
+            let key = key.as_deref().unwrap_or("(not bound)").to_string();
+            (key, label)
         })
-        .collect::<Vec<_>>();
+        .collect();
+    anyhow::ensure!(!rows.is_empty(), "no hotkeys to show");
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-
-    let bold = AttrList::new();
-    bold.insert(AttrInt::new_weight(Weight::Bold));
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    let title_size = layout.pixel_size();
-
-    let attrs = AttrList::new();
-    attrs.insert(AttrString::new_family("Monospace"));
-    attrs.insert(AttrColor::new_background(12000, 12000, 12000));
-
-    layout.set_attributes(Some(&attrs));
-    let key_sizes = strings
+    // Shape everything up front (each run owns its atlas), then measure, then draw.
+    const WRAP: f32 = 100_000.;
+    let title_run = renderer.build_glyph_paragraph(
+        &[TextSpan {
+            text: TITLE,
+            family: SpanFamily::Sans,
+            bold: true,
+            px,
+        }],
+        WRAP,
+        px,
+    )?;
+    let key_runs = rows
         .iter()
         .map(|(key, _)| {
-            layout.set_text(key);
-            layout.pixel_size()
+            renderer.build_glyph_paragraph(
+                &[TextSpan {
+                    text: key,
+                    family: SpanFamily::Mono,
+                    bold: false,
+                    px,
+                }],
+                WRAP,
+                px,
+            )
         })
-        .collect::<Vec<_>>();
-
-    layout.set_attributes(None);
-    let action_sizes = strings
+        .collect::<Result<Vec<_>, _>>()?;
+    let action_runs = rows
         .iter()
-        .map(|(_, action)| {
-            layout.set_markup(action);
-            layout.pixel_size()
+        .map(|(_, label)| {
+            let spans: Vec<TextSpan> = label
+                .iter()
+                .map(|s| TextSpan {
+                    text: &s.text,
+                    family: if s.mono {
+                        SpanFamily::Mono
+                    } else {
+                        SpanFamily::Sans
+                    },
+                    bold: false,
+                    px,
+                })
+                .collect();
+            renderer.build_glyph_paragraph(&spans, WRAP, px)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let key_width = key_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let action_width = action_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let mut width = key_width + padding + action_width;
+    let (tix, tiy, tiw, tih) = title_run.ink_bounds();
+    let key_ink: Vec<(i32, i32, i32, i32)> = key_runs.iter().map(|r| r.ink_bounds()).collect();
+    let act_ink: Vec<(i32, i32, i32, i32)> = action_runs.iter().map(|r| r.ink_bounds()).collect();
 
-    let mut height = zip(&key_sizes, &action_sizes)
-        .map(|((_, key_h), (_, act_h))| max(key_h, act_h))
-        .sum::<i32>()
-        + (key_sizes.len() - 1) as i32 * line_interval
-        + title_size.1
-        + padding;
+    let key_width = key_ink.iter().map(|b| b.2).max().unwrap_or(0);
+    let action_width = act_ink.iter().map(|b| b.2).max().unwrap_or(0);
+    // Uniform row advance from the deepest ink (line-box top to lowest descender) across all rows.
+    let line_bottom = key_ink
+        .iter()
+        .chain(&act_ink)
+        .map(|b| b.1 + b.3)
+        .max()
+        .unwrap_or(0);
+    let row_advance = line_bottom + line_interval;
 
-    width += padding * 2;
-    height += padding * 2;
+    let n = rows.len() as i32;
+    let table_top = padding + tih + padding;
+    let width = key_width + action_width + padding * 3;
+    let height = table_top + (n - 1) * row_advance + line_bottom + padding;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-
-    cr.set_source_rgb(1., 1., 1.);
-
-    cr.move_to(((width - title_size.0) / 2).into(), padding.into());
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(padding.into(), (padding + title_size.1 + padding).into());
-
-    for ((key, action), ((_, key_h), (_, act_h))) in zip(&strings, zip(&key_sizes, &action_sizes)) {
-        layout.set_attributes(Some(&attrs));
-        layout.set_text(key);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to((key_width + padding).into(), 0.);
-
-        let (attrs, text) = match pango::parse_markup(action, '\0') {
-            Ok((attrs, text, _accel)) => (Some(attrs), text),
-            Err(err) => {
-                warn!("error parsing markup for key {key}: {err}");
-                (None, action.into())
-            }
-        };
-
-        layout.set_attributes(attrs.as_ref());
-        layout.set_text(&text);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to(
-            (-(key_width + padding)).into(),
-            (max(key_h, act_h) + line_interval).into(),
-        );
-    }
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.8, 1.0);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width, height),
-        scale,
-        Transform::Normal,
+    let size = Size::<i32, Physical>::from((width, height));
+    let full = Rectangle::from_size(size);
+    let inner = Rectangle::new(
+        Point::from((border, border)),
+        Size::from(((width - border * 2).max(0), (height - border * 2).max(0))),
     );
 
-    Ok(RenderedOverlay {
-        buffer: Some(buffer),
-    })
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((width, height)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+
+        // Light-blue border = whole panel border-coloured, then the inner rect dark.
+        frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
+        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
+
+        // Centered title.
+        let title_origin = Point::<i32, Physical>::from(((width - tiw) / 2 - tix, padding - tiy));
+        frame.render_glyphs(&title_run, title_origin, TEXT_COLOR, full, &[full])?;
+
+        for i in 0..rows.len() {
+            let y_line = table_top + i as i32 * row_advance;
+
+            // Key cell: grey patch hugging the mono text, then the text.
+            let (kx, ky, kw, kh) = key_ink[i];
+            let key_origin = Point::<i32, Physical>::from((padding - kx, y_line));
+            if kw > 0 && kh > 0 {
+                let patch = Rectangle::new(
+                    Point::from((key_origin.x + kx - hpad, key_origin.y + ky - vpad)),
+                    Size::from((kw + hpad * 2, kh + vpad * 2)),
+                );
+                if let Some(patch) = patch.intersection(inner) {
+                    frame.clear(Color32F::from(KEY_BG), &[patch])?;
+                }
+            }
+            frame.render_glyphs(&key_runs[i], key_origin, TEXT_COLOR, full, &[full])?;
+
+            // Action cell: any inline background patches (spawn command), then the text.
+            let (ax, ..) = act_ink[i];
+            let action_x = padding + key_width + padding;
+            let act_origin = Point::<i32, Physical>::from((action_x - ax, y_line));
+            for (si, span) in rows[i].1.iter().enumerate() {
+                let Some(bg) = span.bg else { continue };
+                let (sx, sy, sw, sh) = action_runs[i].span_ink_bounds(si as u32);
+                if sw > 0 && sh > 0 {
+                    let patch = Rectangle::new(
+                        Point::from((act_origin.x + sx - hpad / 2, act_origin.y + sy - vpad)),
+                        Size::from((sw + hpad, sh + vpad * 2)),
+                    );
+                    if let Some(patch) = patch.intersection(inner) {
+                        frame.clear(Color32F::from(bg), &[patch])?;
+                    }
+                }
+            }
+            frame.render_glyphs(&action_runs[i], act_origin, TEXT_COLOR, full, &[full])?;
+        }
+
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 fn action_name(action: &Action) -> String {
@@ -475,13 +582,12 @@ fn action_name(action: &Action) -> String {
         }
         Action::ToggleOverview => String::from("Open the Overview"),
         Action::Screenshot(_, _) => String::from("Take a Screenshot"),
-        Action::Spawn(args) => format!(
-            "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
-            args.first().unwrap_or(&String::new())
-        ),
+        // Spawn actions are handled structurally in `action_label`; this is only a plain fallback.
+        Action::Spawn(args) => {
+            format!("Spawn {}", args.first().map(String::as_str).unwrap_or(""))
+        }
         Action::SpawnSh(command) => format!(
-            "Spawn <span face='monospace' bgcolor='#000000'>{}</span>",
-            // Fairly crude but should get the job done in most cases.
+            "Spawn {}",
             command.split_ascii_whitespace().next().unwrap_or("")
         ),
         _ => String::from("FIXME: Unknown"),
@@ -613,9 +719,10 @@ mod tests {
     #[track_caller]
     fn check(config: &str, action: Action) -> String {
         let config = Config::parse_mem(config).unwrap();
-        if let Some((key, title)) = format_bind(&config.binds.0, &action) {
+        if let Some((key, label)) = format_bind(&config.binds.0, &action) {
             let key = key.map(|key| key_name(false, ModKey::Super, &key));
             let key = key.as_deref().unwrap_or("(not bound)");
+            let title: String = label.iter().map(|s| s.text.as_str()).collect();
             format!(" {key} : {title}")
         } else {
             String::from("None")

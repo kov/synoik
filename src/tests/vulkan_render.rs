@@ -4825,3 +4825,42 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
         "the closing window vanished from the screen too; block-out must only affect the cast",
     );
 }
+
+/// White pixels in the central band `y ∈ [3h/8, 5h/8)`, where the hotkey overlay draws its table.
+fn white_px_in_overlay_band(pixels: &[u8], w: i32, h: i32) -> usize {
+    let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    ((h * 3 / 8) * w..(h * 5 / 8) * w)
+        .filter(|i| is_white(px(pixels, w, i % w, i / w)))
+        .count()
+}
+
+/// The "Important Hotkeys" overlay used to be cairo/pango text uploaded through a GLES-locked
+/// element — it now draws straight into a `VkTexture` on the owned renderer. Assert its white table
+/// text composites through Vulkan, measured against a closed-overlay baseline so the check can't go
+/// vacuous.
+#[test]
+fn vulkan_hotkey_overlay_draws() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // The overlay is shown at startup by default; hide it for a clean baseline.
+    f.niri().hotkey_overlay.hide();
+    let (before, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    assert_eq!(
+        white_px_in_overlay_band(&before, w, h),
+        0,
+        "the overlay band must be empty with the overlay closed, else it cannot witness it"
+    );
+
+    f.niri().hotkey_overlay.show();
+
+    let (after, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let white = white_px_in_overlay_band(&after, w, h);
+    eprintln!("vulkan_hotkey_overlay_draws: {white} white px in the overlay band");
+    assert!(
+        white > 500,
+        "the hotkey overlay text did not draw on Vulkan (blank overlay?): {white} white px"
+    );
+}
