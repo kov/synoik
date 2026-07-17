@@ -1,10 +1,13 @@
 # Owned Vulkan renderer — known gaps and deferred work
 
-Status: 2026-07-13, at the end of Phase C (the owned Vulkan renderer is the renderer for live
-sessions; the co-resident GLES renderer is being deleted).
+Status: **2026-07-17 — done. Phase C slice 8 deleted the co-resident GLES renderer**, and
+smithay now builds without `renderer_gl`/`backend_egl`/`renderer_multi` (`renderer_pixman` stays:
+it is the render tests' CPU oracle, not a fallback). The owned Vulkan renderer is the only renderer,
+and the only one built.
 
-This records what the owned renderer *cannot* do that the GLES renderer could, why we are deleting
-GLES anyway, and what it would take to close each gap. See `STRATEGY.md` §3.10 for the posture this
+This records what the owned renderer *cannot* do that the GLES renderer could, why deleting GLES was
+worth it anyway, and what it would take to close each gap. The gaps below are unchanged by the
+deletion — they were already the Vulkan session's gaps. See `STRATEGY.md` §3.10 for the posture this
 sits under.
 
 The short version: **single-device, LINEAR-only, single-plane is a configuration of this renderer,
@@ -34,11 +37,11 @@ modifier half may stay moot on this VM while the multi-planar half does not.
 
 ## 2. Multi-GPU (render on GPU A, scan out on GPU B) — deferred, and cheap to defer
 
-niri's GLES path supports this through Smithay's `GpuManager<GbmGlesBackend>` / `MultiRenderer`
-(`backend/tty.rs`, the non-Vulkan branch of `TtyOutputState::render`). The Vulkan branch returns
-before ever reaching it, so **a `--renderer=vulkan` session has already had no multi-GPU support**;
-deleting GLES does not remove a capability Vulkan sessions ever had. What it removes is the ability
-to fall back to `--renderer=gles` to get it.
+niri's GLES path supported this through Smithay's `GpuManager<GbmGlesBackend>` / `MultiRenderer`
+(`backend/tty.rs`, the non-Vulkan branch of `TtyOutputState::render`). The Vulkan branch returned
+before ever reaching it, so **a Vulkan session never had multi-GPU support**; deleting GLES removed
+no capability a Vulkan session ever had. What it removed is the ability to fall back to a GLES
+session to get it — an escape hatch that stopped existing when `--renderer` did.
 
 ### Why this is not a one-way door
 
@@ -109,17 +112,19 @@ would be first, or racing KWin — lifting strategies, not code.
 
 ## 3. Other things deleted with GLES
 
-- **`wl_drm` legacy EGL clients.** The global is only bound on non-Vulkan sessions. Dying protocol;
-  small loss.
+- **`wl_drm` legacy EGL clients.** The global was only bound on non-Vulkan sessions, and
+  advertising it is an EGL-backend job — with `backend_egl` off there is no EGL at all, so such a
+  buffer can never arrive. Dying protocol; small loss.
 - **Vulkan-less hardware** (old GPUs, GLES-only ARM blobs). A hard fork targeting a modern base can
   legitimately not care.
-- **The GLES test oracle — less than it looks.** The per-draw oracle in `render_helpers/vulkan/tests.rs`
-  is **Pixman, not GLES**, and survives deletion untouched. What GLES deletion forces is flipping the
-  headless conformance corpus (`tests/fixture.rs` defaults to `RendererKind::Gles`) over to
-  Vulkan-on-lavapipe. The byte-identical GLES A/B check was scaffolding for the port; it structurally
-  **cannot** catch the bug class that actually bit us repeatedly during Phase C (the
-  neutral-per-target block-out leaks) because it renders both sides identically wrong. Pixman plus the
-  structural pins are the durable oracle.
+- **The GLES test oracle — less than it looks, and it cost nothing.** The per-draw oracle in
+  `render_helpers/vulkan/tests.rs` is **Pixman, not GLES**, and survived deletion untouched
+  (`renderer_pixman` is kept for exactly this). The conformance corpus needed no renderer at all —
+  `RendererKind` is gone and `tests/fixture.rs` never mentions one. The byte-identical GLES A/B check
+  was scaffolding for the port; it structurally **cannot** catch the bug class that actually bit us
+  repeatedly during Phase C (the neutral-per-target block-out leaks) because it renders both sides
+  identically wrong. Pixman plus the structural pins are the durable oracle — and the suite got ~4×
+  faster once the GLES machinery was gone (386 tests in ~3.4s).
 
 ---
 
