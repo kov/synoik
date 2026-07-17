@@ -310,6 +310,8 @@ impl Texture for VkTexture {
 pub(crate) struct GlyphRun {
     atlas: VkTexture,
     glyphs: std::sync::Arc<[niri_vk::text::PlacedGlyph]>,
+    /// Source-span index of each glyph, parallel to `glyphs` (see [`niri_vk::text::GlyphAtlas`]).
+    spans: std::sync::Arc<[u32]>,
     side: u32,
 }
 
@@ -317,11 +319,13 @@ impl GlyphRun {
     pub(crate) fn new(
         atlas: VkTexture,
         glyphs: Vec<niri_vk::text::PlacedGlyph>,
+        spans: Vec<u32>,
         side: u32,
     ) -> Self {
         GlyphRun {
             atlas,
             glyphs: glyphs.into(),
+            spans: spans.into(),
             side,
         }
     }
@@ -343,19 +347,40 @@ impl GlyphRun {
     // Used by the panel draw-layer (increment 3) to size/place the run.
     #[allow(dead_code)]
     pub(crate) fn ink_bounds(&self) -> (i32, i32, i32, i32) {
-        let mut it = self.glyphs.iter();
-        let Some(first) = it.next() else {
-            return (0, 0, 0, 0);
-        };
-        let (mut x0, mut y0) = (first.x, first.y);
-        let (mut x1, mut y1) = (first.x + first.w as i32, first.y + first.h as i32);
-        for g in it {
-            x0 = x0.min(g.x);
-            y0 = y0.min(g.y);
-            x1 = x1.max(g.x + g.w as i32);
-            y1 = y1.max(g.y + g.h as i32);
+        Self::bounds_of(self.glyphs.iter())
+    }
+
+    /// The ink bounding box of just the glyphs from source span `span` (a paragraph span index),
+    /// in run-local pixels — for painting an inline background (e.g. a keycap) behind that span.
+    /// Empty (all zeros) when the span has no drawable glyphs. Only meaningful for runs built by
+    /// [`super::VulkanRenderer::build_glyph_paragraph`]; single-run builds tag everything span 0.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn span_ink_bounds(&self, span: u32) -> (i32, i32, i32, i32) {
+        Self::bounds_of(
+            self.glyphs
+                .iter()
+                .zip(self.spans.iter())
+                .filter(move |(_, s)| **s == span)
+                .map(|(g, _)| g),
+        )
+    }
+
+    /// Tight ink bbox over an iterator of glyphs: `(min_x, min_y, width, height)`, zeros if empty.
+    fn bounds_of<'a>(
+        glyphs: impl Iterator<Item = &'a niri_vk::text::PlacedGlyph>,
+    ) -> (i32, i32, i32, i32) {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for g in glyphs {
+            let (gx0, gy0, gx1, gy1) = (g.x, g.y, g.x + g.w as i32, g.y + g.h as i32);
+            bounds = Some(match bounds {
+                None => (gx0, gy0, gx1, gy1),
+                Some((x0, y0, x1, y1)) => (x0.min(gx0), y0.min(gy0), x1.max(gx1), y1.max(gy1)),
+            });
         }
-        (x0, y0, x1 - x0, y1 - y0)
+        match bounds {
+            Some((x0, y0, x1, y1)) => (x0, y0, x1 - x0, y1 - y0),
+            None => (0, 0, 0, 0),
+        }
     }
 }
 

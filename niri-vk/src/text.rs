@@ -42,6 +42,11 @@ pub struct PlacedGlyph {
 pub struct GlyphAtlas {
     pub texture: Texture,
     pub glyphs: Vec<PlacedGlyph>,
+    /// Source-span index of each glyph in [`Self::glyphs`], parallel to it. For
+    /// [`TextContext::build_paragraph`] this is the position in its `spans` slice; for the
+    /// single-run [`TextContext::build_atlas`] it is all zeroes. Lets a caller recover a span's
+    /// ink rectangle to paint an inline background (e.g. a keycap).
+    pub spans: Vec<u32>,
     pub side: u32,
 }
 
@@ -116,7 +121,13 @@ impl TextContext {
             let mut b = buffer.borrow_with(&mut self.fonts);
             b.set_size(Some(wrap_px), None);
             let default_attrs = Attrs::new().family(Family::SansSerif);
-            let rich = spans.iter().map(|s| (s.text, s.attrs()));
+            // Tag each span with its index (cosmic-text carries it to every laid-out glyph as
+            // `metadata`), so `rasterize` can record which span each glyph came from and a caller
+            // can recover a span's ink rectangle (e.g. to paint an inline keycap background).
+            let rich = spans
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.text, s.attrs().metadata(i)));
             b.set_rich_text(rich, &default_attrs, Shaping::Advanced, Some(Align::Center));
             b.shape_until_scroll(false);
         }
@@ -148,8 +159,8 @@ impl TextContext {
         // `None` marks a key that draws nothing (whitespace / missing font / empty raster), so we
         // neither re-rasterize it nor emit an instance for it.
         let mut distinct: HashMap<CacheKey, Option<Raster>> = HashMap::new();
-        // Per-instance placement, still one entry per on-screen glyph.
-        let mut instances: Vec<(CacheKey, i32, i32)> = Vec::new();
+        // Per-instance placement (one entry per on-screen glyph): key, x, y, source-span index.
+        let mut instances: Vec<(CacheKey, i32, i32, u32)> = Vec::new();
 
         for run in buffer.layout_runs() {
             let baseline = run.line_y.round() as i32;
@@ -159,6 +170,7 @@ impl TextContext {
                 lg.x = lg.x.round();
                 let phys = lg.physical((0.0, 0.0), 1.0);
                 let key = phys.cache_key;
+                let span = glyph.metadata as u32;
 
                 let raster = distinct.entry(key).or_insert_with(|| {
                     // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
@@ -191,7 +203,12 @@ impl TextContext {
                 });
 
                 if let Some(raster) = raster {
-                    instances.push((key, phys.x + raster.left, baseline + phys.y - raster.top));
+                    instances.push((
+                        key,
+                        phys.x + raster.left,
+                        baseline + phys.y - raster.top,
+                        span,
+                    ));
                 }
             }
         }
@@ -251,24 +268,24 @@ impl TextContext {
             side *= 2;
         };
 
-        // Resolve every instance to its shared slot.
-        let glyphs = instances
-            .iter()
-            .map(|&(key, x, y)| {
-                let (ax, ay) = slots[&key];
-                let r = distinct[&key]
-                    .as_ref()
-                    .expect("drawn instance has a raster");
-                PlacedGlyph {
-                    x,
-                    y,
-                    w: r.w,
-                    h: r.h,
-                    atlas_x: ax,
-                    atlas_y: ay,
-                }
-            })
-            .collect();
+        // Resolve every instance to its shared slot; `spans` stays parallel to `glyphs`.
+        let mut glyphs = Vec::with_capacity(instances.len());
+        let mut spans = Vec::with_capacity(instances.len());
+        for &(key, x, y, span) in &instances {
+            let (ax, ay) = slots[&key];
+            let r = distinct[&key]
+                .as_ref()
+                .expect("drawn instance has a raster");
+            glyphs.push(PlacedGlyph {
+                x,
+                y,
+                w: r.w,
+                h: r.h,
+                atlas_x: ax,
+                atlas_y: ay,
+            });
+            spans.push(span);
+        }
 
         // 1:1 glyph-px to screen-px with integer placement, so NEAREST sampling is pixel-exact.
         let texture =
@@ -276,6 +293,7 @@ impl TextContext {
         Ok(GlyphAtlas {
             texture,
             glyphs,
+            spans,
             side,
         })
     }
@@ -813,6 +831,81 @@ mod tests {
         );
         atlas.texture.destroy(&gpu);
 
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+
+    /// `build_paragraph` tags every laid-out glyph with its source-span index (parallel to
+    /// `glyphs`), so a caller can recover a span's ink rectangle to paint an inline background.
+    /// Three left-to-right spans on one line must come back in x-order 0 < 1 < 2, and the
+    /// middle span's ink must be a non-empty strict horizontal subset of the whole run.
+    #[test]
+    fn build_paragraph_tags_spans() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("no Vulkan device — skipping build_paragraph_tags_spans");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.unwrap();
+
+        let mut ctx = TextContext::new();
+        let spans = [
+            TextSpan {
+                text: "AAAA ",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 20.0,
+            },
+            TextSpan {
+                text: "MMMM",
+                family: SpanFamily::Mono,
+                bold: true,
+                px: 20.0,
+            },
+            TextSpan {
+                text: " ZZZZ",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 20.0,
+            },
+        ];
+        let atlas = ctx
+            .build_paragraph(&gpu, pool, &spans, 100_000.0, 20.0)
+            .unwrap();
+        assert_eq!(
+            atlas.spans.len(),
+            atlas.glyphs.len(),
+            "spans must be parallel to glyphs"
+        );
+
+        // Horizontal ink extent of the glyphs tagged with a given span index.
+        let span_x = |idx: u32| -> Option<(i32, i32)> {
+            atlas
+                .glyphs
+                .iter()
+                .zip(&atlas.spans)
+                .filter(|(_, s)| **s == idx)
+                .map(|(g, _)| (g.x, g.x + g.w as i32))
+                .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
+        };
+        let s0 = span_x(0).expect("span 0 has ink");
+        let s1 = span_x(1).expect("span 1 has ink");
+        let s2 = span_x(2).expect("span 2 has ink");
+
+        assert!(
+            s0.1 <= s1.0,
+            "span 0 must end before span 1 ({s0:?} vs {s1:?})"
+        );
+        assert!(
+            s1.1 <= s2.0,
+            "span 1 must end before span 2 ({s1:?} vs {s2:?})"
+        );
+        // Middle span is a proper subset of the whole run's horizontal extent.
+        assert!(
+            s0.0 < s1.0 && s1.1 < s2.1,
+            "span 1 ink {s1:?} must be inside the run ({s0:?}..{s2:?})"
+        );
+
+        atlas.texture.destroy(&gpu);
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 }

@@ -588,7 +588,7 @@ impl VulkanRenderer {
             Fourcc::R8,
             false,
         );
-        Ok(GlyphRun::new(vk_tex, atlas.glyphs, side))
+        Ok(GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side))
     }
 
     /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)
@@ -622,7 +622,7 @@ impl VulkanRenderer {
             Fourcc::R8,
             false,
         );
-        Ok(GlyphRun::new(vk_tex, atlas.glyphs, side))
+        Ok(GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side))
     }
 
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The
