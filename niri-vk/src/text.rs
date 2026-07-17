@@ -11,9 +11,13 @@
 //! swash's hinter is skrifa's own (autohint-style), not the font's TrueType bytecode, so results
 //! differ slightly from pango/cairo/FreeType — expected, not a bug.
 
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+use anyhow::{bail, Context, Result};
 use ash::vk;
-use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Hinting, Metrics, Shaping, Weight};
+use cosmic_text::{
+    Align, Attrs, Buffer, CacheKey, Family, FontSystem, Hinting, Metrics, Shaping, Weight,
+};
 use etagere::{size2, AtlasAllocator};
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source};
@@ -40,6 +44,9 @@ pub struct GlyphAtlas {
     pub glyphs: Vec<PlacedGlyph>,
     pub side: u32,
 }
+
+/// Atlas slot (top-left in atlas px) for each distinct glyph, keyed by its shaping cache key.
+type GlyphSlots = HashMap<CacheKey, (u32, u32)>;
 
 /// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
 /// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and
@@ -126,10 +133,23 @@ impl TextContext {
         pool: vk::CommandPool,
         buffer: &Buffer,
     ) -> Result<GlyphAtlas> {
-        let side: u32 = 256;
-        let mut atlas_pixels = vec![0u8; (side * side) as usize];
-        let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
-        let mut glyphs = Vec::new();
+        // One R8 coverage bitmap per DISTINCT glyph (a `CacheKey` folds in glyph id, font, size,
+        // weight, and subpixel bin) — a repeated character costs one atlas slot, not one per
+        // instance. Rasterize each distinct glyph once; every on-screen instance then points at the
+        // shared slot. Without this dedup a long line (a pasted / history-recalled command) blows a
+        // fixed atlas one slot per character; with it the slot count is bounded by the alphabet.
+        struct Raster {
+            data: Vec<u8>,
+            w: u32,
+            h: u32,
+            left: i32,
+            top: i32,
+        }
+        // `None` marks a key that draws nothing (whitespace / missing font / empty raster), so we
+        // neither re-rasterize it nor emit an instance for it.
+        let mut distinct: HashMap<CacheKey, Option<Raster>> = HashMap::new();
+        // Per-instance placement, still one entry per on-screen glyph.
+        let mut instances: Vec<(CacheKey, i32, i32)> = Vec::new();
 
         for run in buffer.layout_runs() {
             let baseline = run.line_y.round() as i32;
@@ -140,51 +160,115 @@ impl TextContext {
                 let phys = lg.physical((0.0, 0.0), 1.0);
                 let key = phys.cache_key;
 
-                // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
-                let Some(font) = fonts.get_font(key.font_id, key.font_weight) else {
-                    continue;
-                };
-                let mut scaler = ctx
-                    .builder(font.as_swash())
-                    .size(f32::from_bits(key.font_size_bits))
-                    .hint(true)
-                    .build();
+                let raster = distinct.entry(key).or_insert_with(|| {
+                    // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
+                    let font = fonts.get_font(key.font_id, key.font_weight)?;
+                    let mut scaler = ctx
+                        .builder(font.as_swash())
+                        .size(f32::from_bits(key.font_size_bits))
+                        .hint(true)
+                        .build();
 
-                // Subpixel remainder from the cache key (0 once fully snapped).
-                let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
-                let rendered = Render::new(&[Source::Outline])
-                    .format(Format::Alpha)
-                    .offset(offset)
-                    .render(&mut scaler, key.glyph_id);
-                let Some(image) = rendered else { continue };
+                    // Subpixel remainder from the cache key (0 once fully snapped).
+                    let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
+                    let image = Render::new(&[Source::Outline])
+                        .format(Format::Alpha)
+                        .offset(offset)
+                        .render(&mut scaler, key.glyph_id)?;
 
-                let (w, h) = (image.placement.width, image.placement.height);
-                if w == 0 || h == 0 {
-                    continue; // whitespace: no bitmap, pen still advances via the next glyph
-                }
-                debug_assert!(matches!(image.content, Content::Mask));
-
-                // +1px padding around each slot to keep neighbours from bleeding.
-                let alloc = atlas
-                    .allocate(size2(w as i32 + 1, h as i32 + 1))
-                    .context("glyph atlas full")?;
-                let (ax, ay) = (alloc.rectangle.min.x as u32, alloc.rectangle.min.y as u32);
-                for row in 0..h {
-                    let src = &image.data[(row * w) as usize..((row + 1) * w) as usize];
-                    let dst = ((ay + row) * side + ax) as usize;
-                    atlas_pixels[dst..dst + w as usize].copy_from_slice(src);
-                }
-
-                glyphs.push(PlacedGlyph {
-                    x: phys.x + image.placement.left,
-                    y: baseline + phys.y - image.placement.top,
-                    w,
-                    h,
-                    atlas_x: ax,
-                    atlas_y: ay,
+                    let (w, h) = (image.placement.width, image.placement.height);
+                    if w == 0 || h == 0 {
+                        return None; // whitespace: no bitmap, pen still advances
+                    }
+                    debug_assert!(matches!(image.content, Content::Mask));
+                    Some(Raster {
+                        data: image.data,
+                        w,
+                        h,
+                        left: image.placement.left,
+                        top: image.placement.top,
+                    })
                 });
+
+                if let Some(raster) = raster {
+                    instances.push((key, phys.x + raster.left, baseline + phys.y - raster.top));
+                }
             }
         }
+
+        // Demand-size the atlas: pick the smallest power-of-two square that plausibly holds every
+        // distinct slot (each `(w+1)x(h+1)` for a 1px bleed guard), then pack. `pack` returns the
+        // per-key slot positions, or `None` if this side couldn't fit them (etagere packing can
+        // fall short of the area estimate); grow and retry up to `MAX_SIDE`.
+        const MAX_SIDE: u32 = 2048;
+        let drawn: Vec<(CacheKey, &Raster)> = distinct
+            .iter()
+            .filter_map(|(k, r)| r.as_ref().map(|r| (*k, r)))
+            .collect();
+
+        let total_area: u64 = drawn
+            .iter()
+            .map(|(_, r)| u64::from(r.w + 1) * u64::from(r.h + 1))
+            .sum();
+        let max_slot = drawn
+            .iter()
+            .map(|(_, r)| (r.w + 1).max(r.h + 1))
+            .max()
+            .unwrap_or(1);
+        // Start from the larger of 256, the biggest single slot, and ~sqrt(area / 0.7 packing).
+        let mut side = 256u32.max(max_slot.next_power_of_two());
+        while side < MAX_SIDE && u64::from(side) * u64::from(side) * 7 < total_area * 10 {
+            side *= 2;
+        }
+
+        let pack = |side: u32| -> Option<(Vec<u8>, GlyphSlots)> {
+            let mut pixels = vec![0u8; (side * side) as usize];
+            let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
+            let mut slots = HashMap::with_capacity(drawn.len());
+            for (key, r) in &drawn {
+                let alloc = atlas.allocate(size2(r.w as i32 + 1, r.h as i32 + 1))?;
+                let (ax, ay) = (alloc.rectangle.min.x as u32, alloc.rectangle.min.y as u32);
+                for row in 0..r.h {
+                    let src = &r.data[(row * r.w) as usize..((row + 1) * r.w) as usize];
+                    let dst = ((ay + row) * side + ax) as usize;
+                    pixels[dst..dst + r.w as usize].copy_from_slice(src);
+                }
+                slots.insert(*key, (ax, ay));
+            }
+            Some((pixels, slots))
+        };
+
+        let (atlas_pixels, slots) = loop {
+            if let Some(packed) = pack(side) {
+                break packed;
+            }
+            if side >= MAX_SIDE {
+                bail!(
+                    "glyph atlas full: {} distinct glyphs exceed {MAX_SIDE}px",
+                    drawn.len()
+                );
+            }
+            side *= 2;
+        };
+
+        // Resolve every instance to its shared slot.
+        let glyphs = instances
+            .iter()
+            .map(|&(key, x, y)| {
+                let (ax, ay) = slots[&key];
+                let r = distinct[&key]
+                    .as_ref()
+                    .expect("drawn instance has a raster");
+                PlacedGlyph {
+                    x,
+                    y,
+                    w: r.w,
+                    h: r.h,
+                    atlas_x: ax,
+                    atlas_y: ay,
+                }
+            })
+            .collect();
 
         // 1:1 glyph-px to screen-px with integer placement, so NEAREST sampling is pixel-exact.
         let texture =
@@ -613,6 +697,122 @@ mod tests {
         );
 
         atlas.texture.destroy(&gpu);
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+
+    /// Three atlas-capacity invariants of the paragraph path:
+    ///  1. A long, high-DPI command line (the pathological run-dialog case) lays out every glyph
+    ///     WITHOUT erroring — an errored draw would make the modal dialog vanish while it still
+    ///     owns the keyboard. (Dedup usually keeps it inside the 256px default, which is the
+    ///     point.)
+    ///  2. When there really are more distinct large glyphs than fit 256px, the atlas GROWS past
+    ///     256 instead of erroring.
+    ///  3. The same glyph repeated 400x dedups to ONE slot (atlas stays 256), yet every instance is
+    ///     still placed.
+    #[test]
+    fn build_paragraph_atlas_capacity() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("no Vulkan device — skipping build_paragraph_atlas_capacity");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.unwrap();
+
+        let mut ctx = TextContext::new();
+
+        // (1) ~180 chars of a real command line at scale-2 sizes: this overflowed
+        // the old fixed 256x256 atlas and returned an error; it must lay out now.
+        let long = "firefox --new-window https://example.org/a/very/long/path?\
+                    q=alpha+beta+gamma&x=1&y=2&z=3#anchor-position-deep-in-the-doc \
+                    && echo done && ls -la /usr/share/applications | grep foo";
+        let long_spans = [
+            TextSpan {
+                text: "Run a Command",
+                family: SpanFamily::Sans,
+                bold: true,
+                px: 28.0,
+            },
+            TextSpan {
+                text: "\n\n",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 28.0,
+            },
+            TextSpan {
+                text: long,
+                family: SpanFamily::Mono,
+                bold: false,
+                px: 28.0,
+            },
+        ];
+        let atlas = ctx
+            .build_paragraph(&gpu, pool, &long_spans, 720.0, 28.0)
+            .expect("a long command line must lay out, not error");
+        assert!(
+            atlas.glyphs.len() > 100,
+            "expected the whole long line laid out, got {} glyphs",
+            atlas.glyphs.len()
+        );
+        atlas.texture.destroy(&gpu);
+
+        // (2) Force the grow path: the full printable-ASCII set in TWO styles
+        // (mono + bold sans) at a large size is ~180 genuinely distinct large
+        // glyphs — more than 256x256 holds even after dedup.
+        let ascii: String = (0x21u8..=0x7e).map(char::from).collect();
+        let grow_spans = [
+            TextSpan {
+                text: &ascii,
+                family: SpanFamily::Mono,
+                bold: false,
+                px: 44.0,
+            },
+            TextSpan {
+                text: "\n",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 44.0,
+            },
+            TextSpan {
+                text: &ascii,
+                family: SpanFamily::Sans,
+                bold: true,
+                px: 44.0,
+            },
+        ];
+        let atlas = ctx
+            .build_paragraph(&gpu, pool, &grow_spans, 100_000.0, 44.0)
+            .expect("a large distinct-glyph set must grow the atlas, not error");
+        assert!(
+            atlas.side > 256,
+            "expected a grown atlas for ~180 distinct large glyphs, got {}",
+            atlas.side
+        );
+        atlas.texture.destroy(&gpu);
+
+        // (3) Dedup: 400 copies of one glyph share one slot, so the atlas stays 256.
+        let repeated = "l".repeat(400);
+        let dedup_spans = [TextSpan {
+            text: &repeated,
+            family: SpanFamily::Mono,
+            bold: false,
+            px: 14.0,
+        }];
+        let atlas = ctx
+            .build_paragraph(&gpu, pool, &dedup_spans, 100_000.0, 14.0)
+            .expect("400 identical glyphs must dedup, not overflow");
+        assert_eq!(
+            atlas.side, 256,
+            "identical glyphs should not grow the atlas (side {})",
+            atlas.side
+        );
+        assert_eq!(
+            atlas.glyphs.len(),
+            400,
+            "every instance is still placed, got {}",
+            atlas.glyphs.len()
+        );
+        atlas.texture.destroy(&gpu);
+
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 }

@@ -251,44 +251,50 @@ impl RunDialog {
                     Ok(texture) => {
                         cache.textures.insert(scale_key, (self.revision, texture));
                     }
+                    // Keep the last good texture for this scale (the failed draw never overwrote
+                    // the cache entry) and fall through to always draw the backdrop below. This
+                    // dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`): a draw failure
+                    // must NEVER make it vanish, or the seat is left in an invisible keyboard trap.
+                    // An out-of-date box beats an invisible one.
                     Err(err) => {
-                        warn!("error rendering the run dialog: {err:#}");
-                        return;
+                        warn!(
+                            "error rendering the run dialog, keeping the previous frame: {err:#}"
+                        );
                     }
                 }
             }
-            match cache.textures.get(&scale_key) {
-                Some((_, texture)) => texture.clone(),
-                None => return,
-            }
+            cache.textures.get(&scale_key).map(|(_, t)| t.clone())
         };
 
-        // The box is opaque, so let the compositor skip drawing behind it.
-        let tex_size = texture.size();
-        let opaque = vec![Rectangle::from_size(tex_size)];
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
+        if let Some(texture) = texture {
+            // The box is opaque, so let the compositor skip drawing behind it.
+            let tex_size = texture.size();
+            let opaque = vec![Rectangle::from_size(tex_size)];
+            let buffer =
+                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
 
-        let size = Size::<f64, Logical>::from((
-            f64::from(tex_size.w) / scale,
-            f64::from(tex_size.h) / scale,
-        ));
-        let location = (output_size.to_point() - size.to_point()).downscale(2.);
-        let mut location = location.to_physical_precise_round(scale).to_logical(scale);
-        location.x = f64::max(0., location.x);
-        location.y = f64::max(0., location.y);
+            let size = Size::<f64, Logical>::from((
+                f64::from(tex_size.w) / scale,
+                f64::from(tex_size.h) / scale,
+            ));
+            let location = (output_size.to_point() - size.to_point()).downscale(2.);
+            let mut location = location.to_physical_precise_round(scale).to_logical(scale);
+            location.x = f64::max(0., location.x);
+            location.y = f64::max(0., location.y);
 
-        let elem = TextureRenderElement::from_texture_buffer(
-            buffer,
-            location,
-            1.,
-            None,
-            None,
-            Kind::Unspecified,
-        );
-        push(RunDialogRenderElement::Texture(elem));
+            let elem = TextureRenderElement::from_texture_buffer(
+                buffer,
+                location,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            );
+            push(RunDialogRenderElement::Texture(elem));
+        }
 
-        // Backdrop.
+        // Backdrop — always drawn while the dialog is open, even if the box failed to render, so
+        // the modal is never invisible while it holds the keyboard.
         let backdrop = SolidColorBuffer::new(output_size, BACKDROP_COLOR);
         let elem = SolidColorRenderElement::from_buffer(
             &backdrop,
@@ -519,12 +525,20 @@ mod tests {
             }
         };
 
-        for (entry, error) in [
-            ("", None),
-            ("echo <b>hi</b> & 'quotes'", None),
-            ("cat<", Some("error with <markup> & entities")),
+        // The last case is the pathological one from review: a long command at
+        // scale 2 that overflowed the old fixed 256px glyph atlas — it must draw,
+        // not error (an errored draw would leave the modal invisible mid-typing).
+        let long_entry = "firefox --new-window https://example.org/a/very/long/path\
+                          ?q=alpha+beta+gamma&x=1#anchor && echo done && ls -la /usr/bin"
+            .to_owned();
+        for (scale, entry, error) in [
+            (1., "", None),
+            (1., "echo <b>hi</b> & 'quotes'", None),
+            (1., "cat<", Some("error with <markup> & entities")),
+            (2., long_entry.as_str(), None),
         ] {
-            let mut tex = draw_dialog_texture(&mut vk, 1., entry, error).expect("dialog texture");
+            let mut tex =
+                draw_dialog_texture(&mut vk, scale, entry, error).expect("dialog texture");
             let size = tex.size();
             assert!(size.w > 0 && size.h > 0);
 
