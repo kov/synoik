@@ -26,6 +26,10 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     self, ZwlrLayerSurfaceV1,
 };
+use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
+    self, ZwlrScreencopyFrameV1,
+};
+use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_backend::client::Backend;
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
@@ -68,6 +72,9 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub seat: Option<WlSeat>,
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
+    /// The in-flight wlr-screencopy capture, if any. One at a time is enough for tests.
+    pub screencopy: Option<ScreencopyCapture>,
 
     pub keyboard: Option<WlKeyboard>,
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
@@ -75,6 +82,46 @@ pub struct State {
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+}
+
+/// The in-flight state of one wlr-screencopy capture, updated by the frame's [`Dispatch`] impl.
+pub struct ScreencopyCapture {
+    pub frame: ZwlrScreencopyFrameV1,
+    /// The shm `(format, width, height, stride)` the compositor asked for, from the `buffer`
+    /// event.
+    pub shm_params: Option<(wl_shm::Format, u32, u32, u32)>,
+    pub buffer_done: bool,
+    pub ready: bool,
+    pub failed: bool,
+}
+
+/// A standalone shm buffer whose backing memfd the client keeps mapped, so it can read back what
+/// the compositor rendered into it (the screencopy destination). Holds `pool` and `file` alive:
+/// smithay keeps its own mapping of the fd, and dropping ours before the read could pull the memory
+/// out from under it.
+pub struct ShmReadback {
+    pub buffer: WlBuffer,
+    pool: WlShmPool,
+    file: std::fs::File,
+    len: usize,
+}
+
+impl ShmReadback {
+    /// The buffer's current bytes (what the compositor last wrote).
+    pub fn read(&mut self) -> Vec<u8> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        self.file.seek(SeekFrom::Start(0)).expect("seek shm memfd");
+        let mut buf = vec![0u8; self.len];
+        self.file.read_exact(&mut buf).expect("read shm memfd");
+        buf
+    }
+}
+
+impl Drop for ShmReadback {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
 }
 
 pub struct Window {
@@ -204,6 +251,8 @@ impl Client {
             viewporter: None,
             seat: None,
             shortcuts_inhibit_manager: None,
+            screencopy_manager: None,
+            screencopy: None,
             keyboard: None,
             key_events: Vec::new(),
             windows: Vec::new(),
@@ -271,6 +320,68 @@ impl Client {
 
     pub fn inhibit_shortcuts(&mut self, surface: &WlSurface) {
         self.state.inhibit_shortcuts(surface);
+    }
+
+    /// Begin a wlr-screencopy capture of `output`. The compositor answers with `buffer` +
+    /// `buffer_done` events describing the destination it wants; roundtrip until
+    /// `self.state.screencopy.buffer_done`, then create the matching buffer and call
+    /// [`Self::copy_screencopy`].
+    pub fn begin_screencopy(&mut self, output: &WlOutput) {
+        let manager = self
+            .state
+            .screencopy_manager
+            .clone()
+            .expect("wlr-screencopy manager not bound");
+        // overlay_cursor = 0: composite without the pointer.
+        let frame = manager.capture_output(0, output, &self.qh, ());
+        self.state.screencopy = Some(ScreencopyCapture {
+            frame,
+            shm_params: None,
+            buffer_done: false,
+            ready: false,
+            failed: false,
+        });
+    }
+
+    /// Hand the compositor `readback`'s buffer to fill. A plain `copy` (not `copy_with_damage`)
+    /// renders synchronously server-side, so one roundtrip after this delivers `ready`.
+    pub fn copy_screencopy(&self, readback: &ShmReadback) {
+        let capture = self
+            .state
+            .screencopy
+            .as_ref()
+            .expect("no capture in flight");
+        capture.frame.copy(&readback.buffer);
+    }
+
+    /// Create a standalone `w`×`h` shm buffer in `format`, backed by a memfd the client keeps so it
+    /// can [`ShmReadback::read`] back what the compositor rendered. Not attached to any surface.
+    pub fn create_shm_readback_buffer(
+        &self,
+        w: i32,
+        h: i32,
+        format: wl_shm::Format,
+    ) -> ShmReadback {
+        use std::os::fd::AsFd;
+
+        use smithay::reexports::rustix::fs::{ftruncate, memfd_create, MemfdFlags};
+
+        let shm = self.state.shm.as_ref().expect("wl_shm not bound");
+        let stride = w * 4;
+        let len = (stride * h) as usize;
+
+        let fd = memfd_create("niri-test-screencopy", MemfdFlags::CLOEXEC).expect("memfd_create");
+        ftruncate(&fd, len as u64).expect("ftruncate");
+        let file = std::fs::File::from(fd);
+
+        let pool = shm.create_pool(file.as_fd(), len as i32, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, stride, format, &self.qh, ());
+        ShmReadback {
+            buffer,
+            pool,
+            file,
+            len,
+        }
     }
 
     pub fn release_shortcuts_inhibitor(&mut self, surface: &WlSurface) {
@@ -686,6 +797,9 @@ impl Dispatch<WlRegistry, ()> for State {
                         ZwpKeyboardShortcutsInhibitManagerV1::interface().version,
                     );
                     state.shortcuts_inhibit_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwlrScreencopyManagerV1::interface().name {
+                    let version = min(version, ZwlrScreencopyManagerV1::interface().version);
+                    state.screencopy_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -949,6 +1063,50 @@ impl Dispatch<WpSinglePixelBufferManagerV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<ZwlrScreencopyManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrScreencopyManagerV1,
+        _event: <ZwlrScreencopyManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // The manager has no events.
+    }
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrScreencopyFrameV1,
+        event: <ZwlrScreencopyFrameV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let Some(capture) = state.screencopy.as_mut() else {
+            return;
+        };
+        match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => {
+                let format = format.into_result().expect("unknown shm format");
+                capture.shm_params = Some((format, width, height, stride));
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => capture.buffer_done = true,
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => capture.ready = true,
+            zwlr_screencopy_frame_v1::Event::Failed => capture.failed = true,
+            // LinuxDmabuf/Damage/Flags: not needed for the shm byte check.
+            _ => {}
+        }
     }
 }
 

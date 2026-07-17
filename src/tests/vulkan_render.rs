@@ -16,6 +16,7 @@ use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
+use wayland_client::protocol::wl_shm;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
@@ -2391,6 +2392,94 @@ fn vulkan_screenshots_a_window_through_vulkan() {
     assert!(
         ran.is_some(),
         "screenshot_window did not run on the Vulkan renderer"
+    );
+}
+
+/// End-to-end `render_to_shm` through the real wlr-screencopy protocol: a client captures the
+/// output into a `wl_shm` `Xrgb8888` buffer, and we read that buffer's bytes back.
+///
+/// This is the only test that drives `render_to_shm` (`niri.rs`'s shm screencopy branch) as a
+/// whole — every other shm test exercises a piece (the byte-order swizzle, the import cache). A
+/// plain `copy` renders synchronously server-side, so the capture completes within a roundtrip.
+///
+/// Red is the discriminator. The pool is `Xrgb8888` — BGRA byte order — so a red window must read
+/// back with red in the **third** byte (`[0, 0, 255, 255]`). If the conversion were skipped or the
+/// order wrong, red would land in the first byte instead; the test asserts both the presence of
+/// BGRA-red and the absence of RGBA-red, so it fails either way.
+#[test]
+fn vulkan_render_to_shm_screencopy_fills_the_buffer() {
+    let Some((mut f, id, _surface)) = window_fixture_with_client(RED, true, None) else {
+        return;
+    };
+    let output = f.client(id).output("headless-1");
+
+    // capture_output → the compositor answers with the shm geometry it wants.
+    f.client(id).begin_screencopy(&output);
+    for _ in 0..10 {
+        f.roundtrip(id);
+        if f.client(id).state.screencopy.as_ref().unwrap().buffer_done {
+            break;
+        }
+    }
+
+    let (format, w, h, stride) = f
+        .client(id)
+        .state
+        .screencopy
+        .as_ref()
+        .unwrap()
+        .shm_params
+        .expect("compositor sent no shm buffer parameters");
+    assert_eq!(format, wl_shm::Format::Xrgb8888, "screencopy shm format");
+    assert_eq!((w, h), (u32::from(OUT_W), u32::from(OUT_H)), "buffer size");
+    assert_eq!(stride, w * 4, "buffer stride");
+
+    // Hand the compositor a matching buffer; a plain copy renders it synchronously.
+    let mut readback = f
+        .client(id)
+        .create_shm_readback_buffer(w as i32, h as i32, format);
+    f.client(id).copy_screencopy(&readback);
+    for _ in 0..10 {
+        f.roundtrip(id);
+        let cap = f.client(id).state.screencopy.as_ref().unwrap();
+        if cap.ready || cap.failed {
+            break;
+        }
+    }
+    let cap = f.client(id).state.screencopy.as_ref().unwrap();
+    assert!(!cap.failed, "compositor reported the screencopy failed");
+    assert!(cap.ready, "screencopy did not become ready");
+
+    let bytes = readback.read();
+    assert_eq!(
+        bytes.len(),
+        (w * h * 4) as usize,
+        "readback size must match the buffer"
+    );
+
+    let (w, h) = (w as i32, h as i32);
+    // Xrgb8888 is BGRA byte order: a red window pixel is [B=0, G=0, R=255, A=255].
+    let is_bgra_red = |p: [u8; 4]| p[0] < 40 && p[1] < 40 && p[2] > 200;
+    // The wrong order (RGBA / no conversion) would put red in the first byte instead.
+    let is_rgba_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let bgra_red = (0..w * h)
+        .filter(|i| is_bgra_red(px(&bytes, w, i % w, i / w)))
+        .count();
+    let rgba_red = (0..w * h)
+        .filter(|i| is_rgba_red(px(&bytes, w, i % w, i / w)))
+        .count();
+    eprintln!(
+        "vulkan_render_to_shm_screencopy_fills_the_buffer: {bgra_red} BGRA-red px, {rgba_red} \
+         RGBA-red px"
+    );
+    assert!(
+        bgra_red > 1000,
+        "the red window is missing from the shm screencopy buffer ({bgra_red} BGRA-red px)"
+    );
+    assert!(
+        rgba_red < 100,
+        "the shm buffer has red in the wrong byte ({rgba_red} RGBA-red px): the Xrgb8888/BGRA \
+         conversion did not happen"
     );
 }
 
