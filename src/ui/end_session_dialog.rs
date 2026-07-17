@@ -18,19 +18,21 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 use niri_config::Config;
+use niri_vk::text::{SpanFamily, TextSpan};
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{Alignment, FontDescription};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::end_session::EndSessionType;
 use crate::niri_render_elements;
-use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -45,10 +47,19 @@ const BORDER: i32 = 2;
 const BUTTON_W: i32 = 120;
 const BUTTON_H: i32 = 40;
 const BUTTON_GAP: i32 = 12;
-const FONT: &str = "sans 12px";
-const TITLE_FONT: &str = "sans bold 15px";
+/// Title font size (bold) and body/label font size, logical px-per-em.
+const TITLE_PX: f64 = 15.;
+const BODY_PX: f64 = 12.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-const ACCENT: (f64, f64, f64) = (0.20, 0.52, 0.89);
+/// Box background, grey border, and the two button fills (accent when focused), straight RGBA.
+const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+const BORDER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.];
+const BUTTON_BG: [f32; 4] = [0.22, 0.22, 0.22, 1.];
+const ACCENT: [f32; 4] = [0.20, 0.52, 0.89, 1.];
+/// Title (white), description (grey), and button-label (white) text colours.
+const TITLE_COLOR: [f32; 4] = [1., 1., 1., 1.];
+const DESC_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.];
+const LABEL_COLOR: [f32; 4] = [1., 1., 1., 1.];
 
 /// Which button currently has focus (keyboard focus and pointer hover are unified — hovering a
 /// button focuses it, and Enter activates the focused one).
@@ -88,8 +99,21 @@ enum State {
 /// The rendered-content signature: re-render only when one of these changes (per output scale).
 type Sig = (u8, Option<u64>, Button);
 
-/// Per-scale rendered-buffer cache: the signature it was rendered at, and the buffer.
-type Buffers = HashMap<NotNan<f64>, (Option<Sig>, Option<MemoryBuffer>)>;
+/// Per-scale texture cache: the signature it was rendered at, and the box texture. Tied to a
+/// renderer context (dropped when it changes).
+struct DialogCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<NotNan<f64>, (Sig, VkTexture)>,
+}
+
+impl DialogCache {
+    fn new() -> Self {
+        Self {
+            context: None,
+            textures: HashMap::new(),
+        }
+    }
+}
 
 pub struct EndSessionDialog {
     state: State,
@@ -99,8 +123,8 @@ pub struct EndSessionDialog {
     /// through the close animation (when the state machine has already cleared) so the fade-out
     /// still has something to draw.
     content: Option<(EndSessionType, Option<u64>)>,
-    /// One cached buffer per output scale, tagged with the content signature it was rendered at.
-    buffers: RefCell<Buffers>,
+    /// One cached texture per output scale, tagged with the content signature it was rendered at.
+    cache: RefCell<DialogCache>,
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
@@ -123,7 +147,7 @@ impl EndSessionDialog {
             state: State::Hidden,
             focused: Button::Action,
             content: None,
-            buffers: RefCell::new(HashMap::new()),
+            cache: RefCell::new(DialogCache::new()),
             clock,
             config,
         }
@@ -321,46 +345,70 @@ impl EndSessionDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-
+        let Some(scale_key) = NotNan::new(scale).ok() else {
+            return;
+        };
         let sig: Sig = (kind as u8, seconds_left, self.focused);
-        let mut buffers = self.buffers.borrow_mut();
-        let (cached_sig, buffer) = buffers
-            .entry(NotNan::new(scale).unwrap())
-            .or_insert((None, None));
-        if *cached_sig != Some(sig) {
-            *buffer = render(scale, kind, seconds_left, self.focused)
-                .map_err(|err| warn!("error rendering the end-session dialog: {err:?}"))
-                .ok();
-            *cached_sig = Some(sig);
+
+        let texture = {
+            let mut cache = self.cache.borrow_mut();
+
+            // The cached textures belong to one renderer context; drop them all if it changed.
+            let context = renderer.context_id();
+            if cache.context.as_ref() != Some(&context) {
+                cache.textures.clear();
+                cache.context = Some(context);
+            }
+
+            let fresh = matches!(cache.textures.get(&scale_key), Some((s, _)) if *s == sig);
+            if !fresh {
+                match draw_dialog_texture(renderer, scale, kind, seconds_left, self.focused) {
+                    Ok(texture) => {
+                        cache.textures.insert(scale_key, (sig, texture));
+                    }
+                    Err(err) => {
+                        // Fail visible: fall through to always draw the backdrop (modal grab).
+                        warn!("error rendering the end-session dialog: {err:#}");
+                    }
+                }
+            }
+            cache.textures.get(&scale_key).map(|(_, t)| t.clone())
+        };
+
+        if let Some(texture) = texture {
+            let tex_size = texture.size();
+            let buffer = TextureBuffer::from_texture(
+                renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                Vec::new(),
+            );
+
+            let size = Size::<f64, Logical>::from((
+                f64::from(tex_size.w) / scale,
+                f64::from(tex_size.h) / scale,
+            ));
+            let location = (output_size.to_point() - size.to_point()).downscale(2.);
+            let mut location = location.to_physical_precise_round(scale).to_logical(scale);
+            location.x = f64::max(0., location.x);
+            location.y = f64::max(0., location.y);
+
+            let elem = TextureRenderElement::from_texture_buffer(
+                buffer,
+                location,
+                clamped_value as f32,
+                None,
+                None,
+                Kind::Unspecified,
+            );
+            let elem = RescaleRenderElement::from_element(
+                elem,
+                (location + size.downscale(2.)).to_physical_precise_round(scale),
+                value.max(0.) * 0.2 + 0.8,
+            );
+            push(EndSessionDialogRenderElement::Texture(elem));
         }
-        let Some(buffer) = buffer else {
-            return;
-        };
-
-        let size = buffer.logical_size();
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer, buffer) else {
-            return;
-        };
-
-        let location = (output_size.to_point() - size.to_point()).downscale(2.);
-        let mut location = location.to_physical_precise_round(scale).to_logical(scale);
-        location.x = f64::max(0., location.x);
-        location.y = f64::max(0., location.y);
-
-        let elem = TextureRenderElement::from_texture_buffer(
-            buffer,
-            location,
-            clamped_value as f32,
-            None,
-            None,
-            Kind::Unspecified,
-        );
-        let elem = RescaleRenderElement::from_element(
-            elem,
-            (location + size.downscale(2.)).to_physical_precise_round(scale),
-            value.max(0.) * 0.2 + 0.8,
-        );
-        push(EndSessionDialogRenderElement::Texture(elem));
 
         // Backdrop dimming the windows behind, faded in with the dialog.
         let data = output.user_data().get_or_insert(|| {
@@ -399,130 +447,131 @@ fn content(
     (title, action, description)
 }
 
-fn render(
+/// Draw the fixed-size dialog into an offscreen [`VkTexture`] on the GPU: the dark box with a grey
+/// border, a centered white title, a centered grey (counting-down) description, and the two buttons
+/// (Cancel left, action right) — filled accent-blue when focused, else dark grey, with a centered
+/// white label. No cairo/pango. (The old pango path left-aligned the title/description and rounded
+/// the button corners; this centers them — matching gnome-shell — and squares the buttons.)
+fn draw_dialog_texture(
+    renderer: &mut VulkanRenderer,
     scale: f64,
     kind: EndSessionType,
     seconds_left: Option<u64>,
     focused: Button,
-) -> anyhow::Result<MemoryBuffer> {
-    let _span = tracy_client::span!("end_session_dialog::render");
-
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("end_session_dialog::draw_dialog_texture");
     let (title, action_label, description) = content(kind, seconds_left);
 
     let px = |logical: i32| to_physical_precise_round::<i32>(scale, logical);
-    let width = px(WIDTH);
-    let height = px(HEIGHT);
-    let padding = f64::from(px(PADDING));
+    let width = px(WIDTH).max(1);
+    let height = px(HEIGHT).max(1);
+    let padding = px(PADDING).max(0);
+    let border = px(BORDER).max(1);
+    let inner_wrap = (width - padding * 2).max(1);
+    let title_px = (TITLE_PX * scale) as f32;
+    let body_px = (BODY_PX * scale) as f32;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-
-    // Dialog background + border.
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-    cr.rectangle(0., 0., width.into(), height.into());
-    cr.set_source_rgb(0.3, 0.3, 0.3);
-    cr.set_line_width((f64::from(px(BORDER))).max(1.));
-    cr.stroke()?;
-
-    // Title.
-    let mut title_font = FontDescription::from_string(TITLE_FONT);
-    title_font.set_absolute_size(to_physical_precise_round(scale, title_font.size()));
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&title_font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_width((width - 2 * px(PADDING)) * pangocairo::pango::SCALE);
-    layout.set_text(title);
-    cr.move_to(padding, padding);
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-    let (_, title_h) = layout.pixel_size();
-
-    // Description (with the countdown).
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_width((width - 2 * px(PADDING)) * pangocairo::pango::SCALE);
-    layout.set_text(&description);
-    cr.move_to(padding, padding + f64::from(title_h) + f64::from(px(12)));
-    cr.set_source_rgb(0.8, 0.8, 0.8);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    // Buttons.
-    draw_button(
-        &cr,
-        scale,
-        EndSessionDialog::button_rect(Button::Cancel),
-        "Cancel",
-        focused == Button::Cancel,
-        &font,
-    )?;
-    draw_button(
-        &cr,
-        scale,
-        EndSessionDialog::button_rect(Button::Action),
-        action_label,
-        focused == Button::Action,
-        &font,
-    )?;
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    Ok(MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width, height),
-        scale,
-        Transform::Normal,
-    ))
-}
-
-fn draw_button(
-    cr: &cairo::Context,
-    scale: f64,
-    rect: Rectangle<f64, Logical>,
-    label: &str,
-    focused: bool,
-    font: &FontDescription,
-) -> anyhow::Result<()> {
-    let x = rect.loc.x * scale;
-    let y = rect.loc.y * scale;
-    let w = rect.size.w * scale;
-    let h = rect.size.h * scale;
-
-    rounded_rect(cr, x, y, w, h, 6. * scale);
-    if focused {
-        cr.set_source_rgb(ACCENT.0, ACCENT.1, ACCENT.2);
-    } else {
-        cr.set_source_rgb(0.22, 0.22, 0.22);
+    fn sans(text: &str, bold: bool, px: f32) -> TextSpan<'_> {
+        TextSpan {
+            text,
+            family: SpanFamily::Sans,
+            bold,
+            px,
+        }
     }
-    cr.fill()?;
 
-    let layout = pangocairo::functions::create_layout(cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_width((w.round() as i32) * pangocairo::pango::SCALE);
-    layout.set_text(label);
-    let (_, label_h) = layout.pixel_size();
-    cr.move_to(x, y + (h - f64::from(label_h)) / 2.);
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(cr, &layout);
-    Ok(())
-}
+    // One centered run per text element; render_glyphs is one colour per call, and the title
+    // (white) and description (grey) differ, so they are separate runs.
+    let title_run = renderer.build_glyph_paragraph(
+        &[sans(title, true, title_px)],
+        inner_wrap as f32,
+        title_px,
+    )?;
+    let desc_run = renderer.build_glyph_paragraph(
+        &[sans(&description, false, body_px)],
+        inner_wrap as f32,
+        body_px,
+    )?;
+    let button_wrap = px(BUTTON_W).max(1) as f32;
+    let cancel_run =
+        renderer.build_glyph_paragraph(&[sans("Cancel", false, body_px)], button_wrap, body_px)?;
+    let action_run = renderer.build_glyph_paragraph(
+        &[sans(action_label, false, body_px)],
+        button_wrap,
+        body_px,
+    )?;
 
-fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    use std::f64::consts::PI;
-    cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -0.5 * PI, 0.);
-    cr.arc(x + w - r, y + h - r, r, 0., 0.5 * PI);
-    cr.arc(x + r, y + h - r, r, 0.5 * PI, PI);
-    cr.arc(x + r, y + r, r, PI, 1.5 * PI);
-    cr.close_path();
+    let size = Size::<i32, Physical>::from((width, height));
+    let full = Rectangle::from_size(size);
+    let inner = Rectangle::new(
+        Point::from((border, border)),
+        Size::from(((width - border * 2).max(0), (height - border * 2).max(0))),
+    );
+
+    // Stack the title then the description under it, each centered within the inner width.
+    let (_, tiy, _, tih) = title_run.ink_bounds();
+    let title_origin = Point::<i32, Physical>::from((padding, padding - tiy));
+    let (_, diy, _, _) = desc_run.ink_bounds();
+    let desc_origin = Point::<i32, Physical>::from((padding, padding + tih + px(12) - diy));
+
+    // Physical button rects (from the shared logical geometry) + centered label origins.
+    let button_phys = |b: Button| -> Rectangle<i32, Physical> {
+        let r = EndSessionDialog::button_rect(b);
+        Rectangle::new(
+            Point::from((px(r.loc.x as i32), px(r.loc.y as i32))),
+            Size::from((px(r.size.w as i32), px(r.size.h as i32))),
+        )
+    };
+    let cancel_rect = button_phys(Button::Cancel);
+    let action_rect = button_phys(Button::Action);
+
+    let (_, ciy, _, cih) = cancel_run.ink_bounds();
+    let cancel_origin = Point::<i32, Physical>::from((
+        cancel_rect.loc.x,
+        cancel_rect.loc.y + (cancel_rect.size.h - cih) / 2 - ciy,
+    ));
+    let (_, aiy, _, aih) = action_run.ink_bounds();
+    let action_origin = Point::<i32, Physical>::from((
+        action_rect.loc.x,
+        action_rect.loc.y + (action_rect.size.h - aih) / 2 - aiy,
+    ));
+
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((width, height)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+
+        // Grey border = whole box grey, then the inner rect dark.
+        frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
+        frame.clear(Color32F::from(BOX_BG), &[inner])?;
+
+        // Button backgrounds (accent when focused).
+        let cancel_bg = if focused == Button::Cancel {
+            ACCENT
+        } else {
+            BUTTON_BG
+        };
+        let action_bg = if focused == Button::Action {
+            ACCENT
+        } else {
+            BUTTON_BG
+        };
+        frame.clear(Color32F::from(cancel_bg), &[cancel_rect])?;
+        frame.clear(Color32F::from(action_bg), &[action_rect])?;
+
+        // Text.
+        frame.render_glyphs(&title_run, title_origin, TITLE_COLOR, full, &[full])?;
+        frame.render_glyphs(&desc_run, desc_origin, DESC_COLOR, full, &[full])?;
+        frame.render_glyphs(&cancel_run, cancel_origin, LABEL_COLOR, full, &[full])?;
+        frame.render_glyphs(&action_run, action_origin, LABEL_COLOR, full, &[full])?;
+        let _sync = frame.finish()?;
+    }
+
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 #[cfg(feature = "dbus")]
@@ -535,12 +584,23 @@ pub fn a11y_node() -> accesskit::Node {
 
 #[cfg(test)]
 mod tests {
+    use smithay::backend::renderer::ExportMem;
+
     use super::*;
 
-    /// The CPU render (pango + cairo) produces a sized buffer for every type, with and without the
-    /// countdown, and for either focused button — the paths the live dialog cycles through.
+    /// The GPU render produces a fixed-size box for every type, countdown state, and focused button
+    /// — the paths the live dialog cycles through — and the focused button's accent-blue fill is
+    /// visible. Skips cleanly with no Vulkan device.
     #[test]
-    fn render_produces_a_sized_buffer_for_every_variant() {
+    fn draws_every_variant() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draws_every_variant: no Vulkan device ({e})");
+                return;
+            }
+        };
+
         for kind in [
             EndSessionType::Logout,
             EndSessionType::Shutdown,
@@ -548,9 +608,40 @@ mod tests {
         ] {
             for seconds in [Some(59), Some(0), None] {
                 for focused in [Button::Cancel, Button::Action] {
-                    let buffer = render(1., kind, seconds, focused).unwrap();
-                    let size = buffer.logical_size();
-                    assert!(size.w > 0. && size.h > 0.);
+                    let mut tex = draw_dialog_texture(&mut vk, 1., kind, seconds, focused)
+                        .expect("dialog texture");
+                    let size = tex.size();
+                    assert_eq!(
+                        (size.w, size.h),
+                        (WIDTH, HEIGHT),
+                        "fixed dialog size at scale 1"
+                    );
+
+                    let fb = vk.bind(&mut tex).expect("bind");
+                    let region = Rectangle::<i32, BufferCoord>::from_size(size);
+                    let mapping = vk
+                        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                        .expect("copy_framebuffer");
+                    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+                    // The focused button's top strip (above its vertically-centered label) is the
+                    // accent-blue fill (B clearly dominant).
+                    let rect = EndSessionDialog::button_rect(focused);
+                    let bx = (rect.loc.x + rect.size.w / 2.) as i32;
+                    let by = rect.loc.y as i32 + 4;
+                    let i = ((by * size.w + bx) * 4) as usize;
+                    let p = [pixels[i], pixels[i + 1], pixels[i + 2]];
+                    assert!(
+                        p[2] > 150 && p[2] > p[0] + 40,
+                        "focused button not accent-blue at its top: {p:?}"
+                    );
+
+                    // Bright glyph ink (title / labels).
+                    let bright = pixels
+                        .chunks_exact(4)
+                        .filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200)
+                        .count();
+                    assert!(bright > 40, "expected visible glyph ink, got {bright}");
                 }
             }
         }
