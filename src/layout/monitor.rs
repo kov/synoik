@@ -27,7 +27,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -1921,7 +1921,6 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_insert_hint_between_workspaces(
         &self,
-        renderer: &mut VulkanRenderer,
         push: &mut dyn FnMut(MonitorRenderElement),
     ) {
         if self.options.layout.insert_hint.off {
@@ -1935,7 +1934,7 @@ impl<W: LayoutElement> Monitor<W> {
         };
 
         self.insert_hint_element
-            .render(renderer, render_loc.location, &mut |elem| {
+            .render(render_loc.location, &mut |elem| {
                 let elem = MonitorInnerRenderElement::Ring(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
                 let elem =
@@ -1967,19 +1966,18 @@ impl<W: LayoutElement> Monitor<W> {
         // First pushed = topmost: the indicator ring sits above the
         // thumbnails (gnome-shell keeps it as the top sibling).
         let indicator_loc = self.thumbnail_indicator_rect(&strip).loc + slide;
-        self.thumb_indicator
-            .render(ctx.renderer, indicator_loc, &mut |elem| {
-                let elem = MonitorInnerRenderElement::Ring(elem);
-                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-                let elem =
-                    RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
-                push(elem);
-            });
+        self.thumb_indicator.render(indicator_loc, &mut |elem| {
+            let elem = MonitorInnerRenderElement::Ring(elem);
+            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+            let elem =
+                RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
+            push(elem);
+        });
 
         // The new-workspace drop placeholder, while a drag hovers a gap.
         if let Some(rect) = strip.placeholder {
             self.thumb_placeholder
-                .render(ctx.renderer, rect.loc + slide, &mut |elem| {
+                .render(rect.loc + slide, &mut |elem| {
                     let elem = MonitorInnerRenderElement::Ring(elem);
                     let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
                     let elem = RelocateRenderElement::from_element(
@@ -2152,8 +2150,7 @@ impl<W: LayoutElement> Monitor<W> {
                 () => {
                     if let Some(loc) = insert_hint_render_loc {
                         if loc.workspace == InsertWorkspace::Existing(ws.id()) {
-                            self.insert_hint_element
-                                .render(ctx.renderer, loc.location, push!());
+                            self.insert_hint_element.render(loc.location, push!());
                         }
                     }
                 };
@@ -2193,11 +2190,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    pub fn render_workspace_shadows(
-        &self,
-        renderer: &mut VulkanRenderer,
-        push: &mut dyn FnMut(MonitorRenderElement),
-    ) {
+    pub fn render_workspace_shadows(&self, push: &mut dyn FnMut(MonitorRenderElement)) {
         let Some(progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
             return;
         };
@@ -2209,7 +2202,7 @@ impl<W: LayoutElement> Monitor<W> {
         let zoom = self.overview_zoom();
 
         for (ws, geo) in self.workspaces_with_render_geo() {
-            ws.render_shadow(renderer, &mut |elem| {
+            ws.render_shadow(&mut |elem| {
                 let elem = elem.with_alpha(alpha);
                 let elem = MonitorInnerRenderElement::Shadow(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);

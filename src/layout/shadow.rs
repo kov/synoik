@@ -4,7 +4,6 @@ use niri_config::CornerRadius;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::render_helpers::shadow::ShadowRenderElement;
-use crate::render_helpers::vulkan::VulkanRenderer;
 
 #[derive(Debug)]
 pub struct Shadow {
@@ -162,18 +161,8 @@ impl Shadow {
         }
     }
 
-    pub fn render(
-        &self,
-        renderer: &mut VulkanRenderer,
-        location: Point<f64, Logical>,
-        push: &mut dyn FnMut(ShadowRenderElement),
-    ) {
+    pub fn render(&self, location: Point<f64, Logical>, push: &mut dyn FnMut(ShadowRenderElement)) {
         if !self.config.on {
-            return;
-        }
-
-        let has_shadow_shader = ShadowRenderElement::has_shader(renderer);
-        if !has_shadow_shader {
             return;
         }
 

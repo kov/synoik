@@ -4682,7 +4682,7 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
@@ -4717,7 +4717,7 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
             // The overview workspace thumbnails strip, above the workspaces.
             mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| {
@@ -4779,7 +4779,7 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+        mon.render_workspace_shadows(&mut |elem| push(elem.into()));
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);

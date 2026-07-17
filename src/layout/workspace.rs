@@ -33,7 +33,6 @@ use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::niri_render_elements;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
@@ -1938,12 +1937,8 @@ impl<W: LayoutElement> Workspace<W> {
             })
     }
 
-    pub fn render_shadow(
-        &self,
-        renderer: &mut VulkanRenderer,
-        push: &mut dyn FnMut(ShadowRenderElement),
-    ) {
-        self.shadow.render(renderer, Point::from((0., 0.)), push);
+    pub fn render_shadow(&self, push: &mut dyn FnMut(ShadowRenderElement)) {
+        self.shadow.render(Point::from((0., 0.)), push);
     }
 
     pub fn render_background(&self) -> SolidColorRenderElement {

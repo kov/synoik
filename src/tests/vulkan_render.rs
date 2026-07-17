@@ -4002,14 +4002,15 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
     );
 }
 
-/// The focus ring / border outline must be rounded on Vulkan, not pointy. It is drawn by
-/// `BorderRenderElement` (a procedural rounded/gradient SDF) when the renderer can render it, else
-/// it falls back to plain `SolidColorRenderElement` quads (square corners). That choice hinges on
-/// `BorderRenderElement::has_shader`, which was GLES-only (`Shaders::get`) — so a Vulkan session
-/// got pointy quads even though the owned renderer draws borders procedurally (rounded). Now
-/// `has_shader` is true on Vulkan too. Map a focused window with a thick blue focus ring + corner
-/// radius and assert the ring is present but its extreme outer corner is rounded away to the
-/// backdrop.
+/// The focus ring / border outline must be rounded, not pointy. It is drawn by
+/// `BorderRenderElement` (a procedural rounded/gradient SDF); a plain `SolidColorRenderElement`
+/// quad (square corners) is the fallback when the ring needs neither rounding nor a gradient.
+///
+/// This once picked between them via a `has_shader` predicate that asked the GLES shader registry,
+/// so a Vulkan session got pointy quads even though the owned renderer draws borders procedurally.
+/// The predicate is gone with GLES; this pins the outcome it was getting wrong. Map a focused
+/// window with a thick blue focus ring + corner radius and assert the ring is present but its
+/// extreme outer corner is rounded away to the backdrop.
 #[test]
 fn vulkan_draws_a_rounded_focus_ring() {
     if VulkanRenderer::new().is_err() {
@@ -4225,12 +4226,12 @@ fn vulkan_composites_for_a_screencast() {
     assert_window_and_background(&pixels, w, h);
 }
 
-/// Drop shadows must draw on Vulkan. `Shadow::render` skips emitting any element at all unless
-/// `ShadowRenderElement::has_shader`, which only asked the GLES shader registry — so a Vulkan
-/// session drew no shadow whatsoever, even though the owned renderer has the material
+/// Drop shadows must draw. `Shadow::render` once skipped emitting any element at all unless a
+/// `has_shader` predicate that only asked the GLES shader registry said yes — so a Vulkan session
+/// drew no shadow whatsoever, even though the owned renderer has the material
 /// (`VulkanFrame::render_shadow`) and `ShadowRenderElement` a real `RenderElement<VulkanRenderer>`
-/// draw. Exactly the gap `BorderRenderElement::has_shader` had (see
-/// `vulkan_draws_a_rounded_focus_ring`).
+/// draw. The predicate is gone with GLES; this pins the outcome. Same shape as the bug in
+/// `vulkan_draws_a_rounded_focus_ring`.
 ///
 /// Assert it by darkening: the backdrop just outside the window must be strictly darker than the
 /// backdrop far away from it, and shade off with distance. A missing shadow makes those equal.

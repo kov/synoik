@@ -375,7 +375,6 @@ impl Thumbnail {
             CornerRadius::default()
         };
 
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
         let clip = move |elem| match elem {
@@ -396,7 +395,7 @@ impl Thumbnail {
                 // the unclipped window CSD already has corners rounded to the
                 // user-provided radius, so our blocked-out rendering should match that
                 // radius.
-                if radius != CornerRadius::default() && has_border_shader {
+                if radius != CornerRadius::default() {
                     return BorderRenderElement::new(
                         geo.size,
                         Rectangle::from_size(geo.size),
@@ -555,7 +554,7 @@ impl Thumbnail {
                 scale,
                 0.5,
             );
-            background.render(ctx.renderer, loc, &mut |elem| {
+            background.render(loc, &mut |elem| {
                 push(WindowMruUiRenderElement::FocusRing(elem))
             });
 
@@ -577,7 +576,7 @@ impl Thumbnail {
                 1.,
             );
 
-            border.render(ctx.renderer, loc, &mut |elem| {
+            border.render(loc, &mut |elem| {
                 push(WindowMruUiRenderElement::FocusRing(elem))
             });
         }

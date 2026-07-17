@@ -217,17 +217,6 @@ impl BorderRenderElement {
         self.location = location;
         self
     }
-
-    /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than
-    /// a plain solid-color fallback.
-    ///
-    /// This asked whether the renderer was the Vulkan one. It is now the only renderer, and it
-    /// always draws borders procedurally, so the answer is a constant — which makes the callers'
-    /// pointy-`SolidColorRenderElement` fallbacks dead. Both go in the follow-up; keeping the
-    /// call here holds this commit to a type-level change.
-    pub fn has_shader(_renderer: &mut VulkanRenderer) -> bool {
-        true
-    }
 }
 
 impl Default for BorderRenderElement {

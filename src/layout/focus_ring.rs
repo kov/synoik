@@ -7,7 +7,6 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::vulkan::VulkanRenderer;
 
 #[derive(Debug)]
 pub struct FocusRing {
@@ -217,7 +216,6 @@ impl FocusRing {
 
     pub fn render(
         &self,
-        renderer: &mut VulkanRenderer,
         location: Point<f64, Logical>,
         push: &mut dyn FnMut(FocusRingRenderElement),
     ) {
@@ -232,10 +230,8 @@ impl FocusRing {
             return;
         }
 
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
-
         let mut push = |buffer, border: &BorderRenderElement, location: Point<f64, Logical>| {
-            let elem = if self.use_border_shader && has_border_shader {
+            let elem = if self.use_border_shader {
                 border.clone().with_location(location).into()
             } else {
                 let alpha = border.alpha();

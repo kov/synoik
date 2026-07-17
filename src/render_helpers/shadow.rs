@@ -133,15 +133,6 @@ impl ShadowRenderElement {
         self.params.alpha = alpha;
         self
     }
-
-    /// Whether `renderer` can draw a drop shadow. Constant now that the Vulkan renderer — which
-    /// always can — is the only one; the callers' skip-the-shadow branches are dead and go with
-    /// this in the follow-up. See [`BorderRenderElement::has_shader`].
-    ///
-    /// [`BorderRenderElement::has_shader`]: crate::render_helpers::border::BorderRenderElement::has_shader
-    pub fn has_shader(_renderer: &mut VulkanRenderer) -> bool {
-        true
-    }
 }
 
 impl Default for ShadowRenderElement {

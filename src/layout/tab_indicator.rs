@@ -9,7 +9,6 @@ use super::LayoutElement;
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::utils::{
     floor_logical_in_physical_max1, round_logical_in_physical, round_logical_in_physical_max1,
 };
@@ -292,15 +291,9 @@ impl TabIndicator {
 
     pub fn render(
         &self,
-        renderer: &mut VulkanRenderer,
         pos: Point<f64, Logical>,
         push: &mut dyn FnMut(TabIndicatorRenderElement),
     ) {
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
-        if !has_border_shader {
-            return;
-        }
-
         for (shader, loc) in zip(&self.shaders, &self.shader_locs) {
             let elem = shader.clone().with_location(pos + *loc);
             push(TabIndicatorRenderElement::from(elem));

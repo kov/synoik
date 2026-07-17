@@ -533,7 +533,6 @@ impl Mapped {
     ) {
         let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
 
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
         let radius = self.geometry_corner_radius();
         let window_size = self
             .size()
@@ -550,7 +549,7 @@ impl Mapped {
                 // because in this case we're assuming that the unclipped window CSD already has
                 // corners rounded to the user-provided radius, so our blocked-out rendering should
                 // match that radius.
-                if radius != CornerRadius::default() && has_border_shader {
+                if radius != CornerRadius::default() {
                     let geo = elem.geo();
                     return BorderRenderElement::new(
                         geo.size,

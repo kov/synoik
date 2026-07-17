@@ -1201,7 +1201,6 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         // If we're not resizing, render the window itself.
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         if !pushed_resize {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
@@ -1225,7 +1224,7 @@ impl<W: LayoutElement> Tile<W> {
                     // the unclipped window CSD already has corners rounded to the
                     // user-provided radius, so our blocked-out rendering should match that
                     // radius.
-                    if radius != CornerRadius::default() && has_border_shader {
+                    if radius != CornerRadius::default() {
                         return BorderRenderElement::new(
                             geo.size,
                             Rectangle::from_size(geo.size),
@@ -1273,7 +1272,7 @@ impl<W: LayoutElement> Tile<W> {
 
             // During the un/fullscreen animation, render a border element in order to use the
             // animated corner radius.
-            if fullscreen_progress < 1. && has_border_shader {
+            if fullscreen_progress < 1. {
                 let border_width = self.visual_border_width().unwrap_or(0.);
                 let radius = self
                     .window
@@ -1310,11 +1309,10 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if let Some(width) = self.visual_border_width() {
-            self.border.render(
-                ctx.renderer,
-                location + Point::from((width, width)),
-                &mut |elem| push(elem.into()),
-            );
+            self.border
+                .render(location + Point::from((width, width)), &mut |elem| {
+                    push(elem.into())
+                });
         }
 
         // Hide the focus ring when maximized/fullscreened. It's not normally visible anyway due to
@@ -1323,12 +1321,11 @@ impl<W: LayoutElement> Tile<W> {
         // a bit weird).
         if focus_ring && expanded_progress < 1. {
             self.focus_ring
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+                .render(location, &mut |elem| push(elem.into()));
         }
 
         if expanded_progress < 1. {
-            self.shadow
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            self.shadow.render(location, &mut |elem| push(elem.into()));
         }
 
         let surface_anim_scale = animated_window_size / window_size;
