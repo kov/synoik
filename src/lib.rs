@@ -12,6 +12,7 @@ pub mod dbus;
 pub mod frame_clock;
 pub mod gnome;
 pub mod handlers;
+pub mod idle_monitor;
 pub mod input;
 pub mod ipc;
 pub mod layer;
