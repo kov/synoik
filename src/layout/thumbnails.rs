@@ -43,11 +43,14 @@ pub struct Strip {
 
 /// Lays out the strip: each thumbnail is the workspace at 5% scale (smaller
 /// if the row wouldn't fit the view width), the row horizontally centered,
-/// and vertically centered in the `top_band` tall margin above the workspace
-/// row. A `placeholder` index makes room for the new-workspace drop
-/// placeholder before that thumbnail (gnome-shell's drop placeholder).
+/// and vertically centered in the margin above the workspace row — between
+/// `top_inset` (the top panel's strut, so the strip clears the panel rather
+/// than being drawn under it) and `top_band`. A `placeholder` index makes room
+/// for the new-workspace drop placeholder before that thumbnail (gnome-shell's
+/// drop placeholder).
 pub fn strip_geometry(
     view_size: Size<f64, Logical>,
+    top_inset: f64,
     top_band: f64,
     n: usize,
     placeholder: Option<usize>,
@@ -67,7 +70,8 @@ pub fn strip_geometry(
     let extra = placeholder.map_or(0., |_| PLACEHOLDER_WIDTH + SPACING);
     let total_w = thumb_w * n as f64 + SPACING * (n - 1) as f64 + extra;
     let x0 = ((view_size.w - total_w) / 2.).round();
-    let y = ((top_band - thumb_h) / 2.).round();
+    // Center within the band between the panel strut and the workspace row.
+    let y = ((top_inset + top_band - thumb_h) / 2.).round();
 
     let mut x = x0;
     let mut placeholder_rect = None;
@@ -170,7 +174,7 @@ mod tests {
     #[test]
     fn three_thumbnails_at_the_gnome_cap() {
         // 5% of 1080 = 54 tall, 96 wide; row of three centered.
-        let strip = strip_geometry(view(), 108., 3, None);
+        let strip = strip_geometry(view(), 0., 108., 3, None);
         assert_eq!(strip.scale, 54. / 1080.);
         let expected_x0 = (1920. - (96. * 3. + 8. * 2.)) / 2.;
         assert_eq!(
@@ -182,9 +186,27 @@ mod tests {
     }
 
     #[test]
+    fn top_inset_pushes_the_strip_below_the_panel() {
+        // Without reserving the panel, a 54px-tall thumbnail centered in the 108px
+        // band sits at y=27 — overlapping a 32px top panel by 5px (the clip bug).
+        let clipped = strip_geometry(view(), 0., 108., 3, None);
+        assert!(clipped.thumbs[0].loc.y < 32.);
+
+        // Reserving the panel strut centers the thumbnail in [32, 108] instead, so
+        // its top clears the panel: (32 + 108 - 54) / 2 = 43.
+        let strip = strip_geometry(view(), 32., 108., 3, None);
+        assert!(
+            strip.thumbs[0].loc.y >= 32.,
+            "the thumbnail must clear the 32px panel, got y={}",
+            strip.thumbs[0].loc.y,
+        );
+        assert_eq!(strip.thumbs[0].loc.y, 43.);
+    }
+
+    #[test]
     fn placeholder_spreads_the_thumbnails_apart() {
-        let at_rest = strip_geometry(view(), 108., 3, None);
-        let strip = strip_geometry(view(), 108., 3, Some(1));
+        let at_rest = strip_geometry(view(), 0., 108., 3, None);
+        let strip = strip_geometry(view(), 0., 108., 3, Some(1));
 
         let rect = strip
             .placeholder
@@ -211,7 +233,7 @@ mod tests {
     #[test]
     fn many_thumbnails_shrink_to_fit() {
         let n = 25;
-        let strip = strip_geometry(view(), 108., n, None);
+        let strip = strip_geometry(view(), 0., 108., n, None);
         assert!(strip.scale < MAX_THUMBNAIL_SCALE);
         let bounds = strip.bounds();
         assert!(bounds.loc.x >= 0. && bounds.loc.x + bounds.size.w <= 1920.);
@@ -219,7 +241,7 @@ mod tests {
 
     #[test]
     fn drop_targets_split_thumbs_and_gaps() {
-        let strip = strip_geometry(view(), 108., 3, None);
+        let strip = strip_geometry(view(), 0., 108., 3, None);
         let y = 40.;
         let first = strip.thumbs[0];
         let second = strip.thumbs[1];

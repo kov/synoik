@@ -1539,8 +1539,16 @@ impl<W: LayoutElement> Monitor<W> {
             }
         });
         let top_band = self.view_size.h * (1. - super::GNOME_OVERVIEW_WORKSPACE_SCALE) / 2.;
+        // Reserve the top panel's strut (same gate as `compute_working_area`) so the strip sits
+        // below the panel instead of being clipped by it.
+        let top_inset = if self.options.layout.windowing_mode == WindowingMode::Floating {
+            crate::ui::panel::PANEL_HEIGHT.min(top_band)
+        } else {
+            0.
+        };
         Some(thumbnails::strip_geometry(
             self.view_size,
+            top_inset,
             top_band,
             self.workspaces.len(),
             placeholder,
