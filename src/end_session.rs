@@ -1,0 +1,223 @@
+//! The state machine behind `org.gnome.SessionManager.EndSessionDialog` (see `dbus::gnome_session`).
+//!
+//! When the user asks to log out, power off, or restart, gnome-session doesn't do it directly: it
+//! asks the shell to put up a confirmation dialog by calling `Open(type, timestamp, seconds,
+//! inhibitors)` on this interface, then waits for us to emit `ConfirmedLogout` / `ConfirmedReboot` /
+//! `ConfirmedShutdown` (proceed) or `Canceled` (abort). gnome-shell implements this in
+//! `js/ui/endSessionDialog.js`; this is the compositor-side equivalent of its dialog lifecycle,
+//! kept pure so the semantics are unit-testable without a bus, a clock, or a renderer.
+//!
+//! Behaviour ground-truthed from `endSessionDialog.js`:
+//!
+//! - Each dialog type has exactly one confirm button (plus Cancel): logout → `ConfirmedLogout`,
+//!   shutdown → `ConfirmedShutdown`, restart → `ConfirmedReboot`.
+//! - The dialog counts down from `seconds` and, on expiry, auto-confirms its default (only) action —
+//!   the same thing clicking the button does. gnome-session always passes a non-zero timeout in
+//!   practice; we treat `0` as "no countdown, stay open" rather than "confirm immediately", so an
+//!   unexpected `0` can never trigger a surprise power-off.
+//!
+//! Time-in/outcome-out like [`crate::idle_monitor`]: `now` is monotonic (`Clock::now_unadjusted`),
+//! and confirming/expiry is returned as an [`EndSessionType`] for the D-Bus layer to turn into the
+//! matching signal — never a side effect here.
+
+use std::time::Duration;
+
+/// Which action the dialog confirms. The `u32` values are the `type` argument of `Open`, matching
+/// `GSM_SHELL_END_SESSION_DIALOG_TYPE_*` / `endSessionDialog.js`'s `DialogType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndSessionType {
+    Logout = 0,
+    Shutdown = 1,
+    Restart = 2,
+}
+
+impl EndSessionType {
+    /// Map the `Open` `type` argument. gnome-session only ever sends 0/1/2; anything else falls back
+    /// to the least-destructive action (logout) rather than guessing a power-off.
+    pub fn from_u32(ty: u32) -> Self {
+        match ty {
+            1 => EndSessionType::Shutdown,
+            2 => EndSessionType::Restart,
+            0 => EndSessionType::Logout,
+            other => {
+                warn!("unknown EndSessionDialog type {other}, treating as logout");
+                EndSessionType::Logout
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Dialog {
+    kind: EndSessionType,
+    /// Monotonic deadline at which the countdown auto-confirms, or `None` when `Open` requested no
+    /// timeout (`seconds == 0`).
+    deadline: Option<Duration>,
+}
+
+/// The confirmation-dialog lifecycle. At most one dialog is open at a time (a second `Open`
+/// replaces the first, matching gnome-shell, which reuses its single dialog instance).
+#[derive(Debug, Default)]
+pub struct EndSession {
+    dialog: Option<Dialog>,
+}
+
+impl EndSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `Open`: put up (or replace) the dialog for `kind`, counting down from `total_seconds` (0 =
+    /// no countdown).
+    pub fn open(&mut self, kind: EndSessionType, total_seconds: u64, now: Duration) {
+        let deadline = (total_seconds > 0).then(|| now + Duration::from_secs(total_seconds));
+        self.dialog = Some(Dialog { kind, deadline });
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    pub fn kind(&self) -> Option<EndSessionType> {
+        self.dialog.as_ref().map(|d| d.kind)
+    }
+
+    /// Whole seconds until the countdown auto-confirms, for the dialog's description. `None` when no
+    /// dialog is open or `Open` requested no timeout.
+    pub fn seconds_left(&self, now: Duration) -> Option<u64> {
+        let deadline = self.dialog.as_ref()?.deadline?;
+        Some(deadline.saturating_sub(now).as_secs())
+    }
+
+    /// The monotonic time [`Self::tick`] will next auto-confirm, so the caller can arm one timer.
+    /// `None` when nothing is counting down.
+    pub fn deadline(&self) -> Option<Duration> {
+        self.dialog.as_ref()?.deadline
+    }
+
+    /// The user confirmed the action (clicked the button, pressed Enter): close the dialog and
+    /// return its type so the D-Bus layer emits the matching `Confirmed*` signal. `None` if no
+    /// dialog is open.
+    pub fn confirm(&mut self) -> Option<EndSessionType> {
+        self.dialog.take().map(|d| d.kind)
+    }
+
+    /// The countdown reached zero: auto-confirm the default action, exactly as [`Self::confirm`]
+    /// would. `None` if no dialog is open or it isn't counting down / hasn't expired yet.
+    pub fn tick(&mut self, now: Duration) -> Option<EndSessionType> {
+        let expired = self
+            .dialog
+            .as_ref()
+            .and_then(|d| d.deadline)
+            .is_some_and(|deadline| now >= deadline);
+        expired.then(|| self.dialog.take().unwrap().kind)
+    }
+
+    /// The user cancelled (Cancel button or Esc): close the dialog. Returns whether one was open, so
+    /// the caller emits `Canceled` (then `Closed`) only when there was something to cancel.
+    pub fn cancel(&mut self) -> bool {
+        self.dialog.take().is_some()
+    }
+
+    /// gnome-session called `Close` to dismiss the dialog itself (e.g. the request was withdrawn):
+    /// just hide it, emitting no signal. Returns whether one was open.
+    pub fn close(&mut self) -> bool {
+        self.dialog.take().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn open_sets_kind_and_is_open() {
+        let mut e = EndSession::new();
+        assert!(!e.is_open());
+        e.open(EndSessionType::Shutdown, 60, s(0));
+        assert!(e.is_open());
+        assert_eq!(e.kind(), Some(EndSessionType::Shutdown));
+    }
+
+    #[test]
+    fn confirm_closes_and_returns_kind() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Restart, 60, s(0));
+        assert_eq!(e.confirm(), Some(EndSessionType::Restart));
+        assert!(!e.is_open());
+        // A second confirm has nothing to confirm.
+        assert_eq!(e.confirm(), None);
+    }
+
+    #[test]
+    fn cancel_closes_and_reports_whether_open() {
+        let mut e = EndSession::new();
+        assert!(!e.cancel(), "cancel with no dialog reports not-open");
+        e.open(EndSessionType::Logout, 60, s(0));
+        assert!(e.cancel());
+        assert!(!e.is_open());
+    }
+
+    #[test]
+    fn countdown_auto_confirms_the_default_action_at_expiry() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Shutdown, 60, s(0));
+        assert_eq!(e.deadline(), Some(s(60)));
+
+        // Before expiry: nothing, and the description counts down.
+        assert_eq!(e.tick(s(59)), None);
+        assert_eq!(e.seconds_left(s(59)), Some(1));
+        assert!(e.is_open());
+
+        // At expiry: auto-confirms the shutdown and closes.
+        assert_eq!(e.tick(s(60)), Some(EndSessionType::Shutdown));
+        assert!(!e.is_open());
+        assert_eq!(e.tick(s(61)), None, "nothing left to auto-confirm");
+    }
+
+    #[test]
+    fn zero_timeout_stays_open_and_never_auto_confirms() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Shutdown, 0, s(0));
+        assert_eq!(e.deadline(), None);
+        assert_eq!(e.seconds_left(s(0)), None);
+        assert_eq!(
+            e.tick(s(100_000)),
+            None,
+            "a 0-second timeout must never surprise-confirm a power-off"
+        );
+        assert!(e.is_open());
+    }
+
+    #[test]
+    fn seconds_left_counts_down_and_saturates() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Logout, 60, s(10));
+        assert_eq!(e.seconds_left(s(10)), Some(60));
+        assert_eq!(e.seconds_left(s(40)), Some(30));
+        // Past the deadline it saturates at 0 rather than underflowing.
+        assert_eq!(e.seconds_left(s(999)), Some(0));
+    }
+
+    #[test]
+    fn reopen_replaces_the_dialog() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Logout, 60, s(0));
+        e.open(EndSessionType::Restart, 30, s(5));
+        assert_eq!(e.kind(), Some(EndSessionType::Restart));
+        assert_eq!(e.deadline(), Some(s(35)));
+    }
+
+    #[test]
+    fn close_hides_without_a_signal() {
+        let mut e = EndSession::new();
+        e.open(EndSessionType::Logout, 60, s(0));
+        assert!(e.close());
+        assert!(!e.is_open());
+        assert!(!e.close());
+    }
+}

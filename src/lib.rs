@@ -9,6 +9,7 @@ pub mod cli;
 pub mod cursor;
 #[cfg(feature = "dbus")]
 pub mod dbus;
+pub mod end_session;
 pub mod frame_clock;
 pub mod gnome;
 pub mod handlers;
