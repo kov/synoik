@@ -269,8 +269,8 @@ fn vulkan_output_render_elements_match_pixman() {
         .expect("vulkan offscreen");
     let vk_pixels = render_elements_into(&mut vk, &mut vk_target, &vk_elements);
 
-    // Pixman oracle: the same solids, bare. Pixman is not a `NiriRenderer` (its foreign error type
-    // can't carry `From<GlesError>`), so it can't hold `OutputRenderElements`; but the enum arm
+    // Pixman oracle: the same solids, bare. Pixman is not a `NiriRenderer` (it does not implement
+    // `AsVulkanRenderer`), so it can't hold `OutputRenderElements`; but the enum arm
     // only delegates to these leaf draws, so a bare-vs-enum match confirms the dispatch is
     // transparent.
     let px_elements = solid_scene();

@@ -197,8 +197,7 @@ impl VkTexture {
     }
 
     /// Whether this is the only handle to the underlying GPU resources (no other clone is live) —
-    /// the [`smithay::backend::renderer::gles::GlesTexture::is_unique_reference`] equivalent, used
-    /// by `OffscreenBuffer` to decide whether a cached offscreen texture can be reused.
+    /// used by `OffscreenBuffer` to decide whether a cached offscreen texture can be reused.
     pub fn is_unique_reference(&mut self) -> bool {
         Arc::get_mut(&mut self.0).is_some()
     }

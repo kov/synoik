@@ -1,6 +1,5 @@
 //! The niri-side renderer trait impls that make [`VulkanRenderer`] a [`NiriRenderer`]: the client
-//! buffer imports ([`ImportMemWl`]/[`ImportEgl`]/[`ImportDma`]) and dmabuf-target [`Bind`], plus
-//! the fallible GLES access ([`AsGlesRenderer`]).
+//! buffer imports ([`ImportMemWl`]/[`ImportEgl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
 //!
 //! shm ([`ImportMemWl`]) and single-plane LINEAR dmabuf ([`ImportDma`]) client buffers import for
 //! real; EGL client-buffer import ([`ImportEgl`]) still returns an error (clients use dmabuf/shm on
@@ -13,7 +12,6 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::display::EGLBufferReader;
 use smithay::backend::egl::Error as EglError;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{
     ContextId, ImportDma, ImportDmaWl, ImportEgl, ImportMem, ImportMemWl, Renderer, Texture,
 };
@@ -27,13 +25,7 @@ use smithay::wayland::shm::with_buffer_contents;
 use super::error::VulkanError;
 use super::types::VkTexture;
 use super::VulkanRenderer;
-use crate::render_helpers::renderer::{AsGlesRenderer, OffscreenRenderer};
-
-impl AsGlesRenderer for VulkanRenderer {
-    fn try_as_gles_renderer(&mut self) -> Option<&mut GlesRenderer> {
-        None
-    }
-}
+use crate::render_helpers::renderer::OffscreenRenderer;
 
 impl OffscreenRenderer for VulkanRenderer {
     fn make_offscreen_sampleable(&self, texture: &VkTexture) -> anyhow::Result<()> {

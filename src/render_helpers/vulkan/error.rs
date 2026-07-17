@@ -43,14 +43,6 @@ impl From<vk::Result> for VulkanError {
     }
 }
 
-impl From<smithay::backend::renderer::gles::GlesError> for VulkanError {
-    // Required by `NiriRenderer::NiriError: From<GlesError>`. The Vulkan path never actually
-    // produces a GLES error; this only satisfies the (GLES-historical) unified error bound.
-    fn from(e: smithay::backend::renderer::gles::GlesError) -> Self {
-        VulkanError::Other(format!("unexpected GLES error on the Vulkan renderer: {e}"))
-    }
-}
-
 impl From<anyhow::Error> for VulkanError {
     fn from(e: anyhow::Error) -> Self {
         VulkanError::Other(format!("{e:#}"))
