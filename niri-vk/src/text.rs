@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use ash::vk;
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Hinting, Metrics, Shaping};
+use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Hinting, Metrics, Shaping, Weight};
 use etagere::{size2, AtlasAllocator};
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source};
@@ -65,8 +65,8 @@ impl TextContext {
         }
     }
 
-    /// Shape `text` at `px` pixels-per-em, rasterize hinted, and pack into an R8 coverage atlas,
-    /// reusing this context's font system and scaler cache.
+    /// Shape a single run of `text` at `px` pixels-per-em (SansSerif), rasterize hinted, and pack
+    /// into an R8 coverage atlas, reusing this context's font system and scaler cache.
     pub fn build_atlas(
         &mut self,
         gpu: &Gpu,
@@ -74,19 +74,58 @@ impl TextContext {
         text: &str,
         px: f32,
     ) -> Result<GlyphAtlas> {
-        let fonts = &mut self.fonts;
-        let ctx = &mut self.scale;
-
-        let mut buffer = Buffer::new(fonts, Metrics::new(px, (px * 1.25).round()));
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
         {
-            let mut b = buffer.borrow_with(fonts);
+            let mut b = buffer.borrow_with(&mut self.fonts);
             b.set_size(None, None);
             let attrs = Attrs::new().family(Family::SansSerif);
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
+        Self::rasterize(&mut self.fonts, &mut self.scale, gpu, pool, &buffer)
+    }
 
+    /// Lay out a styled, center-aligned paragraph wrapped to `wrap_px` pixels: each [`TextSpan`]
+    /// carries its own family/weight/size (via cosmic-text rich text), and the multi-line result is
+    /// rasterized hinted into one R8 coverage atlas. `base_px` sets the default line metrics.
+    /// Glyph placements are paragraph-local (top-left origin), so one [`GlyphAtlas`] draws the
+    /// whole block. This is the dialog/notification text path (title + body + hints in one
+    /// box).
+    pub fn build_paragraph(
+        &mut self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        spans: &[TextSpan],
+        wrap_px: f32,
+        base_px: f32,
+    ) -> Result<GlyphAtlas> {
+        let mut buffer = Buffer::new(
+            &mut self.fonts,
+            Metrics::new(base_px, (base_px * 1.25).round()),
+        );
+        buffer.set_hinting(Hinting::Enabled);
+        {
+            let mut b = buffer.borrow_with(&mut self.fonts);
+            b.set_size(Some(wrap_px), None);
+            let default_attrs = Attrs::new().family(Family::SansSerif);
+            let rich = spans.iter().map(|s| (s.text, s.attrs()));
+            b.set_rich_text(rich, &default_attrs, Shaping::Advanced, Some(Align::Center));
+            b.shape_until_scroll(false);
+        }
+        Self::rasterize(&mut self.fonts, &mut self.scale, gpu, pool, &buffer)
+    }
+
+    /// Rasterize every glyph of an already-shaped `buffer` (hinted) into one R8 coverage atlas.
+    /// Shared by [`Self::build_atlas`] and [`Self::build_paragraph`]; the placements it emits are
+    /// buffer-local (top-left), spanning as many lines as the buffer holds.
+    fn rasterize(
+        fonts: &mut FontSystem,
+        ctx: &mut ScaleContext,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        buffer: &Buffer,
+    ) -> Result<GlyphAtlas> {
         let side: u32 = 256;
         let mut atlas_pixels = vec![0u8; (side * side) as usize];
         let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
@@ -155,6 +194,41 @@ impl TextContext {
             glyphs,
             side,
         })
+    }
+}
+
+/// One styled span of a [`TextContext::build_paragraph`] paragraph.
+#[derive(Clone, Copy)]
+pub struct TextSpan<'a> {
+    pub text: &'a str,
+    pub family: SpanFamily,
+    pub bold: bool,
+    /// Font size in pixels-per-em for this span.
+    pub px: f32,
+}
+
+/// The font family of a [`TextSpan`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpanFamily {
+    Sans,
+    Mono,
+}
+
+impl TextSpan<'_> {
+    fn attrs(&self) -> Attrs<'static> {
+        let family = match self.family {
+            SpanFamily::Sans => Family::SansSerif,
+            SpanFamily::Mono => Family::Monospace,
+        };
+        let weight = if self.bold {
+            Weight::BOLD
+        } else {
+            Weight::NORMAL
+        };
+        Attrs::new()
+            .family(family)
+            .weight(weight)
+            .metrics(Metrics::new(self.px, (self.px * 1.25).round()))
     }
 }
 
@@ -352,7 +426,21 @@ mod tests {
     ) -> Result<Vec<u8>> {
         let atlas = ctx.build_atlas(gpu, pool, text, px)?;
         anyhow::ensure!(!atlas.glyphs.is_empty(), "no glyphs shaped for {text:?}");
+        let pixels = render_atlas(gpu, pool, &atlas, (10.0, 8.0), tw, th);
+        atlas.texture.destroy(gpu);
+        pixels
+    }
 
+    /// Draw a prebuilt `atlas` at `origin` into a `tw`x`th` RGBA target and read it back. The
+    /// caller owns `atlas` (its texture is not destroyed here).
+    fn render_atlas(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        atlas: &GlyphAtlas,
+        origin: (f32, f32),
+        tw: u32,
+        th: u32,
+    ) -> Result<Vec<u8>> {
         let target = RenderTarget::new(gpu, tw, th)?;
         let set_layout = sampler_set_layout(gpu)?;
         let renderer = TextRenderer::new(gpu, target.render_pass, target.extent(), set_layout)?;
@@ -382,7 +470,7 @@ mod tests {
         let dims = [tw as f32, th as f32];
         gpu.run_commands(pool, |cbuf| {
             target.begin(gpu, cbuf, unorm(BG));
-            renderer.draw(gpu, cbuf, set, &atlas, (10.0, 8.0), dims, unorm(FG));
+            renderer.draw(gpu, cbuf, set, atlas, origin, dims, unorm(FG));
             unsafe { gpu.device.cmd_end_render_pass(cbuf) };
         })?;
         let pixels = target.read_back(gpu, pool)?;
@@ -392,7 +480,6 @@ mod tests {
             gpu.device.destroy_descriptor_set_layout(set_layout, None);
         }
         renderer.destroy(gpu);
-        atlas.texture.destroy(gpu);
         target.destroy(gpu);
         Ok(pixels)
     }
@@ -440,6 +527,92 @@ mod tests {
             "reused context produced too little ink: {b_bright}"
         );
 
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+
+    /// A styled, center-aligned, wrapped paragraph lays out over multiple lines with per-span
+    /// families/sizes: the glyphs span a real vertical range and render ink in both the top and
+    /// bottom thirds. Guards the dialog/notification text path. Skips cleanly with no Vulkan.
+    #[test]
+    fn build_paragraph_lays_out_styled_lines() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("no Vulkan device — skipping build_paragraph_lays_out_styled_lines");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.unwrap();
+
+        let mut ctx = TextContext::new();
+        let spans = [
+            TextSpan {
+                text: "Run a Command",
+                family: SpanFamily::Sans,
+                bold: true,
+                px: 18.0,
+            },
+            TextSpan {
+                text: "\n\n",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 14.0,
+            },
+            TextSpan {
+                text: "echo hi",
+                family: SpanFamily::Mono,
+                bold: false,
+                px: 14.0,
+            },
+            TextSpan {
+                text: "\n\n",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 14.0,
+            },
+            TextSpan {
+                text: "Press ESC to close",
+                family: SpanFamily::Sans,
+                bold: false,
+                px: 11.0,
+            },
+        ];
+        let atlas = ctx
+            .build_paragraph(&gpu, pool, &spans, 360.0, 14.0)
+            .unwrap();
+        assert!(
+            !atlas.glyphs.is_empty(),
+            "no glyphs shaped for the paragraph"
+        );
+
+        let min_y = atlas.glyphs.iter().map(|g| g.y).min().unwrap();
+        let max_y = atlas.glyphs.iter().map(|g| g.y + g.h as i32).max().unwrap();
+        assert!(
+            max_y - min_y > 30,
+            "expected a multi-line paragraph, got vertical span {min_y}..{max_y}",
+        );
+
+        let tw = 400u32;
+        let th = (max_y as u32) + 40;
+        let pixels = render_atlas(&gpu, pool, &atlas, (20.0, 10.0), tw, th).unwrap();
+        let band_bright = |y0: u32, y1: u32| -> usize {
+            let mut n = 0;
+            for y in y0..y1 {
+                for x in 0..tw {
+                    let i = ((y * tw + x) * 4) as usize;
+                    if pixels[i] > 150 && pixels[i + 1] > 150 && pixels[i + 2] > 150 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let top = band_bright(0, th / 3);
+        let bottom = band_bright(2 * th / 3, th);
+        assert!(
+            top > 10 && bottom > 10,
+            "expected ink in the top ({top}) and bottom ({bottom}) thirds (multi-line)",
+        );
+
+        atlas.texture.destroy(&gpu);
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 }
