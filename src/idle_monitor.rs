@@ -204,20 +204,14 @@ mod tests {
         // Not yet idle enough.
         assert!(m.refresh(ms(4999)).is_empty());
         // Crosses the interval: fires once.
-        assert_eq!(
-            m.refresh(ms(5000)),
-            vec![Fired { id, owner: owner() }]
-        );
+        assert_eq!(m.refresh(ms(5000)), vec![Fired { id, owner: owner() }]);
         // Still idle, but it already fired this period: silent.
         assert!(m.refresh(ms(9000)).is_empty());
 
         // Activity re-arms it for the next period.
         assert!(m.on_activity(ms(10_000)).is_empty());
         assert!(m.refresh(ms(14_999)).is_empty());
-        assert_eq!(
-            m.refresh(ms(15_000)),
-            vec![Fired { id, owner: owner() }]
-        );
+        assert_eq!(m.refresh(ms(15_000)), vec![Fired { id, owner: owner() }]);
     }
 
     #[test]
