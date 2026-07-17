@@ -5,27 +5,47 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::Config;
+use niri_vk::text::{SpanFamily, TextSpan};
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::FontDescription;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Point, Transform};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
-use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-const FONT: &str = "sans 14px";
+/// Notification font size, logical px-per-em.
+const FONT_PX: f64 = 14.;
+/// A generous non-wrapping layout width (logical px); the notification is content-sized, so this
+/// only needs to exceed the natural line width (a very long config path wraps rather than
+/// producing an ultra-wide banner).
+const WRAP_WIDTH: i32 = 1200;
 const BORDER: i32 = 4;
+/// Notification box background (opaque dark grey), straight RGBA.
+const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// Border for the parse-error variant (red) and the created-config variant (green).
+const BORDER_ERROR: [f32; 4] = [1., 0.3, 0.3, 1.];
+const BORDER_CREATED: [f32; 4] = [0.5, 1., 0.5, 1.];
+/// Keycap background behind the inline command/path (#000000, matching the old pango `bgcolor`).
+const KEYCAP_BG: [f32; 4] = [0., 0., 0., 1.];
+/// Text color (opaque white); the glyph coverage modulates the alpha.
+const TEXT: [f32; 4] = [1., 1., 1., 1.];
+/// Index of the keycap span in [`draw_dialog_texture`]'s span list.
+const KEYCAP_SPAN: u32 = 1;
 
 pub struct ConfigErrorNotification {
     state: State,
-    buffers: RefCell<HashMap<NotNan<f64>, Option<MemoryBuffer>>>,
+    /// Cached notification box textures per output scale. Tied to a renderer context (dropped when
+    /// it changes) and cleared whenever the content (error vs. created-path) changes.
+    cache: RefCell<DialogCache>,
 
     // If set, this is a "Created config at {path}" notification. If unset, this is a config error
     // notification.
@@ -33,6 +53,20 @@ pub struct ConfigErrorNotification {
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
+}
+
+struct DialogCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<NotNan<f64>, VkTexture>,
+}
+
+impl DialogCache {
+    fn new() -> Self {
+        Self {
+            context: None,
+            textures: HashMap::new(),
+        }
+    }
 }
 
 enum State {
@@ -46,7 +80,7 @@ impl ConfigErrorNotification {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self {
             state: State::Hidden,
-            buffers: RefCell::new(HashMap::new()),
+            cache: RefCell::new(DialogCache::new()),
             created_path: None,
             clock,
             config,
@@ -67,7 +101,7 @@ impl ConfigErrorNotification {
     pub fn show_created(&mut self, created_path: &Path) {
         if self.created_path.as_deref() != Some(created_path) {
             self.created_path = Some(created_path.to_owned());
-            self.buffers.borrow_mut().clear();
+            self.cache.borrow_mut().textures.clear();
         }
 
         self.state = State::Showing(self.animation(0., 1.));
@@ -81,7 +115,7 @@ impl ConfigErrorNotification {
 
         if self.created_path.is_some() {
             self.created_path = None;
-            self.buffers.borrow_mut().clear();
+            self.cache.borrow_mut().textures.clear();
         }
 
         // Show from scratch even if already showing to bring attention.
@@ -141,18 +175,38 @@ impl ConfigErrorNotification {
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
         let path = self.created_path.as_deref();
+        let scale_key = NotNan::new(scale).ok()?;
 
-        let mut buffers = self.buffers.borrow_mut();
-        let buffer = buffers
-            .entry(NotNan::new(scale).unwrap())
-            .or_insert_with(move || {
-                // CPU-rendered into a renderer-neutral buffer, uploaded through the active renderer
-                // below so it draws on GLES and Vulkan alike.
-                render(scale, path).ok()
-            });
-        let buffer = buffer.as_ref()?;
+        let texture = {
+            let mut cache = self.cache.borrow_mut();
 
-        let size = buffer.logical_size();
+            // The cached textures belong to one renderer context; drop them all if it changed.
+            let context = renderer.context_id();
+            if cache.context.as_ref() != Some(&context) {
+                cache.textures.clear();
+                cache.context = Some(context);
+            }
+
+            // Not the `entry` API: the build is fallible and borrows `renderer`.
+            #[allow(clippy::map_entry)]
+            if !cache.textures.contains_key(&scale_key) {
+                match draw_dialog_texture(renderer, scale, path) {
+                    Ok(texture) => {
+                        cache.textures.insert(scale_key, texture);
+                    }
+                    Err(err) => {
+                        warn!("error rendering the config error notification: {err:#}");
+                    }
+                }
+            }
+            cache.textures.get(&scale_key).cloned()?
+        };
+
+        let tex_size = texture.size();
+        let size = Size::<f64, Logical>::from((
+            f64::from(tex_size.w) / scale,
+            f64::from(tex_size.h) / scale,
+        ));
         let y_range = size.h + f64::from(PADDING) * 2.;
 
         let x = (output_size.w - size.w).max(0.) / 2.;
@@ -165,8 +219,8 @@ impl ConfigErrorNotification {
         let location = Point::from((x, y));
         let location = location.to_physical_precise_round(scale).to_logical(scale);
 
-        let buffer: TextureBuffer<VkTexture> =
-            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
@@ -180,78 +234,187 @@ impl ConfigErrorNotification {
     }
 }
 
-fn render(scale: f64, created_path: Option<&Path>) -> anyhow::Result<MemoryBuffer> {
-    let _span = tracy_client::span!("config_error_notification::render");
+/// Draw the notification box into an offscreen [`VkTexture`] on the GPU: the opaque dark box, a
+/// coloured border (red for a parse error, green for a created config), a black keycap patch behind
+/// the inline `niri validate` command / config path, and the message. Content-sized. No cairo.
+fn draw_dialog_texture(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    created_path: Option<&Path>,
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("config_error_notification::draw_dialog_texture");
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let padding = padding.max(0);
+    let wrap_px: i32 = to_physical_precise_round(scale, WRAP_WIDTH);
+    let wrap_px = wrap_px.max(1);
+    let border: i32 = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
+    let px = (FONT_PX * scale) as f32;
 
-    let mut text = error_text(true);
-    let mut border_color = (1., 0.3, 0.3);
-    if let Some(path) = created_path {
-        text = format!(
-            "Created a default config file at \
-             <span face='monospace' bgcolor='#000000'>{path:?}</span>",
-        );
-        border_color = (0.5, 1., 0.5);
+    // Span 1 is the keycap (mono command / path), matching KEYCAP_SPAN.
+    let path_text;
+    let (spans, border_color): (Vec<TextSpan>, [f32; 4]) = if let Some(path) = created_path {
+        path_text = format!("{path:?}");
+        (
+            vec![
+                TextSpan {
+                    text: "Created a default config file at ",
+                    family: SpanFamily::Sans,
+                    bold: false,
+                    px,
+                },
+                TextSpan {
+                    text: &path_text,
+                    family: SpanFamily::Mono,
+                    bold: false,
+                    px,
+                },
+            ],
+            BORDER_CREATED,
+        )
+    } else {
+        (
+            vec![
+                TextSpan {
+                    text: "Failed to parse the config file. Please run ",
+                    family: SpanFamily::Sans,
+                    bold: false,
+                    px,
+                },
+                TextSpan {
+                    text: "niri validate",
+                    family: SpanFamily::Mono,
+                    bold: false,
+                    px,
+                },
+                TextSpan {
+                    text: " to see the errors.",
+                    family: SpanFamily::Sans,
+                    bold: false,
+                    px,
+                },
+            ],
+            BORDER_ERROR,
+        )
     };
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let run = renderer.build_glyph_paragraph(&spans, wrap_px as f32, px)?;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
+    // Content-sized box: place the whole ink block at (padding, padding).
+    let (ix, iy, iw, ih) = run.ink_bounds();
+    let box_w = (iw + padding * 2).max(1);
+    let box_h = (ih + padding * 2).max(1);
+    let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
 
-    let (mut width, mut height) = layout.pixel_size();
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(border_color.0, border_color.1, border_color.2);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width, height),
-        scale,
-        Transform::Normal,
+    let size = Size::<i32, Physical>::from((box_w, box_h));
+    let full = Rectangle::from_size(size);
+    let inner = Rectangle::new(
+        Point::from((border, border)),
+        Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
     );
 
-    Ok(buffer)
+    // The keycap background: the command/path span's ink, padded and clamped inside the box.
+    let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
+    let keycap = (kw > 0 && kh > 0).then(|| {
+        let pad_x = (px * 0.25).round() as i32;
+        let pad_y = (px * 0.15).round() as i32;
+        Rectangle::new(
+            Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
+            Size::from((kw + pad_x * 2, kh + pad_y * 2)),
+        )
+        .intersection(inner)
+    });
+
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((box_w, box_h)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+
+        frame.clear(Color32F::from(border_color), &[full])?;
+        frame.clear(Color32F::from(BOX_BG), &[inner])?;
+        if let Some(Some(keycap)) = keycap {
+            frame.clear(Color32F::from(KEYCAP_BG), &[keycap])?;
+        }
+        frame.render_glyphs(&run, origin, TEXT, full, &[full])?;
+        let _sync = frame.finish()?;
+    }
+
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
-pub fn error_text(markup: bool) -> String {
-    let command = if markup {
-        "<span face='monospace' bgcolor='#000000'>niri validate</span>"
-    } else {
-        "niri validate"
-    };
+/// The parse-error message as plain text (for accessibility).
+pub fn error_text() -> String {
+    "Failed to parse the config file. Please run niri validate to see the errors.".to_owned()
+}
 
-    format!("Failed to parse the config file. Please run {command} to see the errors.")
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use smithay::backend::renderer::ExportMem;
+
+    use super::*;
+
+    /// Both variants draw: the parse-error box has a red border, the created-config box a green
+    /// one; both are opaque-dark with a black keycap patch and bright glyph ink. Skips with no GPU.
+    #[test]
+    fn draws_both_variants() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draws_both_variants: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        let created = Path::new("/home/user/.config/niri/config.kdl");
+        for (path, border_is_red) in [(None, true), (Some(created), false)] {
+            let mut tex = draw_dialog_texture(&mut vk, 1., path).expect("notification texture");
+            let size = tex.size();
+            assert!(size.w > 0 && size.h > 0);
+
+            let fb = vk.bind(&mut tex).expect("bind for readback");
+            let region = Rectangle::<i32, BufferCoord>::from_size(size);
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+            let px_at = |x: i32, y: i32| -> [u8; 4] {
+                let i = ((y * size.w + x) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+
+            // The top edge is the coloured border, opaque.
+            let border = px_at(size.w / 2, 1);
+            assert_eq!(border[3], 255, "border must be opaque, got {border:?}");
+            if border_is_red {
+                assert!(
+                    border[0] > 180 && border[1] < 120 && border[2] < 120,
+                    "error border not red: {border:?}"
+                );
+            } else {
+                assert!(
+                    border[1] > 180 && border[0] < 160 && border[2] < 160,
+                    "created border not green: {border:?}"
+                );
+            }
+
+            // A black keycap pixel exists (~0x00, darker than the 0x1A box).
+            let keycap = pixels
+                .chunks_exact(4)
+                .any(|p| p[0] < 12 && p[1] < 12 && p[2] < 12 && p[3] == 255);
+            assert!(keycap, "expected a black keycap patch");
+
+            // Bright glyph ink.
+            let bright = pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+                .count();
+            assert!(bright > 40, "expected visible glyph ink, got {bright}");
+        }
+    }
 }

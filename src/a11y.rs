@@ -261,7 +261,7 @@ impl Niri {
             return;
         }
 
-        self.a11y_announce(crate::ui::config_error_notification::error_text(false));
+        self.a11y_announce(crate::ui::config_error_notification::error_text());
     }
 
     pub fn a11y_announce_hotkey_overlay(&mut self) {
