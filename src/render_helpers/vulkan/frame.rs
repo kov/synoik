@@ -481,6 +481,41 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
+        self.render_glyphs_with(run, origin, dst, damage, |_| color)
+    }
+
+    /// Like [`Self::render_glyphs`], but each glyph is tinted by the colour of its source span:
+    /// `colors[span_index]`, falling back to white for an out-of-range index. Lets one shaped run
+    /// carry multiple colours (e.g. the MRU scope panel's selected-vs-unselected words) in a single
+    /// draw. See [`GlyphRun::spans`](super::types::GlyphRun).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_glyphs_spans(
+        &mut self,
+        run: &GlyphRun,
+        origin: Point<i32, Physical>,
+        colors: &[[f32; 4]],
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let per_glyph: Vec<[f32; 4]> = run
+            .spans()
+            .iter()
+            .map(|&s| colors.get(s as usize).copied().unwrap_or([1.; 4]))
+            .collect();
+        self.render_glyphs_with(run, origin, dst, damage, |i| {
+            per_glyph.get(i).copied().unwrap_or([1.; 4])
+        })
+    }
+
+    /// Shared glyph-draw loop: `color_for(glyph_index)` gives each glyph's tint.
+    fn render_glyphs_with(
+        &mut self,
+        run: &GlyphRun,
+        origin: Point<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        color_for: impl Fn(usize) -> [f32; 4],
+    ) -> Result<(), VulkanError> {
         debug_assert!(
             matches!(self.transform, Transform::Normal),
             "render_glyphs is offscreen-only (identity transform), got {:?}",
@@ -506,7 +541,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 std::slice::from_ref(&set),
                 &[],
             );
-            for g in run.glyphs() {
+            for (i, g) in run.glyphs().iter().enumerate() {
                 let push = TextPush {
                     origin: [(origin.x + g.x) as f32, (origin.y + g.y) as f32],
                     size: [g.w as f32, g.h as f32],
@@ -514,7 +549,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     uv_origin: [g.atlas_x as f32 / side, g.atlas_y as f32 / side],
                     uv_size: [g.w as f32 / side, g.h as f32 / side],
                     _pad: [0.0, 0.0],
-                    color,
+                    color: color_for(i),
                 };
                 dev.cmd_push_constants(
                     self.cbuf,

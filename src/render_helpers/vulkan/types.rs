@@ -338,6 +338,12 @@ impl GlyphRun {
         &self.glyphs
     }
 
+    /// Source-span index of each glyph, parallel to [`Self::glyphs`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn spans(&self) -> &[u32] {
+        &self.spans
+    }
+
     pub(crate) fn side(&self) -> u32 {
         self.side
     }

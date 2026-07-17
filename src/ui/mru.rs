@@ -1,26 +1,27 @@
 use std::cell::RefCell;
-use std::cmp::min;
 use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::ensure;
 use niri_config::{
     Action, Bind, Color, Config, CornerRadius, GradientInterpolation, Key, Modifiers, MruDirection,
     MruFilter, MruScope, Trigger,
 };
-use pango::FontDescription;
-use pangocairo::cairo::{self, ImageSurface};
+use niri_vk::text::{SpanFamily, TextSpan};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::{
+    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
 use crate::animation::{Animation, Clock};
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -30,11 +31,11 @@ use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
-use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::VkTexture;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
@@ -70,8 +71,17 @@ const PANEL_BORDER: i32 = 4;
 /// Backdrop color behind the previews.
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
 
-/// Font used to render the window titles.
-const FONT: &str = "sans 14px";
+/// Font size for the window titles and scope panel, logical px-per-em.
+const FONT_PX: f64 = 14.;
+/// Title text colour (opaque white); the offscreen is otherwise transparent so the gradient fade
+/// and the layout clip act on the text alone.
+const TITLE_COLOR: [f32; 4] = [1., 1., 1., 1.];
+/// Scope-panel background, grey border, keycap patch, and the selected / unselected word colours.
+const PANEL_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+const PANEL_BORDER_COLOR: [f32; 4] = [0.5, 0.5, 0.5, 1.];
+const PANEL_KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
+const PANEL_SELECTED: [f32; 4] = [1., 1., 1., 1.];
+const PANEL_UNSELECTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
 
 /// Scopes in the order they are cycled through.
 ///
@@ -187,23 +197,24 @@ struct MoveAnimation {
     from: f64,
 }
 
-/// CPU-drawn title/scope text cached as a renderer-neutral buffer, uploaded through the active
-/// renderer at render time (so it works on GLES and the owned Vulkan renderer alike). Cheap to
-/// clone (the pixel data is `Arc`-shared).
-type MruTexture = MemoryBuffer;
+/// Title/scope text drawn straight into a sampleable `VkTexture` on the owned Vulkan renderer's
+/// glyph path (no cairo/pango). Cheap to clone (the GPU image is `Arc`-shared).
+type MruTexture = VkTexture;
 
-/// Cached title texture.
+/// Cached title texture, keyed by (title, scale) and the renderer context it was built on.
 #[derive(Debug, Default)]
 struct TitleTexture {
     title: String,
     scale: f64,
+    context: Option<ContextId<VkTexture>>,
     texture: Option<Option<MruTexture>>,
 }
 
-/// Cached scope panel textures.
+/// Cached scope panel textures, keyed by scale and the renderer context.
 #[derive(Debug, Default)]
 struct ScopePanel {
     scale: f64,
+    context: Option<ContextId<VkTexture>>,
     textures: Option<Option<[MruTexture; 3]>>,
 }
 
@@ -327,11 +338,16 @@ impl Thumbnail {
         size.to_physical_precise_round(scale).to_logical(scale)
     }
 
-    fn title_texture(&self, mapped: &Mapped, scale: f64) -> Option<MruTexture> {
+    fn title_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        mapped: &Mapped,
+        scale: f64,
+    ) -> Option<MruTexture> {
         with_toplevel_role(mapped.toplevel(), |role| {
             role.title
                 .as_ref()
-                .and_then(|title| self.title_texture.borrow_mut().get(title, scale))
+                .and_then(|title| self.title_texture.borrow_mut().get(renderer, title, scale))
         })
     }
 
@@ -450,10 +466,13 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        // The title text is a renderer-neutral CPU buffer, uploaded through the active renderer.
-        let title_texture = self.title_texture(mapped, scale);
+        // The title text is drawn straight into a Vulkan texture by the owned renderer.
+        let title_texture = self.title_texture(ctx.renderer, mapped, scale);
         let title_texture = title_texture.map(|texture| {
-            let mut size = texture.logical_size();
+            let mut size = Size::<f64, Logical>::from((
+                f64::from(texture.width()) / scale,
+                f64::from(texture.height()) / scale,
+            ));
             size.w = f64::min(size.w, preview_geo.size.w);
             title_size = Some(size);
             (texture, size)
@@ -480,37 +499,23 @@ impl Thumbnail {
             // entirely inside itself so the concrete texture type matches the gradient wrapper. A
             // title that fits gets a no-op cutoff, so this is safe to take unconditionally; the
             // plain (hard-clipped) texture below is only for when the upload fails.
-            let mut pushed = false;
-            {
-                let vk = ctx.r();
-                if let Ok(buffer) = TextureBuffer::from_memory_buffer(vk.renderer, &texture) {
-                    let elem = TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        loc,
-                        preview_alpha,
-                        Some(src),
-                        None,
-                        Kind::Unspecified,
-                    );
-                    let elem = GradientFadeTextureRenderElement::new(elem);
-                    push(WindowMruUiRenderElement::GradientFade(elem));
-                    pushed = true;
-                }
-            }
-
-            if !pushed {
-                if let Ok(buffer) = TextureBuffer::from_memory_buffer(ctx.renderer, &texture) {
-                    let elem = TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        loc,
-                        preview_alpha,
-                        Some(src),
-                        None,
-                        Kind::Unspecified,
-                    );
-                    push(WindowMruUiRenderElement::UiTexture(elem));
-                }
-            }
+            let buffer = TextureBuffer::from_texture(
+                ctx.renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                Vec::new(),
+            );
+            let elem = TextureRenderElement::from_texture_buffer(
+                buffer,
+                loc,
+                preview_alpha,
+                Some(src),
+                None,
+                Kind::Unspecified,
+            );
+            let elem = GradientFadeTextureRenderElement::new(elem);
+            push(WindowMruUiRenderElement::GradientFade(elem));
         }
 
         let is_urgent = mapped.is_urgent();
@@ -1572,24 +1577,35 @@ impl Inner {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();
 
-        // The scope panel is a renderer-neutral CPU buffer, uploaded through the active renderer.
-        let panel_texture = self.scope_panel.borrow_mut().get(scale, self.wmru.scope);
+        // The scope panel is drawn straight into a Vulkan texture by the owned renderer.
+        let panel_texture = self
+            .scope_panel
+            .borrow_mut()
+            .get(ctx.renderer, scale, self.wmru.scope);
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 
-            let size = texture.logical_size();
+            let size = Size::<f64, Logical>::from((
+                f64::from(texture.width()) / scale,
+                f64::from(texture.height()) / scale,
+            ));
             let location = Point::new((output_size.w - size.w) / 2., padding * 2.);
-            if let Ok(buffer) = TextureBuffer::from_memory_buffer(ctx.renderer, &texture) {
-                let elem = TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    location,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                );
-                push(WindowMruUiRenderElement::UiTexture(elem));
-            }
+            let buffer = TextureBuffer::from_texture(
+                ctx.renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                Vec::new(),
+            );
+            let elem = TextureRenderElement::from_texture_buffer(
+                buffer,
+                location,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            );
+            push(WindowMruUiRenderElement::UiTexture(elem));
         }
 
         let current_id = self.wmru.current_id;
@@ -1629,8 +1645,8 @@ impl Inner {
             // would be annoying to thread the rendering into this function. The texture might be
             // one frame stale or so.
             if let Some(texture) = thumbnail.title_texture.borrow().get_stale() {
-                let title_size = texture.logical_size();
-                geo.size.h += title_gap + title_size.h;
+                let title_h = f64::from(texture.height()) / scale;
+                geo.size.h += title_gap + title_h;
                 // Subtract half the padding so it looks more balanced visually.
                 geo.size.h -= round(padding.y / 2.);
             }
@@ -1645,16 +1661,25 @@ impl Inner {
 }
 
 impl TitleTexture {
-    fn get(&mut self, title: &str, scale: f64) -> Option<MruTexture> {
-        if self.title != title || self.scale != scale {
+    fn get(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        title: &str,
+        scale: f64,
+    ) -> Option<MruTexture> {
+        let context = renderer.context_id();
+        if self.title != title || self.scale != scale || self.context.as_ref() != Some(&context) {
             self.texture = None;
             self.title = title.to_owned();
             self.scale = scale;
+            self.context = Some(context);
         }
 
-        self.texture
-            .get_or_insert_with(|| generate_title_texture(title, scale).ok())
-            .clone()
+        // Not `get_or_insert_with`: the build borrows `renderer`, which the closure can't.
+        if self.texture.is_none() {
+            self.texture = Some(generate_title_texture(renderer, title, scale).ok());
+        }
+        self.texture.as_ref().and_then(|t| t.clone())
     }
 
     fn get_stale(&self) -> Option<&MruTexture> {
@@ -1666,152 +1691,186 @@ impl TitleTexture {
     }
 }
 
-fn generate_title_texture(title: &str, scale: f64) -> anyhow::Result<MruTexture> {
+/// Draw a window title straight into a content-sized, transparent `VkTexture` (white glyphs over a
+/// cleared alpha-0 background — which the text material blends to premultiplied coverage, ready for
+/// the gradient fade). Single-line, like the old `single_paragraph_mode` pango path.
+fn generate_title_texture(
+    renderer: &mut VulkanRenderer,
+    title: &str,
+    scale: f64,
+) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::generate_title_texture");
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let px = (FONT_PX * scale) as f32;
+    let run = renderer.build_glyph_run(title, px)?;
+    let (ix, iy, iw, ih) = run.ink_bounds();
+    anyhow::ensure!(iw > 0 && ih > 0, "empty title");
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    // On Window CSD, line breaks are either stripped or replaced with the linebreak symbol anyway.
-    // No use rendering it as multiple lines.
-    layout.set_single_paragraph_mode(true);
-    layout.set_font_description(Some(&font));
-    layout.set_text(title);
+    // Guard against overly long titles; the fade + layout clip hide any overflow anyway.
+    let w = iw.min(16383);
+    let h = ih.min(16383);
+    let origin = Point::<i32, Physical>::from((-ix, -iy));
+    let size = Size::<i32, Physical>::from((w, h));
+    let full = Rectangle::from_size(size);
 
-    let (width, height) = layout.pixel_size();
-    ensure!(width > 0 && height > 0);
-
-    // Guard against overly long window titles.
-    let width = min(width, 16383);
-    let height = min(height, 16383);
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    Ok(MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        Size::from((width, height)),
-        Scale::from(scale),
-        Transform::Normal,
-    ))
+    let mut target =
+        renderer.create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((w, h)))?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+        frame.clear(Color32F::from([0., 0., 0., 0.]), &[full])?;
+        frame.render_glyphs(&run, origin, TITLE_COLOR, full, &[full])?;
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 impl ScopePanel {
-    fn get(&mut self, scale: f64, scope: MruScope) -> Option<MruTexture> {
-        if self.scale != scale {
+    fn get(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        scope: MruScope,
+    ) -> Option<MruTexture> {
+        let context = renderer.context_id();
+        if self.scale != scale || self.context.as_ref() != Some(&context) {
             self.textures = None;
             self.scale = scale;
+            self.context = Some(context);
         }
 
+        if self.textures.is_none() {
+            self.textures = Some(generate_scope_panels(renderer, scale).ok());
+        }
         self.textures
-            .get_or_insert_with(|| generate_scope_panels(scale).ok())
             .as_ref()
+            .and_then(|x| x.as_ref())
             .map(|x| x[scope as usize].clone())
     }
 }
 
-fn generate_scope_panels(scale: f64) -> anyhow::Result<[MruTexture; 3]> {
-    fn make_panel_text(idx: usize) -> String {
-        let span_unselected = "<span fgcolor='#999999'>";
-        let span_end = "</span>";
-        let span_shortcut = "<span face='mono' bgcolor='#2C2C2C' letter_spacing='5000'><b>";
-        let span_shortcut_end = "</b></span>";
-
-        // Starts with a zero-width space to make letter_spacing work on the left.
-        let mut buf =
-            format!("\u{200B}{span_unselected}{span_shortcut}S{span_shortcut_end}cope:{span_end}");
-
-        for scope in SCOPE_CYCLE {
-            buf.push_str("  ");
-            if scope as usize != idx {
-                buf.push_str(span_unselected);
-            }
-            let text = match scope {
-                MruScope::All => format!("{span_shortcut}A{span_shortcut_end}ll"),
-                MruScope::Output => format!("{span_shortcut}O{span_shortcut_end}utput"),
-                MruScope::Workspace => format!("{span_shortcut}W{span_shortcut_end}orkspace"),
-            };
-            buf.push_str(&text);
-            if scope as usize != idx {
-                buf.push_str(span_end);
-            }
-        }
-
-        buf
-    }
-
-    // Can't wait for array::try_map()
+fn generate_scope_panels(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+) -> anyhow::Result<[MruTexture; 3]> {
+    // Indexed by `scope as usize`, matching `ScopePanel::get`.
     Ok([
-        render_panel(scale, &make_panel_text(0))?,
-        render_panel(scale, &make_panel_text(1))?,
-        render_panel(scale, &make_panel_text(2))?,
+        render_panel(renderer, scale, MruScope::All as usize)?,
+        render_panel(renderer, scale, MruScope::Output as usize)?,
+        render_panel(renderer, scale, MruScope::Workspace as usize)?,
     ])
 }
 
-fn render_panel(scale: f64, text: &str) -> anyhow::Result<MruTexture> {
+/// Draw the scope-indicator panel on the GPU: a dark box with a grey border, "Scope:" then the
+/// three scopes (in cycle order) each with a bold-mono first-letter keycap on a grey patch; the
+/// scope whose discriminant equals `selected` is white, the rest grey. No cairo/pango. (Divergence
+/// from the old markup: no `letter_spacing` on the keycaps.)
+fn render_panel(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    selected: usize,
+) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
+    let px = (FONT_PX * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PANEL_PADDING);
-    // Keep the border width even to avoid blurry edges.
-    // Render to a dummy surface to determine the size.
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
-    let (mut width, mut height) = layout.pixel_size();
+    let padding = padding.max(0);
+    let border: i32 = ((f64::from(PANEL_BORDER) / 2. * scale).round() as i32).max(1);
 
-    width += padding * 2;
-    height += padding * 2;
+    fn mono_bold(t: &str, px: f32) -> TextSpan<'_> {
+        TextSpan {
+            text: t,
+            family: SpanFamily::Mono,
+            bold: true,
+            px,
+        }
+    }
+    fn sans(t: &str, px: f32) -> TextSpan<'_> {
+        TextSpan {
+            text: t,
+            family: SpanFamily::Sans,
+            bold: false,
+            px,
+        }
+    }
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    // First letter + remainder (+ inter-scope gap) for each scope, in cycle order.
+    let last = SCOPE_CYCLE.len() - 1;
+    let parts: Vec<(&str, String, MruScope)> = SCOPE_CYCLE
+        .iter()
+        .enumerate()
+        .map(|(i, &scope)| {
+            let (first, rest) = match scope {
+                MruScope::All => ("A", "ll"),
+                MruScope::Output => ("O", "utput"),
+                MruScope::Workspace => ("W", "orkspace"),
+            };
+            let gap = if i == last { "" } else { "  " };
+            (first, format!("{rest}{gap}"), scope)
+        })
+        .collect();
 
-    let padding = f64::from(padding);
+    let mut spans = vec![mono_bold("S", px), sans("cope:  ", px)];
+    let mut colors = vec![PANEL_UNSELECTED, PANEL_UNSELECTED];
+    let mut keycap_spans = Vec::new();
+    for (first, rest, scope) in &parts {
+        keycap_spans.push(spans.len() as u32);
+        spans.push(mono_bold(first, px));
+        spans.push(sans(rest, px));
+        let color = if *scope as usize == selected {
+            PANEL_SELECTED
+        } else {
+            PANEL_UNSELECTED
+        };
+        colors.push(color);
+        colors.push(color);
+    }
 
-    cr.move_to(padding, padding);
+    // Large wrap so the single line never wraps; centering is moot for one line.
+    let run = renderer.build_glyph_paragraph(&spans, 100_000., px)?;
+    let (ix, iy, iw, ih) = run.ink_bounds();
+    anyhow::ensure!(iw > 0 && ih > 0, "empty panel");
+    let box_w = iw + padding * 2;
+    let box_h = ih + padding * 2;
+    let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
+    let size = Size::<i32, Physical>::from((box_w, box_h));
+    let full = Rectangle::from_size(size);
+    let inner = Rectangle::new(
+        Point::from((border, border)),
+        Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
+    );
 
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((box_w, box_h)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+        frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
+        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
 
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.5, 0.5);
-    cr.set_line_width((f64::from(PANEL_BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    Ok(MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        Size::from((width, height)),
-        Scale::from(scale),
-        Transform::Normal,
-    ))
+        // Grey keycap patches behind each bold-mono first letter.
+        let kpad_x = (px * 0.22).round() as i32;
+        let kpad_y = (px * 0.12).round() as i32;
+        for &ks in &keycap_spans {
+            let (kx, ky, kw, kh) = run.span_ink_bounds(ks);
+            if kw > 0 && kh > 0 {
+                let rect = Rectangle::new(
+                    Point::from((origin.x + kx - kpad_x, origin.y + ky - kpad_y)),
+                    Size::from((kw + kpad_x * 2, kh + kpad_y * 2)),
+                );
+                if let Some(rect) = rect.intersection(inner) {
+                    frame.clear(Color32F::from(PANEL_KEYCAP_BG), &[rect])?;
+                }
+            }
+        }
+        frame.render_glyphs_spans(&run, origin, &colors, full, &[full])?;
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 /// Returns key bindings available when the MRU UI is open.

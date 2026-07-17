@@ -327,7 +327,9 @@ fn vulkan_composites_the_run_dialog() {
 /// switcher closed, so the measurement cannot quietly become vacuous.
 fn white_px_in_scope_panel_strip(pixels: &[u8], w: i32, h: i32) -> usize {
     let is_white = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
-    ((h / 16) * w..(h / 8) * w)
+    // The panel sits just below the GNOME top strip (its white clock is above `h / 24`); the owned
+    // renderer places the scope text ink-tight, a touch higher than the old cairo layout did.
+    ((h / 24) * w..(h / 8) * w)
         .filter(|i| is_white(px(pixels, w, i % w, i / w)))
         .count()
 }
