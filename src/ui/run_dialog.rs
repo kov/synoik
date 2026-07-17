@@ -14,25 +14,36 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use gio::glib;
+use niri_vk::text::{SpanFamily, TextSpan};
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{Alignment, EllipsizeMode, FontDescription, SCALE as PANGO_SCALE};
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Point, Transform};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::niri_render_elements;
-use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
+/// Padding around the dialog text block, logical px.
 const PADDING: i32 = 16;
+/// Wrap width of the dialog text area, logical px.
 const WIDTH: i32 = 400;
-const FONT: &str = "sans 14px";
+/// Base dialog font size (title + entry), logical px-per-em.
+const BASE_FONT_PX: f64 = 14.;
+/// Small (description/hint) font size, logical px-per-em.
+const SMALL_FONT_PX: f64 = 11.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
+/// Dialog box background (opaque dark grey), straight RGBA.
+const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// Dialog text color (opaque white); the glyph coverage modulates the alpha.
+const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// gnome-shell's HistoryManager DEFAULT_LIMIT.
 const HISTORY_LIMIT: usize = 512;
 
@@ -48,16 +59,29 @@ pub struct RunDialog {
     history_index: Option<usize>,
     /// Bumped on every content change to invalidate rendered buffers.
     revision: u64,
-    buffers: RefCell<BuffersByScale>,
+    cache: RefCell<DialogCache>,
 }
 
-/// Rendered dialog buffers per output scale, tagged with the content revision
-/// they were rendered at.
-type BuffersByScale = HashMap<NotNan<f64>, (u64, Option<MemoryBuffer>)>;
+/// Cached dialog box textures per output scale, tagged with the content
+/// revision they were rendered at. Tied to a renderer context: dropped
+/// wholesale when the renderer changes.
+struct DialogCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
+}
+
+impl DialogCache {
+    fn new() -> Self {
+        Self {
+            context: None,
+            textures: HashMap::new(),
+        }
+    }
+}
 
 niri_render_elements! {
     RunDialogRenderElement => {
-        // A plain memory-uploaded texture drawn through the active renderer's `ImportMem`.
+        // The dialog box, drawn offscreen on the GPU (dark box + one glyph paragraph).
         Texture = TextureRenderElement<VkTexture>,
         SolidColor = SolidColorRenderElement,
     }
@@ -82,7 +106,7 @@ impl RunDialog {
             esc_pressed: false,
             history_index: None,
             revision: 0,
-            buffers: RefCell::new(HashMap::new()),
+            cache: RefCell::new(DialogCache::new()),
         }
     }
 
@@ -206,28 +230,49 @@ impl RunDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-
-        let mut buffers = self.buffers.borrow_mut();
-        let (revision, buffer) = buffers
-            .entry(NotNan::new(scale).unwrap())
-            .or_insert((u64::MAX, None));
-        if *revision != self.revision {
-            *buffer = render(scale, &self.entry, self.error.as_deref())
-                .map_err(|err| warn!("error rendering the run dialog: {err:?}"))
-                .ok();
-            *revision = self.revision;
-        }
-        let Some(buffer) = buffer else {
+        let Some(scale_key) = NotNan::new(scale).ok() else {
             return;
         };
 
-        let size = buffer.logical_size();
-        // Upload the CPU-rendered dialog through the active renderer's `ImportMem`, so it draws on
-        // any renderer (including the owned Vulkan one) rather than only GLES.
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer, buffer) else {
-            return;
+        let texture = {
+            let mut cache = self.cache.borrow_mut();
+
+            // The cached textures belong to one renderer context; drop them all if it changed.
+            let context = renderer.context_id();
+            if cache.context.as_ref() != Some(&context) {
+                cache.textures.clear();
+                cache.context = Some(context);
+            }
+
+            let fresh =
+                matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == self.revision);
+            if !fresh {
+                match draw_dialog_texture(renderer, scale, &self.entry, self.error.as_deref()) {
+                    Ok(texture) => {
+                        cache.textures.insert(scale_key, (self.revision, texture));
+                    }
+                    Err(err) => {
+                        warn!("error rendering the run dialog: {err:#}");
+                        return;
+                    }
+                }
+            }
+            match cache.textures.get(&scale_key) {
+                Some((_, texture)) => texture.clone(),
+                None => return,
+            }
         };
 
+        // The box is opaque, so let the compositor skip drawing behind it.
+        let tex_size = texture.size();
+        let opaque = vec![Rectangle::from_size(tex_size)];
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
+
+        let size = Size::<f64, Logical>::from((
+            f64::from(tex_size.w) / scale,
+            f64::from(tex_size.h) / scale,
+        ));
         let location = (output_size.to_point() - size.to_point()).downscale(2.);
         let mut location = location.to_physical_precise_round(scale).to_logical(scale);
         location.x = f64::max(0., location.x);
@@ -261,71 +306,98 @@ impl Default for RunDialog {
     }
 }
 
-fn render(scale: f64, entry: &str, error: Option<&str>) -> anyhow::Result<MemoryBuffer> {
-    let _span = tracy_client::span!("run_dialog::render");
+/// Draw the dialog box into an offscreen [`VkTexture`] on the GPU: clear the
+/// opaque dark background, then draw one center-aligned glyph paragraph — a bold
+/// "Run a Command" title, the monospace entry with a cursor bar, and a small
+/// description/hint line. The returned texture is `SHADER_READ_ONLY`
+/// (sampleable) so the caller composites it directly. No cairo/pango raster.
+///
+/// Unlike the old pango path (which ellipsized a too-long entry from the start),
+/// a long command now *wraps* to more lines and the box grows — acceptable, and
+/// keeps every glyph visible.
+fn draw_dialog_texture(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    entry: &str,
+    error: Option<&str>,
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("run_dialog::draw_dialog_texture");
 
-    let markup = markup(entry, error);
     let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let width: i32 = to_physical_precise_round(scale, WIDTH);
+    let padding = padding.max(0);
+    let wrap_px: i32 = to_physical_precise_round(scale, WIDTH);
+    let wrap_px = wrap_px.max(1);
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    let base_px = (BASE_FONT_PX * scale) as f32;
+    let small_px = (SMALL_FONT_PX * scale) as f32;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_width(width * PANGO_SCALE);
-    layout.set_ellipsize(EllipsizeMode::Start);
-    layout.set_markup(&markup);
+    let description = error.unwrap_or("Press ESC to close");
+    // The entry line carries a trailing cursor bar (U+258F), like gnome-shell.
+    let entry_line = format!("{entry}\u{258f}");
+    let spans = [
+        TextSpan {
+            text: "Run a Command",
+            family: SpanFamily::Sans,
+            bold: true,
+            px: base_px,
+        },
+        TextSpan {
+            text: "\n\n",
+            family: SpanFamily::Sans,
+            bold: false,
+            px: base_px,
+        },
+        TextSpan {
+            text: &entry_line,
+            family: SpanFamily::Mono,
+            bold: false,
+            px: base_px,
+        },
+        TextSpan {
+            text: "\n\n",
+            family: SpanFamily::Sans,
+            bold: false,
+            px: small_px,
+        },
+        TextSpan {
+            text: description,
+            family: SpanFamily::Sans,
+            bold: false,
+            px: small_px,
+        },
+    ];
 
-    let (_, mut height) = layout.pixel_size();
-    height += padding * 2;
-    let width = width + padding * 2;
+    let run = renderer.build_glyph_paragraph(&spans, wrap_px as f32, base_px)?;
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    // The paragraph is laid out in a [0, wrap_px] frame; size the box to its ink
+    // plus padding and place the block at (padding, padding) (keeping the
+    // per-line centering intact).
+    let (_ix, iy, _iw, ih) = run.ink_bounds();
+    let text_h = ih.max(1);
+    let box_w = (wrap_px + padding * 2).max(1);
+    let box_h = (text_h + padding * 2).max(1);
+    let origin = Point::<i32, Physical>::from((padding, padding - iy));
 
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_width((width - padding * 2) * PANGO_SCALE);
-    layout.set_ellipsize(EllipsizeMode::Start);
-    layout.set_markup(&markup);
+    let size = Size::<i32, Physical>::from((box_w, box_h));
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((box_w, box_h)),
+    )?;
 
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-    drop(cr);
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+        let full = Rectangle::from_size(size);
 
-    let data = surface.take_data().unwrap();
-    let buffer = MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width, height),
-        scale,
-        Transform::Normal,
-    );
+        frame.clear(Color32F::from(BOX_BG), &[full])?;
+        frame.render_glyphs(&run, origin, TEXT, full, &[full])?;
+        // finish() submits and fence-waits synchronously, so the sync point is already signaled.
+        let _sync = frame.finish()?;
+    }
 
-    Ok(buffer)
-}
-
-fn markup(entry: &str, error: Option<&str>) -> String {
-    let entry = glib::markup_escape_text(entry);
-    let description = match error {
-        Some(error) => glib::markup_escape_text(error),
-        None => glib::markup_escape_text("Press ESC to close"),
-    };
-    format!(
-        "<b>Run a Command</b>\n\n\
-         <tt>{entry}\u{258f}</tt>\n\n\
-         <small>{description}</small>"
-    )
+    // The box is sampled by its own render element; transition it to shader-read.
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 /// Tokenize and resolve a run dialog command line the way gnome-shell does:
@@ -429,19 +501,60 @@ mod tests {
         assert!(resolve_command_line("   ").is_err());
     }
 
-    /// The CPU half of rendering (pango markup + cairo) works for arbitrary
-    /// entry/error text — in particular, markup metacharacters in the typed
-    /// command must be escaped, not parsed.
+    /// Drive the GPU dialog box into an offscreen and read it back: it must have
+    /// an opaque dark background and bright glyph ink (the title/entry/hint), for
+    /// arbitrary entry/error text — including former markup metacharacters, which
+    /// are now just literal glyphs (there is no markup parser to escape). Skips
+    /// cleanly with no Vulkan device.
     #[test]
-    fn render_survives_markup_metacharacters() {
+    fn draws_the_dialog_with_glyph_coverage() {
+        use smithay::backend::renderer::ExportMem;
+        use smithay::utils::Rectangle;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draws_the_dialog_with_glyph_coverage: no Vulkan device ({e})");
+                return;
+            }
+        };
+
         for (entry, error) in [
             ("", None),
             ("echo <b>hi</b> & 'quotes'", None),
             ("cat<", Some("error with <markup> & entities")),
         ] {
-            let buffer = render(1., entry, error).unwrap();
-            let size = buffer.logical_size();
-            assert!(size.w > 0. && size.h > 0.);
+            let mut tex = draw_dialog_texture(&mut vk, 1., entry, error).expect("dialog texture");
+            let size = tex.size();
+            assert!(size.w > 0 && size.h > 0);
+
+            let fb = vk.bind(&mut tex).expect("bind for readback");
+            let region = Rectangle::<i32, BufferCoord>::from_size(size);
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+            // A pixel near the bottom-right corner (past any text) is the opaque dark box.
+            let bx = size.w - 3;
+            let by = size.h - 3;
+            let i = ((by * size.w + bx) * 4) as usize;
+            let bg = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
+            assert_eq!(bg[3], 255, "the box must be opaque, got {bg:?}");
+            assert!(
+                bg[0] < 60 && bg[1] < 60 && bg[2] < 60,
+                "box bg not dark: {bg:?}"
+            );
+
+            // Bright glyph ink somewhere (the title, at least).
+            let bright = pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+                .count();
+            assert!(
+                bright > 40,
+                "expected visible glyph ink for {entry:?}, got {bright}"
+            );
         }
     }
 

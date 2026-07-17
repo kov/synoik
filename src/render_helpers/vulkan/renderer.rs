@@ -591,6 +591,40 @@ impl VulkanRenderer {
         Ok(GlyphRun::new(vk_tex, atlas.glyphs, side))
     }
 
+    /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)
+    /// carries its own family/weight/size) wrapped to `wrap_px`, into a single [`GlyphRun`] — one
+    /// R8 coverage atlas plus paragraph-local placements spanning every line. This is the
+    /// dialog/notification text path; draw it with [`VulkanFrame::render_glyphs`] at the block
+    /// origin. Reuses the renderer's long-lived [`text_ctx`](Self::text_ctx).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build_glyph_paragraph(
+        &mut self,
+        spans: &[niri_vk::text::TextSpan],
+        wrap_px: f32,
+        base_px: f32,
+    ) -> Result<GlyphRun, VulkanError> {
+        // Split the disjoint borrows, as in `build_glyph_run`.
+        let gpu = self.gpu.clone();
+        let pool = self.command_pool;
+        let atlas = self
+            .text_ctx
+            .build_paragraph(&gpu, pool, spans, wrap_px, base_px)?;
+
+        let side = atlas.side;
+        let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
+        let vk_tex = VkTexture::new(
+            gpu,
+            atlas.texture,
+            desc_pool,
+            set,
+            side,
+            side,
+            Fourcc::R8,
+            false,
+        );
+        Ok(GlyphRun::new(vk_tex, atlas.glyphs, side))
+    }
+
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The
     /// buffer's DRM format must be one of the 8888 byte orders [`import_format`] handles, with the
     /// LINEAR modifier (all Venus exposes) — clients are advertised exactly [`dmabuf_formats`], so
