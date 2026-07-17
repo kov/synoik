@@ -2661,3 +2661,104 @@ fn negative_wl_region_does_not_kill_the_compositor() {
     f.client(id).set_opaque_region(&surface, 0, 0, 200, 200);
     f.double_roundtrip(id);
 }
+
+/// gsd-power drives screen dim, blank, and auto-suspend through `org.gnome.Mutter.IdleMonitor`,
+/// which reports how long the user has been idle. Input activity must reset that clock, or the
+/// screen would blank mid-use. The watch-firing semantics are unit-tested in `crate::idle_monitor`;
+/// this pins the compositor wiring from real synthetic input to the monitor.
+#[test]
+fn idle_monitor_input_activity_resets_idle_time() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // With no input since construction, idle time grows with elapsed monotonic time.
+    let base = f.niri().clock.now_unadjusted();
+    assert!(
+        f.niri()
+            .idle_monitor
+            .idletime_ms(base + Duration::from_secs(600))
+            >= 600_000,
+        "idle time must grow while the user is inactive",
+    );
+
+    // Any input resets it (input `should_notify_activity` -> `Niri::notify_activity`).
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+
+    let now = f.niri().clock.now_unadjusted();
+    assert!(
+        f.niri().idle_monitor.idletime_ms(now) < 1000,
+        "input activity must reset the idle time to near zero",
+    );
+}
+
+/// The `org.gnome.Mutter.IdleMonitor` D-Bus methods land on the compositor via
+/// `on_idle_monitor_msg`. Drive that entry point: an idle watch registered through it fires once
+/// its interval elapses, and a `ResetIdletime` (what gsd sends, and what activity does) re-arms it
+/// for the next period.
+///
+/// The clock is pinned through the `ResetIdletime` handler so the deadlines are deterministic —
+/// `refresh` is then called directly rather than waiting on the real-time calloop timer.
+#[cfg(feature = "dbus")]
+#[test]
+fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
+    use crate::dbus::mutter_idle_monitor::IdleMonitorToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Pin the idle clock to a known instant via ResetIdletime, then register a 5s watch.
+    let t0 = Duration::from_secs(10_000);
+    f.niri().clock.set_unadjusted(t0);
+    f.niri_state()
+        .on_idle_monitor_msg(IdleMonitorToNiri::ResetIdletime);
+
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_idle_monitor_msg(IdleMonitorToNiri::AddIdleWatch {
+            interval: 5000,
+            owner: ":1.gsd".to_owned(),
+            reply,
+        });
+    let id = rx.try_recv().expect("AddIdleWatch must reply with an id");
+    assert!(id > 0, "watch ids are greater than zero");
+
+    assert!(
+        f.niri()
+            .idle_monitor
+            .refresh(t0 + Duration::from_millis(4999))
+            .is_empty(),
+        "must not fire before the interval elapses",
+    );
+    let fired = f
+        .niri()
+        .idle_monitor
+        .refresh(t0 + Duration::from_millis(5000));
+    assert_eq!(fired.len(), 1, "fires once at the interval");
+    assert_eq!(fired[0].id, id);
+    assert_eq!(
+        fired[0].owner, ":1.gsd",
+        "WatchFired is unicast to the owner"
+    );
+
+    // A ResetIdletime (gsd's "user is active") re-arms it for the next idle period.
+    let t1 = t0 + Duration::from_secs(20);
+    f.niri().clock.set_unadjusted(t1);
+    f.niri_state()
+        .on_idle_monitor_msg(IdleMonitorToNiri::ResetIdletime);
+    assert!(
+        f.niri()
+            .idle_monitor
+            .refresh(t1 + Duration::from_millis(4999))
+            .is_empty(),
+        "the just-reset watch must not fire early",
+    );
+    assert_eq!(
+        f.niri()
+            .idle_monitor
+            .refresh(t1 + Duration::from_millis(5000))
+            .len(),
+        1,
+        "the watch must fire again after activity re-armed it",
+    );
+}

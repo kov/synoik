@@ -323,6 +323,13 @@ pub struct Niri {
     pub pointer_constraints_state: PointerConstraintsState,
     pub idle_notifier_state: IdleNotifierState<State>,
     pub idle_inhibit_manager_state: IdleInhibitManagerState,
+    /// `org.gnome.Mutter.IdleMonitor` watch bookkeeping (gsd-power's dim/blank/suspend). Driven by
+    /// `notify_activity` and `idle_monitor_timer`; `WatchFired` goes out via
+    /// `emit_idle_watch_fired`.
+    pub idle_monitor: crate::idle_monitor::IdleMonitor,
+    /// The single timer re-armed to the next idle watch's deadline (see
+    /// `IdleMonitor::next_wakeup`).
+    pub idle_monitor_timer: Option<RegistrationToken>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
@@ -2362,6 +2369,49 @@ impl State {
         }
     }
 
+    #[cfg(feature = "dbus")]
+    pub fn on_idle_monitor_msg(
+        &mut self,
+        msg: crate::dbus::mutter_idle_monitor::IdleMonitorToNiri,
+    ) {
+        use crate::dbus::mutter_idle_monitor::IdleMonitorToNiri;
+
+        let now = self.niri.clock.now_unadjusted();
+        match msg {
+            IdleMonitorToNiri::GetIdletime { reply } => {
+                let _ = reply.send_blocking(self.niri.idle_monitor.idletime_ms(now));
+            }
+            IdleMonitorToNiri::AddIdleWatch {
+                interval,
+                owner,
+                reply,
+            } => {
+                let id = self.niri.idle_monitor.add_idle_watch(interval, owner);
+                let _ = reply.send_blocking(id);
+                // Arms the timer; a watch already past its interval fires on the next iteration.
+                self.niri.reschedule_idle_monitor_timer();
+            }
+            IdleMonitorToNiri::AddUserActiveWatch { owner, reply } => {
+                let id = self.niri.idle_monitor.add_user_active_watch(owner);
+                let _ = reply.send_blocking(id);
+                // No timer: an active watch fires from `notify_activity`, not from elapsed time.
+            }
+            IdleMonitorToNiri::RemoveWatch { id } => {
+                self.niri.idle_monitor.remove_watch(id);
+                self.niri.reschedule_idle_monitor_timer();
+            }
+            IdleMonitorToNiri::ResetIdletime => {
+                let fired = self.niri.idle_monitor.on_activity(now);
+                self.niri.emit_idle_watch_fired(&fired);
+                self.niri.reschedule_idle_monitor_timer();
+            }
+            IdleMonitorToNiri::SenderVanished(name) => {
+                self.niri.idle_monitor.remove_watches_for_owner(&name);
+                self.niri.reschedule_idle_monitor_timer();
+            }
+        }
+    }
+
     /// Register an external accelerator grab, mirroring
     /// `meta_display_grab_accelerator`: an unparseable accelerator or one that
     /// already resolves to an existing keybinding or grab is refused with 0
@@ -2497,6 +2547,7 @@ impl Niri {
         let pointer_constraints_state = PointerConstraintsState::new::<State>(&display_handle);
         let idle_notifier_state = IdleNotifierState::new(&display_handle, event_loop.clone());
         let idle_inhibit_manager_state = IdleInhibitManagerState::new::<State>(&display_handle);
+        let idle_monitor = crate::idle_monitor::IdleMonitor::new(animation_clock.now_unadjusted());
         let data_device_state = DataDeviceState::new::<State>(&display_handle);
         let primary_selection_state =
             PrimarySelectionState::new_with_filter::<State, _>(&display_handle, |client| {
@@ -2760,6 +2811,8 @@ impl Niri {
             relative_pointer_state,
             pointer_constraints_state,
             idle_notifier_state,
+            idle_monitor,
+            idle_monitor_timer: None,
             idle_inhibit_manager_state,
             data_device_state,
             primary_selection_state,
@@ -6976,8 +7029,84 @@ impl Niri {
 
         self.idle_notifier_state.notify_activity(&self.seat);
 
+        // Feed the same activity to the D-Bus idle monitor: fire any user-active watches, re-arm
+        // idle watches, and reschedule their timer. Runs once per event-loop iteration (guarded
+        // above), so continuous input doesn't churn the timer per event.
+        let now = self.clock.now_unadjusted();
+        let fired = self.idle_monitor.on_activity(now);
+        self.emit_idle_watch_fired(&fired);
+        self.reschedule_idle_monitor_timer();
+
         self.notified_activity_this_iteration = true;
     }
+
+    /// Re-arm the single idle-watch timer to the earliest pending deadline (or cancel it if none).
+    /// Idempotent; call after anything that changes the watch set or the last-activity time.
+    pub fn reschedule_idle_monitor_timer(&mut self) {
+        if let Some(token) = self.idle_monitor_timer.take() {
+            self.event_loop.remove(token);
+        }
+        let Some(deadline) = self.idle_monitor.next_wakeup() else {
+            return;
+        };
+        // A deadline already in the past (e.g. a watch added while long idle) yields a zero delay,
+        // which fires on the next loop iteration — mutter fires such a watch at its next dispatch.
+        let delay = deadline.saturating_sub(self.clock.now_unadjusted());
+        let timer = Timer::from_duration(delay);
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.on_idle_monitor_timer();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.idle_monitor_timer = Some(token);
+    }
+
+    fn on_idle_monitor_timer(&mut self) {
+        self.idle_monitor_timer = None;
+        let now = self.clock.now_unadjusted();
+        let fired = self.idle_monitor.refresh(now);
+        self.emit_idle_watch_fired(&fired);
+        // An idle watch that fired but stays registered has a *later* deadline only after the next
+        // activity, so nothing new is pending now; but a second watch with a longer interval might
+        // be, so always recompute.
+        self.reschedule_idle_monitor_timer();
+    }
+
+    #[cfg(feature = "dbus")]
+    pub fn emit_idle_watch_fired(&self, fired: &[crate::idle_monitor::Fired]) {
+        use zbus::names::BusName;
+
+        if fired.is_empty() {
+            return;
+        }
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_idle_monitor.clone()) else {
+            return;
+        };
+        for f in fired {
+            let destination = match BusName::try_from(f.owner.clone()) {
+                Ok(destination) => destination,
+                Err(err) => {
+                    warn!("invalid idle watch owner {:?}: {err:?}", f.owner);
+                    continue;
+                }
+            };
+            let res = async_io::block_on(conn.inner().emit_signal(
+                Some(destination),
+                "/org/gnome/Mutter/IdleMonitor/Core",
+                "org.gnome.Mutter.IdleMonitor",
+                "WatchFired",
+                &(f.id,),
+            ));
+            if let Err(err) = res {
+                warn!("error emitting WatchFired: {err:?}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn emit_idle_watch_fired(&self, _fired: &[crate::idle_monitor::Fired]) {}
 
     pub fn close_mru(&mut self, close_request: MruCloseRequest) -> Option<Window> {
         if !self.window_mru_ui.is_open() {

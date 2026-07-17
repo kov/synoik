@@ -11,6 +11,7 @@ pub mod gnome_shell;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
 pub mod mutter_display_config;
+pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
 
 #[cfg(feature = "xdp-gnome-screencast")]
@@ -23,6 +24,7 @@ use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_shell::GnomeShell;
 use self::gnome_shell_introspect::Introspect;
 use self::mutter_display_config::DisplayConfig;
+use self::mutter_idle_monitor::IdleMonitor;
 use self::mutter_service_channel::ServiceChannel;
 
 trait Start: Interface {
@@ -37,6 +39,7 @@ pub struct DBusServers {
     pub conn_screen_shot: Option<Connection>,
     pub conn_introspect: Option<Connection>,
     pub conn_gnome_shell: Option<Connection>,
+    pub conn_idle_monitor: Option<Connection>,
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_screen_cast: Option<Connection>,
     pub conn_login1: Option<Connection>,
@@ -128,6 +131,16 @@ impl DBusServers {
                 .unwrap();
             let gnome_shell = GnomeShell::new(to_niri);
             dbus.conn_gnome_shell = try_start(gnome_shell);
+
+            let (to_niri, from_idle_monitor) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_idle_monitor, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_idle_monitor_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let idle_monitor = IdleMonitor::new(to_niri);
+            dbus.conn_idle_monitor = try_start(idle_monitor);
 
             #[cfg(feature = "xdp-gnome-screencast")]
             {
