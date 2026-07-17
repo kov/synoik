@@ -7,8 +7,6 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
-use super::renderer::NiriRenderer;
-
 /// Renders a wide variety of borders and border parts.
 ///
 /// This includes:
@@ -220,12 +218,15 @@ impl BorderRenderElement {
         self
     }
 
-    /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than a
-    /// plain solid-color fallback. Callers use it to choose `BorderRenderElement` (rounded corners,
-    /// gradients) over pointy `SolidColorRenderElement` quads — so this must keep reporting what
-    /// the renderer in hand can actually do, not a blanket `true`.
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        renderer.try_as_vulkan_renderer().is_some()
+    /// Whether `renderer` can draw this element as a real (rounded / gradient) border rather than
+    /// a plain solid-color fallback.
+    ///
+    /// This asked whether the renderer was the Vulkan one. It is now the only renderer, and it
+    /// always draws borders procedurally, so the answer is a constant — which makes the callers'
+    /// pointy-`SolidColorRenderElement` fallbacks dead. Both go in the follow-up; keeping the
+    /// call here holds this commit to a type-level change.
+    pub fn has_shader(_renderer: &mut VulkanRenderer) -> bool {
+        true
     }
 }
 

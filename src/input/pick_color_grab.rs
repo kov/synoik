@@ -2,8 +2,7 @@ use niri_ipc::PickedColor;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::Offscreen;
+use smithay::backend::renderer::ExportMem;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, GestureHoldBeginEvent, GestureHoldEndEvent,
     GesturePinchBeginEvent, GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent,
@@ -14,8 +13,8 @@ use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 
-use crate::niri::{Niri, OutputRenderElements, State};
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::niri::{Niri, State};
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_and_download, RenderCtx, RenderTarget};
 
 pub struct PickColorGrab {
@@ -59,17 +58,13 @@ impl PickColorGrab {
     /// Render the scene into a 1x1 offscreen at `pos` through `renderer` and read back the pixel.
     /// Renderer-agnostic (GLES or the owned Vulkan renderer): the readback goes through
     /// [`render_and_download`], which is `copy_framebuffer`-based and correct on both.
-    pub(crate) fn pick_color_with_renderer<R>(
+    pub(crate) fn pick_color_with_renderer(
         niri: &Niri,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         pos: Point<i32, Physical>,
         scale: Scale<f64>,
-    ) -> Option<PickedColor>
-    where
-        R: NiriRenderer + Offscreen<R::NiriTextureId>,
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) -> Option<PickedColor> {
         let size = Size::<i32, Physical>::from((1, 1));
 
         let ctx = RenderCtx {

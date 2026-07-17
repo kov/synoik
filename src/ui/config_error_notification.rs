@@ -15,8 +15,8 @@ use smithay::utils::{Point, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
@@ -129,11 +129,11 @@ impl ConfigErrorNotification {
         !matches!(self.state, State::Hidden)
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-    ) -> Option<TextureRenderElement<R::TextureId>> {
+    ) -> Option<TextureRenderElement<VkTexture>> {
         if matches!(self.state, State::Hidden) {
             return None;
         }
@@ -165,7 +165,7 @@ impl ConfigErrorNotification {
         let location = Point::from((x, y));
         let location = location.to_physical_precise_round(scale).to_logical(scale);
 
-        let buffer: TextureBuffer<R::TextureId> =
+        let buffer: TextureBuffer<VkTexture> =
             TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
 
         let elem = TextureRenderElement::from_texture_buffer(

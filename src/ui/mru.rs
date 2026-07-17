@@ -32,7 +32,6 @@ use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::VkTexture;
@@ -108,24 +107,24 @@ pub enum MruCloseRequest {
 }
 
 niri_render_elements! {
-    ThumbnailRenderElement<R> => {
-        LayoutElement = LayoutElementRenderElement<R>,
-        ClippedSurface = ClippedSurfaceRenderElement<R>,
+    ThumbnailRenderElement => {
+        LayoutElement = LayoutElementRenderElement,
+        ClippedSurface = ClippedSurfaceRenderElement,
         Border = BorderRenderElement,
     }
 }
 
 niri_render_elements! {
-    WindowMruUiRenderElement<R> => {
+    WindowMruUiRenderElement => {
         SolidColor = SolidColorRenderElement,
         // CPU-rendered title/scope-panel text, uploaded through the active renderer so it draws on
         // GLES and the owned Vulkan renderer alike (the M1 escape hatch: TextureRenderElement impls
         // RenderElement<R> for any R: Renderer<TextureId = T>).
-        UiTexture = TextureRenderElement<R::TextureId>,
+        UiTexture = TextureRenderElement<VkTexture>,
         GradientFade = GradientFadeTextureRenderElement<VkTexture>,
         FocusRing = FocusRingRenderElement,
-        Offscreen = OffscreenRenderElement<VkTexture>,
-        Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement<R>>>,
+        Offscreen = OffscreenRenderElement,
+        Thumbnail = RelocateRenderElement<RescaleRenderElement<ThumbnailRenderElement>>,
     }
 }
 
@@ -171,7 +170,7 @@ struct Inner {
     backdrop_buffers: RefCell<HashMap<Output, SolidColorBuffer>>,
 
     /// Offscreen buffer for the closing fade animation on the main output.
-    offscreen_vk: OffscreenBuffer<VkTexture>,
+    offscreen_vk: OffscreenBuffer,
 }
 
 #[derive(Debug)]
@@ -337,16 +336,16 @@ impl Thumbnail {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render<R: NiriRenderer>(
+    fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         config: &niri_config::RecentWindows,
         mapped: &Mapped,
         preview_geo: Rectangle<f64, Logical>,
         scale: f64,
         is_active: bool,
         bob_y: f64,
-        push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
+        push: &mut dyn FnMut(WindowMruUiRenderElement),
     ) {
         let _span = tracy_client::span!("Thumbnail::render");
 
@@ -483,7 +482,8 @@ impl Thumbnail {
             // title that fits gets a no-op cutoff, so this is safe to take unconditionally; the
             // plain (hard-clipped) texture below is only for when the upload fails.
             let mut pushed = false;
-            if let Some(vk) = ctx.try_as_vulkan() {
+            {
+                let vk = ctx.r();
                 if let Ok(buffer) = TextureBuffer::from_memory_buffer(vk.renderer, &texture) {
                     let elem = TextureRenderElement::from_texture_buffer(
                         buffer,
@@ -1109,12 +1109,12 @@ impl WindowMruUi {
         }
     }
 
-    pub fn render_output<R: NiriRenderer>(
+    pub fn render_output(
         &self,
         niri: &Niri,
         output: &Output,
-        mut ctx: RenderCtx<R>,
-        push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
+        mut ctx: RenderCtx,
+        push: &mut dyn FnMut(WindowMruUiRenderElement),
     ) {
         let (inner, progress) = match &self.state {
             UiState::Closed { .. } => return,
@@ -1162,7 +1162,8 @@ impl WindowMruUi {
         if *output == inner.output && alpha < 1. {
             let scale = Scale::from(output.current_scale().fractional_scale());
 
-            if let Some(mut vctx) = ctx.try_as_vulkan() {
+            {
+                let mut vctx = ctx.r();
                 let mut elems = Vec::new();
                 inner.render(niri, vctx.r(), &mut |elem| elems.push(elem));
                 elems.push(WindowMruUiRenderElement::SolidColor(render_backdrop(1.)));
@@ -1563,11 +1564,11 @@ impl Inner {
         })
     }
 
-    fn render<R: NiriRenderer>(
+    fn render(
         &self,
         niri: &Niri,
-        mut ctx: RenderCtx<R>,
-        push: &mut dyn FnMut(WindowMruUiRenderElement<R>),
+        mut ctx: RenderCtx,
+        push: &mut dyn FnMut(WindowMruUiRenderElement),
     ) {
         let output_size = output_size(&self.output);
         let scale = self.output.current_scale().fractional_scale();

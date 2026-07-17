@@ -62,9 +62,9 @@ use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::offscreen::OffscreenData;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -113,8 +113,8 @@ const OVERVIEW_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
 pub struct SizeFrac;
 
 niri_render_elements! {
-    LayoutElementRenderElement<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
+    LayoutElementRenderElement => {
+        Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
         SolidColor = SolidColorRenderElement,
         BackgroundEffect = BackgroundEffectElement,
     }
@@ -161,49 +161,49 @@ pub trait LayoutElement {
     ///
     /// The element should be rendered in such a way that its visual geometry ends up at the given
     /// location.
-    fn render<R: NiriRenderer>(
+    fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
         xray_pos: XrayPos,
-        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         self.render_popups(ctx.r(), location, scale, alpha, xray_pos, push);
         self.render_normal(ctx.r(), location, scale, alpha, push);
     }
 
     /// Renders the non-popup parts of the element.
-    fn render_normal<R: NiriRenderer>(
+    fn render_normal(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         let _ = (ctx, location, scale, alpha, push);
     }
 
     /// Renders the popups of the element.
-    fn render_popups<R: NiriRenderer>(
+    fn render_popups(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
         xray_pos: XrayPos,
-        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         let _ = (ctx, location, scale, alpha, xray_pos, push);
     }
 
     /// Renders the background effect behind the main surface of the element.
     #[allow(clippy::too_many_arguments)]
-    fn render_background_effect<R: NiriRenderer>(
+    fn render_background_effect(
         &self,
-        _ctx: RenderCtx<R>,
+        _ctx: RenderCtx,
         _geometry: Rectangle<f64, Logical>,
         _scale: f64,
         _clip_to_geometry: bool,
@@ -5076,11 +5076,11 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    pub fn render_interactive_move_for_output<R: NiriRenderer>(
+    pub fn render_interactive_move_for_output(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         output: &Output,
-        push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement<R>>),
+        push: &mut dyn FnMut(RescaleRenderElement<TileRenderElement>),
     ) {
         if self.update_render_elements_time != self.clock.now() {
             error!("clock moved between updating render elements and rendering");

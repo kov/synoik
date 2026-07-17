@@ -7,14 +7,16 @@ use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _};
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
 
-use crate::render_helpers::renderer::NiriRenderer;
+use self::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
@@ -45,36 +47,21 @@ pub mod xray;
 /// A rendering context.
 ///
 /// Bundles together things needed by most rendering code.
-pub struct RenderCtx<'a, R> {
-    pub renderer: &'a mut R,
+pub struct RenderCtx<'a> {
+    pub renderer: &'a mut VulkanRenderer,
     pub target: RenderTarget,
     pub xray: Option<&'a Xray>,
 }
 
-impl<'a, R> RenderCtx<'a, R> {
+impl<'a> RenderCtx<'a> {
     /// Reborrows this context with a smaller lifetime.
     #[inline]
-    pub fn r<'b>(&'b mut self) -> RenderCtx<'b, R> {
+    pub fn r<'b>(&'b mut self) -> RenderCtx<'b> {
         RenderCtx {
             renderer: self.renderer,
             target: self.target,
             xray: self.xray,
         }
-    }
-}
-
-impl<'a, R: crate::render_helpers::renderer::AsVulkanRenderer> RenderCtx<'a, R> {
-    /// Reborrows this context as a concrete `VulkanRenderer` context, if the renderer is the owned
-    /// Vulkan renderer. Returns `None` otherwise, so Vulkan-only render paths (e.g. the resize
-    /// crossfade) can specialize and fall back elsewhere.
-    pub fn try_as_vulkan<'b>(
-        &'b mut self,
-    ) -> Option<RenderCtx<'b, crate::render_helpers::vulkan::VulkanRenderer>> {
-        Some(RenderCtx {
-            renderer: self.renderer.try_as_vulkan_renderer()?,
-            target: self.target,
-            xray: self.xray,
-        })
     }
 }
 
@@ -240,11 +227,11 @@ where
     Ok(copy.to_vec())
 }
 
-pub fn render_to_dmabuf<R: NiriRenderer>(
-    renderer: &mut R,
+pub fn render_to_dmabuf(
+    renderer: &mut VulkanRenderer,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
-    elements: &[impl RenderElement<R>],
+    elements: &[impl RenderElement<VulkanRenderer>],
     states: RenderElementStates,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
@@ -268,27 +255,22 @@ pub fn render_to_dmabuf<R: NiriRenderer>(
     Ok(res.sync)
 }
 
-pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
-    renderer: &mut R,
+pub fn render_to_shm(
+    renderer: &mut VulkanRenderer,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
-    elements: &[impl RenderElement<R>],
+    elements: &[impl RenderElement<VulkanRenderer>],
     states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
 
-    // The shm pool wants `Xrgb8888` — BGRA byte order, which is what we read back below on either
-    // renderer, straight into the pool.
+    // The shm pool wants `Xrgb8888` — BGRA byte order, which is what we read back below, straight
+    // into the pool.
     //
-    // The *render target* still differs: GLES can render into a BGRA-order offscreen, while the
-    // owned Vulkan renderer's render pass is R8G8B8A8 and cannot. So ask each for the order it can
-    // actually render, and let the readback do the conversion — on Vulkan `copy_framebuffer` blits
+    // We must *render* `Abgr8888` regardless: the renderer's render pass is R8G8B8A8 and cannot
+    // target a BGRA-order offscreen. The readback does the conversion — `copy_framebuffer` blits
     // through a staging image of the requested format, so the channel swap happens on the GPU.
-    let render_fourcc = if renderer.try_as_vulkan_renderer().is_some() {
-        Fourcc::Abgr8888
-    } else {
-        Fourcc::Xrgb8888
-    };
+    let render_fourcc = Fourcc::Abgr8888;
 
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
@@ -337,8 +319,8 @@ pub fn render_to_shm<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
     .context("expected shm buffer, but didn't get one")?
 }
 
-pub fn clear_dmabuf<R: NiriRenderer>(
-    renderer: &mut R,
+pub fn clear_dmabuf(
+    renderer: &mut VulkanRenderer,
     mut dmabuf: Dmabuf,
 ) -> anyhow::Result<SyncPoint> {
     let size = dmabuf.size();

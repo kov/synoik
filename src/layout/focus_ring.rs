@@ -6,8 +6,8 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::vulkan::VulkanRenderer;
 
 #[derive(Debug)]
 pub struct FocusRing {
@@ -217,7 +217,7 @@ impl FocusRing {
 
     pub fn render(
         &self,
-        renderer: &mut impl NiriRenderer,
+        renderer: &mut VulkanRenderer,
         location: Point<f64, Logical>,
         push: &mut dyn FnMut(FocusRingRenderElement),
     ) {

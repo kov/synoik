@@ -4,8 +4,6 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
-use super::renderer::NiriRenderer;
-
 /// Renders a rounded rectangle shadow.
 ///
 /// Cloned per frame by its owners with the `Id` carried along, so clones share one damage identity.
@@ -136,11 +134,13 @@ impl ShadowRenderElement {
         self
     }
 
-    /// Whether `renderer` can draw a drop shadow. Callers skip emitting shadow elements entirely
-    /// when this is false, so this must keep reporting what the renderer in hand can actually do
-    /// rather than a blanket `true`.
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        renderer.try_as_vulkan_renderer().is_some()
+    /// Whether `renderer` can draw a drop shadow. Constant now that the Vulkan renderer — which
+    /// always can — is the only one; the callers' skip-the-shadow branches are dead and go with
+    /// this in the follow-up. See [`BorderRenderElement::has_shader`].
+    ///
+    /// [`BorderRenderElement::has_shader`]: crate::render_helpers::border::BorderRenderElement::has_shader
+    pub fn has_shader(_renderer: &mut VulkanRenderer) -> bool {
+        true
     }
 }
 

@@ -18,7 +18,6 @@ use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::gnome::{BackgroundOptions, BackgroundSettings};
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -68,15 +67,14 @@ impl Wallpaper {
     /// Returns the wallpaper covering a `view_size` workspace, corners rounded by `corner_radius`
     /// (logical units; 0 disables). `None` — letting the caller draw the solid backstop — when
     /// there is no usable picture or the upload fails.
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         view_size: Size<f64, Logical>,
         corner_radius: f64,
         scale: Scale<f64>,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
-        let vk = renderer.try_as_vulkan_renderer()?;
-        self.render_vulkan(vk, view_size, corner_radius, scale)
+        self.render_vulkan(renderer, view_size, corner_radius, scale)
     }
 
     /// The Vulkan sibling of [`render`](Self::render): uploads the decoded picture to a `VkTexture`

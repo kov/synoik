@@ -31,9 +31,9 @@ use super::{
 use crate::animation::Clock;
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::id::IdCounter;
@@ -159,10 +159,10 @@ type ExposeLayout<'a, W> = Vec<(
 type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>;
 
 niri_render_elements! {
-    WorkspaceRenderElement<R> => {
-        Scrolling = ScrollingSpaceRenderElement<R>,
-        Floating = FloatingSpaceRenderElement<R>,
-        Expose = RescaleRenderElement<TileRenderElement<R>>,
+    WorkspaceRenderElement => {
+        Scrolling = ScrollingSpaceRenderElement,
+        Floating = FloatingSpaceRenderElement,
+        Expose = RescaleRenderElement<TileRenderElement>,
     }
 }
 
@@ -1784,12 +1784,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub fn render_scrolling<R: NiriRenderer>(
+    pub fn render_scrolling(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+        push: &mut dyn FnMut(WorkspaceRenderElement),
     ) {
         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
         self.scrolling
@@ -1798,12 +1798,12 @@ impl<W: LayoutElement> Workspace<W> {
             });
     }
 
-    pub fn render_floating<R: NiriRenderer>(
+    pub fn render_floating(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+        push: &mut dyn FnMut(WorkspaceRenderElement),
     ) {
         if !self.is_floating_visible() {
             return;
@@ -1889,12 +1889,12 @@ impl<W: LayoutElement> Workspace<W> {
 
     /// Renders the workspace as the GNOME overview window picker: each tile
     /// at its slot, interpolated from its real rect by `progress`.
-    pub fn render_expose<R: NiriRenderer>(
+    pub fn render_expose(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         xray_pos: XrayPos,
         progress: f64,
-        push: &mut dyn FnMut(WorkspaceRenderElement<R>),
+        push: &mut dyn FnMut(WorkspaceRenderElement),
     ) {
         let scale = self.scale().fractional_scale();
         for (tile, rect, slot) in self.expose_layout() {
@@ -1938,9 +1938,9 @@ impl<W: LayoutElement> Workspace<W> {
             })
     }
 
-    pub fn render_shadow<R: NiriRenderer>(
+    pub fn render_shadow(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         push: &mut dyn FnMut(ShadowRenderElement),
     ) {
         self.shadow.render(renderer, Point::from((0., 0.)), push);

@@ -15,8 +15,8 @@ use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Scale, Transform};
 
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
@@ -74,11 +74,11 @@ impl HotkeyOverlay {
         self.buffers.borrow_mut().clear();
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-    ) -> Option<TextureRenderElement<R::TextureId>> {
+    ) -> Option<TextureRenderElement<VkTexture>> {
         if !self.is_open {
             return None;
         }
@@ -113,7 +113,7 @@ impl HotkeyOverlay {
         location.x = f64::max(0., location.x);
         location.y = f64::max(0., location.y);
 
-        let buffer: TextureBuffer<R::TextureId> =
+        let buffer: TextureBuffer<VkTexture> =
             TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
 
         let elem = TextureRenderElement::from_texture_buffer(

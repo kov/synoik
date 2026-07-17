@@ -13,7 +13,6 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::vulkan::{pack_mat3, VulkanError, VulkanFrame, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
@@ -81,16 +80,12 @@ pub struct XrayElement {
 
 /// Prepare an [`EffectBuffer`] through the renderer `ctx` wraps. Returns whether the offscreen is
 /// ready to be sampled by the pushed [`XrayElement`]s.
-fn prepare_effect_buffer<R: NiriRenderer>(
-    renderer: &mut R,
+fn prepare_effect_buffer(
+    renderer: &mut VulkanRenderer,
     buffer: &mut EffectBuffer,
     blur: bool,
 ) -> bool {
-    if let Some(vk) = renderer.try_as_vulkan_renderer() {
-        buffer.prepare_vulkan(vk, blur)
-    } else {
-        false
-    }
+    buffer.prepare_vulkan(renderer, blur)
 }
 
 impl Xray {
@@ -104,9 +99,9 @@ impl Xray {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         params: RenderParams,
         xray_pos: XrayPos,
         blur: bool,

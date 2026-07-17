@@ -41,10 +41,10 @@ enum ElementsVk {
     /// Contents remain unchanged.
     Unchanged(
         // Storage to avoid reallocating it every time.
-        Vec<OutputRenderElements<VulkanRenderer>>,
+        Vec<OutputRenderElements>,
     ),
     /// New contents, need to check damage and render.
-    New(Vec<OutputRenderElements<VulkanRenderer>>),
+    New(Vec<OutputRenderElements>),
 }
 
 impl Default for ElementsVk {
@@ -148,7 +148,7 @@ impl EffectBuffer {
     }
 
     /// The storage the caller pushes render elements into before [`Self::prepare_vulkan`].
-    pub fn elements_vulkan(&mut self) -> &mut Vec<OutputRenderElements<VulkanRenderer>> {
+    pub fn elements_vulkan(&mut self) -> &mut Vec<OutputRenderElements> {
         // Assume we're going to insert new elements, switch to New.
         match mem::take(&mut self.elements_vk) {
             ElementsVk::Unchanged(elements) | ElementsVk::New(elements) => {

@@ -9,8 +9,6 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::RenderElement;
-use smithay::backend::renderer::Offscreen;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
@@ -19,13 +17,14 @@ use zbus::object_server::SignalEmitter;
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{Mapped, MappedId, WindowCastRenderElements};
 
 mod pw_utils;
 use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+
+use crate::render_helpers::vulkan::VulkanRenderer;
 
 pub struct Screencasting {
     pub casts: Vec<Cast>,
@@ -428,17 +427,15 @@ impl Niri {
     ///
     /// Split out of `State::redraw_cast` so the renderer can be chosen at the call site: a Vulkan
     /// session must cast through the owned renderer, not the co-resident GLES one.
-    fn redraw_window_cast_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    fn redraw_window_cast_with(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         cast: &mut Cast,
         mapped: &Mapped,
         output: &Output,
         bbox: Rectangle<i32, Physical>,
         scale: Scale<f64>,
-    ) where
-        CastRenderElement<R>: RenderElement<R>,
-    {
+    ) {
         let mut elements = Vec::new();
         let mut pointer_location = Point::default();
 
@@ -535,14 +532,12 @@ impl Niri {
         }
     }
 
-    pub fn render_for_screen_cast<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn render_for_screen_cast(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         target_presentation_time: Duration,
-    ) where
-        CastRenderElement<R>: RenderElement<R>,
-    {
+    ) {
         let _span = tracy_client::span!("Niri::render_for_screen_cast");
 
         let weak = output.downgrade();
@@ -625,14 +620,12 @@ impl Niri {
         }
     }
 
-    pub fn render_windows_for_screen_cast<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn render_windows_for_screen_cast(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         target_presentation_time: Duration,
-    ) where
-        CastRenderElement<R>: RenderElement<R>,
-    {
+    ) {
         let _span = tracy_client::span!("Niri::render_windows_for_screen_cast");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -802,10 +795,10 @@ fn cast_params_for_output(output: &Output) -> (Size<i32, Physical>, u32) {
 }
 
 niri_render_elements! {
-    CastRenderElement<R> => {
-        Output = OutputRenderElements<R>,
-        Window = WindowCastRenderElements<R>,
-        Pointer = PointerRenderElements<R>,
-        RelocatedPointer = RelocateRenderElement<PointerRenderElements<R>>,
+    CastRenderElement => {
+        Output = OutputRenderElements,
+        Window = WindowCastRenderElements,
+        Pointer = PointerRenderElements,
+        RelocatedPointer = RelocateRenderElement<PointerRenderElements>,
     }
 }

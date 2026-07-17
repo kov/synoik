@@ -241,7 +241,7 @@ where
     r.map_texture(&mapping).expect("map_texture").to_vec()
 }
 
-/// The M2 seam: drive a scene through the real `OutputRenderElements<VulkanRenderer>` enum (whose
+/// The M2 seam: drive a scene through the real `OutputRenderElements` enum (whose
 /// `RenderElement<VulkanRenderer>` arm the macro now emits) and assert it matches the Pixman oracle
 /// drawing the same solids bare. This exercises the generic enum dispatch — not just the leaf
 /// element draws that [`vulkan_matches_pixman`] covers — so it proves the whole element tree can
@@ -260,7 +260,7 @@ fn vulkan_output_render_elements_match_pixman() {
 
     // Vulkan side: wrap each solid in the OutputRenderElements enum so the draw goes through the
     // macro-generated `RenderElement<VulkanRenderer>` dispatch, exactly as niri's real render path.
-    let vk_elements: Vec<OutputRenderElements<VulkanRenderer>> = solid_scene()
+    let vk_elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
         .map(OutputRenderElements::SolidColor)
         .collect();
@@ -269,10 +269,9 @@ fn vulkan_output_render_elements_match_pixman() {
         .expect("vulkan offscreen");
     let vk_pixels = render_elements_into(&mut vk, &mut vk_target, &vk_elements);
 
-    // Pixman oracle: the same solids, bare. Pixman is not a `NiriRenderer` (it does not implement
-    // `AsVulkanRenderer`), so it can't hold `OutputRenderElements`; but the enum arm
-    // only delegates to these leaf draws, so a bare-vs-enum match confirms the dispatch is
-    // transparent.
+    // Pixman oracle: the same solids, bare. `OutputRenderElements` only implements
+    // `RenderElement<VulkanRenderer>`, so Pixman can't hold one; but the enum arm only delegates to
+    // these leaf draws, so a bare-vs-enum match confirms the dispatch is transparent.
     let px_elements = solid_scene();
     let mut px = PixmanRenderer::new().expect("pixman renderer");
     let mut px_target = px
@@ -817,7 +816,7 @@ fn vulkan_offscreen_sampleable_roundtrip() {
     let mut a = vk
         .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
         .expect("offscreen A");
-    let a_elements: Vec<OutputRenderElements<VulkanRenderer>> = solid_scene()
+    let a_elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
         .map(OutputRenderElements::SolidColor)
         .collect();
@@ -872,7 +871,7 @@ fn vulkan_offscreen_sampleable_roundtrip() {
 /// niri's `OffscreenBuffer` renders a subtree into an offscreen texture and hands back an element
 /// that re-samples it (window open/close + alpha-fade animations). Drive that whole machinery
 /// through the owned Vulkan renderer — `OffscreenBuffer::render` create_buffer→bind→render→
-/// make-sampleable, then `OffscreenRenderElement<VkTexture>`'s Vulkan draw — and assert the
+/// make-sampleable, then `OffscreenRenderElement`'s Vulkan draw — and assert the
 /// snapshot reproduces a direct render of the same scene.
 #[test]
 fn vulkan_offscreen_snapshot() {
@@ -892,7 +891,7 @@ fn vulkan_offscreen_snapshot() {
 
     // Snapshot: render the same scene into an OffscreenBuffer (cleared transparent), then draw the
     // element it returns — which samples the offscreen — over a CLEAR background.
-    let buffer = OffscreenBuffer::<VkTexture>::default();
+    let buffer = OffscreenBuffer::default();
     let (elem, _sync, _data) = buffer
         .render(&mut vk, Scale::from(1.0), &solid_scene())
         .expect("offscreen snapshot render");

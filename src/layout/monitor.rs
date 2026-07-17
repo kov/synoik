@@ -24,11 +24,10 @@ use crate::animation::{Animation, Clock};
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
-use crate::render_helpers::vulkan::VkTexture;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
@@ -211,8 +210,8 @@ impl<'a, W: LayoutElement> Clone for MonitorAddWindowTarget<'a, W> {
 }
 
 niri_render_elements! {
-    MonitorInnerRenderElement<R> => {
-        Workspace = CropRenderElement<WorkspaceRenderElement<R>>,
+    MonitorInnerRenderElement => {
+        Workspace = CropRenderElement<WorkspaceRenderElement>,
         InsertHint = CropRenderElement<InsertHintRenderElement>,
         // Insert hint between workspaces, and the thumbnail-strip indicator.
         Ring = InsertHintRenderElement,
@@ -223,8 +222,8 @@ niri_render_elements! {
     }
 }
 
-pub type MonitorRenderElement<R> =
-    RelocateRenderElement<RescaleRenderElement<MonitorInnerRenderElement<R>>>;
+pub type MonitorRenderElement =
+    RelocateRenderElement<RescaleRenderElement<MonitorInnerRenderElement>>;
 
 impl WorkspaceSwitch {
     pub fn current_idx(&self) -> f64 {
@@ -1920,10 +1919,10 @@ impl<W: LayoutElement> Monitor<W> {
         ws.render_above_top_layer()
     }
 
-    pub fn render_insert_hint_between_workspaces<R: NiriRenderer>(
+    pub fn render_insert_hint_between_workspaces(
         &self,
-        renderer: &mut R,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
+        renderer: &mut VulkanRenderer,
+        push: &mut dyn FnMut(MonitorRenderElement),
     ) {
         if self.options.layout.insert_hint.off {
             return;
@@ -1948,11 +1947,11 @@ impl<W: LayoutElement> Monitor<W> {
     /// Renders the overview workspace thumbnails strip: each workspace in
     /// miniature (windows at their real positions over the wallpaper), the
     /// active one wrapped by the indicator ring.
-    pub fn render_thumbnails<R: NiriRenderer>(
+    pub fn render_thumbnails(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         wallpaper: Option<&Wallpaper>,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
+        push: &mut dyn FnMut(MonitorRenderElement),
     ) {
         let Some(strip) = self.thumbnail_strip() else {
             return;
@@ -2070,11 +2069,11 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    pub fn render_workspaces<R: NiriRenderer>(
+    pub fn render_workspaces(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         focus_ring: bool,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
+        push: &mut dyn FnMut(MonitorRenderElement),
     ) {
         let _span = tracy_client::span!("Monitor::render_workspaces");
 
@@ -2194,10 +2193,10 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    pub fn render_workspace_shadows<R: NiriRenderer>(
+    pub fn render_workspace_shadows(
         &self,
-        renderer: &mut R,
-        push: &mut dyn FnMut(MonitorRenderElement<R>),
+        renderer: &mut VulkanRenderer,
+        push: &mut dyn FnMut(MonitorRenderElement),
     ) {
         let Some(progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
             return;

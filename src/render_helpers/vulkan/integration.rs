@@ -1,5 +1,5 @@
-//! The niri-side renderer trait impls that make [`VulkanRenderer`] a [`NiriRenderer`]: the client
-//! buffer imports ([`ImportMemWl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
+//! The niri-side renderer trait impls for [`VulkanRenderer`]: the client buffer imports
+//! ([`ImportMemWl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
 //!
 //! shm ([`ImportMemWl`]) and single-plane LINEAR dmabuf ([`ImportDma`]) client buffers import for
 //! real; clients use dmabuf/shm on this stack. There is no `ImportEgl` impl because smithay only
@@ -177,13 +177,6 @@ impl ImportDma for VulkanRenderer {
 }
 
 impl ImportDmaWl for VulkanRenderer {}
-
-/// Compile-time proof that [`VulkanRenderer`] now satisfies the (blanket) [`NiriRenderer`] core, so
-/// it can flow through the generic render-element path.
-const _: fn() = || {
-    fn assert_niri_renderer<R: crate::render_helpers::renderer::NiriRenderer>() {}
-    assert_niri_renderer::<VulkanRenderer>();
-};
 
 #[cfg(test)]
 mod tests {

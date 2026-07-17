@@ -27,7 +27,6 @@ use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::{DebugFlags, ImportDma};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -60,9 +59,9 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
+use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
@@ -2813,26 +2812,21 @@ fn suspend() -> anyhow::Result<()> {
 }
 
 /// Composite `output`'s render elements through `renderer` and hand the frame to `surface`'s
-/// `DrmCompositor` for scanout. Renderer-generic so the GLES `MultiRenderer` and the owned
-/// `VulkanRenderer` share one present path — `DrmCompositor` is renderer-agnostic at the struct
-/// level and `render_frame` is generic over `R: Renderer + Bind<Dmabuf>` (both satisfied by
-/// `NiriRenderer`). The `OutputRenderElements<R>: RenderElement<R>` bound restricts `R` to the
-/// renderers the element macro emits arms for (GLES/Tty and, under the feature, Vulkan).
+/// `DrmCompositor` for scanout. This was generic so the GLES `MultiRenderer` and the owned
+/// `VulkanRenderer` could share one present path; only the latter is left. `DrmCompositor` stays
+/// renderer-agnostic at the struct level and its `render_frame` is generic over
+/// `R: Renderer + Bind<Dmabuf>`, which `VulkanRenderer` satisfies.
 #[allow(clippy::too_many_arguments)]
-fn render_surface_with<R>(
+fn render_surface_with(
     niri: &mut Niri,
     output: &Output,
-    renderer: &mut R,
+    renderer: &mut VulkanRenderer,
     surface: &mut Surface,
     config: &Rc<RefCell<Config>>,
     flags: FrameFlags,
     force_full_damage: bool,
     target_presentation_time: Duration,
-) -> RenderResult
-where
-    R: NiriRenderer,
-    OutputRenderElements<R>: RenderElement<R>,
-{
+) -> RenderResult {
     let mut rv = RenderResult::Skipped;
 
     // Render the elements.

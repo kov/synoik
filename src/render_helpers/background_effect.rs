@@ -10,7 +10,6 @@ use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -148,9 +147,9 @@ impl BackgroundEffect {
         self.options.is_visible()
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -281,8 +280,8 @@ pub fn damage_surface(states: &SurfaceData) {
 // Silence, Clippy
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
-pub fn render_for_tile<R: NiriRenderer>(
-    ctx: RenderCtx<R>,
+pub fn render_for_tile(
+    ctx: RenderCtx,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,

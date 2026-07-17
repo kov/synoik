@@ -11,18 +11,17 @@ use crate::animation::Animation;
 use crate::niri_render_elements;
 use crate::render_helpers::custom_anim::CustomAnimRenderElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
-use crate::render_helpers::vulkan::VkTexture;
 
 #[derive(Debug)]
 pub struct OpenAnimation {
     anim: Animation,
     random_seed: f32,
-    buffer_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
+    buffer_vk: OffscreenBuffer,
 }
 
 niri_render_elements! {
     OpeningWindowRenderElement => {
-        Offscreen = RelocateRenderElement<RescaleRenderElement<OffscreenRenderElement<VkTexture>>>,
+        Offscreen = RelocateRenderElement<RescaleRenderElement<OffscreenRenderElement>>,
         Shader = CustomAnimRenderElement,
     }
 }

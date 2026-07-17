@@ -346,10 +346,7 @@ fn open_mru(f: &mut Fixture, output: &Output) {
 }
 
 /// [`open_mru`], returning the `WindowMruUiRenderElement`s the switcher contributes to the frame.
-fn open_mru_and_collect(
-    f: &mut Fixture,
-    output: &Output,
-) -> Vec<WindowMruUiRenderElement<VulkanRenderer>> {
+fn open_mru_and_collect(f: &mut Fixture, output: &Output) -> Vec<WindowMruUiRenderElement> {
     open_mru(f, output);
 
     let state = f.niri_state();
@@ -884,23 +881,14 @@ const TRANSFORM_CLEAR: [u8; 4] = [0, 0, 0, 0];
 /// Import `pattern` (an `out_size`-shaped `Abgr8888` buffer... actually `tex`-shaped) as a texture
 /// with buffer transform `src_transform`, render it full-screen through `render_texture_from_to`
 /// at output transform `out_transform`, and return the four (inset) corner pixels of the readback.
-/// Generic so it drives GLES and the Vulkan renderer identically.
-fn buffer_transform_corners<R, T>(
-    renderer: &mut R,
+fn buffer_transform_corners(
+    renderer: &mut VulkanRenderer,
     pattern: &[u8],
     tex: Size<i32, BufferCoord>,
     out_size: Size<i32, Physical>,
     src_transform: Transform,
     out_transform: Transform,
-) -> [[u8; 4]; 4]
-where
-    R: Renderer<TextureId = T>
-        + smithay::backend::renderer::Offscreen<T>
-        + ExportMem
-        + smithay::backend::renderer::ImportMem,
-    T: smithay::backend::renderer::Texture + Clone + 'static,
-    R::Error: std::fmt::Debug + Send + Sync + 'static,
-{
+) -> [[u8; 4]; 4] {
     use smithay::backend::renderer::element::Kind;
 
     use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -1225,8 +1213,7 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
-                niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
 
             // Bind the scanout dmabuf as the render target and composite straight into it.
             let mut fb = vk
@@ -1372,8 +1359,7 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
-                niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
 
             // Bind the Argb dmabuf: `Bind<Dmabuf>` takes the present-blit path (shadow + blit).
             let mut fb = vk
@@ -2350,8 +2336,7 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
                 target: RenderTarget::ScreenCapture,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements<VulkanRenderer>> =
-                niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
 
             // The exact damage-tracker flow the screencopy path runs: `damage_output` to derive the
             // element states, then `render_to_dmabuf` (which binds + `render_output_with_states`).

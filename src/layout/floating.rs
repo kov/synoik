@@ -17,7 +17,6 @@ use super::{
 use crate::animation::{Animation, Clock};
 use crate::gnome::TileSide;
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::transaction::TransactionBlocker;
@@ -70,8 +69,8 @@ pub struct FloatingSpace<W: LayoutElement> {
 }
 
 niri_render_elements! {
-    FloatingSpaceRenderElement<R> => {
-        Tile = TileRenderElement<R>,
+    FloatingSpaceRenderElement => {
+        Tile = TileRenderElement,
         ClosingWindow = ClosingWindowRenderElement,
     }
 }
@@ -1178,13 +1177,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         xray_pos: XrayPos,
         view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
-        push: &mut dyn FnMut(FloatingSpaceRenderElement<R>),
+        push: &mut dyn FnMut(FloatingSpaceRenderElement),
     ) {
         let scale = Scale::from(self.scale);
 
@@ -1192,7 +1191,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         //
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         for closing in self.closing_windows.iter().rev() {
-            if let Some(vctx) = ctx.try_as_vulkan() {
+            {
+                let vctx = ctx.r();
                 if let Some(elem) =
                     closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)
                 {

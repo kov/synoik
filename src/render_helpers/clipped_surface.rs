@@ -6,11 +6,10 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::damage::ExtraDamage;
-use super::renderer::NiriRenderer;
 
 #[derive(Debug)]
-pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
-    inner: WaylandSurfaceRenderElement<R>,
+pub struct ClippedSurfaceRenderElement {
+    inner: WaylandSurfaceRenderElement<VulkanRenderer>,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -22,12 +21,12 @@ pub struct RoundedCornerDamage {
     corner_radius: CornerRadius,
 }
 
-impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
+impl ClippedSurfaceRenderElement {
     /// Build a clipped-surface element. The renderer clips in its own pipeline
     /// (`clipped_texture.frag`); the `RenderElement` draw folds the geometry and radius into that
     /// pipeline's push constants.
     pub fn new(
-        elem: WaylandSurfaceRenderElement<R>,
+        elem: WaylandSurfaceRenderElement<VulkanRenderer>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
         corner_radius: CornerRadius,
@@ -41,7 +40,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
     }
 
     pub fn will_clip(
-        elem: &WaylandSurfaceRenderElement<R>,
+        elem: &WaylandSurfaceRenderElement<VulkanRenderer>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
         corner_radius: CornerRadius,
@@ -91,7 +90,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
     }
 }
 
-impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
+impl Element for ClippedSurfaceRenderElement {
     fn id(&self) -> &Id {
         self.inner.id()
     }
@@ -170,7 +169,7 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
 // (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline.
 use crate::render_helpers::vulkan::{ClipParams, VulkanError, VulkanFrame, VulkanRenderer};
 
-impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement<VulkanRenderer> {
+impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
     fn draw(
         &self,
         frame: &mut VulkanFrame<'_, '_>,

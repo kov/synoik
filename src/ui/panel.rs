@@ -27,8 +27,8 @@ use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Logical height of the panel. GNOME's is `2.2em` at an `11pt` base font,
@@ -134,11 +134,11 @@ impl Panel {
         }
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-    ) -> Option<TextureRenderElement<R::TextureId>> {
+    ) -> Option<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
         let width_px = to_physical_precise_round(scale, width);
@@ -160,7 +160,7 @@ impl Panel {
 
         // Upload the CPU-rendered bar through the active renderer's `ImportMem`, so it draws on any
         // renderer (including the owned Vulkan one) rather than only GLES.
-        let buffer: TextureBuffer<R::TextureId> =
+        let buffer: TextureBuffer<VkTexture> =
             TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
 
         let elem = TextureRenderElement::from_texture_buffer(

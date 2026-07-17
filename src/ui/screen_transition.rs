@@ -7,9 +7,8 @@ use smithay::utils::{Scale, Transform};
 use crate::animation::Clock;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::VkTexture;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderTarget;
 
 pub const DELAY: Duration = Duration::from_millis(250);
@@ -109,9 +108,9 @@ impl ScreenTransition {
     /// The element to crossfade from, or `None` if the frozen screen can't be drawn — a failed
     /// Vulkan upload. Callers must skip the crossfade rather than substitute anything: there is no
     /// second copy of the frozen screen.
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         target: RenderTarget,
     ) -> Option<CapturedTextureRenderElement> {
         let alpha = self.alpha();
@@ -120,7 +119,6 @@ impl ScreenTransition {
         let FrozenScreen::Neutral { buffers, vk } = &self.from;
 
         // Upload this target's captured neutral buffer once and draw that.
-        let renderer = renderer.try_as_vulkan_renderer()?;
         if vk.borrow()[idx].is_none() {
             match TextureBuffer::from_memory_buffer(renderer, &buffers[idx]) {
                 Ok(tb) => vk.borrow_mut()[idx] = Some(tb),

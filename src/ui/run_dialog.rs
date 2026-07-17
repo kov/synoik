@@ -24,9 +24,9 @@ use smithay::utils::{Point, Transform};
 
 use crate::niri_render_elements;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 16;
@@ -56,9 +56,9 @@ pub struct RunDialog {
 type BuffersByScale = HashMap<NotNan<f64>, (u64, Option<MemoryBuffer>)>;
 
 niri_render_elements! {
-    RunDialogRenderElement<R> => {
+    RunDialogRenderElement => {
         // A plain memory-uploaded texture drawn through the active renderer's `ImportMem`.
-        Texture = TextureRenderElement<R::TextureId>,
+        Texture = TextureRenderElement<VkTexture>,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -193,11 +193,11 @@ impl RunDialog {
         self.revision += 1;
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-        push: &mut dyn FnMut(RunDialogRenderElement<R>),
+        push: &mut dyn FnMut(RunDialogRenderElement),
     ) {
         if !self.open {
             return;

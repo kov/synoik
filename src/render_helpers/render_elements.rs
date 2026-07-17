@@ -1,41 +1,24 @@
 // Generates the element enums the render tree passes around: an `Element` impl that forwards to
 // each variant, plus the `RenderElement<VulkanRenderer>` impl and the `From` impls.
+//
+// These enums used to come in a `$name<R>` flavour too, back when the tree was generic over the
+// renderer. There is only one renderer now, so every variant type names it concretely.
 #[macro_export]
 macro_rules! niri_render_elements {
-    // The two callable variants: with <R> and without <R>. They include From impls because nested
-    // repetitions ($type and $variant with + and $R with ?) don't work properly.
-    ($name:ident<R> => { $($variant:ident = $type:ty),+ $(,)? }) => {
-        $crate::niri_render_elements!(@impl $name () ($name<R>) => { $($variant = $type),+ });
-
-        $(impl<R: $crate::render_helpers::renderer::NiriRenderer> From<$type> for $name<R> {
-            fn from(x: $type) -> Self {
-                Self::$variant(x)
-            }
-        })+
-    };
-
     ($name:ident => { $($variant:ident = $type:ty),+ $(,)? }) => {
-        $crate::niri_render_elements!(@impl $name ($name) () => { $($variant = $type),+ });
+        #[allow(clippy::large_enum_variant)]
+        #[derive(Debug)]
+        pub enum $name {
+            $($variant($type)),+
+        }
 
         $(impl From<$type> for $name {
             fn from(x: $type) -> Self {
                 Self::$variant(x)
             }
         })+
-    };
 
-    // The internal variant that generates most of the code. $name_no_R and $name_R are necessary
-    // for the impl RenderElement<SomeRenderer> for $name<SomeRenderer>: since $R does not appear
-    // in this line, we cannot condition based on $R like elsewhere, so we condition on duplicate
-    // names instead. Like this: $($name_R<SomeRenderer>)? $($name_no_R)? so only one is chosen.
-    (@impl $name:ident ($($name_no_R:ident)?) ($($name_R:ident<$R:ident>)?) => { $($variant:ident = $type:ty),+ }) => {
-        #[allow(clippy::large_enum_variant)]
-        #[derive(Debug)]
-        pub enum $name$(<$R: $crate::render_helpers::renderer::NiriRenderer>)? {
-            $($variant($type)),+
-        }
-
-        impl$(<$R: $crate::render_helpers::renderer::NiriRenderer>)? smithay::backend::renderer::element::Element for $name$(<$R>)? {
+        impl smithay::backend::renderer::element::Element for $name {
             fn id(&self) -> &smithay::backend::renderer::element::Id {
                 match self {
                     $($name::$variant(elem) => elem.id()),+
@@ -102,7 +85,7 @@ macro_rules! niri_render_elements {
         }
 
         impl smithay::backend::renderer::element::RenderElement<$crate::render_helpers::vulkan::VulkanRenderer>
-            for $($name_R<$crate::render_helpers::vulkan::VulkanRenderer>)? $($name_no_R)?
+            for $name
         {
             fn draw(
                 &self,

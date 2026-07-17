@@ -16,9 +16,9 @@ use smithay::utils::{Point, Transform};
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
@@ -36,8 +36,8 @@ pub struct ExitConfirmDialog {
 }
 
 niri_render_elements! {
-    ExitConfirmDialogRenderElement<R> => {
-        Texture = RescaleRenderElement<TextureRenderElement<R::TextureId>>,
+    ExitConfirmDialogRenderElement => {
+        Texture = RescaleRenderElement<TextureRenderElement<VkTexture>>,
         SolidColor = SolidColorRenderElement,
     }
 }
@@ -145,11 +145,11 @@ impl ExitConfirmDialog {
         matches!(self.state, State::Showing(_) | State::Hiding(_))
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-        push: &mut dyn FnMut(ExitConfirmDialogRenderElement<R>),
+        push: &mut dyn FnMut(ExitConfirmDialogRenderElement),
     ) {
         let (value, clamped_value) = match &self.state {
             State::Hidden => return,

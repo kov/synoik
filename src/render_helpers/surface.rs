@@ -1,24 +1,22 @@
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
-use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Point, Scale};
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
-pub fn push_elements_from_surface_tree<R>(
-    renderer: &mut R,
+use crate::render_helpers::vulkan::VulkanRenderer;
+
+pub fn push_elements_from_surface_tree(
+    renderer: &mut VulkanRenderer,
     surface: &WlSurface,
     // Fractional scale expects surface buffers to be aligned to physical pixels.
     location: Point<i32, Physical>,
     scale: Scale<f64>,
     alpha: f32,
     kind: Kind,
-    push: &mut dyn FnMut(WaylandSurfaceRenderElement<R>),
-) where
-    R: Renderer + ImportAll,
-    R::TextureId: Clone + 'static,
-{
+    push: &mut dyn FnMut(WaylandSurfaceRenderElement<VulkanRenderer>),
+) {
     let _span = tracy_client::span!("push_elements_from_surface_tree");
 
     let location = location.to_f64();

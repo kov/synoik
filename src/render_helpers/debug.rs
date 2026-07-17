@@ -4,14 +4,13 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Color32F;
 use smithay::utils::Scale;
 
-use super::renderer::NiriRenderer;
 use super::solid_color::SolidColorRenderElement;
 use crate::niri::OutputRenderElements;
 
-pub fn push_opaque_regions<R: NiriRenderer>(
-    elem: &OutputRenderElements<R>,
+pub fn push_opaque_regions(
+    elem: &OutputRenderElements,
     scale: Scale<f64>,
-    push: &mut dyn FnMut(OutputRenderElements<R>),
+    push: &mut dyn FnMut(OutputRenderElements),
 ) {
     // HACK
     if format!("{elem:?}").contains("ExtraDamage") {
@@ -50,9 +49,9 @@ pub fn push_opaque_regions<R: NiriRenderer>(
     }
 }
 
-pub fn draw_damage<R: NiriRenderer>(
+pub fn draw_damage(
     damage_tracker: &mut OutputDamageTracker,
-    elements: &mut Vec<OutputRenderElements<R>>,
+    elements: &mut Vec<OutputRenderElements>,
 ) {
     let _span = tracy_client::span!("draw_damage");
 

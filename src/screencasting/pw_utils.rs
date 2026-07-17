@@ -40,7 +40,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::Offscreen;
+use smithay::backend::renderer::ExportMem;
 use smithay::output::{Output, OutputModeSource};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
@@ -50,7 +50,7 @@ use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download_as, render_to_dmabuf,
 };
@@ -1074,17 +1074,14 @@ impl Cast {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn dequeue_buffer_and_render<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn dequeue_buffer_and_render(
         &mut self,
-        renderer: &mut R,
-        mut elements: &[CastRenderElement<R>],
-        cursor_data: &CursorData<CastRenderElement<R>>,
+        renderer: &mut VulkanRenderer,
+        mut elements: &[CastRenderElement],
+        cursor_data: &CursorData<CastRenderElement>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
-    ) -> bool
-    where
-        CastRenderElement<R>: RenderElement<R>,
-    {
+    ) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         let CastState::Ready {
@@ -1191,7 +1188,7 @@ impl Cast {
         }
     }
 
-    pub fn dequeue_buffer_and_clear<R: NiriRenderer>(&mut self, renderer: &mut R) -> bool {
+    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut VulkanRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1507,10 +1504,10 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
     }
 }
 
-unsafe fn add_cursor_metadata<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
-    renderer: &mut R,
+unsafe fn add_cursor_metadata(
+    renderer: &mut VulkanRenderer,
     spa_buffer: *mut spa_buffer,
-    cursor_data: &CursorData<impl RenderElement<R>>,
+    cursor_data: &CursorData<impl RenderElement<VulkanRenderer>>,
     redraw: bool,
 ) {
     unsafe {

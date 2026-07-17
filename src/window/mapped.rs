@@ -31,10 +31,10 @@ use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
 use crate::utils::id::IdCounter;
@@ -205,8 +205,8 @@ pub struct Mapped {
 }
 
 niri_render_elements! {
-    WindowCastRenderElements<R> => {
-        Layout = LayoutElementRenderElement<R>,
+    WindowCastRenderElements => {
+        Layout = LayoutElementRenderElement,
         // Blocked-out window with rounded corners.
         Border = BorderRenderElement,
     }
@@ -525,11 +525,11 @@ impl Mapped {
         &self.last_interactive_resize_start
     }
 
-    pub fn render_for_screen_cast<R: NiriRenderer>(
+    pub fn render_for_screen_cast(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         scale: Scale<f64>,
-        push: &mut dyn FnMut(WindowCastRenderElements<R>),
+        push: &mut dyn FnMut(WindowCastRenderElements),
     ) {
         let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
 
@@ -716,13 +716,13 @@ impl LayoutElement for Mapped {
         self.window.is_in_input_region(&surface_local)
     }
 
-    fn render_normal<R: NiriRenderer>(
+    fn render_normal(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
             let mut buffer = self.block_out_buffer.borrow_mut();
@@ -733,7 +733,7 @@ impl LayoutElement for Mapped {
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<R>| push(elem.into());
+            let mut push = |elem: WaylandSurfaceRenderElement<VulkanRenderer>| push(elem.into());
             push_elements_from_surface_tree(
                 ctx.renderer,
                 surface,
@@ -746,14 +746,14 @@ impl LayoutElement for Mapped {
         }
     }
 
-    fn render_popups<R: NiriRenderer>(
+    fn render_popups(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
         xray_pos: XrayPos,
-        push: &mut dyn FnMut(LayoutElementRenderElement<R>),
+        push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
             return;
@@ -810,9 +810,9 @@ impl LayoutElement for Mapped {
         }
     }
 
-    fn render_background_effect<R: NiriRenderer>(
+    fn render_background_effect(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,

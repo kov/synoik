@@ -12,10 +12,10 @@ use crate::animation::Clock;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
@@ -56,8 +56,8 @@ pub struct MappedLayer {
 }
 
 niri_render_elements! {
-    LayerSurfaceRenderElement<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
+    LayerSurfaceRenderElement => {
+        Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
         SolidColor = SolidColorRenderElement,
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
@@ -184,13 +184,13 @@ impl MappedLayer {
         Point::from((0., y))
     }
 
-    pub fn render_normal<R: NiriRenderer>(
+    pub fn render_normal(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         ns: Option<usize>,
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
-        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+        push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
@@ -257,13 +257,13 @@ impl MappedLayer {
         );
     }
 
-    pub fn render_popups<R: NiriRenderer>(
+    pub fn render_popups(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         ns: Option<usize>,
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
-        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+        push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
             return;

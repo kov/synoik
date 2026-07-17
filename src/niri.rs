@@ -33,7 +33,7 @@ use smithay::backend::renderer::element::{
     RenderElementStates,
 };
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Color32F, Offscreen};
+use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
     bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
     send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
@@ -157,11 +157,11 @@ use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureRenderElement;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_shm, render_to_vec, RenderCtx, RenderTarget,
@@ -2232,14 +2232,12 @@ impl State {
     }
 
     #[cfg(feature = "dbus")]
-    fn take_screenshot_with_renderer<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    fn take_screenshot_with_renderer(
         niri: &mut Niri,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         include_cursor: bool,
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
-    ) where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) {
         let on_done = {
             let to_screenshot = to_screenshot.clone();
             move |path| {
@@ -3974,11 +3972,11 @@ impl Niri {
         }
     }
 
-    pub fn render_pointer<R: NiriRenderer>(
+    pub fn render_pointer(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-        push: &mut dyn FnMut(PointerRenderElements<R>),
+        push: &mut dyn FnMut(PointerRenderElements),
     ) {
         let _span = tracy_client::span!("Niri::render_pointer");
         let output_scale = output.current_scale();
@@ -4442,12 +4440,12 @@ impl Niri {
         }
     }
 
-    pub fn render_to_vec<R: NiriRenderer>(
+    pub fn render_to_vec(
         &self,
-        ctx: RenderCtx<R>,
+        ctx: RenderCtx,
         output: &Output,
         include_pointer: bool,
-    ) -> Vec<OutputRenderElements<R>> {
+    ) -> Vec<OutputRenderElements> {
         let mut elements = Vec::new();
         self.render(ctx, output, include_pointer, &mut |elem| {
             elements.push(elem)
@@ -4455,12 +4453,12 @@ impl Niri {
         elements
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         output: &Output,
         include_pointer: bool,
-        push: &mut dyn FnMut(OutputRenderElements<R>),
+        push: &mut dyn FnMut(OutputRenderElements),
     ) {
         let _span = tracy_client::span!("Niri::render");
 
@@ -4474,9 +4472,7 @@ impl Niri {
         }
 
         // Fill the xray background/backdrop capture buffers.
-        if let Some(vk_ctx) = ctx.try_as_vulkan() {
-            self.fill_xray_elements(vk_ctx, output);
-        }
+        self.fill_xray_elements(ctx.r(), output);
 
         // Reborrow to shorten lifetime to be able to put in xray.
         let mut ctx = ctx.r();
@@ -4488,12 +4484,12 @@ impl Niri {
         self.clear_xray_elements(output);
     }
 
-    fn render_inner<R: NiriRenderer>(
+    fn render_inner(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         output: &Output,
         include_pointer: bool,
-        push: &mut dyn FnMut(OutputRenderElements<R>),
+        push: &mut dyn FnMut(OutputRenderElements),
     ) {
         let state = self.output_state.get(output).unwrap();
         let output_scale = Scale::from(output.current_scale().fractional_scale());
@@ -4795,11 +4791,7 @@ impl Niri {
     /// Fill the per-target background/backdrop
     /// [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)s that the
     /// [`XrayElement`](crate::render_helpers::xray::XrayElement)s sample.
-    pub fn fill_xray_elements(
-        &self,
-        mut ctx: RenderCtx<crate::render_helpers::vulkan::VulkanRenderer>,
-        output: &Output,
-    ) {
+    pub fn fill_xray_elements(&self, mut ctx: RenderCtx, output: &Output) {
         let _span = tracy_client::span!("Niri::fill_xray_elements");
 
         // Make sure the xrayed elements themselves cannot use xray by mistake.
@@ -4907,15 +4899,15 @@ impl Niri {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_layer_normal<R: NiriRenderer>(
+    fn render_layer_normal(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
         xray_pos: XrayPos,
         for_backdrop: bool,
-        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+        push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
             let loc = geo.loc.to_f64();
@@ -4925,15 +4917,15 @@ impl Niri {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_layer_popups<R: NiriRenderer>(
+    fn render_layer_popups(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
         xray_pos: XrayPos,
         for_backdrop: bool,
-        push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+        push: &mut dyn FnMut(LayerSurfaceRenderElement),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
             let loc = geo.loc.to_f64();
@@ -5073,15 +5065,12 @@ impl Niri {
     // Two copies because the screencast arm needs an extra `CastRenderElement` bound, and `#[cfg]`
     // is not allowed on a where-clause predicate.
     #[cfg(feature = "xdp-gnome-screencast")]
-    fn render_captures_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    fn render_captures_with(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         target_presentation_time: Duration,
-    ) where
-        OutputRenderElements<R>: RenderElement<R>,
-        crate::screencasting::CastRenderElement<R>: RenderElement<R>,
-    {
+    ) {
         // Render and send to PipeWire screencast streams.
         self.render_for_screen_cast(renderer, output, target_presentation_time);
 
@@ -5095,14 +5084,12 @@ impl Niri {
     }
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
-    fn render_captures_with<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    fn render_captures_with(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         _target_presentation_time: Duration,
-    ) where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) {
         self.render_for_screencopy_with_damage(renderer, output);
     }
 
@@ -5656,13 +5643,11 @@ impl Niri {
         feedback
     }
 
-    pub fn render_for_screencopy_with_damage<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn render_for_screencopy_with_damage(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
-    ) where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
 
         let mut screencopy_state = mem::take(&mut self.screencopy_state);
@@ -5733,15 +5718,12 @@ impl Niri {
         self.screencopy_state = screencopy_state;
     }
 
-    pub fn render_for_screencopy_without_damage<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn render_for_screencopy_without_damage(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         manager: &ZwlrScreencopyManagerV1,
         screencopy: Screencopy,
-    ) -> anyhow::Result<()>
-    where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::render_for_screencopy");
 
         let output = screencopy.output();
@@ -5819,10 +5801,10 @@ impl Niri {
     }
 
     #[allow(clippy::type_complexity)]
-    fn render_for_screencopy_internal<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
-        renderer: &mut R,
+    fn render_for_screencopy_internal(
+        renderer: &mut VulkanRenderer,
         damage_tracker: &mut OutputDamageTracker,
-        elements: &[impl RenderElement<R>],
+        elements: &[impl RenderElement<VulkanRenderer>],
         states: RenderElementStates,
         screencopy: &Screencopy,
     ) -> anyhow::Result<Option<SyncPoint>> {
@@ -6030,17 +6012,14 @@ impl Niri {
             })
     }
 
-    pub fn screenshot<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn screenshot(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         write_to_disk: bool,
         include_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()>
-    where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot");
 
         self.update_render_elements(Some(output));
@@ -6070,18 +6049,15 @@ impl Niri {
             .context("error saving screenshot")
     }
 
-    pub fn screenshot_window<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn screenshot_window(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         mapped: &Mapped,
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
-    ) -> anyhow::Result<()>
-    where
-        WindowScreenshotRenderElement<R>: RenderElement<R>,
-    {
+    ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -6092,7 +6068,7 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
-        let mut elements: Vec<WindowScreenshotRenderElement<R>> = Vec::new();
+        let mut elements: Vec<WindowScreenshotRenderElement> = Vec::new();
 
         // Add pointer if requested and it's over this window.
         if show_pointer {
@@ -6249,15 +6225,12 @@ impl Niri {
     }
 
     #[cfg(feature = "dbus")]
-    pub fn screenshot_all_outputs<R: NiriRenderer + Offscreen<R::NiriTextureId>>(
+    pub fn screenshot_all_outputs(
         &mut self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
-    ) -> anyhow::Result<()>
-    where
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Niri::screenshot_all_outputs");
 
         self.update_render_elements(None);
@@ -6789,19 +6762,13 @@ impl Niri {
     /// Renders an output's `Output`-target contents into a renderer-neutral CPU buffer through the
     /// given renderer. On a Vulkan session the screen-transition crossfade composites the `Output`
     /// target through the owned renderer (which can't sample a GLES texture), so it uploads this
-    /// buffer to a `VkTexture`; capturing it through the Vulkan renderer keeps that path off GLES.
-    /// Generic so it serves both the Vulkan capture and the GLES fallback.
-    fn capture_output_neutral<R>(
+    /// buffer to a `VkTexture`.
+    fn capture_output_neutral(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         target: RenderTarget,
-    ) -> Option<MemoryBuffer>
-    where
-        R: NiriRenderer + Offscreen<R::NiriTextureId>,
-        R::NiriError: Send + Sync + 'static,
-        OutputRenderElements<R>: RenderElement<R>,
-    {
+    ) -> Option<MemoryBuffer> {
         let size = output.current_mode().unwrap().size;
         let transform = output.current_transform();
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7084,13 +7051,13 @@ impl ClientData for ClientState {
 /// applies the per-window mapping and rounded clip when it samples), pushed last so the wallpaper
 /// sits below the background-layer surfaces, matching `render_inner`'s draw order.
 /// Renderer-agnostic via [`Wallpaper::render_dual`].
-fn push_gnome_wallpaper_into_xray<R: NiriRenderer>(
+fn push_gnome_wallpaper_into_xray(
     gnome_mode: bool,
     wallpaper: &Wallpaper,
-    renderer: &mut R,
+    renderer: &mut VulkanRenderer,
     buf_logical: Size<f64, Logical>,
     buf_scale: Scale<f64>,
-    elements: &mut Vec<OutputRenderElements<R>>,
+    elements: &mut Vec<OutputRenderElements>,
 ) {
     if !gnome_mode {
         return;
@@ -7122,26 +7089,26 @@ fn scale_relocate_crop<E: Element>(
 }
 
 niri_render_elements! {
-    PointerRenderElements<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
-        NamedPointer = MemoryRenderBufferRenderElement<R>,
+    PointerRenderElements => {
+        Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
+        NamedPointer = MemoryRenderBufferRenderElement<VulkanRenderer>,
     }
 }
 
 niri_render_elements! {
-    WindowScreenshotRenderElement<R> => {
-        Layout = LayoutElementRenderElement<R>,
-        Pointer = RelocateRenderElement<PointerRenderElements<R>>,
+    WindowScreenshotRenderElement => {
+        Layout = LayoutElementRenderElement,
+        Pointer = RelocateRenderElement<PointerRenderElements>,
     }
 }
 
 niri_render_elements! {
-    OutputRenderElements<R> => {
-        Monitor = MonitorRenderElement<R>,
-        RescaledTile = RescaleRenderElement<TileRenderElement<R>>,
-        LayerSurface = LayerSurfaceRenderElement<R>,
+    OutputRenderElements => {
+        Monitor = MonitorRenderElement,
+        RescaledTile = RescaleRenderElement<TileRenderElement>,
+        LayerSurface = LayerSurfaceRenderElement,
         RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
-            LayerSurfaceRenderElement<R>
+            LayerSurfaceRenderElement
         >>>,
         RelocatedColor = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             SolidColorRenderElement
@@ -7149,19 +7116,19 @@ niri_render_elements! {
         RelocatedRoundedTexture = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             RoundedTextureRenderElement<crate::render_helpers::vulkan::VkTexture>
         >>>,
-        Pointer = PointerRenderElements<R>,
-        Wayland = WaylandSurfaceRenderElement<R>,
+        Pointer = PointerRenderElements,
+        Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         CapturedTexture = CapturedTextureRenderElement,
-        WindowMruUi = WindowMruUiRenderElement<R>,
-        ExitConfirmDialog = ExitConfirmDialogRenderElement<R>,
-        RunDialog = RunDialogRenderElement<R>,
+        WindowMruUi = WindowMruUiRenderElement,
+        ExitConfirmDialog = ExitConfirmDialogRenderElement,
+        RunDialog = RunDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).
-        UiTexture = TextureRenderElement<R::TextureId>,
+        UiTexture = TextureRenderElement<VkTexture>,
         // Used for the CPU-rendered panels.
-        RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
+        RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
     }
 }

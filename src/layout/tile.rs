@@ -23,13 +23,12 @@ use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, Rounde
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::TextureBuffer;
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -132,16 +131,16 @@ pub struct Tile<W: LayoutElement> {
 }
 
 niri_render_elements! {
-    TileRenderElement<R> => {
-        LayoutElement = LayoutElementRenderElement<R>,
+    TileRenderElement => {
+        LayoutElement = LayoutElementRenderElement,
         FocusRing = FocusRingRenderElement,
         SolidColor = SolidColorRenderElement,
         Opening = OpeningWindowRenderElement,
         Resize = ResizeRenderElement,
         Border = BorderRenderElement,
         Shadow = ShadowRenderElement,
-        ClippedSurface = ClippedSurfaceRenderElement<R>,
-        Offscreen = OffscreenRenderElement<VkTexture>,
+        ClippedSurface = ClippedSurfaceRenderElement,
+        Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
     }
@@ -151,7 +150,7 @@ niri_render_elements! {
 pub type TileUnmapSnapshot = NeutralSnapshot;
 
 /// The renderer an unmap snapshot is captured through, threaded down the layout tree. A concrete
-/// renderer rather than `&mut impl NiriRenderer`: capturing reads back pixels, which is not
+/// renderer rather than `&mut VulkanRenderer`: capturing reads back pixels, which is not
 /// something the generic render path does.
 pub type SnapshotRenderer<'a> = &'a mut crate::render_helpers::vulkan::VulkanRenderer;
 
@@ -162,7 +161,7 @@ struct ResizeAnimation {
     snapshot: LayoutElementRenderSnapshot,
     /// The "current window" snapshot. Reused across frames — its texture is re-rendered in place,
     /// never reallocated (matters on Venus, where per-frame allocation exhausts host blobs).
-    offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
+    offscreen_vk: OffscreenBuffer,
     /// The pre-resize snapshot uploaded to a `VkTexture`, cached for the whole animation (the
     /// source `MemoryBuffer` in `snapshot.neutral` never changes), so it is imported once, not
     /// per frame.
@@ -194,7 +193,7 @@ pub(super) struct AlphaAnimation {
     /// completes.
     pub(super) hold_after_done: bool,
     /// Reused across the animation's frames (reallocation churns virtio-gpu blobs).
-    offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
+    offscreen_vk: OffscreenBuffer,
 }
 
 impl<W: LayoutElement> Tile<W> {
@@ -1037,13 +1036,13 @@ impl<W: LayoutElement> Tile<W> {
         Point::from((0., y))
     }
 
-    fn render_inner<R: NiriRenderer>(
+    fn render_inner(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         location: Point<f64, Logical>,
         mut xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(TileRenderElement<R>),
+        push: &mut dyn FnMut(TileRenderElement),
     ) {
         let _span = tracy_client::span!("Tile::render_inner");
 
@@ -1117,7 +1116,8 @@ impl<W: LayoutElement> Tile<W> {
             // `tex_prev` comes from the neutral snapshot captured at resize-start (uploaded once);
             // `tex_next` is the current window rendered into the reused Vulkan offscreen.
             if !blocked_out {
-                if let Some(mut vctx) = ctx.try_as_vulkan() {
+                {
+                    let mut vctx = ctx.r();
                     if let Some((prev_mem, prev_geo)) =
                         resize.snapshot.neutral.get().and_then(|o| o.as_ref())
                     {
@@ -1347,13 +1347,13 @@ impl<W: LayoutElement> Tile<W> {
         );
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         location: Point<f64, Logical>,
         xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(TileRenderElement<R>),
+        push: &mut dyn FnMut(TileRenderElement),
     ) {
         let _span = tracy_client::span!("Tile::render");
 
@@ -1371,7 +1371,8 @@ impl<W: LayoutElement> Tile<W> {
         // degrade: skip the offscreen effect and fall through to the plain render below, so the
         // window still shows (just without the animation).
         if let Some(open) = &self.open_animation {
-            if let Some(mut vctx) = ctx.try_as_vulkan() {
+            {
+                let mut vctx = ctx.r();
                 let mut elements = Vec::new();
                 self.render_inner(
                     vctx.r(),
@@ -1402,7 +1403,8 @@ impl<W: LayoutElement> Tile<W> {
             // Render the tile into a VkTexture offscreen and composite it at the animated alpha;
             // falls through to the plain render below if the offscreen does not render.
             {
-                if let Some(mut vctx) = ctx.try_as_vulkan() {
+                {
+                    let mut vctx = ctx.r();
                     let mut elements = Vec::new();
                     self.render_inner(
                         vctx.r(),

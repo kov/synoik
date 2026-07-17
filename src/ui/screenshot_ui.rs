@@ -21,7 +21,6 @@ use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -650,9 +649,9 @@ impl ScreenshotUi {
         }
     }
 
-    pub fn render_output<R: NiriRenderer>(
+    pub fn render_output(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         output: &Output,
         target: RenderTarget,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
@@ -1034,15 +1033,15 @@ impl OutputScreenshot {
 
     /// The frozen-screen element, or `None` if it can't be drawn — a failed Vulkan upload. Callers
     /// must skip it rather than substitute anything: there is no second copy of the frozen screen.
-    fn buffer_element<R: NiriRenderer>(
+    fn buffer_element(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
     ) -> Option<CapturedTextureRenderElement> {
         let Self::Neutral {
             screen, screen_vk, ..
         } = self;
 
-        let vk = renderer.try_as_vulkan_renderer()?;
+        let vk = &mut *renderer;
         let tb = upload_cached(vk, screen, screen_vk)?;
         Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
@@ -1058,9 +1057,9 @@ impl OutputScreenshot {
 
     /// The composited-pointer element. `None` when no pointer was captured, or when it can't be
     /// drawn (see [`Self::buffer_element`]).
-    fn pointer_element<R: NiriRenderer>(
+    fn pointer_element(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
     ) -> Option<CapturedTextureRenderElement> {
         let Self::Neutral {
             pointer,
@@ -1068,7 +1067,7 @@ impl OutputScreenshot {
             ..
         } = self;
 
-        let vk = renderer.try_as_vulkan_renderer()?;
+        let vk = &mut *renderer;
         let (neutral, location) = pointer.as_ref()?;
         let tb = upload_cached(vk, neutral, pointer_vk)?;
         Some(CapturedTextureRenderElement(
@@ -1092,14 +1091,14 @@ impl OutputData {
     /// `gles_buffer` is `None` on a Vulkan session (nothing bakes one), so `None` here means only
     /// "no GLES texture to fall back to" — never "no panel". Returning `None` draws no panel at
     /// all.
-    fn panel_element<R: NiriRenderer>(
+    fn panel_element(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         show_pointer: bool,
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
-        let vk = renderer.try_as_vulkan_renderer()?;
+        let vk = &mut *renderer;
         let (show_mem, hide_mem) = self.panel_neutral.as_ref()?;
         let (neutral, cache) = if show_pointer {
             (hide_mem, &self.panel_vk.1)

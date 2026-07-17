@@ -3,12 +3,12 @@
 //! Overlays that freeze the screen (the screen transition, the screenshot UI, the closing window)
 //! cache the upload in a non-generic owning struct and need to hand the resulting *concrete*
 //! element back into the generic `<R>` render tree. It cannot ride the shared
-//! `UiTexture = TextureRenderElement<R::TextureId>` arm as a bare
+//! `UiTexture = TextureRenderElement<VkTexture>` arm as a bare
 //! `TextureRenderElement<VkTexture>`: the macro would emit a `From` impl that overlaps
 //! `UiTexture`'s at `R = VulkanRenderer`, which does not compile. Hence the newtype, on its own
 //! arm.
 //!
-//! Once the render tree is de-genericised and `R::TextureId` is concretely `VkTexture`, the two
+//! Once the render tree is de-genericised and `VkTexture` is concretely `VkTexture`, the two
 //! arms become the same type and this can merge into `UiTexture` and go.
 
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};

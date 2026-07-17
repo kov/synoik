@@ -22,27 +22,22 @@ use super::renderer::OffscreenRenderer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
 
 /// Buffer for offscreen rendering.
-///
-/// Generic over the offscreen texture type `T` (the renderer's `TextureId`), which is always
-/// `VkTexture` today. The generic is what the `Offscreen<T>`/`Bind<T>` bounds on `render` are
-/// written against, so it stays until the render tree stops being generic over the renderer.
-/// (`ContextId<T>` requires `T: Texture`.)
 #[derive(Debug)]
-pub struct OffscreenBuffer<T: Texture> {
+pub struct OffscreenBuffer {
     id: Id,
 
     /// The cached texture buffer.
     ///
     /// Lazily created when `render` is called. Recreated when necessary.
-    inner: RefCell<Option<Inner<T>>>,
+    inner: RefCell<Option<Inner>>,
 }
 
 #[derive(Debug)]
-struct Inner<T: Texture> {
+struct Inner {
     /// The texture with offscreened contents.
-    texture: T,
+    texture: VkTexture,
     /// Id of the renderer context that the texture comes from.
-    renderer_context_id: ContextId<T>,
+    renderer_context_id: ContextId<VkTexture>,
     /// Scale of the texture.
     scale: Scale<f64>,
     /// Damage tracker for drawing to the texture.
@@ -52,10 +47,10 @@ struct Inner<T: Texture> {
 }
 
 #[derive(Debug, Clone)]
-pub struct OffscreenRenderElement<T: Texture> {
+pub struct OffscreenRenderElement {
     id: Id,
-    texture: T,
-    renderer_context_id: ContextId<T>,
+    texture: VkTexture,
+    renderer_context_id: ContextId<VkTexture>,
     scale: Scale<f64>,
     damage: DamageSnapshot<i32, Buffer>,
     offset: Point<f64, Logical>,
@@ -72,17 +67,13 @@ pub struct OffscreenData {
     pub states: RenderElementStates,
 }
 
-impl<T: Texture + Clone + 'static> OffscreenBuffer<T> {
-    pub fn render<R>(
+impl OffscreenBuffer {
+    pub fn render(
         &self,
-        renderer: &mut R,
+        renderer: &mut VulkanRenderer,
         scale: Scale<f64>,
-        elements: &[impl RenderElement<R>],
-    ) -> anyhow::Result<(OffscreenRenderElement<T>, SyncPoint, OffscreenData)>
-    where
-        R: OffscreenRenderer + Renderer<TextureId = T> + Offscreen<T> + Bind<T>,
-        R::Error: std::error::Error + Send + Sync + 'static,
-    {
+        elements: &[impl RenderElement<VulkanRenderer>],
+    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
         let _span = tracy_client::span!("OffscreenBuffer::render");
 
         let geo = encompassing_geo(scale, elements.iter());
@@ -139,7 +130,7 @@ impl<T: Texture + Clone + 'static> OffscreenBuffer<T> {
             let span = tracy_client::span!("creating offscreen buffer");
             span.emit_text(reason);
 
-            let texture: T = renderer
+            let texture: VkTexture = renderer
                 .create_buffer(Fourcc::Abgr8888, src_size)
                 .context("error creating texture")?;
 
@@ -215,7 +206,7 @@ impl<T: Texture + Clone + 'static> OffscreenBuffer<T> {
     }
 }
 
-impl<T: Texture> Default for OffscreenBuffer<T> {
+impl Default for OffscreenBuffer {
     fn default() -> Self {
         OffscreenBuffer {
             inner: RefCell::new(None),
@@ -224,8 +215,8 @@ impl<T: Texture> Default for OffscreenBuffer<T> {
     }
 }
 
-impl<T: Texture> OffscreenRenderElement<T> {
-    pub fn texture(&self) -> &T {
+impl OffscreenRenderElement {
+    pub fn texture(&self) -> &VkTexture {
         &self.texture
     }
 
@@ -256,7 +247,7 @@ impl<T: Texture> OffscreenRenderElement<T> {
     }
 }
 
-impl<T: Texture> Element for OffscreenRenderElement<T> {
+impl Element for OffscreenRenderElement {
     fn id(&self) -> &Id {
         &self.id
     }
@@ -314,7 +305,7 @@ impl<T: Texture> Element for OffscreenRenderElement<T> {
 }
 
 // Samples the offscreen through the owned Vulkan renderer (the sampleable-offscreen bridge).
-impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
+impl RenderElement<VulkanRenderer> for OffscreenRenderElement {
     fn draw(
         &self,
         frame: &mut VulkanFrame<'_, '_>,

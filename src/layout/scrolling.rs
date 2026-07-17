@@ -19,7 +19,6 @@ use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
@@ -94,8 +93,8 @@ pub struct ScrollingSpace<W: LayoutElement> {
 }
 
 niri_render_elements! {
-    ScrollingSpaceRenderElement<R> => {
-        Tile = TileRenderElement<R>,
+    ScrollingSpaceRenderElement => {
+        Tile = TileRenderElement,
         ClosingWindow = ClosingWindowRenderElement,
         TabIndicator = TabIndicatorRenderElement,
     }
@@ -2887,19 +2886,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .is_fullscreen()
     }
 
-    pub fn render<R: NiriRenderer>(
+    pub fn render(
         &self,
-        mut ctx: RenderCtx<R>,
+        mut ctx: RenderCtx,
         xray_pos: XrayPos,
         focus_ring: bool,
-        push: &mut dyn FnMut(ScrollingSpaceRenderElement<R>),
+        push: &mut dyn FnMut(ScrollingSpaceRenderElement),
     ) {
         let scale = Scale::from(self.scale);
 
         // Draw the closing windows on top of the other windows.
         let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
         for closing in self.closing_windows.iter().rev() {
-            if let Some(vctx) = ctx.try_as_vulkan() {
+            {
+                let vctx = ctx.r();
                 if let Some(elem) =
                     closing.render_vulkan(vctx.renderer, view_rect, scale, vctx.target)
                 {
