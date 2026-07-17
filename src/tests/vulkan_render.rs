@@ -3590,9 +3590,14 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
     const S: i32 = 64;
     let size = Size::<i32, Physical>::from((S, S));
 
-    // Render the red|green scene at `transform`, optionally with a whole-output blur-off effect on
-    // top, and read it back.
-    let render_scene = |vk: &mut Vk, transform: Transform, with_effect: bool| -> Vec<u8> {
+    // Render the red|green scene at `transform`, optionally with a whole-output effect on top, and
+    // read it back. `blur` turns the effect from a no-op passthrough into a real blur.
+    let render_scene_opt = |vk: &mut Vk,
+                            transform: Transform,
+                            with_effect: bool,
+                            blur: Option<crate::render_helpers::blur::BlurOptions>,
+                            subregion: Option<crate::utils::region::TransformedRegion>|
+     -> Vec<u8> {
         let mut target = vk
             .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
             .expect("create target");
@@ -3619,12 +3624,12 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                 let effect = FramebufferEffect::new();
                 let params = RenderParams {
                     geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
-                    subregion: None,
+                    subregion: subregion.clone(),
                     clip: None,
                     scale: 1.0,
                 };
-                // Blur OFF, noise 0, saturation 1 → the effect should reproduce the backdrop.
-                let element = effect.render(None, params, None, 0.0, 1.0);
+                // noise 0, saturation 1: with `blur` None the effect should reproduce the backdrop.
+                let element = effect.render(None, params, blur, 0.0, 1.0);
                 let cache = UserDataMap::new();
                 let src = element.src();
                 let dst = element.geometry(Scale::from(1.0));
@@ -3663,6 +3668,46 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
     };
     let close = |a: [u8; 4], b: [u8; 4]| (0..4).all(|i| (a[i] as i32 - b[i] as i32).abs() <= 24);
 
+    let render_scene = |vk: &mut Vk, transform: Transform, with_effect: bool| -> Vec<u8> {
+        render_scene_opt(vk, transform, with_effect, None, None)
+    };
+
+    let blur_opts = crate::render_helpers::blur::BlurOptions {
+        passes: 3,
+        offset: 2.0,
+    };
+
+    // Count the quadrants that contain a blended (blurred-edge) pixel. The edge crosses all four
+    // quadrants whatever the transform, so an unrestricted blur lights up 4; a blur restricted to
+    // the logical top half lights up exactly the 2 quadrants that half maps to — whichever 2 those
+    // are for a given transform. That makes this assertion transform-agnostic without having to
+    // hard-code Smithay's rotation convention.
+    let blended_quadrants = |pixels: &[u8]| -> usize {
+        let mut n = 0;
+        for (qx, qy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let mut found = false;
+            for y in (qy * S / 2)..((qy + 1) * S / 2) {
+                for x in (qx * S / 2)..((qx + 1) * S / 2) {
+                    let p = px(pixels, S, x, y);
+                    if p[0].min(p[1]) > 40 {
+                        found = true;
+                    }
+                }
+            }
+            n += usize::from(found);
+        }
+        n
+    };
+
+    // The strongest blend (both channels raised) anywhere in the frame. Only a blurred edge can
+    // produce one; the sharp red|green scene cannot.
+    let best_blend = |pixels: &[u8]| -> u8 {
+        (0..S * S).fold(0u8, |best, i| {
+            let p = px(pixels, S, i % S, i / S);
+            best.max(p[0].min(p[1]))
+        })
+    };
+
     // _90 rotates the vertical edge to horizontal; Flipped90 is a transposing flip (the anti-
     // diagonal case a plain rotation wouldn't catch). Normal is the trivial baseline.
     for t in [Transform::Normal, Transform::_90, Transform::Flipped90] {
@@ -3676,8 +3721,64 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                  (backdrop sampled with the wrong orientation)"
             );
         }
+
+        // The same, with the blur actually on. A wrongly-oriented capture would blur the backdrop
+        // and put it back rotated, which shows up far from the edge as a corner changing colour —
+        // the corners sit well outside the blur's reach, so they must survive a real blur too.
+        let blurred = render_scene_opt(&mut vk, t, true, Some(blur_opts), None);
+        let bc = corners(&blurred);
+        for (i, (p, b)) in pc.iter().zip(bc.iter()).enumerate() {
+            assert!(
+                close(*p, *b),
+                "{t:?}: corner {i} changed by the BLURRED effect: plain={p:?} blurred={b:?} \
+                 (the blurred backdrop composited with the wrong orientation)"
+            );
+        }
+
+        // And the blur must actually have run: the sharp scene has no blended pixel, the blurred
+        // one must. Without this the corner check above would pass on a blur that drew nothing.
+        let (sharp_blend, blur_blend) = (best_blend(&plain), best_blend(&blurred));
+        assert!(
+            sharp_blend <= 40,
+            "{t:?}: the plain scene already has a blended pixel ({sharp_blend}); the probe is \
+             not discriminating"
+        );
+        assert!(
+            blur_blend > 40,
+            "{t:?}: the blur did not soften the edge (max min(R,G) = {blur_blend})"
+        );
+
+        // A blur restricted to the *logical* top half must follow the content through the output
+        // transform. The blurred edge crosses all four quadrants, so an unrestricted blur lights up
+        // 4 and the subregion must cut that to exactly the 2 the logical top half maps to. A
+        // subregion applied in the wrong space would light up some other count (4 if ignored).
+        let sub_blurred = render_scene_opt(
+            &mut vk,
+            t,
+            true,
+            Some(blur_opts),
+            Some(crate::utils::region::TransformedRegion {
+                rects: std::sync::Arc::new(vec![Rectangle::from_size(Size::from((S, S / 2)))]),
+                scale: Scale::from(1.0),
+                offset: Point::from((0., 0.)),
+            }),
+        );
+        let (all_q, sub_q) = (blended_quadrants(&blurred), blended_quadrants(&sub_blurred));
+        assert_eq!(
+            all_q, 4,
+            "{t:?}: the unrestricted blur should reach all 4 quadrants, got {all_q} — the probe \
+             is not discriminating"
+        );
+        assert_eq!(
+            sub_q, 2,
+            "{t:?}: a blur restricted to the logical top half should reach exactly 2 quadrants, \
+             got {sub_q} (4 = the subregion was ignored; other = it landed in the wrong space \
+             under this transform)"
+        );
+
         eprintln!(
-            "vulkan_backdrop_effect_roundtrips_under_rotation {t:?}: corners {pc:?} preserved"
+            "vulkan_backdrop_effect_roundtrips_under_rotation {t:?}: corners {pc:?} preserved, \
+             blur blend {sharp_blend} -> {blur_blend}, quadrants all={all_q} subregion={sub_q}"
         );
     }
 }

@@ -97,13 +97,15 @@ impl Element for FramebufferEffectElement {
     }
 }
 
-/// The owned Vulkan renderer's backdrop-blur path: the real (non-degraded)
-/// `RenderElement<VulkanRenderer>`. `capture_framebuffer` grabs the scene-behind into a cached
-/// [`BackdropBlur`] (stored in the element's `UserDataMap`, like the GLES `Inner`) and blurs it;
-/// `draw` composites the blurred result with the postprocess-and-clip material — the same two-phase
-/// shape as the GLES impl above, just driven through `VulkanFrame::capture_backdrop` /
-/// `draw_backdrop`. Rotated outputs are not yet handled (Normal-transform only), matching the rest
-/// of the Vulkan port.
+/// The renderer's backdrop-blur path. `capture_framebuffer` grabs the scene-behind into a cached
+/// [`BackdropBlur`] (stored in the element's `UserDataMap`) and blurs it; `draw` composites the
+/// blurred result with the postprocess-and-clip material.
+///
+/// Rotated outputs **are** handled: the capture takes the target sub-region and size through the
+/// output transform, and `sample_transform` maps the logical `v_uv` back onto the physically-
+/// oriented capture. `vulkan_backdrop_effect_roundtrips_under_rotation` pins this under `_90` and
+/// `Flipped90` (the transposing-flip case a plain rotation would miss) for a no-op effect, a real
+/// blur, and a blur restricted to a subregion.
 mod vulkan_impl {
     use std::cell::RefCell;
 
