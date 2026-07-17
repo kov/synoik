@@ -6,27 +6,30 @@
 //! a centered clock; the panel also reserves a top strut so windows never sit
 //! under it (see `layout::workspace::compute_working_area`).
 //!
-//! Rendering mirrors the other in-compositor overlays (see
-//! `config_error_notification.rs`): pango/cairo paints the bar into an
-//! `ImageSurface`, which is uploaded to a `TextureBuffer` and drawn as a
-//! `TextureRenderElement`. The panel's *logical* state (the clock
+//! The bar is drawn entirely on the GPU through the owned Vulkan renderer: an
+//! offscreen `VkTexture` is cleared to the bar background, the Activities/clock
+//! glyph runs are drawn with the [`render_glyphs`](VulkanFrame::render_glyphs)
+//! material, and the result is composited as a `TextureRenderElement` — no
+//! cairo/pango raster, no CPU upload. The panel's *logical* state (the clock
 //! string, whether Activities is checked, the hit rectangles) is kept separate
 //! from that render path so headless tests can assert it without a GPU.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use std::ptr::null_mut;
 
 use ordered_float::NotNan;
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::FontDescription;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
-use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -35,15 +38,29 @@ use crate::utils::{output_size, to_physical_precise_round};
 /// i.e. ~32px at scale 1 (`gnome-shell-sass/widgets/_panel.scss`).
 pub const PANEL_HEIGHT: f64 = 32.;
 
-/// Panel font. Absolute px so it scales cleanly with the output scale (the same
-/// approach as `config_error_notification`); sized to sit comfortably in the bar.
+/// Panel font, as a pango description string (used only to *measure* the
+/// Activities hit rectangle; the drawing uses [`FONT_PX`]).
 const FONT: &str = "sans 13px";
+
+/// Panel font size in logical pixels-per-em (matches [`FONT`]). Scaled by the
+/// output scale to the physical em the glyph rasterizer shapes at.
+const FONT_PX: f64 = 13.;
 
 /// Horizontal padding inside the Activities button, logical px.
 const H_PADDING: f64 = 12.;
 
 /// Label of the left-hand overview toggle.
 const ACTIVITIES: &str = "Activities";
+
+/// Bar background (opaque black — GNOME's dark panel), straight RGBA.
+const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
+
+/// The Activities checked highlight (white at 0.15 over the black bar), pre-mixed
+/// to the opaque grey it composites to so a single opaque clear draws it.
+const HIGHLIGHT: [f32; 4] = [0.15, 0.15, 0.15, 1.];
+
+/// Text color (opaque white); the glyph coverage modulates the alpha.
+const TEXT: [f32; 4] = [1., 1., 1., 1.];
 
 /// A clickable region of the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +71,26 @@ pub enum PanelItem {
 
 /// Cached bar textures keyed by (fractional scale, physical width). The panel
 /// spans the output width, so width is part of the key (unlike the fixed-size
-/// overlays, which key by scale alone).
-type ScaledBuffers = HashMap<(NotNan<f64>, i32), Option<MemoryBuffer>>;
+/// overlays, which key by scale alone). Tied to a renderer context: dropped
+/// wholesale when the renderer changes.
+struct BarCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<(NotNan<f64>, i32), VkTexture>,
+}
+
+impl BarCache {
+    fn new() -> Self {
+        Self {
+            context: None,
+            textures: HashMap::new(),
+        }
+    }
+
+    /// Drop every cached bar (content or renderer changed).
+    fn clear(&mut self) {
+        self.textures.clear();
+    }
+}
 
 pub struct Panel {
     /// Current clock string, e.g. "14:30". Recomputed on the minute tick.
@@ -67,9 +102,9 @@ pub struct Panel {
     /// Left-anchored, so it is the same on every output.
     activities_rect: Rectangle<f64, Logical>,
 
-    /// Cached textures, cleared whenever the drawn content (clock text or
-    /// checked state) changes.
-    buffers: RefCell<ScaledBuffers>,
+    /// Cached GPU bar textures, cleared whenever the drawn content (clock text
+    /// or checked state) changes.
+    cache: RefCell<BarCache>,
 }
 
 impl Panel {
@@ -84,7 +119,7 @@ impl Panel {
             clock_text: format_clock(unsafe { libc::time(null_mut()) }),
             activities_checked: false,
             activities_rect,
-            buffers: RefCell::new(HashMap::new()),
+            cache: RefCell::new(BarCache::new()),
         }
     }
 
@@ -95,7 +130,7 @@ impl Panel {
         let text = format_clock(now);
         if text != self.clock_text {
             self.clock_text = text;
-            self.buffers.borrow_mut().clear();
+            self.cache.borrow_mut().clear();
             true
         } else {
             false
@@ -111,7 +146,7 @@ impl Panel {
     pub fn set_overview_open(&mut self, open: bool) {
         if open != self.activities_checked {
             self.activities_checked = open;
-            self.buffers.borrow_mut().clear();
+            self.cache.borrow_mut().clear();
         }
     }
 
@@ -141,27 +176,47 @@ impl Panel {
     ) -> Option<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
-        let width_px = to_physical_precise_round(scale, width);
-        let key = (NotNan::new(scale).unwrap(), width_px);
+        let width_px: i32 = to_physical_precise_round(scale, width);
+        let width_px = width_px.max(1);
+        let key = (NotNan::new(scale).ok()?, width_px);
 
-        let mut buffers = self.buffers.borrow_mut();
-        let buffer = buffers.entry(key).or_insert_with(|| {
-            // The bar renders CPU-side into a renderer-neutral buffer; degrade a paint panic to a
-            // missing bar rather than aborting scanout.
-            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                render_bar(scale, width_px, &self.clock_text, self.activities_checked).ok()
-            }))
-            .unwrap_or_else(|_| {
-                tracing::error!("panic while painting the panel");
-                None
-            })
-        });
-        let buffer = buffer.as_ref()?;
+        let texture = {
+            let mut cache = self.cache.borrow_mut();
 
-        // Upload the CPU-rendered bar through the active renderer's `ImportMem`, so it draws on any
-        // renderer (including the owned Vulkan one) rather than only GLES.
-        let buffer: TextureBuffer<VkTexture> =
-            TextureBuffer::from_memory_buffer(renderer, buffer).ok()?;
+            // The cached textures belong to one renderer context; drop them all if it changed.
+            let context = renderer.context_id();
+            if cache.context.as_ref() != Some(&context) {
+                cache.clear();
+                cache.context = Some(context);
+            }
+
+            // Not the `entry` API: the build is fallible and borrows `renderer`, which the
+            // closure-based `or_insert_with` can't express.
+            #[allow(clippy::map_entry)]
+            if !cache.textures.contains_key(&key) {
+                match draw_bar_texture(
+                    renderer,
+                    scale,
+                    width_px,
+                    &self.clock_text,
+                    self.activities_checked,
+                ) {
+                    Ok(texture) => {
+                        cache.textures.insert(key, texture);
+                    }
+                    Err(err) => {
+                        tracing::error!("error drawing the panel bar: {err:#}");
+                        return None;
+                    }
+                }
+            }
+            cache.textures.get(&key)?.clone()
+        };
+
+        // The whole bar is opaque, so let the compositor skip drawing behind it.
+        let opaque = vec![Rectangle::from_size(texture.size())];
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
@@ -232,123 +287,126 @@ fn make_font(scale: f64) -> FontDescription {
     font
 }
 
-/// Paint the whole bar into a texture: opaque black background, left Activities
-/// button, centered clock.
-fn render_bar(
+/// Draw the whole bar into an offscreen [`VkTexture`] on the GPU: clear the
+/// opaque background, draw the Activities checked highlight, then the Activities
+/// and clock glyph runs. The returned texture is `SHADER_READ_ONLY` (sampleable)
+/// so the caller can composite it directly.
+fn draw_bar_texture(
+    renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
     checked: bool,
-) -> anyhow::Result<MemoryBuffer> {
-    let _span = tracy_client::span!("panel::render_bar");
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("panel::draw_bar_texture");
 
     let width_px = width_px.max(1);
     let height_px: i32 = to_physical_precise_round(scale, PANEL_HEIGHT);
     let height_px = height_px.max(1);
-    let surface = draw_bar(scale, width_px, height_px, clock, checked)?;
+    let px = (FONT_PX * scale) as f32;
 
-    let data = surface.take_data().unwrap();
-    let buffer = MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width_px, height_px),
-        scale,
-        Transform::Normal,
-    );
+    // Shape both runs (reuses the renderer's long-lived font system).
+    let activities = renderer.build_glyph_run(ACTIVITIES, px)?;
+    let clock_run = renderer.build_glyph_run(clock, px)?;
 
-    Ok(buffer)
-}
-
-/// Draw the bar into a CPU cairo surface (no GPU). Split out of `render_bar` so
-/// the pango/cairo drawing can be exercised in headless tests.
-fn draw_bar(
-    scale: f64,
-    width_px: i32,
-    height_px: i32,
-    clock: &str,
-    checked: bool,
-) -> anyhow::Result<ImageSurface> {
     let h_padding: i32 = to_physical_precise_round(scale, H_PADDING);
-    let font = make_font(scale);
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width_px, height_px)?;
-    let cr = cairo::Context::new(&surface)?;
+    // Left-align Activities to the padding, vertically centered on its ink.
+    let (a_ix, a_iy, _a_iw, a_ih) = activities.ink_bounds();
+    let a_origin = Point::<i32, Physical>::from((h_padding - a_ix, (height_px - a_ih) / 2 - a_iy));
 
-    // Opaque panel background (dark theme: #000000).
-    cr.set_source_rgb(0., 0., 0.);
-    cr.paint()?;
+    // Center the clock's ink in the bar.
+    let (c_ix, c_iy, c_iw, c_ih) = clock_run.ink_bounds();
+    let c_origin =
+        Point::<i32, Physical>::from(((width_px - c_iw) / 2 - c_ix, (height_px - c_ih) / 2 - c_iy));
 
-    // Left: the Activities button.
-    let activities = pangocairo::functions::create_layout(&cr);
-    activities.context().set_round_glyph_positions(false);
-    activities.set_font_description(Some(&font));
-    activities.set_text(ACTIVITIES);
-    let (aw, ah) = activities.pixel_size();
+    // The highlight matches the Activities button hit rectangle (text + padding).
+    let highlight_w: i32 =
+        to_physical_precise_round(scale, measure_logical_width(ACTIVITIES) + H_PADDING * 2.);
+    let highlight_w = highlight_w.clamp(1, width_px);
 
-    if checked {
-        // Subtle highlight while the overview is open.
-        cr.set_source_rgba(1., 1., 1., 0.15);
-        cr.rectangle(0., 0., f64::from(aw + h_padding * 2), f64::from(height_px));
-        cr.fill()?;
+    let size = Size::<i32, Physical>::from((width_px, height_px));
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((width_px, height_px)),
+    )?;
+
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+        let full = Rectangle::from_size(size);
+
+        frame.clear(Color32F::from(BAR_BG), &[full])?;
+        if checked {
+            let hl = Rectangle::new(Point::from((0, 0)), Size::from((highlight_w, height_px)));
+            frame.clear(Color32F::from(HIGHLIGHT), &[hl])?;
+        }
+        frame.render_glyphs(&activities, a_origin, TEXT, full, &[full])?;
+        frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
+        // finish() submits and fence-waits synchronously, so the sync point is already signaled.
+        let _sync = frame.finish()?;
     }
 
-    cr.move_to(f64::from(h_padding), f64::from((height_px - ah) / 2));
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &activities);
-
-    // Center: the clock.
-    let clock_layout = pangocairo::functions::create_layout(&cr);
-    clock_layout.context().set_round_glyph_positions(false);
-    clock_layout.set_font_description(Some(&font));
-    clock_layout.set_text(clock);
-    let (cw, ch) = clock_layout.pixel_size();
-    cr.move_to(
-        f64::from((width_px - cw) / 2),
-        f64::from((height_px - ch) / 2),
-    );
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &clock_layout);
-
-    drop(cr);
-
-    Ok(surface)
+    // The bar is sampled by its own render element; transition it to shader-read.
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
 
 #[cfg(test)]
 mod tests {
+    use smithay::backend::renderer::ExportMem;
+
     use super::*;
 
-    /// Exercise the real pango/cairo drawing headlessly (no GPU): the bar must
-    /// be the right size, fully opaque, and actually render bright text pixels.
+    /// Drive the GPU bar into an offscreen and read it back: it must have an
+    /// opaque dark background, the checked highlight on the left, and bright
+    /// glyph ink for the clock/Activities text. Skips cleanly with no device.
     #[test]
-    fn draws_an_opaque_bar_with_text() {
-        let width = 400;
-        let height: i32 = PANEL_HEIGHT as i32;
-        let mut surface = draw_bar(1., width, height, "12:34", false).unwrap();
-
-        assert_eq!(surface.width(), width);
-        assert_eq!(surface.height(), height);
-
-        let stride = surface.stride() as usize;
-        let data = surface.data().unwrap();
-        let mut all_opaque = true;
-        let mut any_bright = false;
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let px = y * stride + x * 4;
-                // cairo ARgb32 is native-endian; on little-endian: [B, G, R, A].
-                if data[px + 3] != 255 {
-                    all_opaque = false;
-                }
-                if data[px] > 200 && data[px + 1] > 200 && data[px + 2] > 200 {
-                    any_bright = true;
-                }
+    fn draws_a_bar_with_glyph_coverage() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draws_a_bar_with_glyph_coverage: no Vulkan device ({e})");
+                return;
             }
-        }
-        assert!(all_opaque, "the panel background must be fully opaque");
+        };
+
+        let width_px = 400;
+        let height_px = PANEL_HEIGHT as i32;
+        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", true).expect("bar texture");
+
+        let fb = vk.bind(&mut tex).expect("bind for readback");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+        let px_at = |x: i32, y: i32| -> [u8; 4] {
+            let i = ((y * width_px + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+
+        // A pixel deep in the right half (away from any text) is the opaque dark bar.
+        let bg = px_at(width_px - 4, height_px / 2);
+        assert_eq!(bg[3], 255, "the bar must be opaque, got {bg:?}");
         assert!(
-            any_bright,
-            "the clock/Activities text must draw bright pixels"
+            bg[0] < 40 && bg[1] < 40 && bg[2] < 40,
+            "bar bg not dark: {bg:?}"
         );
+
+        // The checked highlight tints the top-left corner grey (brighter than black).
+        let hl = px_at(2, 2);
+        assert!(
+            hl[0] > 20 && hl[0] < 80,
+            "expected the checked highlight grey at top-left, got {hl:?}",
+        );
+
+        // Bright glyph ink somewhere (the clock and Activities text).
+        let bright = pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+            .count();
+        assert!(bright > 40, "expected visible glyph ink, got {bright}");
     }
 }

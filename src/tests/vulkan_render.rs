@@ -1898,10 +1898,11 @@ fn vulkan_reimporting_a_scanout_target_every_frame_does_not_abort() {
     eprintln!("vulkan_reimporting_a_scanout_target...: survived {FRAMES} re-imports");
 }
 
-/// The GNOME top panel renders on the owned Vulkan renderer. It used to `try_as_gles_renderer()?`
-/// and return `None` on Vulkan (a blank bar); now it uploads its CPU-rendered bar through the
-/// active renderer's `ImportMem`. Assert `render` yields an element and that compositing it
-/// produces the opaque bar (alpha 255), rather than nothing.
+/// The GNOME top panel renders on the owned Vulkan renderer. The bar is drawn entirely on the GPU
+/// (an offscreen `VkTexture` cleared to the background with the Activities/clock glyph runs drawn
+/// via the `render_glyphs` material), then composited as a `TextureRenderElement` — no cairo raster
+/// or CPU upload. Assert `render` yields an element and that compositing it produces the opaque bar
+/// (alpha 255), rather than nothing.
 #[test]
 fn vulkan_renders_the_top_panel() {
     let Some(mut f) = window_fixture(GREEN) else {
