@@ -1078,13 +1078,10 @@ impl OutputScreenshot {
 }
 
 impl OutputData {
-    /// The help-panel element (show/hide variant chosen by `show_pointer`): the owned Vulkan
-    /// renderer samples the neutral cairo bytes uploaded to a cached `VkTexture`; every other
-    /// renderer draws the GLES texture directly.
+    /// The help-panel element (show/hide variant chosen by `show_pointer`): the renderer samples
+    /// the neutral cairo bytes uploaded to a cached `VkTexture`.
     ///
-    /// `gles_buffer` is `None` on a Vulkan session (nothing bakes one), so `None` here means only
-    /// "no GLES texture to fall back to" — never "no panel". Returning `None` draws no panel at
-    /// all.
+    /// `None` means the upload failed, and draws no panel at all.
     fn panel_element(
         &self,
         renderer: &mut VulkanRenderer,

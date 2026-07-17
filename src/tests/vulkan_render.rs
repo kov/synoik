@@ -3545,7 +3545,9 @@ fn vulkan_xray_honors_the_cropped_src_fold() {
         .count();
     assert_eq!(red, 0, "cropped src leaked red (count {red})");
 
-    eprintln!("vulkan_xray_matches_the_gles_oracle: ok (fold + cropped src match the GLES oracle)");
+    eprintln!(
+        "vulkan_xray_honors_the_cropped_src_fold: ok (fold applied, cropped src leaks no red)"
+    );
 }
 
 /// A blur-off, saturation-1, noise-0, unclipped framebuffer effect over the *whole* output is a
