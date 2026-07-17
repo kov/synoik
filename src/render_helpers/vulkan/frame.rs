@@ -4,16 +4,17 @@ use ash::vk;
 use glam::{Mat3, Vec2, Vec3};
 use niri_vk::render::{
     as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
+    TextPush,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
-use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
 
 use super::backdrop_blur::BackdropBlur;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
-use super::types::{VkFramebuffer, VkTexture};
+use super::types::{GlyphRun, VkFramebuffer, VkTexture};
 
 /// The clip a [`ClippedSurfaceRenderElement`](crate::render_helpers::clipped_surface) wants applied
 /// to the surface it is about to draw. Set on the frame (via [`VulkanFrame::set_clip_override`])
@@ -456,6 +457,79 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 as_bytes(&push),
             );
             Self::draw_quad(dev, self.cbuf, &scissors);
+        }
+        Ok(())
+    }
+
+    /// Draw a shaped glyph `run` with its top-left run origin at `origin` (physical pixels), tinted
+    /// `color` (straight-alpha; the atlas coverage modulates the alpha). Each glyph is one quad
+    /// sampling its slot in the run's R8 coverage atlas.
+    ///
+    /// **Offscreen-only**: `text.vert` has no output-transform `proj`, so this is correct only on
+    /// an identity-transform target (a UI-chrome offscreen built by the draw layer); that
+    /// offscreen is then composited through the transform-aware texture material. `dst` is the
+    /// run's geometry, used purely to derive the damage scissors (the glyphs place themselves
+    /// via `origin`).
+    // Non-test dead until the panel draw-layer (increment 3) calls it; exercised now by the
+    // `vulkan_render_glyphs_rasterizes_coverage` test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_glyphs(
+        &mut self,
+        run: &GlyphRun,
+        origin: Point<i32, Physical>,
+        color: [f32; 4],
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        debug_assert!(
+            matches!(self.transform, Transform::Normal),
+            "render_glyphs is offscreen-only (identity transform), got {:?}",
+            self.transform,
+        );
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() || run.glyphs().is_empty() {
+            return Ok(());
+        }
+        let target = self.target_dims();
+        let side = run.side() as f32;
+        self.retain(run.atlas());
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.text_pipeline;
+        let set = run.atlas().descriptor_set();
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_bind_descriptor_sets(
+                self.cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipe.layout,
+                0,
+                std::slice::from_ref(&set),
+                &[],
+            );
+            for g in run.glyphs() {
+                let push = TextPush {
+                    origin: [(origin.x + g.x) as f32, (origin.y + g.y) as f32],
+                    size: [g.w as f32, g.h as f32],
+                    target,
+                    uv_origin: [g.atlas_x as f32 / side, g.atlas_y as f32 / side],
+                    uv_size: [g.w as f32 / side, g.h as f32 / side],
+                    _pad: [0.0, 0.0],
+                    color,
+                };
+                dev.cmd_push_constants(
+                    self.cbuf,
+                    pipe.layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    as_bytes(&push),
+                );
+                // One draw per damaged scissor rect: a glyph straddling two damage regions draws in
+                // each, matching the per-rect instancing the other materials do via `draw_quad`.
+                for s in &scissors {
+                    dev.cmd_set_scissor(self.cbuf, 0, std::slice::from_ref(s));
+                    dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+                }
+            }
         }
         Ok(())
     }

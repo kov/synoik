@@ -12,7 +12,7 @@ use niri_vk::render::{
 use niri_vk::shaders::{
     BORDER_FRAG, BORDER_VERT, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG,
     POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG,
-    SHADOW_VERT, SOLID_FRAG, TEX_FRAG,
+    SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
@@ -29,7 +29,7 @@ use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
 use super::frame::VulkanFrame;
 use super::types::{
-    import_format, is_rgba8888, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
+    import_format, is_rgba8888, GlyphRun, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
 };
 use crate::render_helpers::blur::BlurOptions;
 
@@ -72,6 +72,12 @@ pub struct VulkanRenderer {
     pub(super) shadow_pipeline: Pipeline,
     pub(super) postprocess_pipeline: Pipeline,
     pub(super) resize_pipeline: Pipeline,
+    /// The glyph material (`text.vert`/`text.frag`): samples an R8 coverage atlas at set 0. Used
+    /// only when rendering UI chrome into an offscreen (identity transform); see [`TEXT_VERT`].
+    pub(super) text_pipeline: Pipeline,
+    /// The long-lived text stack (font system + scaler cache) behind [`Self::build_glyph_run`], so
+    /// chrome redraws reshape a string without rescanning the system fonts each time.
+    text_ctx: niri_vk::text::TextContext,
     /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
     /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
     custom_resize: Option<Pipeline>,
@@ -340,6 +346,17 @@ impl VulkanRenderer {
             std::mem::size_of::<ResizePush>() as u32,
             true,
         )?;
+        // The glyph material samples the R8 coverage atlas (set 0) and outputs straight-alpha
+        // (coverage modulates the text color's alpha), like the plain texture material.
+        let text_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            TEXT_VERT,
+            TEXT_FRAG,
+            sampler,
+            std::mem::size_of::<niri_vk::render::TextPush>() as u32,
+            false,
+        )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(gpu.queue_family)
@@ -361,6 +378,8 @@ impl VulkanRenderer {
             shadow_pipeline,
             postprocess_pipeline,
             resize_pipeline,
+            text_pipeline,
+            text_ctx: niri_vk::text::TextContext::new(),
             custom_resize: None,
             custom_close: None,
             custom_open: None,
@@ -540,6 +559,36 @@ impl VulkanRenderer {
             .image_info(&image_info);
         unsafe { dev.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         Ok((pool, set))
+    }
+
+    /// Shape and rasterize `text` at `px` pixels-per-em into a [`GlyphRun`] — an R8 coverage atlas
+    /// wrapped as a sampleable [`VkTexture`] plus the per-glyph placements. Reuses the renderer's
+    /// long-lived [`text_ctx`](Self::text_ctx), so a chrome redraw reshapes the string without
+    /// rescanning the system fonts. Draw it with [`VulkanFrame::render_glyphs`].
+    // Non-test dead until the panel draw-layer (increment 3) calls it; exercised now by the
+    // `vulkan_render_glyphs_rasterizes_coverage` test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build_glyph_run(&mut self, text: &str, px: f32) -> Result<GlyphRun, VulkanError> {
+        // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
+        let gpu = self.gpu.clone();
+        let pool = self.command_pool;
+        let atlas = self.text_ctx.build_atlas(&gpu, pool, text, px)?;
+
+        let side = atlas.side;
+        let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
+        // The atlas is R8 coverage, only ever sampled (never scanned out or read back), so the
+        // fourcc is informational; R8 names the byte layout honestly.
+        let vk_tex = VkTexture::new(
+            gpu,
+            atlas.texture,
+            desc_pool,
+            set,
+            side,
+            side,
+            Fourcc::R8,
+            false,
+        );
+        Ok(GlyphRun::new(vk_tex, atlas.glyphs, side))
     }
 
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The
@@ -962,6 +1011,7 @@ impl Drop for VulkanRenderer {
             self.shadow_pipeline.destroy(dev);
             self.postprocess_pipeline.destroy(dev);
             self.resize_pipeline.destroy(dev);
+            self.text_pipeline.destroy(dev);
             // Custom pipelines' layouts reference the shared sampler set layout, so free them
             // first.
             for pipeline in [&self.custom_resize, &self.custom_close, &self.custom_open]

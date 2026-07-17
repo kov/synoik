@@ -52,3 +52,11 @@ pub const POSTPROCESS_FRAG: &[u8] =
 /// color.
 pub const RESIZE_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/resize.vert.spv"));
 pub const RESIZE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/resize.frag.spv"));
+/// Glyph-quad vertex + fragment stages (place a glyph quad, sample its slot in an R8 coverage
+/// atlas, and tint by the push-constant color — the owned text path). Both stages declare the
+/// [`crate::render::TextPush`] block; the fragment outputs straight-alpha (coverage modulates the
+/// text color's alpha). Offscreen-only: the vertex stage has no output-transform `proj`, so it is
+/// correct only for an identity-transform target (a UI-chrome offscreen), which is then composited
+/// through the transform-aware texture material.
+pub const TEXT_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
+pub const TEXT_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));

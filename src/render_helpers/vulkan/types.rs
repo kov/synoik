@@ -300,6 +300,65 @@ impl Texture for VkTexture {
     }
 }
 
+// --- GlyphRun: a shaped, rasterized string ready to draw ----------------------------------------
+
+/// A shaped run of text: the shared R8 coverage atlas (as a sampleable [`VkTexture`]) plus the
+/// per-glyph placements (run-local top-left pixel offsets + atlas sub-rects). Built by
+/// [`super::VulkanRenderer::build_glyph_run`] and drawn by [`super::VulkanFrame::render_glyphs`].
+/// Cheap to clone (the atlas is ref-counted); a UI element caches one and re-places it each frame.
+#[derive(Clone)]
+pub(crate) struct GlyphRun {
+    atlas: VkTexture,
+    glyphs: std::sync::Arc<[niri_vk::text::PlacedGlyph]>,
+    side: u32,
+}
+
+impl GlyphRun {
+    pub(crate) fn new(
+        atlas: VkTexture,
+        glyphs: Vec<niri_vk::text::PlacedGlyph>,
+        side: u32,
+    ) -> Self {
+        GlyphRun {
+            atlas,
+            glyphs: glyphs.into(),
+            side,
+        }
+    }
+
+    pub(crate) fn atlas(&self) -> &VkTexture {
+        &self.atlas
+    }
+
+    pub(crate) fn glyphs(&self) -> &[niri_vk::text::PlacedGlyph] {
+        &self.glyphs
+    }
+
+    pub(crate) fn side(&self) -> u32 {
+        self.side
+    }
+
+    /// The tight bounding box of the run's ink in run-local pixels: `(min_x, min_y, width,
+    /// height)`. Empty (all zeros) when the run has no drawable glyphs (e.g. all whitespace).
+    // Used by the panel draw-layer (increment 3) to size/place the run.
+    #[allow(dead_code)]
+    pub(crate) fn ink_bounds(&self) -> (i32, i32, i32, i32) {
+        let mut it = self.glyphs.iter();
+        let Some(first) = it.next() else {
+            return (0, 0, 0, 0);
+        };
+        let (mut x0, mut y0) = (first.x, first.y);
+        let (mut x1, mut y1) = (first.x + first.w as i32, first.y + first.h as i32);
+        for g in it {
+            x0 = x0.min(g.x);
+            y0 = y0.min(g.y);
+            x1 = x1.max(g.x + g.w as i32);
+            y1 = y1.max(g.y + g.h as i32);
+        }
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+}
+
 // --- VkFramebuffer: a bound target (Smithay `Framebuffer<'buffer>`) -----------------------------
 
 /// An in-use render target — Smithay's `Framebuffer`. Holds the target [`VkTexture`] as a cheap

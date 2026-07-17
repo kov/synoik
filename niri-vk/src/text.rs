@@ -20,26 +20,12 @@ use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::{Format, Vector};
 
 use crate::gpu::Gpu;
-use crate::render::{as_bytes, load_module};
+use crate::render::{as_bytes, load_module, TextPush};
+use crate::shaders::{TEXT_FRAG, TEXT_VERT};
 use crate::texture::Texture;
 
-const TEXT_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.vert.spv"));
-const TEXT_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text.frag.spv"));
-
-/// Push constants for `text.vert`/`text.frag` (std430; `color` at offset 48, 64 bytes).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TextPush {
-    origin: [f32; 2],
-    size: [f32; 2],
-    target: [f32; 2],
-    uv_origin: [f32; 2],
-    uv_size: [f32; 2],
-    _pad: [f32; 2],
-    color: [f32; 4],
-}
-
 /// One placed glyph: where it goes on screen (run-local, top-left) and its slot in the atlas.
+#[derive(Clone, Copy, Debug)]
 pub struct PlacedGlyph {
     pub x: i32,
     pub y: i32,

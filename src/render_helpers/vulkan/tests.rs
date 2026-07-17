@@ -307,6 +307,69 @@ fn vulkan_matches_pixman() {
     assert_close(&vk_pixels, &px_pixels);
 }
 
+// --- Glyph material: the owned text path through VulkanFrame::render_glyphs ---------------------
+
+/// Build a glyph run, draw it into a dark offscreen through `render_glyphs`, read it back, and
+/// assert crisp bright coverage over a still-dark corner. This is the compositor-side counterpart
+/// of niri-vk's `text_context_reuse_rasterizes_coverage`: it proves the text material's pipeline,
+/// the R8-atlas descriptor set built by `build_glyph_run`, and the per-glyph push path all compose
+/// through a real `VulkanFrame`. Skips cleanly with no Vulkan device.
+#[test]
+fn vulkan_render_glyphs_rasterizes_coverage() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_render_glyphs_rasterizes_coverage: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const TWIDE: i32 = 160;
+    const THIGH: i32 = 48;
+    const DARK: [f32; 4] = [0.09, 0.09, 0.11, 1.0];
+
+    let run = vk.build_glyph_run("12:34", 26.0).expect("glyph run");
+    assert!(!run.glyphs().is_empty(), "no glyphs were shaped");
+
+    let size = Size::<i32, Physical>::from((TWIDE, THIGH));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((TWIDE, THIGH)))
+        .expect("vulkan offscreen");
+    let origin = Point::<i32, Physical>::from((10, 10));
+    let full = Rectangle::from_size(size);
+
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame.clear(Color32F::from(DARK), &[full]).expect("clear");
+        frame
+            .render_glyphs(&run, origin, [1.0, 1.0, 1.0, 1.0], full, &[full])
+            .expect("render_glyphs");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((TWIDE, THIGH)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let bright = pixels
+        .chunks_exact(4)
+        .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+        .count();
+    eprintln!("render_glyphs bright pixels = {bright}");
+    assert!(bright > 40, "expected visible glyph ink, got {bright}");
+
+    // The top-left corner is far from the glyph origin (10, 10): still the dark clear.
+    let corner = &pixels[0..4];
+    assert!(
+        corner[0] < 60 && corner[1] < 60 && corner[2] < 60,
+        "bg corner should be dark, got {corner:?}",
+    );
+}
+
 // --- M3 step 1: RoundedTextureRenderElement through the owned Vulkan renderer -------------------
 
 /// Corner radius (logical px == physical px here, scale 1) for the rounded-texture tests.

@@ -229,6 +229,29 @@ pub struct ResizePush {
     pub niri_alpha: f32,
 }
 
+/// Push constants for the glyph material (`text.vert`/`text.frag`). Each glyph draws as its own
+/// quad placed at `origin` (pixels, top-left) of `size`, sampling the sub-rect
+/// `uv_origin`/`uv_size` of the shared R8 coverage atlas, tinted by `color` (coverage modulates the
+/// alpha). std430 layout: `color` (a `vec4`) lands at offset 48; 64 bytes total. Unlike the
+/// quad-family pushes there is **no** `proj` — the text material is offscreen-only (identity
+/// transform); the offscreen is composited through the transform-aware texture material.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TextPush {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+    pub target: [f32; 2],
+    pub uv_origin: [f32; 2],
+    pub uv_size: [f32; 2],
+    pub _pad: [f32; 2],
+    pub color: [f32; 4],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<TextPush>() == 64);
+    assert!(std::mem::offset_of!(TextPush, color) == 48);
+};
+
 impl Default for QuadPush {
     /// A full-texture, un-rounded, un-faded, opaque-white quad — materials override only the fields
     /// they use (and callers set `origin`/`size`/`target`). Note `tex_transform` defaults to
