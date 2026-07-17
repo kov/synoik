@@ -18,10 +18,11 @@ Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
   inspectable model; keep the per-frame render path separate.
 - The renderer is hand-rolled Vulkan, so **the spec is only checked when you ask**:
   `NIRI_VK_VALIDATION=1 cargo test --workspace` loads the Khronos validation layer (needs
-  `vulkan-validation-layers`) and prints every violation as `VULKAN ERROR`. **That output must be
-  empty** — grep for it after touching the renderer. It is off by default because the layer costs
-  real time per call. Do not gate this on a test asserting the error count: the counter is
-  process-wide and the suite is parallel, so such a test is racy by construction.
+  `vulkan-validation-layers`) and **fails the run** (non-zero exit, at process exit) if it reported
+  anything. Run it after touching the renderer. Off by default: the layer costs real time per call.
+  Note the layer never fails a test by itself, so libtest still prints `test result: ok` — trust the
+  exit status, not that line. To find the culprit, re-run with `--test-threads=1`: parallel output
+  interleaves, so the test name printed near a `VULKAN ERROR` means nothing.
 - Live validation needs the real binary: `cargo test` does NOT rebuild `target/debug/niri`
   (only the test harness). After code changes, always `cargo build --bin niri` and restart the
   session, or the running compositor keeps running stale code.

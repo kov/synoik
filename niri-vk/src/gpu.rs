@@ -28,6 +28,36 @@ pub fn validation_errors() -> usize {
     VALIDATION_ERRORS.load(Ordering::Relaxed)
 }
 
+/// Registers [`fail_on_validation_errors`] once per process.
+static REGISTER_EXIT_CHECK: std::sync::Once = std::sync::Once::new();
+
+/// Fail the process at exit if the layer reported any error.
+///
+/// The layer only *reports*: the callback returns `VK_FALSE` and cannot panic (it runs inside the
+/// loader's FFI frame), so nothing here fails a test on its own. Without this hook a validated run
+/// prints its violations under a **green** result — which is exactly what happened on the first
+/// one: 442 errors, `387 passed; 0 failed`.
+///
+/// It is an `atexit` handler rather than a `#[test]` because the check is only meaningful once
+/// every test has run, and libtest neither orders tests nor offers a teardown hook. A test
+/// asserting the count is 0 could instead run *before* the offending test (missing it) or fail
+/// while naming an innocent one — the count is process-wide and the suite is parallel. At exit it
+/// is final, so this neither misses nor misattributes.
+///
+/// Aborting is blunt, but an `atexit` handler cannot set the exit code, and a blunt red beats a
+/// quiet green. Re-run with `--test-threads=1` to attribute the errors to a test.
+extern "C" fn fail_on_validation_errors() {
+    let errors = VALIDATION_ERRORS.load(Ordering::Relaxed);
+    if errors > 0 {
+        eprintln!(
+            "\nVULKAN VALIDATION FAILED: the layer reported {errors} error(s) — see the \
+             `VULKAN ERROR` lines above. Re-run with `--test-threads=1` to see which test caused \
+             them (parallel output interleaves, so nearby test names mean nothing)."
+        );
+        std::process::abort();
+    }
+}
+
 /// The validation layer's message sink.
 ///
 /// Called on the offending Vulkan call's own thread, from inside the loader's FFI frame: unwinding
@@ -158,6 +188,14 @@ impl Gpu {
             layers.push(VALIDATION_LAYER.as_ptr());
             instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             eprintln!("  validation: {VALIDATION_LAYER:?} enabled");
+
+            // Make the run's exit status depend on what the layer found. See
+            // `fail_on_validation_errors`.
+            REGISTER_EXIT_CHECK.call_once(|| {
+                // SAFETY: `fail_on_validation_errors` is a plain `extern "C" fn()` that only reads
+                // an atomic and writes to stderr, and it is registered at most once.
+                unsafe { libc::atexit(fail_on_validation_errors) };
+            });
         }
 
         let create_info = vk::InstanceCreateInfo::default()
