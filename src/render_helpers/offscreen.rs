@@ -7,7 +7,6 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{
     Element, Id, Kind, RenderElement, RenderElementStates, UnderlyingStorage,
 };
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::{
     CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions,
@@ -24,11 +23,12 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanR
 
 /// Buffer for offscreen rendering.
 ///
-/// Generic over the offscreen texture type `T` (the renderer's `TextureId`), defaulting to
-/// `GlesTexture` so bare mentions across the render tree resolve unchanged; the owned Vulkan
-/// renderer specializes it to `VkTexture`. (`ContextId<T>` requires `T: Texture`.)
+/// Generic over the offscreen texture type `T` (the renderer's `TextureId`), which is always
+/// `VkTexture` today. The generic is what the `Offscreen<T>`/`Bind<T>` bounds on `render` are
+/// written against, so it stays until the render tree stops being generic over the renderer.
+/// (`ContextId<T>` requires `T: Texture`.)
 #[derive(Debug)]
-pub struct OffscreenBuffer<T: Texture = GlesTexture> {
+pub struct OffscreenBuffer<T: Texture> {
     id: Id,
 
     /// The cached texture buffer.
@@ -52,7 +52,7 @@ struct Inner<T: Texture> {
 }
 
 #[derive(Debug, Clone)]
-pub struct OffscreenRenderElement<T: Texture = GlesTexture> {
+pub struct OffscreenRenderElement<T: Texture> {
     id: Id,
     texture: T,
     renderer_context_id: ContextId<T>,
@@ -313,43 +313,7 @@ impl<T: Texture> Element for OffscreenRenderElement<T> {
     }
 }
 
-impl RenderElement<GlesRenderer> for OffscreenRenderElement<GlesTexture> {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dest: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        if frame.context_id() != self.renderer_context_id {
-            warn!("trying to render texture from different renderer");
-            return Ok(());
-        }
-
-        frame.render_texture_from_to(
-            &self.texture,
-            src,
-            dest,
-            damage,
-            opaque_regions,
-            Transform::Normal,
-            self.alpha,
-            None,
-            &[],
-        )
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-// The `VkTexture` specialization samples the offscreen through the owned Vulkan renderer (the
-// sampleable-offscreen bridge); the render tree's `<GlesTexture>` variant stays a degraded no-op.
+// Samples the offscreen through the owned Vulkan renderer (the sampleable-offscreen bridge).
 impl RenderElement<VulkanRenderer> for OffscreenRenderElement<VkTexture> {
     fn draw(
         &self,

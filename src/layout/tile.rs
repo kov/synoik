@@ -193,9 +193,7 @@ pub(super) struct AlphaAnimation {
     /// semitransparent, then hold it at semitransparent for a while, until the operation
     /// completes.
     pub(super) hold_after_done: bool,
-    offscreen: OffscreenBuffer,
-    /// The same offscreen for the owned Vulkan renderer (distinct `VkTexture` type). Reused across
-    /// frames like the GLES one.
+    /// Reused across the animation's frames (reallocation churns virtio-gpu blobs).
     offscreen_vk: OffscreenBuffer<crate::render_helpers::vulkan::VkTexture>,
 }
 
@@ -656,15 +654,12 @@ impl<W: LayoutElement> Tile<W> {
         let taken = self.alpha_animation.take();
         let current = taken.as_ref().map_or(from, |a| a.anim.clamped_value());
 
-        // Reuse the existing offscreen buffers (reallocation churns virtio-gpu blobs).
-        let (offscreen, offscreen_vk) = taken
-            .map(|a| (a.offscreen, a.offscreen_vk))
-            .unwrap_or_default();
+        // Reuse the existing offscreen buffer (reallocation churns virtio-gpu blobs).
+        let offscreen_vk = taken.map(|a| a.offscreen_vk).unwrap_or_default();
 
         self.alpha_animation = Some(AlphaAnimation {
             anim: Animation::new(self.clock.clone(), current, to, 0., config),
             hold_after_done: false,
-            offscreen,
             offscreen_vk,
         });
     }
