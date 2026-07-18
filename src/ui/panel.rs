@@ -30,6 +30,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::null_mut;
+use std::time::Duration;
 
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
@@ -42,6 +43,7 @@ use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 
+use crate::gnome::ClockFormat;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -178,8 +180,10 @@ impl BarCache {
 }
 
 pub struct Panel {
-    /// Current clock string, e.g. "14:30". Recomputed on the minute tick.
+    /// Current clock string, e.g. "14:30". Recomputed on each clock tick.
     clock_text: String,
+    /// How the clock label is formatted (from `org.gnome.desktop.interface`).
+    clock_format: ClockFormat,
     /// Whether the overview is open (drives the indicator's checked highlight).
     activities_checked: bool,
 
@@ -189,8 +193,10 @@ pub struct Panel {
 
 impl Panel {
     pub fn new() -> Self {
+        let clock_format = ClockFormat::default();
         Self {
-            clock_text: format_clock(unsafe { libc::time(null_mut()) }),
+            clock_text: format_clock(unsafe { libc::time(null_mut()) }, clock_format),
+            clock_format,
             activities_checked: false,
             cache: RefCell::new(BarCache::new()),
         }
@@ -200,7 +206,7 @@ impl Panel {
     /// the caller can queue a redraw). `now` is epoch seconds — injectable so
     /// tests are deterministic.
     pub fn update_clock_at(&mut self, now: libc::time_t) -> bool {
-        let text = format_clock(now);
+        let text = format_clock(now, self.clock_format);
         if text != self.clock_text {
             self.clock_text = text;
             self.cache.borrow_mut().clear();
@@ -213,6 +219,27 @@ impl Panel {
     /// Recompute the clock from the current wall-clock time.
     pub fn update_clock(&mut self) -> bool {
         self.update_clock_at(unsafe { libc::time(null_mut()) })
+    }
+
+    /// Adopt a clock label format (from a gsettings change). Reformats the label
+    /// immediately; returns whether the displayed string changed.
+    pub fn set_clock_format(&mut self, format: ClockFormat) -> bool {
+        if format == self.clock_format {
+            return false;
+        }
+        self.clock_format = format;
+        self.update_clock()
+    }
+
+    /// How long until the clock label needs redrawing: every second when it shows
+    /// seconds, otherwise on the next minute boundary. The wake source that ticks
+    /// the clock uses this so an idle desktop wakes no more than it must.
+    pub fn clock_tick_interval(&self) -> Duration {
+        if self.clock_format.show_seconds {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(secs_until_next_minute())
+        }
     }
 
     /// Reflect the overview open/closed state on the indicator.
@@ -410,17 +437,59 @@ pub fn secs_until_next_minute() -> u64 {
     (60 - i64::from(sec)).clamp(1, 60) as u64
 }
 
-/// Format epoch seconds as a local `HH:MM` string.
-fn format_clock(now: libc::time_t) -> String {
-    // SAFETY: localtime returns a pointer into a static buffer; we read it
-    // immediately and copy the fields out before any other libc time call.
+/// The `strftime` format string for a clock label, assembled the way
+/// gnome-shell's `GnomeDesktop.WallClock` does from the interface keys: an
+/// optional weekday and date prefix, then the 12h/24h time with optional seconds.
+fn strftime_format(fmt: ClockFormat) -> &'static str {
+    match (
+        fmt.show_weekday,
+        fmt.show_date,
+        fmt.hour24,
+        fmt.show_seconds,
+    ) {
+        // 24-hour
+        (false, false, true, false) => "%H:%M",
+        (false, false, true, true) => "%H:%M:%S",
+        (true, false, true, false) => "%a %H:%M",
+        (true, false, true, true) => "%a %H:%M:%S",
+        (false, true, true, false) => "%b %-e %H:%M",
+        (false, true, true, true) => "%b %-e %H:%M:%S",
+        (true, true, true, false) => "%a %b %-e %H:%M",
+        (true, true, true, true) => "%a %b %-e %H:%M:%S",
+        // 12-hour (%-l drops the leading space on the hour)
+        (false, false, false, false) => "%-l:%M %p",
+        (false, false, false, true) => "%-l:%M:%S %p",
+        (true, false, false, false) => "%a %-l:%M %p",
+        (true, false, false, true) => "%a %-l:%M:%S %p",
+        (false, true, false, false) => "%b %-e %-l:%M %p",
+        (false, true, false, true) => "%b %-e %-l:%M:%S %p",
+        (true, true, false, false) => "%a %b %-e %-l:%M %p",
+        (true, true, false, true) => "%a %b %-e %-l:%M:%S %p",
+    }
+}
+
+/// Format epoch seconds as a local clock label per `fmt`, via locale-aware
+/// `strftime` (like GNOME's WallClock).
+fn format_clock(now: libc::time_t, fmt: ClockFormat) -> String {
+    // SAFETY: localtime returns a pointer into a static buffer; we pass it
+    // straight to strftime before any other libc time call touches it.
     unsafe {
         let tm = libc::localtime(&now);
         if tm.is_null() {
             return String::new();
         }
-        let tm = &*tm;
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+        let Ok(format) = std::ffi::CString::new(strftime_format(fmt)) else {
+            return String::new();
+        };
+        let mut buf = [0u8; 128];
+        let n = libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            format.as_ptr(),
+            tm,
+        );
+        // strftime returns 0 on overflow (never for these short labels).
+        String::from_utf8_lossy(&buf[..n]).trim().to_string()
     }
 }
 
@@ -701,6 +770,100 @@ mod tests {
                 logical.h,
             );
         }
+    }
+
+    /// The clock's `strftime` format is assembled from the interface keys the
+    /// same way GNOME's WallClock does (`dateMenu.js`). Locale-independent.
+    #[test]
+    fn clock_strftime_format_matches_the_interface_keys() {
+        let f = |hour24, wd, date, sec| {
+            strftime_format(ClockFormat {
+                hour24,
+                show_weekday: wd,
+                show_date: date,
+                show_seconds: sec,
+            })
+        };
+        assert_eq!(f(true, false, false, false), "%H:%M");
+        assert_eq!(f(true, true, false, false), "%a %H:%M");
+        assert_eq!(f(true, false, false, true), "%H:%M:%S");
+        assert_eq!(f(true, true, true, true), "%a %b %-e %H:%M:%S");
+        assert_eq!(f(false, false, false, false), "%-l:%M %p");
+        assert_eq!(f(false, true, true, false), "%a %b %-e %-l:%M %p");
+    }
+
+    /// The rendered label reflects the format: seconds add a field, and a weekday
+    /// or date prefix turns the leading digit into a letter. TZ/locale-robust.
+    #[test]
+    fn clock_label_reflects_the_format() {
+        let base = ClockFormat {
+            hour24: true,
+            show_weekday: false,
+            show_date: false,
+            show_seconds: false,
+        };
+        let hhmm = format_clock(0, base);
+        assert_eq!(hhmm.len(), 5, "expected HH:MM, got {hhmm:?}");
+        assert_eq!(hhmm.as_bytes()[2], b':', "expected HH:MM, got {hhmm:?}");
+
+        let with_secs = format_clock(
+            0,
+            ClockFormat {
+                show_seconds: true,
+                ..base
+            },
+        );
+        assert_eq!(
+            with_secs.matches(':').count(),
+            2,
+            "seconds must add a field, got {with_secs:?}"
+        );
+
+        let with_weekday = format_clock(
+            0,
+            ClockFormat {
+                show_weekday: true,
+                ..base
+            },
+        );
+        assert!(
+            with_weekday
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic()),
+            "a weekday prefix must lead with a letter, got {with_weekday:?}"
+        );
+
+        let with_date = format_clock(
+            0,
+            ClockFormat {
+                show_date: true,
+                ..base
+            },
+        );
+        assert!(
+            with_date.len() > hhmm.len(),
+            "a date prefix must lengthen the label, got {with_date:?}"
+        );
+    }
+
+    /// Showing seconds tightens the clock tick to one second; otherwise it waits
+    /// for the minute boundary.
+    #[test]
+    fn clock_tick_interval_tightens_with_seconds() {
+        let mut panel = Panel::new(); // default format shows no seconds
+        let minute = panel.clock_tick_interval();
+        assert!(
+            minute > Duration::ZERO && minute <= Duration::from_secs(60),
+            "the minute tick must land on the next minute boundary, got {minute:?}"
+        );
+        panel.set_clock_format(ClockFormat {
+            hour24: true,
+            show_weekday: false,
+            show_date: false,
+            show_seconds: true,
+        });
+        assert_eq!(panel.clock_tick_interval(), Duration::from_secs(1));
     }
 
     /// Drive the GPU bar into an offscreen and read it back: an opaque dark

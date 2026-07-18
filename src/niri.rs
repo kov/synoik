@@ -836,6 +836,10 @@ impl State {
                 .update(&state.niri.gnome_settings.background);
             state
                 .niri
+                .panel
+                .set_clock_format(state.niri.gnome_settings.clock);
+            state
+                .niri
                 .event_loop
                 .insert_source(rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(settings) = event {
@@ -849,6 +853,7 @@ impl State {
                             .layout
                             .set_gnome_accent_color(settings.accent_color);
                         state.niri.wallpaper.update(&settings.background);
+                        state.niri.panel.set_clock_format(settings.clock);
                         state.niri.queue_redraw_all();
                         state.niri.gnome_settings = settings;
                     }
@@ -2785,9 +2790,9 @@ impl Niri {
                     if state.niri.panel.update_clock() {
                         state.niri.queue_redraw_all();
                     }
-                    TimeoutAction::ToDuration(Duration::from_secs(
-                        crate::ui::panel::secs_until_next_minute(),
-                    ))
+                    // Re-arm for the next second (when showing seconds) or the next
+                    // minute boundary, per the current clock format.
+                    TimeoutAction::ToDuration(state.niri.panel.clock_tick_interval())
                 },
             )
             .unwrap();

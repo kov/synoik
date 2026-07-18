@@ -50,6 +50,8 @@ pub struct GnomeSettings {
     /// gnome-shell's palette (st-theme-context.c). Drives accent-colored
     /// chrome like the overview thumbnail indicator.
     pub accent_color: [u8; 3],
+    /// `org.gnome.desktop.interface clock-*`: how the panel clock label reads.
+    pub clock: ClockFormat,
 }
 
 impl Default for GnomeSettings {
@@ -63,6 +65,7 @@ impl Default for GnomeSettings {
             edge_tiling: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
+            clock: ClockFormat::default(),
         }
     }
 }
@@ -101,6 +104,33 @@ pub enum BackgroundOptions {
     Zoom,
     /// One picture spanned across all monitors.
     Spanned,
+}
+
+/// The panel clock label format from `org.gnome.desktop.interface`, the same
+/// keys gnome-shell's `GnomeDesktop.WallClock` formats from (`dateMenu.js`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockFormat {
+    /// `clock-format`: 24-hour when true, else 12-hour with an AM/PM suffix.
+    pub hour24: bool,
+    /// `clock-show-weekday`: prefix the abbreviated weekday.
+    pub show_weekday: bool,
+    /// `clock-show-date`: include the abbreviated month and day-of-month.
+    pub show_date: bool,
+    /// `clock-show-seconds`: include seconds (and tick the clock every second).
+    pub show_seconds: bool,
+}
+
+impl Default for ClockFormat {
+    fn default() -> Self {
+        // A bare `HH:MM` fallback for when the interface schema is absent; the
+        // live gsettings values override it on a real GNOME session.
+        Self {
+            hour24: true,
+            show_weekday: false,
+            show_date: false,
+            show_seconds: false,
+        }
+    }
 }
 
 /// `org.gnome.desktop.wm.preferences focus-new-windows`.
@@ -177,6 +207,19 @@ impl GnomeSettings {
                 Some(rgb) => self.accent_color = rgb,
                 None => warn!("ignoring unrecognized accent-color {value:?}"),
             }
+        }
+        if settings_has_key(interface, "clock-format") {
+            // The key is the enum "12h"/"24h"; treat anything else as 24-hour.
+            self.clock.hour24 = interface.string("clock-format").as_str() != "12h";
+        }
+        if settings_has_key(interface, "clock-show-weekday") {
+            self.clock.show_weekday = interface.boolean("clock-show-weekday");
+        }
+        if settings_has_key(interface, "clock-show-date") {
+            self.clock.show_date = interface.boolean("clock-show-date");
+        }
+        if settings_has_key(interface, "clock-show-seconds") {
+            self.clock.show_seconds = interface.boolean("clock-show-seconds");
         }
     }
 
