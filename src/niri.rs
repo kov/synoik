@@ -838,6 +838,22 @@ impl State {
                 .niri
                 .layout
                 .set_gnome_accent_color(state.niri.gnome_settings.accent_color);
+            // Decode wallpapers on a worker thread (a 4K JPEG-XL decode would
+            // otherwise stall the main loop, e.g. on a color-scheme flip), and
+            // route finished decodes back here to swap in + redraw.
+            let (wp_tx, wp_rx) = calloop::channel::channel();
+            state.niri.wallpaper.spawn_worker(wp_tx);
+            state
+                .niri
+                .event_loop
+                .insert_source(wp_rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(decoded) = event {
+                        if state.niri.wallpaper.apply_decoded(decoded) {
+                            state.niri.queue_redraw_all();
+                        }
+                    }
+                })
+                .unwrap();
             state
                 .niri
                 .wallpaper
