@@ -69,7 +69,16 @@ const SYS_ADVANCE: f64 = SYS_ICON + SYS_GAP;
 const PILL_W: f64 = 96.;
 const PILL_ICON_INSET: f64 = 12.;
 
+/// Outer radius of the menu panel, logical px. gnome-shell 50.1's `.quick-settings`
+/// uses `border-radius: $modal_radius * 2.25` = `(8*2)*2.25` = 36px
+/// (`gnome-shell-sass/_common.scss`, `widgets/_quick-settings.scss`). All content is
+/// inset by `PAD` and self-rounded, so this arc never clips a tile or the pill.
+const MENU_RADIUS: f64 = 36.;
+
 const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
+/// Fully-transparent clear for the menu offscreen, so the rounded MENU_BG fill leaves
+/// the four outer corners transparent (they blend to whatever is beneath the popover).
+const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
@@ -343,7 +352,26 @@ impl QuickSettings {
         // The chrome (menu + tile backgrounds + labels), beneath the icons.
         match self.texture(renderer, scale) {
             Ok(texture) => {
-                let opaque = vec![Rectangle::from_size(texture.size())];
+                // The menu's outer corners are rounded (transparent), so report opacity as the two
+                // bands that exclude the four `MENU_RADIUS` corner squares — never claiming a
+                // cut-away corner pixel is opaque (which would let occlusion drop what shows
+                // through). Under-reporting the small arc/square slivers is harmless.
+                let size = texture.size();
+                let r = (MENU_RADIUS * scale).round() as i32;
+                let opaque = if r > 0 && size.w > 2 * r && size.h > 2 * r {
+                    vec![
+                        Rectangle::new(
+                            Point::<i32, BufferCoord>::from((0, r)),
+                            Size::from((size.w, size.h - 2 * r)),
+                        ),
+                        Rectangle::new(
+                            Point::<i32, BufferCoord>::from((r, 0)),
+                            Size::from((size.w - 2 * r, size.h)),
+                        ),
+                    ]
+                } else {
+                    vec![Rectangle::from_size(size)]
+                };
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
@@ -419,7 +447,11 @@ impl QuickSettings {
             let mut fb = renderer.bind(&mut target)?;
             let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
             let full = Rectangle::from_size(phys);
-            frame.clear(Color32F::from(MENU_BG), &[full])?;
+            // Rounded panel: clear transparent, then fill the menu background as a rounded rect so
+            // the outer corners stay transparent (the composited element's opacity hint below
+            // excludes those corners). Content is drawn on top of the opaque interior.
+            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            frame.render_rounded_rect(MENU_BG, (MENU_RADIUS * scale) as f32, full, &[full])?;
 
             let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
             let rect_px = |r: Rectangle<f64, Logical>| {
@@ -705,6 +737,13 @@ mod tests {
             .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
             .expect("copy_framebuffer");
         let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+        // The menu's outer corner is rounded away: the top-left pixel is transparent.
+        let tl = [pixels[0], pixels[1], pixels[2], pixels[3]];
+        assert!(
+            tl[3] < 40,
+            "the menu's outer corner must be transparent (rounded), got {tl:?}"
+        );
 
         // The center of the Dark Style tile (index 0) is the accent: high R, low G/B.
         let r0 = tile_rect(0);
