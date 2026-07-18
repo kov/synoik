@@ -583,10 +583,23 @@ impl VulkanRenderer {
     // `vulkan_render_glyphs_rasterizes_coverage` test.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_glyph_run(&mut self, text: &str, px: f32) -> Result<GlyphRun, VulkanError> {
+        self.build_glyph_run_weighted(text, px, false)
+    }
+
+    /// Like [`Self::build_glyph_run`], but rasterizes bold when `bold` — the panel clock draws
+    /// `font-weight: bold` to match GNOME's `panel_button`.
+    pub(crate) fn build_glyph_run_weighted(
+        &mut self,
+        text: &str,
+        px: f32,
+        bold: bool,
+    ) -> Result<GlyphRun, VulkanError> {
         // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
-        let atlas = self.text_ctx.build_atlas(&gpu, pool, text, px)?;
+        let atlas = self
+            .text_ctx
+            .build_atlas_weighted(&gpu, pool, text, px, bold)?;
 
         let side = atlas.side;
         let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;

@@ -567,7 +567,7 @@ impl Panel {
     /// The dateMenu (clock) button rect: the shaped label plus a padding on each
     /// side, centered on the output. `output_width` is the output's logical width.
     pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let clock_w = niri_vk::text::measure_line_width(&self.clock_text, FONT_PX as f32);
+        let clock_w = niri_vk::text::measure_line_width_weighted(&self.clock_text, FONT_PX as f32, true);
         let w = clock_w + H_PADDING * 2.;
         Rectangle::new(
             Point::from(((output_width - w) / 2., 0.)),
@@ -958,7 +958,8 @@ fn draw_bar_texture(
     let height_px = height_px.max(1);
     let px = (FONT_PX * scale) as f32;
 
-    let clock_run = renderer.build_glyph_run(clock, px)?;
+    // The dateMenu clock draws bold, like GNOME's `panel_button` (font-weight: bold).
+    let clock_run = renderer.build_glyph_run_weighted(clock, px, true)?;
 
     // Center the clock horizontally by its *advance* box, not its ink. gnome-shell's
     // WallClock uses tabular figures, so the advance width is constant as the seconds
@@ -966,7 +967,7 @@ fn draw_bar_texture(
     // wobble per digit) makes the whole run jitter left/right each second. Our
     // SansSerif digits are tabular too, so an advance-centered origin is rock-steady.
     // Vertical stays ink-centered (the ink height is stable across digits).
-    let advance_w = niri_vk::text::measure_line_width(clock, px).round() as i32;
+    let advance_w = niri_vk::text::measure_line_width_weighted(clock, px, true).round() as i32;
     let (_c_ix, c_iy, _c_iw, c_ih) = clock_run.ink_bounds();
     let c_origin =
         Point::<i32, Physical>::from(((width_px - advance_w) / 2, (height_px - c_ih) / 2 - c_iy));

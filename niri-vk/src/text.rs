@@ -68,12 +68,22 @@ fn measure_fonts() -> &'static Mutex<FontSystem> {
 /// rectangle at construction time, before a renderer exists. Matches the width `build_glyph_run`
 /// would produce at the same `px` (both shape SansSerif through cosmic-text).
 pub fn measure_line_width(text: &str, px: f32) -> f64 {
+    measure_line_width_weighted(text, px, false)
+}
+
+/// Like [`measure_line_width`], but shapes at [`Weight::BOLD`] when `bold` — the width a bold run
+/// (e.g. the panel clock, which draws `font-weight: bold` like GNOME's `panel_button`) lays out to,
+/// so its hit rectangle and centering match the glyphs `build_glyph_run_weighted` rasterizes.
+pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
     let mut fonts = measure_fonts().lock().unwrap();
     let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
     {
         let mut b = buffer.borrow_with(&mut fonts);
         b.set_size(None, None);
-        let attrs = Attrs::new().family(Family::SansSerif);
+        let mut attrs = Attrs::new().family(Family::SansSerif);
+        if bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
         b.set_text(text, &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(false);
     }
@@ -116,12 +126,28 @@ impl TextContext {
         text: &str,
         px: f32,
     ) -> Result<GlyphAtlas> {
+        self.build_atlas_weighted(gpu, pool, text, px, false)
+    }
+
+    /// Like [`Self::build_atlas`], but shapes and rasterizes at [`Weight::BOLD`] when `bold` — the
+    /// bold panel-clock path (GNOME's `panel_button` is `font-weight: bold`).
+    pub fn build_atlas_weighted(
+        &mut self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        text: &str,
+        px: f32,
+        bold: bool,
+    ) -> Result<GlyphAtlas> {
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
         {
             let mut b = buffer.borrow_with(&mut self.fonts);
             b.set_size(None, None);
-            let attrs = Attrs::new().family(Family::SansSerif);
+            let mut attrs = Attrs::new().family(Family::SansSerif);
+            if bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
