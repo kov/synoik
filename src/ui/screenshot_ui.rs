@@ -1481,9 +1481,11 @@ fn generate_panel(
         )),
     );
 
-    // The capture button is composited as a separate element over this panel (see
-    // `OutputData::button_element`); the offscreen quad pipelines misrender here, and only the
-    // clear + glyph paths are reliable from a hand-bound offscreen.
+    // This panel is a plain bordered rectangle, so `clear` + `render_glyphs` fully draw it; the
+    // capture button is still composited as a separate element over it (see
+    // `OutputData::button_element`). Rounded chrome here (a rounded panel, an SDF shutter) can now
+    // use `render_rounded_rect` — the offscreen "rounded misrenders" belief was a misdiagnosis
+    // (see the quick-settings / calendar / panel-dot chrome) — but is left for a later pass.
     let mut target = renderer.create_buffer(
         Fourcc::Abgr8888,
         Size::<i32, BufferCoord>::from((width, height)),
