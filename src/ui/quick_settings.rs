@@ -53,7 +53,11 @@ const COLS: usize = 2;
 /// Icon size inside a tile, and its inset from the tile's left edge.
 const TILE_ICON: f64 = 16.;
 const TILE_ICON_INSET: f64 = 12.;
-const LABEL_PX: f64 = 11.;
+/// Tile-title / battery-percentage font size, logical px. GNOME's `.quick-toggle-title`
+/// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
+/// (`gnome-shell-sass/_common.scss`). 11pt maps to the same 13 logical px as the panel
+/// clock (`panel::FONT_PX`), drawn bold — not 11px regular, which reads too small.
+const LABEL_PX: f64 = 13.;
 
 /// The system row (Settings on the left, Lock/Power on the right) sits at the
 /// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,
@@ -521,15 +525,20 @@ impl QuickSettings {
         // Shape the tile labels + the battery pill's percentage up front (immutable
         // borrows of the font system).
         let labels: Vec<String> = GRID.iter().map(|item| item.label(self.network)).collect();
+        // `.quick-toggle-title` / the power toggle's percentage are %heading = weight 700.
         let label_runs: Vec<_> = labels
             .iter()
-            .map(|l| renderer.build_glyph_run(l, label_px))
+            .map(|l| renderer.build_glyph_run_weighted(l, label_px, true))
             .collect::<Result<_, _>>()?;
         let pill_run = self
             .battery
             .as_ref()
             .map(|b| {
-                renderer.build_glyph_run(&format!("{}%", b.percentage.round() as i64), label_px)
+                renderer.build_glyph_run_weighted(
+                    &format!("{}%", b.percentage.round() as i64),
+                    label_px,
+                    true,
+                )
             })
             .transpose()?;
 
