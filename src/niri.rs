@@ -3377,6 +3377,16 @@ impl Niri {
         Some((output, pos_within_output))
     }
 
+    /// The workspace snapshot for `output`'s monitor, driving that panel's dot indicator.
+    pub fn workspace_state_for(&self, output: &Output) -> crate::ui::panel::WorkspaceState {
+        let (count, active) = self
+            .layout
+            .monitor_for_output(output)
+            .map(|mon| (mon.n_workspaces(), mon.active_workspace_idx()))
+            .unwrap_or((0, 0));
+        crate::ui::panel::WorkspaceState { count, active }
+    }
+
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
         let config = self.config.borrow();
         let hot_corners = output
@@ -4705,7 +4715,8 @@ impl Niri {
         // overlays above). It stays up during the overview, matching gnome-shell.
         // This is after the lock/screenshot early-returns, so it is hidden there.
         if self.layout.is_gnome_mode() {
-            if let Some(element) = self.panel.render(ctx.renderer, output) {
+            let ws = self.workspace_state_for(output);
+            for element in self.panel.render(ctx.renderer, output, ws) {
                 push(element.into());
             }
         }

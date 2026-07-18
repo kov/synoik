@@ -408,6 +408,12 @@ impl<W: LayoutElement> Monitor<W> {
         self.active_workspace_idx
     }
 
+    /// Number of workspaces on this monitor (including the trailing empty one). Drives the panel's
+    /// workspace-dot indicator count (GNOME's `WorkspacesAdjustment.upper`).
+    pub fn n_workspaces(&self) -> usize {
+        self.workspaces.len()
+    }
+
     pub fn active_workspace_ref(&self) -> &Workspace<W> {
         &self.workspaces[self.active_workspace_idx]
     }

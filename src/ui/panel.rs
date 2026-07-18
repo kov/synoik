@@ -1,18 +1,31 @@
 //! The GNOME top panel.
 //!
 //! A persistent bar drawn in-compositor at the top of each output while the
-//! session is in GNOME (floating) windowing mode. This first slice draws the
-//! bar chrome, a left "Activities" button (clickable, toggles the overview) and
-//! a centered clock; the panel also reserves a top strut so windows never sit
-//! under it (see `layout::workspace::compute_working_area`).
+//! session is in GNOME (floating) windowing mode. It draws the bar chrome, a
+//! left-hand **workspace indicator** (the graphical dots that replaced GNOME's
+//! old "Activities" text button — click toggles the overview, scroll switches
+//! workspace) and a centered clock; the panel also reserves a top strut so
+//! windows never sit under it (see `layout::workspace::compute_working_area`).
 //!
 //! The bar is drawn entirely on the GPU through the owned Vulkan renderer: an
-//! offscreen `VkTexture` is cleared to the bar background, the Activities/clock
-//! glyph runs are drawn with the [`render_glyphs`](VulkanFrame::render_glyphs)
-//! material, and the result is composited as a `TextureRenderElement` — no
-//! cairo/pango raster, no CPU upload. The panel's *logical* state (the clock
-//! string, whether Activities is checked, the hit rectangles) is kept separate
-//! from that render path so headless tests can assert it without a GPU.
+//! offscreen `VkTexture` is cleared to the bar background, the clock glyph run
+//! is drawn with the [`render_glyphs`](VulkanFrame::render_glyphs) material, and
+//! the result is composited as a `TextureRenderElement` — no cairo/pango raster.
+//! The workspace dots are a small CPU-rasterized bitmap (a capsule distance
+//! field, like the screenshot shutter) composited as a second element on top of
+//! the bar, because rounded shapes don't render reliably inside a hand-bound
+//! offscreen.
+//!
+//! ## Extension-representable structure
+//!
+//! The panel's *logical* model — which named items live in which of the three
+//! boxes, and each item's screen rectangle and state — is kept separate from the
+//! per-frame render path. GNOME extensions address the panel through exactly this
+//! surface (`Main.panel.statusArea[role]`, the left/center/right boxes), so we
+//! model it the same way ([`PanelBox`] / [`PanelItem`], roles [`ROLE_ACTIVITIES`]
+//! and [`ROLE_DATE_MENU`]) even though the extension host itself is deferred. The
+//! goal is a stable role→box→rect map an extension host can bind to, *not* a
+//! widget tree; rendering consumes the model but never the other way around.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -25,8 +38,11 @@ use smithay::backend::renderer::{
     Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
 };
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
+use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -40,36 +56,109 @@ pub const PANEL_HEIGHT: f64 = 32.;
 /// physical em the glyph rasterizer shapes at.
 const FONT_PX: f64 = 13.;
 
-/// Horizontal padding inside the Activities button, logical px.
-const H_PADDING: f64 = 12.;
+/// Base workspace-dot diameter, logical px. GNOME: `$scalable_icon_size (16) * 0.5`
+/// (`gnome-shell-sass/widgets/_panel.scss`), fully rounded (`$forced_circular_radius`).
+const DOT_DIAMETER: f64 = 8.;
 
-/// Label of the left-hand overview toggle.
-const ACTIVITIES: &str = "Activities";
+/// Gap between dots, logical px (`panel.js` `WorkspaceIndicators` box `spacing`).
+const DOT_SPACING: f64 = 5.;
+
+/// Horizontal padding on each side of the whole dot row, logical px. GNOME's dot
+/// box has `0 $scaled_padding*0.5` (3px); we keep a little extra so the row isn't
+/// jammed against the screen edge and stays a comfortable click target.
+const INDICATOR_H_PADDING: f64 = 6.;
+
+/// Inactive dots are drawn at 0.75× and half-opacity (`panel.js`
+/// `INACTIVE_WORKSPACE_DOT_SCALE`, `WorkspaceDot._updateVisuals`).
+const INACTIVE_DOT_SCALE: f64 = 0.75;
+const INACTIVE_DOT_OPACITY: f64 = 0.5;
 
 /// Bar background (opaque black — GNOME's dark panel), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 
-/// The Activities checked highlight (white at 0.15 over the black bar), pre-mixed
-/// to the opaque grey it composites to so a single opaque clear draws it.
+/// The checked highlight (white at 0.15 over the black bar), pre-mixed to the
+/// opaque grey it composites to so a single opaque clear draws it.
 const HIGHLIGHT: [f32; 4] = [0.15, 0.15, 0.15, 1.];
 
 /// Text color (opaque white); the glyph coverage modulates the alpha.
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
 
-/// A clickable region of the panel.
+/// Role of the left-hand workspace indicator (GNOME's `activities` panel role).
+pub const ROLE_ACTIVITIES: &str = "activities";
+/// Role of the centered clock (GNOME's `dateMenu` panel role).
+pub const ROLE_DATE_MENU: &str = "dateMenu";
+
+/// One of the panel's three boxes, mirroring GNOME's `_leftBox`/`_centerBox`/`_rightBox`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelItem {
-    /// The left-hand button that toggles the overview.
-    Activities,
+pub enum PanelBox {
+    Left,
+    Center,
+    Right,
 }
 
-/// Cached bar textures keyed by (fractional scale, physical width). The panel
-/// spans the output width, so width is part of the key (unlike the fixed-size
-/// overlays, which key by scale alone). Tied to a renderer context: dropped
-/// wholesale when the renderer changes.
+/// A named panel component and where it currently sits. The addressable surface a
+/// future extension host binds to (see the module docs); rendering is separate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelItem {
+    /// Stable GNOME role name, e.g. [`ROLE_ACTIVITIES`].
+    pub role: &'static str,
+    /// Which box the item lives in.
+    pub r#box: PanelBox,
+    /// The item's rectangle in output-local logical coords.
+    pub rect: Rectangle<f64, Logical>,
+}
+
+/// Per-output workspace snapshot that drives the dot indicator (GNOME's
+/// `WorkspacesAdjustment`: `count` = `upper`, `active` = `value`). The panel is a
+/// single global object rendered per output, so the caller passes the snapshot
+/// for the output being drawn/hit-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceState {
+    pub count: usize,
+    pub active: usize,
+}
+
+impl WorkspaceState {
+    /// Clamp `active` into range so an out-of-range index never drops the wide pill.
+    fn active(self) -> usize {
+        self.active.min(self.count.saturating_sub(1))
+    }
+}
+
+/// The dot row's `widthMultiplier` (`panel.js` `WorkspaceIndicators._updateExpansion`):
+/// the active pill is this many base-diameters wide.
+fn width_multiplier(count: usize) -> f64 {
+    if count <= 2 {
+        3.625
+    } else if count <= 5 {
+        3.25
+    } else {
+        2.75
+    }
+}
+
+/// Logical width of the whole indicator button (padding + dots + gaps). Independent
+/// of *which* dot is active (exactly one is the wide pill), so hit rect, checked
+/// highlight, and the drawn bitmap all agree.
+fn indicator_logical_width(count: usize) -> f64 {
+    if count == 0 {
+        return 2. * INDICATOR_H_PADDING;
+    }
+    let mult = width_multiplier(count);
+    let dots = (count as f64 - 1.) * DOT_DIAMETER + DOT_DIAMETER * mult;
+    let gaps = (count as f64 - 1.) * DOT_SPACING;
+    2. * INDICATOR_H_PADDING + dots + gaps
+}
+
+/// Cached bar textures and the uploaded dot-strip, keyed so a content change
+/// misses. Tied to a renderer context: dropped wholesale when the renderer changes.
 struct BarCache {
     context: Option<ContextId<VkTexture>>,
-    textures: HashMap<(NotNan<f64>, i32), VkTexture>,
+    /// Bar chrome keyed by (scale, physical width, workspace count) — the count
+    /// sets the checked-highlight width.
+    textures: HashMap<(NotNan<f64>, i32, usize), VkTexture>,
+    /// The workspace-dot strip, keyed by (scale, count, active).
+    indicator: HashMap<(NotNan<f64>, usize, usize), TextureBuffer<VkTexture>>,
 }
 
 impl BarCache {
@@ -77,44 +166,32 @@ impl BarCache {
         Self {
             context: None,
             textures: HashMap::new(),
+            indicator: HashMap::new(),
         }
     }
 
-    /// Drop every cached bar (content or renderer changed).
+    /// Drop everything cached (content or renderer changed).
     fn clear(&mut self) {
         self.textures.clear();
+        self.indicator.clear();
     }
 }
 
 pub struct Panel {
     /// Current clock string, e.g. "14:30". Recomputed on the minute tick.
     clock_text: String,
-    /// Whether the overview is open (drives the Activities checked highlight).
+    /// Whether the overview is open (drives the indicator's checked highlight).
     activities_checked: bool,
 
-    /// Hit rectangle of the Activities button, in output-local logical coords.
-    /// Left-anchored, so it is the same on every output.
-    activities_rect: Rectangle<f64, Logical>,
-
-    /// Cached GPU bar textures, cleared whenever the drawn content (clock text
-    /// or checked state) changes.
+    /// Cached GPU chrome, cleared whenever the drawn content changes.
     cache: RefCell<BarCache>,
 }
 
 impl Panel {
     pub fn new() -> Self {
-        // Measure the label GPU-free (cosmic-text shaping, no renderer needed) so the hit
-        // rectangle is known at construction time — the same width the bar draws the run to.
-        let activities_w = activities_logical_width();
-        let activities_rect = Rectangle::new(
-            Point::from((0., 0.)),
-            Size::from((activities_w, PANEL_HEIGHT)),
-        );
-
         Self {
             clock_text: format_clock(unsafe { libc::time(null_mut()) }),
             activities_checked: false,
-            activities_rect,
             cache: RefCell::new(BarCache::new()),
         }
     }
@@ -138,7 +215,7 @@ impl Panel {
         self.update_clock_at(unsafe { libc::time(null_mut()) })
     }
 
-    /// Reflect the overview open/closed state on the Activities button.
+    /// Reflect the overview open/closed state on the indicator.
     pub fn set_overview_open(&mut self, open: bool) {
         if open != self.activities_checked {
             self.activities_checked = open;
@@ -151,15 +228,48 @@ impl Panel {
         &self.clock_text
     }
 
-    /// Whether the Activities button is highlighted (for tests / introspection).
+    /// Whether the indicator button is highlighted (for tests / introspection).
     pub fn activities_checked(&self) -> bool {
         self.activities_checked
     }
 
-    /// Which panel item, if any, sits at an output-local logical position.
-    pub fn hit_test(&self, pos: Point<f64, Logical>) -> Option<PanelItem> {
-        if self.activities_rect.contains(pos) {
-            Some(PanelItem::Activities)
+    /// The workspace-indicator button rect (left-anchored, so the same on every
+    /// output). Width grows with the workspace count.
+    pub fn activities_rect(&self, ws: WorkspaceState) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((0., 0.)),
+            Size::from((indicator_logical_width(ws.count), PANEL_HEIGHT)),
+        )
+    }
+
+    /// The panel's items with their current rectangles, for introspection and the
+    /// (deferred) extension host. `output_width` is the output's logical width, used
+    /// to center the clock.
+    pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
+        let clock_w = niri_vk::text::measure_line_width(&self.clock_text, FONT_PX as f32);
+        let clock_rect = Rectangle::new(
+            Point::from(((output_width - clock_w) / 2., 0.)),
+            Size::from((clock_w, PANEL_HEIGHT)),
+        );
+        vec![
+            PanelItem {
+                role: ROLE_ACTIVITIES,
+                r#box: PanelBox::Left,
+                rect: self.activities_rect(ws),
+            },
+            PanelItem {
+                role: ROLE_DATE_MENU,
+                r#box: PanelBox::Center,
+                rect: clock_rect,
+            },
+        ]
+    }
+
+    /// Which panel *role*, if any, sits at an output-local logical position. Only
+    /// the interactive items (the indicator) are hit-tested for now.
+    pub fn hit_test(&self, pos: Point<f64, Logical>, ws: WorkspaceState) -> Option<&'static str> {
+        if self.activities_rect(ws).contains(pos) {
+            Some(ROLE_ACTIVITIES)
         } else {
             None
         }
@@ -169,60 +279,112 @@ impl Panel {
         &self,
         renderer: &mut VulkanRenderer,
         output: &Output,
-    ) -> Option<TextureRenderElement<VkTexture>> {
+        ws: WorkspaceState,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
         let width_px: i32 = to_physical_precise_round(scale, width);
         let width_px = width_px.max(1);
-        let key = (NotNan::new(scale).ok()?, width_px);
-
-        let texture = {
-            let mut cache = self.cache.borrow_mut();
-
-            // The cached textures belong to one renderer context; drop them all if it changed.
-            let context = renderer.context_id();
-            if cache.context.as_ref() != Some(&context) {
-                cache.clear();
-                cache.context = Some(context);
-            }
-
-            // Not the `entry` API: the build is fallible and borrows `renderer`, which the
-            // closure-based `or_insert_with` can't express.
-            #[allow(clippy::map_entry)]
-            if !cache.textures.contains_key(&key) {
-                match draw_bar_texture(
-                    renderer,
-                    scale,
-                    width_px,
-                    &self.clock_text,
-                    self.activities_checked,
-                ) {
-                    Ok(texture) => {
-                        cache.textures.insert(key, texture);
-                    }
-                    Err(err) => {
-                        tracing::error!("error drawing the panel bar: {err:#}");
-                        return None;
-                    }
-                }
-            }
-            cache.textures.get(&key)?.clone()
+        let Some(scale_key) = NotNan::new(scale).ok() else {
+            return Vec::new();
         };
 
-        // The whole bar is opaque, so let the compositor skip drawing behind it.
-        let opaque = vec![Rectangle::from_size(texture.size())];
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
+        let mut cache = self.cache.borrow_mut();
 
-        let elem = TextureRenderElement::from_texture_buffer(
+        // The cached textures belong to one renderer context; drop them all if it changed.
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.clear();
+            cache.context = Some(context);
+        }
+
+        let mut elements = Vec::with_capacity(2);
+
+        // The workspace dots sit on top of the bar. It is pushed first, and the
+        // element list is consumed in reverse, so first-pushed is topmost.
+        if let Some(strip) = self.indicator_element(renderer, &mut cache, scale, scale_key, ws) {
+            elements.push(strip);
+        }
+
+        // The bar chrome (opaque background, checked highlight, centered clock).
+        let bar_key = (scale_key, width_px, ws.count);
+        #[allow(clippy::map_entry)]
+        if !cache.textures.contains_key(&bar_key) {
+            match draw_bar_texture(
+                renderer,
+                scale,
+                width_px,
+                &self.clock_text,
+                self.activities_checked,
+                ws.count,
+            ) {
+                Ok(texture) => {
+                    cache.textures.insert(bar_key, texture);
+                }
+                Err(err) => {
+                    tracing::error!("error drawing the panel bar: {err:#}");
+                    return elements;
+                }
+            }
+        }
+        if let Some(texture) = cache.textures.get(&bar_key).cloned() {
+            // The whole bar is opaque, so let the compositor skip drawing behind it.
+            let opaque = vec![Rectangle::from_size(texture.size())];
+            let buffer =
+                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
+            elements.push(TextureRenderElement::from_texture_buffer(
+                buffer,
+                Point::from((0., 0.)),
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
+        }
+
+        elements
+    }
+
+    /// Build (or reuse) the workspace-dot strip element, composited on top of the
+    /// bar at the left, vertically centered.
+    fn indicator_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        cache: &mut BarCache,
+        scale: f64,
+        scale_key: NotNan<f64>,
+        ws: WorkspaceState,
+    ) -> Option<TextureRenderElement<VkTexture>> {
+        if ws.count == 0 {
+            return None;
+        }
+        let key = (scale_key, ws.count, ws.active());
+
+        #[allow(clippy::map_entry)]
+        if !cache.indicator.contains_key(&key) {
+            let bitmap = indicator_bitmap(scale, ws)?;
+            match TextureBuffer::from_memory_buffer(renderer, &bitmap) {
+                Ok(tb) => {
+                    cache.indicator.insert(key, tb);
+                }
+                Err(err) => {
+                    tracing::error!("error uploading the panel workspace indicator: {err:#}");
+                    return None;
+                }
+            }
+        }
+        let buffer = cache.indicator.get(&key)?.clone();
+
+        // Vertically center the dot band (DOT_DIAMETER tall) in the bar.
+        let location = Point::from((0., (PANEL_HEIGHT - DOT_DIAMETER) / 2.));
+        Some(TextureRenderElement::from_texture_buffer(
             buffer,
-            Point::from((0., 0.)),
+            location,
             1.,
             None,
             None,
             Kind::Unspecified,
-        );
-        Some(elem)
+        ))
     }
 }
 
@@ -262,24 +424,105 @@ fn format_clock(now: libc::time_t) -> String {
     }
 }
 
-/// The Activities button's logical width: the shaped label plus a horizontal
-/// padding on each side. Measured GPU-free (cosmic-text shaping) so it is the
-/// same at construction time (the hit rectangle) and at draw time (the checked
-/// highlight), matching what the bar draws the glyph run to.
-fn activities_logical_width() -> f64 {
-    niri_vk::text::measure_line_width(ACTIVITIES, FONT_PX as f32) + H_PADDING * 2.
+/// Rasterize the workspace-dot strip into a premultiplied-white `MemoryBuffer`
+/// (transparent background, one capsule per workspace): the active dot is a wide
+/// full-opacity pill, the others are small half-opacity circles. A pure CPU
+/// distance field (no cairo), like the screenshot shutter.
+///
+/// The pixels are physical-sized (padding/dots scaled by `scale`), so the buffer
+/// is tagged at the output `scale`, never `1.` — otherwise it composites `scale`×
+/// too big on a HiDPI output (the buffer-scale-tag trap that bit the shutter).
+fn indicator_bitmap(scale: f64, ws: WorkspaceState) -> Option<MemoryBuffer> {
+    let count = ws.count;
+    if count == 0 {
+        return None;
+    }
+    let active = ws.active();
+    let mult = width_multiplier(count);
+
+    let width_px: i32 =
+        to_physical_precise_round::<i32>(scale, indicator_logical_width(count)).max(1);
+    let height_px: i32 = to_physical_precise_round::<i32>(scale, DOT_DIAMETER).max(1);
+    let (w, h) = (width_px as usize, height_px as usize);
+    let cy = height_px as f64 / 2.;
+
+    // Physical capsule per dot: two circle centers on the band midline, radius, opacity.
+    let mut caps: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(count);
+    let mut x = INDICATOR_H_PADDING; // logical cursor at the left edge of the current slot
+    for i in 0..count {
+        let slot_w = if i == active {
+            DOT_DIAMETER * mult
+        } else {
+            DOT_DIAMETER
+        };
+        let (draw_w, draw_d, opacity) = if i == active {
+            (slot_w, DOT_DIAMETER, 1.0)
+        } else {
+            (
+                DOT_DIAMETER * INACTIVE_DOT_SCALE,
+                DOT_DIAMETER * INACTIVE_DOT_SCALE,
+                INACTIVE_DOT_OPACITY,
+            )
+        };
+        let slot_cx = x + slot_w / 2.;
+        let r = draw_d / 2.;
+        let half_span = (draw_w / 2. - r).max(0.);
+        caps.push((
+            (slot_cx - half_span) * scale,
+            (slot_cx + half_span) * scale,
+            r * scale,
+            opacity,
+        ));
+        x += slot_w + DOT_SPACING;
+    }
+
+    let mut data = vec![0u8; w * h * 4];
+    for py in 0..h {
+        for px in 0..w {
+            let fx = px as f64 + 0.5;
+            let fy = py as f64 + 0.5;
+            let mut cov = 0.0_f64;
+            for &(x0, x1, r, opacity) in &caps {
+                // Distance from the pixel to the horizontal segment [x0, x1] at y = cy.
+                let qx = fx.clamp(x0, x1);
+                let dx = fx - qx;
+                let dy = fy - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                // 1 inside the capsule, 0 outside, ~1px physical AA transition.
+                let c = (0.5 - (dist - r)).clamp(0., 1.) * opacity;
+                cov = cov.max(c);
+            }
+            // Premultiplied opaque white × coverage → all four channels equal.
+            let v = (cov * 255.).round().clamp(0., 255.) as u8;
+            let idx = (py * w + px) * 4;
+            data[idx] = v;
+            data[idx + 1] = v;
+            data[idx + 2] = v;
+            data[idx + 3] = v;
+        }
+    }
+
+    Some(MemoryBuffer::new(
+        data,
+        Fourcc::Argb8888,
+        Size::from((width_px, height_px)),
+        Scale::from(scale),
+        Transform::Normal,
+    ))
 }
 
-/// Draw the whole bar into an offscreen [`VkTexture`] on the GPU: clear the
-/// opaque background, draw the Activities checked highlight, then the Activities
-/// and clock glyph runs. The returned texture is `SHADER_READ_ONLY` (sampleable)
-/// so the caller can composite it directly.
+/// Draw the bar chrome into an offscreen [`VkTexture`]: clear the opaque
+/// background, draw the checked highlight over the indicator button, then the
+/// centered clock glyph run. The returned texture is `SHADER_READ_ONLY`
+/// (sampleable) so the caller can composite it directly. The workspace dots are
+/// composited separately, on top.
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
     checked: bool,
+    ws_count: usize,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("panel::draw_bar_texture");
 
@@ -288,24 +531,16 @@ fn draw_bar_texture(
     let height_px = height_px.max(1);
     let px = (FONT_PX * scale) as f32;
 
-    // Shape both runs (reuses the renderer's long-lived font system).
-    let activities = renderer.build_glyph_run(ACTIVITIES, px)?;
     let clock_run = renderer.build_glyph_run(clock, px)?;
-
-    let h_padding: i32 = to_physical_precise_round(scale, H_PADDING);
-
-    // Left-align Activities to the padding, vertically centered on its ink.
-    let (a_ix, a_iy, _a_iw, a_ih) = activities.ink_bounds();
-    let a_origin = Point::<i32, Physical>::from((h_padding - a_ix, (height_px - a_ih) / 2 - a_iy));
 
     // Center the clock's ink in the bar.
     let (c_ix, c_iy, c_iw, c_ih) = clock_run.ink_bounds();
     let c_origin =
         Point::<i32, Physical>::from(((width_px - c_iw) / 2 - c_ix, (height_px - c_ih) / 2 - c_iy));
 
-    // The highlight matches the Activities button hit rectangle (label + padding),
-    // measured GPU-free so it agrees with `activities_rect`.
-    let highlight_w: i32 = to_physical_precise_round(scale, activities_logical_width());
+    // The highlight matches the indicator button rect (padding + dots), so it
+    // agrees with `activities_rect`.
+    let highlight_w: i32 = to_physical_precise_round(scale, indicator_logical_width(ws_count));
     let highlight_w = highlight_w.clamp(1, width_px);
 
     let size = Size::<i32, Physical>::from((width_px, height_px));
@@ -324,7 +559,6 @@ fn draw_bar_texture(
             let hl = Rectangle::new(Point::from((0, 0)), Size::from((highlight_w, height_px)));
             frame.clear(Color32F::from(HIGHLIGHT), &[hl])?;
         }
-        frame.render_glyphs(&activities, a_origin, TEXT, full, &[full])?;
         frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
         // finish() submits and fence-waits synchronously, so the sync point is already signaled.
         let _sync = frame.finish()?;
@@ -341,9 +575,137 @@ mod tests {
 
     use super::*;
 
-    /// Drive the GPU bar into an offscreen and read it back: it must have an
-    /// opaque dark background, the checked highlight on the left, and bright
-    /// glyph ink for the clock/Activities text. Skips cleanly with no device.
+    /// The indicator button widens as workspaces are added (structural — no GPU).
+    #[test]
+    fn indicator_width_grows_with_workspace_count() {
+        let w2 = indicator_logical_width(2);
+        let w3 = indicator_logical_width(3);
+        let w6 = indicator_logical_width(6);
+        assert!(w3 > w2, "3 workspaces should be wider than 2: {w3} vs {w2}");
+        assert!(w6 > w3, "6 workspaces should be wider than 3: {w6} vs {w3}");
+
+        let panel = Panel::new();
+        let r2 = panel.activities_rect(WorkspaceState {
+            count: 2,
+            active: 0,
+        });
+        let r4 = panel.activities_rect(WorkspaceState {
+            count: 4,
+            active: 1,
+        });
+        assert!(r4.size.w > r2.size.w);
+        // A click at the left edge lands on the indicator; the far right does not.
+        assert_eq!(
+            panel.hit_test(
+                Point::from((4., 10.)),
+                WorkspaceState {
+                    count: 3,
+                    active: 1
+                }
+            ),
+            Some(ROLE_ACTIVITIES)
+        );
+        assert_eq!(
+            panel.hit_test(
+                Point::from((10_000., 10.)),
+                WorkspaceState {
+                    count: 3,
+                    active: 1
+                }
+            ),
+            None
+        );
+    }
+
+    /// The panel exposes both roles in their boxes (extension-representable model).
+    #[test]
+    fn items_expose_roles_and_boxes() {
+        let panel = Panel::new();
+        let items = panel.items(
+            1920.,
+            WorkspaceState {
+                count: 3,
+                active: 1,
+            },
+        );
+        let activities = items.iter().find(|i| i.role == ROLE_ACTIVITIES).unwrap();
+        let date = items.iter().find(|i| i.role == ROLE_DATE_MENU).unwrap();
+        assert_eq!(activities.r#box, PanelBox::Left);
+        assert_eq!(date.r#box, PanelBox::Center);
+        // The clock is roughly centered on the output.
+        let center = date.rect.loc.x + date.rect.size.w / 2.;
+        assert!((center - 960.).abs() < 1.);
+    }
+
+    /// The rasterized dot strip: the active pill spans more columns of bright
+    /// coverage than an inactive dot, and it is opaque while inactive dots are dim.
+    #[test]
+    fn indicator_bitmap_active_pill_is_wider_and_brighter() {
+        let ws = WorkspaceState {
+            count: 3,
+            active: 1,
+        };
+        let bmp = indicator_bitmap(2.0, ws).expect("bitmap");
+        let w = bmp.size().w as usize;
+        let h = bmp.size().h as usize;
+        let data = bmp.data();
+        // Peak alpha in each column (channels are equal: premultiplied white).
+        let col_peak: Vec<u8> = (0..w)
+            .map(|x| (0..h).map(|y| data[(y * w + x) * 4 + 3]).max().unwrap_or(0))
+            .collect();
+        // Count columns whose peak crosses a mid threshold — a proxy for the drawn
+        // width. The active pill (full opacity, wide) beats an inactive dot.
+        let bright_cols = col_peak.iter().filter(|&&v| v > 200).count();
+        let dim_present = col_peak.iter().any(|&v| v > 90 && v <= 200);
+        assert!(
+            bright_cols >= (DOT_DIAMETER * 2.0) as usize,
+            "expected a wide bright pill, only {bright_cols} bright columns"
+        );
+        assert!(
+            dim_present,
+            "expected dimmer inactive dots (half-opacity coverage)"
+        );
+    }
+
+    /// The buffer-scale-tag guard for the hand-rasterized dot strip (see the
+    /// `vulkan-buffer-scale-tag-trap`): its pixels are physical, so the tag must be
+    /// the output scale. If it were `1.`, the *logical* size would balloon with the
+    /// scale and the strip would composite `scale`× too big on a HiDPI seat —
+    /// invisible in the scale-1 suite. Asserting logical size is scale-invariant is
+    /// exactly what the compositor consumes (`logical = pixels / tag`).
+    #[test]
+    fn indicator_bitmap_is_tagged_at_output_scale() {
+        let ws = WorkspaceState {
+            count: 3,
+            active: 1,
+        };
+        let expected_w = indicator_logical_width(ws.count);
+        for scale in [1.0, 1.5, 2.0] {
+            let bmp = indicator_bitmap(scale, ws).expect("bitmap");
+            assert!(
+                (bmp.scale().x - scale).abs() < 1e-9 && (bmp.scale().y - scale).abs() < 1e-9,
+                "strip tagged at {:?}, not the output scale {scale}",
+                bmp.scale(),
+            );
+            // Physical pixels grow with scale, but the logical size must not.
+            let logical = bmp.logical_size();
+            assert!(
+                (logical.w - expected_w).abs() < 1.0,
+                "logical width {} drifts from {expected_w} at scale {scale} — physical pixels \
+                 tagged at the wrong scale",
+                logical.w,
+            );
+            assert!(
+                (logical.h - DOT_DIAMETER).abs() < 1.0,
+                "logical height {} drifts from {DOT_DIAMETER} at scale {scale}",
+                logical.h,
+            );
+        }
+    }
+
+    /// Drive the GPU bar into an offscreen and read it back: an opaque dark
+    /// background, the checked highlight on the left, and bright clock glyph ink.
+    /// Skips cleanly with no device.
     #[test]
     fn draws_a_bar_with_glyph_coverage() {
         let mut vk = match VulkanRenderer::new() {
@@ -356,7 +718,8 @@ mod tests {
 
         let width_px = 400;
         let height_px = PANEL_HEIGHT as i32;
-        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", true).expect("bar texture");
+        let mut tex =
+            draw_bar_texture(&mut vk, 1., width_px, "12:34", true, 3).expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
@@ -385,7 +748,7 @@ mod tests {
             "expected the checked highlight grey at top-left, got {hl:?}",
         );
 
-        // Bright glyph ink somewhere (the clock and Activities text).
+        // Bright glyph ink somewhere (the clock text).
         let bright = pixels
             .chunks_exact(4)
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)

@@ -3048,13 +3048,14 @@ impl State {
                 return;
             }
 
-            // GNOME top panel: a left-click on the Activities button toggles the
+            // GNOME top panel: a left-click on the workspace indicator toggles the
             // overview (the mouse counterpart of the Super-tap overlay key).
             if self.niri.layout.is_gnome_mode() && button == Some(MouseButton::Left) {
                 let location = pointer.current_location();
-                if let Some((_output, pos_within_output)) = self.niri.output_under(location) {
-                    if self.niri.panel.hit_test(pos_within_output)
-                        == Some(crate::ui::panel::PanelItem::Activities)
+                if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                    let ws = self.niri.workspace_state_for(output);
+                    if self.niri.panel.hit_test(pos_within_output, ws)
+                        == Some(crate::ui::panel::ROLE_ACTIVITIES)
                     {
                         self.niri.suppressed_buttons.insert(button_code);
                         self.do_action(Action::ToggleOverview, false);
@@ -3414,6 +3415,35 @@ impl State {
         };
 
         let is_mru_open = self.niri.window_mru_ui.is_open();
+
+        // GNOME top panel: a wheel scroll over the workspace indicator switches
+        // workspaces (gnome-shell handleWorkspaceScroll). Handle it before the
+        // generic wheel binds so it works with no modifier, and consume the event.
+        if source == AxisSource::Wheel && self.niri.layout.is_gnome_mode() {
+            let location = pointer.current_location();
+            let over_indicator = self
+                .niri
+                .output_under(location)
+                .map(|(output, pos)| {
+                    let ws = self.niri.workspace_state_for(output);
+                    self.niri.panel.hit_test(pos, ws) == Some(crate::ui::panel::ROLE_ACTIVITIES)
+                })
+                .unwrap_or(false);
+            if over_indicator {
+                let vertical = vertical_amount_v120.unwrap_or(0.);
+                let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
+                if ticks > 0 {
+                    for _ in 0..ticks {
+                        self.do_action(Action::FocusWorkspaceDownUnderMouse, false);
+                    }
+                } else if ticks < 0 {
+                    for _ in ticks..0 {
+                        self.do_action(Action::FocusWorkspaceUpUnderMouse, false);
+                    }
+                }
+                return;
+            }
+        }
 
         // Handle wheel scroll bindings.
         if source == AxisSource::Wheel {

@@ -2033,18 +2033,19 @@ fn vulkan_renders_the_top_panel() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elem = state
-                .niri
-                .panel
-                .render(vk, &output)
-                .expect("panel produced no element on Vulkan (still blank)");
+            let ws = state.niri.workspace_state_for(&output);
+            let elems = state.niri.panel.render(vk, &output, ws);
+            assert!(
+                !elems.is_empty(),
+                "panel produced no element on Vulkan (still blank)"
+            );
             let pixels = render_to_vec(
                 vk,
                 Size::<i32, Physical>::from((width, bar_h)),
                 scale,
                 Transform::Normal,
                 Fourcc::Abgr8888,
-                [elem].into_iter(),
+                elems.into_iter(),
             )
             .expect("render panel");
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()

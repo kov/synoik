@@ -2619,6 +2619,55 @@ fn panel_activities_click_toggles_overview() {
     );
 }
 
+/// Scrolling over the workspace indicator switches workspaces (gnome-shell's
+/// `handleWorkspaceScroll`): a wheel notch down goes to the next workspace.
+#[test]
+fn panel_scroll_over_indicator_switches_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Mapping a window gives the monitor an occupied workspace plus the trailing
+    // empty one, so there is a workspace 2 to scroll to.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        0
+    );
+
+    // Park the pointer over the indicator (top-left of the panel) and scroll down.
+    pointer_motion_to(&mut f, 10., 10.);
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        1,
+        "a wheel notch over the indicator must switch to the next workspace"
+    );
+
+    // A scroll far from the indicator (mid-screen) must NOT switch workspaces.
+    pointer_motion_to(&mut f, 960., 540.);
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        1,
+        "a scroll away from the indicator must not switch workspaces"
+    );
+}
+
 /// A client must not be able to kill the compositor with a malformed `wl_region`.
 ///
 /// `wl_region.add` takes plain ints and the protocol does not forbid a negative extent, so clients
