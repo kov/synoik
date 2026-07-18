@@ -2034,10 +2034,11 @@ fn vulkan_renders_the_top_panel() {
         .headless()
         .with_vulkan_renderer(|vk| {
             let ws = state.niri.workspace_state_for(&output);
+            let position = state.niri.workspace_position_for(&output);
             let elems = state
                 .niri
                 .panel
-                .render(vk, &output, ws, &state.niri.icon_cache);
+                .render(vk, &output, ws, position, &state.niri.icon_cache);
             assert!(
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"

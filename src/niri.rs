@@ -3449,6 +3449,16 @@ impl Niri {
         crate::ui::panel::WorkspaceState { count, active }
     }
 
+    /// The live (fractional) active-workspace index for `output` — gnome-shell's
+    /// `WorkspacesAdjustment.value`. Equals `active` at rest and slides between indices
+    /// while a workspace switch animates, driving the panel dots' expansion.
+    pub fn workspace_position_for(&self, output: &Output) -> f64 {
+        self.layout
+            .monitor_for_output(output)
+            .map(|mon| mon.workspace_render_idx())
+            .unwrap_or(0.)
+    }
+
     fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
         let config = self.config.borrow();
         let hot_corners = output
@@ -4792,9 +4802,10 @@ impl Niri {
         // This is after the lock/screenshot early-returns, so it is hidden there.
         if self.layout.is_gnome_mode() {
             let ws = self.workspace_state_for(output);
+            let ws_position = self.workspace_position_for(output);
             for element in self
                 .panel
-                .render(ctx.renderer, output, ws, &self.icon_cache)
+                .render(ctx.renderer, output, ws, ws_position, &self.icon_cache)
             {
                 push(element.into());
             }

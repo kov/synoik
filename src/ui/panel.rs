@@ -537,6 +537,7 @@ impl Panel {
         renderer: &mut VulkanRenderer,
         output: &Output,
         ws: WorkspaceState,
+        position: f64,
         icons: &IconCache,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
@@ -575,27 +576,55 @@ impl Panel {
         // Button container state (hover/active) invalidates the bar cache on change, so
         // the structural key can stay content-only.
         let containers = self.button_containers(width, ws);
-        let bar_key = (scale_key, width_px, ws.count, ws.active());
-        #[allow(clippy::map_entry)]
-        if !cache.textures.contains_key(&bar_key) {
+
+        // While a workspace switch animates, `position` is fractional and the dots morph
+        // every frame — draw the bar fresh and skip the cache (which is keyed on the
+        // integer active index). The switch animation already drives the per-frame
+        // redraws. At rest, cache as usual, drawing with the exact integer index so the
+        // cached texture always matches its key.
+        let animating = (position - position.round()).abs() > 1e-6;
+        let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
                 scale,
                 width_px,
                 &self.clock_text,
                 &containers,
-                ws,
+                ws.count,
+                position,
             ) {
-                Ok(texture) => {
-                    cache.textures.insert(bar_key, texture);
-                }
+                Ok(texture) => Some(texture),
                 Err(err) => {
                     tracing::error!("error drawing the panel bar: {err:#}");
-                    return elements;
+                    None
                 }
             }
-        }
-        if let Some(texture) = cache.textures.get(&bar_key).cloned() {
+        } else {
+            let bar_key = (scale_key, width_px, ws.count, ws.active());
+            #[allow(clippy::map_entry)]
+            if !cache.textures.contains_key(&bar_key) {
+                match draw_bar_texture(
+                    renderer,
+                    scale,
+                    width_px,
+                    &self.clock_text,
+                    &containers,
+                    ws.count,
+                    ws.active() as f64,
+                ) {
+                    Ok(texture) => {
+                        cache.textures.insert(bar_key, texture);
+                    }
+                    Err(err) => {
+                        tracing::error!("error drawing the panel bar: {err:#}");
+                        return elements;
+                    }
+                }
+            }
+            cache.textures.get(&bar_key).cloned()
+        };
+
+        if let Some(texture) = bar_texture {
             // The whole bar is opaque, so let the compositor skip drawing behind it.
             let opaque = vec![Rectangle::from_size(texture.size())];
             let buffer =
@@ -748,36 +777,53 @@ fn format_clock(now: libc::time_t, fmt: ClockFormat) -> String {
     }
 }
 
-/// Draw the workspace dots into the bar frame as rounded rects: the active dot is a
-/// wide full-opacity white pill (a half-height radius clamps to a stadium in
-/// `sdf_rect.frag`), the others are small half-opacity white circles. Laid out at the
-/// left, vertically centered — the same slot layout `indicator_logical_width` (and so
-/// the button hit-test) derives from. gnome-shell's dots are fully rounded
-/// (`$forced_circular_radius`). Drawn over the opaque bar background, so the texture
-/// stays fully opaque; replaces the old CPU capsule bitmap.
+/// Interpolate `a`→`b` by `t` (gnome-shell's `Util.lerp`).
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
+}
+
+/// Draw the workspace dots into the bar frame as rounded rects, continuously
+/// expanded around the active workspace so the row morphs smoothly while switching.
+///
+/// `position` is the live (fractional) active-workspace index — gnome-shell's
+/// `WorkspacesAdjustment.value` — so at rest it's the integer active index and while a
+/// switch animates it slides between two indices. Each dot's `expansion`
+/// (`panel.js WorkspaceIndicators._updateExpansion`) is `clamp(1 - |i - position|, 0, 1)`,
+/// driving, exactly as gnome-shell's `WorkspaceDot`: opacity `lerp(0.5, 1, e)`, dot
+/// scale `lerp(0.75, 1, e)`, and an allocation-width factor `lerp(1, widthMultiplier, e)`.
+/// The active dot (e=1) is a wide full-opacity pill; a distant one (e=0) a small
+/// half-opacity circle; mid-switch the two straddled dots are each half-grown.
+///
+/// The per-dot allocation widths always sum to a constant (the two straddled dots'
+/// expansions sum to 1), so the whole row — and thus `indicator_logical_width`, the hit
+/// rect, and the button pill — stay the same width throughout the slide. Laid out at the
+/// left, vertically centered; fully rounded (`$forced_circular_radius`). Drawn over the
+/// opaque bar background, so the texture stays fully opaque.
 fn draw_workspace_dots(
     frame: &mut VulkanFrame,
     scale: f64,
-    ws: WorkspaceState,
+    count: usize,
+    position: f64,
     full: Rectangle<i32, Physical>,
 ) -> anyhow::Result<()> {
-    let count = ws.count;
     if count == 0 {
         return Ok(());
     }
-    let active = ws.active();
     let mult = width_multiplier(count);
     let band_cy = PANEL_HEIGHT / 2.;
 
     let mut x = INDICATOR_H_PADDING; // logical left edge of the current slot
     for i in 0..count {
-        let (slot_w, draw_w, draw_h, opacity) = if i == active {
-            let w = DOT_DIAMETER * mult;
-            (w, w, DOT_DIAMETER, 1.0_f32)
-        } else {
-            let d = DOT_DIAMETER * INACTIVE_DOT_SCALE;
-            (DOT_DIAMETER, d, d, INACTIVE_DOT_OPACITY as f32)
-        };
+        let expansion = (1. - (i as f64 - position).abs()).clamp(0., 1.);
+        let dot_scale = lerp(INACTIVE_DOT_SCALE, 1., expansion);
+        let width_factor = lerp(1., mult, expansion);
+        let opacity = lerp(INACTIVE_DOT_OPACITY, 1., expansion) as f32;
+
+        // Allocation slot (constant total across the row); the visible dot is the
+        // slot scaled by `dot_scale` about its center (gnome-shell's `scaleX`/`scaleY`).
+        let slot_w = DOT_DIAMETER * width_factor;
+        let draw_w = slot_w * dot_scale;
+        let draw_h = DOT_DIAMETER * dot_scale;
         let slot_cx = x + slot_w / 2.;
         let rect = Rectangle::new(
             Point::<i32, Physical>::from((
@@ -789,7 +835,7 @@ fn draw_workspace_dots(
                 to_physical_precise_round::<i32>(scale, draw_h).max(1),
             )),
         );
-        // Half the physical height clamps to a full circle (inactive) or stadium (active).
+        // Half the physical height clamps to a full circle (small dot) or stadium (pill).
         let radius = rect.size.h as f32 / 2.;
         frame.render_rounded_rect([1., 1., 1., opacity], radius, rect, &[full])?;
         x += slot_w + DOT_SPACING;
@@ -808,7 +854,8 @@ fn draw_bar_texture(
     width_px: i32,
     clock: &str,
     containers: &[(Rectangle<f64, Logical>, [f32; 4])],
-    ws: WorkspaceState,
+    count: usize,
+    position: f64,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("panel::draw_bar_texture");
 
@@ -858,7 +905,7 @@ fn draw_bar_texture(
             let radius = phys.size.h as f32 / 2.;
             frame.render_rounded_rect(*color, radius, phys, &[full])?;
         }
-        draw_workspace_dots(&mut frame, scale, ws, full)?;
+        draw_workspace_dots(&mut frame, scale, count, position, full)?;
         frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
         // finish() submits and fence-waits synchronously, so the sync point is already signaled.
         let _sync = frame.finish()?;
@@ -1003,8 +1050,8 @@ mod tests {
         };
         let scale = 2.0;
         let width_px = to_physical_precise_round::<i32>(scale, 400.);
-        let mut tex =
-            draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws).expect("bar texture");
+        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws.count, 1.)
+            .expect("bar texture");
         let size = tex.size();
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -1033,6 +1080,88 @@ mod tests {
         // A dim (half-opacity white over the dark bar) inactive dot is also present.
         let dim = row.chunks_exact(4).any(|p| p[0] > 80 && p[0] <= 200);
         assert!(dim, "expected dimmer inactive dots (half-opacity)");
+    }
+
+    /// The dot row's total allocation width is invariant to the (fractional) switch
+    /// position: the two straddled dots' expansions always sum to 1, so the row — and
+    /// hence `indicator_logical_width`, the button hit rect, and its pill — never resize
+    /// mid-switch. Pins that invariant (pure, the property the animation relies on).
+    #[test]
+    fn dot_row_width_is_invariant_during_switch() {
+        let count = 4;
+        let mult = width_multiplier(count);
+        let slot_sum = |p: f64| {
+            (0..count)
+                .map(|i| {
+                    let e = (1. - (i as f64 - p).abs()).clamp(0., 1.);
+                    DOT_DIAMETER * lerp(1., mult, e)
+                })
+                .sum::<f64>()
+        };
+        let rest = slot_sum(0.);
+        for p in [0., 0.25, 0.5, 0.75, 1., 1.5, 2.5, 3.] {
+            assert!(
+                (slot_sum(p) - rest).abs() < 1e-9,
+                "dot row width changed at position {p}: {} vs {rest}",
+                slot_sum(p)
+            );
+        }
+        // And it equals the dots term of `indicator_logical_width` (one full-width pill).
+        let expected = (count as f64 - 1.) * DOT_DIAMETER + DOT_DIAMETER * mult;
+        assert!((rest - expected).abs() < 1e-9, "{rest} vs {expected}");
+    }
+
+    /// Mid-switch (a fractional position), the two straddled dots are each only
+    /// partially expanded — so the peak brightness in the dot region is the ~0.75-opacity
+    /// of a half-grown dot, strictly dimmer than the full-white active pill at rest. Pins
+    /// that the fractional path actually morphs the dots. Skips with no device.
+    #[test]
+    fn draw_bar_texture_dots_morph_during_switch() {
+        use smithay::backend::renderer::{ExportMem, Texture as _};
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draw_bar_texture_dots_morph_during_switch: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let scale = 2.0;
+        let width_px = to_physical_precise_round::<i32>(scale, 400.);
+
+        // Peak red over the band row across just the two-dot region (far from the clock).
+        let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
+            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position)
+                .expect("bar texture");
+            let size = tex.size();
+            let fb = vk.bind(&mut tex).expect("bind for readback");
+            let region = Rectangle::<i32, BufferCoord>::from_size(size);
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+            let w = size.w as usize;
+            let band_y = (size.h / 2) as usize;
+            let right = to_physical_precise_round::<i32>(scale, indicator_logical_width(2))
+                .clamp(1, size.w) as usize;
+            pixels[band_y * w * 4..band_y * w * 4 + right * 4]
+                .chunks_exact(4)
+                .map(|p| p[0])
+                .max()
+                .unwrap_or(0)
+        };
+
+        let rest = peak(&mut vk, 0.); // dot 0 fully active → full white
+        let mid = peak(&mut vk, 0.5); // both dots half-expanded → ~0.75 opacity, no full pillar
+        assert!(rest > 240, "resting active dot should be full white, peak {rest}");
+        assert!(
+            (150..=235).contains(&mid),
+            "mid-switch dots should be partial opacity, peak {mid}"
+        );
+        assert!(
+            mid < rest,
+            "mid-switch peak {mid} must be dimmer than the resting active pill {rest}"
+        );
     }
 
     /// The clock is centered on its advance box (see `draw_bar_texture`), which is
@@ -1167,8 +1296,9 @@ mod tests {
         let mut panel = Panel::new();
         panel.set_overview_open(true);
         let containers = panel.button_containers(width_px as f64, ws);
-        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", &containers, ws)
-            .expect("bar texture");
+        let mut tex =
+            draw_bar_texture(&mut vk, 1., width_px, "12:34", &containers, ws.count, ws.active as f64)
+                .expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
