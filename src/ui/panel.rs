@@ -43,7 +43,8 @@ use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 
-use crate::gnome::ClockFormat;
+use crate::gnome::{ClockFormat, QuickToggles};
+use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -92,6 +93,47 @@ const TEXT: [f32; 4] = [1., 1., 1., 1.];
 pub const ROLE_ACTIVITIES: &str = "activities";
 /// Role of the centered clock (GNOME's `dateMenu` panel role).
 pub const ROLE_DATE_MENU: &str = "dateMenu";
+/// Role of the right-hand status area that opens quick settings (GNOME's
+/// `quickSettings`).
+pub const ROLE_QUICK_SETTINGS: &str = "quickSettings";
+
+/// Right-box status-indicator icon size and inter-icon gap, logical px.
+const QS_ICON: f64 = 16.;
+const QS_ICON_GAP: f64 = 4.;
+
+/// The always-present anchor icon of the quick-settings indicator (a placeholder
+/// for the dynamic network/volume/battery cluster, which is daemon-backed and
+/// deferred). First that resolves wins.
+const QS_ANCHOR_ICONS: &[&str] = &[
+    "emblem-system-symbolic",
+    "applications-system-symbolic",
+    "open-menu-symbolic",
+];
+/// Real status icons the indicator surfaces when the matching toggle is on
+/// (GNOME shows the DND icon in the panel; the others are our own touch).
+const QS_DND_ICONS: &[&str] = &["notifications-disabled-symbolic"];
+const QS_NIGHT_ICONS: &[&str] = &["night-light-symbolic"];
+
+/// The candidate icon-name lists for the quick-settings indicator, left-to-right:
+/// any active real-status icons, then the anchor.
+fn qs_indicator_icons(toggles: QuickToggles) -> Vec<&'static [&'static str]> {
+    let mut v: Vec<&'static [&'static str]> = Vec::new();
+    if toggles.do_not_disturb {
+        v.push(QS_DND_ICONS);
+    }
+    if toggles.night_light {
+        v.push(QS_NIGHT_ICONS);
+    }
+    v.push(QS_ANCHOR_ICONS);
+    v
+}
+
+/// Logical width of the right-box quick-settings indicator (padding + icons +
+/// gaps). Depends on how many status icons are currently shown.
+fn qs_indicator_width(toggles: QuickToggles) -> f64 {
+    let n = qs_indicator_icons(toggles).len() as f64;
+    2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+}
 
 /// One of the panel's three boxes, mirroring GNOME's `_leftBox`/`_centerBox`/`_rightBox`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +206,9 @@ struct BarCache {
     textures: HashMap<(NotNan<f64>, i32, usize), VkTexture>,
     /// The workspace-dot strip, keyed by (scale, count, active).
     indicator: HashMap<(NotNan<f64>, usize, usize), TextureBuffer<VkTexture>>,
+    /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name).
+    /// Always tinted white, so the name is the only content key.
+    qs_icons: HashMap<(NotNan<f64>, String), TextureBuffer<VkTexture>>,
 }
 
 impl BarCache {
@@ -172,6 +217,7 @@ impl BarCache {
             context: None,
             textures: HashMap::new(),
             indicator: HashMap::new(),
+            qs_icons: HashMap::new(),
         }
     }
 
@@ -179,6 +225,7 @@ impl BarCache {
     fn clear(&mut self) {
         self.textures.clear();
         self.indicator.clear();
+        self.qs_icons.clear();
     }
 }
 
@@ -189,6 +236,9 @@ pub struct Panel {
     clock_format: ClockFormat,
     /// Whether the overview is open (drives the indicator's checked highlight).
     activities_checked: bool,
+    /// The quick-settings toggle states, mirrored from gsettings — they decide
+    /// which status icons the right-box indicator shows.
+    toggles: QuickToggles,
 
     /// Cached GPU chrome, cleared whenever the drawn content changes.
     cache: RefCell<BarCache>,
@@ -201,8 +251,21 @@ impl Panel {
             clock_text: format_clock(unsafe { libc::time(null_mut()) }, clock_format),
             clock_format,
             activities_checked: false,
+            toggles: QuickToggles::default(),
             cache: RefCell::new(BarCache::new()),
         }
+    }
+
+    /// Adopt the quick-settings toggle states (from a gsettings change or a tile
+    /// click). Returns whether they changed (so the caller can queue a redraw);
+    /// the indicator's icon set may differ.
+    pub fn set_quick_toggles(&mut self, toggles: QuickToggles) -> bool {
+        if toggles == self.toggles {
+            return false;
+        }
+        self.toggles = toggles;
+        self.cache.borrow_mut().clear();
+        true
     }
 
     /// Recompute the clock from the wall clock. Returns whether it changed (so
@@ -283,9 +346,24 @@ impl Panel {
         )
     }
 
+    /// The quick-settings status indicator rect: the icon cluster plus a padding
+    /// on each side, right-anchored on the output. Its width tracks how many
+    /// status icons are currently shown.
+    pub fn quick_settings_rect(
+        &self,
+        output_width: f64,
+        toggles: QuickToggles,
+    ) -> Rectangle<f64, Logical> {
+        let w = qs_indicator_width(toggles);
+        Rectangle::new(
+            Point::from((output_width - w, 0.)),
+            Size::from((w, PANEL_HEIGHT)),
+        )
+    }
+
     /// The panel's items with their current rectangles, for introspection and the
     /// (deferred) extension host. `output_width` is the output's logical width, used
-    /// to center the clock.
+    /// to place the centered clock and the right-anchored quick-settings indicator.
     pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
         vec![
             PanelItem {
@@ -298,11 +376,17 @@ impl Panel {
                 r#box: PanelBox::Center,
                 rect: self.date_menu_rect(output_width),
             },
+            PanelItem {
+                role: ROLE_QUICK_SETTINGS,
+                r#box: PanelBox::Right,
+                rect: self.quick_settings_rect(output_width, self.toggles),
+            },
         ]
     }
 
     /// Which panel *role*, if any, sits at an output-local logical position.
-    /// `output_width` is needed to place the centered dateMenu.
+    /// `output_width` is needed to place the centered dateMenu and the
+    /// right-anchored quick-settings indicator.
     pub fn hit_test(
         &self,
         pos: Point<f64, Logical>,
@@ -311,6 +395,11 @@ impl Panel {
     ) -> Option<&'static str> {
         if self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
+        } else if self
+            .quick_settings_rect(output_width, self.toggles)
+            .contains(pos)
+        {
+            Some(ROLE_QUICK_SETTINGS)
         } else if self.date_menu_rect(output_width).contains(pos) {
             Some(ROLE_DATE_MENU)
         } else {
@@ -323,6 +412,7 @@ impl Panel {
         renderer: &mut VulkanRenderer,
         output: &Output,
         ws: WorkspaceState,
+        icons: &IconCache,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
@@ -341,10 +431,20 @@ impl Panel {
             cache.context = Some(context);
         }
 
-        let mut elements = Vec::with_capacity(2);
+        let mut elements = Vec::with_capacity(4);
 
-        // The workspace dots sit on top of the bar. It is pushed first, and the
-        // element list is consumed in reverse, so first-pushed is topmost.
+        // The workspace dots and the right-box status icons sit on top of the bar.
+        // Elements are pushed first-topmost (the list is consumed in reverse).
+        self.qs_indicator_elements(
+            renderer,
+            &mut cache,
+            scale,
+            scale_key,
+            width,
+            &mut elements,
+            icons,
+        );
+
         if let Some(strip) = self.indicator_element(renderer, &mut cache, scale, scale_key, ws) {
             elements.push(strip);
         }
@@ -428,6 +528,62 @@ impl Panel {
             None,
             Kind::Unspecified,
         ))
+    }
+
+    /// Push the right-box quick-settings status icons onto `elements`, laid out in
+    /// a right-anchored cluster and composited on top of the bar. Each icon is
+    /// resolved from its candidate list and uploaded once per (scale, name).
+    #[allow(clippy::too_many_arguments)]
+    fn qs_indicator_elements(
+        &self,
+        renderer: &mut VulkanRenderer,
+        cache: &mut BarCache,
+        scale: f64,
+        scale_key: NotNan<f64>,
+        output_width: f64,
+        elements: &mut Vec<TextureRenderElement<VkTexture>>,
+        icons: &IconCache,
+    ) {
+        let rect = self.quick_settings_rect(output_width, self.toggles);
+        let mut x = rect.loc.x + INDICATOR_H_PADDING;
+        for candidates in qs_indicator_icons(self.toggles) {
+            // Resolve the first candidate that rasterizes, then cache its upload.
+            let Some((name, buffer)) = candidates.iter().find_map(|name| {
+                icons
+                    .buffer(name, QS_ICON, scale, TEXT)
+                    .map(|b| (name.to_string(), b))
+            }) else {
+                x += QS_ICON + QS_ICON_GAP;
+                continue;
+            };
+            let key = (scale_key, name);
+            #[allow(clippy::map_entry)]
+            if !cache.qs_icons.contains_key(&key) {
+                match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                    Ok(tb) => {
+                        cache.qs_icons.insert(key.clone(), tb);
+                    }
+                    Err(err) => {
+                        tracing::error!("error uploading a quick-settings indicator icon: {err:#}");
+                        x += QS_ICON + QS_ICON_GAP;
+                        continue;
+                    }
+                }
+            }
+            if let Some(tb) = cache.qs_icons.get(&key) {
+                let logical = tb.logical_size();
+                let location = Point::from((x, (PANEL_HEIGHT - logical.h) / 2.));
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    tb.clone(),
+                    location,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            x += QS_ICON + QS_ICON_GAP;
+        }
     }
 }
 

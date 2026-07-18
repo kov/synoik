@@ -54,6 +54,22 @@ pub struct GnomeSettings {
     pub clock: ClockFormat,
     /// `org.gnome.desktop.calendar`: week start + week-number column.
     pub calendar: CalendarSettings,
+    /// The state of the quick-settings toggles we back with gsettings.
+    pub quick_toggles: QuickToggles,
+}
+
+/// The gsettings-backed quick-settings toggles (the "self-contained" ones that
+/// need no daemon): each mirrors one key, read for the tile's on/off state and
+/// written back by [`GnomeSettingsWriter`] when the tile is clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuickToggles {
+    /// `org.gnome.desktop.interface color-scheme == "prefer-dark"` (Dark Style).
+    pub dark_style: bool,
+    /// Do Not Disturb: the *inverse* of `org.gnome.desktop.notifications
+    /// show-banners` (gnome-shell's DND tile hides banners).
+    pub do_not_disturb: bool,
+    /// `org.gnome.settings-daemon.plugins.color night-light-enabled`.
+    pub night_light: bool,
 }
 
 impl Default for GnomeSettings {
@@ -69,6 +85,7 @@ impl Default for GnomeSettings {
             accent_color: ACCENT_BLUE,
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
+            quick_toggles: QuickToggles::default(),
         }
     }
 }
@@ -262,6 +279,23 @@ impl GnomeSettings {
         }
         if settings_has_key(interface, "clock-show-seconds") {
             self.clock.show_seconds = interface.boolean("clock-show-seconds");
+        }
+        if settings_has_key(interface, "color-scheme") {
+            self.quick_toggles.dark_style = interface.string("color-scheme") == "prefer-dark";
+        }
+    }
+
+    fn load_notifications(&mut self, notifications: &gio::Settings) {
+        // gnome-shell's Do Not Disturb tile is the inverse of show-banners
+        // (js/ui/status/system.js / calendar.js `_setDndState`).
+        if settings_has_key(notifications, "show-banners") {
+            self.quick_toggles.do_not_disturb = !notifications.boolean("show-banners");
+        }
+    }
+
+    fn load_color(&mut self, color: &gio::Settings) {
+        if settings_has_key(color, "night-light-enabled") {
+            self.quick_toggles.night_light = color.boolean("night-light-enabled");
         }
     }
 
@@ -670,6 +704,60 @@ impl GnomeSettingsWriter {
             });
         });
     }
+
+    /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
+    /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
+    pub fn set_dark_style(&self, dark: bool) {
+        let value = if dark { "prefer-dark" } else { "default" };
+        self.set_string("interface", "color-scheme", value);
+    }
+
+    /// Do Not Disturb tile: the *inverse* of `org.gnome.desktop.notifications
+    /// show-banners`.
+    pub fn set_do_not_disturb(&self, dnd: bool) {
+        self.set_bool("notifications", "show-banners", !dnd);
+    }
+
+    /// Night Light tile: `org.gnome.settings-daemon.plugins.color
+    /// night-light-enabled`.
+    pub fn set_night_light(&self, on: bool) {
+        self.set_bool("color", "night-light-enabled", on);
+    }
+
+    /// Write a string key on one of the stores (named by [`Stores::get`]),
+    /// hopping onto the watcher thread first. Missing store/key is a no-op.
+    fn set_string(&self, store: &'static str, key: &'static str, value: &'static str) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(settings) = s.get(store) {
+                    if settings_has_key(settings, key) {
+                        if let Err(err) = settings.set_string(key, value) {
+                            warn!("error writing {store} {key}: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Write a boolean key on one of the stores. Missing store/key is a no-op.
+    fn set_bool(&self, store: &'static str, key: &'static str, value: bool) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(settings) = s.get(store) {
+                    if settings_has_key(settings, key) {
+                        if let Err(err) = settings.set_boolean(key, value) {
+                            warn!("error writing {store} {key}: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
 }
 
 /// The `org.gnome.mutter.keybindings` keys we honor, with their schema
@@ -703,6 +791,8 @@ struct Stores {
     background: Option<gio::Settings>,
     interface: Option<gio::Settings>,
     calendar: Option<gio::Settings>,
+    notifications: Option<gio::Settings>,
+    color: Option<gio::Settings>,
 }
 
 impl Stores {
@@ -719,11 +809,24 @@ impl Stores {
             background: gsettings("org.gnome.desktop.background"),
             interface: gsettings("org.gnome.desktop.interface"),
             calendar: gsettings("org.gnome.desktop.calendar"),
+            notifications: gsettings("org.gnome.desktop.notifications"),
+            color: gsettings("org.gnome.settings-daemon.plugins.color"),
         }
     }
 
     fn any(&self) -> bool {
         self.all().next().is_some()
+    }
+
+    /// The open store with this short name, for [`GnomeSettingsWriter`]'s setters.
+    fn get(&self, name: &str) -> Option<&gio::Settings> {
+        match name {
+            "interface" => self.interface.as_ref(),
+            "notifications" => self.notifications.as_ref(),
+            "color" => self.color.as_ref(),
+            "shell" => self.shell.as_ref(),
+            _ => None,
+        }
     }
 
     fn all(&self) -> impl Iterator<Item = &gio::Settings> {
@@ -737,6 +840,8 @@ impl Stores {
             &self.background,
             &self.interface,
             &self.calendar,
+            &self.notifications,
+            &self.color,
         ]
         .into_iter()
         .flatten()
@@ -769,6 +874,12 @@ impl Stores {
         }
         if let Some(calendar) = &self.calendar {
             settings.load_calendar(calendar);
+        }
+        if let Some(notifications) = &self.notifications {
+            settings.load_notifications(notifications);
+        }
+        if let Some(color) = &self.color {
+            settings.load_color(color);
         }
         settings
     }
@@ -1280,6 +1391,8 @@ mod tests {
                 background: None,
                 interface: None,
                 calendar: None,
+                notifications: None,
+                color: None,
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -1376,6 +1489,8 @@ mod tests {
                         background: None,
                         interface: None,
                         calendar: None,
+                        notifications: None,
+                        color: None,
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);

@@ -2034,7 +2034,10 @@ fn vulkan_renders_the_top_panel() {
         .headless()
         .with_vulkan_renderer(|vk| {
             let ws = state.niri.workspace_state_for(&output);
-            let elems = state.niri.panel.render(vk, &output, ws);
+            let elems = state
+                .niri
+                .panel
+                .render(vk, &output, ws, &state.niri.icon_cache);
             assert!(
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"
@@ -2146,11 +2149,14 @@ fn vulkan_renders_the_calendar_popover() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elem = state
+            let elems = state
                 .niri
                 .panel_popover
-                .render(vk, &output)
-                .expect("an open popover must produce a render element");
+                .render(vk, &state.niri.icon_cache, &output);
+            assert!(
+                !elems.is_empty(),
+                "an open popover must produce a render element"
+            );
             // The popover composites centered under the clock, so capture the full
             // output width and enough height to include the calendar box.
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
@@ -2161,7 +2167,7 @@ fn vulkan_renders_the_calendar_popover() {
                 scale,
                 Transform::Normal,
                 Fourcc::Abgr8888,
-                [elem].into_iter(),
+                elems.into_iter(),
             )
             .expect("render popover");
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
@@ -2171,6 +2177,64 @@ fn vulkan_renders_the_calendar_popover() {
     assert!(
         opaque > 0,
         "the calendar popover did not composite any opaque pixels on Vulkan"
+    );
+}
+
+/// The quick-settings popover renders on the owned Vulkan renderer when open: the
+/// menu chrome (an offscreen box with tile backgrounds + labels) plus the icon
+/// elements composited on top. Assert `render` yields several elements that
+/// composite opaque (the dark menu) pixels.
+#[test]
+fn vulkan_renders_the_quick_settings_popover() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    // Open the quick-settings popover under the right-box indicator.
+    {
+        let output_w = output_size(&output).w;
+        let toggles = f.niri().gnome_settings.quick_toggles;
+        let anchor = f.niri().panel.quick_settings_rect(output_w, toggles);
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri()
+            .panel_popover
+            .toggle_quick_settings(output.clone(), anchor, toggles, accent);
+    }
+    assert!(f.niri().panel_popover.is_open());
+
+    let state = f.niri_state();
+    let opaque = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            assert!(
+                !elems.is_empty(),
+                "an open quick-settings popover must produce render elements"
+            );
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 300.);
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((w, h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elems.into_iter(),
+            )
+            .expect("render quick-settings popover");
+            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        opaque > 0,
+        "the quick-settings popover did not composite any opaque pixels on Vulkan"
     );
 }
 

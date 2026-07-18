@@ -2709,6 +2709,74 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     );
 }
 
+/// Clicking the right-box quick-settings indicator opens its popover; Escape and
+/// an outside click both dismiss it (the same popup-menu grab as the calendar).
+/// Clicking a tile inside flips its gsettings-backed state.
+#[test]
+fn panel_quick_settings_click_opens_toggles_and_dismisses() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    assert!(!f.niri().panel_popover.is_open());
+
+    // The indicator is right-anchored; with the default toggles it's a single
+    // anchor icon in the top-right corner. Click it.
+    let open = |f: &mut Fixture| {
+        pointer_motion_to(f, 1906., 10.);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    open(&mut f);
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "clicking the quick-settings indicator must open its popover"
+    );
+
+    // A click on the Do Not Disturb tile flips the local state and keeps the menu
+    // open. The menu is centered under the indicator, clamped into the output; the
+    // DND tile is the top-right tile of the two-column grid.
+    let output_w = 1920.0_f64;
+    let toggles = f.niri().gnome_settings.quick_toggles;
+    let anchor = f.niri().panel.quick_settings_rect(output_w, toggles);
+    // Recompute the popover origin the way the popover does (centered, clamped).
+    let menu_w = 332.0_f64; // PAD*2 + 2*TILE_W + TILE_GAP
+    let center_x = anchor.loc.x + anchor.size.w / 2.;
+    let origin_x = (center_x - menu_w / 2.).clamp(0., output_w - menu_w);
+    // DND tile center: PAD + (TILE_W + TILE_GAP) + TILE_W/2, PAD + TILE_H/2.
+    let tile_x = origin_x + 12. + (150. + 8.) + 75.;
+    let tile_y = 32. + 12. + 28.;
+    pointer_motion_to(&mut f, tile_x, tile_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "a tile click must not close the quick-settings menu"
+    );
+    assert!(
+        f.niri().gnome_settings.quick_toggles.do_not_disturb,
+        "clicking the Do Not Disturb tile must flip its state on"
+    );
+
+    // Escape closes it.
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "Escape must close the quick-settings popover"
+    );
+
+    // Reopen, then a click well outside dismisses it.
+    open(&mut f);
+    assert!(f.niri().panel_popover.is_open());
+    pointer_motion_to(&mut f, 960., 700.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "a click outside the quick-settings popover must dismiss it"
+    );
+}
+
 /// A client must not be able to kill the compositor with a malformed `wl_region`.
 ///
 /// `wl_region.add` takes plain ints and the protocol does not forbid a negative extent, so clients

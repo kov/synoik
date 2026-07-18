@@ -15,6 +15,7 @@
 //! symbolic icons all live under `<theme>/{symbolic,scalable}/<category>/` in the
 //! current theme (with an Adwaita/hicolor fallback), which a direct search covers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -46,8 +47,8 @@ const CATEGORIES: &[&str] = &[
 pub struct IconCache {
     /// Themes to search, in order (e.g. the configured theme, then Adwaita/hicolor).
     themes: Vec<String>,
-    resolved: HashMap<String, Option<PathBuf>>,
-    buffers: HashMap<(String, u32, u32), MemoryBuffer>,
+    resolved: RefCell<HashMap<String, Option<PathBuf>>>,
+    buffers: RefCell<HashMap<(String, u32, u32), MemoryBuffer>>,
 }
 
 impl IconCache {
@@ -61,19 +62,24 @@ impl IconCache {
         }
         Self {
             themes,
-            resolved: HashMap::new(),
-            buffers: HashMap::new(),
+            resolved: RefCell::new(HashMap::new()),
+            buffers: RefCell::new(HashMap::new()),
         }
     }
 
     /// The file path for a symbolic icon `name` (with or without the trailing
     /// `-symbolic`), or `None` if the theme doesn't provide it.
-    pub fn resolve(&mut self, name: &str) -> Option<PathBuf> {
-        if let Some(hit) = self.resolved.get(name) {
+    ///
+    /// Interior-mutable (the cache is shared behind `&`, so both the panel and the
+    /// popover can rasterize from the render path without a `&mut` borrow).
+    pub fn resolve(&self, name: &str) -> Option<PathBuf> {
+        if let Some(hit) = self.resolved.borrow().get(name) {
             return hit.clone();
         }
         let path = resolve_symbolic(name, &self.themes);
-        self.resolved.insert(name.to_string(), path.clone());
+        self.resolved
+            .borrow_mut()
+            .insert(name.to_string(), path.clone());
         path
     }
 
@@ -81,7 +87,7 @@ impl IconCache {
     /// output `scale` and tinted to straight-RGBA `color`. `None` if unresolved.
     /// Cached by (name, physical size, color).
     pub fn buffer(
-        &mut self,
+        &self,
         name: &str,
         logical_px: f64,
         scale: f64,
@@ -89,19 +95,20 @@ impl IconCache {
     ) -> Option<MemoryBuffer> {
         let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
         let key = (name.to_string(), px, color_key(color));
-        if !self.buffers.contains_key(&key) {
-            let path = self.resolve(name)?;
-            match rasterize_symbolic(&path, px, color, scale) {
-                Ok(buf) => {
-                    self.buffers.insert(key.clone(), buf);
-                }
-                Err(err) => {
-                    tracing::warn!("failed to rasterize icon {name:?}: {err:#}");
-                    return None;
-                }
+        if let Some(buf) = self.buffers.borrow().get(&key) {
+            return Some(buf.clone());
+        }
+        let path = self.resolve(name)?;
+        match rasterize_symbolic(&path, px, color, scale) {
+            Ok(buf) => {
+                self.buffers.borrow_mut().insert(key, buf.clone());
+                Some(buf)
+            }
+            Err(err) => {
+                tracing::warn!("failed to rasterize icon {name:?}: {err:#}");
+                None
             }
         }
-        self.buffers.get(&key).cloned()
     }
 }
 
@@ -258,7 +265,7 @@ mod tests {
 
     #[test]
     fn cache_resolves_and_reuses() {
-        let mut cache = IconCache::new("Adwaita");
+        let cache = IconCache::new("Adwaita");
         // Unknown icon resolves to None and is remembered.
         assert!(cache
             .resolve("definitely-not-an-icon-xyz-symbolic")

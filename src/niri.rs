@@ -156,6 +156,7 @@ use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
+use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -458,6 +459,8 @@ pub struct Niri {
     pub end_session_dialog: EndSessionDialog,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
+    /// Shared symbolic-icon cache for the panel and its popovers.
+    pub icon_cache: IconCache,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -845,6 +848,10 @@ impl State {
                 .set_clock_format(state.niri.gnome_settings.clock);
             state
                 .niri
+                .panel
+                .set_quick_toggles(state.niri.gnome_settings.quick_toggles);
+            state
+                .niri
                 .event_loop
                 .insert_source(rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(settings) = event {
@@ -859,6 +866,7 @@ impl State {
                             .set_gnome_accent_color(settings.accent_color);
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
+                        state.niri.panel.set_quick_toggles(settings.quick_toggles);
                         state.niri.queue_redraw_all();
                         state.niri.gnome_settings = settings;
                     }
@@ -2940,6 +2948,7 @@ impl Niri {
             end_session_dialog,
             panel: Panel::new(),
             panel_popover: PanelPopover::new(),
+            icon_cache: IconCache::new("Adwaita"),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -4737,11 +4746,18 @@ impl Niri {
         // This is after the lock/screenshot early-returns, so it is hidden there.
         if self.layout.is_gnome_mode() {
             let ws = self.workspace_state_for(output);
-            for element in self.panel.render(ctx.renderer, output, ws) {
+            for element in self
+                .panel
+                .render(ctx.renderer, output, ws, &self.icon_cache)
+            {
                 push(element.into());
             }
-            // A panel popover (dateMenu calendar, …) sits above the bar.
-            if let Some(element) = self.panel_popover.render(ctx.renderer, output) {
+            // A panel popover (dateMenu calendar, quick settings, …) sits above the
+            // bar; the quick-settings menu composites several elements (chrome + icons).
+            for element in self
+                .panel_popover
+                .render(ctx.renderer, &self.icon_cache, output)
+            {
                 push(element.into());
             }
         }

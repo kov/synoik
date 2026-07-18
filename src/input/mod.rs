@@ -833,6 +833,44 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Apply a quick-settings popover click outcome: write the backing gsettings
+    /// key (mirrored locally so the tile and the panel indicator update before the
+    /// change round-trips through the watcher), or spawn a system-row command.
+    fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
+        use crate::ui::popover::PopoverAction;
+
+        let set_toggle = |state: &mut Self, f: fn(&mut crate::gnome::QuickToggles, bool), v| {
+            f(&mut state.niri.gnome_settings.quick_toggles, v);
+            state
+                .niri
+                .panel
+                .set_quick_toggles(state.niri.gnome_settings.quick_toggles);
+        };
+
+        match action {
+            PopoverAction::Consumed => {}
+            PopoverAction::SetDarkStyle(v) => {
+                if let Some(w) = &self.niri.gnome_settings_writer {
+                    w.set_dark_style(v);
+                }
+                set_toggle(self, |t, v| t.dark_style = v, v);
+            }
+            PopoverAction::SetDoNotDisturb(v) => {
+                if let Some(w) = &self.niri.gnome_settings_writer {
+                    w.set_do_not_disturb(v);
+                }
+                set_toggle(self, |t, v| t.do_not_disturb = v, v);
+            }
+            PopoverAction::SetNightLight(v) => {
+                if let Some(w) = &self.niri.gnome_settings_writer {
+                    w.set_night_light(v);
+                }
+                set_toggle(self, |t, v| t.night_light = v, v);
+            }
+            PopoverAction::Spawn(command) => spawn(command, None),
+        }
+    }
+
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
@@ -3072,13 +3110,18 @@ impl State {
                     .output_under(location)
                     .map(|(o, p)| (o.clone(), p));
 
-                // An open popover (dateMenu calendar, …) grabs pointer clicks: a click inside
-                // routes to it, anywhere else dismisses it. Either way the click is consumed.
+                // An open popover (dateMenu calendar, quick settings, …) grabs pointer clicks: a
+                // click inside routes to it (a quick-settings tile/button returns an action we
+                // apply), anywhere else dismisses it. Either way the click is consumed.
                 if self.niri.panel_popover.is_open() {
                     self.niri.suppressed_buttons.insert(button_code);
                     match under {
                         Some((output, pos)) => {
-                            self.niri.panel_popover.pointer_click(&output, pos);
+                            if let Some(action) =
+                                self.niri.panel_popover.pointer_click(&output, pos)
+                            {
+                                self.apply_popover_action(action);
+                            }
                         }
                         None => self.niri.panel_popover.close(),
                     }
@@ -3109,6 +3152,17 @@ impl State {
                                     cal.show_week_numbers,
                                     accent,
                                 );
+                                self.niri.suppressed_buttons.insert(button_code);
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                            Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
+                                let toggles = self.niri.gnome_settings.quick_toggles;
+                                let anchor = self.niri.panel.quick_settings_rect(output_w, toggles);
+                                let accent = self.niri.gnome_settings.accent_color;
+                                self.niri
+                                    .panel_popover
+                                    .toggle_quick_settings(output, anchor, toggles, accent);
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
                                 return;
