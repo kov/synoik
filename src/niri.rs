@@ -2769,6 +2769,7 @@ impl Niri {
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
         let panel_popover = PanelPopover::new(animation_clock.clone(), config.clone());
+        let panel = Panel::new(animation_clock.clone(), config.clone());
 
         #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
@@ -2986,7 +2987,7 @@ impl Niri {
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
             end_session_dialog,
-            panel: Panel::new(),
+            panel,
             panel_popover,
             icon_cache: IconCache::new("Adwaita"),
 
@@ -4539,6 +4540,7 @@ impl Niri {
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
         self.panel_popover.advance_animations();
+        self.panel.advance_animations();
 
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
@@ -5183,6 +5185,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.

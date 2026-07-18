@@ -29,8 +29,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::null_mut;
+use std::rc::Rc;
 use std::time::Duration;
 
+use niri_config::Config;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
@@ -40,6 +42,7 @@ use smithay::backend::renderer::{
 use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::animation::{Animation, Clock};
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
@@ -95,12 +98,38 @@ const BTN_INSET_Y: f64 = 3.;
 /// padding is this plus the pill's own `BTN_MARGIN_X` edge inset.
 const BTN_H_PADDING: f64 = 12.;
 
-/// `panel_button` fill states over the dark bar (white `$fg`), straight RGBA — the
-/// SDF fill blends over the opaque background: hover `transparentize($fg, .83)`,
+/// `panel_button` fill *alpha* over the dark bar (white `$fg`) — the SDF fill blends
+/// over the opaque background: idle 0, hover `transparentize($fg, .83)`,
 /// active/`:checked` `transparentize($fg, .72)`, active+hover `transparentize($fg, .68)`.
-const BTN_HOVER: [f32; 4] = [1., 1., 1., 0.17];
-const BTN_ACTIVE: [f32; 4] = [1., 1., 1., 0.28];
-const BTN_ACTIVE_HOVER: [f32; 4] = [1., 1., 1., 0.32];
+/// The container color is white at the (animated) alpha of these.
+const BTN_HOVER_A: f32 = 0.17;
+const BTN_ACTIVE_A: f32 = 0.28;
+const BTN_ACTIVE_HOVER_A: f32 = 0.32;
+
+/// The three panel-button roles whose containers fade between states.
+const BTN_ROLES: [&str; 3] = [ROLE_ACTIVITIES, ROLE_DATE_MENU, ROLE_QUICK_SETTINGS];
+
+/// A button container's fill-alpha fade (gnome-shell `panel_button`'s 150ms
+/// `transition-duration`). `target` is the alpha the fill is heading to; `anim`
+/// interpolates the previous alpha → target and is cleared once it settles.
+struct FillFade {
+    target: f32,
+    anim: Option<Animation>,
+}
+
+impl FillFade {
+    /// The current fill alpha: the running animation's value, or the settled target.
+    fn value(&self) -> f32 {
+        match &self.anim {
+            Some(a) if !a.is_done() => a.clamped_value() as f32,
+            _ => self.target,
+        }
+    }
+
+    fn is_animating(&self) -> bool {
+        self.anim.as_ref().is_some_and(|a| !a.is_done())
+    }
+}
 
 /// A panel button's rounded container: its hit rect inset by the `panel_button`
 /// margin/border, so the pill floats off the screen edge and the fill is a stadium.
@@ -294,13 +323,32 @@ pub struct Panel {
     /// right-box status cluster.
     system_status: SystemStatus,
 
+    /// Animation clock + config, for the button-container fill fades.
+    clock: Clock,
+    config: Rc<RefCell<Config>>,
+    /// Per-role container fill-alpha fade (keyed by role), so hover/active
+    /// transitions ease over 150ms instead of snapping.
+    fills: HashMap<&'static str, FillFade>,
+
     /// Cached GPU chrome, cleared whenever the drawn content changes.
     cache: RefCell<BarCache>,
 }
 
 impl Panel {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         let clock_format = ClockFormat::default();
+        let fills = BTN_ROLES
+            .iter()
+            .map(|&role| {
+                (
+                    role,
+                    FillFade {
+                        target: 0.,
+                        anim: None,
+                    },
+                )
+            })
+            .collect();
         Self {
             clock_text: format_clock(unsafe { libc::time(null_mut()) }, clock_format),
             clock_format,
@@ -309,6 +357,9 @@ impl Panel {
             open_menu: None,
             toggles: QuickToggles::default(),
             system_status: SystemStatus::default(),
+            clock,
+            config,
+            fills,
             cache: RefCell::new(BarCache::new()),
         }
     }
@@ -381,7 +432,7 @@ impl Panel {
     pub fn set_overview_open(&mut self, open: bool) {
         if open != self.activities_checked {
             self.activities_checked = open;
-            self.cache.borrow_mut().clear_bars();
+            self.retarget_fills();
         }
     }
 
@@ -393,7 +444,7 @@ impl Panel {
             return false;
         }
         self.hovered = role;
-        self.cache.borrow_mut().clear_bars();
+        self.retarget_fills();
         true
     }
 
@@ -404,14 +455,14 @@ impl Panel {
             return false;
         }
         self.open_menu = role;
-        self.cache.borrow_mut().clear_bars();
+        self.retarget_fills();
         true
     }
 
-    /// The container fill for a button given its current hover/active state, or
-    /// `None` when it's idle (no container drawn). A button is "active" when its
-    /// menu is up (or, for Activities, the overview is open).
-    fn button_fill(&self, role: &'static str) -> Option<[f32; 4]> {
+    /// The container fill *alpha* a button should settle at for its current
+    /// hover/active state (0 when idle). A button is "active" when its menu is up
+    /// (or, for Activities, the overview is open).
+    fn target_alpha(&self, role: &str) -> f32 {
         let active = if role == ROLE_ACTIVITIES {
             self.activities_checked
         } else {
@@ -419,16 +470,61 @@ impl Panel {
         };
         let hover = self.hovered == Some(role);
         match (active, hover) {
-            (true, true) => Some(BTN_ACTIVE_HOVER),
-            (true, false) => Some(BTN_ACTIVE),
-            (false, true) => Some(BTN_HOVER),
-            (false, false) => None,
+            (true, true) => BTN_ACTIVE_HOVER_A,
+            (true, false) => BTN_ACTIVE_A,
+            (false, true) => BTN_HOVER_A,
+            (false, false) => 0.,
         }
     }
 
+    /// Recompute every button's target fill alpha after a state change and, for any
+    /// that changed, start a fade from the current (animated) value to the new
+    /// target — gnome-shell's `panel_button` 150ms transition. Invalidates the bar
+    /// cache so the fade redraws.
+    fn retarget_fills(&mut self) {
+        let config = self.config.borrow().animations.panel_popover_open_close.0;
+        let mut changed = false;
+        for role in BTN_ROLES {
+            let target = self.target_alpha(role);
+            let fade = self.fills.get_mut(role).expect("every role has a fade");
+            if (fade.target - target).abs() < f32::EPSILON {
+                continue;
+            }
+            let from = fade.value();
+            fade.target = target;
+            fade.anim = Some(Animation::new(
+                self.clock.clone(),
+                f64::from(from),
+                f64::from(target),
+                0.,
+                config,
+            ));
+            changed = true;
+        }
+        if changed {
+            self.cache.borrow_mut().clear_bars();
+        }
+    }
+
+    /// Settle finished container-fill fades (drop the completed animation so it
+    /// rests at its target). Called from the compositor's animation tick.
+    pub fn advance_animations(&mut self) {
+        for fade in self.fills.values_mut() {
+            if fade.anim.as_ref().is_some_and(|a| a.is_done()) {
+                fade.anim = None;
+            }
+        }
+    }
+
+    /// Whether any button-container fade is still running (keeps the redraw loop
+    /// ticking, and makes `render` draw the bar fresh rather than from cache).
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.fills.values().any(FillFade::is_animating)
+    }
+
     /// The rounded containers to paint behind the buttons this frame, each a
-    /// (pill rect, fill color) — only for buttons that are hovered or active. The
-    /// same building block (`render_rounded_rect`) for all three, so they're
+    /// (pill rect, fill color) — only for buttons with a non-zero (animated) fill.
+    /// The same building block (`render_rounded_rect`) for all three, so they're
     /// consistent. `output_width` places the centered/right-anchored buttons.
     fn button_containers(
         &self,
@@ -441,8 +537,9 @@ impl Panel {
             (ROLE_DATE_MENU, self.date_menu_rect(output_width)),
             (ROLE_QUICK_SETTINGS, self.quick_settings_rect(output_width)),
         ] {
-            if let Some(color) = self.button_fill(role) {
-                v.push((container_rect(rect), color));
+            let alpha = self.fills.get(role).map_or(0., FillFade::value);
+            if alpha > 0.001 {
+                v.push((container_rect(rect), [1., 1., 1., alpha]));
             }
         }
         v
@@ -578,11 +675,13 @@ impl Panel {
         let containers = self.button_containers(width, ws);
 
         // While a workspace switch animates, `position` is fractional and the dots morph
-        // every frame — draw the bar fresh and skip the cache (which is keyed on the
-        // integer active index). The switch animation already drives the per-frame
-        // redraws. At rest, cache as usual, drawing with the exact integer index so the
-        // cached texture always matches its key.
-        let animating = (position - position.round()).abs() > 1e-6;
+        // every frame; while a button-container fill fades, the pill alpha changes every
+        // frame — in either case draw the bar fresh and skip the cache (keyed on the
+        // integer active index, not the animated state). The switch / fill animations
+        // already drive the per-frame redraws. At rest, cache as usual, drawing with the
+        // exact integer index so the cached texture always matches its key.
+        let animating =
+            (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
         let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
@@ -699,11 +798,6 @@ impl Panel {
     }
 }
 
-impl Default for Panel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Seconds until the next wall-clock minute boundary (1..=60), so the clock
 /// tick can align to when the displayed minute actually changes.
@@ -922,6 +1016,12 @@ mod tests {
 
     use super::*;
 
+    /// A panel with a fresh animation clock + default config, for tests that don't
+    /// exercise the container fades.
+    fn test_panel() -> Panel {
+        Panel::new(Clock::default(), Rc::new(RefCell::new(Config::default())))
+    }
+
     /// The indicator button widens as workspaces are added (structural — no GPU).
     #[test]
     fn indicator_width_grows_with_workspace_count() {
@@ -931,7 +1031,7 @@ mod tests {
         assert!(w3 > w2, "3 workspaces should be wider than 2: {w3} vs {w2}");
         assert!(w6 > w3, "6 workspaces should be wider than 3: {w6} vs {w3}");
 
-        let panel = Panel::new();
+        let panel = test_panel();
         let r2 = panel.activities_rect(WorkspaceState {
             count: 2,
             active: 0,
@@ -999,8 +1099,8 @@ mod tests {
         );
 
         // The populated cluster is wider than the anchor fallback.
-        let base = Panel::new().quick_settings_rect(1920.).size.w;
-        let mut panel = Panel::new();
+        let base = test_panel().quick_settings_rect(1920.).size.w;
+        let mut panel = test_panel();
         panel.set_system_status(status);
         let wide = panel.quick_settings_rect(1920.).size.w;
         assert!(
@@ -1012,7 +1112,7 @@ mod tests {
     /// The panel exposes both roles in their boxes (extension-representable model).
     #[test]
     fn items_expose_roles_and_boxes() {
-        let panel = Panel::new();
+        let panel = test_panel();
         let items = panel.items(
             1920.,
             WorkspaceState {
@@ -1258,7 +1358,7 @@ mod tests {
     /// for the minute boundary.
     #[test]
     fn clock_tick_interval_tightens_with_seconds() {
-        let mut panel = Panel::new(); // default format shows no seconds
+        let mut panel = test_panel(); // default format shows no seconds
         let minute = panel.clock_tick_interval();
         assert!(
             minute > Duration::ZERO && minute <= Duration::from_secs(60),
@@ -1293,8 +1393,11 @@ mod tests {
             active: 0,
         };
         // Overview open → the Activities button is active, so its container pill is drawn.
-        let mut panel = Panel::new();
+        // Advance the clock past the 150ms fade so the pill is at its full target alpha.
+        let mut clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
         panel.set_overview_open(true);
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
         let containers = panel.button_containers(width_px as f64, ws);
         let mut tex =
             draw_bar_texture(&mut vk, 1., width_px, "12:34", &containers, ws.count, ws.active as f64)

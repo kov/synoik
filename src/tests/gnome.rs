@@ -2550,7 +2550,10 @@ fn panel_reserves_top_strut() {
 /// The panel clock formats local wall time as `HH:MM` and advances with it.
 #[test]
 fn panel_clock_is_hh_mm() {
-    let mut panel = crate::ui::panel::Panel::new();
+    let mut panel = crate::ui::panel::Panel::new(
+        crate::animation::Clock::default(),
+        std::rc::Rc::new(std::cell::RefCell::new(niri_config::Config::default())),
+    );
 
     // Epoch 0 and one hour later differ by exactly one hour in any timezone.
     panel.update_clock_at(0);
