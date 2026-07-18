@@ -28,6 +28,11 @@ use crate::render_helpers::icon::IconCache;
 /// `BoxPointer` `-arrow-rise` (`$base_padding` = 6px). It emerges from `rise` above
 /// its resting spot (toward the panel) and settles down, reversing on close.
 const POPOVER_RISE: f64 = 6.;
+
+/// Resting gap between the popover and the panel / screen edge, logical px. gnome-shell's
+/// `.popup-menu-boxpointer { -arrow-rise: $base_padding }` is documented as the "distance
+/// from the panel & screen edge" (6px), so the menu doesn't sit flush against either.
+const POPOVER_MARGIN: f64 = 6.;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::Calendar;
@@ -291,8 +296,9 @@ impl PanelPopover {
         Some(PopoverAction::Consumed)
     }
 
-    /// The popover's top-left, output-local logical: centered under the anchor,
-    /// clamped into the output, just below the panel; snapped to the pixel grid.
+    /// The popover's resting top-left, output-local logical: centered under the anchor,
+    /// clamped into the output with a `POPOVER_MARGIN` inset from the screen edges, and
+    /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.
     fn location(&self, output: &Output) -> Point<f64, Logical> {
         let scale = output.current_scale().fractional_scale();
         let ow = output_size(output).w;
@@ -302,8 +308,11 @@ impl PanelPopover {
             .map(|c| c.logical_size())
             .unwrap_or_default();
         let center_x = self.anchor.loc.x + self.anchor.size.w / 2.;
-        let x = (center_x - size.w / 2.).clamp(0., (ow - size.w).max(0.));
-        Point::from((x, PANEL_HEIGHT))
+        // Keep a margin from both screen edges (upper bound falls back to the lower one
+        // when the popover is wider than the margined area).
+        let max_x = (ow - size.w - POPOVER_MARGIN).max(POPOVER_MARGIN);
+        let x = (center_x - size.w / 2.).clamp(POPOVER_MARGIN, max_x);
+        Point::from((x, PANEL_HEIGHT + POPOVER_MARGIN))
             .to_physical_precise_round(scale)
             .to_logical(scale)
     }

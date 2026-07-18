@@ -2740,15 +2740,17 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     // DND tile is the top-right tile of the two-column grid.
     let output_w = 1920.0_f64;
     let anchor = f.niri().panel.quick_settings_rect(output_w);
-    // Recompute the popover origin the way the popover does (centered, clamped).
+    // Recompute the popover origin the way the popover does (centered, clamped with a
+    // POPOVER_MARGIN inset from the screen edges).
     let menu_w = 332.0_f64; // PAD*2 + 2*TILE_W + TILE_GAP
+    let margin = 6.0_f64; // POPOVER_MARGIN
     let center_x = anchor.loc.x + anchor.size.w / 2.;
-    let origin_x = (center_x - menu_w / 2.).clamp(0., output_w - menu_w);
+    let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
     // DND tile center (top-right tile), menu-local: x = PAD + (TILE_W + TILE_GAP)
     // + TILE_W/2; y = PAD + SYS_H + TILE_GAP + TILE_H/2 (the grid sits below the
-    // top system row). Plus the popover origin (menu y = PANEL_HEIGHT).
+    // top system row). Plus the popover origin (menu y = PANEL_HEIGHT + margin).
     let tile_x = origin_x + 12. + (150. + 8.) + 75.;
-    let tile_y = 32. + (12. + 44. + 8.) + 28.;
+    let tile_y = (32. + margin) + (12. + 44. + 8.) + 28.;
     pointer_motion_to(&mut f, tile_x, tile_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
