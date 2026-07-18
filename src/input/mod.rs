@@ -608,6 +608,22 @@ impl State {
                     }
                 }
 
+                // A panel popover (the dateMenu calendar, …) grabs the keyboard modally like the
+                // dialogs above: Escape closes it, every other key is swallowed.
+                if this.niri.panel_popover.is_open() {
+                    this.niri.panel_popover.handle_key(raw, pressed);
+                    this.niri.queue_redraw_all();
+
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        return FilterResult::Forward;
+                    }
+                }
+
                 // Check if all modifiers were released while the MRU UI was open. If so, close the
                 // UI (which will also transfer the focus to the current MRU UI selection).
                 if this.niri.window_mru_ui.is_open() && !pressed && modifiers.is_empty() {
@@ -3048,18 +3064,57 @@ impl State {
                 return;
             }
 
-            // GNOME top panel: a left-click on the workspace indicator toggles the
-            // overview (the mouse counterpart of the Super-tap overlay key).
-            if self.niri.layout.is_gnome_mode() && button == Some(MouseButton::Left) {
+            // GNOME top panel + its popovers.
+            if self.niri.layout.is_gnome_mode() {
                 let location = pointer.current_location();
-                if let Some((output, pos_within_output)) = self.niri.output_under(location) {
-                    let ws = self.niri.workspace_state_for(output);
-                    if self.niri.panel.hit_test(pos_within_output, ws)
-                        == Some(crate::ui::panel::ROLE_ACTIVITIES)
-                    {
-                        self.niri.suppressed_buttons.insert(button_code);
-                        self.do_action(Action::ToggleOverview, false);
-                        return;
+                let under = self
+                    .niri
+                    .output_under(location)
+                    .map(|(o, p)| (o.clone(), p));
+
+                // An open popover (dateMenu calendar, …) grabs pointer clicks: a click inside
+                // routes to it, anywhere else dismisses it. Either way the click is consumed.
+                if self.niri.panel_popover.is_open() {
+                    self.niri.suppressed_buttons.insert(button_code);
+                    match under {
+                        Some((output, pos)) => {
+                            self.niri.panel_popover.pointer_click(&output, pos);
+                        }
+                        None => self.niri.panel_popover.close(),
+                    }
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+
+                // A left-click on a panel button: the workspace indicator toggles the overview
+                // (the mouse counterpart of the Super-tap); the clock opens the calendar popover.
+                if button == Some(MouseButton::Left) {
+                    if let Some((output, pos)) = under {
+                        let ws = self.niri.workspace_state_for(&output);
+                        let output_w = output_size(&output).w;
+                        match self.niri.panel.hit_test(pos, output_w, ws) {
+                            Some(crate::ui::panel::ROLE_ACTIVITIES) => {
+                                self.niri.suppressed_buttons.insert(button_code);
+                                self.do_action(Action::ToggleOverview, false);
+                                return;
+                            }
+                            Some(crate::ui::panel::ROLE_DATE_MENU) => {
+                                let anchor = self.niri.panel.date_menu_rect(output_w);
+                                let cal = self.niri.gnome_settings.calendar;
+                                let accent = self.niri.gnome_settings.accent_color;
+                                self.niri.panel_popover.toggle_calendar(
+                                    output,
+                                    anchor,
+                                    cal.week_start,
+                                    cal.show_week_numbers,
+                                    accent,
+                                );
+                                self.niri.suppressed_buttons.insert(button_code);
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -3426,7 +3481,9 @@ impl State {
                 .output_under(location)
                 .map(|(output, pos)| {
                     let ws = self.niri.workspace_state_for(output);
-                    self.niri.panel.hit_test(pos, ws) == Some(crate::ui::panel::ROLE_ACTIVITIES)
+                    let output_w = output_size(output).w;
+                    self.niri.panel.hit_test(pos, output_w, ws)
+                        == Some(crate::ui::panel::ROLE_ACTIVITIES)
                 })
                 .unwrap_or(false);
             if over_indicator {

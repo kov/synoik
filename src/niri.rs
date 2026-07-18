@@ -174,6 +174,7 @@ use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderE
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::panel::Panel;
+use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
@@ -456,6 +457,7 @@ pub struct Niri {
     pub run_dialog: RunDialog,
     pub end_session_dialog: EndSessionDialog,
     pub panel: Panel,
+    pub panel_popover: PanelPopover,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -588,6 +590,7 @@ pub enum KeyboardFocus {
     ExitConfirmDialog,
     RunDialog,
     EndSessionDialog,
+    Popover,
     Overview,
     Mru,
 }
@@ -739,6 +742,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -753,6 +757,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Mru => None,
         }
@@ -1275,6 +1280,8 @@ impl State {
             KeyboardFocus::ScreenshotUi
         } else if self.niri.window_mru_ui.is_open() {
             KeyboardFocus::Mru
+        } else if self.niri.panel_popover.is_open() {
+            KeyboardFocus::Popover
         } else if let Some(output) = self.niri.layout.active_output() {
             let mon = self.niri.layout.monitor_for_output(output).unwrap();
             let layers = layer_map_for_output(output);
@@ -2932,6 +2939,7 @@ impl Niri {
             run_dialog: RunDialog::new(),
             end_session_dialog,
             panel: Panel::new(),
+            panel_popover: PanelPopover::new(),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -4395,6 +4403,7 @@ impl Niri {
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::RunDialog => true,
             KeyboardFocus::EndSessionDialog => true,
+            KeyboardFocus::Popover => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Mru => true,
         };
@@ -4487,6 +4496,13 @@ impl Niri {
         // Keep the panel's Activities highlight in sync with the overview.
         let overview_open = self.layout.is_overview_open();
         self.panel.set_overview_open(overview_open);
+
+        // A panel popover must not outlive the contexts it belongs to: close it when the
+        // overview opens or the session leaves GNOME mode, so its modal keyboard grab
+        // (`KeyboardFocus::Popover`) can never get stuck with no way to dismiss it.
+        if self.panel_popover.is_open() && (overview_open || !self.layout.is_gnome_mode()) {
+            self.panel_popover.close();
+        }
 
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
@@ -4722,6 +4738,10 @@ impl Niri {
         if self.layout.is_gnome_mode() {
             let ws = self.workspace_state_for(output);
             for element in self.panel.render(ctx.renderer, output, ws) {
+                push(element.into());
+            }
+            // A panel popover (dateMenu calendar, …) sits above the bar.
+            if let Some(element) = self.panel_popover.render(ctx.renderer, output) {
                 push(element.into());
             }
         }

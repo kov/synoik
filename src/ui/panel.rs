@@ -75,6 +75,9 @@ const INDICATOR_H_PADDING: f64 = 6.;
 const INACTIVE_DOT_SCALE: f64 = 0.75;
 const INACTIVE_DOT_OPACITY: f64 = 0.5;
 
+/// Horizontal padding on each side of the dateMenu (clock) button, logical px.
+const H_PADDING: f64 = 12.;
+
 /// Bar background (opaque black — GNOME's dark panel), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 
@@ -269,15 +272,21 @@ impl Panel {
         )
     }
 
+    /// The dateMenu (clock) button rect: the shaped label plus a padding on each
+    /// side, centered on the output. `output_width` is the output's logical width.
+    pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+        let clock_w = niri_vk::text::measure_line_width(&self.clock_text, FONT_PX as f32);
+        let w = clock_w + H_PADDING * 2.;
+        Rectangle::new(
+            Point::from(((output_width - w) / 2., 0.)),
+            Size::from((w, PANEL_HEIGHT)),
+        )
+    }
+
     /// The panel's items with their current rectangles, for introspection and the
     /// (deferred) extension host. `output_width` is the output's logical width, used
     /// to center the clock.
     pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
-        let clock_w = niri_vk::text::measure_line_width(&self.clock_text, FONT_PX as f32);
-        let clock_rect = Rectangle::new(
-            Point::from(((output_width - clock_w) / 2., 0.)),
-            Size::from((clock_w, PANEL_HEIGHT)),
-        );
         vec![
             PanelItem {
                 role: ROLE_ACTIVITIES,
@@ -287,16 +296,23 @@ impl Panel {
             PanelItem {
                 role: ROLE_DATE_MENU,
                 r#box: PanelBox::Center,
-                rect: clock_rect,
+                rect: self.date_menu_rect(output_width),
             },
         ]
     }
 
-    /// Which panel *role*, if any, sits at an output-local logical position. Only
-    /// the interactive items (the indicator) are hit-tested for now.
-    pub fn hit_test(&self, pos: Point<f64, Logical>, ws: WorkspaceState) -> Option<&'static str> {
+    /// Which panel *role*, if any, sits at an output-local logical position.
+    /// `output_width` is needed to place the centered dateMenu.
+    pub fn hit_test(
+        &self,
+        pos: Point<f64, Logical>,
+        output_width: f64,
+        ws: WorkspaceState,
+    ) -> Option<&'static str> {
         if self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
+        } else if self.date_menu_rect(output_width).contains(pos) {
+            Some(ROLE_DATE_MENU)
         } else {
             None
         }
@@ -667,6 +683,7 @@ mod tests {
         assert_eq!(
             panel.hit_test(
                 Point::from((4., 10.)),
+                1920.,
                 WorkspaceState {
                     count: 3,
                     active: 1
@@ -677,6 +694,7 @@ mod tests {
         assert_eq!(
             panel.hit_test(
                 Point::from((10_000., 10.)),
+                1920.,
                 WorkspaceState {
                     count: 3,
                     active: 1

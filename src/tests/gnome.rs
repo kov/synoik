@@ -2668,6 +2668,47 @@ fn panel_scroll_over_indicator_switches_workspace() {
     );
 }
 
+/// Clicking the dateMenu (clock) opens the calendar popover; Escape and an
+/// outside click both dismiss it (gnome-shell's popup-menu grab).
+#[test]
+fn panel_date_menu_click_opens_and_dismisses_calendar() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    assert!(!f.niri().panel_popover.is_open());
+
+    // The clock is centered; click it.
+    let open = |f: &mut Fixture| {
+        pointer_motion_to(f, 960., 10.);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    open(&mut f);
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "clicking the clock must open the calendar popover"
+    );
+
+    // Escape closes it (the modal keyboard grab).
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "Escape must close the popover"
+    );
+
+    // Reopen, then a click well outside the popover dismisses it.
+    open(&mut f);
+    assert!(f.niri().panel_popover.is_open());
+    pointer_motion_to(&mut f, 10., 700.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "a click outside the popover must dismiss it"
+    );
+}
+
 /// A client must not be able to kill the compositor with a malformed `wl_region`.
 ///
 /// `wl_region.add` takes plain ints and the protocol does not forbid a negative extent, so clients

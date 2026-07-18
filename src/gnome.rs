@@ -52,6 +52,8 @@ pub struct GnomeSettings {
     pub accent_color: [u8; 3],
     /// `org.gnome.desktop.interface clock-*`: how the panel clock label reads.
     pub clock: ClockFormat,
+    /// `org.gnome.desktop.calendar`: week start + week-number column.
+    pub calendar: CalendarSettings,
 }
 
 impl Default for GnomeSettings {
@@ -66,6 +68,7 @@ impl Default for GnomeSettings {
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
             clock: ClockFormat::default(),
+            calendar: CalendarSettings::default(),
         }
     }
 }
@@ -131,6 +134,45 @@ impl Default for ClockFormat {
             show_seconds: false,
         }
     }
+}
+
+/// The calendar popover settings from `org.gnome.desktop.calendar`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarSettings {
+    /// First day of the week, 0=Sunday..6=Saturday (`week-start-day`, with
+    /// `'default'` resolved to the locale like `Shell.util_get_week_start`).
+    pub week_start: u8,
+    /// `show-weekdate`: show the ISO week-number column.
+    pub show_week_numbers: bool,
+}
+
+impl Default for CalendarSettings {
+    fn default() -> Self {
+        Self {
+            week_start: locale_week_start(),
+            show_week_numbers: false,
+        }
+    }
+}
+
+/// The locale's first day of the week, 0=Sunday..6=Saturday, via glibc's
+/// `nl_langinfo(_NL_TIME_FIRST_WEEKDAY)` (1=Sunday..7=Saturday), like
+/// gnome-shell's `Shell.util_get_week_start`.
+fn locale_week_start() -> u8 {
+    // _NL_TIME_FIRST_WEEKDAY is a glibc extension; its value is 0x2000e.
+    const _NL_TIME_FIRST_WEEKDAY: libc::nl_item = 0x20000 + 14;
+    // SAFETY: nl_langinfo returns a pointer to a static, NUL-terminated string
+    // whose first byte encodes the weekday (1=Sunday). Read that one byte.
+    let first = unsafe {
+        let p = libc::nl_langinfo(_NL_TIME_FIRST_WEEKDAY);
+        if p.is_null() {
+            1
+        } else {
+            *p as u8
+        }
+    };
+    // 1..=7 (1=Sunday) → 0..=6 (0=Sunday); default to Sunday on anything odd.
+    first.checked_sub(1).map(|w| w % 7).unwrap_or(0)
 }
 
 /// `org.gnome.desktop.wm.preferences focus-new-windows`.
@@ -220,6 +262,29 @@ impl GnomeSettings {
         }
         if settings_has_key(interface, "clock-show-seconds") {
             self.clock.show_seconds = interface.boolean("clock-show-seconds");
+        }
+    }
+
+    fn load_calendar(&mut self, calendar: &gio::Settings) {
+        if settings_has_key(calendar, "show-weekdate") {
+            self.calendar.show_week_numbers = calendar.boolean("show-weekdate");
+        }
+        if settings_has_key(calendar, "week-start-day") {
+            let value = calendar.string("week-start-day");
+            self.calendar.week_start = match value.as_str() {
+                "sunday" => 0,
+                "monday" => 1,
+                "tuesday" => 2,
+                "wednesday" => 3,
+                "thursday" => 4,
+                "friday" => 5,
+                "saturday" => 6,
+                "default" => locale_week_start(),
+                other => {
+                    warn!("ignoring unrecognized week-start-day {other:?}");
+                    locale_week_start()
+                }
+            };
         }
     }
 
@@ -637,6 +702,7 @@ struct Stores {
     lockdown: Option<gio::Settings>,
     background: Option<gio::Settings>,
     interface: Option<gio::Settings>,
+    calendar: Option<gio::Settings>,
 }
 
 impl Stores {
@@ -652,6 +718,7 @@ impl Stores {
             lockdown: gsettings("org.gnome.desktop.lockdown"),
             background: gsettings("org.gnome.desktop.background"),
             interface: gsettings("org.gnome.desktop.interface"),
+            calendar: gsettings("org.gnome.desktop.calendar"),
         }
     }
 
@@ -669,6 +736,7 @@ impl Stores {
             &self.lockdown,
             &self.background,
             &self.interface,
+            &self.calendar,
         ]
         .into_iter()
         .flatten()
@@ -698,6 +766,9 @@ impl Stores {
         }
         if let Some(interface) = &self.interface {
             settings.load_interface(interface);
+        }
+        if let Some(calendar) = &self.calendar {
+            settings.load_calendar(calendar);
         }
         settings
     }
@@ -1208,6 +1279,7 @@ mod tests {
                 lockdown: None,
                 background: None,
                 interface: None,
+                calendar: None,
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -1303,6 +1375,7 @@ mod tests {
                         lockdown: None,
                         background: None,
                         interface: None,
+                        calendar: None,
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);
