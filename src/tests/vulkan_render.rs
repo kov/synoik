@@ -2058,6 +2058,63 @@ fn vulkan_renders_the_top_panel() {
     );
 }
 
+/// A recolored symbolic icon composites through the owned Vulkan renderer with the
+/// tint intact: rasterize an icon red, upload it, composite, and read it back — the
+/// covered pixels must be red (proving the `Abgr8888` recolor buffer composites with
+/// the channel order the panel/quick-settings icons rely on).
+#[test]
+fn vulkan_composites_a_recolored_icon() {
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::icon::{rasterize_symbolic, resolve_symbolic};
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_composites_a_recolored_icon: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let themes = vec!["Adwaita".to_string(), "hicolor".to_string()];
+    let Some(path) = ["night-light-symbolic", "weather-clear-night-symbolic"]
+        .into_iter()
+        .find_map(|n| resolve_symbolic(n, &themes))
+    else {
+        eprintln!("skipping vulkan_composites_a_recolored_icon: no symbolic icons installed");
+        return;
+    };
+
+    let buf = rasterize_symbolic(&path, 32, [1., 0., 0., 1.], 1.).expect("rasterize");
+    let tb = TextureBuffer::from_memory_buffer(&mut vk, &buf).expect("upload icon");
+    let elem = TextureRenderElement::from_texture_buffer(
+        tb,
+        Point::from((0., 0.)),
+        1.,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let pixels = render_to_vec(
+        &mut vk,
+        Size::<i32, Physical>::from((32, 32)),
+        Scale::from(1.),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [elem].into_iter(),
+    )
+    .expect("render icon");
+
+    let red = pixels
+        .chunks_exact(4)
+        .filter(|p| p[0] > 120 && p[1] < 60 && p[2] < 60 && p[3] > 120)
+        .count();
+    assert!(
+        red > 10,
+        "a red-tinted icon must composite red (Abgr8888 channel order), got {red}"
+    );
+}
+
 /// The dateMenu calendar popover renders on the owned Vulkan renderer when open:
 /// the calendar box is drawn offscreen and composited as a positioned element.
 /// Assert `render` yields an element that composites opaque (the dark box) pixels.
