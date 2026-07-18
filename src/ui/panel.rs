@@ -79,9 +79,31 @@ const H_PADDING: f64 = 12.;
 /// Bar background (opaque black — GNOME's dark panel), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 
-/// The checked highlight (white at 0.15 over the black bar), pre-mixed to the
-/// opaque grey it composites to so a single opaque clear draws it.
-const HIGHLIGHT: [f32; 4] = [0.15, 0.15, 0.15, 1.];
+/// Panel-button container inset from its hit rect (`_drawing.scss` `panel_button`
+/// mixin): `$base_margin` (4px) horizontally so an edge button isn't glued to the
+/// screen edge, and the 3px transparent border vertically. What's left is the
+/// fully-rounded (`$forced_circular_radius`) pill that lights up on hover/active.
+const BTN_MARGIN_X: f64 = 4.;
+const BTN_INSET_Y: f64 = 3.;
+
+/// `panel_button` fill states over the dark bar (white `$fg`), straight RGBA — the
+/// SDF fill blends over the opaque background: hover `transparentize($fg, .83)`,
+/// active/`:checked` `transparentize($fg, .72)`, active+hover `transparentize($fg, .68)`.
+const BTN_HOVER: [f32; 4] = [1., 1., 1., 0.17];
+const BTN_ACTIVE: [f32; 4] = [1., 1., 1., 0.28];
+const BTN_ACTIVE_HOVER: [f32; 4] = [1., 1., 1., 0.32];
+
+/// A panel button's rounded container: its hit rect inset by the `panel_button`
+/// margin/border, so the pill floats off the screen edge and the fill is a stadium.
+fn container_rect(rect: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((rect.loc.x + BTN_MARGIN_X, rect.loc.y + BTN_INSET_Y)),
+        Size::from((
+            (rect.size.w - 2. * BTN_MARGIN_X).max(0.),
+            (rect.size.h - 2. * BTN_INSET_Y).max(0.),
+        )),
+    )
+}
 
 /// Text color (opaque white); the glyph coverage modulates the alpha.
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
@@ -234,6 +256,13 @@ impl BarCache {
         self.textures.clear();
         self.qs_icons.clear();
     }
+
+    /// Drop only the bar chrome, keeping the uploaded status icons. Used when just
+    /// the button container state (hover/active) changes, which redraws the bar but
+    /// leaves the composited icons untouched — hover moves must not re-upload icons.
+    fn clear_bars(&mut self) {
+        self.textures.clear();
+    }
 }
 
 pub struct Panel {
@@ -241,8 +270,14 @@ pub struct Panel {
     clock_text: String,
     /// How the clock label is formatted (from `org.gnome.desktop.interface`).
     clock_format: ClockFormat,
-    /// Whether the overview is open (drives the indicator's checked highlight).
+    /// Whether the overview is open (drives the Activities button's active state).
     activities_checked: bool,
+    /// Which panel button is currently pointer-hovered, if any — its container
+    /// lights up dimly (gnome-shell `panel_button:hover`). Set from pointer motion.
+    hovered: Option<&'static str>,
+    /// Which panel button's popover menu is up, if any — its container lights up
+    /// strongly (`panel_button:checked`). Synced from the popover each frame.
+    open_menu: Option<&'static str>,
     /// The quick-settings toggle states, mirrored from gsettings — they decide
     /// which status icons the right-box indicator shows.
     toggles: QuickToggles,
@@ -261,6 +296,8 @@ impl Panel {
             clock_text: format_clock(unsafe { libc::time(null_mut()) }, clock_format),
             clock_format,
             activities_checked: false,
+            hovered: None,
+            open_menu: None,
             toggles: QuickToggles::default(),
             system_status: SystemStatus::default(),
             cache: RefCell::new(BarCache::new()),
@@ -331,12 +368,75 @@ impl Panel {
         }
     }
 
-    /// Reflect the overview open/closed state on the indicator.
+    /// Reflect the overview open/closed state on the Activities button.
     pub fn set_overview_open(&mut self, open: bool) {
         if open != self.activities_checked {
             self.activities_checked = open;
-            self.cache.borrow_mut().clear();
+            self.cache.borrow_mut().clear_bars();
         }
+    }
+
+    /// Set which panel button the pointer is hovering (`None` when off any button).
+    /// Returns whether it changed, so the caller can queue a redraw; only the bar
+    /// chrome is invalidated (the status icons are unaffected by hover).
+    pub fn set_hovered_role(&mut self, role: Option<&'static str>) -> bool {
+        if role == self.hovered {
+            return false;
+        }
+        self.hovered = role;
+        self.cache.borrow_mut().clear_bars();
+        true
+    }
+
+    /// Set which panel button's popover is open (`None` when none is). Returns
+    /// whether it changed, so the caller can queue a redraw.
+    pub fn set_open_menu(&mut self, role: Option<&'static str>) -> bool {
+        if role == self.open_menu {
+            return false;
+        }
+        self.open_menu = role;
+        self.cache.borrow_mut().clear_bars();
+        true
+    }
+
+    /// The container fill for a button given its current hover/active state, or
+    /// `None` when it's idle (no container drawn). A button is "active" when its
+    /// menu is up (or, for Activities, the overview is open).
+    fn button_fill(&self, role: &'static str) -> Option<[f32; 4]> {
+        let active = if role == ROLE_ACTIVITIES {
+            self.activities_checked
+        } else {
+            self.open_menu == Some(role)
+        };
+        let hover = self.hovered == Some(role);
+        match (active, hover) {
+            (true, true) => Some(BTN_ACTIVE_HOVER),
+            (true, false) => Some(BTN_ACTIVE),
+            (false, true) => Some(BTN_HOVER),
+            (false, false) => None,
+        }
+    }
+
+    /// The rounded containers to paint behind the buttons this frame, each a
+    /// (pill rect, fill color) — only for buttons that are hovered or active. The
+    /// same building block (`render_rounded_rect`) for all three, so they're
+    /// consistent. `output_width` places the centered/right-anchored buttons.
+    fn button_containers(
+        &self,
+        output_width: f64,
+        ws: WorkspaceState,
+    ) -> Vec<(Rectangle<f64, Logical>, [f32; 4])> {
+        let mut v = Vec::new();
+        for (role, rect) in [
+            (ROLE_ACTIVITIES, self.activities_rect(ws)),
+            (ROLE_DATE_MENU, self.date_menu_rect(output_width)),
+            (ROLE_QUICK_SETTINGS, self.quick_settings_rect(output_width)),
+        ] {
+            if let Some(color) = self.button_fill(role) {
+                v.push((container_rect(rect), color));
+            }
+        }
+        v
     }
 
     /// The current clock string (for tests / introspection).
@@ -462,7 +562,10 @@ impl Panel {
             icons,
         );
 
-        // The bar chrome (opaque background, checked highlight, workspace dots, clock).
+        // The bar chrome (opaque background, button containers, workspace dots, clock).
+        // Button container state (hover/active) invalidates the bar cache on change, so
+        // the structural key can stay content-only.
+        let containers = self.button_containers(width, ws);
         let bar_key = (scale_key, width_px, ws.count, ws.active());
         #[allow(clippy::map_entry)]
         if !cache.textures.contains_key(&bar_key) {
@@ -471,7 +574,7 @@ impl Panel {
                 scale,
                 width_px,
                 &self.clock_text,
-                self.activities_checked,
+                &containers,
                 ws,
             ) {
                 Ok(texture) => {
@@ -686,16 +789,16 @@ fn draw_workspace_dots(
 }
 
 /// Draw the bar chrome into an offscreen [`VkTexture`]: clear the opaque
-/// background, draw the checked highlight over the indicator button, then the
-/// centered clock glyph run. The returned texture is `SHADER_READ_ONLY`
-/// (sampleable) so the caller can composite it directly. The workspace dots are
-/// composited separately, on top.
+/// background, paint the rounded hover/active button containers, then the
+/// workspace dots and the centered clock glyph run. The returned texture is
+/// `SHADER_READ_ONLY` (sampleable) so the caller can composite it directly. The
+/// right-box status icons are composited separately, on top.
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
-    checked: bool,
+    containers: &[(Rectangle<f64, Logical>, [f32; 4])],
     ws: WorkspaceState,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("panel::draw_bar_texture");
@@ -712,11 +815,6 @@ fn draw_bar_texture(
     let c_origin =
         Point::<i32, Physical>::from(((width_px - c_iw) / 2 - c_ix, (height_px - c_ih) / 2 - c_iy));
 
-    // The highlight matches the indicator button rect (padding + dots), so it
-    // agrees with `activities_rect`.
-    let highlight_w: i32 = to_physical_precise_round(scale, indicator_logical_width(ws.count));
-    let highlight_w = highlight_w.clamp(1, width_px);
-
     let size = Size::<i32, Physical>::from((width_px, height_px));
     let mut target = renderer.create_buffer(
         Fourcc::Abgr8888,
@@ -729,9 +827,21 @@ fn draw_bar_texture(
         let full = Rectangle::from_size(size);
 
         frame.clear(Color32F::from(BAR_BG), &[full])?;
-        if checked {
-            let hl = Rectangle::new(Point::from((0, 0)), Size::from((highlight_w, height_px)));
-            frame.clear(Color32F::from(HIGHLIGHT), &[hl])?;
+        // The rounded button containers (hover/active), behind the button content.
+        for (rect, color) in containers {
+            let phys = Rectangle::new(
+                Point::<i32, Physical>::from((
+                    to_physical_precise_round(scale, rect.loc.x),
+                    to_physical_precise_round(scale, rect.loc.y),
+                )),
+                Size::<i32, Physical>::from((
+                    to_physical_precise_round::<i32>(scale, rect.size.w).max(1),
+                    to_physical_precise_round::<i32>(scale, rect.size.h).max(1),
+                )),
+            );
+            // Half the physical height clamps the SDF to a stadium (fully rounded pill).
+            let radius = phys.size.h as f32 / 2.;
+            frame.render_rounded_rect(*color, radius, phys, &[full])?;
         }
         draw_workspace_dots(&mut frame, scale, ws, full)?;
         frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
@@ -879,7 +989,7 @@ mod tests {
         let scale = 2.0;
         let width_px = to_physical_precise_round::<i32>(scale, 400.);
         let mut tex =
-            draw_bar_texture(&mut vk, scale, width_px, "12:34", false, ws).expect("bar texture");
+            draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws).expect("bar texture");
         let size = tex.size();
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -1005,8 +1115,8 @@ mod tests {
     }
 
     /// Drive the GPU bar into an offscreen and read it back: an opaque dark
-    /// background, the checked highlight on the left, and bright clock glyph ink.
-    /// Skips cleanly with no device.
+    /// background, the active Activities container pill on the left, and bright
+    /// clock glyph ink. Skips cleanly with no device.
     #[test]
     fn draws_a_bar_with_glyph_coverage() {
         let mut vk = match VulkanRenderer::new() {
@@ -1023,8 +1133,12 @@ mod tests {
             count: 3,
             active: 0,
         };
-        let mut tex =
-            draw_bar_texture(&mut vk, 1., width_px, "12:34", true, ws).expect("bar texture");
+        // Overview open → the Activities button is active, so its container pill is drawn.
+        let mut panel = Panel::new();
+        panel.set_overview_open(true);
+        let containers = panel.button_containers(width_px as f64, ws);
+        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", &containers, ws)
+            .expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
@@ -1046,11 +1160,13 @@ mod tests {
             "bar bg not dark: {bg:?}"
         );
 
-        // The checked highlight tints the top-left corner grey (brighter than black).
-        let hl = px_at(2, 2);
+        // The active Activities container fills the left pill with grey (white α0.28
+        // over black ≈ 71). Sampled above the dot band, inside the inset pill, so it's
+        // container fill, not a workspace dot and not the (transparent) screen-edge margin.
+        let hl = px_at(17, 6);
         assert!(
-            hl[0] > 20 && hl[0] < 80,
-            "expected the checked highlight grey at top-left, got {hl:?}",
+            hl[3] == 255 && hl[0] > 45 && hl[0] < 100 && hl[0] == hl[1] && hl[1] == hl[2],
+            "expected the active container grey inside the pill, got {hl:?}",
         );
 
         // Bright glyph ink somewhere (the clock text).

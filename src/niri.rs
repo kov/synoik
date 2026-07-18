@@ -4554,6 +4554,11 @@ impl Niri {
             self.panel_popover.close();
         }
 
+        // Keep the panel button containers' active state in sync with the open popover
+        // (the clock/quick-settings button stays lit while its menu is up).
+        let open_role = self.panel_popover.open_role();
+        self.panel.set_open_menu(open_role);
+
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
                 let scale = Scale::from(out.current_scale().fractional_scale());

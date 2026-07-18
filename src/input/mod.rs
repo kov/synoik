@@ -2673,6 +2673,24 @@ impl State {
         }
     }
 
+    /// Light up the panel button under the pointer (gnome-shell `panel_button:hover`).
+    /// `pos` is the global-space pointer location. Off any button — or outside GNOME
+    /// mode — clears the hover. Redraws only when the hovered button actually changed.
+    fn update_panel_hover(&mut self, pos: Point<f64, Logical>) {
+        let role = if self.niri.layout.is_gnome_mode() {
+            self.niri.output_under(pos).and_then(|(output, p)| {
+                let ws = self.niri.workspace_state_for(output);
+                let output_w = output_size(output).w;
+                self.niri.panel.hit_test(p, output_w, ws)
+            })
+        } else {
+            None
+        };
+        if self.niri.panel.set_hovered_role(role) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
         let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
         // Any of the early returns here mean that the pointer is not inside the hot corner.
@@ -2836,6 +2854,8 @@ impl State {
             }
         }
 
+        self.update_panel_hover(new_pos);
+
         let under = self.niri.contents_under(new_pos);
 
         // Handle confined pointer.
@@ -2979,6 +2999,8 @@ impl State {
                 }
             }
         }
+
+        self.update_panel_hover(pos);
 
         let under = self.niri.contents_under(pos);
 

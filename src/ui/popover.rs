@@ -123,6 +123,20 @@ impl PanelPopover {
         self.open
     }
 
+    /// The panel button role whose menu is up, so the panel can keep that button's
+    /// container in its active state. `None` once the popover starts closing, so the
+    /// button de-highlights immediately as the menu fades out (like gnome-shell
+    /// dropping `:checked` on dismiss).
+    pub fn open_role(&self) -> Option<&'static str> {
+        if !self.open || self.closing {
+            return None;
+        }
+        match self.content.as_ref()? {
+            PopoverContent::Calendar(_) => Some(crate::ui::panel::ROLE_DATE_MENU),
+            PopoverContent::QuickSettings(_) => Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        }
+    }
+
     /// Build an open/close fade animation from `from` to `to` using the configured
     /// `panel_popover_open_close` params (gnome-shell's `BoxPointer` timing).
     fn make_anim(&self, from: f64, to: f64) -> Animation {
