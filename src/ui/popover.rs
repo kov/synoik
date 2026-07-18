@@ -211,6 +211,7 @@ impl PanelPopover {
         output: Output,
         anchor: Rectangle<f64, Logical>,
         toggles: crate::gnome::QuickToggles,
+        network: crate::system_status::NetworkStatus,
         battery: Option<crate::system_status::BatteryStatus>,
         accent: [u8; 3],
     ) {
@@ -223,7 +224,7 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
-            toggles, battery, accent,
+            toggles, network, battery, accent,
         )));
         self.anim = Some(self.make_anim(0., 1.));
     }

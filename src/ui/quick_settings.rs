@@ -1,9 +1,11 @@
 //! The quick-settings menu (the right-hand panel status area's popover).
 //!
-//! A fork-owned port of gnome-shell's `js/ui/quickSettings.js` first slice: a
-//! **system row** at the top (gnome-shell's `SystemItem`, which `panel.js` adds
-//! first) above a two-column grid of [`QuickToggle`]-style tiles backed purely by
-//! gsettings — **Dark Style**, **Do Not Disturb**, **Night Light**. The system
+//! A fork-owned port of gnome-shell's `js/ui/quickSettings.js`: a **system row** at
+//! the top (gnome-shell's `SystemItem`, which `panel.js` adds first) above a
+//! two-column grid of [`QuickToggle`]-style tiles. The grid leads with a live
+//! **Network** tile (wired/Wi-Fi state from the NetworkManager watcher, accent when
+//! connected — a click opens network settings), then gsettings-backed toggles —
+//! **Dark Style**, **Do Not Disturb**, **Night Light**. The system
 //! row has a far-left battery **pill** (icon + percentage, only with a battery,
 //! like `PowerToggle`), then screenshot / settings / lock / power. Each tile shows
 //! a symbolic icon and a label and flips its gsettings key on click; screenshot
@@ -16,10 +18,11 @@
 //! composited as separate elements on top** from the shared [`IconCache`] —
 //! symbolic SVGs recolored to the fore/back color of their slot.
 //!
-//! Deferred vs gnome-shell: sliders (volume/brightness), the network/bluetooth
-//! toggles and their sub-menus, and the per-toggle detail popups — the
-//! daemon-backed extras. The self-contained tiles, the system row, and the
-//! battery pill are here.
+//! Deferred vs gnome-shell: sliders (volume/brightness), the bluetooth toggle, the
+//! per-toggle detail sub-menus (the Network tile opens settings instead of an
+//! in-menu enable/disable + connection list), and SSID/connection-name labels. The
+//! self-contained tiles, the Network status tile, the system row, and the battery
+//! pill are here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -37,7 +40,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::system_status::{self, BatteryStatus};
+use crate::system_status::{self, BatteryStatus, NetworkStatus};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
@@ -94,8 +97,6 @@ enum Tile {
     NightLight,
 }
 
-const TILES: [Tile; 3] = [Tile::DarkStyle, Tile::DoNotDisturb, Tile::NightLight];
-
 impl Tile {
     fn label(self) -> &'static str {
         match self {
@@ -130,6 +131,76 @@ impl Tile {
             Tile::NightLight => PopoverAction::SetNightLight(on),
         }
     }
+}
+
+/// A cell in the quick-settings grid: either a gsettings-backed [`Tile`] toggle or
+/// the live **Network** status tile — whose state comes from the NetworkManager
+/// watcher ([`crate::system_status`]) rather than gsettings, and whose click opens
+/// network settings rather than flipping a key (the in-menu enable/disable toggle and
+/// the connection sub-menu are deferred, like gnome-shell's `NMDeviceToggle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridTile {
+    Network,
+    Toggle(Tile),
+}
+
+/// Grid order, row-major over two columns: Network leads in the prominent top-left
+/// cell (gnome-shell's quick-settings grid leads with connectivity), then the
+/// gsettings toggles fill out the 2×2 grid.
+const GRID: [GridTile; 4] = [
+    GridTile::Network,
+    GridTile::Toggle(Tile::DarkStyle),
+    GridTile::Toggle(Tile::DoNotDisturb),
+    GridTile::Toggle(Tile::NightLight),
+];
+
+impl GridTile {
+    /// The tile's label given the live toggle + network state.
+    fn label(self, network: NetworkStatus) -> String {
+        match self {
+            GridTile::Toggle(t) => t.label().to_string(),
+            GridTile::Network => network_label(network).to_string(),
+        }
+    }
+
+    /// Candidate symbolic icon names, first that resolves wins.
+    fn icons(self, network: NetworkStatus) -> Vec<String> {
+        match self {
+            GridTile::Toggle(t) => t.icons().iter().map(|s| s.to_string()).collect(),
+            GridTile::Network => network_icons(network),
+        }
+    }
+
+    /// Whether the tile reads as "on" (accent background): a toggle's gsettings
+    /// state, or — for Network — whether a connection is currently up.
+    fn is_on(self, toggles: QuickToggles, network: NetworkStatus) -> bool {
+        match self {
+            GridTile::Toggle(t) => t.is_on(toggles),
+            GridTile::Network => {
+                matches!(network, NetworkStatus::Wired | NetworkStatus::Wireless(_))
+            }
+        }
+    }
+}
+
+/// The Network tile's label. The status model carries no SSID / connection name yet,
+/// so these are gnome-shell's generic per-type fallbacks.
+fn network_label(network: NetworkStatus) -> &'static str {
+    match network {
+        NetworkStatus::Wired => "Wired",
+        NetworkStatus::Wireless(_) => "Wi-Fi",
+        NetworkStatus::Offline => "Offline",
+        NetworkStatus::Airplane => "Airplane Mode",
+        NetworkStatus::Unknown => "Network",
+    }
+}
+
+/// The Network tile's icon candidates, falling back to a wired glyph while the state
+/// is `Unknown` (pre-first-read / no `dbus` feature) so the tile always shows an icon.
+fn network_icons(network: NetworkStatus) -> Vec<String> {
+    system_status::network_icon(network)
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_else(|| vec!["network-wired-symbolic".to_string()])
 }
 
 /// The system-row buttons (gnome-shell's `SystemItem`, `js/ui/status/system.js`):
@@ -188,6 +259,8 @@ impl SysButton {
 /// updates the tile immediately (the write-back round-trips through gsettings).
 pub struct QuickSettings {
     toggles: QuickToggles,
+    /// Live network state (from the system-bus watcher), for the Network grid tile.
+    network: NetworkStatus,
     /// The battery, for the far-left power pill; `None` hides it (desktop / VM
     /// without a battery), like gnome-shell's `PowerToggle.visible = IsPresent`.
     battery: Option<BatteryStatus>,
@@ -204,11 +277,17 @@ struct TextureCache {
 }
 
 impl QuickSettings {
-    /// Open with the current toggle states and battery; `accent` straight RGB
-    /// (e.g. `gnome_settings.accent_color`).
-    pub fn new(toggles: QuickToggles, battery: Option<BatteryStatus>, accent: [u8; 3]) -> Self {
+    /// Open with the current toggle states, network state, and battery; `accent`
+    /// straight RGB (e.g. `gnome_settings.accent_color`).
+    pub fn new(
+        toggles: QuickToggles,
+        network: NetworkStatus,
+        battery: Option<BatteryStatus>,
+        accent: [u8; 3],
+    ) -> Self {
         Self {
             toggles,
+            network,
             battery,
             accent: [
                 f32::from(accent[0]) / 255.,
@@ -239,12 +318,23 @@ impl QuickSettings {
     /// actionable but is still inside the menu). A tile click also flips the
     /// tile's own state so it updates before the gsettings write round-trips.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
-        for (i, tile) in TILES.iter().enumerate() {
+        for (i, item) in GRID.iter().enumerate() {
             if tile_rect(i).contains(pos) {
-                let on = !tile.is_on(self.toggles);
-                self.set_tile(*tile, on);
-                self.revision += 1;
-                return tile.action(on);
+                return match item {
+                    // Network: open settings (the in-place toggle / sub-menu is deferred).
+                    GridTile::Network => PopoverAction::Spawn(
+                        ["gnome-control-center", "network"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    GridTile::Toggle(tile) => {
+                        let on = !tile.is_on(self.toggles);
+                        self.set_tile(*tile, on);
+                        self.revision += 1;
+                        tile.action(on)
+                    }
+                };
             }
         }
         // The battery pill opens power settings (gnome-shell's PowerToggle).
@@ -287,18 +377,19 @@ impl QuickSettings {
         let mut elements = Vec::new();
 
         // Tile icons (drawn above the chrome, so pushed before it).
-        for (i, tile) in TILES.iter().enumerate() {
-            let on = tile.is_on(self.toggles);
+        for (i, item) in GRID.iter().enumerate() {
+            let on = item.is_on(self.toggles, self.network);
             let color = if on { FG_ON } else { FG_OFF };
             let rect = tile_rect(i);
             let center = Point::from((
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
             ));
+            let candidates = item.icons(self.network);
             if let Some(el) = icon_element(
                 renderer,
                 icons,
-                tile.icons(),
+                &candidates,
                 TILE_ICON,
                 scale,
                 color,
@@ -427,9 +518,10 @@ impl QuickSettings {
 
         // Shape the tile labels + the battery pill's percentage up front (immutable
         // borrows of the font system).
-        let label_runs: Vec<_> = TILES
+        let labels: Vec<String> = GRID.iter().map(|item| item.label(self.network)).collect();
+        let label_runs: Vec<_> = labels
             .iter()
-            .map(|t| renderer.build_glyph_run(t.label(), label_px))
+            .map(|l| renderer.build_glyph_run(l, label_px))
             .collect::<Result<_, _>>()?;
         let pill_run = self
             .battery
@@ -466,9 +558,9 @@ impl QuickSettings {
                 Point::<i32, Physical>::from((lx - ix, cy - ih / 2 - iy))
             };
 
-            for (i, tile) in TILES.iter().enumerate() {
+            for (i, item) in GRID.iter().enumerate() {
                 let rect = tile_rect(i);
-                let on = tile.is_on(self.toggles);
+                let on = item.is_on(self.toggles, self.network);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
                 // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
@@ -528,7 +620,7 @@ fn menu_w() -> f64 {
 
 /// The menu's logical height: the system row at the top, the gap, then the grid.
 fn menu_h() -> f64 {
-    let rows = TILES.len().div_ceil(COLS) as f64;
+    let rows = GRID.len().div_ceil(COLS) as f64;
     PAD + SYS_H + TILE_GAP + rows * TILE_H + (rows - 1.) * TILE_GAP + PAD
 }
 
@@ -632,7 +724,9 @@ mod tests {
     /// inside the menu without going off an edge.
     #[test]
     fn layout_places_tiles_and_system_row_within_bounds() {
-        let size = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]).logical_size();
+        let size =
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0])
+                .logical_size();
         let within = |r: Rectangle<f64, Logical>, what: &str| {
             assert!(
                 r.loc.x >= 0. && r.loc.y >= 0.,
@@ -641,7 +735,7 @@ mod tests {
             assert!(r.loc.x + r.size.w <= size.w + 0.01, "{what} off the right");
             assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
         };
-        for i in 0..TILES.len() {
+        for i in 0..GRID.len() {
             within(tile_rect(i), "tile");
         }
         for has_pill in [false, true] {
@@ -654,11 +748,12 @@ mod tests {
         }
     }
 
-    /// Clicking a tile flips its state and returns the matching set-action.
+    /// Clicking a gsettings tile flips its state and returns the matching set-action.
     #[test]
     fn clicking_a_tile_flips_and_returns_the_action() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
-        let dnd = tile_rect(1); // Do Not Disturb
+        let mut qs =
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+        let dnd = tile_rect(2); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));
@@ -666,10 +761,32 @@ mod tests {
         assert!(qs.revision > before);
     }
 
+    /// The Network tile (grid cell 0) reads as "on" when connected and, clicked,
+    /// opens network settings without flipping any local toggle state.
+    #[test]
+    fn network_tile_reflects_state_and_opens_settings() {
+        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired));
+        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wireless(60)));
+        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Offline));
+        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Airplane));
+
+        let mut qs =
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+        let before = qs.revision;
+        let action = qs.pointer_click(center(tile_rect(0)));
+        match action {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
+            other => panic!("expected network settings, got {other:?}"),
+        }
+        // Network is not a gsettings toggle: no local flip, so no chrome revision bump.
+        assert_eq!(qs.revision, before);
+    }
+
     /// The screenshot button opens the UI; the settings button spawns its command.
     #[test]
     fn clicking_system_buttons_returns_their_actions() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
+        let mut qs =
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
 
         let shot = qs.pointer_click(center(sys_rect(SysButton::Screenshot, false)));
         assert!(matches!(shot, PopoverAction::Screenshot));
@@ -687,7 +804,12 @@ mod tests {
     fn battery_pill_appears_and_opens_power_settings() {
         assert!(pill_rect(false).is_none());
 
-        let mut qs = QuickSettings::new(QuickToggles::default(), Some(battery(79.)), [0, 0, 0]);
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            Some(battery(79.)),
+            [0, 0, 0],
+        );
         let pill = pill_rect(true).expect("a battery must show the pill");
         let action = qs.pointer_click(center(pill));
         match action {
@@ -703,7 +825,8 @@ mod tests {
     /// A click in empty menu space is consumed but does nothing.
     #[test]
     fn clicking_empty_space_is_consumed() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
+        let mut qs =
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
         // Below the top system row, between the two tile columns.
         let action = qs.pointer_click(Point::from((menu_w() / 2., PAD + SYS_H + 2.)));
         assert!(matches!(action, PopoverAction::Consumed));
@@ -723,11 +846,17 @@ mod tests {
             }
         };
         // Dark Style on, with a vivid red accent so the active tile is unmistakable.
+        // Network Unknown → the Network tile (cell 0) stays grey, not accent.
         let toggles = QuickToggles {
             dark_style: true,
             ..Default::default()
         };
-        let qs = QuickSettings::new(toggles, Some(battery(79.)), [0xff, 0x00, 0x00]);
+        let qs = QuickSettings::new(
+            toggles,
+            NetworkStatus::Unknown,
+            Some(battery(79.)),
+            [0xff, 0x00, 0x00],
+        );
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
         let size = tex.size();
 
@@ -745,8 +874,8 @@ mod tests {
             "the menu's outer corner must be transparent (rounded), got {tl:?}"
         );
 
-        // The center of the Dark Style tile (index 0) is the accent: high R, low G/B.
-        let r0 = tile_rect(0);
+        // The center of the Dark Style tile (grid cell 1) is the accent: high R, low G/B.
+        let r0 = tile_rect(1);
         let cx = (r0.loc.x + r0.size.w * 0.15) as i32;
         let cy = (r0.loc.y + r0.size.h / 2.) as i32;
         let i = ((cy * size.w + cx) * 4) as usize;
@@ -767,8 +896,8 @@ mod tests {
             "the active tile's corner must be cut to MENU_BG, got {corner:?}"
         );
 
-        // The Night Light tile (index 2, off) is the dim grey, not the accent.
-        let r2 = tile_rect(2);
+        // The Night Light tile (grid cell 3, off) is the dim grey, not the accent.
+        let r2 = tile_rect(3);
         let gx = (r2.loc.x + r2.size.w * 0.15) as i32;
         let gy = (r2.loc.y + r2.size.h / 2.) as i32;
         let j = ((gy * size.w + gx) * 4) as usize;

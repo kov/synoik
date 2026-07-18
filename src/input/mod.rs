@@ -3182,10 +3182,11 @@ impl State {
                             Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
                                 let toggles = self.niri.gnome_settings.quick_toggles;
                                 let anchor = self.niri.panel.quick_settings_rect(output_w);
+                                let network = self.niri.system_status.network;
                                 let battery = self.niri.system_status.battery.clone();
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri.panel_popover.toggle_quick_settings(
-                                    output, anchor, toggles, battery, accent,
+                                    output, anchor, toggles, network, battery, accent,
                                 );
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
