@@ -153,6 +153,25 @@ impl<T: Texture> TextureRenderElement<T> {
         self.alpha = alpha;
     }
 
+    /// This element's top-left in output-local logical coords.
+    pub fn location(&self) -> Point<f64, Logical> {
+        self.location
+    }
+
+    pub fn set_location(&mut self, location: Point<f64, Logical>) {
+        self.location = location;
+    }
+
+    /// Override the element's logical size, scaling the texture to fit. Paired with
+    /// `set_location`, this scales an already-built overlay element about a pivot (the
+    /// panel popover's open/close scale). Only sound to use while the element is also
+    /// translucent: a `size` override isn't reflected in [`Self::opaque_regions`], but a
+    /// translucent element already reports no opaque regions, so nothing reads the stale
+    /// value. (`logical_size` prefers this override.)
+    pub fn set_size(&mut self, size: Size<f64, Logical>) {
+        self.size = Some(size);
+    }
+
     pub fn logical_src(&self) -> Rectangle<f64, Logical> {
         self.src
             .unwrap_or_else(|| Rectangle::from_size(self.logical_size()))

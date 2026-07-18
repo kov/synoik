@@ -389,10 +389,30 @@ impl PanelPopover {
             None => Vec::new(),
         };
 
-        // Fade the whole popover (chrome + composited icons) by the open/close progress.
+        // Fade + scale the whole popover by the open/close progress. gnome-shell's
+        // BoxPointer opens from 0.96→1.0 scale about the panel-adjacent edge it emerges
+        // from (its arrow); we pivot on the popover's top-center. Applied only while
+        // animating (`progress < 1`), where the fade already makes every element
+        // translucent — so the scaled geometry not being reflected in `opaque_regions`
+        // is harmless (a translucent element reports none). At rest the elements are
+        // untouched, so their opaque regions stay exact.
         if progress < 1. {
+            let scale_f = 0.96 + 0.04 * f64::from(progress); // lerp(0.96, 1.0, progress)
+            let menu_w = self
+                .content
+                .as_ref()
+                .map(|c| c.logical_size().w)
+                .unwrap_or_default();
+            let pivot = Point::<f64, Logical>::from((origin.x + menu_w / 2., origin.y));
             for el in &mut elements {
                 el.set_alpha(progress);
+                let loc = el.location();
+                let sz = el.logical_size();
+                el.set_location(Point::from((
+                    pivot.x + (loc.x - pivot.x) * scale_f,
+                    pivot.y + (loc.y - pivot.y) * scale_f,
+                )));
+                el.set_size(Size::from((sz.w * scale_f, sz.h * scale_f)));
             }
         }
         elements
