@@ -1394,11 +1394,13 @@ fn button_bitmap(scale: f64) -> MemoryBuffer {
         }
     }
 
+    // The pixels are physical-sized (`radius` is already scaled), so tag the buffer at the output
+    // scale — matching the panel texture — or it composites `scale`× too big on a HiDPI output.
     MemoryBuffer::new(
         data,
         Fourcc::Argb8888,
         Size::from((side, side)),
-        Scale::from(1.),
+        Scale::from(scale),
         Transform::Normal,
     )
 }
