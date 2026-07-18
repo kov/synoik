@@ -1,10 +1,11 @@
 //! The quick-settings menu (the right-hand panel status area's popover).
 //!
 //! A fork-owned port of gnome-shell's `js/ui/quickSettings.js` first slice: a
-//! two-column grid of [`QuickToggle`]-style tiles backed purely by gsettings —
-//! **Dark Style**, **Do Not Disturb**, **Night Light** — plus a **system row**
-//! of icon buttons (Settings, Lock, Power). Each tile shows a symbolic icon and
-//! a label and flips its gsettings key on click; the system buttons spawn the
+//! **system row** at the top (Settings on the left, Lock/Power on the right —
+//! gnome-shell's `SystemItem`, which `panel.js` adds first) above a two-column
+//! grid of [`QuickToggle`]-style tiles backed purely by gsettings — **Dark
+//! Style**, **Do Not Disturb**, **Night Light**. Each tile shows a symbolic icon
+//! and a label and flips its gsettings key on click; the system buttons spawn the
 //! canonical session commands.
 //!
 //! Like the calendar, the chrome (menu/tile backgrounds + labels) is drawn into
@@ -48,11 +49,15 @@ const TILE_ICON: f64 = 16.;
 const TILE_ICON_INSET: f64 = 12.;
 const LABEL_PX: f64 = 11.;
 
-/// The system row (Settings/Lock/Power): a right-aligned cluster of bare icons.
+/// The system row (Settings on the left, Lock/Power on the right) sits at the
+/// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,
+/// which `panel.js` adds first (`_addItemsBefore(this._system…)`). Bare icons.
 const SYS_H: f64 = 44.;
 const SYS_ICON: f64 = 20.;
 const SYS_GAP: f64 = 18.;
 const SYS_HIT: f64 = 40.;
+/// Inset of the outermost system icons from the menu's left/right edges.
+const SYS_INSET: f64 = 12.;
 
 const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
@@ -387,35 +392,34 @@ fn menu_w() -> f64 {
     PAD * 2. + COLS as f64 * TILE_W + (COLS as f64 - 1.) * TILE_GAP
 }
 
-/// The menu's logical height: the tile grid, the gap, then the system row.
+/// The menu's logical height: the system row at the top, the gap, then the grid.
 fn menu_h() -> f64 {
     let rows = TILES.len().div_ceil(COLS) as f64;
-    PAD + rows * TILE_H + (rows - 1.) * TILE_GAP + TILE_GAP + SYS_H + PAD
+    PAD + SYS_H + TILE_GAP + rows * TILE_H + (rows - 1.) * TILE_GAP + PAD
 }
 
-/// The rectangle of tile `i` (row-major), menu-local logical.
+/// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below
+/// the top system row.
 fn tile_rect(i: usize) -> Rectangle<f64, Logical> {
     let row = (i / COLS) as f64;
     let col = (i % COLS) as f64;
     let x = PAD + col * (TILE_W + TILE_GAP);
-    let y = PAD + row * (TILE_H + TILE_GAP);
+    let y = PAD + SYS_H + TILE_GAP + row * (TILE_H + TILE_GAP);
     Rectangle::new(Point::from((x, y)), Size::from((TILE_W, TILE_H)))
 }
 
-/// The top of the system row, menu-local logical.
-fn sys_row_top() -> f64 {
-    let rows = TILES.len().div_ceil(COLS) as f64;
-    PAD + rows * TILE_H + (rows - 1.) * TILE_GAP + TILE_GAP
-}
-
-/// The hit rectangle of system button `i` (right-aligned cluster), menu-local.
+/// The hit rectangle of system button `i`, menu-local. The row is at the top:
+/// Settings on the left, Lock then Power right-aligned in the corner (GNOME's
+/// desktop `SystemItem` layout, minus the not-yet-ported screenshot button).
 fn sys_rect(i: usize) -> Rectangle<f64, Logical> {
-    let n = SYS_BUTTONS.len() as f64;
-    let cluster_w = n * SYS_ICON + (n - 1.) * SYS_GAP;
-    let start = menu_w() - PAD - cluster_w;
-    let center_x = start + i as f64 * (SYS_ICON + SYS_GAP) + SYS_ICON / 2.;
+    let right = menu_w() - PAD - SYS_INSET - SYS_ICON / 2.;
+    let center_x = match SYS_BUTTONS[i] {
+        SysButton::Settings => PAD + SYS_INSET + SYS_ICON / 2.,
+        SysButton::Lock => right - (SYS_ICON + SYS_GAP),
+        SysButton::Power => right,
+    };
     Rectangle::new(
-        Point::from((center_x - SYS_HIT / 2., sys_row_top())),
+        Point::from((center_x - SYS_HIT / 2., PAD)),
         Size::from((SYS_HIT, SYS_H)),
     )
 }
