@@ -609,8 +609,27 @@ impl State {
                 }
 
                 // A panel popover (the dateMenu calendar, …) grabs the keyboard modally like the
-                // dialogs above: Escape closes it, every other key is swallowed.
+                // dialogs above: Escape closes it, every other key is swallowed. The one exception
+                // is the hardcoded VT-switch chord (Ctrl+Alt+F1..F12): switching to a text console
+                // must never be blocked by an in-compositor overlay, so let it through to the
+                // backend even while the popover holds the grab.
                 if this.niri.panel_popover.is_open() {
+                    #[allow(non_upper_case_globals)]
+                    if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
+                        modified.raw()
+                    {
+                        if pressed {
+                            let vt = (modified.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
+                            this.backend.change_vt(vt);
+                            this.niri.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(None);
+                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        } else {
+                            return FilterResult::Forward;
+                        }
+                    }
+
                     this.niri.panel_popover.handle_key(raw, pressed);
                     this.niri.queue_redraw_all();
 
