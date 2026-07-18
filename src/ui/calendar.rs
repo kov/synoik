@@ -39,13 +39,18 @@ const HEADER_PX: f64 = 14.;
 const WEEKDAY_PX: f64 = 10.;
 const DAY_PX: f64 = 12.;
 const ARROW_PX: f64 = 18.;
-/// The today/selected highlight disc, drawn as a filled-circle glyph behind the
-/// day number (a rounded fill can't be drawn inside a hand-bound offscreen, but a
-/// `●` glyph can — see the buffer/offscreen notes in the render helpers).
-const DISC_PX: f64 = 30.;
+/// Diameter (logical px) of the today/selected highlight circle, drawn behind the
+/// day number with `render_rounded_rect` (a half-diameter radius clamps to a full
+/// circle in `sdf_rect.frag`). gnome-shell 50.1 makes both today and the selected
+/// day circular filled buttons (`.calendar-day { border-radius:
+/// $forced_circular_radius }`; today `%default_button`, selected `%flat_button`).
+const DISC_DIAM: f64 = 30.;
 
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
+/// The selected (non-today) day's subtle filled circle — gnome-shell's flat-button
+/// selected state (a faint light fill), vs today's accent fill.
+const SELECTED_BG: [f32; 4] = [0.28, 0.28, 0.28, 1.];
 /// Out-of-month day numbers, dimmed.
 const DIM: [f32; 4] = [0.5, 0.5, 0.5, 1.];
 /// Weekday header + week numbers, muted.
@@ -258,7 +263,6 @@ impl Calendar {
         let weekday_px = (WEEKDAY_PX * scale) as f32;
         let day_px = (DAY_PX * scale) as f32;
         let arrow_px = (ARROW_PX * scale) as f32;
-        let disc_px = (DISC_PX * scale) as f32;
 
         let title = strftime_ymd(
             Ymd {
@@ -284,8 +288,6 @@ impl Calendar {
             .iter()
             .map(|d| renderer.build_glyph_run(&d.day.to_string(), day_px))
             .collect::<Result<_, _>>()?;
-        let disc_run = renderer.build_glyph_run("\u{25cf}", disc_px)?; // ●
-        let ring_run = renderer.build_glyph_run("\u{25cb}", disc_px)?; // ○
 
         let week_runs: Vec<_> = if self.show_week_numbers {
             (0..GRID_ROWS)
@@ -373,22 +375,17 @@ impl Calendar {
                 let (cx, cy) = center(layout.cell(i / GRID_COLS, i % GRID_COLS));
                 let is_today = *date == self.today;
                 let is_selected = *date == self.selected;
-                if is_today {
-                    frame.render_glyphs(
-                        &disc_run,
-                        place(disc_run.ink_bounds(), cx, cy),
-                        self.accent,
-                        full,
-                        &[full],
-                    )?;
-                } else if is_selected {
-                    frame.render_glyphs(
-                        &ring_run,
-                        place(ring_run.ink_bounds(), cx, cy),
-                        MUTED,
-                        full,
-                        &[full],
-                    )?;
+                // Today: accent-filled circle; selected (not today): a subtle filled circle —
+                // matching gnome-shell's circular calendar-day buttons. The day number draws on
+                // top. A half-diameter radius clamps to a full circle in `sdf_rect.frag`.
+                if is_today || is_selected {
+                    let side = px(DISC_DIAM);
+                    let disc = Rectangle::new(
+                        Point::<i32, Physical>::from((cx - side / 2, cy - side / 2)),
+                        Size::<i32, Physical>::from((side, side)),
+                    );
+                    let bg = if is_today { self.accent } else { SELECTED_BG };
+                    frame.render_rounded_rect(bg, (side / 2) as f32, disc, &[full])?;
                 }
                 let in_month = date.month == self.month;
                 let color = if is_today || in_month { TEXT } else { DIM };
