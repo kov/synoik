@@ -2197,10 +2197,15 @@ fn vulkan_renders_the_quick_settings_popover() {
         let output_w = output_size(&output).w;
         let toggles = f.niri().gnome_settings.quick_toggles;
         let anchor = f.niri().panel.quick_settings_rect(output_w);
+        let battery = f.niri().system_status.battery.clone();
         let accent = f.niri().gnome_settings.accent_color;
-        f.niri()
-            .panel_popover
-            .toggle_quick_settings(output.clone(), anchor, toggles, accent);
+        f.niri().panel_popover.toggle_quick_settings(
+            output.clone(),
+            anchor,
+            toggles,
+            battery,
+            accent,
+        );
     }
     assert!(f.niri().panel_popover.is_open());
 

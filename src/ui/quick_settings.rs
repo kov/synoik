@@ -1,12 +1,13 @@
 //! The quick-settings menu (the right-hand panel status area's popover).
 //!
 //! A fork-owned port of gnome-shell's `js/ui/quickSettings.js` first slice: a
-//! **system row** at the top (Settings on the left, Lock/Power on the right —
-//! gnome-shell's `SystemItem`, which `panel.js` adds first) above a two-column
-//! grid of [`QuickToggle`]-style tiles backed purely by gsettings — **Dark
-//! Style**, **Do Not Disturb**, **Night Light**. Each tile shows a symbolic icon
-//! and a label and flips its gsettings key on click; the system buttons spawn the
-//! canonical session commands.
+//! **system row** at the top (gnome-shell's `SystemItem`, which `panel.js` adds
+//! first) above a two-column grid of [`QuickToggle`]-style tiles backed purely by
+//! gsettings — **Dark Style**, **Do Not Disturb**, **Night Light**. The system
+//! row has a far-left battery **pill** (icon + percentage, only with a battery,
+//! like `PowerToggle`), then screenshot / settings / lock / power. Each tile shows
+//! a symbolic icon and a label and flips its gsettings key on click; screenshot
+//! opens the interactive UI and the rest spawn the canonical session command.
 //!
 //! Like the calendar, the chrome (menu/tile backgrounds + labels) is drawn into
 //! one offscreen `VkTexture` with `clear` + `render_glyphs` (rounded fills and
@@ -15,9 +16,9 @@
 //! [`IconCache`] — symbolic SVGs recolored to the fore/back color of their slot.
 //!
 //! Deferred vs gnome-shell: sliders (volume/brightness), the network/bluetooth
-//! toggles and their sub-menus, the battery/percentage row — all daemon-backed
-//! (NetworkManager, UPower, gsd) and mostly absent on the VM. This is the
-//! self-contained core.
+//! toggles and their sub-menus, and the per-toggle detail popups — the
+//! daemon-backed extras. The self-contained tiles, the system row, and the
+//! battery pill are here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,6 +36,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::system_status::{self, BatteryStatus};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
@@ -58,6 +60,13 @@ const SYS_GAP: f64 = 18.;
 const SYS_HIT: f64 = 40.;
 /// Inset of the outermost system icons from the menu's left/right edges.
 const SYS_INSET: f64 = 12.;
+/// Advance between adjacent system-row icon centers.
+const SYS_ADVANCE: f64 = SYS_ICON + SYS_GAP;
+/// The battery pill (gnome-shell's `PowerToggle`): a wide item at the far left of
+/// the system row showing the battery icon + percentage, only when a battery is
+/// present. Clicking it opens power settings.
+const PILL_W: f64 = 96.;
+const PILL_ICON_INSET: f64 = 12.;
 
 const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
@@ -113,19 +122,33 @@ impl Tile {
     }
 }
 
-/// The system-row buttons, left-to-right within the right-aligned cluster.
+/// The system-row buttons (gnome-shell's `SystemItem`, `js/ui/status/system.js`):
+/// screenshot + settings, then lock + power.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SysButton {
+    Screenshot,
     Settings,
     Lock,
     Power,
 }
 
-const SYS_BUTTONS: [SysButton; 3] = [SysButton::Settings, SysButton::Lock, SysButton::Power];
+const SYS_BUTTONS: [SysButton; 4] = [
+    SysButton::Screenshot,
+    SysButton::Settings,
+    SysButton::Lock,
+    SysButton::Power,
+];
 
 impl SysButton {
     fn icons(self) -> &'static [&'static str] {
         match self {
+            // gnome-shell uses `screenshooter-symbolic` (its own bundled icon),
+            // absent from Adwaita on disk — fall back to what the theme ships.
+            SysButton::Screenshot => &[
+                "screenshooter-symbolic",
+                "applets-screenshooter-symbolic",
+                "camera-photo-symbolic",
+            ],
             SysButton::Settings => &[
                 "org.gnome.Settings-symbolic",
                 "emblem-system-symbolic",
@@ -136,17 +159,18 @@ impl SysButton {
         }
     }
 
-    /// The canonical command this button spawns (the same ones GNOME's session
-    /// buttons ultimately drive): Settings opens control-center, Lock asks logind
-    /// to lock the session, Power asks gnome-session to begin the power-off flow
-    /// (which calls back our own EndSessionDialog).
-    fn command(self) -> Vec<String> {
+    /// What clicking this button does. Screenshot opens the interactive UI (like
+    /// gnome-shell's `Main.screenshotUI.open`); the rest spawn the canonical
+    /// command: Settings opens control-center, Lock asks logind to lock, Power
+    /// asks gnome-session to begin the power-off flow (our own EndSessionDialog).
+    fn action(self) -> PopoverAction {
         let words: &[&str] = match self {
+            SysButton::Screenshot => return PopoverAction::Screenshot,
             SysButton::Settings => &["gnome-control-center"],
             SysButton::Lock => &["loginctl", "lock-session"],
             SysButton::Power => &["gnome-session-quit", "--power-off"],
         };
-        words.iter().map(|s| s.to_string()).collect()
+        PopoverAction::Spawn(words.iter().map(|s| s.to_string()).collect())
     }
 }
 
@@ -154,6 +178,9 @@ impl SysButton {
 /// updates the tile immediately (the write-back round-trips through gsettings).
 pub struct QuickSettings {
     toggles: QuickToggles,
+    /// The battery, for the far-left power pill; `None` hides it (desktop / VM
+    /// without a battery), like gnome-shell's `PowerToggle.visible = IsPresent`.
+    battery: Option<BatteryStatus>,
     /// Accent color for an active tile's background (straight RGBA).
     accent: [f32; 4],
     /// Bumped on any toggle so the cached chrome texture is redrawn.
@@ -167,11 +194,12 @@ struct TextureCache {
 }
 
 impl QuickSettings {
-    /// Open with the current toggle states; `accent` straight RGB (e.g.
-    /// `gnome_settings.accent_color`).
-    pub fn new(toggles: QuickToggles, accent: [u8; 3]) -> Self {
+    /// Open with the current toggle states and battery; `accent` straight RGB
+    /// (e.g. `gnome_settings.accent_color`).
+    pub fn new(toggles: QuickToggles, battery: Option<BatteryStatus>, accent: [u8; 3]) -> Self {
         Self {
             toggles,
+            battery,
             accent: [
                 f32::from(accent[0]) / 255.,
                 f32::from(accent[1]) / 255.,
@@ -184,6 +212,11 @@ impl QuickSettings {
                 textures: HashMap::new(),
             }),
         }
+    }
+
+    /// Whether the battery pill is shown (governs the system-row layout).
+    fn has_pill(&self) -> bool {
+        self.battery.is_some()
     }
 
     /// The menu's logical size (fixed: two tile columns + the system row).
@@ -204,9 +237,20 @@ impl QuickSettings {
                 return tile.action(on);
             }
         }
-        for (i, button) in SYS_BUTTONS.iter().enumerate() {
-            if sys_rect(i).contains(pos) {
-                return PopoverAction::Spawn(button.command());
+        // The battery pill opens power settings (gnome-shell's PowerToggle).
+        if let Some(pill) = pill_rect(self.has_pill()) {
+            if pill.contains(pos) {
+                return PopoverAction::Spawn(
+                    ["gnome-control-center", "power"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                );
+            }
+        }
+        for button in SYS_BUTTONS {
+            if sys_rect(button, self.has_pill()).contains(pos) {
+                return button.action();
             }
         }
         PopoverAction::Consumed
@@ -256,14 +300,35 @@ impl QuickSettings {
         }
 
         // System-row icons.
-        for (i, button) in SYS_BUTTONS.iter().enumerate() {
-            let rect = sys_rect(i);
+        for button in SYS_BUTTONS {
+            let rect = sys_rect(button, self.has_pill());
             let center =
                 Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
             if let Some(el) = icon_element(
                 renderer,
                 icons,
                 button.icons(),
+                SYS_ICON,
+                scale,
+                SYS_FG,
+                origin,
+                center,
+            ) {
+                elements.push(el);
+            }
+        }
+
+        // The battery pill's icon, at its left (the percentage label is chrome).
+        if let (Some(battery), Some(pill)) = (&self.battery, pill_rect(self.has_pill())) {
+            let center = Point::from((
+                pill.loc.x + PILL_ICON_INSET + SYS_ICON / 2.,
+                pill.loc.y + pill.size.h / 2.,
+            ));
+            let candidates = system_status::battery_icon(battery);
+            if let Some(el) = icon_element(
+                renderer,
+                icons,
+                &candidates,
                 SYS_ICON,
                 scale,
                 SYS_FG,
@@ -331,11 +396,19 @@ impl QuickSettings {
         let phys = Size::<i32, Physical>::from((w_px, h_px));
         let label_px = (LABEL_PX * scale) as f32;
 
-        // Shape the tile labels up front (immutable borrows of the font system).
+        // Shape the tile labels + the battery pill's percentage up front (immutable
+        // borrows of the font system).
         let label_runs: Vec<_> = TILES
             .iter()
             .map(|t| renderer.build_glyph_run(t.label(), label_px))
             .collect::<Result<_, _>>()?;
+        let pill_run = self
+            .battery
+            .as_ref()
+            .map(|b| {
+                renderer.build_glyph_run(&format!("{}%", b.percentage.round() as i64), label_px)
+            })
+            .transpose()?;
 
         let mut target = renderer.create_buffer(
             Fourcc::Abgr8888,
@@ -379,6 +452,21 @@ impl QuickSettings {
                 )?;
             }
 
+            // The battery pill: a filled slab (its icon composites on top) with the
+            // percentage after it.
+            if let (Some(pill), Some(run)) = (pill_rect(self.has_pill()), &pill_run) {
+                frame.clear(Color32F::from(TILE_OFF), &[rect_px(pill)])?;
+                let label_x = px(pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.);
+                let label_cy = px(pill.loc.y + pill.size.h / 2.);
+                frame.render_glyphs(
+                    run,
+                    place_left(run.ink_bounds(), label_x, label_cy),
+                    FG_OFF,
+                    full,
+                    &[full],
+                )?;
+            }
+
             let _sync = frame.finish()?;
         }
 
@@ -408,15 +496,34 @@ fn tile_rect(i: usize) -> Rectangle<f64, Logical> {
     Rectangle::new(Point::from((x, y)), Size::from((TILE_W, TILE_H)))
 }
 
-/// The hit rectangle of system button `i`, menu-local. The row is at the top:
-/// Settings on the left, Lock then Power right-aligned in the corner (GNOME's
-/// desktop `SystemItem` layout, minus the not-yet-ported screenshot button).
-fn sys_rect(i: usize) -> Rectangle<f64, Logical> {
+/// The battery pill's rectangle at the far left of the top system row, or `None`
+/// when there's no battery (gnome-shell's `PowerToggle.visible = IsPresent`).
+fn pill_rect(has_pill: bool) -> Option<Rectangle<f64, Logical>> {
+    has_pill.then(|| Rectangle::new(Point::from((PAD, PAD)), Size::from((PILL_W, SYS_H))))
+}
+
+/// The hit rectangle of a system button, menu-local. The row is at the top,
+/// mirroring gnome-shell's `SystemItem`: with a battery, the pill leads at the
+/// left and screenshot/settings/lock/power cluster at the right; without one,
+/// screenshot/settings sit on the left and lock/power on the right.
+fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
+    let left = PAD + SYS_INSET + SYS_ICON / 2.;
     let right = menu_w() - PAD - SYS_INSET - SYS_ICON / 2.;
-    let center_x = match SYS_BUTTONS[i] {
-        SysButton::Settings => PAD + SYS_INSET + SYS_ICON / 2.,
-        SysButton::Lock => right - (SYS_ICON + SYS_GAP),
-        SysButton::Power => right,
+    let center_x = if has_pill {
+        // All four buttons right-aligned (the pill takes the left).
+        match button {
+            SysButton::Power => right,
+            SysButton::Lock => right - SYS_ADVANCE,
+            SysButton::Settings => right - 2. * SYS_ADVANCE,
+            SysButton::Screenshot => right - 3. * SYS_ADVANCE,
+        }
+    } else {
+        match button {
+            SysButton::Screenshot => left,
+            SysButton::Settings => left + SYS_ADVANCE,
+            SysButton::Lock => right - SYS_ADVANCE,
+            SysButton::Power => right,
+        }
     };
     Rectangle::new(
         Point::from((center_x - SYS_HIT / 2., PAD)),
@@ -428,10 +535,10 @@ fn sys_rect(i: usize) -> Rectangle<f64, Logical> {
 /// element centered at `origin + center` (both menu-local logical), tinted
 /// `color`. `None` when no candidate resolves.
 #[allow(clippy::too_many_arguments)]
-fn icon_element(
+fn icon_element<S: AsRef<str>>(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
-    candidates: &[&str],
+    candidates: &[S],
     logical_px: f64,
     scale: f64,
     color: [f32; 4],
@@ -440,7 +547,7 @@ fn icon_element(
 ) -> Option<TextureRenderElement<VkTexture>> {
     let buffer = candidates
         .iter()
-        .find_map(|name| icons.buffer(name, logical_px, scale, color))?;
+        .find_map(|name| icons.buffer(name.as_ref(), logical_px, scale, color))?;
     let tb = match TextureBuffer::from_memory_buffer(renderer, &buffer) {
         Ok(tb) => tb,
         Err(err) => {
@@ -464,59 +571,95 @@ fn icon_element(
 mod tests {
     use super::*;
 
-    /// The tile grid and system row lay out without overlap and inside the menu.
+    fn battery(percentage: f64) -> BatteryStatus {
+        BatteryStatus {
+            icon_name: "battery-level-80-symbolic".to_string(),
+            percentage,
+        }
+    }
+
+    fn center(r: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+        Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+    }
+
+    /// The tile grid and system row (with and without the battery pill) lay out
+    /// inside the menu without going off an edge.
     #[test]
     fn layout_places_tiles_and_system_row_within_bounds() {
-        let size = QuickSettings::new(QuickToggles::default(), [0, 0, 0]).logical_size();
+        let size = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]).logical_size();
+        let within = |r: Rectangle<f64, Logical>, what: &str| {
+            assert!(
+                r.loc.x >= 0. && r.loc.y >= 0.,
+                "{what} off the top/left edge"
+            );
+            assert!(r.loc.x + r.size.w <= size.w + 0.01, "{what} off the right");
+            assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
+        };
         for i in 0..TILES.len() {
-            let r = tile_rect(i);
-            assert!(r.loc.x >= 0. && r.loc.y >= 0.);
-            assert!(r.loc.x + r.size.w <= size.w + 0.01);
-            assert!(r.loc.y + r.size.h <= size.h + 0.01);
+            within(tile_rect(i), "tile");
         }
-        for i in 0..SYS_BUTTONS.len() {
-            let r = sys_rect(i);
-            assert!(r.loc.x >= 0., "sys button {i} off the left edge");
-            assert!(r.loc.x + r.size.w <= size.w + 0.01);
-            assert!(r.loc.y + r.size.h <= size.h + 0.01);
+        for has_pill in [false, true] {
+            for button in SYS_BUTTONS {
+                within(sys_rect(button, has_pill), "sys button");
+            }
+            if let Some(pill) = pill_rect(has_pill) {
+                within(pill, "battery pill");
+            }
         }
     }
 
     /// Clicking a tile flips its state and returns the matching set-action.
     #[test]
     fn clicking_a_tile_flips_and_returns_the_action() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), [0, 0, 0]);
+        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
         let dnd = tile_rect(1); // Do Not Disturb
         let before = qs.revision;
-        let action = qs.pointer_click(Point::from((
-            dnd.loc.x + dnd.size.w / 2.,
-            dnd.loc.y + dnd.size.h / 2.,
-        )));
+        let action = qs.pointer_click(center(dnd));
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));
         assert!(qs.toggles.do_not_disturb);
         assert!(qs.revision > before);
     }
 
-    /// A system button returns a spawn of its canonical command.
+    /// The screenshot button opens the UI; the settings button spawns its command.
     #[test]
-    fn clicking_a_system_button_spawns() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), [0, 0, 0]);
-        let settings = sys_rect(0);
-        let action = qs.pointer_click(Point::from((
-            settings.loc.x + settings.size.w / 2.,
-            settings.loc.y + settings.size.h / 2.,
-        )));
-        match action {
+    fn clicking_system_buttons_returns_their_actions() {
+        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
+
+        let shot = qs.pointer_click(center(sys_rect(SysButton::Screenshot, false)));
+        assert!(matches!(shot, PopoverAction::Screenshot));
+
+        let settings = qs.pointer_click(center(sys_rect(SysButton::Settings, false)));
+        match settings {
             PopoverAction::Spawn(cmd) => assert_eq!(cmd[0], "gnome-control-center"),
             other => panic!("expected a spawn, got {other:?}"),
         }
     }
 
+    /// The battery pill only exists with a battery, and clicking it opens power
+    /// settings. Its presence also shifts the system buttons right (they cluster).
+    #[test]
+    fn battery_pill_appears_and_opens_power_settings() {
+        assert!(pill_rect(false).is_none());
+
+        let mut qs = QuickSettings::new(QuickToggles::default(), Some(battery(79.)), [0, 0, 0]);
+        let pill = pill_rect(true).expect("a battery must show the pill");
+        let action = qs.pointer_click(center(pill));
+        match action {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "power"]),
+            other => panic!("expected power settings, got {other:?}"),
+        }
+        // Settings sits further right when the pill is present.
+        assert!(
+            sys_rect(SysButton::Settings, true).loc.x > sys_rect(SysButton::Settings, false).loc.x
+        );
+    }
+
     /// A click in empty menu space is consumed but does nothing.
     #[test]
     fn clicking_empty_space_is_consumed() {
-        let mut qs = QuickSettings::new(QuickToggles::default(), [0, 0, 0]);
-        let action = qs.pointer_click(Point::from((1., 1.)));
+        let mut qs = QuickSettings::new(QuickToggles::default(), None, [0, 0, 0]);
+        // Below the top system row, between the two tile columns.
+        let action = qs.pointer_click(Point::from((menu_w() / 2., PAD + SYS_H + 2.)));
         assert!(matches!(action, PopoverAction::Consumed));
     }
 
@@ -538,7 +681,7 @@ mod tests {
             dark_style: true,
             ..Default::default()
         };
-        let qs = QuickSettings::new(toggles, [0xff, 0x00, 0x00]);
+        let qs = QuickSettings::new(toggles, Some(battery(79.)), [0xff, 0x00, 0x00]);
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
         let size = tex.size();
 

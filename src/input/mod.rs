@@ -867,6 +867,7 @@ impl State {
                 }
                 set_toggle(self, |t, v| t.night_light = v, v);
             }
+            PopoverAction::Screenshot => self.open_screenshot_ui(true, None),
             PopoverAction::Spawn(command) => spawn(command, None),
         }
     }
@@ -3159,10 +3160,11 @@ impl State {
                             Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
                                 let toggles = self.niri.gnome_settings.quick_toggles;
                                 let anchor = self.niri.panel.quick_settings_rect(output_w);
+                                let battery = self.niri.system_status.battery.clone();
                                 let accent = self.niri.gnome_settings.accent_color;
-                                self.niri
-                                    .panel_popover
-                                    .toggle_quick_settings(output, anchor, toggles, accent);
+                                self.niri.panel_popover.toggle_quick_settings(
+                                    output, anchor, toggles, battery, accent,
+                                );
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
                                 return;

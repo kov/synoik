@@ -39,8 +39,19 @@ pub enum PopoverAction {
     SetDoNotDisturb(bool),
     /// Set `org.gnome.settings-daemon.plugins.color night-light-enabled`.
     SetNightLight(bool),
-    /// Spawn a command (a system-row button); the popover closes.
+    /// Open the interactive screenshot UI (the screenshot system button); the
+    /// popover closes.
+    Screenshot,
+    /// Spawn a command (a system-row button / the battery pill); popover closes.
     Spawn(Vec<String>),
+}
+
+impl PopoverAction {
+    /// Whether applying this action dismisses the menu (GNOME closes quick
+    /// settings when a system button is used, but keeps it open for a toggle).
+    fn closes_menu(&self) -> bool {
+        matches!(self, PopoverAction::Screenshot | PopoverAction::Spawn(_))
+    }
 }
 
 /// The content a popover hosts.
@@ -111,12 +122,14 @@ impl PanelPopover {
         )));
     }
 
-    /// Toggle the quick-settings menu, anchored at `anchor` on `output`.
+    /// Toggle the quick-settings menu, anchored at `anchor` on `output`. `battery`
+    /// feeds the power pill (`None` hides it).
     pub fn toggle_quick_settings(
         &mut self,
         output: Output,
         anchor: Rectangle<f64, Logical>,
         toggles: crate::gnome::QuickToggles,
+        battery: Option<crate::system_status::BatteryStatus>,
         accent: [u8; 3],
     ) {
         if self.is_showing::<QuickSettingsTag>() {
@@ -127,7 +140,7 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
-            toggles, accent,
+            toggles, battery, accent,
         )));
     }
 
@@ -191,8 +204,9 @@ impl PanelPopover {
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
-            // A system-row spawn closes the menu, like GNOME.
-            if matches!(action, PopoverAction::Spawn(_)) {
+            // A system button (screenshot / settings / lock / power / pill)
+            // closes the menu, like GNOME.
+            if action.closes_menu() {
                 self.close();
             }
             return Some(action);
