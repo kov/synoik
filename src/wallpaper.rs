@@ -224,6 +224,16 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
 fn decode(path: &Path) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
+    // TODO(perf): a stock 4K JPEG-XL takes *seconds* here, which is why this had
+    // to move off the main loop at all. Investigate before it becomes a papered-
+    // over cost: (1) the gsrs binary is a *debug* build and `jxl-oxide`/`image`
+    // are unoptimized — an `opt-level = 3` dev-profile override for the decode
+    // crates (like the `insta`/`similar` overrides in Cargo.toml) may alone cut
+    // it to well under a second; (2) we decode full-res then downscale to an 8192
+    // cap and upload — decoding straight to the output size would do far less
+    // work; (3) cache the decoded light/dark variants so toggling color-scheme
+    // back is instant instead of re-decoding.
+
     let decoded = if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("jxl"))
