@@ -61,15 +61,20 @@ const LABEL_PX: f64 = 13.;
 
 /// The system row (Settings on the left, Lock/Power on the right) sits at the
 /// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,
-/// which `panel.js` adds first (`_addItemsBefore(this._system…)`). Bare icons.
+/// which `panel.js` adds first (`_addItemsBefore(this._system…)`).
 const SYS_H: f64 = 44.;
-const SYS_ICON: f64 = 20.;
-const SYS_GAP: f64 = 18.;
+/// Symbolic-icon size inside a system button. gnome-shell's `.icon-button` uses
+/// `icon-size: $scalable_icon_size` = 16px (`_buttons.scss`).
+const SYS_ICON: f64 = 16.;
+/// Diameter of a system button's circular background disc, and its hit target. The
+/// `.icon-button` is the 16px icon plus `$scaled_padding * 2` = 12px padding on each
+/// side (`_buttons.scss`) → 40px.
 const SYS_HIT: f64 = 40.;
-/// Inset of the outermost system icons from the menu's left/right edges.
-const SYS_INSET: f64 = 12.;
-/// Advance between adjacent system-row icon centers.
-const SYS_ADVANCE: f64 = SYS_ICON + SYS_GAP;
+/// Gap between adjacent system-button discs: `$base_padding * 2` = 12px, the
+/// `.quick-settings-system-item` box spacing (`_quick-settings.scss`).
+const SYS_GAP: f64 = 12.;
+/// Advance between adjacent disc centers: one disc plus the inter-disc gap.
+const SYS_ADVANCE: f64 = SYS_HIT + SYS_GAP;
 /// The battery pill (gnome-shell's `PowerToggle`): a wide item at the far left of
 /// the system row showing the battery icon + percentage, only when a battery is
 /// present. Clicking it opens power settings.
@@ -676,8 +681,9 @@ fn pill_rect(has_pill: bool) -> Option<Rectangle<f64, Logical>> {
 /// left and screenshot/settings/lock/power cluster at the right; without one,
 /// screenshot/settings sit on the left and lock/power on the right.
 fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
-    let left = PAD + SYS_INSET + SYS_ICON / 2.;
-    let right = menu_w() - PAD - SYS_INSET - SYS_ICON / 2.;
+    // Outermost disc edges align with the tile-grid columns (both inset by PAD).
+    let left = PAD + SYS_HIT / 2.;
+    let right = menu_w() - PAD - SYS_HIT / 2.;
     let center_x = if has_pill {
         // All four buttons right-aligned (the pill takes the left).
         match button {
