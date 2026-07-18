@@ -159,7 +159,10 @@ new_without_default = "allow"
 collapsible_match = "allow"
 
 [profile.release]
-debug = "line-tables-only"
+# Full DWARF (was "line-tables-only") so a release binary is debuggable — locals in
+# the debugger, richer profiler/crash symbolication. Costs link time + binary size;
+# dial back to "line-tables-only" if that bites.
+debug = true
 overflow-checks = true
 lto = "thin"
 
@@ -167,9 +170,14 @@ lto = "thin"
 # knuffel with chomsky generates a metric ton of debuginfo.
 debug = false
 
-[profile.dev.package]
-insta.opt-level = 3
-similar.opt-level = 3
+[profile.dev.package."*"]
+# Optimize all dependencies at opt-level 3 even in dev/test builds; our own crates
+# stay at opt-level 0 for fast incremental rebuilds. Heavy decoders and rasterizers
+# (the 4K JPEG-XL wallpaper decode, resvg, image, ash/Vulkan) are painfully slow
+# unoptimized — this is the fix for the seconds-long wallpaper stall on the dev binary
+# the gsrs seat runs. Only the first build after a dep change pays; the ~15s dev-loop
+# rebuild of our own code is unaffected.
+opt-level = 3
 
 [package.metadata.generate-rpm]
 version = "26.04"
