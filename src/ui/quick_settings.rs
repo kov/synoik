@@ -9,11 +9,12 @@
 //! a symbolic icon and a label and flips its gsettings key on click; screenshot
 //! opens the interactive UI and the rest spawn the canonical session command.
 //!
-//! Like the calendar, the chrome (menu/tile backgrounds + labels) is drawn into
-//! one offscreen `VkTexture` with `clear` + `render_glyphs` (rounded fills and
-//! texture blits don't render reliably inside a hand-bound offscreen), and the
-//! **icons are composited as separate elements on top** from the shared
-//! [`IconCache`] — symbolic SVGs recolored to the fore/back color of their slot.
+//! The chrome (menu bg + tile/pill backgrounds + labels) is drawn into one
+//! offscreen `VkTexture`: `clear` for the menu fill, `render_rounded_rect` for the
+//! pill-shaped tile and battery-pill backgrounds (gnome-shell's quick toggles use
+//! `$forced_circular_radius`), and `render_glyphs` for the labels. The **icons are
+//! composited as separate elements on top** from the shared [`IconCache`] —
+//! symbolic SVGs recolored to the fore/back color of their slot.
 //!
 //! Deferred vs gnome-shell: sliders (volume/brightness), the network/bluetooth
 //! toggles and their sub-menus, and the per-toggle detail popups — the
@@ -437,7 +438,15 @@ impl QuickSettings {
                 let rect = tile_rect(i);
                 let on = tile.is_on(self.toggles);
                 let bg = if on { self.accent } else { TILE_OFF };
-                frame.clear(Color32F::from(bg), &[rect_px(rect)])?;
+                // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
+                // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
+                // MENU_BG, so the cut corners reveal the menu, keeping the texture opaque.
+                frame.render_rounded_rect(
+                    bg,
+                    (rect.size.h / 2. * scale) as f32,
+                    rect_px(rect),
+                    &[full],
+                )?;
 
                 let fg = if on { FG_ON } else { FG_OFF };
                 let label_x = px(rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.);
@@ -455,7 +464,12 @@ impl QuickSettings {
             // The battery pill: a filled slab (its icon composites on top) with the
             // percentage after it.
             if let (Some(pill), Some(run)) = (pill_rect(self.has_pill()), &pill_run) {
-                frame.clear(Color32F::from(TILE_OFF), &[rect_px(pill)])?;
+                frame.render_rounded_rect(
+                    TILE_OFF,
+                    (pill.size.h / 2. * scale) as f32,
+                    rect_px(pill),
+                    &[full],
+                )?;
                 let label_x = px(pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.);
                 let label_cy = px(pill.loc.y + pill.size.h / 2.);
                 frame.render_glyphs(
@@ -701,6 +715,17 @@ mod tests {
         assert!(
             px[0] > 150 && px[1] < 80 && px[2] < 80 && px[3] > 150,
             "the active Dark Style tile must be the accent color, got {px:?}"
+        );
+
+        // The tile's corner is cut to the pill: a deep-corner pixel reveals the dark MENU_BG
+        // beneath, not the accent — proving `render_rounded_rect` rounded the tile in the offscreen.
+        let kx = (r0.loc.x + 2.) as i32;
+        let ky = (r0.loc.y + 2.) as i32;
+        let k = ((ky * size.w + kx) * 4) as usize;
+        let corner = [pixels[k], pixels[k + 1], pixels[k + 2]];
+        assert!(
+            corner[0] < 70 && corner[1] < 70 && corner[2] < 70,
+            "the active tile's corner must be cut to MENU_BG, got {corner:?}"
         );
 
         // The Night Light tile (index 2, off) is the dim grey, not the accent.
