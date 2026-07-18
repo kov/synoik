@@ -819,10 +819,16 @@ fn draw_bar_texture(
 
     let clock_run = renderer.build_glyph_run(clock, px)?;
 
-    // Center the clock's ink in the bar.
-    let (c_ix, c_iy, c_iw, c_ih) = clock_run.ink_bounds();
+    // Center the clock horizontally by its *advance* box, not its ink. gnome-shell's
+    // WallClock uses tabular figures, so the advance width is constant as the seconds
+    // tick and the label never shifts; centering on the ink (whose left edge/width
+    // wobble per digit) makes the whole run jitter left/right each second. Our
+    // SansSerif digits are tabular too, so an advance-centered origin is rock-steady.
+    // Vertical stays ink-centered (the ink height is stable across digits).
+    let advance_w = niri_vk::text::measure_line_width(clock, px).round() as i32;
+    let (_c_ix, c_iy, _c_iw, c_ih) = clock_run.ink_bounds();
     let c_origin =
-        Point::<i32, Physical>::from(((width_px - c_iw) / 2 - c_ix, (height_px - c_ih) / 2 - c_iy));
+        Point::<i32, Physical>::from(((width_px - advance_w) / 2, (height_px - c_ih) / 2 - c_iy));
 
     let size = Size::<i32, Physical>::from((width_px, height_px));
     let mut target = renderer.create_buffer(
@@ -1027,6 +1033,21 @@ mod tests {
         // A dim (half-opacity white over the dark bar) inactive dot is also present.
         let dim = row.chunks_exact(4).any(|p| p[0] > 80 && p[0] <= 200);
         assert!(dim, "expected dimmer inactive dots (half-opacity)");
+    }
+
+    /// The clock is centered on its advance box (see `draw_bar_texture`), which is
+    /// constant across ticks only because the panel font's digits are tabular — that's
+    /// what keeps the label from jittering left/right as the seconds change. Pins that
+    /// invariant: if SansSerif ever resolves to a font with proportional digits this
+    /// fails, flagging that advance-centering alone would no longer be steady.
+    #[test]
+    fn clock_advance_width_is_stable_across_seconds() {
+        let px = FONT_PX as f32;
+        let a = niri_vk::text::measure_line_width("12:34:56", px);
+        let b = niri_vk::text::measure_line_width("12:34:07", px);
+        let c = niri_vk::text::measure_line_width("18:88:88", px);
+        assert_eq!(a, b, "clock width must not depend on the digits (tabular figures)");
+        assert_eq!(a, c, "clock width must not depend on the digits (tabular figures)");
     }
 
     /// The clock's `strftime` format is assembled from the interface keys the
