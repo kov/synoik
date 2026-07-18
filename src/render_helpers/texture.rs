@@ -190,6 +190,13 @@ impl<T: Texture> Element for TextureRenderElement<T> {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        // A translucent element occludes nothing: reporting opaque regions while `alpha < 1`
+        // would let the damage tracker skip clearing/repainting the scene beneath, so the fade
+        // blends over stale framebuffer content (the panel-popover close-fade bug). Matches
+        // smithay's own texture element and the sibling gate in `rounded_texture.rs`.
+        if self.alpha < 1.0 {
+            return OpaqueRegions::default();
+        }
         let texture_size = self.buffer.texture.size().to_f64();
         let src = self.src();
 

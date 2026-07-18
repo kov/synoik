@@ -2248,6 +2248,67 @@ fn vulkan_renders_the_quick_settings_popover() {
     );
 }
 
+/// A translucent `TextureRenderElement` (alpha < 1, e.g. a fading popover) must NOT report
+/// any opaque regions. If it does, the damage tracker skips clearing and repainting beneath
+/// it, so the fade blends over stale framebuffer content instead of the scene behind — the
+/// panel-popover close-fade bug, where the chrome stuck at full opacity while the corners
+/// (not claimed opaque) faded. Mirrors smithay's own texture element, which gates
+/// `opaque_regions` on `alpha < 1.0`. Skips with no Vulkan device.
+#[test]
+fn vulkan_translucent_texture_element_claims_no_opaque_regions() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            use smithay::backend::renderer::element::Kind;
+
+            use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+            const W: i32 = 32;
+            const H: i32 = 32;
+            let texels = vec![255u8; (W * H * 4) as usize];
+            // An opaque texture that claims its full rect opaque.
+            let opaque = vec![Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)))];
+            let tb = TextureBuffer::from_memory(
+                vk,
+                &texels,
+                Fourcc::Abgr8888,
+                (W, H),
+                false,
+                1.0,
+                Transform::Normal,
+                opaque,
+            )
+            .expect("import opaque texture");
+
+            let mut el = TextureRenderElement::from_texture_buffer(
+                tb,
+                (0., 0.),
+                1.0,
+                None,
+                None,
+                Kind::Unspecified,
+            );
+            assert!(
+                !Element::opaque_regions(&el, Scale::from(1.0)).is_empty(),
+                "a fully-opaque element must report its opaque region",
+            );
+
+            // Fading it must drop the opaque claim — otherwise the damage tracker treats the
+            // translucent element as an occluder and never repaints the scene beneath it.
+            el.set_alpha(0.5);
+            assert!(
+                Element::opaque_regions(&el, Scale::from(1.0)).is_empty(),
+                "a translucent (alpha < 1) element must not claim any opaque region",
+            );
+        })
+        .expect("vulkan renderer");
+}
+
 /// A resize animation on a Vulkan session must draw the cross-fade (`render_resize`), not the red
 /// `SolidColorBuffer` placeholder. Reproduces the live "the window becomes a red rect while
 /// maximizing/restoring" bug: map a window, issue a niri-driven (animated) resize, commit the new
