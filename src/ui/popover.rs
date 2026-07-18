@@ -23,6 +23,11 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::IconCache;
+
+/// How far the popover slides in (logical px) as it fades open — gnome-shell's
+/// `BoxPointer` `-arrow-rise` (`$base_padding` = 6px). It emerges from `rise` above
+/// its resting spot (toward the panel) and settles down, reversing on close.
+const POPOVER_RISE: f64 = 6.;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::Calendar;
@@ -316,7 +321,14 @@ impl PanelPopover {
         }
         let _span = tracy_client::span!("PanelPopover::render");
         let scale = output.current_scale().fractional_scale();
-        let origin = self.location(output);
+        let progress = self.progress();
+
+        // Slide: emerge from `POPOVER_RISE` above the resting spot as it opens (and
+        // slide back up on close), coupled with the fade — gnome-shell's BoxPointer.
+        // Applied only here, not in `location`, so hit-testing uses the resting rect
+        // (input is inactive until fully open anyway).
+        let mut origin = self.location(output);
+        origin.y -= POPOVER_RISE * (1. - f64::from(progress));
 
         let mut elements = match self.content.as_ref() {
             Some(PopoverContent::Calendar(cal)) => match cal.texture(renderer, scale) {
@@ -354,7 +366,6 @@ impl PanelPopover {
         };
 
         // Fade the whole popover (chrome + composited icons) by the open/close progress.
-        let progress = self.progress();
         if progress < 1. {
             for el in &mut elements {
                 el.set_alpha(progress);
