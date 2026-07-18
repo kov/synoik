@@ -28,6 +28,10 @@ Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
   session, or the running compositor keeps running stale code.
 - Reference checkouts (read-only, not this repo): `~/Projects/gnome-shell` and
   `~/Projects/mutter` (both 50.1) — ground behavior there; never copy GObject.
+- **Reference-first, not memory.** Before porting or changing any GNOME behavior/layout, read the
+  actual 50.1 source in those checkouts and cite the file — do NOT rely on recollection of how GNOME
+  looks/works. Memory drifts from the shipped version (e.g. the quick-settings system row is a
+  full-width row at the *top*, not the bottom); grep the reference first, then implement.
 
 ## Git
 **Hard fork (2026-07):** `main` is the only living branch (ours, to push later). We no longer
