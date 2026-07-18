@@ -611,6 +611,118 @@ fn vulkan_screenshot_ui_draws_the_help_panel() {
     );
 }
 
+/// Build a Vulkan fixture whose single output is configured at `scale` (through config, by
+/// connector name), plus one settled green window. Mirrors [`window_fixture`] but at a non-unit
+/// output scale — the regime where a buffer whose pixels are physical-sized but whose scale tag is
+/// wrong (e.g. `1.0`) composites `scale`× too big. Every other render test runs at scale 1, where
+/// that bug is a no-op. See the `vulkan-buffer-scale-tag-trap` note.
+fn scaled_green_fixture(scale: f64) -> Option<Fixture> {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return None;
+    }
+
+    let mut config = Config::default();
+    config.outputs.0.push(niri_config::Output {
+        name: "headless-1".to_string(),
+        scale: Some(niri_config::FloatOrInt(scale)),
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    Some(f)
+}
+
+/// The screenshot-UI capture button must draw at its intended logical diameter (`2·RADIUS`) at a
+/// **non-unit output scale**. Regression guard for the physical-vs-scale buffer-tag bug (fix
+/// `3dff0940`): the shutter bitmap is rasterized at physical size, so tagging its `MemoryBuffer` at
+/// `1.0` instead of the output scale made it composite `scale`× too big and overflow the help box.
+/// That is invisible at scale 1 — where every other render test runs — so this guard runs at 2×.
+#[test]
+fn vulkan_screenshot_ui_button_is_scale_correct() {
+    let Some(mut f) = scaled_green_fixture(2.0) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+    assert!(
+        (scale - 2.0).abs() < 1e-6,
+        "expected a scale-2 output, got {scale}; the guard is vacuous otherwise"
+    );
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let rect = f
+        .niri()
+        .screenshot_ui
+        .panel_rect(&output)
+        .expect("the open screenshot UI must have a help panel");
+
+    // The button sits at the panel's left: centre x = left + PADDING + RADIUS (both logical, in
+    // screenshot_ui.rs: PADDING = 8, RADIUS = 16). Scan that column across the whole output and
+    // measure the vertical extent of the white shutter ring/disk.
+    let radius_phys = to_physical_precise_round::<i32>(scale, 16.);
+    let padding_phys = to_physical_precise_round::<i32>(scale, 8.);
+    // The button occupies the panel's left column: x in [left+PADDING, left+PADDING+2·RADIUS].
+    // Bound the scan to the left of the help text (text_x ≈ PADDING + 2·RADIUS + PADDING) so
+    // only the white shutter — not the white glyphs — is measured. Scan only WITHIN the panel
+    // box vertically (the selection-rectangle chrome above the panel is white too). The button
+    // is the only white here; measure its bounding-box height: a correct button is 2·RADIUS
+    // (64px at 2×); the bug's 2× button clips to the ~106px panel, well outside tolerance
+    // either way.
+    let left = rect.loc.x;
+    let text_x = left + 2 * radius_phys + padding_phys;
+    let mut top: Option<i32> = None;
+    let mut bot = 0;
+    for y in rect.loc.y..(rect.loc.y + rect.size.h).min(h) {
+        for x in (left + padding_phys)..text_x.min(w) {
+            let p = px(&pixels, w, x, y);
+            // Pure white shutter over the rgb(26) panel — a mid threshold catches the AA edge too.
+            if p[0] > 128 && p[1] > 128 && p[2] > 128 {
+                top.get_or_insert(y);
+                bot = y;
+                break;
+            }
+        }
+    }
+    let top = top.expect("no capture-button pixels found in the panel's left column");
+    let extent = bot - top + 1;
+    let expected = 2 * radius_phys; // 2·RADIUS logical, expressed at the output scale
+    eprintln!(
+        "button vertical extent {extent}px at scale {scale} (expected ~{expected}); panel {rect:?}"
+    );
+    // The bug doubled the button (~4·RADIUS·scale, clipped by the panel). Allow AA slack but
+    // reject.
+    assert!(
+        (expected - 8..=expected + 8).contains(&extent),
+        "capture-button vertical extent {extent}px != expected ~{expected}px — button tagged at \
+         the wrong scale? (the physical-vs-scale buffer-tag trap)"
+    );
+}
+
 /// The screenshot UI's Output neutral is captured through the owned Vulkan renderer
 /// (`capture_screenshot_neutrals`), not a GLES readback — self-hosting site 3. Drive the capture
 /// DIRECTLY (bypassing the GLES fallback that `..._draws_the_frozen_screen` can't see past): map a
