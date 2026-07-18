@@ -85,8 +85,10 @@ const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
-/// Text/icon on an active (accent) tile — dark, for contrast.
-const FG_ON: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// Text/icon on an active (accent) tile. GNOME's `-st-accent-fg-color` is hardcoded white
+/// (`#ffffff`) for every accent — including the light ones like yellow — so the toggled-on
+/// label and symbolic icon are white, not dark (st-theme-context.c:41, GNOME 50.1).
+const FG_ON: [f32; 4] = [1., 1., 1., 1.];
 const SYS_FG: [f32; 4] = [0.9, 0.9, 0.9, 1.];
 
 /// The gsettings-backed tiles, in grid order (row-major, two columns).
