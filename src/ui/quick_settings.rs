@@ -616,6 +616,26 @@ impl QuickSettings {
                 )?;
             }
 
+            // The system-row action buttons (screenshot/settings/lock/power) are
+            // gnome-shell `.icon-button`s: a circular button-background disc beneath each
+            // symbolic icon (`_buttons.scss`: `@extend %button` + `border-radius:
+            // $forced_circular_radius`). SYS_HIT (40px) is the 16px icon plus the button's
+            // 12px padding on each side — i.e. the button diameter. The icons composite on
+            // top afterwards, like the battery pill above.
+            for button in SYS_BUTTONS {
+                let hit = sys_rect(button, self.has_pill());
+                let disc = Rectangle::new(
+                    Point::from((hit.loc.x, hit.loc.y + (hit.size.h - SYS_HIT) / 2.)),
+                    Size::from((SYS_HIT, SYS_HIT)),
+                );
+                frame.render_rounded_rect(
+                    TILE_OFF,
+                    (SYS_HIT / 2. * scale) as f32,
+                    rect_px(disc),
+                    &[full],
+                )?;
+            }
+
             let _sync = frame.finish()?;
         }
 
