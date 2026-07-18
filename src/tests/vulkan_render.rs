@@ -559,11 +559,11 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
 
 /// The screenshot UI's help panel must actually draw.
 ///
-/// The panel is the UI's most fragile element: cairo-drawn on the CPU, uploaded as a neutral, and
-/// gated on the open animation's progress — three chances to end up invisible while the frozen
-/// screenshot (which is *not* progress-gated) still draws and makes the frame look right. Measure
-/// inside [`ScreenshotUi::panel_rect`]: whole-frame white does not discriminate the panel, since
-/// the four selection-border buffers alone score thousands of white px without it.
+/// The panel is the UI's most fragile element: drawn into an offscreen, gated on the open
+/// animation's progress — chances to end up invisible while the frozen screenshot (which is *not*
+/// progress-gated) still draws and makes the frame look right. Measure inside
+/// [`ScreenshotUi::panel_rect`]: whole-frame white does not discriminate the panel, since the four
+/// selection-border buffers alone score thousands of white px without it.
 #[test]
 fn vulkan_screenshot_ui_draws_the_help_panel() {
     let Some(mut f) = green_window_fixture() else {
@@ -574,15 +574,16 @@ fn vulkan_screenshot_ui_draws_the_help_panel() {
     f.niri_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
 
+    // The panel is built lazily on the first render, so render before reading its rect.
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
     let rect = f
         .niri()
         .screenshot_ui
         .panel_rect(&output)
         .expect("the open screenshot UI must have a help panel");
 
-    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-
-    // `render_panel` fills the panel with rgb(0.1) — 26/255 — and writes the help text in white.
+    // `generate_panel` fills the panel with rgb(0.1) — 26/255 — and writes the help text in white.
     let mut background = 0;
     let mut text = 0;
     for y in rect.loc.y..(rect.loc.y + rect.size.h).min(h) {

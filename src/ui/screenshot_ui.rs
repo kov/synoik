@@ -1,26 +1,30 @@
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::f64::consts::TAU;
 use std::iter::zip;
 use std::rc::Rc;
 
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
-use pango::{Alignment, FontDescription};
-use pangocairo::cairo::{self, ImageSurface};
+use niri_vk::text::{SpanFamily, TextSpan};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{
+    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
+};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
 use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -35,14 +39,14 @@ const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
-const FONT: &str = "sans 14px";
+const FONT_PX: f64 = 14.;
 const BORDER: i32 = 4;
-const TEXT_HIDE_P: &str =
-    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
-     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to hide the pointer.";
-const TEXT_SHOW_P: &str =
-    "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
-     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
+
+/// Dark panel background, grey border, and the grey keycap patch (`#2C2C2C`).
+const PANEL_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+const PANEL_BORDER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.];
+const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
+const TEXT_COLOR: [f32; 4] = [1., 1., 1., 1.];
 
 // Ideally the screenshot UI should support cross-output selections. However, that poses some
 // technical challenges when the outputs have different scales and such. So, this implementation
@@ -95,12 +99,34 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    /// The (show, hide) help panels as renderer-neutral CPU buffers. The panel is CPU/cairo-drawn,
-    /// so these are the source bytes — no GPU readback. They are also what the capture button's
-    /// hit test measures.
-    panel_neutral: Option<(MemoryBuffer, MemoryBuffer)>,
-    /// `panel_neutral` uploaded once each to `VkTexture`s, cached across frames.
-    panel_vk: (VkCache, VkCache),
+    /// The help panel, drawn straight into `VkTexture`s by the owned renderer and cached across
+    /// frames. Built lazily on the first render (no renderer is available at open time); the
+    /// capture button's hit test reads its size, so the button isn't clickable until one frame
+    /// has drawn.
+    panel: RefCell<PanelCache>,
+}
+
+/// The two help-panel variants (show/hide-pointer), rebuilt on a scale or renderer-context change.
+#[derive(Default)]
+struct PanelCache {
+    scale: f64,
+    context: Option<ContextId<VkTexture>>,
+    /// "…to show the pointer." — shown while the pointer is hidden.
+    show: Option<VkTexture>,
+    /// "…to hide the pointer." — shown while the pointer is visible.
+    hide: Option<VkTexture>,
+    /// The CPU-composed capture-button bitmap (composited over the panel as a separate element),
+    /// and its once-per-context Vulkan upload.
+    button: Option<MemoryBuffer>,
+    button_vk: VkCache,
+}
+
+impl PanelCache {
+    /// The panel's physical size (both variants share it), or `None` before the first draw.
+    fn size(&self) -> Option<Size<i32, Buffer>> {
+        let t = self.show.as_ref().or(self.hide.as_ref())?;
+        Some(Size::from((t.width() as i32, t.height() as i32)))
+    }
 }
 
 /// An output's screenshot captured through the owned Vulkan renderer up front, so a Vulkan session
@@ -226,14 +252,6 @@ impl ScreenshotUi {
                 ];
                 let locations = [Default::default(); 8];
 
-                let render_panel_ = |text| {
-                    render_panel(scale, text)
-                        .map_err(|err| warn!("error rendering help panel: {err:?}"))
-                        .ok()
-                };
-                let panel_neutral =
-                    Option::zip(render_panel_(TEXT_SHOW_P), render_panel_(TEXT_HIDE_P));
-
                 let data = OutputData {
                     size,
                     scale,
@@ -241,8 +259,7 @@ impl ScreenshotUi {
                     screenshot,
                     buffers,
                     locations,
-                    panel_neutral,
-                    panel_vk: (RefCell::new(None), RefCell::new(None)),
+                    panel: RefCell::new(PanelCache::default()),
                 };
                 (output, data)
             })
@@ -645,25 +662,19 @@ impl ScreenshotUi {
 
     /// The help panel's on-screen rect on `output`, or `None` if it has no panel.
     ///
-    /// Test-only. The panel is cairo-drawn from real text, so its size depends on the font the
-    /// machine actually has — a test cannot hardcode this rect. Measuring *inside* it is also the
-    /// only way to tell the panel apart from the UI's other chrome: the four selection-border
-    /// buffers alone score thousands of white pixels with the panel entirely absent.
+    /// Test-only. The panel is drawn from real text, so its size depends on the font the machine
+    /// actually has — a test cannot hardcode this rect. Measuring *inside* it is also the only way
+    /// to tell the panel apart from the UI's other chrome: the four selection-border buffers alone
+    /// score thousands of white pixels with the panel entirely absent. Returns `None` until the
+    /// panel has drawn at least once (it is built lazily at render time).
     #[cfg(test)]
     pub fn panel_rect(&self, output: &Output) -> Option<Rectangle<i32, Physical>> {
-        let Self::Open {
-            output_data,
-            show_pointer,
-            ..
-        } = self
-        else {
+        let Self::Open { output_data, .. } = self else {
             return None;
         };
 
         let output_data = output_data.get(output)?;
-        let (show_mem, hide_mem) = output_data.panel_neutral.as_ref()?;
-        let neutral = if *show_pointer { hide_mem } else { show_mem };
-        let size = neutral.size();
+        let size = output_data.panel.borrow().size()?;
 
         Some(Rectangle::new(
             panel_location(output_data, size),
@@ -698,20 +709,22 @@ impl ScreenshotUi {
         let scale = output_data.scale;
         let progress = open_anim.clamped_value().clamp(0., 1.) as f32;
 
-        // The help panel goes on top. Keyed off `panel_neutral`, not the GLES `panel`: the neutral
-        // is drawn on every session, while a Vulkan one bakes no GLES texture — gating on `panel`
-        // here silently drops the whole panel from a Vulkan session.
-        if let Some((show_mem, hide_mem)) = &output_data.panel_neutral {
-            let neutral = if *show_pointer { hide_mem } else { show_mem };
+        // The help panel goes on top. Built lazily here (no renderer exists at open time), so this
+        // is also what first populates the size the capture-button hit test reads.
+        output_data.ensure_panel(renderer);
+        if let Some(size) = output_data.panel.borrow().size() {
             let alpha = if button.is_dragging_selection() {
                 0.3
             } else {
                 0.9
             };
-            let location = panel_location(output_data, neutral.size())
-                .to_f64()
-                .to_logical(scale);
+            let location = panel_location(output_data, size).to_f64().to_logical(scale);
 
+            // Earlier-pushed elements are composited on top (the screenshot goes last), so push the
+            // capture button before the panel to keep it above the panel background.
+            if let Some(elem) = output_data.button_element(renderer, size, alpha * progress) {
+                push(ScreenshotUiRenderElement::Screenshot(elem));
+            }
             if let Some(elem) =
                 output_data.panel_element(renderer, *show_pointer, location, alpha * progress)
             {
@@ -875,7 +888,6 @@ impl ScreenshotUi {
         let Self::Open {
             selection,
             output_data,
-            show_pointer,
             button,
             ..
         } = self
@@ -926,9 +938,7 @@ impl ScreenshotUi {
             return false;
         };
 
-        if let Some((show, hide)) = &output_data.panel_neutral {
-            let buffer = if *show_pointer { hide } else { show };
-            let panel_size = buffer.size();
+        if let Some(panel_size) = output_data.panel.borrow().size() {
             let location = panel_location(output_data, panel_size);
 
             if is_within_capture_button(output_data.scale, panel_size, point - location) {
@@ -965,7 +975,6 @@ impl ScreenshotUi {
             selection,
             output_data,
             button,
-            show_pointer,
             ..
         } = self
         else {
@@ -1006,9 +1015,7 @@ impl ScreenshotUi {
                 return None;
             };
 
-            if let Some((show, hide)) = &output_data.panel_neutral {
-                let buffer = if *show_pointer { hide } else { show };
-                let panel_size = buffer.size();
+            if let Some(panel_size) = output_data.panel.borrow().size() {
                 let location = panel_location(output_data, panel_size);
 
                 if is_within_capture_button(output_data.scale, panel_size, point - location) {
@@ -1106,10 +1113,72 @@ impl OutputScreenshot {
 }
 
 impl OutputData {
-    /// The help-panel element (show/hide variant chosen by `show_pointer`): the renderer samples
-    /// the neutral cairo bytes uploaded to a cached `VkTexture`.
-    ///
-    /// `None` means the upload failed, and draws no panel at all.
+    /// Build both help-panel variants into `VkTexture`s if missing or stale (scale / renderer
+    /// context change). Failures leave the variant `None` — the panel just doesn't draw.
+    fn ensure_panel(&self, renderer: &mut VulkanRenderer) {
+        let scale = self.scale;
+        let context = renderer.context_id();
+        {
+            let cache = self.panel.borrow();
+            if cache.show.is_some()
+                && cache.scale == scale
+                && cache.context.as_ref() == Some(&context)
+            {
+                return;
+            }
+        }
+
+        let show = generate_panel(renderer, scale, "show")
+            .map_err(|err| warn!("error rendering help panel: {err:?}"))
+            .ok();
+        let hide = generate_panel(renderer, scale, "hide")
+            .map_err(|err| warn!("error rendering help panel: {err:?}"))
+            .ok();
+        *self.panel.borrow_mut() = PanelCache {
+            scale,
+            context: Some(context),
+            show,
+            hide,
+            button: Some(button_bitmap(scale)),
+            button_vk: RefCell::new(None),
+        };
+    }
+
+    /// The capture-button element, positioned at the panel's left-centre. `None` if the button
+    /// bitmap or its upload is missing.
+    fn button_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        panel_size: Size<i32, Buffer>,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let scale = self.scale;
+        let padding: i32 = to_physical_precise_round(scale, PADDING);
+        let radius: i32 = to_physical_precise_round(scale, RADIUS);
+
+        let cache = self.panel.borrow();
+        let buffer = cache.button.as_ref()?;
+        let tb = upload_cached(renderer, buffer, &cache.button_vk)?;
+
+        // Panel-local physical offset of the button's top-left, then into output-logical space.
+        let loc =
+            panel_location(self, panel_size) + Point::from((padding, panel_size.h / 2 - radius));
+        let location = loc.to_f64().to_logical(scale);
+
+        Some(CapturedTextureRenderElement(
+            TextureRenderElement::from_texture_buffer(
+                tb,
+                location,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ),
+        ))
+    }
+
+    /// The help-panel element (show/hide variant chosen by `show_pointer`), or `None` if the panel
+    /// hasn't been built (see [`Self::ensure_panel`]).
     fn panel_element(
         &self,
         renderer: &mut VulkanRenderer,
@@ -1117,17 +1186,23 @@ impl OutputData {
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
-        let vk = &mut *renderer;
-        let (show_mem, hide_mem) = self.panel_neutral.as_ref()?;
-        let (neutral, cache) = if show_pointer {
-            (hide_mem, &self.panel_vk.1)
+        let cache = self.panel.borrow();
+        let texture = if show_pointer {
+            &cache.hide
         } else {
-            (show_mem, &self.panel_vk.0)
+            &cache.show
         };
-        let tb = upload_cached(vk, neutral, cache)?;
+        let texture = texture.clone()?;
+        let buffer = TextureBuffer::from_texture(
+            renderer,
+            texture,
+            self.scale,
+            Transform::Normal,
+            Vec::new(),
+        );
         Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
-                tb,
+                buffer,
                 location,
                 alpha,
                 None,
@@ -1281,95 +1356,166 @@ fn is_within_capture_button(
     (pos.x - xc) * (pos.x - xc) + (pos.y - yc) * (pos.y - yc) <= radius * radius
 }
 
-/// Draws the help panel with cairo and hands back the CPU bytes it was drawn from. They are what
-/// the capture button's hit test measures, and what the panel is uploaded from.
-fn render_panel(scale: f64, text: &str) -> anyhow::Result<MemoryBuffer> {
-    let _span = tracy_client::span!("screenshot_ui::render_panel");
+/// Compose the concentric capture-button bitmap: a white centre disk and a white outer ring with a
+/// transparent gap between them (and outside), so it composites over the dark panel like the old
+/// cairo shutter icon. A pure CPU distance test (no cairo); tagged at `scale` so it draws at the
+/// same logical size regardless of the output scale.
+fn button_bitmap(scale: f64) -> MemoryBuffer {
+    let radius: i32 = to_physical_precise_round(scale, RADIUS);
+    let stroke: i32 = to_physical_precise_round::<i32>(scale, 2).max(1);
+    let side = (radius * 2).max(1);
+    let d = side as usize;
+    let c = f64::from(radius); // centre, since side == 2·radius
+    let r = f64::from(radius);
+    let ring_inner = f64::from((radius - stroke).max(0));
+    let disk_outer = f64::from((radius - stroke * 2).max(0));
 
+    // 1 below `edge`, 0 above, ~1px transition.
+    let below = |dist: f64, edge: f64| (edge - dist + 0.5).clamp(0., 1.);
+    // 1 within [inner, outer], 0 outside.
+    let band = |dist: f64, inner: f64, outer: f64| {
+        f64::min((dist - inner + 0.5).clamp(0., 1.), below(dist, outer))
+    };
+
+    let mut data = vec![0u8; d * d * 4];
+    for y in 0..d {
+        for x in 0..d {
+            let dx = x as f64 + 0.5 - c;
+            let dy = y as f64 + 0.5 - c;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let cov = f64::max(below(dist, disk_outer), band(dist, ring_inner, r));
+            // Premultiplied opaque white × coverage → all four channels equal.
+            let v = (cov * 255.).round().clamp(0., 255.) as u8;
+            let i = (y * d + x) * 4;
+            data[i] = v;
+            data[i + 1] = v;
+            data[i + 2] = v;
+            data[i + 3] = v;
+        }
+    }
+
+    MemoryBuffer::new(
+        data,
+        Fourcc::Argb8888,
+        Size::from((side, side)),
+        Scale::from(1.),
+        Transform::Normal,
+    )
+}
+
+/// Draw the screenshot help panel straight into a `VkTexture`: a dark box with a grey border, the
+/// concentric-circle capture button on the left, and two left-aligned help lines with `Space`/`P`
+/// keycaps on grey patches. `verb` is the pointer line's verb ("show" or "hide"). No cairo/pango.
+fn generate_panel(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    verb: &str,
+) -> anyhow::Result<VkTexture> {
+    let _span = tracy_client::span!("screenshot_ui::generate_panel");
+
+    let px = (FONT_PX * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
     // Keep the border width even to avoid blurry edges.
-    let border_width = (f64::from(BORDER) / 2. * scale).round() * 2.;
-    let half_border_width = (border_width / 2.) as i32;
+    let border_width = ((f64::from(BORDER) / 2. * scale).round() as i32 * 2).max(2);
+    let half_border_width = border_width / 2;
     let radius: i32 = to_physical_precise_round(scale, RADIUS);
-    let circle_stroke: f64 = to_physical_precise_round(scale, 2.);
+    // 2 px between the two lines, matching the old cairo line spacing.
+    let line_gap: i32 = to_physical_precise_round(scale, 2);
+    // Breathing room around the grey keycap patches.
+    let kpad_x = (px * 0.28).round() as i32;
+    let kpad_y = (px * 0.12).round() as i32;
 
-    // Add 2 px of spacing to separate the backgrounds of the "Space" and "P" keys.
-    let spacing = to_physical_precise_round::<i32>(scale, 2) * 1024;
+    fn sans(text: &str, px: f32) -> TextSpan<'_> {
+        TextSpan {
+            text,
+            family: SpanFamily::Sans,
+            bold: false,
+            px,
+        }
+    }
+    fn mono(text: &str, px: f32) -> TextSpan<'_> {
+        TextSpan {
+            text,
+            family: SpanFamily::Mono,
+            bold: false,
+            px,
+        }
+    }
 
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
+    // Each line is its own single-line run so the two share a left edge (the paragraph builder
+    // center-aligns; we strip that per line via its ink-x). The keycap is span index 1.
+    let pointer_line = format!(" to {verb} the pointer.");
+    const WRAP: f32 = 100_000.;
+    let lines = [
+        vec![
+            sans("Press ", px),
+            mono(" Space ", px),
+            sans(" to save the screenshot.", px),
+        ],
+        vec![sans("Press ", px), mono(" P ", px), sans(&pointer_line, px)],
+    ];
+    let runs = lines
+        .iter()
+        .map(|spans| renderer.build_glyph_paragraph(spans, WRAP, px))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ink: Vec<(i32, i32, i32, i32)> = runs.iter().map(|r| r.ink_bounds()).collect();
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
+    let text_w = ink.iter().map(|b| b.2).max().unwrap_or(0);
+    let line_bottom = ink.iter().map(|b| b.1 + b.3).max().unwrap_or(0);
+    let row_advance = line_bottom + line_gap;
+    let text_h = row_advance * (lines.len() as i32 - 1) + line_bottom;
 
-    let (mut width, mut height) = layout.pixel_size();
+    let width = text_w + padding + radius * 2 + padding - half_border_width + padding;
+    let height = max(text_h, radius * 2) + padding * 2;
+    let text_x = padding + radius * 2 + padding - half_border_width;
 
-    width += padding + radius * 2 + padding - half_border_width + padding;
-    height = max(height, radius * 2);
-    height += padding * 2;
+    let size = Size::<i32, Physical>::from((width, height));
+    let full = Rectangle::from_size(size);
+    let inner = Rectangle::new(
+        Point::from((half_border_width, half_border_width)),
+        Size::from((
+            (width - half_border_width * 2).max(0),
+            (height - half_border_width * 2).max(0),
+        )),
+    );
 
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
+    // The capture button is composited as a separate element over this panel (see
+    // `OutputData::button_element`); the offscreen quad pipelines misrender here, and only the
+    // clear + glyph paths are reliable from a hand-bound offscreen.
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((width, height)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
 
-    let padding = f64::from(padding);
-    let half_border_width = f64::from(half_border_width);
-    let r = f64::from(radius);
+        // Grey border = whole box grey, then the inner rect dark.
+        frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
+        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
 
-    let yc = f64::from(height / 2);
+        // Two help lines, left-aligned at `text_x`.
+        for (i, run) in runs.iter().enumerate() {
+            let (ix, _, _, _) = ink[i];
+            let y_line = padding + i as i32 * row_advance;
+            let origin = Point::<i32, Physical>::from((text_x - ix, y_line));
 
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r, 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
+            // Grey keycap patch behind span 1 (" Space " / " P ").
+            let (sx, sy, sw, sh) = run.span_ink_bounds(1);
+            if sw > 0 && sh > 0 {
+                let patch = Rectangle::new(
+                    Point::from((origin.x + sx - kpad_x, origin.y + sy - kpad_y)),
+                    Size::from((sw + kpad_x * 2, sh + kpad_y * 2)),
+                );
+                if let Some(patch) = patch.intersection(inner) {
+                    frame.clear(Color32F::from(KEYCAP_BG), &[patch])?;
+                }
+            }
+            frame.render_glyphs(run, origin, TEXT_COLOR, full, &[full])?;
+        }
 
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke, 0., TAU);
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.fill()?;
-
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke * 2., 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
-
-    cr.move_to(padding + r * 2. + padding - half_border_width, padding);
-
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.3, 0.3, 0.3);
-    cr.set_line_width(border_width);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    // `None` on a Vulkan session: it draws the panel from `neutral` below, and never samples this.
-    // Cairo ARGB32 is premultiplied Argb8888, which is what the upload expects.
-    Ok(MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        Size::from((width, height)),
-        Scale::from(scale),
-        Transform::Normal,
-    ))
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
 }
