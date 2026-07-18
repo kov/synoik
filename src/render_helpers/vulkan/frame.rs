@@ -405,6 +405,55 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         Ok(())
     }
 
+    /// Draw a rounded solid-color rectangle filling `dst`, corners cut by `corner_radius` (physical
+    /// pixels) with analytic 1px antialiasing — the toolkit's rounded-rect fill primitive (quick-
+    /// settings tile/pill/menu backgrounds, calendar highlights). `color` is straight-alpha RGBA;
+    /// the box SDF modulates its alpha at the edge/corners, so the corner region blends to whatever
+    /// is already in the target (e.g. the menu background this tile sits on).
+    ///
+    /// The owned-renderer analogue of GLES's `rounding_alpha` chrome fill. Unlike
+    /// [`Self::render_rounded_texture`] it samples no texture (no descriptor set): the box-SDF
+    /// `sdf_rect.frag` reads only `origin`/`size`/`corner_radius`/`color` from the shared
+    /// [`QuadPush`]. `dst` places the quad; `damage` scopes the draw like every other material.
+    // Non-test dead until the overlay draw layer (rounded-chrome pass) calls it; exercised now by
+    // the `vulkan_rounded_rect_fills_and_cuts_corners` test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn render_rounded_rect(
+        &mut self,
+        color: [f32; 4],
+        corner_radius: f32,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+        let push = QuadPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            corner_radius,
+            color,
+            ..Default::default()
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.sdf_rect_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            Self::draw_quad(dev, self.cbuf, &scissors);
+        }
+        Ok(())
+    }
+
     /// Draw `texture` into `dst` with a horizontal alpha fade over `cutoff` (`[left, right]` in the
     /// sampled texture's u coordinate; `left >= right` disables it) — the owned-renderer equivalent
     /// of niri's `GradientFadeTextureRenderElement` (the MRU switcher fades clipped thumbnails).

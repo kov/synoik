@@ -557,6 +557,86 @@ fn vulkan_rounded_texture_partial_src() {
     );
 }
 
+/// The rounded solid-fill primitive (`render_rounded_rect` → `sdf_rect.frag`) fills its rect with a
+/// solid color, cuts the corners to the SDF disc — revealing the background it was drawn *over*, not
+/// a transparent hole — keeps the corner arc-center opaque (an SDF disc, not a square clip), and
+/// antialiases the boundary. This is the exact quick-settings-tile scenario: a rounded fill drawn
+/// INTO a hand-bound offscreen on top of an already-cleared opaque menu background — the case the
+/// overlays have been faking with CPU SDFs / glyph discs. Oracle-free structural invariants.
+#[test]
+fn vulkan_rounded_rect_fills_and_cuts_corners() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_rounded_rect_fills_and_cuts_corners: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Straight-alpha orange fill; `round(c * 255)` is what it reads back to over an opaque bg.
+    const FILL: [f32; 4] = [1.0, 0.5, 0.1, 1.0];
+    const FILL_U8: [u8; 4] = [255, 128, 26, 255];
+    const RAD: f32 = 16.0;
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let full = Rectangle::from_size(size);
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame.clear(Color32F::from(CLEAR), &[full]).expect("clear");
+        frame
+            .render_rounded_rect(FILL, RAD, full, &[full])
+            .expect("render_rounded_rect");
+        let _sync = frame.finish().expect("finish");
+    }
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let clear = clear_u8();
+    // Interior center: the solid fill.
+    assert!(
+        close_px(px(&pixels, 32, 32), FILL_U8, 6),
+        "center should be the fill color, got {:?}",
+        px(&pixels, 32, 32),
+    );
+    // Straight edge midpoint (far from any corner): still covered by the fill.
+    assert!(
+        close_px(px(&pixels, 32, 1), FILL_U8, 6),
+        "top-edge midpoint should be filled, got {:?}",
+        px(&pixels, 32, 1),
+    );
+    // Deep outer corner: cut to the SDF disc → shows the background it was drawn over, not a hole.
+    assert!(
+        close_px(px(&pixels, 0, 0), clear, 4),
+        "corner should be cut to the background, got {:?}",
+        px(&pixels, 0, 0),
+    );
+    // The corner arc-center (radius in along the diagonal) stays opaque fill — proves it's an SDF
+    // disc, not a square clip that would have removed the whole corner block.
+    assert!(
+        close_px(px(&pixels, RAD as i32, RAD as i32), FILL_U8, 8),
+        "arc-center should be filled, got {:?}",
+        px(&pixels, RAD as i32, RAD as i32),
+    );
+    // Boundary is antialiased: somewhere along the corner diagonal a pixel is a partial blend of
+    // fill and background (not a 1-bit mask).
+    let aa = (0..RAD as i32).any(|d| {
+        let r = px(&pixels, d, d)[0];
+        r > clear[0] + 10 && r < FILL_U8[0] - 10
+    });
+    assert!(
+        aa,
+        "corner boundary should be antialiased (a partial fill/bg blend on the arc)",
+    );
+}
+
 // --- M3 step 1c: GradientFadeTextureRenderElement through the owned Vulkan renderer ------------
 
 /// A horizontally-clipped texture (src narrower than the buffer) fades its alpha out toward the

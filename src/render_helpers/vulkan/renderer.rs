@@ -11,7 +11,7 @@ use niri_vk::render::{
 };
 use niri_vk::shaders::{
     BORDER_FRAG, BORDER_VERT, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG,
-    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SHADOW_FRAG,
+    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG, SHADOW_FRAG,
     SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
@@ -64,6 +64,7 @@ pub struct VulkanRenderer {
     /// scene-so-far and keep compositing on top of it.
     pub(super) continuation_render_pass: vk::RenderPass,
     pub(super) solid_pipeline: Pipeline,
+    pub(super) sdf_rect_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) clipped_texture_pipeline: Pipeline,
@@ -269,6 +270,18 @@ impl VulkanRenderer {
             quad_push,
             false,
         )?;
+        // Rounded solid-color fill: the `sdf_rect.frag` box-SDF material, samples nothing (no set),
+        // shares `QuadPush` (uses only origin/size/corner_radius/color) and blends straight-alpha
+        // like `solid` — the toolkit's rounded-rect primitive (tile/pill/menu backgrounds).
+        let sdf_rect_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            SDF_FRAG,
+            &[],
+            quad_push,
+            false,
+        )?;
         let texture_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -370,6 +383,7 @@ impl VulkanRenderer {
             render_pass,
             continuation_render_pass,
             solid_pipeline,
+            sdf_rect_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
             clipped_texture_pipeline,
@@ -1037,6 +1051,7 @@ impl Drop for VulkanRenderer {
             self.shm_staging.destroy(dev);
             self.readback_staging_buffer.destroy(dev);
             self.solid_pipeline.destroy(dev);
+            self.sdf_rect_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
             self.clipped_texture_pipeline.destroy(dev);
