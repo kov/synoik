@@ -147,6 +147,12 @@ impl<T: Texture> TextureRenderElement<T> {
             .unwrap_or_else(|| self.buffer.logical_size())
     }
 
+    /// Overall opacity multiplier for this element. Used to fade a composited overlay
+    /// (e.g. the panel popover) by an animation progress value after the element is built.
+    pub fn set_alpha(&mut self, alpha: f32) {
+        self.alpha = alpha;
+    }
+
     pub fn logical_src(&self) -> Rectangle<f64, Logical> {
         self.src
             .unwrap_or_else(|| Rectangle::from_size(self.logical_size()))

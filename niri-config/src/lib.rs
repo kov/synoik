@@ -1622,6 +1622,17 @@ mod tests {
                         ),
                     },
                 ),
+                panel_popover_open_close: PanelPopoverOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 150,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
                 overview_open_close: OverviewOpenCloseAnim(
                     Animation {
                         off: false,

@@ -2143,6 +2143,9 @@ fn vulkan_renders_the_calendar_popover() {
         );
     }
     assert!(f.niri().panel_popover.is_open());
+    // Settle the open fade so the popover renders at full opacity (else the anim leaves
+    // it at alpha 0 — the headless-animation-clock trap).
+    f.settle_animations();
 
     let state = f.niri_state();
     let opaque = state
@@ -2208,6 +2211,8 @@ fn vulkan_renders_the_quick_settings_popover() {
         );
     }
     assert!(f.niri().panel_popover.is_open());
+    // Settle the open fade so the popover renders at full opacity (the clock trap).
+    f.settle_animations();
 
     let state = f.niri_state();
     let opaque = state

@@ -17,6 +17,7 @@ pub struct Animations {
     pub config_notification_open_close: ConfigNotificationOpenCloseAnim,
     pub exit_confirmation_open_close: ExitConfirmationOpenCloseAnim,
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
+    pub panel_popover_open_close: PanelPopoverOpenCloseAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
     pub recent_windows_close: RecentWindowsCloseAnim,
 }
@@ -35,6 +36,7 @@ impl Default for Animations {
             config_notification_open_close: Default::default(),
             exit_confirmation_open_close: Default::default(),
             screenshot_ui_open: Default::default(),
+            panel_popover_open_close: Default::default(),
             overview_open_close: Default::default(),
             recent_windows_close: Default::default(),
         }
@@ -68,6 +70,8 @@ pub struct AnimationsPart {
     #[knuffel(child)]
     pub screenshot_ui_open: Option<ScreenshotUiOpenAnim>,
     #[knuffel(child)]
+    pub panel_popover_open_close: Option<PanelPopoverOpenCloseAnim>,
+    #[knuffel(child)]
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
     #[knuffel(child)]
     pub recent_windows_close: Option<RecentWindowsCloseAnim>,
@@ -95,6 +99,7 @@ impl MergeWith<AnimationsPart> for Animations {
             config_notification_open_close,
             exit_confirmation_open_close,
             screenshot_ui_open,
+            panel_popover_open_close,
             overview_open_close,
             recent_windows_close,
         );
@@ -294,6 +299,23 @@ impl Default for ScreenshotUiOpenAnim {
     }
 }
 
+/// The panel popovers (quick settings, calendar) fade/scale open and closed, like
+/// gnome-shell's `BoxPointer` (`POPUP_ANIMATION_TIME = 150ms`, `EASE_OUT_QUAD`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelPopoverOpenCloseAnim(pub Animation);
+
+impl Default for PanelPopoverOpenCloseAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 150,
+                curve: Curve::EaseOutQuad,
+            }),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverviewOpenCloseAnim(pub Animation);
 
@@ -480,6 +502,21 @@ where
 }
 
 impl<S> knuffel::Decode<S> for ScreenshotUiOpenAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+impl<S> knuffel::Decode<S> for PanelPopoverOpenCloseAnim
 where
     S: knuffel::traits::ErrorSpan,
 {

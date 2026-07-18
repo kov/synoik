@@ -2689,9 +2689,11 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
         "clicking the clock must open the calendar popover"
     );
 
-    // Escape closes it (the modal keyboard grab).
+    // Escape closes it (the modal keyboard grab). The close is animated (fade-out),
+    // so settle the animation before asserting it's gone.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
+    f.settle_animations();
     assert!(
         !f.niri().panel_popover.is_open(),
         "Escape must close the popover"
@@ -2703,6 +2705,7 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     pointer_motion_to(&mut f, 10., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
     assert!(
         !f.niri().panel_popover.is_open(),
         "a click outside the popover must dismiss it"
@@ -2758,9 +2761,10 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
         "clicking the Do Not Disturb tile must flip its state on"
     );
 
-    // Escape closes it.
+    // Escape closes it (animated fade-out; settle before asserting it's gone).
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
+    f.settle_animations();
     assert!(
         !f.niri().panel_popover.is_open(),
         "Escape must close the quick-settings popover"
@@ -2772,10 +2776,53 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     pointer_motion_to(&mut f, 960., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
     assert!(
         !f.niri().panel_popover.is_open(),
         "a click outside the quick-settings popover must dismiss it"
     );
+}
+
+/// The popover opens and closes with an animation (gnome-shell's `BoxPointer` fade):
+/// opening starts a running animation; dismissing does NOT drop the popover instantly
+/// but keeps it visible (fading) with an ongoing animation until it settles.
+#[test]
+fn panel_popover_open_and_close_are_animated() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Open the calendar (click the centered clock).
+    pointer_motion_to(&mut f, 960., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.niri().panel_popover.is_open());
+    assert!(
+        f.niri().panel_popover.are_animations_ongoing(),
+        "opening must start a fade animation"
+    );
+
+    // Once settled, it's still open but no longer animating.
+    f.settle_animations();
+    assert!(f.niri().panel_popover.is_open());
+    assert!(!f.niri().panel_popover.are_animations_ongoing());
+
+    // Dismiss with Escape: the popover must NOT vanish instantly — it stays visible,
+    // fading out, with an ongoing animation.
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "the close must be animated, not instant — the popover stays visible while fading"
+    );
+    assert!(
+        f.niri().panel_popover.are_animations_ongoing(),
+        "closing must run a fade-out animation"
+    );
+
+    // After the fade-out settles, it's gone.
+    f.settle_animations();
+    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.niri().panel_popover.are_animations_ongoing());
 }
 
 /// A client must not be able to kill the compositor with a malformed `wl_region`.

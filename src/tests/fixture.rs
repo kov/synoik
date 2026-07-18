@@ -98,6 +98,19 @@ impl Fixture {
         niri.clock.set_complete_instantly(false);
     }
 
+    /// Drive animations to completion by pinning the (lazy) clock forward past any
+    /// running animation, then advancing. Unlike [`niri_complete_animations`], this
+    /// actually moves the clock, so `is_done`/progress read as finished at render
+    /// time too — the correct way to settle a timed overlay (see the
+    /// headless-animation-clock trap). Call it immediately before asserting, after
+    /// the last input roundtrip (`refresh` clears the lazy clock).
+    pub fn settle_animations(&mut self) {
+        let niri = self.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(1000));
+        niri.advance_animations();
+    }
+
     /// Inject a key press through the real input pipeline (`process_input_event`).
     ///
     /// `evdev_code` is a Linux `KEY_*` evdev keycode (e.g. `KEY_LEFTMETA`); it is

@@ -13,10 +13,15 @@
 //! top of its chrome), so [`render`](PanelPopover::render) returns a `Vec`. The
 //! net-new behavior vs the existing overlays is outside-click dismissal.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use niri_config::Config;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -77,20 +82,71 @@ pub struct PanelPopover {
     /// The panel button rect it hangs from, output-local logical.
     anchor: Rectangle<f64, Logical>,
     content: Option<PopoverContent>,
+    /// The shared animation clock, cloned into each open/close [`Animation`].
+    clock: Clock,
+    /// The live config, read for the popover open/close animation params on each toggle.
+    config: Rc<RefCell<Config>>,
+    /// The open/close fade progress (0 = hidden, 1 = fully shown). `None` = no animation
+    /// has run yet (treated as fully shown). On close it runs current→0.
+    anim: Option<Animation>,
+    /// While closing, the content is kept and rendered (fading out) until the animation
+    /// settles, then dropped by [`advance_animations`](Self::advance_animations).
+    closing: bool,
 }
 
 impl PanelPopover {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self {
             open: false,
             output: None,
             anchor: Rectangle::default(),
             content: None,
+            clock,
+            config,
+            anim: None,
+            closing: false,
         }
     }
 
+    /// Whether the popover is showing (including while it fades out on close).
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Build an open/close fade animation from `from` to `to` using the configured
+    /// `panel_popover_open_close` params (gnome-shell's `BoxPointer` timing).
+    fn make_anim(&self, from: f64, to: f64) -> Animation {
+        let c = self.config.borrow();
+        Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            c.animations.panel_popover_open_close.0,
+        )
+    }
+
+    /// The current fade progress in `[0, 1]` (1 when fully open with no animation).
+    fn progress(&self) -> f32 {
+        self.anim
+            .as_ref()
+            .map_or(1., |a| a.clamped_value().clamp(0., 1.) as f32)
+    }
+
+    /// Settle the open/close animation: once a close fade finishes, drop the content.
+    pub fn advance_animations(&mut self) {
+        if self.closing && self.anim.as_ref().is_none_or(|a| a.is_done()) {
+            self.open = false;
+            self.closing = false;
+            self.output = None;
+            self.content = None;
+            self.anim = None;
+        }
+    }
+
+    /// Whether an open/close fade is still running (keeps the redraw loop ticking).
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.anim.as_ref().is_some_and(|a| !a.is_done())
     }
 
     /// The output the popover is anchored on, while open.
@@ -113,6 +169,7 @@ impl PanelPopover {
             return;
         }
         self.open = true;
+        self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::Calendar(Calendar::new(
@@ -120,6 +177,7 @@ impl PanelPopover {
             show_week_numbers,
             accent,
         )));
+        self.anim = Some(self.make_anim(0., 1.));
     }
 
     /// Toggle the quick-settings menu, anchored at `anchor` on `output`. `battery`
@@ -137,31 +195,40 @@ impl PanelPopover {
             return;
         }
         self.open = true;
+        self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
             toggles, battery, accent,
         )));
+        self.anim = Some(self.make_anim(0., 1.));
     }
 
     /// Whether the popover is open showing a particular content kind (so a second
     /// click on the *same* button toggles it closed, but clicking a different
-    /// panel button swaps content instead of no-op-toggling).
+    /// panel button swaps content instead of no-op-toggling). A popover that is
+    /// fading out (`closing`) is not "showing", so its button re-opens it fresh.
     fn is_showing<T: ContentTag>(&self) -> bool {
-        self.open && self.content.as_ref().is_some_and(T::matches)
+        self.open && !self.closing && self.content.as_ref().is_some_and(T::matches)
     }
 
+    /// Start the fade-out. The content stays and keeps rendering (fading) until the
+    /// animation settles, when [`advance_animations`](Self::advance_animations) drops
+    /// it. Idempotent while already closing.
     pub fn close(&mut self) {
-        self.open = false;
-        self.output = None;
-        self.content = None;
+        if !self.open || self.closing {
+            return;
+        }
+        self.closing = true;
+        let from = f64::from(self.progress());
+        self.anim = Some(self.make_anim(from, 0.));
     }
 
     /// Feed a key while the popover is open. Escape closes it; every other key is
     /// swallowed (a modal grab, like GNOME popup menus). Returns whether the key
-    /// was consumed.
+    /// was consumed. A closing (fading-out) popover no longer grabs input.
     pub fn handle_key(&mut self, raw: Option<Keysym>, pressed: bool) -> bool {
-        if !self.open {
+        if !self.open || self.closing {
             return false;
         }
         if pressed && raw == Some(Keysym::Escape) {
@@ -180,7 +247,9 @@ impl PanelPopover {
         output: &Output,
         pos: Point<f64, Logical>,
     ) -> Option<PopoverAction> {
-        if !self.open {
+        // A closed or fading-out popover doesn't grab: let the caller handle the click
+        // normally (so a click during the close fade still hits whatever is beneath).
+        if !self.open || self.closing {
             return None;
         }
         if self.output.as_ref() != Some(output) {
@@ -249,7 +318,7 @@ impl PanelPopover {
         let scale = output.current_scale().fractional_scale();
         let origin = self.location(output);
 
-        match self.content.as_ref() {
+        let mut elements = match self.content.as_ref() {
             Some(PopoverContent::Calendar(cal)) => match cal.texture(renderer, scale) {
                 Ok(texture) => {
                     use smithay::backend::renderer::element::Kind;
@@ -282,13 +351,16 @@ impl PanelPopover {
             },
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             None => Vec::new(),
-        }
-    }
-}
+        };
 
-impl Default for PanelPopover {
-    fn default() -> Self {
-        Self::new()
+        // Fade the whole popover (chrome + composited icons) by the open/close progress.
+        let progress = self.progress();
+        if progress < 1. {
+            for el in &mut elements {
+                el.set_alpha(progress);
+            }
+        }
+        elements
     }
 }
 
