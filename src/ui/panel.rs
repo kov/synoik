@@ -63,18 +63,21 @@ const DOT_DIAMETER: f64 = 8.;
 /// Gap between dots, logical px (`panel.js` `WorkspaceIndicators` box `spacing`).
 const DOT_SPACING: f64 = 5.;
 
-/// Horizontal padding on each side of the whole dot row, logical px. GNOME's dot
-/// box has `0 $scaled_padding*0.5` (3px); we keep a little extra so the row isn't
-/// jammed against the screen edge and stays a comfortable click target.
-const INDICATOR_H_PADDING: f64 = 6.;
+/// Horizontal padding from the button's hit-rect edge to its content (the dot row
+/// or the status-icon cluster), logical px: the pill's edge inset (`BTN_MARGIN_X`)
+/// plus the panel_button breathing room (`BTN_H_PADDING`), so the content sits
+/// `BTN_H_PADDING` inside the lit pill.
+const INDICATOR_H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
 
 /// Inactive dots are drawn at 0.75× and half-opacity (`panel.js`
 /// `INACTIVE_WORKSPACE_DOT_SCALE`, `WorkspaceDot._updateVisuals`).
 const INACTIVE_DOT_SCALE: f64 = 0.75;
 const INACTIVE_DOT_OPACITY: f64 = 0.5;
 
-/// Horizontal padding on each side of the dateMenu (clock) button, logical px.
-const H_PADDING: f64 = 12.;
+/// Horizontal padding from the dateMenu (clock) button's hit-rect edge to the clock
+/// label, logical px — the pill inset plus the panel_button breathing room, so the
+/// clock sits `BTN_H_PADDING` inside its lit pill, like the other buttons.
+const H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
 
 /// Bar background (opaque black — GNOME's dark panel), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
@@ -85,6 +88,12 @@ const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 /// fully-rounded (`$forced_circular_radius`) pill that lights up on hover/active.
 const BTN_MARGIN_X: f64 = 4.;
 const BTN_INSET_Y: f64 = 3.;
+
+/// Horizontal breathing room between the lit pill and the button's content, logical
+/// px — gnome-shell's panel_button `-natural-hpadding` (`$base_padding * 2` = 12px,
+/// `_panel.scss`). Without it the pill hugs the dots/icons; the button's content
+/// padding is this plus the pill's own `BTN_MARGIN_X` edge inset.
+const BTN_H_PADDING: f64 = 12.;
 
 /// `panel_button` fill states over the dark bar (white `$fg`), straight RGBA — the
 /// SDF fill blends over the opaque background: hover `transparentize($fg, .83)`,
