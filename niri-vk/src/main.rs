@@ -19,6 +19,7 @@
 //! blending, descriptor sets / samplers, ping-pong blur, glyph atlas) on Venus and lavapipe,
 //! headless.
 
+#[cfg(feature = "pango-ref")]
 mod pango_ref;
 
 use std::path::PathBuf;
@@ -68,24 +69,32 @@ fn main() -> Result<()> {
 
     let text = render_text(&gpu)?;
     assert_text(&text)?;
-    // Reference render (pango/cairo), stacked below ours into one PNG for a 1x crispness compare.
-    let reference = pango_ref::render(
-        TEXT,
-        TW as i32,
-        TH as i32,
-        TEXT_PX as f64,
-        [TEXT_FG[0], TEXT_FG[1], TEXT_FG[2]],
-        [TEXT_BG[0], TEXT_BG[1], TEXT_BG[2]],
-        (TEXT_ORIGIN.0 as f64, TEXT_ORIGIN.1 as f64),
-    )?;
-    let mut combined = text.clone();
-    combined.extend_from_slice(&reference);
     let path = artifact_path("text.png");
-    write_png(&path, TW, TH * 2, &combined)?;
-    eprintln!(
-        "niri-vk: wrote {} (top: swash atlas, bottom: pango ref)",
-        path.display()
-    );
+    #[cfg(feature = "pango-ref")]
+    {
+        // Reference render (pango/cairo), stacked below ours for a 1x crispness compare.
+        let reference = pango_ref::render(
+            TEXT,
+            TW as i32,
+            TH as i32,
+            TEXT_PX as f64,
+            [TEXT_FG[0], TEXT_FG[1], TEXT_FG[2]],
+            [TEXT_BG[0], TEXT_BG[1], TEXT_BG[2]],
+            (TEXT_ORIGIN.0 as f64, TEXT_ORIGIN.1 as f64),
+        )?;
+        let mut combined = text.clone();
+        combined.extend_from_slice(&reference);
+        write_png(&path, TW, TH * 2, &combined)?;
+        eprintln!(
+            "niri-vk: wrote {} (top: swash atlas, bottom: pango ref)",
+            path.display()
+        );
+    }
+    #[cfg(not(feature = "pango-ref"))]
+    {
+        write_png(&path, TW, TH, &text)?;
+        eprintln!("niri-vk: wrote {} (swash atlas)", path.display());
+    }
     eprintln!("niri-vk: OK — hinted glyph-atlas text verified");
 
     if let Some(dmabuf) = render_dmabuf(&gpu)? {

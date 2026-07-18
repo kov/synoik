@@ -12,6 +12,7 @@
 //! differ slightly from pango/cairo/FreeType — expected, not a bug.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -52,6 +53,35 @@ pub struct GlyphAtlas {
 
 /// Atlas slot (top-left in atlas px) for each distinct glyph, keyed by its shaping cache key.
 type GlyphSlots = HashMap<CacheKey, (u32, u32)>;
+
+/// A process-global font system used only for GPU-free text *measurement* — sizing a hit rectangle
+/// or a layout box before any renderer (hence any [`TextContext`]) exists. The first call scans the
+/// system fonts (tens of ms); every measurement after is cheap. Shaping only, never rasterization,
+/// so it needs no [`Gpu`]. The draw path uses the renderer's own [`TextContext`] font system.
+fn measure_fonts() -> &'static Mutex<FontSystem> {
+    static FONTS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
+    FONTS.get_or_init(|| Mutex::new(FontSystem::new()))
+}
+
+/// Logical width, in pixels, of a single-line `text` shaped SansSerif at `px` pixels-per-em — the
+/// advance the renderer lays the run out to. GPU-free (shaping only), so callers can size a hit
+/// rectangle at construction time, before a renderer exists. Matches the width `build_glyph_run`
+/// would produce at the same `px` (both shape SansSerif through cosmic-text).
+pub fn measure_line_width(text: &str, px: f32) -> f64 {
+    let mut fonts = measure_fonts().lock().unwrap();
+    let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
+    {
+        let mut b = buffer.borrow_with(&mut fonts);
+        b.set_size(None, None);
+        let attrs = Attrs::new().family(Family::SansSerif);
+        b.set_text(text, &attrs, Shaping::Advanced, None);
+        b.shape_until_scroll(false);
+    }
+    buffer
+        .layout_runs()
+        .map(|run| run.line_w)
+        .fold(0.0_f32, f32::max) as f64
+}
 
 /// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
 /// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and

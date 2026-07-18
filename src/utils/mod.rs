@@ -544,7 +544,7 @@ pub fn baba_is_float_offset(now: Duration, view_height: f64) -> f64 {
 pub fn show_screenshot_notification(image_path: Option<&Path>) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
-    use pango::glib;
+    use gio::glib;
     use zbus::zvariant;
 
     let conn = zbus::blocking::Connection::session()?;

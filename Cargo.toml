@@ -84,8 +84,6 @@ niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
 niri-vk = { version = "0.0.0", path = "niri-vk" }
 ordered-float = "5.3.0"
-pango = { version = "0.22.8", features = ["v1_44"] }
-pangocairo = "0.22.8"
 pipewire = { version = "0.9.2", optional = true, features = ["v0_3_33"] }
 png = "0.18.1"
 profiling = "1.0.17"

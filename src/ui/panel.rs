@@ -19,8 +19,6 @@ use std::collections::HashMap;
 use std::ptr::null_mut;
 
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::FontDescription;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{
@@ -38,12 +36,8 @@ use crate::utils::{output_size, to_physical_precise_round};
 /// i.e. ~32px at scale 1 (`gnome-shell-sass/widgets/_panel.scss`).
 pub const PANEL_HEIGHT: f64 = 32.;
 
-/// Panel font, as a pango description string (used only to *measure* the
-/// Activities hit rectangle; the drawing uses [`FONT_PX`]).
-const FONT: &str = "sans 13px";
-
-/// Panel font size in logical pixels-per-em (matches [`FONT`]). Scaled by the
-/// output scale to the physical em the glyph rasterizer shapes at.
+/// Panel font size in logical pixels-per-em. Scaled by the output scale to the
+/// physical em the glyph rasterizer shapes at.
 const FONT_PX: f64 = 13.;
 
 /// Horizontal padding inside the Activities button, logical px.
@@ -109,7 +103,9 @@ pub struct Panel {
 
 impl Panel {
     pub fn new() -> Self {
-        let activities_w = measure_logical_width(ACTIVITIES) + H_PADDING * 2.;
+        // Measure the label GPU-free (cosmic-text shaping, no renderer needed) so the hit
+        // rectangle is known at construction time — the same width the bar draws the run to.
+        let activities_w = activities_logical_width();
         let activities_rect = Rectangle::new(
             Point::from((0., 0.)),
             Size::from((activities_w, PANEL_HEIGHT)),
@@ -266,25 +262,12 @@ fn format_clock(now: libc::time_t) -> String {
     }
 }
 
-/// Measure a string's width at logical scale (for hit rectangles), in px.
-fn measure_logical_width(text: &str) -> f64 {
-    let Ok(surface) = ImageSurface::create(cairo::Format::ARgb32, 0, 0) else {
-        return 0.;
-    };
-    let Ok(cr) = cairo::Context::new(&surface) else {
-        return 0.;
-    };
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.set_font_description(Some(&make_font(1.)));
-    layout.set_text(text);
-    f64::from(layout.pixel_size().0)
-}
-
-/// The panel font at a given scale (absolute px, scaled like the other overlays).
-fn make_font(scale: f64) -> FontDescription {
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-    font
+/// The Activities button's logical width: the shaped label plus a horizontal
+/// padding on each side. Measured GPU-free (cosmic-text shaping) so it is the
+/// same at construction time (the hit rectangle) and at draw time (the checked
+/// highlight), matching what the bar draws the glyph run to.
+fn activities_logical_width() -> f64 {
+    niri_vk::text::measure_line_width(ACTIVITIES, FONT_PX as f32) + H_PADDING * 2.
 }
 
 /// Draw the whole bar into an offscreen [`VkTexture`] on the GPU: clear the
@@ -320,9 +303,9 @@ fn draw_bar_texture(
     let c_origin =
         Point::<i32, Physical>::from(((width_px - c_iw) / 2 - c_ix, (height_px - c_ih) / 2 - c_iy));
 
-    // The highlight matches the Activities button hit rectangle (text + padding).
-    let highlight_w: i32 =
-        to_physical_precise_round(scale, measure_logical_width(ACTIVITIES) + H_PADDING * 2.);
+    // The highlight matches the Activities button hit rectangle (label + padding),
+    // measured GPU-free so it agrees with `activities_rect`.
+    let highlight_w: i32 = to_physical_precise_round(scale, activities_logical_width());
     let highlight_w = highlight_w.clamp(1, width_px);
 
     let size = Size::<i32, Physical>::from((width_px, height_px));

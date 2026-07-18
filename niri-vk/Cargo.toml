@@ -2,8 +2,8 @@
 name = "niri-vk"
 version = "0.0.0"
 edition = "2021"
-# Above the workspace's 1.85 floor (pango 0.22 needs 1.92). This library leads the toolchain
-# requirement; matching niri's pango 0.22 also dedupes the workspace build.
+# Above the workspace's 1.85 floor. The optional `pango-ref` reference rasterizer needs pango 0.22
+# (rustc 1.92); this library leads the toolchain requirement even with that feature off.
 rust-version = "1.92"
 license = "GPL-3.0-or-later"
 publish = false
@@ -12,7 +12,6 @@ description = "Owned Vulkan (ash) render primitives for the compositor's Vulkan 
 [dependencies]
 anyhow.workspace = true
 ash = "0.38.0"
-cairo-rs = "0.22.0"
 cosmic-text = "0.19.0"
 # Explicit-sync spike (sync_spike.rs): drm_syncobj ioctls + raw sync_file/eventfd/poll. drm-ffi
 # 0.9 dedupes with the version Smithay already pulls into the workspace.
@@ -20,7 +19,17 @@ drm-ffi = "0.9.1"
 etagere = "0.3.0"
 gbm = "0.18.0"
 libc = "0.2"
-pango = "0.22.8"
-pangocairo = "0.22.8"
 png = "0.18.1"
 swash = "0.2"
+
+# The demo binary's pango/cairo reference rasterizer (see `pango-ref` feature). Optional so the
+# compositor build (which depends on this crate as a library) never compiles cairo/pango — the swash
+# glyph atlas is the shipping text path; pango is only a dev-time crispness oracle.
+cairo-rs = { version = "0.22.0", optional = true }
+pango = { version = "0.22.8", optional = true }
+pangocairo = { version = "0.22.8", optional = true }
+
+[features]
+# Stack a pango/cairo reference under our swash atlas in the `text.png` demo artifact for a 1x
+# crispness compare: `cargo run -p niri-vk --features pango-ref`. Off by default.
+pango-ref = ["dep:cairo-rs", "dep:pango", "dep:pangocairo"]
