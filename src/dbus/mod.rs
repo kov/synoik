@@ -14,6 +14,7 @@ pub mod gnome_shell_screenshot;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
+pub mod system_status;
 
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod mutter_screen_cast;
@@ -48,6 +49,7 @@ pub struct DBusServers {
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
+    pub conn_system_status: Option<Connection>,
 }
 
 impl DBusServers {
@@ -217,6 +219,22 @@ impl DBusServers {
             }
             Err(err) => {
                 warn!("error starting locale1 watcher: {err:?}");
+            }
+        }
+
+        let (to_niri, from_system_status) = calloop::channel::channel();
+        niri.event_loop
+            .insert_source(from_system_status, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_system_status_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match system_status::start(to_niri) {
+            Ok(conn) => {
+                dbus.conn_system_status = Some(conn);
+            }
+            Err(err) => {
+                warn!("error starting system-status watcher: {err:?}");
             }
         }
 

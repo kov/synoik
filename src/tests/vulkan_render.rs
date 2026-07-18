@@ -2196,7 +2196,7 @@ fn vulkan_renders_the_quick_settings_popover() {
     {
         let output_w = output_size(&output).w;
         let toggles = f.niri().gnome_settings.quick_toggles;
-        let anchor = f.niri().panel.quick_settings_rect(output_w, toggles);
+        let anchor = f.niri().panel.quick_settings_rect(output_w);
         let accent = f.niri().gnome_settings.accent_color;
         f.niri()
             .panel_popover

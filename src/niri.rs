@@ -127,6 +127,8 @@ use crate::dbus::freedesktop_login1::Login1ToNiri;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospect};
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
+#[cfg(feature = "dbus")]
+use crate::dbus::system_status::SystemStatusToNiri;
 use crate::frame_clock::FrameClock;
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
@@ -169,6 +171,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::system_status::SystemStatus;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
@@ -366,6 +369,9 @@ pub struct Niri {
     pub gnome_settings: GnomeSettings,
     /// Writes settings back to the GSettings store; `None` when headless.
     pub gnome_settings_writer: Option<GnomeSettingsWriter>,
+    /// Live network + battery state for the panel status area (from the system-bus
+    /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
+    pub system_status: SystemStatus,
     /// The decoded `org.gnome.desktop.background` picture, drawn as the
     /// workspace background in GNOME windowing mode.
     pub wallpaper: Wallpaper,
@@ -2392,6 +2398,22 @@ impl State {
     }
 
     #[cfg(feature = "dbus")]
+    pub fn on_system_status_msg(&mut self, msg: SystemStatusToNiri) {
+        match msg {
+            SystemStatusToNiri::Battery(battery) => self.niri.system_status.battery = battery,
+            SystemStatusToNiri::Network(network) => self.niri.system_status.network = network,
+        }
+        trace!("system status changed: {:?}", self.niri.system_status);
+        if self
+            .niri
+            .panel
+            .set_system_status(self.niri.system_status.clone())
+        {
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    #[cfg(feature = "dbus")]
     pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToNiri) {
         use crate::dbus::gnome_shell::GnomeShellToNiri;
         match msg {
@@ -2904,6 +2926,7 @@ impl Niri {
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
+            system_status: SystemStatus::default(),
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),

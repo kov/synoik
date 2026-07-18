@@ -3158,7 +3158,7 @@ impl State {
                             }
                             Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
                                 let toggles = self.niri.gnome_settings.quick_toggles;
-                                let anchor = self.niri.panel.quick_settings_rect(output_w, toggles);
+                                let anchor = self.niri.panel.quick_settings_rect(output_w);
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri
                                     .panel_popover

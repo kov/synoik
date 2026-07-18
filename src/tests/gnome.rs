@@ -2736,8 +2736,7 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     // open. The menu is centered under the indicator, clamped into the output; the
     // DND tile is the top-right tile of the two-column grid.
     let output_w = 1920.0_f64;
-    let toggles = f.niri().gnome_settings.quick_toggles;
-    let anchor = f.niri().panel.quick_settings_rect(output_w, toggles);
+    let anchor = f.niri().panel.quick_settings_rect(output_w);
     // Recompute the popover origin the way the popover does (centered, clamped).
     let menu_w = 332.0_f64; // PAD*2 + 2*TILE_W + TILE_GAP
     let center_x = anchor.loc.x + anchor.size.w / 2.;

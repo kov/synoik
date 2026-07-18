@@ -49,6 +49,7 @@ use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::system_status::{self, SystemStatus};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Logical height of the panel. GNOME's is `2.2em` at an `11pt` base font,
@@ -101,9 +102,9 @@ pub const ROLE_QUICK_SETTINGS: &str = "quickSettings";
 const QS_ICON: f64 = 16.;
 const QS_ICON_GAP: f64 = 4.;
 
-/// The always-present anchor icon of the quick-settings indicator (a placeholder
-/// for the dynamic network/volume/battery cluster, which is daemon-backed and
-/// deferred). First that resolves wins.
+/// Fallback anchor icon shown only when the status cluster would otherwise be
+/// empty (no `dbus` feature / no daemons), so the button is always clickable.
+/// First that resolves wins.
 const QS_ANCHOR_ICONS: &[&str] = &[
     "emblem-system-symbolic",
     "applications-system-symbolic",
@@ -115,23 +116,36 @@ const QS_DND_ICONS: &[&str] = &["notifications-disabled-symbolic"];
 const QS_NIGHT_ICONS: &[&str] = &["night-light-symbolic"];
 
 /// The candidate icon-name lists for the quick-settings indicator, left-to-right:
-/// any active real-status icons, then the anchor.
-fn qs_indicator_icons(toggles: QuickToggles) -> Vec<&'static [&'static str]> {
-    let mut v: Vec<&'static [&'static str]> = Vec::new();
+/// active toggle touches (DND / Night Light), then the live system cluster
+/// (network, then battery in the corner, like GNOME). Each entry is a candidate
+/// list; the first name that resolves in the theme is drawn. Falls back to the
+/// anchor icon so the cluster is never empty.
+fn qs_indicator_icons(toggles: QuickToggles, status: &SystemStatus) -> Vec<Vec<String>> {
+    let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let mut v: Vec<Vec<String>> = Vec::new();
     if toggles.do_not_disturb {
-        v.push(QS_DND_ICONS);
+        v.push(owned(QS_DND_ICONS));
     }
     if toggles.night_light {
-        v.push(QS_NIGHT_ICONS);
+        v.push(owned(QS_NIGHT_ICONS));
     }
-    v.push(QS_ANCHOR_ICONS);
+    if let Some(candidates) = system_status::network_icon(status.network) {
+        v.push(owned(candidates));
+    }
+    if let Some(battery) = &status.battery {
+        v.push(system_status::battery_icon(battery));
+    }
+    if v.is_empty() {
+        v.push(owned(QS_ANCHOR_ICONS));
+    }
     v
 }
 
 /// Logical width of the right-box quick-settings indicator (padding + icons +
 /// gaps). Depends on how many status icons are currently shown.
-fn qs_indicator_width(toggles: QuickToggles) -> f64 {
-    let n = qs_indicator_icons(toggles).len() as f64;
+fn qs_indicator_width(toggles: QuickToggles, status: &SystemStatus) -> f64 {
+    let n = qs_indicator_icons(toggles, status).len() as f64;
     2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
 }
 
@@ -239,6 +253,9 @@ pub struct Panel {
     /// The quick-settings toggle states, mirrored from gsettings — they decide
     /// which status icons the right-box indicator shows.
     toggles: QuickToggles,
+    /// Live network + battery state (from the system-bus watcher), shown as the
+    /// right-box status cluster.
+    system_status: SystemStatus,
 
     /// Cached GPU chrome, cleared whenever the drawn content changes.
     cache: RefCell<BarCache>,
@@ -252,6 +269,7 @@ impl Panel {
             clock_format,
             activities_checked: false,
             toggles: QuickToggles::default(),
+            system_status: SystemStatus::default(),
             cache: RefCell::new(BarCache::new()),
         }
     }
@@ -264,6 +282,18 @@ impl Panel {
             return false;
         }
         self.toggles = toggles;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// Adopt the live network/battery state (from the system-bus watcher). Returns
+    /// whether it changed, so the caller can queue a redraw; the indicator's icon
+    /// set (and width) may differ.
+    pub fn set_system_status(&mut self, status: SystemStatus) -> bool {
+        if status == self.system_status {
+            return false;
+        }
+        self.system_status = status;
         self.cache.borrow_mut().clear();
         true
     }
@@ -348,13 +378,9 @@ impl Panel {
 
     /// The quick-settings status indicator rect: the icon cluster plus a padding
     /// on each side, right-anchored on the output. Its width tracks how many
-    /// status icons are currently shown.
-    pub fn quick_settings_rect(
-        &self,
-        output_width: f64,
-        toggles: QuickToggles,
-    ) -> Rectangle<f64, Logical> {
-        let w = qs_indicator_width(toggles);
+    /// status icons (toggles + live network/battery) are currently shown.
+    pub fn quick_settings_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+        let w = qs_indicator_width(self.toggles, &self.system_status);
         Rectangle::new(
             Point::from((output_width - w, 0.)),
             Size::from((w, PANEL_HEIGHT)),
@@ -379,7 +405,7 @@ impl Panel {
             PanelItem {
                 role: ROLE_QUICK_SETTINGS,
                 r#box: PanelBox::Right,
-                rect: self.quick_settings_rect(output_width, self.toggles),
+                rect: self.quick_settings_rect(output_width),
             },
         ]
     }
@@ -395,10 +421,7 @@ impl Panel {
     ) -> Option<&'static str> {
         if self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
-        } else if self
-            .quick_settings_rect(output_width, self.toggles)
-            .contains(pos)
-        {
+        } else if self.quick_settings_rect(output_width).contains(pos) {
             Some(ROLE_QUICK_SETTINGS)
         } else if self.date_menu_rect(output_width).contains(pos) {
             Some(ROLE_DATE_MENU)
@@ -544,9 +567,9 @@ impl Panel {
         elements: &mut Vec<TextureRenderElement<VkTexture>>,
         icons: &IconCache,
     ) {
-        let rect = self.quick_settings_rect(output_width, self.toggles);
+        let rect = self.quick_settings_rect(output_width);
         let mut x = rect.loc.x + INDICATOR_H_PADDING;
-        for candidates in qs_indicator_icons(self.toggles) {
+        for candidates in qs_indicator_icons(self.toggles, &self.system_status) {
             // Resolve the first candidate that rasterizes, then cache its upload.
             let Some((name, buffer)) = candidates.iter().find_map(|name| {
                 icons
@@ -857,6 +880,49 @@ mod tests {
                 }
             ),
             None
+        );
+    }
+
+    /// The right-box indicator shows the live network+battery cluster when it has
+    /// status, and falls back to the single anchor icon when empty (so it's always
+    /// present/clickable). The populated cluster is wider.
+    #[test]
+    fn qs_indicator_cluster_or_anchor_fallback() {
+        use crate::system_status::{BatteryStatus, NetworkStatus, SystemStatus};
+
+        let toggles = QuickToggles::default();
+
+        // Empty status → the single anchor fallback.
+        let empty = SystemStatus::default();
+        let icons = qs_indicator_icons(toggles, &empty);
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0][0], QS_ANCHOR_ICONS[0]);
+
+        // Wired + battery → network then battery, no anchor.
+        let status = SystemStatus {
+            network: NetworkStatus::Wired,
+            battery: Some(BatteryStatus {
+                icon_name: "battery-level-90-symbolic".to_string(),
+                percentage: 90.,
+            }),
+        };
+        let icons = qs_indicator_icons(toggles, &status);
+        assert_eq!(icons.len(), 2);
+        assert_eq!(icons[0][0], "network-wired-symbolic");
+        assert_eq!(icons[1][0], "battery-level-90-symbolic");
+        assert!(
+            !icons.iter().any(|c| c[0] == QS_ANCHOR_ICONS[0]),
+            "no anchor icon once the cluster is populated"
+        );
+
+        // The populated cluster is wider than the anchor fallback.
+        let base = Panel::new().quick_settings_rect(1920.).size.w;
+        let mut panel = Panel::new();
+        panel.set_system_status(status);
+        let wide = panel.quick_settings_rect(1920.).size.w;
+        assert!(
+            wide > base,
+            "the cluster ({wide}) should be wider than the anchor fallback ({base})"
         );
     }
 
