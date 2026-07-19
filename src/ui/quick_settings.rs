@@ -280,11 +280,14 @@ fn network_index() -> usize {
 
 /// The menu-local layout context: everything the pure geometry functions need to place elements,
 /// including the vertical shift a below-the-owner-row detail view imposes. Threaded through every
-/// geometry fn so hit-testing and rendering share one source of truth for the shift.
+/// geometry fn so hit-testing and rendering share one source of truth for the shift — and, via
+/// `network`, the same detail-row *set* the renderer draws (so row geometry can't diverge from what
+/// it hit-tests once rows become state-dependent, e.g. the Q6 Wi-Fi list).
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     has_slider: bool,
     expanded: Option<DetailOwner>,
+    network: NetworkStatus,
 }
 
 impl Layout {
@@ -481,13 +484,17 @@ impl SysButton {
 
     /// What clicking this button does (for the buttons that act immediately). Screenshot opens the
     /// interactive UI (like gnome-shell's `Main.screenshotUI.open`); Settings opens control-center;
-    /// Lock asks logind to lock. Power is handled separately (it opens the session submenu).
+    /// Lock asks logind to lock. Power has a [`detail_owner`](Self::detail_owner) and must be
+    /// routed through it (the session submenu), never here — calling `action()` on it would
+    /// reintroduce the one-click-no-confirm power-off this menu deliberately removed.
     fn action(self) -> PopoverAction {
         let words: &[&str] = match self {
             SysButton::Screenshot => return PopoverAction::Screenshot,
             SysButton::Settings => &["gnome-control-center"],
             SysButton::Lock => &["loginctl", "lock-session"],
-            SysButton::Power => &["gnome-session-quit", "--power-off"],
+            SysButton::Power => {
+                unreachable!("the power button opens its submenu via detail_owner(), not action()")
+            }
         };
         PopoverAction::Spawn(words.iter().map(|s| s.to_string()).collect())
     }
@@ -563,6 +570,7 @@ impl QuickSettings {
         Layout {
             has_slider: self.audio.is_some(),
             expanded: self.expanded,
+            network: self.network,
         }
     }
 
@@ -1316,7 +1324,19 @@ fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
 fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let card = detail_rect(layout)?;
-    let rows = owner.rows(NetworkStatus::Unknown);
+    // Walk the SAME rows the renderer/hit-test build (keyed on the live state), so the geometry
+    // can't drift from what's drawn once rows become state-dependent. The card height comes from
+    // the static `row_count()`; assert they stay in lockstep (else the card mis-sizes / rows fall
+    // outside it) — the one thing to update together when a consumer's row set grows.
+    let rows = owner.rows(layout.network);
+    debug_assert_eq!(
+        (
+            rows.len(),
+            rows.iter().filter(|r| r.separator_before).count()
+        ),
+        owner.row_count(),
+        "detail row_count() must match rows() for correct card sizing"
+    );
     if k >= rows.len() {
         return None;
     }
@@ -1433,6 +1453,7 @@ mod tests {
         Layout {
             has_slider,
             expanded: None,
+            network: NetworkStatus::Wired,
         }
     }
 
@@ -1716,10 +1737,12 @@ mod tests {
         let collapsed = Layout {
             has_slider: false,
             expanded: None,
+            network: NetworkStatus::Wired,
         };
         let expanded = Layout {
             has_slider: false,
             expanded: Some(DetailOwner::Network),
+            network: NetworkStatus::Wired,
         };
         assert!(
             menu_h(expanded) > menu_h(collapsed),
@@ -1806,6 +1829,7 @@ mod tests {
                 let l = Layout {
                     has_slider,
                     expanded: Some(owner),
+                    network: NetworkStatus::Wired,
                 };
                 assert!(
                     menu_h(l) < 600.,
@@ -1865,10 +1889,12 @@ mod tests {
         let collapsed = Layout {
             has_slider: true,
             expanded: None,
+            network: NetworkStatus::Wired,
         };
         let expanded = Layout {
             has_slider: true,
             expanded: Some(DetailOwner::Power),
+            network: NetworkStatus::Wired,
         };
         let block = DETAIL_MARGIN + DetailOwner::Power.detail_height();
         assert_eq!(
