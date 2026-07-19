@@ -174,6 +174,19 @@ struct DetailRow {
 enum DetailOwner {
     /// The Network grid tile's detail view (its expand-arrow half).
     Network,
+    /// The system-row power button's session submenu (gnome-shell's `ShutdownItem`, itself a
+    /// `hasMenu` item sharing this same detail-view mechanism).
+    Power,
+}
+
+/// A spawn `DetailRow` from a command's words.
+fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
+    DetailRow {
+        label: label.to_string(),
+        icons: Vec::new(),
+        action: PopoverAction::Spawn(cmd.iter().map(|s| s.to_string()).collect()),
+        separator_before,
+    }
 }
 
 impl DetailOwner {
@@ -182,6 +195,11 @@ impl DetailOwner {
     fn header(self, network: NetworkStatus) -> (Vec<String>, String) {
         match self {
             DetailOwner::Network => (network_icons(network), network_label(network).to_string()),
+            // gnome-shell's `ShutdownItem` menu header (`status/system.js`).
+            DetailOwner::Power => (
+                vec!["system-shutdown-symbolic".to_string()],
+                "Power Off".to_string(),
+            ),
         }
     }
 
@@ -201,6 +219,17 @@ impl DetailOwner {
                 ),
                 separator_before: false,
             }],
+            // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
+            // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
+            // ones that go through a confirmation dialog; Suspend acts immediately. Restart / Power
+            // Off / Log Out drive our own gnome-session handshake (EndSessionDialog); Suspend goes
+            // straight to logind via systemctl. Switch User is deferred (needs a greeter jump).
+            DetailOwner::Power => vec![
+                spawn_row("Suspend", &["systemctl", "suspend"], false),
+                spawn_row("Restart…", &["gnome-session-quit", "--reboot"], false),
+                spawn_row("Power Off…", &["gnome-session-quit", "--power-off"], false),
+                spawn_row("Log Out…", &["gnome-session-quit", "--logout"], true),
+            ],
         }
     }
 
@@ -209,6 +238,7 @@ impl DetailOwner {
     fn row_count(self) -> (usize, usize) {
         match self {
             DetailOwner::Network => (1, 0),
+            DetailOwner::Power => (4, 1),
         }
     }
 
@@ -233,6 +263,9 @@ impl DetailOwner {
                 let row = (network_index() / COLS) as f64;
                 grid_top(has_slider) + (row + 1.) * TILE_H + row * TILE_GAP
             }
+            // The power button lives in the top system row, so its detail pins right below it —
+            // above the slider and the whole grid, which shift down.
+            DetailOwner::Power => PAD + SYS_H,
         }
     }
 }
@@ -436,10 +469,19 @@ impl SysButton {
         }
     }
 
-    /// What clicking this button does. Screenshot opens the interactive UI (like
-    /// gnome-shell's `Main.screenshotUI.open`); the rest spawn the canonical
-    /// command: Settings opens control-center, Lock asks logind to lock, Power
-    /// asks gnome-session to begin the power-off flow (our own EndSessionDialog).
+    /// The detail view this button opens instead of acting immediately, if any. gnome-shell's
+    /// power button is a `hasMenu` `ShutdownItem`: it opens the session submenu rather than
+    /// powering off directly (which is what our button used to do).
+    fn detail_owner(self) -> Option<DetailOwner> {
+        match self {
+            SysButton::Power => Some(DetailOwner::Power),
+            _ => None,
+        }
+    }
+
+    /// What clicking this button does (for the buttons that act immediately). Screenshot opens the
+    /// interactive UI (like gnome-shell's `Main.screenshotUI.open`); Settings opens control-center;
+    /// Lock asks logind to lock. Power is handled separately (it opens the session submenu).
     fn action(self) -> PopoverAction {
         let words: &[&str] = match self {
             SysButton::Screenshot => return PopoverAction::Screenshot,
@@ -589,6 +631,17 @@ impl QuickSettings {
         }
         for button in SYS_BUTTONS {
             if sys_rect(button, self.has_pill()).contains(pos) {
+                // The power button opens its session submenu (toggle, one detail at a time)
+                // instead of acting; the others run their action immediately.
+                if let Some(owner) = button.detail_owner() {
+                    self.expanded = if self.expanded == Some(owner) {
+                        None
+                    } else {
+                        Some(owner)
+                    };
+                    self.revision += 1;
+                    return PopoverAction::Consumed;
+                }
                 return button.action();
             }
         }
@@ -1748,16 +1801,94 @@ mod tests {
     /// its bottom edge).
     #[test]
     fn expanded_menu_stays_within_a_sane_height() {
-        for has_slider in [false, true] {
-            let l = Layout {
-                has_slider,
-                expanded: Some(DetailOwner::Network),
-            };
+        for owner in [DetailOwner::Network, DetailOwner::Power] {
+            for has_slider in [false, true] {
+                let l = Layout {
+                    has_slider,
+                    expanded: Some(owner),
+                };
+                assert!(
+                    menu_h(l) < 600.,
+                    "expanded menu unexpectedly tall: {}",
+                    menu_h(l)
+                );
+            }
+        }
+    }
+
+    /// The system-row power button opens a session submenu (gnome-shell's `ShutdownItem`) rather
+    /// than powering off directly; its rows are the session actions, Log Out past a group break.
+    #[test]
+    fn power_button_opens_the_session_submenu() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+        let before = qs.revision;
+        let a = qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        assert!(
+            matches!(a, PopoverAction::Consumed),
+            "opens the menu, not a spawn"
+        );
+        assert_eq!(qs.expanded, Some(DetailOwner::Power));
+        assert!(qs.revision > before);
+
+        let (_, title) = DetailOwner::Power.header(NetworkStatus::Unknown);
+        assert_eq!(title, "Power Off");
+        let rows = DetailOwner::Power.rows(NetworkStatus::Unknown);
+        assert_eq!(rows.len(), 4);
+        assert!(rows[3].separator_before, "Log Out starts the session group");
+
+        // The "Power Off…" row (index 2) spawns the shutdown command.
+        let row = detail_row_rect(2, qs.layout()).expect("the power-off row");
+        match qs.pointer_click(center(row)) {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-session-quit", "--power-off"]),
+            other => panic!("expected the power-off spawn, got {other:?}"),
+        }
+    }
+
+    /// At most one detail view is open: opening a second closes the first (across owners).
+    #[test]
+    fn only_one_detail_view_is_open_at_a_time() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        // The power button is in the top row (never shifted), so it's still hittable; opening it
+        // replaces the Network detail rather than stacking.
+        qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        assert_eq!(qs.expanded, Some(DetailOwner::Power));
+    }
+
+    /// The power detail pins below the system row: the row itself doesn't move, but the slider and
+    /// the whole grid shift down by the card block.
+    #[test]
+    fn power_detail_shifts_slider_and_grid_but_not_the_system_row() {
+        let collapsed = Layout {
+            has_slider: true,
+            expanded: None,
+        };
+        let expanded = Layout {
+            has_slider: true,
+            expanded: Some(DetailOwner::Power),
+        };
+        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height();
+        assert_eq!(
+            sys_rect(SysButton::Power, false).loc.y,
+            PAD,
+            "system row must not move"
+        );
+        let ds = slider_row_rect(expanded).loc.y - slider_row_rect(collapsed).loc.y;
+        assert!(
+            (ds - block).abs() < 0.01,
+            "the slider must shift by the block, got {ds}"
+        );
+        for i in 0..GRID.len() {
+            let d = tile_rect(i, expanded).loc.y - tile_rect(i, collapsed).loc.y;
             assert!(
-                menu_h(l) < 600.,
-                "expanded menu unexpectedly tall: {}",
-                menu_h(l)
+                (d - block).abs() < 0.01,
+                "tile {i} must shift by the block, got {d}"
             );
         }
+        let card = detail_rect(expanded).unwrap();
+        assert!((card.loc.y - (PAD + SYS_H + DETAIL_MARGIN)).abs() < 0.01);
     }
 }
