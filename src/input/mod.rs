@@ -911,10 +911,42 @@ impl State {
                     pw.set_default_sink(&name);
                 }
             }
+            #[cfg(feature = "pipewire")]
+            PopoverAction::SetInputVolume(volume) => {
+                if let Some(status) = self
+                    .niri
+                    .pw_audio
+                    .as_ref()
+                    .and_then(|pw| pw.set_input_volume(volume))
+                {
+                    self.on_mic_status(status);
+                }
+            }
+            #[cfg(feature = "pipewire")]
+            PopoverAction::ToggleInputMute => {
+                if let Some(status) = self
+                    .niri
+                    .pw_audio
+                    .as_ref()
+                    .and_then(|pw| pw.toggle_input_muted())
+                {
+                    self.on_mic_status(status);
+                }
+            }
+            // Fire-and-forget, like SetDefaultSink.
+            #[cfg(feature = "pipewire")]
+            PopoverAction::SetDefaultSource(name) => {
+                if let Some(pw) = self.niri.pw_audio.as_ref() {
+                    pw.set_default_source(&name);
+                }
+            }
             #[cfg(not(feature = "pipewire"))]
             PopoverAction::SetVolume(_)
             | PopoverAction::ToggleMute
-            | PopoverAction::SetDefaultSink(_) => {}
+            | PopoverAction::SetDefaultSink(_)
+            | PopoverAction::SetInputVolume(_)
+            | PopoverAction::ToggleInputMute
+            | PopoverAction::SetDefaultSource(_) => {}
         }
     }
 
@@ -3287,9 +3319,19 @@ impl State {
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
+                                let mic = self.niri.mic;
+                                let source_list = self.niri.source_list.clone();
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri.panel_popover.toggle_quick_settings(
-                                    output, anchor, toggles, network, battery, audio, sink_list,
+                                    output,
+                                    anchor,
+                                    toggles,
+                                    network,
+                                    battery,
+                                    audio,
+                                    sink_list,
+                                    mic,
+                                    source_list,
                                     accent,
                                 );
                                 self.niri.suppressed_buttons.insert(button_code);

@@ -39,7 +39,7 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
-use crate::audio::{AudioStatus, SinkList};
+use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
 use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
@@ -186,13 +186,66 @@ enum DetailOwner {
     Power,
     /// The volume slider's output-device picker (gnome-shell's `OutputStreamSlider` device menu).
     Output,
+    /// The mic slider's input-device picker (gnome-shell's `InputStreamSlider` device menu).
+    Input,
 }
 
-/// The most output sink rows the picker renders (Fable): the card grows with the sink count and the
+/// The most device rows a picker renders (Fable): the card grows with the device count and the
 /// popover has no scrolling, so cap the list to keep the trailing "Sound Settings" row on-screen.
-/// Beyond this the extra sinks are dropped (a rare config — many null-sinks or a big HDMI/BT
-/// fleet).
-const MAX_SINK_ROWS: usize = 6;
+/// Beyond this the extra devices are dropped (a rare config — many null-sinks or a big HDMI/BT
+/// fleet). Shared by the output (sink) and input (source) pickers.
+const MAX_DEVICE_ROWS: usize = 6;
+
+/// One of the two stacked volume sliders. gnome-shell adds the output slider then the input
+/// (microphone) slider as consecutive quick-settings items, so the mic stacks directly below the
+/// output slider, above the tile grid (`volume.js` `InputIndicator` push order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slider {
+    Output,
+    Mic,
+}
+
+impl Slider {
+    /// The detail picker this slider's arrow opens.
+    fn owner(self) -> DetailOwner {
+        match self {
+            Slider::Output => DetailOwner::Output,
+            Slider::Mic => DetailOwner::Input,
+        }
+    }
+}
+
+/// Which slider rows are present, so the pure geometry can place both. The output slider shows when
+/// a sink is bound (`audio.is_some()`); the mic slider only while recording with a bound source
+/// (gnome-shell's `_shouldBeVisible = stream != null && recording`, `volume.js:429`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sliders {
+    output: bool,
+    mic: bool,
+}
+
+impl Sliders {
+    /// Count of present slider rows (0, 1, or 2).
+    fn count(self) -> usize {
+        self.output as usize + self.mic as usize
+    }
+
+    fn present(self, sl: Slider) -> bool {
+        match sl {
+            Slider::Output => self.output,
+            Slider::Mic => self.mic,
+        }
+    }
+
+    /// This slider's vertical slot among the present sliders, top-down: Output is always slot 0;
+    /// Mic follows the output slider (slot 1) when present, else takes slot 0.
+    fn slot(self, sl: Slider) -> usize {
+        match sl {
+            Slider::Output => 0,
+            Slider::Mic => self.output as usize,
+        }
+    }
+}
 
 /// A spawn `DetailRow` from a command's words.
 fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
@@ -221,11 +274,21 @@ impl DetailOwner {
                 vec!["audio-headphones-symbolic".to_string()],
                 "Sound Output".to_string(),
             ),
+            // gnome-shell's input slider header (`volume.js:391`).
+            DetailOwner::Input => (
+                vec!["audio-input-microphone-symbolic".to_string()],
+                "Sound Input".to_string(),
+            ),
         }
     }
 
     /// The action rows, top to bottom, given the live state.
-    fn rows(self, network: NetworkStatus, sink_list: &SinkList) -> Vec<DetailRow> {
+    fn rows(
+        self,
+        network: NetworkStatus,
+        sink_list: &SinkList,
+        source_list: &SourceList,
+    ) -> Vec<DetailRow> {
         match self {
             // v1 Network detail: a single entry point to the full settings (the in-menu
             // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
@@ -262,7 +325,7 @@ impl DetailOwner {
                 let mut rows: Vec<DetailRow> = sink_list
                     .sinks
                     .iter()
-                    .take(MAX_SINK_ROWS)
+                    .take(MAX_DEVICE_ROWS)
                     .map(|sink| DetailRow {
                         label: sink.description.clone(),
                         icons: Vec::new(),
@@ -278,19 +341,41 @@ impl DetailOwner {
                 ));
                 rows
             }
+            // The input mirror of Output: one row per source, then "Sound Settings".
+            DetailOwner::Input => {
+                let mut rows: Vec<DetailRow> = source_list
+                    .sources
+                    .iter()
+                    .take(MAX_DEVICE_ROWS)
+                    .map(|source| DetailRow {
+                        label: source.description.clone(),
+                        icons: Vec::new(),
+                        action: PopoverAction::SetDefaultSource(source.name.clone()),
+                        separator_before: false,
+                        selected: source_list.default_name.as_deref() == Some(source.name.as_str()),
+                    })
+                    .collect();
+                rows.push(spawn_row(
+                    "Sound Settings",
+                    &["gnome-control-center", "sound"],
+                    true,
+                ));
+                rows
+            }
         }
     }
 
     /// The per-row `separator_before` flags, top to bottom — the card's row *shape*, derived purely
-    /// from the sink count (no label/state), so the geometry can size the card without building
+    /// from the device count (no label/state), so the geometry can size the card without building
     /// rows. MUST match `rows()`'s length + separators (a debug_assert checks it at the draw/hit
-    /// sites). `sink_count` is ignored by the fixed owners.
-    fn row_shape(self, sink_count: usize) -> Vec<bool> {
+    /// sites). `device_count` is ignored by the fixed owners; it's the sink count for Output, the
+    /// source count for Input.
+    fn row_shape(self, device_count: usize) -> Vec<bool> {
         match self {
             DetailOwner::Network => vec![false],
             DetailOwner::Power => vec![false, false, false, true],
-            DetailOwner::Output => {
-                let mut shape = vec![false; sink_count.min(MAX_SINK_ROWS)];
+            DetailOwner::Output | DetailOwner::Input => {
+                let mut shape = vec![false; device_count.min(MAX_DEVICE_ROWS)];
                 shape.push(true); // the "Sound Settings" row, past a separator
                 shape
             }
@@ -298,8 +383,8 @@ impl DetailOwner {
     }
 
     /// The card's logical height: top pad + header + gap + rows + separators + bottom pad.
-    fn detail_height(self, sink_count: usize) -> f64 {
-        let shape = self.row_shape(sink_count);
+    fn detail_height(self, device_count: usize) -> f64 {
+        let shape = self.row_shape(device_count);
         let rows = shape.len() as f64;
         let seps = shape.iter().filter(|&&s| s).count() as f64;
         DETAIL_PAD
@@ -313,18 +398,20 @@ impl DetailOwner {
 
     /// The natural (pre-shift) y of the bottom edge of the owner's row — where the detail card is
     /// pinned directly below (gnome-shell binds the menu container's Y to the source actor).
-    fn anchor_row_bottom(self, has_slider: bool) -> f64 {
+    fn anchor_row_bottom(self, sliders: Sliders) -> f64 {
         match self {
             DetailOwner::Network => {
                 let row = (network_index() / COLS) as f64;
-                grid_top(has_slider) + (row + 1.) * TILE_H + row * TILE_GAP
+                grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
             }
             // The power button lives in the top system row, so its detail pins right below it —
-            // above the slider and the whole grid, which shift down.
+            // above the sliders and the whole grid, which shift down.
             DetailOwner::Power => PAD + SYS_H,
-            // The output picker pins below the volume slider row (which only exists with a sink —
-            // `normalize_expanded` guarantees Output is open only then).
-            DetailOwner::Output => PAD + SYS_H + TILE_GAP + SLIDER_H,
+            // The picker pins below its slider's row (each picker is open only while its slider
+            // exists — `normalize_expanded` guarantees it). Derived from the slider's slot so the
+            // Input anchor is right whether or not the output slider is present.
+            DetailOwner::Output => slider_row_y(Slider::Output, sliders) + SLIDER_H,
+            DetailOwner::Input => slider_row_y(Slider::Mic, sliders) + SLIDER_H,
         }
     }
 }
@@ -344,22 +431,51 @@ fn network_index() -> usize {
 /// the renderer draws.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
-    has_slider: bool,
+    sliders: Sliders,
     expanded: Option<DetailOwner>,
-    /// Number of output sinks — the only state a detail card's *size* depends on (the Output
-    /// picker's row count). Fixed owners ignore it.
+    /// Number of output sinks and input sources — the state a detail card's *size* depends on (the
+    /// picker row counts) and the state each slider's picker arrow is gated on. Fixed owners
+    /// ignore them.
     sink_count: usize,
+    source_count: usize,
+    /// The slider being dragged and the device count frozen at drag start, so a device hot-plug
+    /// mid-drag can't add/remove that slider's picker arrow (which would resize the track and
+    /// remap `volume_from_x`, snapping the level). Scoped to the arrow/track only — the detail
+    /// card still sizes from the live count. `None` when not dragging.
+    drag: Option<(Slider, usize)>,
 }
 
 impl Layout {
+    /// The device count that a slider's picker arrow reflects: the frozen count while this slider
+    /// is being dragged, else the live count (sinks for Output, sources for Mic).
+    fn arrow_count(self, sl: Slider) -> usize {
+        match self.drag {
+            Some((dragged, frozen)) if dragged == sl => frozen,
+            _ => match sl {
+                Slider::Output => self.sink_count,
+                Slider::Mic => self.source_count,
+            },
+        }
+    }
+
+    /// The live device count feeding an owner's detail card (never frozen — the card always sizes
+    /// to the real rows). Fixed owners return 0 (ignored by their `row_shape`).
+    fn owner_device_count(self, owner: DetailOwner) -> usize {
+        match owner {
+            DetailOwner::Output => self.sink_count,
+            DetailOwner::Input => self.source_count,
+            _ => 0,
+        }
+    }
+
     /// The detail card's `(natural insert y, block height)` when a view is open. The block height
     /// is the card plus its top margin — exactly how far the rows below the owner shift down, and
     /// how much taller the menu grows.
     fn detail_block(self) -> Option<(f64, f64)> {
         let owner = self.expanded?;
         Some((
-            owner.anchor_row_bottom(self.has_slider),
-            DETAIL_MARGIN + owner.detail_height(self.sink_count),
+            owner.anchor_row_bottom(self.sliders),
+            DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner)),
         ))
     }
 
@@ -574,17 +690,19 @@ pub struct QuickSettings {
     accent: [f32; 4],
     /// Default-sink state for the volume slider; `None` hides the slider row.
     audio: Option<AudioStatus>,
-    /// The output sinks + current default, for the slider's device picker (empty → no picker
-    /// arrow).
+    /// The output sinks + current default, for the output slider's device picker (empty → no
+    /// picker arrow).
     sink_list: SinkList,
-    /// Whether the volume slider is being dragged (a button is held on it).
-    sliding: bool,
-    /// The sink count frozen at drag start, so the slider track's geometry can't shift mid-drag if
-    /// a sink hot-plugs (which would otherwise make the picker arrow appear/vanish, resize the
-    /// track, and remap `volume_from_x` — snapping the volume under a stationary pointer).
-    /// `Some` only while `sliding`; [`layout`](Self::layout) reads it in place of the live
-    /// count.
-    slide_sink_count: Option<usize>,
+    /// Microphone state (level/mute + recording/source-present visibility) for the mic slider.
+    mic: MicStatus,
+    /// The input sources + current default, for the mic slider's device picker.
+    source_list: SourceList,
+    /// The slider currently being dragged (a button held on its track) and the device count frozen
+    /// at drag start — so a device hot-plug mid-drag can't add/remove that slider's picker arrow,
+    /// resize the track, and remap `volume_from_x` (snapping the level under a stationary
+    /// pointer). `None` when not dragging; [`layout`](Self::layout) threads it into
+    /// `Layout::drag`.
+    sliding: Option<(Slider, usize)>,
     /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
     /// when collapsed. At most one at a time.
     expanded: Option<DetailOwner>,
@@ -601,12 +719,15 @@ struct TextureCache {
 impl QuickSettings {
     /// Open with the current toggle states, network state, and battery; `accent`
     /// straight RGB (e.g. `gnome_settings.accent_color`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         toggles: QuickToggles,
         network: NetworkStatus,
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
+        mic: MicStatus,
+        source_list: SourceList,
         accent: [u8; 3],
     ) -> Self {
         Self {
@@ -615,8 +736,9 @@ impl QuickSettings {
             battery,
             audio,
             sink_list,
-            sliding: false,
-            slide_sink_count: None,
+            mic,
+            source_list,
+            sliding: None,
             expanded: None,
             accent: [
                 f32::from(accent[0]) / 255.,
@@ -637,13 +759,25 @@ impl QuickSettings {
         self.battery.is_some()
     }
 
-    /// The current layout context (slider presence + which detail view is open + sink count), the
-    /// single source of truth every geometry function shares.
+    /// Which slider rows are present: the output slider whenever a sink is bound; the mic slider
+    /// only while recording with a bound source (gnome-shell's `_shouldBeVisible`,
+    /// `volume.js:429`).
+    fn sliders(&self) -> Sliders {
+        Sliders {
+            output: self.audio.is_some(),
+            mic: self.mic.recording && self.mic.source_present,
+        }
+    }
+
+    /// The current layout context (slider presence + which detail view is open + device counts +
+    /// the active drag), the single source of truth every geometry function shares.
     fn layout(&self) -> Layout {
         Layout {
-            has_slider: self.audio.is_some(),
+            sliders: self.sliders(),
             expanded: self.expanded,
-            sink_count: self.slide_sink_count.unwrap_or(self.sink_list.sinks.len()),
+            sink_count: self.sink_list.sinks.len(),
+            source_count: self.source_list.sources.len(),
+            drag: self.sliding,
         }
     }
 
@@ -654,9 +788,15 @@ impl QuickSettings {
     /// row (broken geometry) or strand the user with an open card and no arrow to close it. Returns
     /// whether it collapsed (→ redraw). Network/Power owners always exist, so they're untouched.
     fn normalize_expanded(&mut self) -> bool {
-        if self.expanded == Some(DetailOwner::Output)
-            && (self.audio.is_none() || self.sink_list.sinks.len() <= 1)
-        {
+        let sliders = self.sliders();
+        let invalid = match self.expanded {
+            // Output valid only while its slider exists AND >1 sink (the arrow's gate).
+            Some(DetailOwner::Output) => !sliders.output || self.sink_list.sinks.len() <= 1,
+            // Input the same, off the mic slider + source count.
+            Some(DetailOwner::Input) => !sliders.mic || self.source_list.sources.len() <= 1,
+            _ => false,
+        };
+        if invalid {
             self.expanded = None;
             self.revision += 1;
             return true;
@@ -690,7 +830,7 @@ impl QuickSettings {
         // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
         if let Some(owner) = self.expanded {
             for (k, row) in owner
-                .rows(self.network, &self.sink_list)
+                .rows(self.network, &self.sink_list, &self.source_list)
                 .into_iter()
                 .enumerate()
             {
@@ -758,63 +898,87 @@ impl QuickSettings {
                 return button.action();
             }
         }
-        // The volume slider: the speaker icon toggles mute; the arrow (when >1 sink) toggles the
-        // output-device picker; the track jumps to (and begins dragging toward) the clicked
+        // The volume sliders (output, then mic): the icon toggles mute; the arrow (when >1 device)
+        // toggles the device picker; the track jumps to (and begins dragging toward) the clicked
         // position. The arrow is tested BEFORE the track so an arrow click never starts a drag (the
         // track is genuinely shortened to make room, so `volume_from_x` stays in range).
-        if self.audio.is_some() {
-            if slider_icon_rect(layout).contains(pos) {
-                return PopoverAction::ToggleMute;
+        for slider in [Slider::Output, Slider::Mic] {
+            if !layout.sliders.present(slider) {
+                continue;
             }
-            if slider_arrow_rect(layout).is_some_and(|r| r.contains(pos)) {
-                self.expanded = if self.expanded == Some(DetailOwner::Output) {
+            if slider_icon_rect(slider, layout).contains(pos) {
+                return match slider {
+                    Slider::Output => PopoverAction::ToggleMute,
+                    Slider::Mic => PopoverAction::ToggleInputMute,
+                };
+            }
+            if slider_arrow_rect(slider, layout).is_some_and(|r| r.contains(pos)) {
+                let owner = slider.owner();
+                self.expanded = if self.expanded == Some(owner) {
                     None
                 } else {
-                    Some(DetailOwner::Output)
+                    Some(owner)
                 };
                 self.revision += 1;
                 return PopoverAction::Consumed;
             }
-            if slider_track_rect(layout).contains(pos) {
-                self.sliding = true;
-                self.slide_sink_count = Some(self.sink_list.sinks.len());
-                return self.set_local_volume(volume_from_x(pos.x, layout));
+            if slider_track_rect(slider, layout).contains(pos) {
+                self.sliding = Some((slider, self.device_count(slider)));
+                return self.set_local_volume(slider, volume_from_x(slider, pos.x, layout));
             }
         }
         PopoverAction::Consumed
+    }
+
+    /// The live device count backing a slider's picker (sinks for Output, sources for Mic) — the
+    /// value frozen at drag start.
+    fn device_count(&self, slider: Slider) -> usize {
+        match slider {
+            Slider::Output => self.sink_list.sinks.len(),
+            Slider::Mic => self.source_list.sources.len(),
+        }
     }
 
     /// Continue a slider drag: while a button is held on the track, motion updates
     /// the volume. Returns the action to apply, or `None` when not dragging.
     pub fn pointer_drag(&mut self, pos: Point<f64, Logical>) -> Option<PopoverAction> {
         let layout = self.layout();
-        self.sliding
-            .then(|| self.set_local_volume(volume_from_x(pos.x, layout)))
+        let (slider, _) = self.sliding?;
+        Some(self.set_local_volume(slider, volume_from_x(slider, pos.x, layout)))
     }
 
-    /// End a slider drag (pointer released). Returns whether releasing the frozen sink count
-    /// changed the effective geometry (a sink hot-plugged mid-drag) — the caller redraws so the
-    /// picker arrow that was suppressed during the drag now appears.
+    /// End a slider drag (pointer released). Returns whether releasing the frozen device count
+    /// changed the dragged slider's arrow geometry (a device hot-plugged mid-drag) — the caller
+    /// redraws so the picker arrow that was suppressed during the drag now appears.
     pub fn end_drag(&mut self) -> bool {
-        self.sliding = false;
-        let unfrozen = self.slide_sink_count.take();
-        unfrozen.is_some_and(|frozen| frozen != self.sink_list.sinks.len())
+        let Some((slider, frozen)) = self.sliding.take() else {
+            return false;
+        };
+        frozen != self.device_count(slider)
     }
 
-    /// Optimistically move the slider locally (so the handle tracks the pointer
-    /// before the PipeWire echo lands) and emit the volume action.
-    fn set_local_volume(&mut self, volume: f64) -> PopoverAction {
-        if let Some(audio) = self.audio.as_mut() {
-            audio.volume = volume;
-        }
+    /// Optimistically move a slider locally (so the handle tracks the pointer before the PipeWire
+    /// echo lands) and emit the matching volume action.
+    fn set_local_volume(&mut self, slider: Slider, volume: f64) -> PopoverAction {
         self.revision += 1;
-        PopoverAction::SetVolume(volume)
+        match slider {
+            Slider::Output => {
+                if let Some(audio) = self.audio.as_mut() {
+                    audio.volume = volume;
+                }
+                PopoverAction::SetVolume(volume)
+            }
+            Slider::Mic => {
+                self.mic.volume = volume;
+                PopoverAction::SetInputVolume(volume)
+            }
+        }
     }
 
-    /// Adopt a fresh sink state (from the PipeWire watcher). Ignored mid-drag so the
-    /// lagging echo doesn't yank the handle. Returns whether it changed.
+    /// Adopt a fresh sink state (from the PipeWire watcher). Ignored while dragging the OUTPUT
+    /// slider so the lagging echo doesn't yank the handle. Returns whether it changed.
     pub fn set_audio(&mut self, audio: Option<AudioStatus>) -> bool {
-        if self.sliding || audio == self.audio {
+        if matches!(self.sliding, Some((Slider::Output, _))) || audio == self.audio {
             return false;
         }
         self.audio = audio;
@@ -823,6 +987,42 @@ impl QuickSettings {
         // pins below a slider row that's no longer there.
         self.normalize_expanded();
         true
+    }
+
+    /// Adopt a fresh mic snapshot (from the PipeWire watcher). While the mic slider is being
+    /// dragged, the live level/mute is ignored (the optimistic drag value wins, like `set_audio`) —
+    /// but a *visibility* change (recording or the source stopping) is always honored:
+    /// `publish_mic` dedups, so a dropped `recording:false` would never be re-sent and the
+    /// slider (and any open input picker) would linger forever, emitting volume at a gone
+    /// source. Returns whether it changed.
+    pub fn set_mic(&mut self, mic: MicStatus) -> bool {
+        if mic == self.mic {
+            return false;
+        }
+        if matches!(self.sliding, Some((Slider::Mic, _))) {
+            if mic.recording && mic.source_present {
+                // Still visible: keep the optimistic level/mute, don't move the slider mid-drag.
+                return false;
+            }
+            // The mic slider is vanishing under the drag: cancel it before it hides.
+            self.sliding = None;
+        }
+        self.mic = mic;
+        self.revision += 1;
+        // The mic slider vanishing must also close an open input picker.
+        self.normalize_expanded();
+        true
+    }
+
+    /// Adopt a fresh input-source list (from the PipeWire watcher). Returns whether it changed.
+    pub fn set_source_list(&mut self, source_list: SourceList) -> bool {
+        let mut changed = self.source_list != source_list;
+        if changed {
+            self.source_list = source_list;
+            self.revision += 1;
+        }
+        changed |= self.normalize_expanded();
+        changed
     }
 
     fn set_tile(&mut self, tile: Tile, on: bool) {
@@ -913,7 +1113,7 @@ impl QuickSettings {
                     elements.push(el);
                 }
                 for (k, row) in owner
-                    .rows(self.network, &self.sink_list)
+                    .rows(self.network, &self.sink_list, &self.source_list)
                     .into_iter()
                     .enumerate()
                 {
@@ -995,12 +1195,20 @@ impl QuickSettings {
             }
         }
 
-        // The volume slider's mute/level speaker icon, in its disc.
-        if let Some(audio) = self.audio {
-            let disc = slider_icon_rect(layout);
+        // Each present slider's mute/level icon (speaker for output, mic for input) in its disc,
+        // plus its device-picker arrow at the right (when >1 device).
+        for slider in [Slider::Output, Slider::Mic] {
+            if !layout.sliders.present(slider) {
+                continue;
+            }
+            let disc = slider_icon_rect(slider, layout);
             let center =
                 Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
-            let name = crate::audio::volume_icon(&audio).to_string();
+            let name = match slider {
+                Slider::Output => crate::audio::volume_icon(&self.audio.unwrap_or_default()),
+                Slider::Mic => crate::audio::mic_volume_icon(&self.mic),
+            }
+            .to_string();
             if let Some(el) = icon_element(
                 renderer,
                 icons,
@@ -1013,8 +1221,7 @@ impl QuickSettings {
             ) {
                 elements.push(el);
             }
-            // The device-picker arrow at the right of the slider row (when >1 sink).
-            if let Some(arrow) = slider_arrow_rect(layout) {
+            if let Some(arrow) = slider_arrow_rect(slider, layout) {
                 let center = Point::from((
                     arrow.loc.x + arrow.size.w / 2.,
                     arrow.loc.y + arrow.size.h / 2.,
@@ -1138,12 +1345,12 @@ impl QuickSettings {
             .map(|owner| -> anyhow::Result<_> {
                 let (_, title) = owner.header(self.network);
                 let title_run = renderer.build_glyph_run_weighted(&title, detail_title_px, true)?;
-                let rows = owner.rows(self.network, &self.sink_list);
+                let rows = owner.rows(self.network, &self.sink_list, &self.source_list);
                 // The card is sized from the pure `row_shape`; assert the live rows match it (count
                 // + separator positions) so the geometry can't drift from what's drawn here.
                 debug_assert_eq!(
                     rows.iter().map(|r| r.separator_before).collect::<Vec<_>>(),
-                    owner.row_shape(self.sink_list.sinks.len()),
+                    owner.row_shape(self.layout().owner_device_count(owner)),
                     "rows() must match row_shape() for correct card sizing"
                 );
                 let row_runs = rows
@@ -1262,11 +1469,21 @@ impl QuickSettings {
                 )?;
             }
 
-            // The volume slider: mute-button disc, the trough, its accent-filled
-            // portion, and the round handle (`.quick-slider` + `_slider.scss`). The
-            // speaker icon composites on top afterwards.
-            if let Some(audio) = self.audio {
-                let disc = slider_icon_rect(layout);
+            // Each present slider: mute-button disc, the trough, its accent-filled portion, and the
+            // round handle (`.quick-slider` + `_slider.scss`). The level icon composites on top
+            // afterwards. Output and mic share the geometry; only the level/mute source differs.
+            for slider in [Slider::Output, Slider::Mic] {
+                if !layout.sliders.present(slider) {
+                    continue;
+                }
+                let (volume, muted) = match slider {
+                    Slider::Output => {
+                        let a = self.audio.unwrap_or_default();
+                        (a.volume, a.muted)
+                    }
+                    Slider::Mic => (self.mic.volume, self.mic.muted),
+                };
+                let disc = slider_icon_rect(slider, layout);
                 frame.render_rounded_rect(
                     TILE_OFF,
                     (SLIDER_H / 2. * scale) as f32,
@@ -1274,7 +1491,7 @@ impl QuickSettings {
                     &[full],
                 )?;
 
-                let track = slider_track_rect(layout);
+                let track = slider_track_rect(slider, layout);
                 let cy = track.loc.y + track.size.h / 2.;
                 let trough = Rectangle::new(
                     Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
@@ -1287,12 +1504,8 @@ impl QuickSettings {
                     &[full],
                 )?;
 
-                let handle_cx = slider_handle_x(audio.volume, layout);
-                let fill_color = if audio.muted {
-                    SLIDER_TROUGH_BG
-                } else {
-                    self.accent
-                };
+                let handle_cx = slider_handle_x(slider, volume, layout);
+                let fill_color = if muted { SLIDER_TROUGH_BG } else { self.accent };
                 let fill = Rectangle::new(
                     trough.loc,
                     Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
@@ -1343,7 +1556,7 @@ impl QuickSettings {
                     };
                     let has_icon = self
                         .expanded
-                        .map(|o| o.rows(self.network, &self.sink_list))
+                        .map(|o| o.rows(self.network, &self.sink_list, &self.source_list))
                         .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
                         .unwrap_or(false);
                     let label_x = if has_icon {
@@ -1381,68 +1594,71 @@ fn menu_w() -> f64 {
     PAD * 2. + COLS as f64 * TILE_W + (COLS as f64 - 1.) * TILE_GAP
 }
 
-/// The y of the tile grid's top edge. The grid sits below the system row, and below
-/// the volume slider too when a sink is present (gnome-shell orders the output slider
-/// right under the system item, above the toggle tiles).
-fn grid_top(has_slider: bool) -> f64 {
-    let mut y = PAD + SYS_H + TILE_GAP;
-    if has_slider {
-        y += SLIDER_H + TILE_GAP;
-    }
-    y
+/// The y of the tile grid's top edge. The grid sits below the system row, and below the volume
+/// sliders too when present (gnome-shell orders the output slider then the mic slider right under
+/// the system item, above the toggle tiles).
+fn grid_top(sliders: Sliders) -> f64 {
+    PAD + SYS_H + TILE_GAP + sliders.count() as f64 * (SLIDER_H + TILE_GAP)
 }
 
 /// The y of the grid's bottom edge (grid top + tile rows), before any detail shift.
-fn grid_bottom(has_slider: bool) -> f64 {
+fn grid_bottom(sliders: Sliders) -> f64 {
     let rows = GRID.len().div_ceil(COLS) as f64;
-    grid_top(has_slider) + rows * TILE_H + (rows - 1.) * TILE_GAP
+    grid_top(sliders) + rows * TILE_H + (rows - 1.) * TILE_GAP
 }
 
-/// The menu's logical height: system row, optional volume slider, tile grid, padding — grown by
-/// the open detail view's block (the card plus its top margin) when one is expanded.
+/// The menu's logical height: system row, sliders, tile grid, padding — grown by the open detail
+/// view's block (the card plus its top margin) when one is expanded.
 fn menu_h(layout: Layout) -> f64 {
-    let base = grid_bottom(layout.has_slider) + PAD;
+    let base = grid_bottom(layout.sliders) + PAD;
     base + layout.detail_block().map(|(_, h)| h).unwrap_or(0.)
 }
 
-/// The volume-slider row rectangle (full content width), between the system row and
-/// the tile grid. Shifts down under a detail view whose owner sits above it.
-fn slider_row_rect(layout: Layout) -> Rectangle<f64, Logical> {
-    let y = PAD + SYS_H + TILE_GAP;
+/// The natural (pre-shift) y of a slider's row top, from its vertical slot among the present
+/// sliders. Output takes slot 0 (right under the system row); the mic slider follows it.
+fn slider_row_y(sl: Slider, sliders: Sliders) -> f64 {
+    PAD + SYS_H + TILE_GAP + sliders.slot(sl) as f64 * (SLIDER_H + TILE_GAP)
+}
+
+/// A slider's row rectangle (full content width). Shifts down under a detail view whose owner sits
+/// above it.
+fn slider_row_rect(sl: Slider, layout: Layout) -> Rectangle<f64, Logical> {
+    let y = slider_row_y(sl, layout.sliders);
     Rectangle::new(
         Point::from((PAD, y + layout.shift_below(y))),
         Size::from((menu_w() - 2. * PAD, SLIDER_H)),
     )
 }
 
-/// The mute-button disc at the left of the slider row.
-fn slider_icon_rect(layout: Layout) -> Rectangle<f64, Logical> {
-    let row = slider_row_rect(layout);
+/// The mute-button disc at the left of a slider row.
+fn slider_icon_rect(sl: Slider, layout: Layout) -> Rectangle<f64, Logical> {
+    let row = slider_row_rect(sl, layout);
     Rectangle::new(row.loc, Size::from((SLIDER_H, SLIDER_H)))
 }
 
-/// The output-device picker's menu-button (`go-next` arrow) at the right end of the slider row —
-/// gnome-shell's `QuickSlider._menuButton`, shown **only when there's more than one sink** to pick
-/// between (`menuEnabled = _deviceItems.size > 1`). `None` otherwise.
-fn slider_arrow_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
-    if layout.sink_count <= 1 {
+/// A slider's device-picker menu-button (`go-next` arrow) at the right end of the row —
+/// gnome-shell's `QuickSlider._menuButton`, shown **only when there's more than one device** to
+/// pick between (`menuEnabled = _deviceItems.size > 1`). Uses the drag-frozen count while this
+/// slider is dragged. `None` otherwise.
+fn slider_arrow_rect(sl: Slider, layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    if layout.arrow_count(sl) <= 1 {
         return None;
     }
-    let row = slider_row_rect(layout);
+    let row = slider_row_rect(sl, layout);
     Some(Rectangle::new(
         Point::from((row.loc.x + row.size.w - ARROW_W, row.loc.y)),
         Size::from((ARROW_W, SLIDER_H)),
     ))
 }
 
-/// The slider's interactive track band (row minus the mute disc, and minus the device-picker arrow
+/// A slider's interactive track band (row minus the mute disc, and minus the device-picker arrow
 /// when shown). The drawn trough is a thin bar centered in this band; the usable handle-center
 /// x-range is inset by half a handle so the handle never overhangs. Genuinely shortened when the
 /// arrow is present, so an arrow click never lands on the track and `volume_from_x` stays in range.
-fn slider_track_rect(layout: Layout) -> Rectangle<f64, Logical> {
-    let row = slider_row_rect(layout);
+fn slider_track_rect(sl: Slider, layout: Layout) -> Rectangle<f64, Logical> {
+    let row = slider_row_rect(sl, layout);
     let x = row.loc.x + SLIDER_H + SYS_GAP;
-    let right = match slider_arrow_rect(layout) {
+    let right = match slider_arrow_rect(sl, layout) {
         Some(arrow) => arrow.loc.x - SYS_GAP,
         None => row.loc.x + row.size.w,
     };
@@ -1452,17 +1668,17 @@ fn slider_track_rect(layout: Layout) -> Rectangle<f64, Logical> {
     )
 }
 
-/// Perceptual volume `0..=1` for a pointer x on the slider track.
-fn volume_from_x(x: f64, layout: Layout) -> f64 {
-    let track = slider_track_rect(layout);
+/// Perceptual volume `0..=1` for a pointer x on a slider's track.
+fn volume_from_x(sl: Slider, x: f64, layout: Layout) -> f64 {
+    let track = slider_track_rect(sl, layout);
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     ((x - left) / (right - left)).clamp(0.0, 1.0)
 }
 
-/// The x of the handle center for a given perceptual volume.
-fn slider_handle_x(volume: f64, layout: Layout) -> f64 {
-    let track = slider_track_rect(layout);
+/// The x of the handle center for a given perceptual volume on a slider's track.
+fn slider_handle_x(sl: Slider, volume: f64, layout: Layout) -> f64 {
+    let track = slider_track_rect(sl, layout);
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     left + volume.clamp(0.0, 1.0) * (right - left)
@@ -1475,7 +1691,7 @@ fn tile_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
     let row = (i / COLS) as f64;
     let col = (i % COLS) as f64;
     let x = PAD + col * (TILE_W + TILE_GAP);
-    let y = grid_top(layout.has_slider) + row * (TILE_H + TILE_GAP);
+    let y = grid_top(layout.sliders) + row * (TILE_H + TILE_GAP);
     Rectangle::new(
         Point::from((x, y + layout.shift_below(y))),
         Size::from((TILE_W, TILE_H)),
@@ -1510,10 +1726,13 @@ fn tile_body_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
 /// when collapsed.
 fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
-    let insert_y = owner.anchor_row_bottom(layout.has_slider);
+    let insert_y = owner.anchor_row_bottom(layout.sliders);
     Some(Rectangle::new(
         Point::from((PAD, insert_y + DETAIL_MARGIN)),
-        Size::from((menu_w() - 2. * PAD, owner.detail_height(layout.sink_count))),
+        Size::from((
+            menu_w() - 2. * PAD,
+            owner.detail_height(layout.owner_device_count(owner)),
+        )),
     ))
 }
 
@@ -1525,7 +1744,7 @@ fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
 fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let card = detail_rect(layout)?;
-    let shape = owner.row_shape(layout.sink_count);
+    let shape = owner.row_shape(layout.owner_device_count(owner));
     if k >= shape.len() {
         return None;
     }
@@ -1637,12 +1856,18 @@ mod tests {
         Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
     }
 
-    /// A collapsed layout (no open detail view) with the given slider presence.
+    /// A collapsed layout (no open detail view) with the given output-slider presence (no mic
+    /// slider, no devices).
     fn lay(has_slider: bool) -> Layout {
         Layout {
-            has_slider,
+            sliders: Sliders {
+                output: has_slider,
+                mic: false,
+            },
             expanded: None,
             sink_count: 0,
+            source_count: 0,
+            drag: None,
         }
     }
 
@@ -1659,6 +1884,8 @@ mod tests {
                 None,
                 audio,
                 SinkList::default(),
+                MicStatus::default(),
+                SourceList::default(),
                 [0, 0, 0],
             )
             .logical_size();
@@ -1682,13 +1909,14 @@ mod tests {
                 }
             }
             if has_slider {
-                within(slider_row_rect(lay(has_slider)), "slider row");
-                within(slider_icon_rect(lay(has_slider)), "slider mute button");
-                within(slider_track_rect(lay(has_slider)), "slider track");
+                let o = Slider::Output;
+                within(slider_row_rect(o, lay(has_slider)), "slider row");
+                within(slider_icon_rect(o, lay(has_slider)), "slider mute button");
+                within(slider_track_rect(o, lay(has_slider)), "slider track");
                 // The slider sits above the tile grid.
                 assert!(
-                    slider_row_rect(lay(has_slider)).loc.y
-                        + slider_row_rect(lay(has_slider)).size.h
+                    slider_row_rect(o, lay(has_slider)).loc.y
+                        + slider_row_rect(o, lay(has_slider)).size.h
                         <= tile_rect(0, lay(has_slider)).loc.y + 0.01,
                     "slider must be above the first tile row"
                 );
@@ -1705,6 +1933,8 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         );
         let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
@@ -1730,6 +1960,8 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         );
         let before = qs.revision;
@@ -1752,6 +1984,8 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         );
 
@@ -1777,6 +2011,8 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         );
         let pill = pill_rect(true).expect("a battery must show the pill");
@@ -1800,6 +2036,8 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         );
         // Below the top system row, between the two tile columns.
@@ -1832,6 +2070,8 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0xff, 0x00, 0x00],
         );
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
@@ -1893,6 +2133,8 @@ mod tests {
             None,
             audio,
             SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
             [0, 0, 0],
         )
     }
@@ -1916,6 +2158,195 @@ mod tests {
         let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
         q.sink_list = make_sinks(n);
         q
+    }
+
+    /// `n` input sources with `source0` the default.
+    fn make_sources(n: usize) -> SourceList {
+        SourceList {
+            sources: (0..n)
+                .map(|i| crate::audio::SourceInfo {
+                    name: format!("source{i}"),
+                    description: format!("Source {i}"),
+                })
+                .collect(),
+            default_name: (n > 0).then(|| "source0".to_string()),
+        }
+    }
+
+    /// A recording mic with a bound source at half volume — the mic slider is visible.
+    fn recording_mic() -> MicStatus {
+        MicStatus {
+            recording: true,
+            muted: false,
+            volume: 0.5,
+            source_present: true,
+        }
+    }
+
+    /// A menu with BOTH sliders live (one output sink + a recording mic) and `n` input sources.
+    fn qs_with_sources(n: usize) -> QuickSettings {
+        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        q.mic = recording_mic();
+        q.source_list = make_sources(n);
+        q
+    }
+
+    /// The mic slider shows only while recording with a bound source (gnome-shell's
+    /// `stream != null && recording`); it stacks directly below the output slider, above the grid.
+    #[test]
+    fn mic_slider_shows_only_while_recording_with_a_source() {
+        // Recording but no bound source → no mic slider.
+        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        q.mic = MicStatus {
+            recording: true,
+            source_present: false,
+            ..MicStatus::default()
+        };
+        assert!(!q.sliders().mic, "no slider without a bound source");
+        // Bound source but not recording → still no mic slider.
+        q.mic = MicStatus {
+            recording: false,
+            source_present: true,
+            ..MicStatus::default()
+        };
+        assert!(!q.sliders().mic, "no slider when not recording");
+        // Recording + bound source → the mic slider appears, below the output slider.
+        let q = qs_with_sources(1);
+        assert!(q.sliders().mic && q.sliders().output);
+        let out = slider_row_rect(Slider::Output, q.layout());
+        let mic = slider_row_rect(Slider::Mic, q.layout());
+        assert!(
+            (mic.loc.y - (out.loc.y + SLIDER_H + TILE_GAP)).abs() < 0.01,
+            "mic slider must sit one row below the output slider"
+        );
+        assert!(
+            mic.loc.y + mic.size.h <= tile_rect(0, q.layout()).loc.y + 0.01,
+            "mic slider must be above the first tile row"
+        );
+    }
+
+    /// The mic slider's icon toggles the source mute; its track sets the source volume — distinct
+    /// actions from the output slider so the two never cross-wire.
+    #[test]
+    fn mic_slider_icon_and_track_return_input_actions() {
+        let mut q = qs_with_sources(1);
+        let layout = q.layout();
+        assert!(matches!(
+            q.pointer_click(center(slider_icon_rect(Slider::Mic, layout))),
+            PopoverAction::ToggleInputMute
+        ));
+        let track = slider_track_rect(Slider::Mic, layout);
+        match q.pointer_click(center(track)) {
+            PopoverAction::SetInputVolume(v) => assert!((v - 0.5).abs() < 0.05),
+            other => panic!("expected SetInputVolume, got {other:?}"),
+        }
+        // The output slider still returns output actions.
+        assert!(matches!(
+            q.pointer_click(center(slider_icon_rect(Slider::Output, q.layout()))),
+            PopoverAction::ToggleMute
+        ));
+    }
+
+    /// The input picker arrow shows only with >1 source; opening it lists the sources (default
+    /// checked) then "Sound Settings", and a row sets that source default.
+    #[test]
+    fn input_picker_lists_sources_and_routes_actions() {
+        assert!(slider_arrow_rect(Slider::Mic, qs_with_sources(1).layout()).is_none());
+        let mut q = qs_with_sources(3); // default = source0
+        let arrow = slider_arrow_rect(Slider::Mic, q.layout()).expect("arrow with >1 source");
+        assert!(matches!(
+            q.pointer_click(center(arrow)),
+            PopoverAction::Consumed
+        ));
+        assert_eq!(q.expanded, Some(DetailOwner::Input));
+
+        let rows = DetailOwner::Input.rows(q.network, &q.sink_list, &q.source_list);
+        assert_eq!(rows.len(), 4, "3 sources + Sound Settings");
+        assert!(rows[0].selected && !rows[1].selected);
+        assert_eq!(rows[3].label, "Sound Settings");
+        match q.pointer_click(center(detail_row_rect(1, q.layout()).unwrap())) {
+            PopoverAction::SetDefaultSource(name) => assert_eq!(name, "source1"),
+            other => panic!("expected SetDefaultSource, got {other:?}"),
+        }
+    }
+
+    /// The input picker's card pins below the mic slider row (which is itself below the output
+    /// slider), and opening it while the output picker is open replaces it (one detail at a time).
+    #[test]
+    fn input_picker_anchors_below_the_mic_slider_and_is_exclusive() {
+        let mut q = qs_with_sources(2);
+        q.sink_list = make_sinks(2); // give the output picker an arrow too
+                                     // Open the output picker first.
+        let out_arrow = slider_arrow_rect(Slider::Output, q.layout()).unwrap();
+        q.pointer_click(center(out_arrow));
+        assert_eq!(q.expanded, Some(DetailOwner::Output));
+        // Opening the input picker replaces it.
+        let mic_arrow = slider_arrow_rect(Slider::Mic, q.layout()).unwrap();
+        q.pointer_click(center(mic_arrow));
+        assert_eq!(q.expanded, Some(DetailOwner::Input));
+        // The card sits below the mic slider's row bottom.
+        let mic = slider_row_rect(Slider::Mic, q.layout());
+        let card = detail_rect(q.layout()).unwrap();
+        assert!(card.loc.y >= mic.loc.y + SLIDER_H - 0.01);
+    }
+
+    /// An open input picker collapses when recording stops (its slider vanishes) or sources drop to
+    /// one — the same `normalize_expanded` guard the output picker uses.
+    #[test]
+    fn input_picker_collapses_when_its_owner_vanishes() {
+        let mut q = qs_with_sources(2);
+        q.pointer_click(center(slider_arrow_rect(Slider::Mic, q.layout()).unwrap()));
+        assert_eq!(q.expanded, Some(DetailOwner::Input));
+        // Recording stops → slider (and picker) gone.
+        assert!(q.set_mic(MicStatus::default()));
+        assert!(q.expanded.is_none());
+
+        // And the sources-drop-to-one path.
+        let mut q = qs_with_sources(2);
+        q.pointer_click(center(slider_arrow_rect(Slider::Mic, q.layout()).unwrap()));
+        assert!(q.set_source_list(make_sources(1)));
+        assert!(q.expanded.is_none());
+    }
+
+    /// A source hot-plugging mid-drag must not snap the mic volume (the dragged slider's arrow is
+    /// frozen), and recording stopping mid-drag cancels the drag rather than stranding it.
+    #[test]
+    fn mic_drag_freezes_geometry_and_recording_stop_cancels_it() {
+        let mut q = qs_with_sources(1); // one source → no mic arrow, full-width track
+        let track = slider_track_rect(Slider::Mic, q.layout());
+        let press = Point::from((
+            track.loc.x + track.size.w * 0.5,
+            track.loc.y + track.size.h / 2.,
+        ));
+        q.pointer_click(press);
+        assert!(matches!(q.sliding, Some((Slider::Mic, _))));
+        let held = q.mic.volume;
+
+        // A second source appears mid-drag: the arrow stays suppressed, the level doesn't snap.
+        assert!(q.set_source_list(make_sources(2)));
+        assert!(slider_arrow_rect(Slider::Mic, q.layout()).is_none());
+        assert!(matches!(
+            q.pointer_drag(press).unwrap(),
+            PopoverAction::SetInputVolume(_)
+        ));
+        assert_eq!(
+            q.mic.volume, held,
+            "a stationary pointer must not snap the mic level"
+        );
+        assert!(
+            q.end_drag(),
+            "the mid-drag hotplug needs a redraw on release"
+        );
+
+        // Recording stopping mid-drag cancels the drag (no lingering slider emitting at a gone
+        // src).
+        let mut q = qs_with_sources(1);
+        let track = slider_track_rect(Slider::Mic, q.layout());
+        q.pointer_click(center(track));
+        assert!(q.sliding.is_some());
+        assert!(q.set_mic(MicStatus::default()));
+        assert!(q.sliding.is_none(), "recording stop must cancel the drag");
+        assert!(!q.sliders().mic, "and hide the slider");
     }
 
     /// A menu tile's arrow-half and toggle-body are disjoint hit regions; a plain toggle has no
@@ -1959,14 +2390,24 @@ mod tests {
     #[test]
     fn detail_view_grows_menu_and_shifts_lower_rows_only() {
         let collapsed = Layout {
-            has_slider: false,
+            sliders: Sliders {
+                output: false,
+                mic: false,
+            },
             expanded: None,
             sink_count: 0,
+            source_count: 0,
+            drag: None,
         };
         let expanded = Layout {
-            has_slider: false,
+            sliders: Sliders {
+                output: false,
+                mic: false,
+            },
             expanded: Some(DetailOwner::Network),
             sink_count: 0,
+            source_count: 0,
+            drag: None,
         };
         assert!(
             menu_h(expanded) > menu_h(collapsed),
@@ -2051,9 +2492,14 @@ mod tests {
         for owner in [DetailOwner::Network, DetailOwner::Power] {
             for has_slider in [false, true] {
                 let l = Layout {
-                    has_slider,
+                    sliders: Sliders {
+                        output: has_slider,
+                        mic: false,
+                    },
                     expanded: Some(owner),
                     sink_count: 0,
+                    source_count: 0,
+                    drag: None,
                 };
                 assert!(
                     menu_h(l) < 600.,
@@ -2080,7 +2526,11 @@ mod tests {
 
         let (_, title) = DetailOwner::Power.header(NetworkStatus::Unknown);
         assert_eq!(title, "Power Off");
-        let rows = DetailOwner::Power.rows(NetworkStatus::Unknown, &SinkList::default());
+        let rows = DetailOwner::Power.rows(
+            NetworkStatus::Unknown,
+            &SinkList::default(),
+            &SourceList::default(),
+        );
         assert_eq!(rows.len(), 4);
         assert!(rows[3].separator_before, "Log Out starts the session group");
 
@@ -2111,14 +2561,24 @@ mod tests {
     #[test]
     fn power_detail_shifts_slider_and_grid_but_not_the_system_row() {
         let collapsed = Layout {
-            has_slider: true,
+            sliders: Sliders {
+                output: true,
+                mic: false,
+            },
             expanded: None,
             sink_count: 0,
+            source_count: 0,
+            drag: None,
         };
         let expanded = Layout {
-            has_slider: true,
+            sliders: Sliders {
+                output: true,
+                mic: false,
+            },
             expanded: Some(DetailOwner::Power),
             sink_count: 0,
+            source_count: 0,
+            drag: None,
         };
         let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
         assert_eq!(
@@ -2126,7 +2586,8 @@ mod tests {
             PAD,
             "system row must not move"
         );
-        let ds = slider_row_rect(expanded).loc.y - slider_row_rect(collapsed).loc.y;
+        let ds = slider_row_rect(Slider::Output, expanded).loc.y
+            - slider_row_rect(Slider::Output, collapsed).loc.y;
         assert!(
             (ds - block).abs() < 0.01,
             "the slider must shift by the block, got {ds}"
@@ -2148,24 +2609,24 @@ mod tests {
     fn slider_arrow_appears_only_with_multiple_sinks() {
         for (n, expect) in [(0, false), (1, false), (2, true), (5, true)] {
             assert_eq!(
-                slider_arrow_rect(qs_with_sinks(n).layout()).is_some(),
+                slider_arrow_rect(Slider::Output, qs_with_sinks(n).layout()).is_some(),
                 expect,
                 "n={n}"
             );
         }
         let one = qs_with_sinks(1);
         let two = qs_with_sinks(2);
-        let t1 = slider_track_rect(one.layout());
-        let t2 = slider_track_rect(two.layout());
+        let t1 = slider_track_rect(Slider::Output, one.layout());
+        let t2 = slider_track_rect(Slider::Output, two.layout());
         assert!(
             t2.loc.x + t2.size.w < t1.loc.x + t1.size.w,
             "the track must shrink to make room for the arrow"
         );
         // volume_from_x still maps the full 0..1 within the shortened track.
         let l = two.layout();
-        let track = slider_track_rect(l);
-        assert!(volume_from_x(track.loc.x, l).abs() < 1e-9);
-        assert!((volume_from_x(track.loc.x + track.size.w, l) - 1.0).abs() < 1e-9);
+        let track = slider_track_rect(Slider::Output, l);
+        assert!(volume_from_x(Slider::Output, track.loc.x, l).abs() < 1e-9);
+        assert!((volume_from_x(Slider::Output, track.loc.x + track.size.w, l) - 1.0).abs() < 1e-9);
     }
 
     /// The slider arrow toggles the output picker and never moves the volume; the slider row (its
@@ -2174,7 +2635,9 @@ mod tests {
     fn slider_arrow_toggles_the_picker_without_changing_volume() {
         let mut q = qs_with_sinks(2);
         let before = q.audio.unwrap().volume;
-        let a = q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        let a = q.pointer_click(center(
+            slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
+        ));
         assert!(matches!(a, PopoverAction::Consumed));
         assert_eq!(q.expanded, Some(DetailOwner::Output));
         assert_eq!(
@@ -2182,7 +2645,9 @@ mod tests {
             before,
             "arrow click must not move the volume"
         );
-        let a = q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        let a = q.pointer_click(center(
+            slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
+        ));
         assert!(matches!(a, PopoverAction::Consumed));
         assert!(q.expanded.is_none());
     }
@@ -2195,20 +2660,20 @@ mod tests {
     fn a_sink_hotplug_mid_drag_does_not_snap_the_volume() {
         let mut q = qs_with_sinks(1); // one sink → no arrow, full-width track
                                       // Press mid-track and hold.
-        let track = slider_track_rect(q.layout());
+        let track = slider_track_rect(Slider::Output, q.layout());
         let press = Point::from((
             track.loc.x + track.size.w * 0.5,
             track.loc.y + track.size.h / 2.,
         ));
         q.pointer_click(press);
-        assert!(q.sliding);
+        assert!(q.sliding.is_some());
         let held = q.audio.unwrap().volume;
 
         // A second sink appears while the button is held: the list updates, but the drag geometry
         // stays frozen (no arrow, track unchanged).
         assert!(q.set_sink_list(make_sinks(2)));
         assert!(
-            slider_arrow_rect(q.layout()).is_none(),
+            slider_arrow_rect(Slider::Output, q.layout()).is_none(),
             "the picker arrow must stay suppressed mid-drag"
         );
 
@@ -2227,7 +2692,7 @@ mod tests {
             q.end_drag(),
             "the mid-drag hotplug needs a redraw on release"
         );
-        assert!(slider_arrow_rect(q.layout()).is_some());
+        assert!(slider_arrow_rect(Slider::Output, q.layout()).is_some());
     }
 
     /// The picker lists one row per sink (default checked) then a "Sound Settings" row; a sink row
@@ -2235,8 +2700,10 @@ mod tests {
     #[test]
     fn output_picker_lists_sinks_and_routes_actions() {
         let mut q = qs_with_sinks(3); // default = sink0
-        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list);
+        q.pointer_click(center(
+            slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
+        ));
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list);
         assert_eq!(rows.len(), 4, "3 sinks + Sound Settings");
         assert!(rows[0].selected && !rows[1].selected && !rows[2].selected);
         assert!(rows[3].separator_before && !rows[3].selected);
@@ -2261,9 +2728,13 @@ mod tests {
     /// agree under the cap.
     #[test]
     fn output_picker_caps_the_sink_rows() {
-        let q = qs_with_sinks(MAX_SINK_ROWS + 3);
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list);
-        assert_eq!(rows.len(), MAX_SINK_ROWS + 1, "capped sinks + settings row");
+        let q = qs_with_sinks(MAX_DEVICE_ROWS + 3);
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list);
+        assert_eq!(
+            rows.len(),
+            MAX_DEVICE_ROWS + 1,
+            "capped sinks + settings row"
+        );
         assert_eq!(
             DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
             rows.len()
@@ -2281,12 +2752,12 @@ mod tests {
 
         assert!(menu_h(expanded) > menu_h(collapsed), "the menu must grow");
         assert_eq!(
-            slider_row_rect(expanded).loc.y,
-            slider_row_rect(collapsed).loc.y,
+            slider_row_rect(Slider::Output, expanded).loc.y,
+            slider_row_rect(Slider::Output, collapsed).loc.y,
             "the slider row (owner) must not shift"
         );
         let card = detail_rect(expanded).unwrap();
-        let slider = slider_row_rect(expanded);
+        let slider = slider_row_rect(Slider::Output, expanded);
         assert!(
             card.loc.y >= slider.loc.y + SLIDER_H - 0.01,
             "card sits below the slider"
@@ -2302,13 +2773,17 @@ mod tests {
     #[test]
     fn output_picker_collapses_when_its_owner_vanishes() {
         let mut q = qs_with_sinks(2);
-        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        q.pointer_click(center(
+            slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
+        ));
         assert_eq!(q.expanded, Some(DetailOwner::Output));
         assert!(q.set_sink_list(make_sinks(1)));
         assert!(q.expanded.is_none(), "one sink left → no picker");
 
         let mut q = qs_with_sinks(2);
-        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        q.pointer_click(center(
+            slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
+        ));
         assert_eq!(q.expanded, Some(DetailOwner::Output));
         assert!(q.set_audio(None));
         assert!(q.expanded.is_none(), "slider vanished → no picker");

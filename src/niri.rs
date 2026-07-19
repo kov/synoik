@@ -384,6 +384,9 @@ pub struct Niri {
     /// Output sinks + current default for the QS output-device picker; empty until the PipeWire
     /// watcher reports sinks (also where the backend is absent, e.g. headless).
     pub sink_list: crate::audio::SinkList,
+    /// Input sources + current default for the QS input-device picker; empty until the PipeWire
+    /// watcher reports sources (also where the backend is absent, e.g. headless).
+    pub source_list: crate::audio::SourceList,
     /// The live PipeWire audio connection (feature `audio`); its loop is driven on
     /// the compositor's calloop. `None` when the connection failed or is disabled.
     #[cfg(feature = "pipewire")]
@@ -2515,7 +2518,10 @@ impl State {
     /// panel privacy indicator.
     pub fn on_mic_status(&mut self, mic: crate::audio::MicStatus) {
         self.niri.mic = mic;
-        if self.niri.panel.set_mic(mic) {
+        let mut redraw = self.niri.panel.set_mic(mic);
+        // Keep an open quick-settings mic slider (level/mute/visibility) in sync with live changes.
+        redraw |= self.niri.panel_popover.set_mic(mic);
+        if redraw {
             self.niri.queue_redraw_all();
         }
     }
@@ -2525,6 +2531,15 @@ impl State {
     pub fn on_sink_list(&mut self, list: crate::audio::SinkList) {
         self.niri.sink_list = list.clone();
         if self.niri.panel_popover.set_sink_list(list) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    /// Adopt a fresh input-source list (+ current default) from the PipeWire watcher, for the
+    /// quick-settings input-device picker.
+    pub fn on_source_list(&mut self, list: crate::audio::SourceList) {
+        self.niri.source_list = list.clone();
+        if self.niri.panel_popover.set_source_list(list) {
             self.niri.queue_redraw_all();
         }
     }
@@ -3048,6 +3063,7 @@ impl Niri {
             audio: None,
             mic: crate::audio::MicStatus::default(),
             sink_list: crate::audio::SinkList::default(),
+            source_list: crate::audio::SourceList::default(),
             #[cfg(feature = "pipewire")]
             pw_audio: None,
             system_status: SystemStatus::default(),

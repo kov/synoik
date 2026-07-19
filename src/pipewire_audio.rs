@@ -40,7 +40,7 @@ use pipewire::types::ObjectType;
 
 use crate::audio::{
     pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioStatus, MicStatus, SinkInfo,
-    SinkList, MAX_VOLUME,
+    SinkList, SourceInfo, SourceList, MAX_VOLUME,
 };
 use crate::niri::State;
 
@@ -65,11 +65,14 @@ struct BoundSink {
     channels: usize,
 }
 
-/// A bound default-source node, kept alive so its `Props` (mute) events flow.
+/// A bound default-source node, kept alive so its `Props` (mute + volume) events flow.
 struct BoundSource {
     id: u32,
-    _node: Node,
+    node: Node,
     _listener: NodeListener,
+    /// Channel count from the last `channelVolumes` read, so writes match. Defaults 1 — most mics
+    /// are mono, unlike the stereo sink default.
+    channels: usize,
 }
 
 /// A tracked input-capture stream (`Stream/Input/Audio`): an application recording from a mic. We
@@ -108,15 +111,22 @@ struct Inner {
     sink_list_last: Option<SinkList>,
     sink_list_dirty: Option<SinkList>,
 
-    // --- Microphone privacy indicator (input side) ---
-    /// Known `Audio/Source` nodes: id → (node.name, owned global for late binding).
-    sources: HashMap<u32, (String, GlobalObject<PropertiesBox>)>,
+    // --- Microphone privacy indicator + input slider/picker (input side) ---
+    /// Known `Audio/Source` nodes: id → (node.name, node.description, owned global for late
+    /// binding). Description captured once at appearance (props are only live then), like sinks.
+    sources: HashMap<u32, (String, String, GlobalObject<PropertiesBox>)>,
     /// The default source's `node.name`, from `default.audio.source`.
     default_source_name: Option<String>,
-    /// The currently-bound default source (for its mute).
+    /// The currently-bound default source (for its mute + volume).
     bound_source: Option<BoundSource>,
     /// The default source's mute, `false` when unknown (no source/metadata) — see [`MicStatus`].
     mic_muted: bool,
+    /// The default source's perceptual volume, `0.0` when unknown (no bound source).
+    mic_volume: f64,
+    /// The last source list handed to the compositor (for the input-device picker), and one it
+    /// hasn't drained yet — published only on an actual change, mirroring the sink path.
+    source_list_last: Option<SourceList>,
+    source_list_dirty: Option<SourceList>,
     /// Active input-capture streams: node id → [`Capture`]. Mutated ONLY from registry callbacks
     /// (`on_global`/`on_global_remove`); the per-node `.info()` callback only flips `running`.
     captures: HashMap<u32, Capture>,
@@ -148,10 +158,37 @@ impl Inner {
         let status = MicStatus {
             recording,
             muted: self.mic_muted,
+            volume: self.mic_volume,
+            source_present: self.bound_source.is_some(),
         };
         if self.mic_last != Some(status) {
             self.mic_last = Some(status);
             self.mic_dirty = Some(status);
+        }
+    }
+
+    /// Rebuild the source list from the tracked sources + current default, and flag it for the
+    /// compositor only on an actual change. Sorted by PipeWire global id, mirroring
+    /// [`publish_sinks`].
+    fn publish_sources(&mut self) {
+        let mut ids: Vec<u32> = self.sources.keys().copied().collect();
+        ids.sort_unstable();
+        let list = SourceList {
+            sources: ids
+                .iter()
+                .map(|id| {
+                    let (name, description, _) = &self.sources[id];
+                    SourceInfo {
+                        name: name.clone(),
+                        description: description.clone(),
+                    }
+                })
+                .collect(),
+            default_name: self.default_source_name.clone(),
+        };
+        if self.source_list_last.as_ref() != Some(&list) {
+            self.source_list_last = Some(list.clone());
+            self.source_list_dirty = Some(list);
         }
     }
 
@@ -214,12 +251,13 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
                 wrapper.0.loop_().iterate(Duration::ZERO);
                 // Drain all signals under one borrow, then release it before calling into State
                 // (which redraws) so nothing can re-enter a borrowed Inner.
-                let (dirty, mic_dirty, sink_list_dirty) = {
+                let (dirty, mic_dirty, sink_list_dirty, source_list_dirty) = {
                     let mut inner = inner.borrow_mut();
                     (
                         inner.dirty.take(),
                         inner.mic_dirty.take(),
                         inner.sink_list_dirty.take(),
+                        inner.source_list_dirty.take(),
                     )
                 };
                 if let Some(status) = dirty {
@@ -230,6 +268,9 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
                 }
                 if let Some(list) = sink_list_dirty {
                     state.on_sink_list(list);
+                }
+                if let Some(list) = source_list_dirty {
+                    state.on_source_list(list);
                 }
                 Ok(PostAction::Continue)
             }
@@ -303,6 +344,37 @@ impl PwAudio {
         self.set_muted(!muted)
     }
 
+    /// Set the perceptual volume on the default **source** (mic slider). Mirrors [`set_volume`]:
+    /// writes `channelVolumes` to the bound source and optimistically publishes the mic status so
+    /// the slider and the panel privacy tint react before the echo. No-op if no source is bound.
+    pub fn set_input_volume(&self, volume: f64) -> Option<MicStatus> {
+        let volume = volume.clamp(0.0, MAX_VOLUME);
+        let mut inner = self.inner.borrow_mut();
+        let bound = inner.bound_source.as_ref()?;
+        let linear = volume_to_pw_linear(volume) as f32;
+        let vols = vec![linear; bound.channels.max(1)];
+        set_props(&bound.node, Some(vols), None);
+        inner.mic_volume = volume;
+        inner.publish_mic();
+        inner.mic_last
+    }
+
+    /// Set the mute flag on the default **source**. Mirrors [`set_muted`].
+    pub fn set_input_muted(&self, muted: bool) -> Option<MicStatus> {
+        let mut inner = self.inner.borrow_mut();
+        let bound = inner.bound_source.as_ref()?;
+        set_props(&bound.node, None, Some(muted));
+        inner.mic_muted = muted;
+        inner.publish_mic();
+        inner.mic_last
+    }
+
+    /// Flip the mute flag on the default source.
+    pub fn toggle_input_muted(&self) -> Option<MicStatus> {
+        let muted = self.inner.borrow().mic_muted;
+        self.set_input_muted(!muted)
+    }
+
     /// Set the system default output to the sink with this `node.name`, by writing the persistent
     /// `default.configured.audio.sink` metadata key (what `wpctl set-default` / gvc's
     /// `change_output` write). The session manager (WirePlumber) echoes it back as
@@ -323,6 +395,23 @@ impl PwAudio {
             Some("Spa:String:JSON"),
             // `node.name` comes from a PipeWire C string, so it can't contain an interior NUL —
             // `set_property`'s internal `CString::new().expect()` therefore can't panic here.
+            Some(&sink_default_json(node_name)),
+        );
+    }
+
+    /// Set the system default **input** to the source with this `node.name`, by writing the
+    /// persistent `default.configured.audio.source` metadata key. The input mirror of
+    /// [`set_default_sink`]; WirePlumber echoes it back as `default.audio.source`, moving the
+    /// picker's check. No-op if no `default` metadata is bound.
+    pub fn set_default_source(&self, node_name: &str) {
+        let inner = self.inner.borrow();
+        let Some((metadata, _)) = inner.metadata.as_ref() else {
+            return;
+        };
+        metadata.set_property(
+            0,
+            "default.configured.audio.source",
+            Some("Spa:String:JSON"),
             Some(&sink_default_json(node_name)),
         );
     }
@@ -386,13 +475,23 @@ fn on_global(
                     return;
                 };
                 let name = name.to_string();
+                // Human label for the picker, gvc's preference order (same as sinks).
+                let description = props
+                    .get("node.description")
+                    .or_else(|| props.get("node.nick"))
+                    .or_else(|| props.get("device.description"))
+                    .unwrap_or(name.as_str())
+                    .to_string();
                 let mut inner = inner_rc.borrow_mut();
-                inner.sources.insert(obj.id, (name.clone(), obj.to_owned()));
+                inner
+                    .sources
+                    .insert(obj.id, (name.clone(), description, obj.to_owned()));
                 if inner.default_source_name.as_deref() == Some(name.as_str())
                     && inner.bound_source.as_ref().map(|b| b.id) != Some(obj.id)
                 {
                     bind_default_source(&mut inner, weak);
                 }
+                inner.publish_sources();
             } else if class == "Stream/Input/Audio" {
                 // An application recording from a mic. Bind it to watch its run-state.
                 track_capture(&inner_rc, weak, obj, props);
@@ -445,7 +544,9 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     if inner.sinks.remove(&id).is_some() {
         inner.publish_sinks();
     }
-    inner.sources.remove(&id);
+    if inner.sources.remove(&id).is_some() {
+        inner.publish_sources();
+    }
     if inner.bound.as_ref().map(|b| b.id) == Some(id) {
         inner.bound = None;
         inner.publish(None);
@@ -453,6 +554,7 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     if inner.bound_source.as_ref().map(|b| b.id) == Some(id) {
         inner.bound_source = None;
         inner.mic_muted = false; // mute state is now unknown → treat as a privacy event
+        inner.mic_volume = 0.0; // and the level is unknown
         inner.publish_mic();
     }
     // A recording stream going away recomputes the indicator.
@@ -489,6 +591,8 @@ fn on_metadata_property(
         }
         inner.default_source_name = Some(name);
         bind_default_source(&mut inner, weak);
+        // The picker marks the default row, so a default change must republish the list.
+        inner.publish_sources();
     } else {
         if inner.default_name.as_deref() == Some(name.as_str()) {
             return;
@@ -627,7 +731,7 @@ fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     let Some(id) = inner
         .sources
         .iter()
-        .find(|(_, (n, _))| *n == name)
+        .find(|(_, (n, _, _))| *n == name)
         .map(|(id, _)| *id)
     else {
         return; // node not surfaced yet; on_global will bind it when it appears
@@ -635,7 +739,7 @@ fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     if inner.bound_source.as_ref().map(|b| b.id) == Some(id) {
         return;
     }
-    let node = match registry.bind::<Node, _>(&inner.sources[&id].1) {
+    let node = match registry.bind::<Node, _>(&inner.sources[&id].2) {
         Ok(node) => node,
         Err(_) => {
             warn!("failed to bind default audio source node {id}");
@@ -655,36 +759,59 @@ fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     node.subscribe_params(&[ParamType::Props]);
     inner.bound_source = Some(BoundSource {
         id,
-        _node: node,
+        node,
         _listener: listener,
+        channels: 1,
     });
 }
 
-/// A default-source `Props` param arrived: pull `mute` and recompute the mic status.
-// The SPA property constant keeps its C mixed-case name; matched as a constant.
+/// A default-source `Props` param arrived: pull `mute` + `channelVolumes` and recompute the mic
+/// status. Props events can be partial (mute-only or volume-only), so — like [`on_node_param`] —
+/// each field falls back to the last-known value rather than dropping the whole pod.
+// The SPA property constants keep their C mixed-case names; matched as constants.
 #[allow(non_upper_case_globals)]
 fn on_source_param(weak: &Weak<RefCell<Inner>>, pod: &Pod) {
     let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
     else {
         return;
     };
+    let mut linear: Option<f64> = None;
+    let mut mono: Option<f64> = None;
     let mut muted: Option<bool> = None;
+    let mut channels: Option<usize> = None;
     for prop in &obj.properties {
-        if let (SPA_PROP_mute, Value::Bool(b)) = (prop.key, &prop.value) {
-            muted = Some(*b);
+        match (prop.key, &prop.value) {
+            (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(vols))) => {
+                channels = Some(vols.len());
+                // gvc exposes a single volume: the loudest channel.
+                linear = vols
+                    .iter()
+                    .map(|v| *v as f64)
+                    .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))));
+            }
+            (SPA_PROP_volume, Value::Float(v)) => mono = Some(*v as f64),
+            (SPA_PROP_mute, Value::Bool(b)) => muted = Some(*b),
+            _ => {}
         }
     }
-    let Some(muted) = muted else {
-        return;
-    };
     let Some(inner_rc) = weak.upgrade() else {
         return;
     };
     let mut inner = inner_rc.borrow_mut();
-    if inner.mic_muted != muted {
-        inner.mic_muted = muted;
-        inner.publish_mic();
+    if let Some(ch) = channels {
+        if let Some(bound) = inner.bound_source.as_mut() {
+            bound.channels = ch.max(1);
+        }
     }
+    let volume = match linear.or(mono) {
+        Some(l) => pw_linear_to_volume(l),
+        None => inner.mic_volume,
+    };
+    let muted = muted.unwrap_or(inner.mic_muted);
+    inner.mic_muted = muted;
+    inner.mic_volume = volume;
+    // `publish_mic` dedups against the last status, so an unchanged pod is a no-op.
+    inner.publish_mic();
 }
 
 /// A `Props` param arrived: pull `channelVolumes` + `mute` and publish.

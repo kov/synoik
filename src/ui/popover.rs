@@ -62,6 +62,13 @@ pub enum PopoverAction {
     /// menu stays open (gnome-shell keeps the device list up after picking); the check moves when
     /// the write echoes back.
     SetDefaultSink(String),
+    /// Set the default source's perceptual volume `0..=1` (the QS mic slider).
+    SetInputVolume(f64),
+    /// Toggle the default source's mute (clicking the mic slider's icon).
+    ToggleInputMute,
+    /// Set the system default input source to this `node.name` (an input-device-picker row). The
+    /// menu stays open, like [`SetDefaultSink`](Self::SetDefaultSink).
+    SetDefaultSource(String),
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -224,6 +231,8 @@ impl PanelPopover {
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
+        mic: crate::audio::MicStatus,
+        source_list: crate::audio::SourceList,
         accent: [u8; 3],
     ) {
         if self.is_showing::<QuickSettingsTag>() {
@@ -235,7 +244,14 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
-            toggles, network, battery, audio, sink_list, accent,
+            toggles,
+            network,
+            battery,
+            audio,
+            sink_list,
+            mic,
+            source_list,
+            accent,
         )));
         self.anim = Some(self.make_anim(0., 1.));
     }
@@ -258,6 +274,28 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_sink_list(sink_list)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh mic snapshot to an open quick-settings popover, so the mic slider tracks live
+    /// level/mute changes and appears/disappears with recording. Returns whether it changed.
+    pub fn set_mic(&mut self, mic: crate::audio::MicStatus) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_mic(mic)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh input-source list to an open quick-settings popover, so the input-device picker
+    /// tracks sources appearing/disappearing and default changes. Returns whether it changed.
+    pub fn set_source_list(&mut self, source_list: crate::audio::SourceList) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_source_list(source_list)
             }
             _ => false,
         }

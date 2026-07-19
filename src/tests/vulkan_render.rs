@@ -2265,6 +2265,8 @@ fn vulkan_renders_the_quick_settings_popover() {
         let battery = f.niri().system_status.battery.clone();
         let audio = f.niri().audio;
         let sink_list = f.niri().sink_list.clone();
+        let mic = f.niri().mic;
+        let source_list = f.niri().source_list.clone();
         let accent = f.niri().gnome_settings.accent_color;
         f.niri().panel_popover.toggle_quick_settings(
             output.clone(),
@@ -2274,6 +2276,8 @@ fn vulkan_renders_the_quick_settings_popover() {
             battery,
             audio,
             sink_list,
+            mic,
+            source_list,
             accent,
         );
     }

@@ -38,11 +38,12 @@ impl Default for AudioStatus {
     }
 }
 
-/// A snapshot of microphone (input) activity for the panel privacy indicator — the fork's model
-/// behind gnome-shell's `InputIndicator` (`js/ui/status/volume.js`). Fed by the PipeWire watcher;
-/// carries no rendering or PipeWire dependency (stays [`Default`] — not recording — where the audio
-/// backend is absent, e.g. headless).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A snapshot of microphone (input) activity, feeding both the panel privacy indicator
+/// (gnome-shell's `InputIndicator`) and the quick-settings **microphone slider**
+/// (`InputStreamSlider`, `js/ui/status/volume.js`). Fed by the PipeWire watcher; carries no
+/// rendering or PipeWire dependency (stays [`Default`] — not recording — where the audio backend is
+/// absent, e.g. headless). No `Eq` because it carries an f64 volume.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MicStatus {
     /// A non-skipped application is actively capturing (a running input stream).
     pub recording: bool,
@@ -52,6 +53,31 @@ pub struct MicStatus {
     /// would be wrong. This diverges from gnome-shell, which shows un-tinted when there's no
     /// stream.
     pub muted: bool,
+    /// The default source's perceptual (cubic) volume, `0.0..=MAX_VOLUME`, for the mic slider
+    /// fill. `0.0` when unknown (no bound source).
+    pub volume: f64,
+    /// Whether a default source is actually bound (a stream to control). gnome-shell's mic slider
+    /// visibility is `stream != null && recording` (`volume.js:429`), so the slider shows only
+    /// when both hold — a recording with no controllable source would give a dead slider.
+    pub source_present: bool,
+}
+
+/// The symbolic icon for the current microphone level, gnome-shell's `InputStreamSlider` level
+/// icons (`microphone-sensitivity-{muted,low,medium,high}-symbolic`, `volume.js:384-388`). Same
+/// bucketing shape as [`volume_icon`]: muted (or ≤0) → muted glyph; else low/medium/high at the ⅓/⅔
+/// marks.
+pub fn mic_volume_icon(status: &MicStatus) -> &'static str {
+    const ICONS: [&str; 4] = [
+        "microphone-sensitivity-muted-symbolic",
+        "microphone-sensitivity-low-symbolic",
+        "microphone-sensitivity-medium-symbolic",
+        "microphone-sensitivity-high-symbolic",
+    ];
+    if status.muted || status.volume <= 0.0 {
+        return ICONS[0];
+    }
+    let n = (3.0 * status.volume).ceil() as i64;
+    ICONS[n.clamp(1, 3) as usize]
 }
 
 /// Apps the mic privacy indicator ignores — they open capture only to display input levels, so
@@ -77,6 +103,24 @@ pub struct SinkInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SinkList {
     pub sinks: Vec<SinkInfo>,
+    pub default_name: Option<String>,
+}
+
+/// One audio input source, for the quick-settings input-device picker (gnome-shell's
+/// `InputStreamSlider` device rows). The input mirror of [`SinkInfo`]: `name` is the `node.name`
+/// key, `description` the human label (`node.description`). gnome-shell's list is port-level; we
+/// diverge to source-level, same as the output picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// The set of input sources + the current default, fed by the PipeWire watcher for the input-device
+/// picker. The input mirror of [`SinkList`]; `default_name` is the default source's `node.name`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceList {
+    pub sources: Vec<SourceInfo>,
     pub default_name: Option<String>,
 }
 
@@ -168,6 +212,36 @@ mod tests {
         assert_eq!(volume_icon(&at(0.67, false)), "audio-volume-high-symbolic");
         assert_eq!(volume_icon(&at(1.0, false)), "audio-volume-high-symbolic");
         assert_eq!(volume_icon(&at(1.5, false)), "audio-volume-high-symbolic");
+    }
+
+    #[test]
+    fn mic_icon_buckets_match_gnome_thresholds() {
+        let mic = |volume: f64, muted: bool| MicStatus {
+            recording: true,
+            muted,
+            volume,
+            source_present: true,
+        };
+        assert_eq!(
+            mic_volume_icon(&mic(0.5, true)),
+            "microphone-sensitivity-muted-symbolic"
+        );
+        assert_eq!(
+            mic_volume_icon(&mic(0.0, false)),
+            "microphone-sensitivity-muted-symbolic"
+        );
+        assert_eq!(
+            mic_volume_icon(&mic(0.2, false)),
+            "microphone-sensitivity-low-symbolic"
+        );
+        assert_eq!(
+            mic_volume_icon(&mic(0.5, false)),
+            "microphone-sensitivity-medium-symbolic"
+        );
+        assert_eq!(
+            mic_volume_icon(&mic(1.0, false)),
+            "microphone-sensitivity-high-symbolic"
+        );
     }
 
     #[test]

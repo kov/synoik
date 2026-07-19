@@ -1528,6 +1528,7 @@ mod tests {
         let rec = MicStatus {
             recording: true,
             muted: false,
+            ..MicStatus::default()
         };
         let icons = qs_indicator_icons(toggles, &wired(), None, rec);
         assert_eq!(icons[0].0[0], "microphone-sensitivity-high-symbolic");
@@ -1538,6 +1539,7 @@ mod tests {
         let muted = MicStatus {
             recording: true,
             muted: true,
+            ..MicStatus::default()
         };
         let icons = qs_indicator_icons(toggles, &wired(), None, muted);
         assert_eq!(icons[0].0[0], "microphone-sensitivity-muted-symbolic");
