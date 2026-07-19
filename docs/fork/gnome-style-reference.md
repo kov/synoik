@@ -646,6 +646,10 @@ Developer console: dialog + toolbar/tabs, property inspector, evaluator, window/
 Component-level state of our reimplementation. `module` is under `src/`. Keep this current as
 you port; the §2 tables stay pure GNOME reference.
 
+**Panel status/indicator backlog:** the exhaustive gap inventory for the top panel — every missing
+indicator, its GNOME 50.1 source, dependency, and a prioritized slice order — lives in
+`docs/fork/panel-status-port.md`. Start there for panel-status work.
+
 | GNOME component (§2) | our module | status | notes |
 |---|---|---|---|
 | design tokens §1 | `ui::pt_to_px` + constants across `ui/*` | 🟡 | accent palette + white accent-fg + dark bg match; pt→px unified via `ui::pt_to_px` (§1.3); the `%`-font scale + spacing/radii are not yet a shared token module |
