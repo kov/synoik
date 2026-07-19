@@ -375,6 +375,12 @@ pub struct Niri {
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
+    /// The authoritative last-selected (non-Balanced) power profile the Power Mode tile toggles
+    /// back to (gnome-shell's `last-selected-power-profile`). Seeded from gsettings at
+    /// startup, updated from each power-profile echo, and write-through-persisted — kept here
+    /// (not re-read from the gsettings model, which the watcher rebuilds from defaults on
+    /// every unrelated change).
+    pub last_power_profile: String,
     /// Default audio-sink state (volume + mute) for the panel output indicator and
     /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
     pub audio: Option<crate::audio::AudioStatus>,
@@ -871,6 +877,7 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
+            state.niri.last_power_profile = state.niri.gnome_settings.last_power_profile.clone();
             state.niri.gnome_settings_writer = Some(writer);
             state
                 .niri
@@ -2491,14 +2498,36 @@ impl State {
         match msg {
             SystemStatusToNiri::Battery(battery) => self.niri.system_status.battery = battery,
             SystemStatusToNiri::Network(network) => self.niri.system_status.network = network,
-            SystemStatusToNiri::PowerProfiles(power) => self.niri.system_status.power = power,
+            SystemStatusToNiri::PowerProfiles(power) => {
+                // gnome-shell's `_sync`: whenever the (echoed) active profile is a known,
+                // non-Balanced one, that becomes the last-selected the body-toggle returns to —
+                // recorded for external changes too, not just our own clicks. Kept authoritative on
+                // `Niri` (the gsettings model is rebuilt from defaults on every unrelated change),
+                // with best-effort write-through to persist it.
+                use crate::system_status::KnownProfile;
+                if power.is_active()
+                    && KnownProfile::parse(&power.active).is_some()
+                    && self.niri.last_power_profile != power.active
+                {
+                    self.niri.last_power_profile = power.active.clone();
+                    if let Some(writer) = &self.niri.gnome_settings_writer {
+                        writer.set_last_power_profile(power.active.clone());
+                    }
+                }
+                self.niri.system_status.power = power;
+            }
         }
         trace!("system status changed: {:?}", self.niri.system_status);
-        if self
+        let mut redraw = self
             .niri
             .panel
-            .set_system_status(self.niri.system_status.clone())
-        {
+            .set_system_status(self.niri.system_status.clone());
+        // Keep an open quick-settings Power Mode tile in sync with live changes.
+        redraw |= self
+            .niri
+            .panel_popover
+            .set_power_profile(self.niri.system_status.power.clone());
+        if redraw {
             self.niri.queue_redraw_all();
         }
     }
@@ -3083,6 +3112,7 @@ impl Niri {
             #[cfg(feature = "pipewire")]
             pw_audio: None,
             system_status: SystemStatus::default(),
+            last_power_profile: "power-saver".to_string(),
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),

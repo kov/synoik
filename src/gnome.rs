@@ -56,6 +56,10 @@ pub struct GnomeSettings {
     pub calendar: CalendarSettings,
     /// The state of the quick-settings toggles we back with gsettings.
     pub quick_toggles: QuickToggles,
+    /// `org.gnome.shell last-selected-power-profile`: the non-Balanced profile the Power Mode
+    /// tile's body-click toggles back to (gnome-shell's `PowerProfilesToggle`). GNOME's schema
+    /// default is `"power-saver"`.
+    pub last_power_profile: String,
 }
 
 /// The gsettings-backed quick-settings toggles (the "self-contained" ones that
@@ -86,6 +90,7 @@ impl Default for GnomeSettings {
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
             quick_toggles: QuickToggles::default(),
+            last_power_profile: "power-saver".to_string(),
         }
     }
 }
@@ -221,6 +226,9 @@ impl GnomeSettings {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+        }
+        if settings_has_key(shell, "last-selected-power-profile") {
+            self.last_power_profile = shell.string("last-selected-power-profile").to_string();
         }
     }
 
@@ -697,6 +705,29 @@ impl GnomeSettingsWriter {
                         let history: Vec<&str> = history.iter().map(String::as_str).collect();
                         if let Err(err) = shell.set_strv("command-history", history) {
                             warn!("error writing org.gnome.shell command-history: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Persist the last non-Balanced power profile to `org.gnome.shell
+    /// last-selected-power-profile` (gnome-shell's `PowerProfilesToggle._sync`). Takes a runtime
+    /// `String` (unlike [`set_string`](Self::set_string)'s `&'static str`). Missing store/key is a
+    /// no-op, so the authoritative copy lives on `Niri` and this is best-effort persistence.
+    pub fn set_last_power_profile(&self, profile: String) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(shell) = &s.shell {
+                    if settings_has_key(shell, "last-selected-power-profile") {
+                        if let Err(err) = shell.set_string("last-selected-power-profile", &profile)
+                        {
+                            warn!(
+                                "error writing org.gnome.shell last-selected-power-profile: {err}"
+                            );
                         }
                     }
                 }

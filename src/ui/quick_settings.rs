@@ -45,7 +45,9 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::system_status::{self, AirplaneStatus, BatteryStatus, NetworkStatus};
+use crate::system_status::{
+    self, AirplaneStatus, BatteryStatus, NetworkStatus, PowerProfileStatus,
+};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
@@ -63,6 +65,16 @@ const TILE_ICON_INSET: f64 = 12.;
 /// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
 /// light/small.
 const LABEL_PX: f64 = crate::ui::pt_to_px(11.);
+
+/// A tile subtitle's font size — gnome-shell's `.quick-toggle-subtitle` is `%caption` (9pt),
+/// regular weight (`gnome-shell-sass/widgets/_quick-settings.scss`). Only Power Mode uses a
+/// subtitle so far.
+const SUBTITLE_PX: f64 = crate::ui::pt_to_px(9.);
+
+/// Half the vertical gap between a two-line tile's title and subtitle line centers (each is offset
+/// this far from the tile's vertical center). Keeps the 11pt title + 9pt subtitle from overlapping
+/// inside `TILE_H` without growing the tile (gnome-shell's tiles don't grow for a subtitle either).
+const SUBTITLE_GAP: f64 = 9.;
 
 /// The system row (Settings on the left, Lock/Power on the right) sits at the
 /// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,
@@ -417,13 +429,21 @@ impl DetailOwner {
 }
 
 /// The grid slot the Network tile occupies (its detail view anchors below this row). Derived by
-/// identity over [`BASE_GRID`] — the Airplane tile is only ever appended (see [`grid`]), so
-/// Network's index is stable regardless of whether airplane shows.
+/// identity over [`BASE_GRID`] — the conditional tiles are only ever appended (see [`grid`]), so
+/// Network's index is stable regardless of whether they show.
 fn network_index() -> usize {
     BASE_GRID
         .iter()
         .position(|t| matches!(t, GridTile::Network))
         .unwrap_or(0)
+}
+
+/// The grid slot the Power Mode tile occupies when shown. It's the **first** conditional tile
+/// appended after [`BASE_GRID`] (before Airplane — see [`grid`]), so its index is the constant
+/// `BASE_GRID.len()` whenever present; its detail view anchors below this row. The append order is
+/// load-bearing here and pinned by a debug_assert at the hit/render sites.
+fn power_profile_index() -> usize {
+    BASE_GRID.len()
 }
 
 /// The menu-local layout context: everything the pure geometry functions need to place elements,
@@ -547,6 +567,11 @@ impl Tile {
 enum GridTile {
     Network,
     Toggle(Tile),
+    /// Power Mode (power-profiles-daemon) — a live D-Bus-backed toggle, shown only when the daemon
+    /// is present. Its label carries a second (subtitle) line with the active profile name, its
+    /// icon tracks the profile, its body-click toggles Balanced ↔ last-selected, and its arrow
+    /// opens the profile picker (gnome-shell's `PowerProfilesToggle`, a `QuickMenuToggle`).
+    PowerProfile,
     /// Airplane (rfkill) mode — a live D-Bus-backed toggle (gsd-rfkill), shown only when the
     /// hardware has rfkill switches (`ShouldShowAirplaneMode`). Unlike [`Toggle`](Self::Toggle)
     /// its state isn't gsettings; unlike [`Network`](Self::Network) its click flips a value.
@@ -555,8 +580,9 @@ enum GridTile {
 
 /// The always-present grid tiles, row-major over two columns: Network leads in the prominent
 /// top-left cell (gnome-shell's quick-settings grid leads with connectivity), then the gsettings
-/// toggles fill out the 2×2. The Airplane tile is *appended* to this when shown (see [`grid`]) —
-/// gnome-shell adds rfkill after every tile we carry (`panel.js` `QUICK_SETTINGS_ITEMS` order).
+/// toggles fill out the 2×2. The PowerProfile and Airplane tiles are *appended* to this when shown
+/// (see [`grid`]) — gnome-shell adds both after every tile we carry (`panel.js`
+/// `QUICK_SETTINGS_ITEMS` order: powerProfiles before rfkill, which our append order preserves).
 const BASE_GRID: [GridTile; 4] = [
     GridTile::Network,
     GridTile::Toggle(Tile::DarkStyle),
@@ -564,12 +590,17 @@ const BASE_GRID: [GridTile; 4] = [
     GridTile::Toggle(Tile::NightLight),
 ];
 
-/// The live grid: [`BASE_GRID`] plus the Airplane tile when rfkill hardware is present. **Airplane
-/// is always appended, never inserted** — `network_index`/`anchor_row_bottom` resolve tile identity
-/// by index over `BASE_GRID` and silently depend on that prefix staying put (a debug_assert at the
-/// call sites pins it).
-fn grid(show_airplane: bool) -> Vec<GridTile> {
+/// The live grid: [`BASE_GRID`] plus the two conditional tiles. **They are always appended in this
+/// exact order — PowerProfile then Airplane — never inserted.** `network_index` and
+/// `power_profile_index`/`anchor_row_bottom` resolve tile identity by a *constant* index over
+/// `BASE_GRID` (Network at its `BASE_GRID` slot; PowerProfile, the first conditional, always at
+/// `BASE_GRID.len()`), which holds only while PowerProfile precedes Airplane. Two debug_asserts at
+/// the call sites pin both the prefix and the append order.
+fn grid(show_power_profile: bool, show_airplane: bool) -> Vec<GridTile> {
     let mut tiles = BASE_GRID.to_vec();
+    if show_power_profile {
+        tiles.push(GridTile::PowerProfile);
+    }
     if show_airplane {
         tiles.push(GridTile::Airplane);
     }
@@ -577,47 +608,62 @@ fn grid(show_airplane: bool) -> Vec<GridTile> {
 }
 
 impl GridTile {
-    /// The tile's label given the live toggle + network state.
+    /// The tile's (title) label given the live toggle + network state. Power Mode's title is
+    /// static; its active profile is the [`subtitle`](Self::subtitle) line.
     fn label(self, network: NetworkStatus) -> String {
         match self {
             GridTile::Toggle(t) => t.label().to_string(),
             GridTile::Network => network_label(network).to_string(),
+            GridTile::PowerProfile => "Power Mode".to_string(),
             GridTile::Airplane => "Airplane Mode".to_string(),
         }
     }
 
+    /// The tile's second (subtitle) line, or `None` for a single-line tile. Only Power Mode has one
+    /// (the active profile name), mirroring gnome-shell's `QuickMenuToggle` subtitle.
+    fn subtitle(self, power: &PowerProfileStatus) -> Option<String> {
+        match self {
+            GridTile::PowerProfile => Some(power.name().to_string()),
+            _ => None,
+        }
+    }
+
     /// Candidate symbolic icon names, first that resolves wins.
-    fn icons(self, network: NetworkStatus) -> Vec<String> {
+    fn icons(self, network: NetworkStatus, power: &PowerProfileStatus) -> Vec<String> {
         match self {
             GridTile::Toggle(t) => t.icons().iter().map(|s| s.to_string()).collect(),
             GridTile::Network => network_icons(network),
+            GridTile::PowerProfile => vec![power.icon().to_string()],
             GridTile::Airplane => vec!["airplane-mode-symbolic".to_string()],
         }
     }
 
-    /// Whether the tile reads as "on" (accent background): a toggle's gsettings
-    /// state, Network's connected state, or Airplane's active state.
+    /// Whether the tile reads as "on" (accent background): a toggle's gsettings state, Network's
+    /// connected state, Power Mode's non-Balanced state, or Airplane's active state.
     fn is_on(
         self,
         toggles: QuickToggles,
         network: NetworkStatus,
         airplane: AirplaneStatus,
+        power: &PowerProfileStatus,
     ) -> bool {
         match self {
             GridTile::Toggle(t) => t.is_on(toggles),
             GridTile::Network => {
                 matches!(network, NetworkStatus::Wired | NetworkStatus::Wireless(_))
             }
+            GridTile::PowerProfile => power.is_active(),
             GridTile::Airplane => airplane.active,
         }
     }
 
     /// Whether this tile carries an expand-arrow that opens a detail view (gnome-shell's
-    /// `QuickMenuToggle`). Only Network in v1; the toggles are plain [`QuickToggle`]s.
+    /// `QuickMenuToggle`). Only Network here; Power Mode gains its profile-picker arrow in the next
+    /// slice. The toggles/Airplane are plain [`QuickToggle`]s.
     fn detail_owner(self) -> Option<DetailOwner> {
         match self {
             GridTile::Network => Some(DetailOwner::Network),
-            GridTile::Toggle(_) | GridTile::Airplane => None,
+            GridTile::Toggle(_) | GridTile::PowerProfile | GridTile::Airplane => None,
         }
     }
 }
@@ -715,6 +761,10 @@ pub struct QuickSettings {
     /// Airplane (rfkill) state, for the conditionally-shown Airplane grid tile. `show` grows the
     /// grid by one tile; `active` is the tile's on-state.
     airplane: AirplaneStatus,
+    /// Power-profile state, for the conditionally-shown Power Mode grid tile. `show` grows the
+    /// grid; `active`/profiles drive its subtitle, icon, on-state, and (next slice) its
+    /// picker.
+    power: PowerProfileStatus,
     /// The battery, for the far-left power pill; `None` hides it (desktop / VM
     /// without a battery), like gnome-shell's `PowerToggle.visible = IsPresent`.
     battery: Option<BatteryStatus>,
@@ -756,6 +806,7 @@ impl QuickSettings {
         toggles: QuickToggles,
         network: NetworkStatus,
         airplane: AirplaneStatus,
+        power: PowerProfileStatus,
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
@@ -767,6 +818,7 @@ impl QuickSettings {
             toggles,
             network,
             airplane,
+            power,
             battery,
             audio,
             sink_list,
@@ -803,9 +855,10 @@ impl QuickSettings {
         }
     }
 
-    /// The live grid tiles (Network + toggles, plus Airplane when rfkill hardware is present).
+    /// The live grid tiles (Network + toggles, plus Power Mode / Airplane when their daemons are
+    /// present).
     fn grid(&self) -> Vec<GridTile> {
-        grid(self.airplane.show)
+        grid(self.power.show, self.airplane.show)
     }
 
     /// The current layout context (slider presence + which detail view is open + device counts +
@@ -828,6 +881,18 @@ impl QuickSettings {
             return false;
         }
         self.airplane = airplane;
+        self.revision += 1;
+        true
+    }
+
+    /// Adopt a fresh power-profile snapshot (from power-profiles-daemon). `show` grows/shrinks the
+    /// grid by the Power Mode tile; `active`/`available` drive its subtitle, icon, and on-state.
+    /// Returns whether it changed.
+    pub fn set_power_profile(&mut self, power: PowerProfileStatus) -> bool {
+        if self.power == power {
+            return false;
+        }
+        self.power = power;
         self.revision += 1;
         true
     }
@@ -897,7 +962,15 @@ impl QuickSettings {
         debug_assert_eq!(
             &tiles[..BASE_GRID.len()],
             &BASE_GRID,
-            "grid() must APPEND the airplane tile, never insert (network_index depends on it)"
+            "grid() must APPEND the conditional tiles, never insert (network_index depends on it)"
+        );
+        debug_assert!(
+            tiles
+                .iter()
+                .position(|t| matches!(t, GridTile::PowerProfile))
+                .is_none_or(|i| i == power_profile_index()),
+            "PowerProfile must be the FIRST appended tile (before Airplane) — \
+             power_profile_index()/anchor_row_bottom assume its constant index"
         );
         for (i, &item) in tiles.iter().enumerate() {
             // A menu tile's arrow-half toggles its detail view (open, or close if already open —
@@ -933,6 +1006,11 @@ impl QuickSettings {
                     // toggle back) — an accepted minor divergence for the
                     // sub-round-trip double-click window.
                     GridTile::Airplane => PopoverAction::SetAirplaneMode(!self.airplane.active),
+                    // Power Mode body: gnome-shell's `clicked` — toggle Balanced ↔ last-selected.
+                    // Which target that is depends on state the compositor owns (the last-selected
+                    // gsettings/memory), so we defer the choice to `apply_popover_action`. Also
+                    // echo-driven (no local flip).
+                    GridTile::PowerProfile => PopoverAction::TogglePowerProfile,
                 };
             }
         }
@@ -1124,14 +1202,14 @@ impl QuickSettings {
 
         // Tile icons (drawn above the chrome, so pushed before it).
         for (i, item) in self.grid().into_iter().enumerate() {
-            let on = item.is_on(self.toggles, self.network, self.airplane);
+            let on = item.is_on(self.toggles, self.network, self.airplane, &self.power);
             let color = if on { FG_ON } else { FG_OFF };
             let rect = tile_rect(i, layout);
             let center = Point::from((
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
             ));
-            let candidates = item.icons(self.network);
+            let candidates = item.icons(self.network, &self.power);
             if let Some(el) = icon_element(
                 renderer,
                 icons,
@@ -1406,6 +1484,18 @@ impl QuickSettings {
             .iter()
             .map(|l| renderer.build_glyph_run_weighted(l, label_px, true))
             .collect::<Result<_, _>>()?;
+        // A parallel Option<run> for the (regular-weight) subtitle line — `Some` only for the tiles
+        // that carry one (Power Mode's active profile), `None` otherwise.
+        let subtitle_px = (SUBTITLE_PX * scale) as f32;
+        let subtitle_runs: Vec<Option<_>> = self
+            .grid()
+            .iter()
+            .map(|item| {
+                item.subtitle(&self.power)
+                    .map(|s| renderer.build_glyph_run_weighted(&s, subtitle_px, false))
+                    .transpose()
+            })
+            .collect::<Result<_, _>>()?;
         let pill_run = self
             .battery
             .as_ref()
@@ -1470,7 +1560,7 @@ impl QuickSettings {
 
             for (i, item) in self.grid().into_iter().enumerate() {
                 let rect = tile_rect(i, layout);
-                let on = item.is_on(self.toggles, self.network, self.airplane);
+                let on = item.is_on(self.toggles, self.network, self.airplane, &self.power);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
                 // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
@@ -1495,18 +1585,40 @@ impl QuickSettings {
 
                 let fg = if on { FG_ON } else { FG_OFF };
                 let label_x = px(rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.);
-                let label_cy = px(rect.loc.y + rect.size.h / 2.);
+                let center_y = rect.loc.y + rect.size.h / 2.;
                 let run = &label_runs[i];
                 // Clip the label to the toggle-body so a long name can't run under the arrow
                 // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
                 let clip = rect_px(tile_body_rect(i, item, layout));
-                frame.render_glyphs(
-                    run,
-                    place_left(run.ink_bounds(), label_x, label_cy),
-                    fg,
-                    clip,
-                    &[full],
-                )?;
+                match &subtitle_runs[i] {
+                    // Two-line tile (Power Mode): title above center, subtitle below.
+                    Some(sub) => {
+                        frame.render_glyphs(
+                            run,
+                            place_left(run.ink_bounds(), label_x, px(center_y - SUBTITLE_GAP)),
+                            fg,
+                            clip,
+                            &[full],
+                        )?;
+                        frame.render_glyphs(
+                            sub,
+                            place_left(sub.ink_bounds(), label_x, px(center_y + SUBTITLE_GAP)),
+                            fg,
+                            clip,
+                            &[full],
+                        )?;
+                    }
+                    // Single-line tile: the title, vertically centered.
+                    None => {
+                        frame.render_glyphs(
+                            run,
+                            place_left(run.ink_bounds(), label_x, px(center_y)),
+                            fg,
+                            clip,
+                            &[full],
+                        )?;
+                    }
+                }
             }
 
             // The battery pill: a filled slab (its icon composites on top) with the
@@ -1965,6 +2077,7 @@ mod tests {
                 QuickToggles::default(),
                 NetworkStatus::Wired,
                 AirplaneStatus::default(),
+                PowerProfileStatus::default(),
                 None,
                 audio,
                 SinkList::default(),
@@ -2015,6 +2128,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2035,14 +2149,26 @@ mod tests {
     #[test]
     fn network_tile_reflects_state_and_opens_settings() {
         let off = AirplaneStatus::default();
-        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired, off));
-        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wireless(60), off));
-        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Offline, off));
+        let np = PowerProfileStatus::default();
+        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired, off, &np));
+        assert!(GridTile::Network.is_on(
+            QuickToggles::default(),
+            NetworkStatus::Wireless(60),
+            off,
+            &np
+        ));
+        assert!(!GridTile::Network.is_on(
+            QuickToggles::default(),
+            NetworkStatus::Offline,
+            off,
+            &np
+        ));
 
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2068,6 +2194,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2096,6 +2223,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2122,6 +2250,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2157,6 +2286,7 @@ mod tests {
             toggles,
             NetworkStatus::Unknown,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2221,6 +2351,7 @@ mod tests {
             QuickToggles::default(),
             network,
             AirplaneStatus::default(),
+            PowerProfileStatus::default(),
             None,
             audio,
             SinkList::default(),
@@ -2511,6 +2642,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             airplane,
+            PowerProfileStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2555,6 +2687,74 @@ mod tests {
             air.loc.y + TILE_H / 2.,
         ));
         assert!(matches!(qs.pointer_click(empty), PopoverAction::Consumed));
+    }
+
+    /// With power-profiles-daemon present the grid gains a Power Mode tile, appended as the FIRST
+    /// conditional (index 4, before Airplane). It's a two-line tile ("Power Mode" + the active
+    /// profile subtitle), reads "on" when not Balanced, and its body-click returns the (target-
+    /// deferred) toggle action. With both conditional tiles shown, PowerProfile stays ahead of
+    /// Airplane, the invariant `power_profile_index`/`anchor_row_bottom` depend on.
+    #[test]
+    fn power_mode_tile_appends_with_subtitle_and_body_toggles() {
+        use crate::system_status::KnownProfile;
+        let power = PowerProfileStatus {
+            active: "performance".to_string(),
+            available: vec![
+                KnownProfile::Performance,
+                KnownProfile::Balanced,
+                KnownProfile::PowerSaver,
+            ],
+            show: true,
+        };
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            power,
+            None,
+            None,
+            SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
+            [0, 0, 0],
+        );
+
+        // Appended as the 5th tile at the constant power_profile_index (4).
+        let tiles = qs.grid();
+        assert_eq!(tiles.len(), 5);
+        assert_eq!(power_profile_index(), 4);
+        assert_eq!(tiles[power_profile_index()], GridTile::PowerProfile);
+
+        // Two-line tile: static "Power Mode" title, active profile as the subtitle.
+        assert_eq!(
+            GridTile::PowerProfile.label(NetworkStatus::Wired),
+            "Power Mode"
+        );
+        assert_eq!(
+            GridTile::PowerProfile.subtitle(&qs.power).as_deref(),
+            Some("Performance")
+        );
+        // On because the active profile isn't Balanced.
+        assert!(GridTile::PowerProfile.is_on(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            &qs.power,
+        ));
+
+        // Body click returns the toggle action; no arrow yet, so the whole tile is body.
+        let action = qs.pointer_click(center(tile_rect(power_profile_index(), qs.layout())));
+        assert!(matches!(action, PopoverAction::TogglePowerProfile));
+
+        // Both conditionals shown: PowerProfile (4) stays ahead of Airplane (5).
+        qs.set_airplane(AirplaneStatus {
+            active: false,
+            show: true,
+        });
+        let tiles = qs.grid();
+        assert_eq!(tiles.len(), 6);
+        assert_eq!(tiles[4], GridTile::PowerProfile);
+        assert_eq!(tiles[5], GridTile::Airplane);
     }
 
     /// The Network arrow opens the detail view; clicking it again collapses it. Both are internal

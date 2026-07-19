@@ -957,6 +957,39 @@ impl State {
             }
             #[cfg(not(feature = "dbus"))]
             PopoverAction::SetAirplaneMode(_) => {}
+            // Power Mode body toggle: Balanced ↔ the compositor-owned last-selected profile
+            // (gnome-shell's `clicked`). Fire-and-forget write on the system-status connection; the
+            // tile updates on the daemon's echo.
+            #[cfg(feature = "dbus")]
+            PopoverAction::TogglePowerProfile => {
+                let target = if self.niri.system_status.power.is_active() {
+                    "balanced".to_string()
+                } else {
+                    self.niri.last_power_profile.clone()
+                };
+                if let Some(conn) = self
+                    .niri
+                    .dbus
+                    .as_ref()
+                    .and_then(|d| d.conn_system_status.as_ref())
+                {
+                    crate::dbus::system_status::set_active_profile(conn, target);
+                }
+            }
+            // Power Mode picker row: set the chosen profile directly.
+            #[cfg(feature = "dbus")]
+            PopoverAction::SetPowerProfile(profile) => {
+                if let Some(conn) = self
+                    .niri
+                    .dbus
+                    .as_ref()
+                    .and_then(|d| d.conn_system_status.as_ref())
+                {
+                    crate::dbus::system_status::set_active_profile(conn, profile);
+                }
+            }
+            #[cfg(not(feature = "dbus"))]
+            PopoverAction::TogglePowerProfile | PopoverAction::SetPowerProfile(_) => {}
         }
     }
 
@@ -3327,6 +3360,7 @@ impl State {
                                 let anchor = self.niri.panel.quick_settings_rect(output_w);
                                 let network = self.niri.system_status.network;
                                 let airplane = self.niri.system_status.airplane;
+                                let power = self.niri.system_status.power.clone();
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
@@ -3339,6 +3373,7 @@ impl State {
                                     toggles,
                                     network,
                                     airplane,
+                                    power,
                                     battery,
                                     audio,
                                     sink_list,

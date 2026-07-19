@@ -72,6 +72,14 @@ pub enum PopoverAction {
     /// Set gsd-rfkill's airplane mode (the QS "Airplane Mode" toggle). The menu stays open; the
     /// tile updates on the gsd echo (not optimistic — a rejected/hw-blocked write has no echo).
     SetAirplaneMode(bool),
+    /// Toggle the power profile (the Power Mode tile body): Balanced ↔ last-selected. Carries no
+    /// target because *which* profile depends on the compositor-owned last-selected state; the
+    /// input layer resolves it (`apply_popover_action`). Menu stays open; echo-driven.
+    TogglePowerProfile,
+    /// Set power-profiles-daemon's `ActiveProfile` to this profile id (a Power Mode picker row).
+    /// The menu stays open; the check moves when the write echoes back (like
+    /// [`SetDefaultSink`]).
+    SetPowerProfile(String),
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -232,6 +240,7 @@ impl PanelPopover {
         toggles: crate::gnome::QuickToggles,
         network: crate::system_status::NetworkStatus,
         airplane: crate::system_status::AirplaneStatus,
+        power: crate::system_status::PowerProfileStatus,
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
@@ -251,6 +260,7 @@ impl PanelPopover {
             toggles,
             network,
             airplane,
+            power,
             battery,
             audio,
             sink_list,
@@ -313,6 +323,18 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_airplane(airplane)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh power-profile snapshot to an open quick-settings popover, so the "Power Mode"
+    /// tile appears/vanishes with the daemon and tracks the live profile. Returns whether it
+    /// changed.
+    pub fn set_power_profile(&mut self, power: crate::system_status::PowerProfileStatus) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_power_profile(power)
             }
             _ => false,
         }
