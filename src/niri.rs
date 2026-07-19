@@ -372,6 +372,13 @@ pub struct Niri {
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
+    /// Default audio-sink state (volume + mute) for the panel output indicator and
+    /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
+    pub audio: Option<crate::audio::AudioStatus>,
+    /// The live PipeWire audio connection (feature `audio`); its loop is driven on
+    /// the compositor's calloop. `None` when the connection failed or is disabled.
+    #[cfg(feature = "pipewire")]
+    pub pw_audio: Option<crate::pipewire_audio::PwAudio>,
     /// The decoded `org.gnome.desktop.background` picture, drawn as the
     /// workspace background in GNOME windowing mode.
     pub wallpaper: Wallpaper,
@@ -2413,6 +2420,15 @@ impl State {
         }
     }
 
+    /// Adopt a fresh default-sink snapshot from the PipeWire watcher (`None` when
+    /// no sink is bound). Updates the panel's output indicator + QS slider.
+    pub fn on_audio_status(&mut self, status: Option<crate::audio::AudioStatus>) {
+        self.niri.audio = status;
+        if self.niri.panel.set_audio(status) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
     #[cfg(feature = "dbus")]
     pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToNiri) {
         use crate::dbus::gnome_shell::GnomeShellToNiri;
@@ -2928,6 +2944,9 @@ impl Niri {
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
+            audio: None,
+            #[cfg(feature = "pipewire")]
+            pw_audio: None,
             system_status: SystemStatus::default(),
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),

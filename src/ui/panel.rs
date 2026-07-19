@@ -48,6 +48,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::audio::AudioStatus;
 use crate::system_status::{self, SystemStatus};
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -177,7 +178,11 @@ const QS_NIGHT_ICONS: &[&str] = &["night-light-symbolic"];
 /// (network, then battery in the corner, like GNOME). Each entry is a candidate
 /// list; the first name that resolves in the theme is drawn. Falls back to the
 /// anchor icon so the cluster is never empty.
-fn qs_indicator_icons(toggles: QuickToggles, status: &SystemStatus) -> Vec<Vec<String>> {
+fn qs_indicator_icons(
+    toggles: QuickToggles,
+    status: &SystemStatus,
+    audio: Option<AudioStatus>,
+) -> Vec<Vec<String>> {
     let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
     let mut v: Vec<Vec<String>> = Vec::new();
@@ -190,6 +195,9 @@ fn qs_indicator_icons(toggles: QuickToggles, status: &SystemStatus) -> Vec<Vec<S
     if let Some(candidates) = system_status::network_icon(status.network) {
         v.push(owned(candidates));
     }
+    if let Some(audio) = audio {
+        v.push(vec![crate::audio::volume_icon(&audio).to_string()]);
+    }
     if let Some(battery) = &status.battery {
         v.push(system_status::battery_icon(battery));
     }
@@ -201,8 +209,8 @@ fn qs_indicator_icons(toggles: QuickToggles, status: &SystemStatus) -> Vec<Vec<S
 
 /// Logical width of the right-box quick-settings indicator (padding + icons +
 /// gaps). Depends on how many status icons are currently shown.
-fn qs_indicator_width(toggles: QuickToggles, status: &SystemStatus) -> f64 {
-    let n = qs_indicator_icons(toggles, status).len() as f64;
+fn qs_indicator_width(toggles: QuickToggles, status: &SystemStatus, audio: Option<AudioStatus>) -> f64 {
+    let n = qs_indicator_icons(toggles, status, audio).len() as f64;
     2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
 }
 
@@ -323,6 +331,9 @@ pub struct Panel {
     /// Live network + battery state (from the system-bus watcher), shown as the
     /// right-box status cluster.
     system_status: SystemStatus,
+    /// Default-sink audio state (from the PipeWire watcher); its speaker icon sits
+    /// in the status cluster between network and battery.
+    audio: Option<AudioStatus>,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -358,6 +369,7 @@ impl Panel {
             open_menu: None,
             toggles: QuickToggles::default(),
             system_status: SystemStatus::default(),
+            audio: None,
             clock,
             config,
             fills,
@@ -385,6 +397,18 @@ impl Panel {
             return false;
         }
         self.system_status = status;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// Adopt the live default-sink audio state (from the PipeWire watcher). Returns
+    /// whether it changed, so the caller can queue a redraw; the cluster's speaker
+    /// icon (and possibly its width) may differ.
+    pub fn set_audio(&mut self, audio: Option<AudioStatus>) -> bool {
+        if audio == self.audio {
+            return false;
+        }
+        self.audio = audio;
         self.cache.borrow_mut().clear();
         true
     }
@@ -580,7 +604,7 @@ impl Panel {
     /// on each side, right-anchored on the output. Its width tracks how many
     /// status icons (toggles + live network/battery) are currently shown.
     pub fn quick_settings_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let w = qs_indicator_width(self.toggles, &self.system_status);
+        let w = qs_indicator_width(self.toggles, &self.system_status, self.audio);
         Rectangle::new(
             Point::from((output_width - w, 0.)),
             Size::from((w, PANEL_HEIGHT)),
@@ -758,7 +782,7 @@ impl Panel {
     ) {
         let rect = self.quick_settings_rect(output_width);
         let mut x = rect.loc.x + INDICATOR_H_PADDING;
-        for candidates in qs_indicator_icons(self.toggles, &self.system_status) {
+        for candidates in qs_indicator_icons(self.toggles, &self.system_status, self.audio) {
             // Resolve the first candidate that rasterizes, then cache its upload.
             let Some((name, buffer)) = candidates.iter().find_map(|name| {
                 icons
@@ -1079,7 +1103,7 @@ mod tests {
 
         // Empty status → the single anchor fallback.
         let empty = SystemStatus::default();
-        let icons = qs_indicator_icons(toggles, &empty);
+        let icons = qs_indicator_icons(toggles, &empty, None);
         assert_eq!(icons.len(), 1);
         assert_eq!(icons[0][0], QS_ANCHOR_ICONS[0]);
 
@@ -1091,7 +1115,7 @@ mod tests {
                 percentage: 90.,
             }),
         };
-        let icons = qs_indicator_icons(toggles, &status);
+        let icons = qs_indicator_icons(toggles, &status, None);
         assert_eq!(icons.len(), 2);
         assert_eq!(icons[0][0], "network-wired-symbolic");
         assert_eq!(icons[1][0], "battery-level-90-symbolic");
@@ -1099,6 +1123,17 @@ mod tests {
             !icons.iter().any(|c| c[0] == QS_ANCHOR_ICONS[0]),
             "no anchor icon once the cluster is populated"
         );
+
+        // With audio, the speaker icon sits between network and battery.
+        let audio = Some(AudioStatus {
+            volume: 0.5,
+            muted: false,
+        });
+        let icons = qs_indicator_icons(toggles, &status, audio);
+        assert_eq!(icons.len(), 3);
+        assert_eq!(icons[0][0], "network-wired-symbolic");
+        assert_eq!(icons[1][0], "audio-volume-medium-symbolic");
+        assert_eq!(icons[2][0], "battery-level-90-symbolic");
 
         // The populated cluster is wider than the anchor fallback.
         let base = test_panel().quick_settings_rect(1920.).size.w;

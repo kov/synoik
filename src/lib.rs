@@ -4,6 +4,7 @@ extern crate tracing;
 #[cfg(feature = "dbus")]
 pub mod a11y;
 pub mod animation;
+pub mod audio;
 pub mod backend;
 pub mod cli;
 pub mod cursor;
@@ -19,6 +20,8 @@ pub mod ipc;
 pub mod layer;
 pub mod layout;
 pub mod niri;
+#[cfg(feature = "pipewire")]
+pub mod pipewire_audio;
 pub mod protocols;
 pub mod render_helpers;
 pub mod rubber_band;

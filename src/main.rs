@@ -251,6 +251,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dbus")]
     dbus::DBusServers::start(&mut state, cli.session);
 
+    // Default-sink volume/mute for the panel indicator + QS slider, from PipeWire.
+    // The connection's loop is driven on the compositor's calloop; skip in headless
+    // (IPC-only) runs.
+    #[cfg(feature = "pipewire")]
+    if !cli.headless {
+        match niri::pipewire_audio::start(&event_loop.handle()) {
+            Ok(pw) => {
+                pw.pump();
+                state.niri.pw_audio = Some(pw);
+            }
+            Err(err) => warn!("error starting PipeWire audio watcher: {err:?}"),
+        }
+    }
+
     #[cfg(feature = "dbus")]
     if cli.session {
         state.niri.a11y.start();
