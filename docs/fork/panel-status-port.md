@@ -139,12 +139,12 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 
 | # | Indicator | Panel icon | QS menu UI | Reference | Dep | Status |
 |---|---|---|---|---|---|---|
-| Q1 | **system** | battery/power icon + optional % (`system-shutdown-symbolic` w/o battery) | `SystemItem` row: PowerToggle (battery→power settings), Screenshot, Settings, Lock, **Shutdown w/ submenu** (Suspend/Restart/Power Off/Log Out) | `js/ui/status/system.js:308`; icon `:319-360`; row `:263-306`; PowerToggle `:32`; Screenshot `:110`; Settings `:133`; Lock `:240`; Shutdown+submenu `:167` | `[self]`/`[dbus:login1]` | 🟡 have screenshot/settings/lock/power buttons + battery pill; **missing the shutdown submenu** (our power button spawns power-off directly). **No user avatar upstream** — don't add one. |
+| Q1 | **system** | battery/power icon + optional % (`system-shutdown-symbolic` w/o battery) | `SystemItem` row: PowerToggle (battery→power settings), Screenshot, Settings, Lock, **Shutdown w/ submenu** (Suspend/Restart/Power Off/Log Out) | `js/ui/status/system.js:308`; icon `:319-360`; row `:263-306`; PowerToggle `:32`; Screenshot `:110`; Settings `:133`; Lock `:240`; Shutdown+submenu `:167` | `[self]`/`[dbus:login1]` | ✅ screenshot/settings/lock + battery pill; **power button now opens the session submenu** (Suspend/Restart…/Power Off…/Log Out…) on the QuickMenuToggle framework, no longer power-offs directly. Switch User deferred (greeter jump). **No user avatar upstream** — don't add one. |
 | Q2 | **volume output** | speaker icon | `OutputStreamSlider` + output-device submenu | `OutputIndicator` `js/ui/status/volume.js:468`; icon `:439,487`; slider `:293,491`; device section `:77` | `[pw]` | 🟡 slider ✅; **device-picker submenu ⬜** |
-| Q3 | **volume input (mic)** | mic privacy icon while recording | `InputStreamSlider` + input-device submenu | `InputIndicator` `volume.js:508`; icon `:544-549`; slider `:367,535` | `[pw]` | ⬜ |
+| Q3 | **volume input (mic)** | mic privacy icon while recording | `InputStreamSlider` + input-device submenu | `InputIndicator` `volume.js:508`; icon `:544-549`; slider `:367,535` | `[pw]` | 🟡 privacy icon ✅ (orange while a non-skipped, non-monitor `Stream/Input/Audio` runs; white when source muted; leftmost in cluster); **input slider + device submenu + volume-graded sensitivity icon ⬜** |
 | Q4 | **brightness** | none | `BrightnessItem` slider; multi-monitor submenu | `js/ui/status/brightness.js:94`; slider `:38,99`; submenu `:12` | `[dbus:gsd/logind]` backlight | ⬜ |
 | Q5 | **keyboard backlight** | none | `KeyboardBrightnessToggle` (slider or discrete steps) | `js/ui/status/backlight.js:236`; toggle `:159,241`; slider `:21`; steps `:79` | `[dbus:UPower/logind]` | ⬜ |
-| Q6 | **network** | status icon(s) | per-device `QuickMenuToggle`s: wired, Wi-Fi (list), modem, BT-tether, VPN — each w/ submenu | `js/ui/status/network.js`; built `panel.js:303-310`; NMToggle `:1381`; Wi-Fi `:1076`; VPN `:1541` | `[nm]` | 🟡 panel icon ✅ + tile that opens settings; **in-menu enable/disable, Wi-Fi list, VPN, submenus ⬜**; no SSID label |
+| Q6 | **network** | status icon(s) | per-device `QuickMenuToggle`s: wired, Wi-Fi (list), modem, BT-tether, VPN — each w/ submenu | `js/ui/status/network.js`; built `panel.js:303-310`; NMToggle `:1381`; Wi-Fi `:1076`; VPN `:1541` | `[nm]` | 🟡 panel icon ✅; tile is now a QuickMenuToggle — arrow opens an in-menu detail card (header + **Network Settings** row); body opens settings. **In-menu enable/disable, Wi-Fi list, VPN ⬜** (need NM writes); no SSID label |
 | Q7 | **bluetooth** | bluetooth icon | `BluetoothToggle` + device-list submenu | `js/ui/status/bluetooth.js:442`; built `panel.js:312-319`; icon `:450`; toggle `:273,453`; device item `:201` | `[dbus:bluez]` | ⬜ |
 | Q8 | **power profiles** | profile icon | `PowerProfilesToggle` + profile submenu | `js/ui/status/powerProfiles.js:134`; icon `:139`; toggle `:42,150`; section `:75` | `[dbus:power-profiles-daemon]` | ⬜ |
 | Q9 | **night light** | `night-light-symbolic` | `NightLightToggle` (plain) | `js/ui/status/nightLight.js:38`; icon `:43`; toggle `:16-21,46` | `[self]` gsettings | ✅ |
@@ -160,11 +160,16 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 | Q19 | **background apps** | none | `BackgroundAppsToggle` flat-menu list of running background apps | `js/ui/status/backgroundApps.js:251`; toggle `:137-147,256`; item `:35` | `[subsystem]` app/portal tracking | ⬜ |
 
 ### QS framework gaps
-- **`QuickMenuToggle`** — a toggle with an expand-arrow opening an in-menu **detail view** (device
-  lists, profile lists, Wi-Fi networks). We only have plain on/off tiles + open-settings. This is the
-  prerequisite for Q6/Q7/Q8's in-menu submenus. (Upstream base classes in `js/ui/quickSettings.js`:
-  `QuickToggle`, `QuickMenuToggle`, `QuickSlider`, `QuickToggleMenu`.)
-- **Shutdown submenu** in the system row (Q1) — needs the same submenu affordance.
+- **`QuickMenuToggle`** — ✅ **framework landed** (`src/ui/quick_settings.rs`): a menu tile split into
+  a toggle-body + expand-arrow whose arrow opens an in-menu **detail view** (a `%card` with a header +
+  action rows) pinned below its owner's row, growing the menu and shifting the rows below down. Keyed
+  by identity (`DetailOwner`), one open at a time, no new `PopoverAction` (open/close is internal +
+  `Consumed`; rows are `Spawn`). Consumers so far: the **Network** tile (arrow → header + Network
+  Settings row) and the **power button** (Q1 session submenu). This is the prerequisite for Q6/Q7/Q8's
+  in-menu device/profile lists — each now just adds a `DetailOwner` arm (`header`/`rows`/`row_count`/
+  `anchor_row_bottom`) + the backend to enumerate/act. Deferred v1 polish: slide-down grow animation,
+  dim-the-rest, per-row hover, split-radius tile look.
+- **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
 
 ---
 
@@ -209,14 +214,17 @@ carved these out as separate work — none block R1 for daily use:
    surface actually gates on it.
 
 **Tier 2 — reuses backends already wired:**
-5. Q3 microphone input slider + mic privacy icon — PipeWire is already integrated.
+5. Q3 microphone input slider (privacy icon ✅) — PipeWire is already integrated.
 6. Q13 promote airplane to a standalone rfkill toggle + panel icon — NM `WirelessEnabled` already read.
-7. Q2 output-device picker submenu — needs the QuickMenuToggle framework (do after #10).
+7. Q2 output-device picker submenu — **framework now landed**; needs sink enumeration + set-default
+   (pipewire already tracks the `sinks` map; add a `DetailOwner` arm hung off the slider's menu-button).
 
 **Tier 3 — new system-bus watchers (same pattern as `src/dbus/system_status.rs`):**
 8. Q7 bluetooth (bluez).
 9. Q8 power profiles (power-profiles-daemon).
-10. **QuickMenuToggle detail-view framework** — unlocks Q6 Wi-Fi list, Q7 device list, Q2 device picker.
+10. ✅ **QuickMenuToggle detail-view framework** — done (`2f7d2b0a`/`16d81fc9`); consumers so far
+    Network tile + Q1 power submenu. Unlocks Q6 Wi-Fi list, Q7 device list, Q2 device picker, Q8
+    profiles — each adds a `DetailOwner` arm + its backend.
 11. Q4 brightness slider (gsd/logind).
 12. R4 a11y menu (gsettings).
 
@@ -224,6 +232,3 @@ carved these out as separate work — none block R1 for daily use:
 13. Notification server (`org.freedesktop.Notifications`) → C2 dot + C3 message list.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
-
-**Decide tomorrow:** confirm Tier-1 order and whether to start the QuickMenuToggle framework early
-(it gates several Tier-2/3 items).
