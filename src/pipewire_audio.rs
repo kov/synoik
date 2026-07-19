@@ -26,7 +26,7 @@ use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
 use pipewire::main_loop::MainLoopRc;
 use pipewire::metadata::{Metadata, MetadataListener};
-use pipewire::node::{Node, NodeListener};
+use pipewire::node::{Node, NodeInfoRef, NodeListener};
 use pipewire::properties::PropertiesBox;
 use pipewire::registry::{GlobalObject, Listener as RegistryListener, RegistryRc};
 use pipewire::spa::param::ParamType;
@@ -38,7 +38,7 @@ use pipewire::spa::sys::{
 };
 use pipewire::types::ObjectType;
 
-use crate::audio::{pw_linear_to_volume, volume_to_pw_linear, AudioStatus, MAX_VOLUME};
+use crate::audio::{pw_linear_to_volume, volume_to_pw_linear, AudioStatus, MicStatus, MAX_VOLUME};
 use crate::niri::State;
 
 /// The live audio connection, owned by the compositor for the whole session.
@@ -62,6 +62,26 @@ struct BoundSink {
     channels: usize,
 }
 
+/// A bound default-source node, kept alive so its `Props` (mute) events flow.
+struct BoundSource {
+    id: u32,
+    _node: Node,
+    _listener: NodeListener,
+}
+
+/// A tracked input-capture stream (`Stream/Input/Audio`): an application recording from a mic. We
+/// bind the node only to watch its run-state via `.info()` — a `Running` non-skipped stream is what
+/// makes the privacy indicator light up. The node + listener are kept alive here; dropping this
+/// entry (only ever from `on_global_remove`) unbinds it.
+struct Capture {
+    /// `application.id`, for the skip list (matched against `id` only, per gnome-shell).
+    app_id: Option<String>,
+    /// Whether the node is currently in the `Running` state (actively capturing).
+    running: bool,
+    _node: Node,
+    _listener: NodeListener,
+}
+
 #[derive(Default)]
 struct Inner {
     /// Registry, so the metadata callback can bind a node when the default changes.
@@ -78,6 +98,24 @@ struct Inner {
     status: AudioStatus,
     present: bool,
     dirty: Option<Option<AudioStatus>>,
+
+    // --- Microphone privacy indicator (input side) ---
+    /// Known `Audio/Source` nodes: id → (node.name, owned global for late binding).
+    sources: HashMap<u32, (String, GlobalObject<PropertiesBox>)>,
+    /// The default source's `node.name`, from `default.audio.source`.
+    default_source_name: Option<String>,
+    /// The currently-bound default source (for its mute).
+    bound_source: Option<BoundSource>,
+    /// The default source's mute, `false` when unknown (no source/metadata) — see [`MicStatus`].
+    mic_muted: bool,
+    /// Active input-capture streams: node id → [`Capture`]. Mutated ONLY from registry callbacks
+    /// (`on_global`/`on_global_remove`); the per-node `.info()` callback only flips `running`.
+    captures: HashMap<u32, Capture>,
+    /// The last mic status handed to the compositor, so we publish only on an actual change
+    /// (`.info()` fires for non-state changes too).
+    mic_last: Option<MicStatus>,
+    /// A mic status the compositor hasn't drained yet.
+    mic_dirty: Option<MicStatus>,
 }
 
 impl Inner {
@@ -88,6 +126,24 @@ impl Inner {
             self.status = s;
         }
         self.dirty = Some(status);
+    }
+
+    /// Recompute the mic status from the current captures + source mute, and flag it for the
+    /// compositor only if it actually changed.
+    fn publish_mic(&mut self) {
+        let recording = crate::audio::is_recording(
+            self.captures
+                .values()
+                .map(|c| (c.app_id.as_deref(), c.running)),
+        );
+        let status = MicStatus {
+            recording,
+            muted: self.mic_muted,
+        };
+        if self.mic_last != Some(status) {
+            self.mic_last = Some(status);
+            self.mic_dirty = Some(status);
+        }
     }
 }
 
@@ -121,9 +177,17 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
             let inner = inner.clone();
             move |_, wrapper, state: &mut State| {
                 wrapper.0.loop_().iterate(Duration::ZERO);
-                let dirty = inner.borrow_mut().dirty.take();
+                // Drain both signals under one borrow, then release it before calling into State
+                // (which redraws) so nothing can re-enter a borrowed Inner.
+                let (dirty, mic_dirty) = {
+                    let mut inner = inner.borrow_mut();
+                    (inner.dirty.take(), inner.mic_dirty.take())
+                };
                 if let Some(status) = dirty {
                     state.on_audio_status(status);
+                }
+                if let Some(mic) = mic_dirty {
+                    state.on_mic_status(mic);
                 }
                 Ok(PostAction::Continue)
             }
@@ -146,6 +210,12 @@ impl PwAudio {
     pub fn status(&self) -> Option<AudioStatus> {
         let inner = self.inner.borrow();
         inner.present.then_some(inner.status)
+    }
+
+    /// The last-known microphone activity (recording + mute). `None` until the first capture stream
+    /// is seen; the compositor treats `None` as "not recording".
+    pub fn mic_status(&self) -> Option<MicStatus> {
+        self.inner.borrow().mic_last
     }
 
     /// Set the perceptual volume (clamped to `[0, MAX_VOLUME]`) on the default sink.
@@ -216,20 +286,39 @@ fn on_global(
     match obj.type_ {
         ObjectType::Node => {
             let Some(props) = obj.props else { return };
-            if props.get("media.class") != Some("Audio/Sink") {
-                return;
-            }
-            let Some(name) = props.get("node.name") else {
+            let Some(class) = props.get("media.class") else {
                 return;
             };
-            let name = name.to_string();
-            let mut inner = inner_rc.borrow_mut();
-            inner.sinks.insert(obj.id, (name.clone(), obj.to_owned()));
-            // If this is the default sink and nothing is bound yet, bind it now.
-            if inner.default_name.as_deref() == Some(name.as_str())
-                && inner.bound.as_ref().map(|b| b.id) != Some(obj.id)
-            {
-                bind_default(&mut inner, weak);
+            if class == "Audio/Sink" {
+                let Some(name) = props.get("node.name") else {
+                    return;
+                };
+                let name = name.to_string();
+                let mut inner = inner_rc.borrow_mut();
+                inner.sinks.insert(obj.id, (name.clone(), obj.to_owned()));
+                // If this is the default sink and nothing is bound yet, bind it now.
+                if inner.default_name.as_deref() == Some(name.as_str())
+                    && inner.bound.as_ref().map(|b| b.id) != Some(obj.id)
+                {
+                    bind_default(&mut inner, weak);
+                }
+            } else if class.starts_with("Audio/Source") {
+                // Prefix, not exact: virtual/processed mics (echo-cancel, the default source on
+                // many laptops) are `Audio/Source/Virtual`.
+                let Some(name) = props.get("node.name") else {
+                    return;
+                };
+                let name = name.to_string();
+                let mut inner = inner_rc.borrow_mut();
+                inner.sources.insert(obj.id, (name.clone(), obj.to_owned()));
+                if inner.default_source_name.as_deref() == Some(name.as_str())
+                    && inner.bound_source.as_ref().map(|b| b.id) != Some(obj.id)
+                {
+                    bind_default_source(&mut inner, weak);
+                }
+            } else if class == "Stream/Input/Audio" {
+                // An application recording from a mic. Bind it to watch its run-state.
+                track_capture(&inner_rc, weak, obj, props);
             }
         }
         ObjectType::Metadata => {
@@ -271,9 +360,19 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     };
     let mut inner = inner_rc.borrow_mut();
     inner.sinks.remove(&id);
+    inner.sources.remove(&id);
     if inner.bound.as_ref().map(|b| b.id) == Some(id) {
         inner.bound = None;
         inner.publish(None);
+    }
+    if inner.bound_source.as_ref().map(|b| b.id) == Some(id) {
+        inner.bound_source = None;
+        inner.mic_muted = false; // mute state is now unknown → treat as a privacy event
+        inner.publish_mic();
+    }
+    // A recording stream going away recomputes the indicator.
+    if inner.captures.remove(&id).is_some() {
+        inner.publish_mic();
     }
 }
 
@@ -284,9 +383,14 @@ fn on_metadata_property(
     key: Option<&str>,
     value: Option<&str>,
 ) {
-    if subject != 0 || key != Some("default.audio.sink") {
+    if subject != 0 {
         return;
     }
+    let is_source = match key {
+        Some("default.audio.sink") => false,
+        Some("default.audio.source") => true,
+        _ => return,
+    };
     let Some(name) = value.and_then(parse_metadata_name) else {
         return;
     };
@@ -294,11 +398,19 @@ fn on_metadata_property(
         return;
     };
     let mut inner = inner_rc.borrow_mut();
-    if inner.default_name.as_deref() == Some(name.as_str()) {
-        return;
+    if is_source {
+        if inner.default_source_name.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        inner.default_source_name = Some(name);
+        bind_default_source(&mut inner, weak);
+    } else {
+        if inner.default_name.as_deref() == Some(name.as_str()) {
+            return;
+        }
+        inner.default_name = Some(name);
+        bind_default(&mut inner, weak);
     }
-    inner.default_name = Some(name);
-    bind_default(&mut inner, weak);
 }
 
 /// Bind the node named by `default_name` (if it's a known sink) and subscribe to
@@ -347,6 +459,145 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
         _listener: listener,
         channels: 2,
     });
+}
+
+/// Bind an input-capture stream and watch its run-state via `.info()`. A `Running` non-skipped
+/// stream is what lights the mic privacy indicator. Called only from `on_global` (registry
+/// callback), the sole mutator of `captures`.
+fn track_capture(
+    inner_rc: &Rc<RefCell<Inner>>,
+    weak: &Weak<RefCell<Inner>>,
+    obj: &GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    props: &pipewire::spa::utils::dict::DictRef,
+) {
+    // Skip monitor captures — a stream recording a sink's monitor is capturing desktop audio, not
+    // the microphone. gvc drops monitor sources entirely and gnome-shell's indicator never lights
+    // for them, so tracking one here would be a false privacy alarm (e.g. a screen recorder
+    // grabbing system sound). `PW_KEY_STREAM_MONITOR` marks these.
+    if props.get("stream.monitor") == Some("true") {
+        return;
+    }
+    let app_id = props.get("application.id").map(str::to_string);
+    let id = obj.id;
+    let mut inner = inner_rc.borrow_mut();
+    let Some(registry) = inner.registry.clone() else {
+        return;
+    };
+    let node = match registry.bind::<Node, _>(obj) {
+        Ok(node) => node,
+        Err(_) => {
+            warn!("failed to bind input-capture node {id}");
+            return;
+        }
+    };
+    let listener = {
+        let weak = weak.clone();
+        node.add_listener_local()
+            .info(move |info| on_capture_info(&weak, id, info))
+            .register()
+    };
+    inner.captures.insert(
+        id,
+        Capture {
+            app_id,
+            running: false,
+            _node: node,
+            _listener: listener,
+        },
+    );
+    inner.publish_mic();
+}
+
+/// A capture node's info arrived: flip its `running` flag on a `Running`↔other transition and
+/// recompute. Only ever writes the `running` flag (never mutates the `captures` map), so it can't
+/// drop the very entry it's called for.
+fn on_capture_info(weak: &Weak<RefCell<Inner>>, id: u32, info: &NodeInfoRef) {
+    // Read the raw state, NOT `NodeInfoRef::state()`: that accessor dereferences the node's error
+    // string (UB on NULL) and `.unwrap()`s its UTF-8 for the `Error` variant, and panics on any
+    // unknown state — a panic here aborts the compositor from a C callback. We only need "is it
+    // Running", so compare the raw enum: any other state (incl. Error/unknown) is "not recording".
+    let running = info.as_raw().state == pipewire::sys::pw_node_state_PW_NODE_STATE_RUNNING;
+    let Some(inner_rc) = weak.upgrade() else {
+        return;
+    };
+    let mut inner = inner_rc.borrow_mut();
+    match inner.captures.get_mut(&id) {
+        Some(cap) if cap.running != running => cap.running = running,
+        _ => return, // unknown id, or no state change
+    }
+    inner.publish_mic();
+}
+
+/// Bind the node named by `default_source_name` (if it's a known source) and subscribe to its
+/// `Props` for the mute flag. Mirrors [`bind_default`].
+fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
+    let Some(name) = inner.default_source_name.clone() else {
+        return;
+    };
+    let Some(registry) = inner.registry.clone() else {
+        return;
+    };
+    let Some(id) = inner
+        .sources
+        .iter()
+        .find(|(_, (n, _))| *n == name)
+        .map(|(id, _)| *id)
+    else {
+        return; // node not surfaced yet; on_global will bind it when it appears
+    };
+    if inner.bound_source.as_ref().map(|b| b.id) == Some(id) {
+        return;
+    }
+    let node = match registry.bind::<Node, _>(&inner.sources[&id].1) {
+        Ok(node) => node,
+        Err(_) => {
+            warn!("failed to bind default audio source node {id}");
+            return;
+        }
+    };
+    let listener = {
+        let weak = weak.clone();
+        node.add_listener_local()
+            .param(move |_seq, _id, _index, _next, pod| {
+                if let Some(pod) = pod {
+                    on_source_param(&weak, pod);
+                }
+            })
+            .register()
+    };
+    node.subscribe_params(&[ParamType::Props]);
+    inner.bound_source = Some(BoundSource {
+        id,
+        _node: node,
+        _listener: listener,
+    });
+}
+
+/// A default-source `Props` param arrived: pull `mute` and recompute the mic status.
+// The SPA property constant keeps its C mixed-case name; matched as a constant.
+#[allow(non_upper_case_globals)]
+fn on_source_param(weak: &Weak<RefCell<Inner>>, pod: &Pod) {
+    let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+    else {
+        return;
+    };
+    let mut muted: Option<bool> = None;
+    for prop in &obj.properties {
+        if let (SPA_PROP_mute, Value::Bool(b)) = (prop.key, &prop.value) {
+            muted = Some(*b);
+        }
+    }
+    let Some(muted) = muted else {
+        return;
+    };
+    let Some(inner_rc) = weak.upgrade() else {
+        return;
+    };
+    let mut inner = inner_rc.borrow_mut();
+    if inner.mic_muted != muted {
+        inner.mic_muted = muted;
+        inner.publish_mic();
+    }
 }
 
 /// A `Props` param arrived: pull `channelVolumes` + `mute` and publish.

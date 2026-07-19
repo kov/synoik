@@ -38,6 +38,37 @@ impl Default for AudioStatus {
     }
 }
 
+/// A snapshot of microphone (input) activity for the panel privacy indicator — the fork's model
+/// behind gnome-shell's `InputIndicator` (`js/ui/status/volume.js`). Fed by the PipeWire watcher;
+/// carries no rendering or PipeWire dependency (stays [`Default`] — not recording — where the audio
+/// backend is absent, e.g. headless).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MicStatus {
+    /// A non-skipped application is actively capturing (a running input stream).
+    pub recording: bool,
+    /// The default source is muted — a muted mic is no privacy concern, so the panel drops the
+    /// tint. Defaults `false` (→ tinted) when the mute state is unknown (no source/metadata): an
+    /// active capture whose mute we can't read is still a privacy event, so understating it white
+    /// would be wrong. This diverges from gnome-shell, which shows un-tinted when there's no
+    /// stream.
+    pub muted: bool,
+}
+
+/// Apps the mic privacy indicator ignores — they open capture only to display input levels, so
+/// they aren't a real recording. Matches gnome-shell's `_maybeShowInput` skip list
+/// (`js/ui/status/volume.js`), compared against `application.id` only (never `application.name`).
+pub const MIC_SKIP_APP_IDS: &[&str] = &["org.gnome.VolumeControl", "org.PulseAudio.pavucontrol"];
+
+/// Whether any non-skipped application is actively recording, given `(application.id, running)` for
+/// each input-capture stream. Pure, so the PipeWire recording signal can be unit-tested. A stream
+/// counts only when its node is in the `Running` state (an idle/corked stream — e.g. a browser
+/// holding an open-but-paused mic — must not pin the indicator).
+pub fn is_recording<'a>(streams: impl IntoIterator<Item = (Option<&'a str>, bool)>) -> bool {
+    streams.into_iter().any(|(app_id, running)| {
+        running && !app_id.is_some_and(|id| MIC_SKIP_APP_IDS.contains(&id))
+    })
+}
+
 /// The symbolic icon for the current output volume, mirroring gnome-shell's
 /// `StreamSlider.getIcon`: muted (or ≤0) shows the muted glyph; otherwise the level
 /// buckets into low/medium/high at the ⅓ and ⅔ marks (`n = clamp(ceil(3·v), 1, 3)`).
@@ -100,6 +131,24 @@ mod tests {
         assert_eq!(volume_icon(&at(0.67, false)), "audio-volume-high-symbolic");
         assert_eq!(volume_icon(&at(1.0, false)), "audio-volume-high-symbolic");
         assert_eq!(volume_icon(&at(1.5, false)), "audio-volume-high-symbolic");
+    }
+
+    #[test]
+    fn recording_requires_a_running_non_skipped_stream() {
+        // No streams, or only idle ones → not recording.
+        assert!(!is_recording(std::iter::empty()));
+        assert!(!is_recording([(Some("org.mozilla.firefox"), false)]));
+        // A running non-skipped stream → recording.
+        assert!(is_recording([(Some("org.mozilla.firefox"), true)]));
+        assert!(is_recording([(None, true)])); // native clients often have no application.id
+                                               // Skipped apps don't count even while running…
+        assert!(!is_recording([(Some("org.PulseAudio.pavucontrol"), true)]));
+        assert!(!is_recording([(Some("org.gnome.VolumeControl"), true)]));
+        // …but a real recorder alongside a skipped monitor still counts.
+        assert!(is_recording([
+            (Some("org.PulseAudio.pavucontrol"), true),
+            (Some("org.mozilla.firefox"), true),
+        ]));
     }
 
     #[test]

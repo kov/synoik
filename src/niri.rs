@@ -378,6 +378,9 @@ pub struct Niri {
     /// Default audio-sink state (volume + mute) for the panel output indicator and
     /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
     pub audio: Option<crate::audio::AudioStatus>,
+    /// Microphone activity (recording + mute) for the panel privacy indicator; default = not
+    /// recording (also the value where the PipeWire backend is absent, e.g. headless).
+    pub mic: crate::audio::MicStatus,
     /// The live PipeWire audio connection (feature `audio`); its loop is driven on
     /// the compositor's calloop. `None` when the connection failed or is disabled.
     #[cfg(feature = "pipewire")]
@@ -2505,6 +2508,15 @@ impl State {
         }
     }
 
+    /// The PipeWire watcher reports a change in microphone activity (recording / mute); update the
+    /// panel privacy indicator.
+    pub fn on_mic_status(&mut self, mic: crate::audio::MicStatus) {
+        self.niri.mic = mic;
+        if self.niri.panel.set_mic(mic) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
     #[cfg(feature = "dbus")]
     pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToNiri) {
         use crate::dbus::gnome_shell::GnomeShellToNiri;
@@ -3022,6 +3034,7 @@ impl Niri {
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
             audio: None,
+            mic: crate::audio::MicStatus::default(),
             #[cfg(feature = "pipewire")]
             pw_audio: None,
             system_status: SystemStatus::default(),

@@ -43,7 +43,7 @@ use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
-use crate::audio::AudioStatus;
+use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
@@ -210,6 +210,44 @@ const QS_ANCHOR_ICONS: &[&str] = &[
 /// (GNOME shows the DND icon in the panel; the others are our own touch).
 const QS_DND_ICONS: &[&str] = &["notifications-disabled-symbolic"];
 const QS_NIGHT_ICONS: &[&str] = &["night-light-symbolic"];
+/// Mic privacy icon (GNOME's `InputIndicator`): the sensitivity glyph while an unmuted app records,
+/// the muted glyph when the source is muted. `audio-input-microphone-symbolic` is the
+/// widely-shipped fallback if `microphone-sensitivity-*` is absent on a host.
+const QS_MIC_ICONS: &[&str] = &[
+    "microphone-sensitivity-high-symbolic",
+    "audio-input-microphone-symbolic",
+];
+const QS_MIC_MUTED_ICONS: &[&str] = &[
+    "microphone-sensitivity-muted-symbolic",
+    "audio-input-microphone-symbolic",
+];
+/// GNOME's privacy-indicator tint (`$orange_3`, #ff7800), applied to the mic icon while an unmuted
+/// app is recording (a muted mic drops the tint — no privacy concern).
+const PRIVACY_ORANGE: [f32; 4] = [1., 0x78 as f32 / 255., 0., 1.];
+
+/// Pack an RGBA tint into a hashable key byte-quad for the `qs_icons` upload cache.
+fn color_key(c: [f32; 4]) -> [u8; 4] {
+    [
+        (c[0] * 255.) as u8,
+        (c[1] * 255.) as u8,
+        (c[2] * 255.) as u8,
+        (c[3] * 255.) as u8,
+    ]
+}
+
+/// The mic privacy indicator's icon candidates + tint, or `None` when nothing is recording. Shown
+/// (tinted orange) while an unmuted app captures; muted → the muted glyph, untinted.
+fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
+    if !mic.recording {
+        return None;
+    }
+    let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if mic.muted {
+        Some((owned(QS_MIC_MUTED_ICONS), TEXT))
+    } else {
+        Some((owned(QS_MIC_ICONS), PRIVACY_ORANGE))
+    }
+}
 
 /// The candidate icon-name lists for the quick-settings indicator, left-to-right:
 /// active toggle touches (DND / Night Light), then the live system cluster
@@ -220,27 +258,33 @@ fn qs_indicator_icons(
     toggles: QuickToggles,
     status: &SystemStatus,
     audio: Option<AudioStatus>,
-) -> Vec<Vec<String>> {
+    mic: MicStatus,
+) -> Vec<(Vec<String>, [f32; 4])> {
     let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    let mut v: Vec<Vec<String>> = Vec::new();
+    let mut v: Vec<(Vec<String>, [f32; 4])> = Vec::new();
     if toggles.do_not_disturb {
-        v.push(owned(QS_DND_ICONS));
+        v.push((owned(QS_DND_ICONS), TEXT));
     }
     if toggles.night_light {
-        v.push(owned(QS_NIGHT_ICONS));
+        v.push((owned(QS_NIGHT_ICONS), TEXT));
     }
     if let Some(candidates) = system_status::network_icon(status.network) {
-        v.push(owned(candidates));
+        v.push((owned(candidates), TEXT));
     }
     if let Some(audio) = audio {
-        v.push(vec![crate::audio::volume_icon(&audio).to_string()]);
+        v.push((vec![crate::audio::volume_icon(&audio).to_string()], TEXT));
     }
     if let Some(battery) = &status.battery {
-        v.push(system_status::battery_icon(battery));
+        v.push((system_status::battery_icon(battery), TEXT));
+    }
+    // The mic privacy icon leads the cluster (GNOME inserts privacy indicators at the front,
+    // `panel.js`), tinted orange while recording unmuted.
+    if let Some(mic_icon) = mic_indicator_icon(mic) {
+        v.insert(0, mic_icon);
     }
     if v.is_empty() {
-        v.push(owned(QS_ANCHOR_ICONS));
+        v.push((owned(QS_ANCHOR_ICONS), TEXT));
     }
     v
 }
@@ -251,8 +295,9 @@ fn qs_indicator_width(
     toggles: QuickToggles,
     status: &SystemStatus,
     audio: Option<AudioStatus>,
+    mic: MicStatus,
 ) -> f64 {
-    let n = qs_indicator_icons(toggles, status, audio).len() as f64;
+    let n = qs_indicator_icons(toggles, status, audio, mic).len() as f64;
     2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
 }
 
@@ -339,9 +384,10 @@ struct BarCache {
     /// the count sets the checked-highlight width, and the count + active index
     /// place the workspace dots (drawn into the bar as rounded rects).
     textures: HashMap<(NotNan<f64>, i32, usize, usize), VkTexture>,
-    /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name).
-    /// Always tinted white, so the name is the only content key.
-    qs_icons: HashMap<(NotNan<f64>, String), TextureBuffer<VkTexture>>,
+    /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name, tint). The tint is
+    /// part of the key because the mic privacy icon uploads orange while the rest are white — the
+    /// same name at two colors must not collide.
+    qs_icons: HashMap<(NotNan<f64>, String, [u8; 4]), TextureBuffer<VkTexture>>,
 }
 
 impl BarCache {
@@ -389,6 +435,9 @@ pub struct Panel {
     /// Default-sink audio state (from the PipeWire watcher); its speaker icon sits
     /// in the status cluster between network and battery.
     audio: Option<AudioStatus>,
+    /// Microphone activity (from the PipeWire watcher); its privacy icon leads the status cluster
+    /// while an app is recording. Default = not recording.
+    mic: MicStatus,
     /// Active screen recording, if any (mirrored from the screencast ledger). Drives
     /// the standalone `screenRecording` indicator — a red pill with the `M:SS`
     /// elapsed label and a stop glyph, leftmost in the right box.
@@ -433,6 +482,7 @@ impl Panel {
             toggles: QuickToggles::default(),
             system_status: SystemStatus::default(),
             audio: None,
+            mic: MicStatus::default(),
             recording: None,
             keyboard_layout: None,
             clock,
@@ -474,6 +524,18 @@ impl Panel {
             return false;
         }
         self.audio = audio;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// Adopt the live microphone activity (from the PipeWire watcher). Returns whether it changed,
+    /// so the caller can queue a redraw; the cluster's mic privacy icon (presence/tint) and width
+    /// may differ. Clearing the cache drops any stale-tinted mic texture.
+    pub fn set_mic(&mut self, mic: MicStatus) -> bool {
+        if mic == self.mic {
+            return false;
+        }
+        self.mic = mic;
         self.cache.borrow_mut().clear();
         true
     }
@@ -754,7 +816,7 @@ impl Panel {
     fn right_box_role_width(&self, role: &str) -> f64 {
         match role {
             ROLE_QUICK_SETTINGS => {
-                qs_indicator_width(self.toggles, &self.system_status, self.audio)
+                qs_indicator_width(self.toggles, &self.system_status, self.audio, self.mic)
             }
             ROLE_SCREEN_RECORDING => self.recording_width(),
             ROLE_KEYBOARD => self.keyboard_width(),
@@ -909,7 +971,7 @@ impl Panel {
                 .iter()
                 .find_map(|n| icons.buffer(n, R1_ICON, scale, TEXT).map(|b| (*n, b)))
             {
-                let key = (scale_key, name.to_string());
+                let key = (scale_key, name.to_string(), color_key(TEXT));
                 #[allow(clippy::map_entry)]
                 if !cache.qs_icons.contains_key(&key) {
                     if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
@@ -1039,17 +1101,19 @@ impl Panel {
     ) {
         let rect = self.quick_settings_rect(output_width);
         let mut x = rect.loc.x + INDICATOR_H_PADDING;
-        for candidates in qs_indicator_icons(self.toggles, &self.system_status, self.audio) {
-            // Resolve the first candidate that rasterizes, then cache its upload.
+        for (candidates, color) in
+            qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
+        {
+            // Resolve the first candidate that rasterizes (in its tint), then cache its upload.
             let Some((name, buffer)) = candidates.iter().find_map(|name| {
                 icons
-                    .buffer(name, QS_ICON, scale, TEXT)
+                    .buffer(name, QS_ICON, scale, color)
                     .map(|b| (name.to_string(), b))
             }) else {
                 x += QS_ICON + QS_ICON_GAP;
                 continue;
             };
-            let key = (scale_key, name);
+            let key = (scale_key, name, color_key(color));
             #[allow(clippy::map_entry)]
             if !cache.qs_icons.contains_key(&key) {
                 match TextureBuffer::from_memory_buffer(renderer, &buffer) {
@@ -1396,11 +1460,13 @@ mod tests {
 
         let toggles = QuickToggles::default();
 
+        let no_mic = MicStatus::default();
+
         // Empty status → the single anchor fallback.
         let empty = SystemStatus::default();
-        let icons = qs_indicator_icons(toggles, &empty, None);
+        let icons = qs_indicator_icons(toggles, &empty, None, no_mic);
         assert_eq!(icons.len(), 1);
-        assert_eq!(icons[0][0], QS_ANCHOR_ICONS[0]);
+        assert_eq!(icons[0].0[0], QS_ANCHOR_ICONS[0]);
 
         // Wired + battery → network then battery, no anchor.
         let status = SystemStatus {
@@ -1410,12 +1476,12 @@ mod tests {
                 percentage: 90.,
             }),
         };
-        let icons = qs_indicator_icons(toggles, &status, None);
+        let icons = qs_indicator_icons(toggles, &status, None, no_mic);
         assert_eq!(icons.len(), 2);
-        assert_eq!(icons[0][0], "network-wired-symbolic");
-        assert_eq!(icons[1][0], "battery-level-90-symbolic");
+        assert_eq!(icons[0].0[0], "network-wired-symbolic");
+        assert_eq!(icons[1].0[0], "battery-level-90-symbolic");
         assert!(
-            !icons.iter().any(|c| c[0] == QS_ANCHOR_ICONS[0]),
+            !icons.iter().any(|c| c.0[0] == QS_ANCHOR_ICONS[0]),
             "no anchor icon once the cluster is populated"
         );
 
@@ -1424,11 +1490,11 @@ mod tests {
             volume: 0.5,
             muted: false,
         });
-        let icons = qs_indicator_icons(toggles, &status, audio);
+        let icons = qs_indicator_icons(toggles, &status, audio, no_mic);
         assert_eq!(icons.len(), 3);
-        assert_eq!(icons[0][0], "network-wired-symbolic");
-        assert_eq!(icons[1][0], "audio-volume-medium-symbolic");
-        assert_eq!(icons[2][0], "battery-level-90-symbolic");
+        assert_eq!(icons[0].0[0], "network-wired-symbolic");
+        assert_eq!(icons[1].0[0], "audio-volume-medium-symbolic");
+        assert_eq!(icons[2].0[0], "battery-level-90-symbolic");
 
         // The populated cluster is wider than the anchor fallback.
         let base = test_panel().quick_settings_rect(1920.).size.w;
@@ -1439,6 +1505,57 @@ mod tests {
             wide > base,
             "the cluster ({wide}) should be wider than the anchor fallback ({base})"
         );
+    }
+
+    /// The mic privacy icon leads the cluster (leftmost) while recording, tinted orange when
+    /// unmuted and drawn muted-untinted when the source is muted; it widens the cluster and
+    /// disappears when recording stops. Pure/structural, no GPU.
+    #[test]
+    fn mic_privacy_icon_leads_the_cluster_when_recording() {
+        use crate::system_status::{NetworkStatus, SystemStatus};
+
+        let toggles = QuickToggles::default();
+        let wired = || SystemStatus {
+            network: NetworkStatus::Wired,
+            battery: None,
+        };
+
+        // Not recording → no mic icon at all.
+        let icons = qs_indicator_icons(toggles, &wired(), None, MicStatus::default());
+        assert!(!icons.iter().any(|(c, _)| c[0].starts_with("microphone")));
+
+        // Recording + unmuted → mic icon FIRST, tinted orange, network still after it.
+        let rec = MicStatus {
+            recording: true,
+            muted: false,
+        };
+        let icons = qs_indicator_icons(toggles, &wired(), None, rec);
+        assert_eq!(icons[0].0[0], "microphone-sensitivity-high-symbolic");
+        assert_eq!(icons[0].1, PRIVACY_ORANGE);
+        assert!(icons.iter().any(|(c, _)| c[0] == "network-wired-symbolic"));
+
+        // Recording + muted → the muted glyph, untinted (white, no privacy concern).
+        let muted = MicStatus {
+            recording: true,
+            muted: true,
+        };
+        let icons = qs_indicator_icons(toggles, &wired(), None, muted);
+        assert_eq!(icons[0].0[0], "microphone-sensitivity-muted-symbolic");
+        assert_eq!(icons[0].1, TEXT);
+
+        // Recording widens the cluster (mic ADDS to the network icon), and clearing narrows it.
+        let mut panel = test_panel();
+        panel.set_system_status(wired());
+        let base = panel.quick_settings_rect(1920.).size.w;
+        assert!(panel.set_mic(rec));
+        let wide = panel.quick_settings_rect(1920.).size.w;
+        assert!(
+            wide > base,
+            "recording widens the cluster ({wide} vs {base})"
+        );
+        assert!(panel.set_mic(MicStatus::default()));
+        assert_eq!(panel.quick_settings_rect(1920.).size.w, base);
+        assert!(!panel.set_mic(MicStatus::default()), "no-op re-set");
     }
 
     /// The panel exposes both roles in their boxes (extension-representable model).
