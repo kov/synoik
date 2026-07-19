@@ -96,10 +96,10 @@ impl Inner {
 pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio> {
     let main_loop = MainLoopRc::new(None).context("creating pipewire MainLoop")?;
     let context = ContextRc::new(&main_loop, None).context("creating pipewire Context")?;
-    let core = context
-        .connect_rc(None)
-        .context("connecting to pipewire")?;
-    let registry = core.get_registry_rc().context("getting pipewire registry")?;
+    let core = context.connect_rc(None).context("connecting to pipewire")?;
+    let registry = core
+        .get_registry_rc()
+        .context("getting pipewire registry")?;
 
     let inner = Rc::new(RefCell::new(Inner::default()));
     inner.borrow_mut().registry = Some(registry.clone());
@@ -206,7 +206,10 @@ impl AsFd for AsFdWrapper {
 }
 
 /// A new global appeared: track `Audio/Sink` nodes and bind the `default` metadata.
-fn on_global(weak: &Weak<RefCell<Inner>>, obj: &GlobalObject<&pipewire::spa::utils::dict::DictRef>) {
+fn on_global(
+    weak: &Weak<RefCell<Inner>>,
+    obj: &GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+) {
     let Some(inner_rc) = weak.upgrade() else {
         return;
     };
@@ -363,9 +366,10 @@ fn on_node_param(weak: &Weak<RefCell<Inner>>, pod: &Pod) {
             (SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(vols))) => {
                 channels = Some(vols.len());
                 // gvc exposes a single volume: the loudest channel.
-                linear = vols.iter().map(|v| *v as f64).fold(None, |acc, v| {
-                    Some(acc.map_or(v, |a: f64| a.max(v)))
-                });
+                linear = vols
+                    .iter()
+                    .map(|v| *v as f64)
+                    .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))));
             }
             (SPA_PROP_volume, Value::Float(v)) => mono = Some(*v as f64),
             (SPA_PROP_mute, Value::Bool(b)) => muted = Some(*b),
@@ -382,7 +386,9 @@ fn on_node_param(weak: &Weak<RefCell<Inner>>, pod: &Pod) {
         }
     }
     // Props events can be partial; fall back to the last-known values.
-    let linear = linear.or(mono).unwrap_or_else(|| volume_to_pw_linear(inner.status.volume));
+    let linear = linear
+        .or(mono)
+        .unwrap_or_else(|| volume_to_pw_linear(inner.status.volume));
     let muted = muted.unwrap_or(inner.status.muted);
     inner.publish(Some(AudioStatus {
         volume: pw_linear_to_volume(linear),

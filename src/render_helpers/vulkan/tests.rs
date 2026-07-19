@@ -558,17 +558,19 @@ fn vulkan_rounded_texture_partial_src() {
 }
 
 /// The rounded solid-fill primitive (`render_rounded_rect` → `sdf_rect.frag`) fills its rect with a
-/// solid color, cuts the corners to the SDF disc — revealing the background it was drawn *over*, not
-/// a transparent hole — keeps the corner arc-center opaque (an SDF disc, not a square clip), and
-/// antialiases the boundary. This is the exact quick-settings-tile scenario: a rounded fill drawn
-/// INTO a hand-bound offscreen on top of an already-cleared opaque menu background — the case the
-/// overlays have been faking with CPU SDFs / glyph discs. Oracle-free structural invariants.
+/// solid color, cuts the corners to the SDF disc — revealing the background it was drawn *over*,
+/// not a transparent hole — keeps the corner arc-center opaque (an SDF disc, not a square clip),
+/// and antialiases the boundary. This is the exact quick-settings-tile scenario: a rounded fill
+/// drawn INTO a hand-bound offscreen on top of an already-cleared opaque menu background — the case
+/// the overlays have been faking with CPU SDFs / glyph discs. Oracle-free structural invariants.
 #[test]
 fn vulkan_rounded_rect_fills_and_cuts_corners() {
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skipping vulkan_rounded_rect_fills_and_cuts_corners: no Vulkan device ({e})");
+            eprintln!(
+                "skipping vulkan_rounded_rect_fills_and_cuts_corners: no Vulkan device ({e})"
+            );
             return;
         }
     };

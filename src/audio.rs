@@ -83,9 +83,15 @@ mod tests {
         assert_eq!(volume_icon(&at(0.0, false)), "audio-volume-muted-symbolic");
         // (0, 1/3] → low
         assert_eq!(volume_icon(&at(0.01, false)), "audio-volume-low-symbolic");
-        assert_eq!(volume_icon(&at(1.0 / 3.0, false)), "audio-volume-low-symbolic");
+        assert_eq!(
+            volume_icon(&at(1.0 / 3.0, false)),
+            "audio-volume-low-symbolic"
+        );
         // (1/3, 2/3] → medium
-        assert_eq!(volume_icon(&at(0.34, false)), "audio-volume-medium-symbolic");
+        assert_eq!(
+            volume_icon(&at(0.34, false)),
+            "audio-volume-medium-symbolic"
+        );
         assert_eq!(
             volume_icon(&at(2.0 / 3.0, false)),
             "audio-volume-medium-symbolic"

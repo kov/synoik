@@ -39,12 +39,12 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::audio::AudioStatus;
 use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::audio::AudioStatus;
 use crate::system_status::{self, BatteryStatus, NetworkStatus};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
@@ -526,10 +526,8 @@ impl QuickSettings {
         // The volume slider's mute/level speaker icon, in its disc.
         if let Some(audio) = self.audio {
             let disc = slider_icon_rect();
-            let center = Point::from((
-                disc.loc.x + disc.size.w / 2.,
-                disc.loc.y + disc.size.h / 2.,
-            ));
+            let center =
+                Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
             let name = crate::audio::volume_icon(&audio).to_string();
             if let Some(el) = icon_element(
                 renderer,
@@ -761,7 +759,11 @@ impl QuickSettings {
                 )?;
 
                 let handle_cx = slider_handle_x(audio.volume);
-                let fill_color = if audio.muted { SLIDER_TROUGH_BG } else { self.accent };
+                let fill_color = if audio.muted {
+                    SLIDER_TROUGH_BG
+                } else {
+                    self.accent
+                };
                 let fill = Rectangle::new(
                     trough.loc,
                     Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
@@ -968,11 +970,14 @@ mod tests {
     fn layout_places_tiles_and_system_row_within_bounds() {
         for audio in [None, Some(AudioStatus::default())] {
             let has_slider = audio.is_some();
-            let size =
-                QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, audio, [
-                    0, 0, 0,
-                ])
-                .logical_size();
+            let size = QuickSettings::new(
+                QuickToggles::default(),
+                NetworkStatus::Wired,
+                None,
+                audio,
+                [0, 0, 0],
+            )
+            .logical_size();
             let within = |r: Rectangle<f64, Logical>, what: &str| {
                 assert!(
                     r.loc.x >= 0. && r.loc.y >= 0.,
@@ -998,7 +1003,8 @@ mod tests {
                 within(slider_track_rect(), "slider track");
                 // The slider sits above the tile grid.
                 assert!(
-                    slider_row_rect().loc.y + slider_row_rect().size.h <= tile_rect(0, has_slider).loc.y + 0.01,
+                    slider_row_rect().loc.y + slider_row_rect().size.h
+                        <= tile_rect(0, has_slider).loc.y + 0.01,
                     "slider must be above the first tile row"
                 );
             }
@@ -1008,8 +1014,13 @@ mod tests {
     /// Clicking a gsettings tile flips its state and returns the matching set-action.
     #[test]
     fn clicking_a_tile_flips_and_returns_the_action() {
-        let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            None,
+            None,
+            [0, 0, 0],
+        );
         let dnd = tile_rect(2, false); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
@@ -1027,8 +1038,13 @@ mod tests {
         assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Offline));
         assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Airplane));
 
-        let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            None,
+            None,
+            [0, 0, 0],
+        );
         let before = qs.revision;
         let action = qs.pointer_click(center(tile_rect(0, false)));
         match action {
@@ -1042,8 +1058,13 @@ mod tests {
     /// The screenshot button opens the UI; the settings button spawns its command.
     #[test]
     fn clicking_system_buttons_returns_their_actions() {
-        let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            None,
+            None,
+            [0, 0, 0],
+        );
 
         let shot = qs.pointer_click(center(sys_rect(SysButton::Screenshot, false)));
         assert!(matches!(shot, PopoverAction::Screenshot));
@@ -1083,8 +1104,13 @@ mod tests {
     /// A click in empty menu space is consumed but does nothing.
     #[test]
     fn clicking_empty_space_is_consumed() {
-        let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            None,
+            None,
+            [0, 0, 0],
+        );
         // Below the top system row, between the two tile columns.
         let action = qs.pointer_click(Point::from((menu_w() / 2., PAD + SYS_H + 2.)));
         assert!(matches!(action, PopoverAction::Consumed));
@@ -1145,7 +1171,8 @@ mod tests {
         );
 
         // The tile's corner is cut to the pill: a deep-corner pixel reveals the dark MENU_BG
-        // beneath, not the accent — proving `render_rounded_rect` rounded the tile in the offscreen.
+        // beneath, not the accent — proving `render_rounded_rect` rounded the tile in the
+        // offscreen.
         let kx = (r0.loc.x + 2.) as i32;
         let ky = (r0.loc.y + 2.) as i32;
         let k = ((ky * size.w + kx) * 4) as usize;

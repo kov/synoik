@@ -43,12 +43,12 @@ use smithay::output::Output;
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::audio::AudioStatus;
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::audio::AudioStatus;
 use crate::system_status::{self, SystemStatus};
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -209,7 +209,11 @@ fn qs_indicator_icons(
 
 /// Logical width of the right-box quick-settings indicator (padding + icons +
 /// gaps). Depends on how many status icons are currently shown.
-fn qs_indicator_width(toggles: QuickToggles, status: &SystemStatus, audio: Option<AudioStatus>) -> f64 {
+fn qs_indicator_width(
+    toggles: QuickToggles,
+    status: &SystemStatus,
+    audio: Option<AudioStatus>,
+) -> f64 {
     let n = qs_indicator_icons(toggles, status, audio).len() as f64;
     2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
 }
@@ -592,7 +596,8 @@ impl Panel {
     /// The dateMenu (clock) button rect: the shaped label plus a padding on each
     /// side, centered on the output. `output_width` is the output's logical width.
     pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let clock_w = niri_vk::text::measure_line_width_weighted(&self.clock_text, FONT_PX as f32, true);
+        let clock_w =
+            niri_vk::text::measure_line_width_weighted(&self.clock_text, FONT_PX as f32, true);
         let w = clock_w + H_PADDING * 2.;
         Rectangle::new(
             Point::from(((output_width - w) / 2., 0.)),
@@ -705,8 +710,7 @@ impl Panel {
         // integer active index, not the animated state). The switch / fill animations
         // already drive the per-frame redraws. At rest, cache as usual, drawing with the
         // exact integer index so the cached texture always matches its key.
-        let animating =
-            (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
+        let animating = (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
         let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
@@ -822,7 +826,6 @@ impl Panel {
         }
     }
 }
-
 
 /// Seconds until the next wall-clock minute boundary (1..=60), so the clock
 /// tick can align to when the displayed minute actually changes.
@@ -1177,7 +1180,9 @@ mod tests {
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("skipping draw_bar_texture_paints_workspace_dots: no Vulkan device ({e})");
+                eprintln!(
+                    "skipping draw_bar_texture_paints_workspace_dots: no Vulkan device ({e})"
+                );
                 return;
             }
         };
@@ -1259,7 +1264,9 @@ mod tests {
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("skipping draw_bar_texture_dots_morph_during_switch: no Vulkan device ({e})");
+                eprintln!(
+                    "skipping draw_bar_texture_dots_morph_during_switch: no Vulkan device ({e})"
+                );
                 return;
             }
         };
@@ -1290,7 +1297,10 @@ mod tests {
 
         let rest = peak(&mut vk, 0.); // dot 0 fully active → full white
         let mid = peak(&mut vk, 0.5); // both dots half-expanded → ~0.75 opacity, no full pillar
-        assert!(rest > 240, "resting active dot should be full white, peak {rest}");
+        assert!(
+            rest > 240,
+            "resting active dot should be full white, peak {rest}"
+        );
         assert!(
             (150..=235).contains(&mid),
             "mid-switch dots should be partial opacity, peak {mid}"
@@ -1312,8 +1322,14 @@ mod tests {
         let a = niri_vk::text::measure_line_width("12:34:56", px);
         let b = niri_vk::text::measure_line_width("12:34:07", px);
         let c = niri_vk::text::measure_line_width("18:88:88", px);
-        assert_eq!(a, b, "clock width must not depend on the digits (tabular figures)");
-        assert_eq!(a, c, "clock width must not depend on the digits (tabular figures)");
+        assert_eq!(
+            a, b,
+            "clock width must not depend on the digits (tabular figures)"
+        );
+        assert_eq!(
+            a, c,
+            "clock width must not depend on the digits (tabular figures)"
+        );
     }
 
     /// The clock's `strftime` format is assembled from the interface keys the
@@ -1436,9 +1452,16 @@ mod tests {
         panel.set_overview_open(true);
         clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
         let containers = panel.button_containers(width_px as f64, ws);
-        let mut tex =
-            draw_bar_texture(&mut vk, 1., width_px, "12:34", &containers, ws.count, ws.active as f64)
-                .expect("bar texture");
+        let mut tex = draw_bar_texture(
+            &mut vk,
+            1.,
+            width_px,
+            "12:34",
+            &containers,
+            ws.count,
+            ws.active as f64,
+        )
+        .expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
