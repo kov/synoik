@@ -3255,7 +3255,7 @@ fn native_screen_recording_registers_and_stops() {
 
     // Starting registers a Native recording and shows the R1 pill.
     f.niri()
-        .start_native_recording(&output, path.clone(), 30, true)
+        .start_native_recording(&output, path.clone(), 30, true, None)
         .unwrap();
     assert!(f
         .niri()
@@ -3344,18 +3344,10 @@ fn shell_screencast_dbus_start_and_stop() {
         .any(|r| matches!(r.kind, RecordingKind::Native(_))));
 
     // A second Start while recording is declined (one recording at a time).
-    assert!(start(&mut f, template).is_err(), "already recording");
-
-    // An area request is declined until that slice lands.
-    let (reply, rx) = async_channel::bounded(1);
-    f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
-        area: Some((0, 0, 100, 100)),
-        template: dir.join("area").to_string_lossy().into_owned(),
-        draw_cursor: true,
-        framerate: 30,
-        reply,
-    });
-    assert!(rx.recv_blocking().unwrap().is_err(), "area unsupported");
+    assert!(
+        start(&mut f, template.clone()).is_err(),
+        "already recording"
+    );
 
     // Stop reports that a recording was torn down and clears the ledger.
     let (reply, rx) = async_channel::bounded(1);
@@ -3363,6 +3355,29 @@ fn shell_screencast_dbus_start_and_stop() {
         .on_shell_screencast_msg(ScreencastToNiri::Stop { reply });
     assert!(rx.recv_blocking().unwrap(), "stop found a live recording");
     assert!(f.niri().casting.recordings.is_empty());
+
+    // A ScreencastArea request records a region of the output (a later slice used to decline it).
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
+        area: Some((100, 100, 640, 480)),
+        template: dir.join("area %%").to_string_lossy().into_owned(),
+        draw_cursor: false,
+        framerate: 30,
+        reply,
+    });
+    let area_path = rx.recv_blocking().unwrap().expect("area recording starts");
+    assert_eq!(area_path, dir.join("area %.webm").to_string_lossy());
+    assert!(f
+        .niri()
+        .casting
+        .recordings
+        .iter()
+        .any(|r| matches!(r.kind, RecordingKind::Native(_))));
+
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri()
+        .on_shell_screencast_msg(ScreencastToNiri::Stop { reply });
+    assert!(rx.recv_blocking().unwrap());
 
     std::fs::remove_dir_all(&dir).ok();
 }

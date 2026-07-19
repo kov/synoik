@@ -74,10 +74,14 @@ pub struct NativeRecording {
     output: WeakOutput,
     /// The encoder worker; captured frames are pushed here, and `finish()` finalizes the file.
     recorder: crate::recording::encoder::ThreadedRecorder,
-    /// Physical capture size (the output mode, transformed).
+    /// Physical capture size: the whole output (mode, transformed) or, for an area recording, the
+    /// cropped region — rounded to even dimensions for 4:2:0 encoding.
     size: Size<i32, Physical>,
     /// Output fractional scale.
     scale: Scale<f64>,
+    /// The recorded region in global logical coordinates, for `ScreencastArea`. `None` records the
+    /// whole output. Used per frame to shift output-local content into the cropped buffer.
+    crop: Option<Rectangle<i32, Logical>>,
     /// Whether to composite the pointer into the recording (the `draw-cursor` option).
     draw_cursor: bool,
     /// Where the finished file lands.
@@ -995,8 +999,9 @@ impl Niri {
         }
     }
 
-    /// Start a recording for a `Screencast`/`ScreencastArea` request, returning the absolute output
-    /// path or a human-readable reason it was declined. Area recording is a later slice.
+    /// Start a recording for a `Screencast` (whole active output) or `ScreencastArea` (a
+    /// global-logical rectangle) request, returning the absolute output path or a human-readable
+    /// reason it was declined.
     #[cfg(feature = "xdp-gnome-screencast")]
     fn start_shell_screencast(
         &mut self,
@@ -1005,9 +1010,6 @@ impl Niri {
         draw_cursor: bool,
         framerate: u32,
     ) -> Result<String, String> {
-        if area.is_some() {
-            return Err("area recording is not yet supported".to_owned());
-        }
         if self
             .casting
             .recordings
@@ -1016,14 +1018,39 @@ impl Niri {
         {
             return Err("a recording is already in progress".to_owned());
         }
-        let output = self
-            .layout
-            .active_output()
-            .cloned()
-            .ok_or_else(|| "no active output to record".to_owned())?;
+
+        // `ScreencastArea` records a global-logical rectangle: pick the output it lands on (largest
+        // intersection) and record that crop. `Screencast` records the whole active output.
+        let (output, crop) = match area {
+            Some((x, y, w, h)) => {
+                if w <= 0 || h <= 0 {
+                    return Err(format!("invalid recording area size {w}x{h}"));
+                }
+                let rect = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+                let (CastTarget::Area { output, rect, .. }, _, _) = self
+                    .cast_params_for_area(rect)
+                    .ok_or_else(|| "the recording area is not on any output".to_owned())?
+                else {
+                    unreachable!("cast_params_for_area returns an Area target");
+                };
+                let output = output
+                    .upgrade()
+                    .ok_or_else(|| "the recording area's output went away".to_owned())?;
+                (output, Some(rect))
+            }
+            None => {
+                let output = self
+                    .layout
+                    .active_output()
+                    .cloned()
+                    .ok_or_else(|| "no active output to record".to_owned())?;
+                (output, None)
+            }
+        };
+
         let path = crate::recording::resolve_file_template(template, "webm")
             .map_err(|err| format!("could not resolve the recording path: {err:#}"))?;
-        self.start_native_recording(&output, path.clone(), framerate, draw_cursor)
+        self.start_native_recording(&output, path.clone(), framerate, draw_cursor, crop)
             .map_err(|err| format!("could not start the recorder: {err:#}"))?;
         self.queue_redraw_all();
         Ok(path.to_string_lossy().into_owned())
@@ -1038,6 +1065,7 @@ impl Niri {
         path: std::path::PathBuf,
         fps: u32,
         draw_cursor: bool,
+        crop: Option<Rectangle<i32, Logical>>,
     ) -> anyhow::Result<CastSessionId> {
         use crate::recording::encoder::{FfmpegEncoder, ThreadedRecorder};
         use crate::recording::RecordConfig;
@@ -1045,9 +1073,18 @@ impl Niri {
         let fps = fps.clamp(1, 120);
 
         let transform = output.current_transform();
-        let size =
-            transform.transform_size(output.current_mode().context("output has no mode")?.size);
         let scale = Scale::from(output.current_scale().fractional_scale());
+        // The whole output, or the cropped area (its physical size on this output).
+        let mut size = match crop {
+            Some(rect) => rect.size.to_physical_precise_round(scale),
+            None => {
+                transform.transform_size(output.current_mode().context("output has no mode")?.size)
+            }
+        };
+        // 4:2:0 (yuv420p) needs even dimensions; an arbitrary area selection may be odd.
+        size.w &= !1;
+        size.h &= !1;
+        anyhow::ensure!(size.w > 0 && size.h > 0, "recording area is too small");
 
         let config = RecordConfig {
             width: size.w as u32,
@@ -1068,6 +1105,7 @@ impl Niri {
                 recorder,
                 size,
                 scale,
+                crop,
                 draw_cursor,
                 path,
                 last_frame_time: Duration::ZERO,
@@ -1199,15 +1237,29 @@ impl Niri {
 
             let mut disconnected = false;
             if due {
-                let Some((size, scale, draw_cursor)) =
+                let Some((size, scale, draw_cursor, crop)) =
                     self.casting.recordings.iter().find_map(|r| match &r.kind {
                         RecordingKind::Native(n) if r.session_id == id => {
-                            Some((n.size, n.scale, n.draw_cursor))
+                            Some((n.size, n.scale, n.draw_cursor, n.crop))
                         }
                         _ => None,
                     })
                 else {
                     continue;
+                };
+
+                // Shift output-local content so the recorded region's top-left maps to the buffer
+                // origin. Zero for a whole-output recording (a no-op relocate); the area's offset
+                // otherwise. Content outside the buffer is clipped, so the pointer shows only when
+                // it falls inside the area.
+                let neg_offset = match crop {
+                    Some(rect) => {
+                        let Some(geo) = self.global_space.output_geometry(output) else {
+                            continue;
+                        };
+                        area_crop_offset(rect, geo, scale).upscale(-1)
+                    }
+                    None => Point::from((0, 0)),
                 };
 
                 // Build the output's screencast elements and read them back as RGBA.
@@ -1216,7 +1268,13 @@ impl Niri {
                     target: RenderTarget::Screencast,
                     xray: None,
                 };
-                let elements = self.render_to_vec(ctx, output, draw_cursor);
+                let elements: Vec<_> = self
+                    .render_to_vec(ctx, output, draw_cursor)
+                    .into_iter()
+                    .map(|elem| {
+                        RelocateRenderElement::from_element(elem, neg_offset, Relocate::Relative)
+                    })
+                    .collect();
                 match render_to_vec(
                     renderer,
                     size,

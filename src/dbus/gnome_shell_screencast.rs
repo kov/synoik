@@ -6,10 +6,11 @@
 //! (`Niri::start_native_recording`). The `<Ctrl><Shift><Alt>R` keybinding, the screenshot UI, and
 //! any `gdbus` caller reach recording through here.
 //!
-//! Matches gnome-shell 50.1: methods `Screencast`/`ScreencastArea`/`StopScreencast`, the
-//! `ScreencastSupported` property, options `draw-cursor`(b)/`framerate`(i) (others ignored — we
-//! encode VP8/WebM), and gnome-shell's file-template algorithm (`crate::recording`). Like the real
-//! service, a recording auto-stops when the client that started it drops off the bus.
+//! Matches gnome-shell 50.1: methods `Screencast` (whole output) / `ScreencastArea` (a
+//! global-logical rectangle) / `StopScreencast`, the `ScreencastSupported` property, options
+//! `draw-cursor`(b)/`framerate`(i) (others ignored — we encode VP8/WebM), and gnome-shell's
+//! file-template algorithm (`crate::recording`). Like the real service, a recording auto-stops when
+//! the client that started it drops off the bus.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
