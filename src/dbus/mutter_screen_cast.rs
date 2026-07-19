@@ -59,6 +59,15 @@ struct RecordWindowProperties {
     _is_recording: Option<bool>,
 }
 
+#[derive(Debug, DeserializeDict, Type)]
+#[zvariant(signature = "dict")]
+struct RecordAreaProperties {
+    #[zvariant(rename = "cursor-mode")]
+    cursor_mode: Option<CursorMode>,
+    #[zvariant(rename = "is-recording")]
+    _is_recording: Option<bool>,
+}
+
 #[derive(Clone)]
 pub struct Stream {
     id: CastStreamId,
@@ -73,13 +82,33 @@ pub struct Stream {
 enum StreamTarget {
     // FIXME: update on scale changes and whatnot.
     Output(niri_ipc::Output),
-    Window { id: u64 },
+    Window {
+        id: u64,
+    },
+    /// A rectangular sub-region of the stage, in global logical coordinates.
+    Area {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamTargetId {
-    Output { name: String },
-    Window { id: u64 },
+    Output {
+        name: String,
+    },
+    Window {
+        id: u64,
+    },
+    /// A rectangular sub-region of the stage, in global logical coordinates.
+    Area {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
 }
 
 #[derive(Debug, SerializeDict, Type, Value)]
@@ -274,6 +303,56 @@ impl Session {
         Ok(path)
     }
 
+    async fn record_area(
+        &mut self,
+        #[zbus(object_server)] server: &ObjectServer,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        properties: RecordAreaProperties,
+    ) -> fdo::Result<OwnedObjectPath> {
+        debug!(x, y, width, height, ?properties, "record_area");
+
+        if width <= 0 || height <= 0 {
+            return Err(fdo::Error::Failed("invalid area size".to_owned()));
+        }
+
+        let stream_id = CastStreamId::next();
+        let path = format!("/org/gnome/Mutter/ScreenCast/Stream/u{}", stream_id.get());
+        let path = OwnedObjectPath::try_from(path).unwrap();
+
+        let cursor_mode = properties.cursor_mode.unwrap_or_default();
+
+        let target = StreamTarget::Area {
+            x,
+            y,
+            w: width,
+            h: height,
+        };
+        let stream = Stream::new(
+            stream_id,
+            self.id,
+            target,
+            cursor_mode,
+            self.to_niri.clone(),
+        );
+        match server.at(&path, stream.clone()).await {
+            Ok(true) => {
+                let iface = server.interface(&path).await.unwrap();
+                self.streams.lock().unwrap().push((stream, iface));
+            }
+            Ok(false) => return Err(fdo::Error::Failed("stream path already exists".to_owned())),
+            Err(err) => {
+                return Err(fdo::Error::Failed(format!(
+                    "error creating stream object: {err:?}"
+                )))
+            }
+        }
+
+        Ok(path)
+    }
+
     #[zbus(signal)]
     async fn closed(ctxt: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
@@ -301,6 +380,10 @@ impl Stream {
                     size: (1, 1),
                 }
             }
+            StreamTarget::Area { x, y, w, h } => StreamParameters {
+                position: (*x, *y),
+                size: (*w, *h),
+            },
         }
     }
 }
@@ -401,6 +484,12 @@ impl StreamTarget {
                 name: output.name.clone(),
             },
             StreamTarget::Window { id } => StreamTargetId::Window { id: *id },
+            StreamTarget::Area { x, y, w, h } => StreamTargetId::Area {
+                x: *x,
+                y: *y,
+                w: *w,
+                h: *h,
+            },
         }
     }
 }

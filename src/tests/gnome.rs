@@ -3039,3 +3039,72 @@ fn end_session_dialog_open_confirm_and_cancel() {
         "gnome-session's Close must dismiss the dialog",
     );
 }
+
+// RecordArea screencast: an area is recorded from a single output (the one it overlaps most),
+// cropped to the recorded rectangle. See docs/fork/panel-status-port.md (slice 1, Half A).
+
+#[test]
+fn screencast_area_resolves_to_the_containing_output() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::niri::CastTarget;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    // A rect fully inside the output resolves to it, at 1:1 physical size (headless scale 1).
+    let rect = Rectangle::new(Point::from((100, 100)), Size::from((300, 200)));
+    let (target, size, _refresh) = f
+        .niri()
+        .cast_params_for_area(rect)
+        .expect("a rect inside an output must resolve");
+    assert_eq!(size, Size::from((300, 200)));
+    let CastTarget::Area {
+        name, rect: got, ..
+    } = target
+    else {
+        panic!("expected an Area cast target");
+    };
+    assert_eq!(name, out.name());
+    assert_eq!(got, rect);
+
+    // A rect off every output resolves to nothing (mutter fails the stream likewise).
+    let off = Rectangle::new(Point::from((10_000, 10_000)), Size::from((100, 100)));
+    assert!(f.niri().cast_params_for_area(off).is_none());
+}
+
+#[test]
+fn screencast_area_picks_the_largest_intersection_output() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::niri::CastTarget;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    // Order the two outputs left→right by their global position.
+    let mut outs = [f.niri_output(1), f.niri_output(2)];
+    outs.sort_by_key(|o| f.niri().global_space.output_geometry(o).unwrap().loc.x);
+    let right_geo = f.niri().global_space.output_geometry(&outs[1]).unwrap();
+    let seam = right_geo.loc.x;
+
+    // Straddle the seam: 40px on the left output, 200px on the right → the right output wins.
+    let rect = Rectangle::new(
+        Point::from((seam - 40, right_geo.loc.y + 100)),
+        Size::from((240, 100)),
+    );
+    let (target, _, _) = f
+        .niri()
+        .cast_params_for_area(rect)
+        .expect("a straddling rect still resolves");
+    let CastTarget::Area { name, .. } = target else {
+        panic!("expected an Area cast target");
+    };
+    assert_eq!(
+        name,
+        outs[1].name(),
+        "the output with the larger intersection must win"
+    );
+}

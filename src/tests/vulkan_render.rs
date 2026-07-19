@@ -5234,3 +5234,87 @@ fn vulkan_hotkey_overlay_draws() {
         "the hotkey overlay text did not draw on Vulkan (blank overlay?): {white} white px"
     );
 }
+
+/// An area screencast records a cropped sub-rectangle of the output. This pins the crop convention
+/// `Niri::render_area_for_screen_cast` uses — the shared `RenderTarget::Screencast` element list
+/// wrapped in `RelocateRenderElement` by `-area.loc` — at the pixel level, so an offset-sign or
+/// buffer-size error fails headlessly instead of only live. Slice 1, Half A.
+#[test]
+fn vulkan_area_cast_crops_to_the_output_subrect() {
+    use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+    use smithay::utils::{Point, Rectangle};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // A sub-rectangle well inside the 1280×720 output (scale 1 → physical == logical).
+    let area = Rectangle::new(Point::from((200, 150)), Size::from((400, 300)));
+
+    let state = f.niri_state();
+    let (full, crop) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+
+            // The full output frame, composited exactly as a monitor cast would.
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Screencast,
+                xray: None,
+            };
+            let elements = niri.render_to_vec(ctx, &output, false);
+            let full = render_to_vec(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+
+            // The same scene shifted by -area.loc into an area-sized buffer — the area-cast crop.
+            let neg = area.loc.to_physical_precise_round(scale).upscale(-1);
+            let relocated: Vec<_> = elements
+                .iter()
+                .map(|e| RelocateRenderElement::from_element(e, neg, Relocate::Relative))
+                .collect();
+            let crop = render_to_vec(
+                vk,
+                area.size.to_physical_precise_round(scale),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                relocated.iter().rev(),
+            )?;
+
+            Ok((full, crop))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("compositing through Vulkan must not error");
+
+    // Every sampled crop pixel must equal the full-frame pixel at the area offset: the crop is
+    // exactly the sub-rectangle, nothing shifted or mirrored.
+    let (aw, ah) = (area.size.w, area.size.h);
+    for &(sx, sy) in &[
+        (0, 0),
+        (aw - 1, 0),
+        (0, ah - 1),
+        (aw - 1, ah - 1),
+        (aw / 2, ah / 2),
+    ] {
+        assert_eq!(
+            px(&crop, aw, sx, sy),
+            px(&full, i32::from(OUT_W), area.loc.x + sx, area.loc.y + sy),
+            "area crop pixel ({sx},{sy}) must equal the full frame at (+{},+{})",
+            area.loc.x,
+            area.loc.y,
+        );
+    }
+}

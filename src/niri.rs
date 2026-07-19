@@ -675,6 +675,17 @@ pub enum CastTarget {
     Window {
         id: u64,
     },
+    /// A rectangular sub-region of the stage.
+    ///
+    /// Resolved at cast start to the single output with the largest intersection with `rect`
+    /// (mutter composites all intersecting views; cross-output area casts are not yet supported).
+    Area {
+        output: WeakOutput,
+        /// Cached name of the resolved output.
+        name: String,
+        /// Recorded region, in global logical coordinates.
+        rect: Rectangle<i32, Logical>,
+    },
 }
 
 impl CastTarget {
@@ -686,7 +697,10 @@ impl CastTarget {
     }
 
     pub fn matches_output(&self, weak: &WeakOutput) -> bool {
-        matches!(self, CastTarget::Output { output, .. } if output == weak)
+        matches!(
+            self,
+            CastTarget::Output { output, .. } | CastTarget::Area { output, .. } if output == weak
+        )
     }
 
     pub fn matches(&self, ipc: &niri_ipc::CastTarget) -> bool {
@@ -707,6 +721,9 @@ impl CastTarget {
             Nothing => niri_ipc::CastTarget::Nothing {},
             Output { name, .. } => niri_ipc::CastTarget::Output { name: name.clone() },
             Window { id } => niri_ipc::CastTarget::Window { id: *id },
+            // Area casts are never dynamic-target, so this is never queried over IPC; report the
+            // resolved output (there is no IPC area variant) rather than inventing one.
+            Area { name, .. } => niri_ipc::CastTarget::Output { name: name.clone() },
         }
     }
 }
@@ -4827,9 +4844,9 @@ impl Niri {
         if self.layout.is_gnome_mode() {
             let ws = self.workspace_state_for(output);
             let ws_position = self.workspace_position_for(output);
-            for element in self
-                .panel
-                .render(ctx.renderer, output, ws, ws_position, &self.icon_cache)
+            for element in
+                self.panel
+                    .render(ctx.renderer, output, ws, ws_position, &self.icon_cache)
             {
                 push(element.into());
             }
@@ -5327,6 +5344,8 @@ impl Niri {
         // unimplemented, but happens to work by chance, since output
         // redrawing is more eager than it should be.
         self.render_windows_for_screen_cast(renderer, output, target_presentation_time);
+
+        self.render_area_for_screen_cast(renderer, output, target_presentation_time);
 
         self.render_for_screencopy_with_damage(renderer, output);
     }

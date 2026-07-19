@@ -11,7 +11,7 @@ use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::desktop::Window;
 use smithay::output::Output;
-use smithay::utils::{Physical, Point, Rectangle, Scale, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
@@ -147,7 +147,7 @@ impl State {
                 }
                 return;
             }
-            CastTarget::Output { output, .. } => {
+            CastTarget::Output { output, .. } | CastTarget::Area { output, .. } => {
                 if let Some(output) = output.upgrade() {
                     self.niri.queue_redraw(&output);
                 }
@@ -217,7 +217,7 @@ impl State {
             // Leave refresh as is when clearing. Chances are, the next refresh will match it,
             // then we'll avoid reconfiguring.
             CastTarget::Nothing => (),
-            CastTarget::Output { output, .. } => {
+            CastTarget::Output { output, .. } | CastTarget::Area { output, .. } => {
                 if let Some(output) = output.upgrade() {
                     refresh = Some(output.current_mode().unwrap().refresh as u32);
                 }
@@ -285,6 +285,8 @@ impl State {
                 };
                 (size, refresh)
             }
+            // Area casts are never dynamic-target, so they never start this way.
+            CastTarget::Area { .. } => return,
         };
 
         let (gbm, render_formats) = match self.prepare_pw_cast() {
@@ -382,6 +384,16 @@ impl State {
                             return;
                         };
                         (CastTarget::Window { id }, size, refresh, true)
+                    }
+                    StreamTargetId::Area { x, y, w, h } => {
+                        let rect = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+                        let Some((target, size, refresh)) = self.niri.cast_params_for_area(rect)
+                        else {
+                            warn!("error starting screencast: requested area is off all outputs");
+                            self.niri.stop_cast(session_id);
+                            return;
+                        };
+                        (target, size, refresh, false)
                     }
                 };
 
@@ -705,6 +717,112 @@ impl Niri {
         }
     }
 
+    /// Render area screencasts of this output: the output's content, cropped to the recorded
+    /// rectangle.
+    ///
+    /// Reuses the same `RenderTarget::Screencast` element list as a monitor cast (so block-out /
+    /// privacy semantics hold with no new capture path), shifted so the area's top-left maps to the
+    /// buffer origin — the `RelocateRenderElement` crop is the same trick the cursor and window
+    /// paths already use.
+    pub fn render_area_for_screen_cast(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) {
+        let _span = tracy_client::span!("Niri::render_area_for_screen_cast");
+
+        let weak = output.downgrade();
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let output_geo = self.global_space.output_geometry(output).unwrap();
+
+        let mut casts_to_stop = vec![];
+
+        let mut casts = mem::take(&mut self.casting.casts);
+        for cast in &mut casts {
+            if !cast.is_active() {
+                continue;
+            }
+
+            let CastTarget::Area {
+                output: cast_output,
+                rect,
+                ..
+            } = &cast.target
+            else {
+                continue;
+            };
+            if cast_output != &weak {
+                continue;
+            }
+            let rect = *rect;
+
+            let size = rect.size.to_physical_precise_round(scale);
+
+            match cast.ensure_size(size) {
+                Ok(CastSizeChange::Ready) => (),
+                Ok(CastSizeChange::Pending) => continue,
+                Err(err) => {
+                    warn!("error updating stream size, stopping screencast: {err:?}");
+                    casts_to_stop.push(cast.session_id);
+                    continue;
+                }
+            }
+
+            if cast.check_time_and_schedule(output, target_presentation_time) {
+                continue;
+            }
+
+            // Shift output-local content so the area's top-left maps to the buffer origin.
+            let offset = (rect.loc - output_geo.loc).to_physical_precise_round(scale);
+            let neg_offset = offset.upscale(-1);
+
+            let mut elements = Vec::new();
+            let mut pointer_location = Point::default();
+
+            if self.pointer_visibility.is_visible() {
+                let pointer_loc = self
+                    .tablet_cursor_location
+                    .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+                // Only render the pointer when it's within the recorded area.
+                if rect.to_f64().contains(pointer_loc) {
+                    pointer_location = pointer_loc - rect.loc.to_f64();
+                    self.render_pointer(renderer, output, &mut |elem| {
+                        let elem = RelocateRenderElement::from_element(
+                            elem,
+                            neg_offset,
+                            Relocate::Relative,
+                        );
+                        elements.push(CastRenderElement::from(elem));
+                    });
+                }
+            }
+
+            let main_start = elements.len();
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                xray: None,
+            };
+            self.render(ctx, output, false, &mut |elem| {
+                let elem =
+                    RelocateRenderElement::from_element(elem, neg_offset, Relocate::Relative);
+                elements.push(CastRenderElement::from(elem));
+            });
+
+            let cursor_data = CursorData::compute(&elements, main_start, pointer_location, scale);
+
+            if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, size, scale) {
+                cast.last_frame_time = target_presentation_time;
+            }
+        }
+        self.casting.casts = casts;
+
+        for id in casts_to_stop {
+            self.stop_cast(id);
+        }
+    }
+
     pub fn stop_cast(&mut self, session_id: CastSessionId) {
         let _span = tracy_client::span!("Niri::stop_cast");
         let _span = debug_span!("stop_cast", %session_id).entered();
@@ -784,6 +902,50 @@ impl Niri {
         let refresh = output.current_mode().unwrap().refresh as u32;
         Some((bbox.size, refresh))
     }
+
+    /// Resolve an area screencast (global logical `rect`) to a single output, its physical buffer
+    /// size, and refresh.
+    ///
+    /// Single-output MVP: the area is recorded from the output with the largest intersection with
+    /// `rect`, cropped to that output. mutter composites every intersecting view instead; a
+    /// cross-output area cast is a follow-up. Returns `None` when the rect intersects no output
+    /// (mutter fails the stream in that case too).
+    pub(crate) fn cast_params_for_area(
+        &self,
+        rect: Rectangle<i32, Logical>,
+    ) -> Option<(CastTarget, Size<i32, Physical>, u32)> {
+        let mut best: Option<(&Output, i32)> = None;
+        for output in self.global_space.outputs() {
+            let geo = self.global_space.output_geometry(output).unwrap();
+            let Some(isect) = geo.intersection(rect) else {
+                continue;
+            };
+            let area = isect.size.w * isect.size.h;
+            if area > 0 && best.is_none_or(|(_, best_area)| area > best_area) {
+                best = Some((output, area));
+            }
+        }
+
+        let (output, _) = best?;
+        let geo = self.global_space.output_geometry(output).unwrap();
+        if !geo.contains_rect(rect) {
+            warn!(
+                "screencast area spans beyond one output; recording only the \
+                 largest-intersection output (cross-output area casts are not yet supported)"
+            );
+        }
+
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        // Buffer size = round(area size * scale), matching mutter's meta-stream-area.
+        let size = rect.size.to_physical_precise_round(scale);
+        let refresh = output.current_mode().unwrap().refresh as u32;
+        let target = CastTarget::Area {
+            output: output.downgrade(),
+            name: output.name(),
+            rect,
+        };
+        Some((target, size, refresh))
+    }
 }
 
 fn cast_params_for_output(output: &Output) -> (Size<i32, Physical>, u32) {
@@ -800,5 +962,7 @@ niri_render_elements! {
         Window = WindowCastRenderElements,
         Pointer = PointerRenderElements,
         RelocatedPointer = RelocateRenderElement<PointerRenderElements>,
+        // Output content shifted into an area cast's cropped buffer.
+        RelocatedOutput = RelocateRenderElement<OutputRenderElements>,
     }
 }
