@@ -158,14 +158,19 @@ pub const ROLE_QUICK_SETTINGS: &str = "quickSettings";
 /// Role of the standalone screen-recording indicator (GNOME's `screenRecording`,
 /// leftmost of the right box — `sessionMode.js:99`).
 pub const ROLE_SCREEN_RECORDING: &str = "screenRecording";
+/// Role of the keyboard input-source indicator (GNOME's `keyboard`, `sessionMode.js:99`;
+/// `InputSourceIndicator` `js/ui/status/keyboard.js:874`) — a short xkb-layout label shown
+/// only when more than one layout is configured.
+pub const ROLE_KEYBOARD: &str = "keyboard";
 
-/// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The four unbuilt
+/// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The remaining unbuilt
 /// standalone indicators are commented out; adding one is a new entry here plus a
-/// presence/width case. quickSettings anchors the right edge; earlier roles stack
-/// to its left in this order.
+/// presence/width case in [`Panel::right_box_role_width`]. quickSettings anchors the
+/// right edge; earlier roles stack to its left in this order.
 const RIGHT_BOX_ORDER: &[&str] = &[
     ROLE_SCREEN_RECORDING,
-    // screenSharing, dwellClick, a11y, keyboard,
+    // screenSharing, dwellClick, a11y,
+    ROLE_KEYBOARD,
     ROLE_QUICK_SETTINGS,
 ];
 
@@ -388,6 +393,10 @@ pub struct Panel {
     /// the standalone `screenRecording` indicator — a red pill with the `M:SS`
     /// elapsed label and a stop glyph, leftmost in the right box.
     recording: Option<Recording>,
+    /// The active keyboard-layout short label (e.g. "us"/"br"), or `None` when fewer than two
+    /// layouts are configured. Drives the `keyboard` right-box indicator (GNOME's
+    /// `InputSourceIndicator`); computed by the compositor from xkb state.
+    keyboard_layout: Option<String>,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -425,6 +434,7 @@ impl Panel {
             system_status: SystemStatus::default(),
             audio: None,
             recording: None,
+            keyboard_layout: None,
             clock,
             config,
             fills,
@@ -499,6 +509,19 @@ impl Panel {
             return false;
         }
         self.recording.as_mut().unwrap().label = label;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// Adopt the active keyboard-layout short label (`Some("us")` shows the indicator, `None` hides
+    /// it — the compositor passes `None` when fewer than two layouts are configured). Returns
+    /// whether it changed, so the caller can queue a redraw; the indicator's presence and the
+    /// right box's width may differ.
+    pub fn set_keyboard_layout(&mut self, label: Option<String>) -> bool {
+        if label == self.keyboard_layout {
+            return false;
+        }
+        self.keyboard_layout = label;
         self.cache.borrow_mut().clear();
         true
     }
@@ -700,11 +723,9 @@ impl Panel {
     /// on each side, right-anchored on the output. Its width tracks how many
     /// status icons (toggles + live network/battery) are currently shown.
     pub fn quick_settings_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let w = qs_indicator_width(self.toggles, &self.system_status, self.audio);
-        Rectangle::new(
-            Point::from((output_width - w, 0.)),
-            Size::from((w, PANEL_HEIGHT)),
-        )
+        // quickSettings anchors the right edge and is always present.
+        self.right_box_rect(ROLE_QUICK_SETTINGS, output_width)
+            .expect("quick settings is always present in the right box")
     }
 
     /// Logical width of the screen-recording indicator pill: padding + the `M:SS`
@@ -717,13 +738,46 @@ impl Panel {
         2. * INDICATOR_H_PADDING + label_w + R1_SPACING + R1_ICON
     }
 
-    /// The screen-recording indicator rect: leftmost in the right box, directly left
-    /// of (adjacent to) quick-settings — `sessionMode.js:99` order. Only meaningful
-    /// while recording (width 0 otherwise); callers guard on [`Self::is_recording`].
+    /// Logical width of the keyboard input-source indicator: padding + the short layout
+    /// label + padding (a plain panel button, like the clock). Zero when hidden.
+    fn keyboard_width(&self) -> f64 {
+        let Some(label) = &self.keyboard_layout else {
+            return 0.;
+        };
+        let label_w = niri_vk::text::measure_line_width_weighted(label, FONT_PX as f32, true);
+        2. * INDICATOR_H_PADDING + label_w
+    }
+
+    /// The logical width a right-box role currently occupies, `0` when the role is absent
+    /// (quickSettings is always present, the others come and go). The single source of
+    /// truth for right-box presence, folded by [`Self::right_box_rect`] into placement.
+    fn right_box_role_width(&self, role: &str) -> f64 {
+        match role {
+            ROLE_QUICK_SETTINGS => {
+                qs_indicator_width(self.toggles, &self.system_status, self.audio)
+            }
+            ROLE_SCREEN_RECORDING => self.recording_width(),
+            ROLE_KEYBOARD => self.keyboard_width(),
+            _ => 0.,
+        }
+    }
+
+    /// The screen-recording indicator rect. Only meaningful while recording (a zero-width
+    /// rect at the next indicator's left edge otherwise); callers guard on [`Self::is_recording`].
     pub fn screen_recording_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let w = self.recording_width();
-        let qs_x = self.quick_settings_rect(output_width).loc.x;
-        Rectangle::new(Point::from((qs_x - w, 0.)), Size::from((w, PANEL_HEIGHT)))
+        self.right_box_rect(ROLE_SCREEN_RECORDING, output_width)
+            .unwrap_or_else(|| {
+                // Not recording: fall back to a zero-width rect anchored where the pill would
+                // start (immediately left of whatever right-box roles are present).
+                let mut right = output_width;
+                for &role in RIGHT_BOX_ORDER.iter().rev() {
+                    if role == ROLE_SCREEN_RECORDING {
+                        break;
+                    }
+                    right -= self.right_box_role_width(role);
+                }
+                Rectangle::new(Point::from((right, 0.)), Size::from((0., PANEL_HEIGHT)))
+            })
     }
 
     /// Whether the screen-recording indicator is currently shown.
@@ -732,17 +786,24 @@ impl Panel {
     }
 
     /// The rect of a right-box role while it is currently present, else `None`. The one
-    /// place a right-box indicator's presence + geometry is decided; [`RIGHT_BOX_ORDER`]
-    /// then fixes their left-to-right order for both [`Self::items`] and
-    /// [`Self::hit_test`], so a new indicator is one entry there plus one arm here.
+    /// place a right-box indicator's geometry is decided: fold [`RIGHT_BOX_ORDER`] right-to-left
+    /// from the output edge, giving each present role (nonzero width) the next slot leftward.
+    /// [`Self::items`] and [`Self::hit_test`] iterate the same order, so a new indicator is one
+    /// entry there plus one arm in [`Self::right_box_role_width`].
     fn right_box_rect(&self, role: &str, output_width: f64) -> Option<Rectangle<f64, Logical>> {
-        match role {
-            ROLE_QUICK_SETTINGS => Some(self.quick_settings_rect(output_width)),
-            ROLE_SCREEN_RECORDING if self.is_recording() => {
-                Some(self.screen_recording_rect(output_width))
+        let mut right = output_width;
+        for &r in RIGHT_BOX_ORDER.iter().rev() {
+            let w = self.right_box_role_width(r);
+            if w <= 0. {
+                continue; // absent
             }
-            _ => None,
+            let rect = Rectangle::new(Point::from((right - w, 0.)), Size::from((w, PANEL_HEIGHT)));
+            if r == role {
+                return Some(rect);
+            }
+            right -= w;
         }
+        None
     }
 
     /// The panel's items with their current rectangles, for introspection and the
@@ -883,6 +944,14 @@ impl Panel {
             containers.push((container_rect(r1), R1_BG));
             (rec.label.clone(), r1.loc.x + INDICATOR_H_PADDING)
         });
+        // The keyboard input-source label — a plain (transparent) panel button, no fill
+        // container this slice (hover/checked is deferred with its source menu). Left-aligned
+        // at the button padding, like the recording pill's label.
+        let keyboard_label = self
+            .keyboard_layout
+            .as_ref()
+            .zip(self.right_box_rect(ROLE_KEYBOARD, width))
+            .map(|(label, kb)| (label.clone(), kb.loc.x + INDICATOR_H_PADDING));
 
         // While a workspace switch animates, `position` is fractional and the dots morph
         // every frame; while a button-container fill fades, the pill alpha changes every
@@ -901,6 +970,7 @@ impl Panel {
                 ws.count,
                 position,
                 recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
+                keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -921,6 +991,7 @@ impl Panel {
                     ws.count,
                     ws.active() as f64,
                     recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
+                    keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
                 ) {
                     Ok(texture) => {
                         cache.textures.insert(bar_key, texture);
@@ -1162,6 +1233,7 @@ fn draw_bar_texture(
     count: usize,
     position: f64,
     recording_label: Option<(&str, f64)>,
+    keyboard_label: Option<(&str, f64)>,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("panel::draw_bar_texture");
 
@@ -1187,6 +1259,20 @@ fn draw_bar_texture(
     // The recording label's bold glyph run, left-aligned at the pill padding and
     // ink-centered vertically like the clock. Built before binding the target.
     let recording = recording_label
+        .map(|(label, lx)| -> anyhow::Result<_> {
+            let run = renderer.build_glyph_run_weighted(label, px, true)?;
+            let (_ix, iy, _iw, ih) = run.ink_bounds();
+            let origin = Point::<i32, Physical>::from((
+                to_physical_precise_round(scale, lx),
+                (height_px - ih) / 2 - iy,
+            ));
+            Ok((run, origin))
+        })
+        .transpose()?;
+
+    // The keyboard input-source label, shaped like the recording label (bold, left-aligned at
+    // its button padding, ink-centered vertically).
+    let keyboard = keyboard_label
         .map(|(label, lx)| -> anyhow::Result<_> {
             let run = renderer.build_glyph_run_weighted(label, px, true)?;
             let (_ix, iy, _iw, ih) = run.ink_bounds();
@@ -1230,6 +1316,10 @@ fn draw_bar_texture(
         frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
         // The screen-recording pill's M:SS label, over its red container.
         if let Some((run, origin)) = &recording {
+            frame.render_glyphs(run, *origin, TEXT, full, &[full])?;
+        }
+        // The keyboard input-source short label.
+        if let Some((run, origin)) = &keyboard {
             frame.render_glyphs(run, *origin, TEXT, full, &[full])?;
         }
         // finish() submits and fence-waits synchronously, so the sync point is already signaled.
@@ -1394,8 +1484,18 @@ mod tests {
         };
         let scale = 2.0;
         let width_px = to_physical_precise_round::<i32>(scale, 400.);
-        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws.count, 1., None)
-            .expect("bar texture");
+        let mut tex = draw_bar_texture(
+            &mut vk,
+            scale,
+            width_px,
+            "12:34",
+            &[],
+            ws.count,
+            1.,
+            None,
+            None,
+        )
+        .expect("bar texture");
         let size = tex.size();
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -1477,8 +1577,9 @@ mod tests {
 
         // Peak red over the band row across just the two-dot region (far from the clock).
         let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None)
-                .expect("bar texture");
+            let mut tex =
+                draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None, None)
+                    .expect("bar texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -1663,6 +1764,7 @@ mod tests {
             ws.count,
             ws.active as f64,
             None,
+            None,
         )
         .expect("bar texture");
 
@@ -1768,6 +1870,69 @@ mod tests {
             .all(|i| i.role != ROLE_SCREEN_RECORDING));
     }
 
+    /// The keyboard indicator is absent until a label is set (GNOME hides it with <2 sources),
+    /// then sits directly left of quick-settings and right of the recording pill, hit-testing to
+    /// its role. `sessionMode.js:99` order; structural, no GPU.
+    #[test]
+    fn keyboard_indicator_visibility_and_order() {
+        let clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
+        let ws = WorkspaceState {
+            count: 1,
+            active: 0,
+        };
+        let ow = 1920.;
+
+        // A single layout (compositor passes `None`): no keyboard item, no change on re-set.
+        assert!(!panel.set_keyboard_layout(None));
+        assert!(panel.items(ow, ws).iter().all(|i| i.role != ROLE_KEYBOARD));
+
+        // Two layouts → the compositor passes the active short label; the indicator appears.
+        assert!(panel.set_keyboard_layout(Some("us".into())));
+        let items = panel.items(ow, ws);
+        let kb = items
+            .iter()
+            .find(|i| i.role == ROLE_KEYBOARD)
+            .expect("the keyboard indicator is present with a label");
+        let qs = items
+            .iter()
+            .find(|i| i.role == ROLE_QUICK_SETTINGS)
+            .unwrap();
+        assert_eq!(kb.r#box, PanelBox::Right);
+        assert!(kb.rect.loc.x < qs.rect.loc.x, "keyboard is left of QS");
+        assert!(
+            (kb.rect.loc.x + kb.rect.size.w - qs.rect.loc.x).abs() < 1e-6,
+            "keyboard abuts quick-settings",
+        );
+        let center = Point::from((kb.rect.loc.x + kb.rect.size.w / 2., 16.));
+        assert_eq!(panel.hit_test(center, ow, ws), Some(ROLE_KEYBOARD));
+
+        // With a recording too, the order is screenRecording | keyboard | quickSettings.
+        let now = clock.now_unadjusted();
+        assert!(panel.set_recording(Some(now)));
+        let items = panel.items(ow, ws);
+        let rx = items
+            .iter()
+            .find(|i| i.role == ROLE_SCREEN_RECORDING)
+            .unwrap()
+            .rect;
+        let kx = items.iter().find(|i| i.role == ROLE_KEYBOARD).unwrap().rect;
+        assert!(rx.loc.x < kx.loc.x, "recording is left of keyboard");
+        assert!(
+            (rx.loc.x + rx.size.w - kx.loc.x).abs() < 1e-6,
+            "recording abuts keyboard",
+        );
+
+        // A wider label widens the indicator (width tracks the measured text).
+        let w1 = panel.keyboard_width();
+        assert!(panel.set_keyboard_layout(Some("us2".into())));
+        assert!(panel.keyboard_width() > w1, "a longer label is wider");
+
+        // Clearing the label hides it again.
+        assert!(panel.set_keyboard_layout(None));
+        assert!(panel.items(ow, ws).iter().all(|i| i.role != ROLE_KEYBOARD));
+    }
+
     /// The recording pill draws red (`#c01c28`) with its white `M:SS` label on top.
     /// Skips with no device.
     #[test]
@@ -1798,6 +1963,7 @@ mod tests {
             3,
             1.,
             Some(("0:05", 306.)),
+            None,
         )
         .expect("bar texture");
         let size = tex.size();

@@ -17,6 +17,7 @@ pub mod handlers;
 pub mod idle_monitor;
 pub mod input;
 pub mod ipc;
+pub mod keyboard_layout;
 pub mod layer;
 pub mod layout;
 pub mod niri;

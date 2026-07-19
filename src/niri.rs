@@ -1011,10 +1011,63 @@ impl State {
         self.refresh_ipc_outputs();
         self.ipc_refresh_layout();
         self.ipc_refresh_keyboard_layout_index();
+        self.refresh_keyboard_layout_indicator();
 
         // Needs to be called after updating the keyboard focus.
         #[cfg(feature = "dbus")]
         self.niri.refresh_a11y();
+    }
+
+    /// Push the active keyboard-layout short label into the panel's `keyboard` indicator (GNOME's
+    /// `InputSourceIndicator`). Runs every `refresh()`, so it also catches `track_layout "window"`
+    /// focus-driven switches that have no action hook. The panel setter compares against its stored
+    /// label and only reports a change, so recomputing here is cheap and needs no invalidation
+    /// bookkeeping. See [`crate::keyboard_layout::short_label`].
+    fn refresh_keyboard_layout_indicator(&mut self) {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let (names, idx) = keyboard.with_xkb_state(self, |context| {
+            let xkb = context.xkb().lock().unwrap();
+            let names: Vec<String> = xkb
+                .layouts()
+                .map(|layout| xkb.layout_name(layout).to_owned())
+                .collect();
+            let idx = xkb.active_layout().0 as usize;
+            (names, idx)
+        });
+
+        // The effective layout codes: the niri xkb config's `layout` string, unless it is a `file`
+        // keymap (codes don't apply) or unset (then locale1 supplies the keymap — mirror the
+        // resolution in `reload_config_and_outputs`).
+        let xkb = self.effective_xkb();
+        let codes: Vec<String> = if xkb.file.is_none() {
+            xkb.layout
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let label = crate::keyboard_layout::short_label(&codes, &names, idx);
+        if self.niri.panel.set_keyboard_layout(label) {
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    /// The keyboard `Xkb` config actually driving the keymap: the niri config's own, unless it is
+    /// left at default, in which case systemd-localed (`xkb_from_locale1`) supplies it. Mirrors the
+    /// fallback in the config-reload path so the panel label matches the live keymap.
+    fn effective_xkb(&self) -> Xkb {
+        let config = self.niri.config.borrow();
+        let xkb = config.input.keyboard.xkb.clone();
+        drop(config);
+        if xkb == Xkb::default() {
+            self.niri.xkb_from_locale1.clone().unwrap_or_default()
+        } else {
+            xkb
+        }
     }
 
     fn notify_blocker_cleared(&mut self) {

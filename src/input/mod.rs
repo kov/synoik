@@ -3291,6 +3291,13 @@ impl State {
                                 self.niri.queue_redraw_all();
                                 return;
                             }
+                            Some(crate::ui::panel::ROLE_KEYBOARD) => {
+                                // GNOME opens the input-source menu here; the menu/popover is
+                                // deferred. Swallow the click so it doesn't fall through to
+                                // whatever sits under the panel strut.
+                                self.niri.suppressed_buttons.insert(button_code);
+                                return;
+                            }
                             _ => {}
                         }
                     }
