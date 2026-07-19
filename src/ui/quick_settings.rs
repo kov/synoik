@@ -636,7 +636,7 @@ const BASE_GRID: [GridTile; 4] = [
 /// `power_profile_index`/`anchor_row_bottom` resolve tile identity by a *constant* index over
 /// `BASE_GRID` (Network at its `BASE_GRID` slot; PowerProfile, the first conditional, always at
 /// `BASE_GRID.len()`), which holds only while PowerProfile precedes Airplane. Two debug_asserts at
-/// the call sites pin both the prefix and the append order.
+/// the hit site (`pointer_click`) pin both the prefix and the append order.
 fn grid(show_power_profile: bool, show_airplane: bool) -> Vec<GridTile> {
     let mut tiles = BASE_GRID.to_vec();
     if show_power_profile {

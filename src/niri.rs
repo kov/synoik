@@ -2501,12 +2501,17 @@ impl State {
             SystemStatusToNiri::PowerProfiles(power) => {
                 // gnome-shell's `_sync`: whenever the (echoed) active profile is a known,
                 // non-Balanced one, that becomes the last-selected the body-toggle returns to —
-                // recorded for external changes too, not just our own clicks. Kept authoritative on
-                // `Niri` (the gsettings model is rebuilt from defaults on every unrelated change),
-                // with best-effort write-through to persist it.
-                use crate::system_status::KnownProfile;
+                // recorded for external changes too, not just our own clicks (gnome-shell's
+                // `_sync`, which records *any* non-Balanced profile, vendor/custom
+                // ones included, so a machine with a firmware profile toggles back
+                // to it). Kept authoritative on `Niri` (the gsettings model is
+                // rebuilt from defaults on every unrelated change), with
+                // best-effort write-through to persist it. External edits to the gsettings key
+                // mid-session aren't re-seeded here (the next non-Balanced echo overwrites it) — an
+                // accepted minor divergence, since re-seeding would clobber this copy from the
+                // default on schema-less systems.
                 if power.is_active()
-                    && KnownProfile::parse(&power.active).is_some()
+                    && !power.active.is_empty()
                     && self.niri.last_power_profile != power.active
                 {
                     self.niri.last_power_profile = power.active.clone();
