@@ -40,6 +40,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::audio::AudioStatus;
 use crate::system_status::{self, BatteryStatus, NetworkStatus};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
@@ -80,6 +81,20 @@ const SYS_ADVANCE: f64 = SYS_HIT + SYS_GAP;
 /// present. Clicking it opens power settings.
 const PILL_W: f64 = 96.;
 const PILL_ICON_INSET: f64 = 12.;
+
+/// The volume slider row (gnome-shell's `.quick-slider`): a full-width row below the
+/// tile grid with a mute icon-button at the left and the slider track filling the
+/// rest. Height is the `.icon-button` disc; the track is a thin trough with an
+/// accent-filled portion and a round handle (`_slider.scss`).
+const SLIDER_H: f64 = 40.;
+const SLIDER_ICON: f64 = 16.;
+/// Slider handle diameter (`$slider_size` = 16px) and trough thickness
+/// (`-barlevel-height` = 4px), logical px.
+const SLIDER_HANDLE: f64 = 16.;
+const SLIDER_TROUGH: f64 = 4.;
+/// Track background (`transparentize($fg_color, .9)`) and filled portion (accent).
+const SLIDER_TROUGH_BG: [f32; 4] = [1., 1., 1., 0.1];
+// The slider's mute-button disc uses the same off-tile background as the tiles.
 
 /// Outer radius of the menu panel, logical px. gnome-shell 50.1's `.quick-settings`
 /// uses `border-radius: $modal_radius * 2.25` = `(8*2)*2.25` = 36px
@@ -277,6 +292,10 @@ pub struct QuickSettings {
     battery: Option<BatteryStatus>,
     /// Accent color for an active tile's background (straight RGBA).
     accent: [f32; 4],
+    /// Default-sink state for the volume slider; `None` hides the slider row.
+    audio: Option<AudioStatus>,
+    /// Whether the volume slider is being dragged (a button is held on it).
+    sliding: bool,
     /// Bumped on any toggle so the cached chrome texture is redrawn.
     revision: u64,
     cache: RefCell<TextureCache>,
@@ -294,12 +313,15 @@ impl QuickSettings {
         toggles: QuickToggles,
         network: NetworkStatus,
         battery: Option<BatteryStatus>,
+        audio: Option<AudioStatus>,
         accent: [u8; 3],
     ) -> Self {
         Self {
             toggles,
             network,
             battery,
+            audio,
+            sliding: false,
             accent: [
                 f32::from(accent[0]) / 255.,
                 f32::from(accent[1]) / 255.,
@@ -321,7 +343,7 @@ impl QuickSettings {
 
     /// The menu's logical size (fixed: two tile columns + the system row).
     pub fn logical_size(&self) -> Size<f64, Logical> {
-        Size::from((menu_w(), menu_h()))
+        Size::from((menu_w(), menu_h(self.audio.is_some())))
     }
 
     /// Handle a click at a menu-local logical position, returning the action to
@@ -364,7 +386,51 @@ impl QuickSettings {
                 return button.action();
             }
         }
+        // The volume slider: the speaker icon toggles mute; the track jumps to (and
+        // begins dragging toward) the clicked position.
+        if self.audio.is_some() {
+            if slider_icon_rect().contains(pos) {
+                return PopoverAction::ToggleMute;
+            }
+            if slider_track_rect().contains(pos) {
+                self.sliding = true;
+                return self.set_local_volume(volume_from_x(pos.x));
+            }
+        }
         PopoverAction::Consumed
+    }
+
+    /// Continue a slider drag: while a button is held on the track, motion updates
+    /// the volume. Returns the action to apply, or `None` when not dragging.
+    pub fn pointer_drag(&mut self, pos: Point<f64, Logical>) -> Option<PopoverAction> {
+        self.sliding
+            .then(|| self.set_local_volume(volume_from_x(pos.x)))
+    }
+
+    /// End a slider drag (pointer released).
+    pub fn end_drag(&mut self) {
+        self.sliding = false;
+    }
+
+    /// Optimistically move the slider locally (so the handle tracks the pointer
+    /// before the PipeWire echo lands) and emit the volume action.
+    fn set_local_volume(&mut self, volume: f64) -> PopoverAction {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.volume = volume;
+        }
+        self.revision += 1;
+        PopoverAction::SetVolume(volume)
+    }
+
+    /// Adopt a fresh sink state (from the PipeWire watcher). Ignored mid-drag so the
+    /// lagging echo doesn't yank the handle. Returns whether it changed.
+    pub fn set_audio(&mut self, audio: Option<AudioStatus>) -> bool {
+        if self.sliding || audio == self.audio {
+            return false;
+        }
+        self.audio = audio;
+        self.revision += 1;
+        true
     }
 
     fn set_tile(&mut self, tile: Tile, on: bool) {
@@ -442,6 +508,28 @@ impl QuickSettings {
                 icons,
                 &candidates,
                 SYS_ICON,
+                scale,
+                SYS_FG,
+                origin,
+                center,
+            ) {
+                elements.push(el);
+            }
+        }
+
+        // The volume slider's mute/level speaker icon, in its disc.
+        if let Some(audio) = self.audio {
+            let disc = slider_icon_rect();
+            let center = Point::from((
+                disc.loc.x + disc.size.w / 2.,
+                disc.loc.y + disc.size.h / 2.,
+            ));
+            let name = crate::audio::volume_icon(&audio).to_string();
+            if let Some(el) = icon_element(
+                renderer,
+                icons,
+                &[name],
+                SLIDER_ICON,
                 scale,
                 SYS_FG,
                 origin,
@@ -641,6 +729,56 @@ impl QuickSettings {
                 )?;
             }
 
+            // The volume slider: mute-button disc, the trough, its accent-filled
+            // portion, and the round handle (`.quick-slider` + `_slider.scss`). The
+            // speaker icon composites on top afterwards.
+            if let Some(audio) = self.audio {
+                let disc = slider_icon_rect();
+                frame.render_rounded_rect(
+                    TILE_OFF,
+                    (SLIDER_H / 2. * scale) as f32,
+                    rect_px(disc),
+                    &[full],
+                )?;
+
+                let track = slider_track_rect();
+                let cy = track.loc.y + track.size.h / 2.;
+                let trough = Rectangle::new(
+                    Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
+                    Size::from((track.size.w, SLIDER_TROUGH)),
+                );
+                frame.render_rounded_rect(
+                    SLIDER_TROUGH_BG,
+                    (SLIDER_TROUGH / 2. * scale) as f32,
+                    rect_px(trough),
+                    &[full],
+                )?;
+
+                let handle_cx = slider_handle_x(audio.volume);
+                let fill_color = if audio.muted { SLIDER_TROUGH_BG } else { self.accent };
+                let fill = Rectangle::new(
+                    trough.loc,
+                    Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
+                );
+                frame.render_rounded_rect(
+                    fill_color,
+                    (SLIDER_TROUGH / 2. * scale) as f32,
+                    rect_px(fill),
+                    &[full],
+                )?;
+
+                let handle = Rectangle::new(
+                    Point::from((handle_cx - SLIDER_HANDLE / 2., cy - SLIDER_HANDLE / 2.)),
+                    Size::from((SLIDER_HANDLE, SLIDER_HANDLE)),
+                );
+                frame.render_rounded_rect(
+                    FG_OFF,
+                    (SLIDER_HANDLE / 2. * scale) as f32,
+                    rect_px(handle),
+                    &[full],
+                )?;
+            }
+
             let _sync = frame.finish()?;
         }
 
@@ -654,10 +792,64 @@ fn menu_w() -> f64 {
     PAD * 2. + COLS as f64 * TILE_W + (COLS as f64 - 1.) * TILE_GAP
 }
 
-/// The menu's logical height: the system row at the top, the gap, then the grid.
-fn menu_h() -> f64 {
+/// The y of the grid's bottom edge (system row + gap + tile rows).
+fn grid_bottom() -> f64 {
     let rows = GRID.len().div_ceil(COLS) as f64;
-    PAD + SYS_H + TILE_GAP + rows * TILE_H + (rows - 1.) * TILE_GAP + PAD
+    PAD + SYS_H + TILE_GAP + rows * TILE_H + (rows - 1.) * TILE_GAP
+}
+
+/// The menu's logical height: system row, tile grid, and the volume slider row when
+/// a sink is present.
+fn menu_h(has_slider: bool) -> f64 {
+    let content = if has_slider {
+        grid_bottom() + TILE_GAP + SLIDER_H
+    } else {
+        grid_bottom()
+    };
+    content + PAD
+}
+
+/// The volume-slider row rectangle (full content width, below the grid).
+fn slider_row_rect() -> Rectangle<f64, Logical> {
+    let y = grid_bottom() + TILE_GAP;
+    Rectangle::new(
+        Point::from((PAD, y)),
+        Size::from((menu_w() - 2. * PAD, SLIDER_H)),
+    )
+}
+
+/// The mute-button disc at the left of the slider row.
+fn slider_icon_rect() -> Rectangle<f64, Logical> {
+    let row = slider_row_rect();
+    Rectangle::new(row.loc, Size::from((SLIDER_H, SLIDER_H)))
+}
+
+/// The slider's interactive track band (row minus the mute disc). The drawn trough
+/// is a thin bar centered in this band; the usable handle-center x-range is inset by
+/// half a handle so the handle never overhangs.
+fn slider_track_rect() -> Rectangle<f64, Logical> {
+    let row = slider_row_rect();
+    let x = row.loc.x + SLIDER_H + SYS_GAP;
+    Rectangle::new(
+        Point::from((x, row.loc.y)),
+        Size::from((row.loc.x + row.size.w - x, SLIDER_H)),
+    )
+}
+
+/// Perceptual volume `0..=1` for a pointer x on the slider track.
+fn volume_from_x(x: f64) -> f64 {
+    let track = slider_track_rect();
+    let left = track.loc.x + SLIDER_HANDLE / 2.;
+    let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
+    ((x - left) / (right - left)).clamp(0.0, 1.0)
+}
+
+/// The x of the handle center for a given perceptual volume.
+fn slider_handle_x(volume: f64) -> f64 {
+    let track = slider_track_rect();
+    let left = track.loc.x + SLIDER_HANDLE / 2.;
+    let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
+    left + volume.clamp(0.0, 1.0) * (right - left)
 }
 
 /// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below
@@ -762,7 +954,7 @@ mod tests {
     #[test]
     fn layout_places_tiles_and_system_row_within_bounds() {
         let size =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0])
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0])
                 .logical_size();
         let within = |r: Rectangle<f64, Logical>, what: &str| {
             assert!(
@@ -789,7 +981,7 @@ mod tests {
     #[test]
     fn clicking_a_tile_flips_and_returns_the_action() {
         let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
         let dnd = tile_rect(2); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
@@ -808,7 +1000,7 @@ mod tests {
         assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Airplane));
 
         let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
         let before = qs.revision;
         let action = qs.pointer_click(center(tile_rect(0)));
         match action {
@@ -823,7 +1015,7 @@ mod tests {
     #[test]
     fn clicking_system_buttons_returns_their_actions() {
         let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
 
         let shot = qs.pointer_click(center(sys_rect(SysButton::Screenshot, false)));
         assert!(matches!(shot, PopoverAction::Screenshot));
@@ -845,6 +1037,7 @@ mod tests {
             QuickToggles::default(),
             NetworkStatus::Wired,
             Some(battery(79.)),
+            None,
             [0, 0, 0],
         );
         let pill = pill_rect(true).expect("a battery must show the pill");
@@ -863,7 +1056,7 @@ mod tests {
     #[test]
     fn clicking_empty_space_is_consumed() {
         let mut qs =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, [0, 0, 0]);
+            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
         // Below the top system row, between the two tile columns.
         let action = qs.pointer_click(Point::from((menu_w() / 2., PAD + SYS_H + 2.)));
         assert!(matches!(action, PopoverAction::Consumed));
@@ -892,6 +1085,7 @@ mod tests {
             toggles,
             NetworkStatus::Unknown,
             Some(battery(79.)),
+            None,
             [0xff, 0x00, 0x00],
         );
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");

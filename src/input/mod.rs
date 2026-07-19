@@ -888,6 +888,22 @@ impl State {
             }
             PopoverAction::Screenshot => self.open_screenshot_ui(true, None),
             PopoverAction::Spawn(command) => spawn(command, None),
+            #[cfg(feature = "pipewire")]
+            PopoverAction::SetVolume(volume) => {
+                if let Some(pw) = self.niri.pw_audio.as_ref() {
+                    let status = pw.set_volume(volume);
+                    self.on_audio_status(status);
+                }
+            }
+            #[cfg(feature = "pipewire")]
+            PopoverAction::ToggleMute => {
+                if let Some(pw) = self.niri.pw_audio.as_ref() {
+                    let status = pw.toggle_muted();
+                    self.on_audio_status(status);
+                }
+            }
+            #[cfg(not(feature = "pipewire"))]
+            PopoverAction::SetVolume(_) | PopoverAction::ToggleMute => {}
         }
     }
 
@@ -2708,6 +2724,16 @@ impl State {
         if self.niri.panel.set_hovered_role(role) {
             self.niri.queue_redraw_all();
         }
+
+        // While a quick-settings slider is being dragged, route motion to it.
+        if self.niri.panel_popover.is_open() {
+            if let Some((output, p)) = self.niri.output_under(pos).map(|(o, p)| (o.clone(), p)) {
+                if let Some(action) = self.niri.panel_popover.pointer_drag(&output, p) {
+                    self.apply_popover_action(action);
+                    self.niri.queue_redraw_all();
+                }
+            }
+        }
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
@@ -3089,6 +3115,12 @@ impl State {
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
+        // End any quick-settings volume-slider drag on button release (the press that
+        // started it is suppressed below, so handle it before that early return).
+        if button_state == ButtonState::Released {
+            self.niri.panel_popover.end_drag();
+        }
+
         // Ignore release events for mouse clicks that triggered a bind.
         if self.niri.suppressed_buttons.remove(&button_code) {
             return;
@@ -3203,9 +3235,10 @@ impl State {
                                 let anchor = self.niri.panel.quick_settings_rect(output_w);
                                 let network = self.niri.system_status.network;
                                 let battery = self.niri.system_status.battery.clone();
+                                let audio = self.niri.audio;
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri.panel_popover.toggle_quick_settings(
-                                    output, anchor, toggles, network, battery, accent,
+                                    output, anchor, toggles, network, battery, audio, accent,
                                 );
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
@@ -3597,6 +3630,38 @@ impl State {
                     }
                 }
                 return;
+            }
+
+            // Scroll over the quick-settings indicator adjusts the default sink's
+            // volume, like gnome-shell's output indicator (±2% per tick, up = louder).
+            #[cfg(feature = "pipewire")]
+            {
+                let over_qs = self
+                    .niri
+                    .output_under(location)
+                    .map(|(output, pos)| {
+                        let ws = self.niri.workspace_state_for(output);
+                        let output_w = output_size(output).w;
+                        self.niri.panel.hit_test(pos, output_w, ws)
+                            == Some(crate::ui::panel::ROLE_QUICK_SETTINGS)
+                    })
+                    .unwrap_or(false);
+                if over_qs {
+                    let vertical = vertical_amount_v120.unwrap_or(0.);
+                    let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
+                    if ticks != 0 {
+                        let delta = -(ticks as f64) * crate::audio::SCROLL_STEP;
+                        let new = self
+                            .niri
+                            .pw_audio
+                            .as_ref()
+                            .and_then(|pw| pw.adjust_volume(delta));
+                        if let Some(status) = new {
+                            self.on_audio_status(Some(status));
+                        }
+                    }
+                    return;
+                }
             }
         }
 

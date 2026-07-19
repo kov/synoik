@@ -2424,7 +2424,10 @@ impl State {
     /// no sink is bound). Updates the panel's output indicator + QS slider.
     pub fn on_audio_status(&mut self, status: Option<crate::audio::AudioStatus>) {
         self.niri.audio = status;
-        if self.niri.panel.set_audio(status) {
+        let mut redraw = self.niri.panel.set_audio(status);
+        // Keep an open quick-settings volume slider in sync with live changes.
+        redraw |= self.niri.panel_popover.set_audio(status);
+        if redraw {
             self.niri.queue_redraw_all();
         }
     }

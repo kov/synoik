@@ -2203,6 +2203,7 @@ fn vulkan_renders_the_quick_settings_popover() {
         let anchor = f.niri().panel.quick_settings_rect(output_w);
         let network = f.niri().system_status.network;
         let battery = f.niri().system_status.battery.clone();
+        let audio = f.niri().audio;
         let accent = f.niri().gnome_settings.accent_color;
         f.niri().panel_popover.toggle_quick_settings(
             output.clone(),
@@ -2210,6 +2211,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             toggles,
             network,
             battery,
+            audio,
             accent,
         );
     }

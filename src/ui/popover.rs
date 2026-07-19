@@ -43,7 +43,7 @@ use crate::utils::output_size;
 /// The side effect a popover click asks the caller (the input handler) to apply.
 /// Keeps the content widgets pure — they never touch gsettings or spawn — while
 /// still driving real behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PopoverAction {
     /// The click was consumed but has no side effect (e.g. a calendar day, or a
     /// hit on empty menu space). The popover stays open.
@@ -54,6 +54,10 @@ pub enum PopoverAction {
     SetDoNotDisturb(bool),
     /// Set `org.gnome.settings-daemon.plugins.color night-light-enabled`.
     SetNightLight(bool),
+    /// Set the default sink's perceptual volume `0..=1` (the QS volume slider).
+    SetVolume(f64),
+    /// Toggle the default sink's mute (clicking the slider's speaker icon).
+    ToggleMute,
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -205,7 +209,8 @@ impl PanelPopover {
     }
 
     /// Toggle the quick-settings menu, anchored at `anchor` on `output`. `battery`
-    /// feeds the power pill (`None` hides it).
+    /// feeds the power pill (`None` hides it); `audio` feeds the volume slider.
+    #[allow(clippy::too_many_arguments)]
     pub fn toggle_quick_settings(
         &mut self,
         output: Output,
@@ -213,6 +218,7 @@ impl PanelPopover {
         toggles: crate::gnome::QuickToggles,
         network: crate::system_status::NetworkStatus,
         battery: Option<crate::system_status::BatteryStatus>,
+        audio: Option<crate::audio::AudioStatus>,
         accent: [u8; 3],
     ) {
         if self.is_showing::<QuickSettingsTag>() {
@@ -224,9 +230,45 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
-            toggles, network, battery, accent,
+            toggles, network, battery, audio, accent,
         )));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Push a fresh audio snapshot to an open quick-settings popover (from the
+    /// PipeWire watcher), so the volume slider tracks live changes. Returns whether
+    /// it changed anything.
+    pub fn set_audio(&mut self, audio: Option<crate::audio::AudioStatus>) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_audio(audio)
+            }
+            _ => false,
+        }
+    }
+
+    /// Continue a quick-settings volume-slider drag at output-local `pos`; returns
+    /// the action to apply, or `None` when not over a live slider drag.
+    pub fn pointer_drag(
+        &mut self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Option<PopoverAction> {
+        if !self.open || self.closing || self.output.as_ref() != Some(output) {
+            return None;
+        }
+        let local = pos - self.location(output);
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) => qs.pointer_drag(local),
+            _ => None,
+        }
+    }
+
+    /// End any quick-settings slider drag (pointer released).
+    pub fn end_drag(&mut self) {
+        if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
+            qs.end_drag();
+        }
     }
 
     /// Whether the popover is open showing a particular content kind (so a second
