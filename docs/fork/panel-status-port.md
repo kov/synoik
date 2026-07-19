@@ -96,7 +96,7 @@ dot; popover = **two columns** (`calendarArea` hbox, `dateMenu.js:893-897`).
 | C1 | Clock label | wall-clock text | `dateMenu.js:865,882` | `[self]` | ✅ (`panel.rs` `format_clock`) |
 | C2 | **Notifications dot** (`MessagesIndicator`) | small dot on clock when unread | `dateMenu.js:743,869,883` | `[subsystem]` notifications | ⬜ |
 | C3 | **Message-list column** (`CalendarMessageList`) | notifications + media controls + **Clear** button + "No Notifications" placeholder | `js/ui/calendar.js:794`; placeholder `:775,804`; view `:814-821`; clear button `:823-837`; added `dateMenu.js:918-919` | `[subsystem]` `org.freedesktop.Notifications` server (we have none) | ⬜ |
-| C4 | **TodayButton header** | day-of-week + full date above the grid | `TodayButton` `dateMenu.js:52,70-77`; added `:942` | `[self]` | ⬜ (easy add to `calendar.rs`) |
+| C4 | **TodayButton header** | day-of-week + full date above the grid | `TodayButton` `dateMenu.js:52,70-77`; added `:942` | `[self]` | ✅ `e5b3ac6c` (header card in `calendar.rs`; click snaps to today; one-surface divergence) |
 | C5 | Calendar month grid | 6×7 day grid | `Calendar.Calendar()` `dateMenu.js:899,943` | `[self]` | ✅ (`calendar.rs`) |
 | C6 | **Events section** | today's calendar events / "No Events" | `EventsSection` `dateMenu.js:111`; added `:960-961`; placeholder `:289-293` | `[dbus:evolution-data-server]` (CalendarServer) | ⬜ (noted deferred `calendar.rs:11`) |
 | C7 | **World clocks section** | clocks from GNOME Clocks | `WorldClocksSection` `dateMenu.js:331`; added `:963-964` | `[dbus]` GNOME Clocks + gsettings | ⬜ |
@@ -201,9 +201,9 @@ carved these out as separate work — none block R1 for daily use:
 ## Prioritized backlog (pick from the top)
 
 **Tier 1 — self-contained, no new daemon, real daily-driver gaps:**
-1. C4 TodayButton header (calendar) — smallest, self-contained.
-2. R1 screen-recording indicator — compositor already knows when a cast is live.
-3. Q18 unsafe-mode indicator + toggle — pure compositor state.
+1. ✅ C4 TodayButton header (calendar) — done `e5b3ac6c`.
+2. ✅ R1 screen-recording indicator — done (native recorder track).
+3. Q18 unsafe-mode indicator + toggle — pure compositor state.  ← next
 4. R5 input-source (keyboard) indicator — xkb/gsettings; high value for multi-layout users.
 
 **Tier 2 — reuses backends already wired:**
