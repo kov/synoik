@@ -43,3 +43,8 @@ Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
 rebase or merge from niri. The `niri-main` branch and the `upstream` remote (niri) are frozen
 reference/history only — do not rebase/merge from them. Owned-render-stack direction is in
 `docs/fork/STRATEGY.md` §3.10.
+
+**Pre-commit hook:** `.githooks/pre-commit` gates every commit on `cargo fmt --all -- --check`
+and `cargo clippy --workspace --all-targets -- -D warnings`. It is not active until each clone
+opts in: `git config core.hooksPath .githooks` (per-clone local config, so a fresh checkout must
+re-run it). Always run `cargo fmt --all` before committing regardless.
