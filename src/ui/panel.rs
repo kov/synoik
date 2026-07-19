@@ -55,9 +55,10 @@ use crate::utils::{output_size, to_physical_precise_round};
 /// i.e. ~32px at scale 1 (`gnome-shell-sass/widgets/_panel.scss`).
 pub const PANEL_HEIGHT: f64 = 32.;
 
-/// Panel font size in logical pixels-per-em. Scaled by the output scale to the
-/// physical em the glyph rasterizer shapes at.
-const FONT_PX: f64 = 13.;
+/// Panel font size in logical pixels-per-em. The clock draws at GNOME's `panel_button`
+/// base of 11pt (`_drawing.scss`), bold. Scaled by the output scale to the physical em
+/// the glyph rasterizer shapes at.
+const FONT_PX: f64 = crate::ui::pt_to_px(11.);
 
 /// Base workspace-dot diameter, logical px. GNOME: `$scalable_icon_size (16) * 0.5`
 /// (`gnome-shell-sass/widgets/_panel.scss`), fully rounded (`$forced_circular_radius`).

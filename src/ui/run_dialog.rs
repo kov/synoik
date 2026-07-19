@@ -35,10 +35,10 @@ use crate::utils::{output_size, to_physical_precise_round};
 const PADDING: i32 = 16;
 /// Wrap width of the dialog text area, logical px.
 const WIDTH: i32 = 400;
-/// Base dialog font size (title + entry), logical px-per-em.
-const BASE_FONT_PX: f64 = 14.;
-/// Small (description/hint) font size, logical px-per-em.
-const SMALL_FONT_PX: f64 = 11.;
+/// Base dialog font size (title + entry), GNOME body 11pt, logical px-per-em.
+const BASE_FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Small (description/hint) font size, GNOME `%caption` 9pt, logical px-per-em.
+const SMALL_FONT_PX: f64 = crate::ui::pt_to_px(9.);
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 /// Dialog box background (opaque dark grey), straight RGBA.
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];

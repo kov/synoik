@@ -47,9 +47,10 @@ const BORDER: i32 = 2;
 const BUTTON_W: i32 = 120;
 const BUTTON_H: i32 = 40;
 const BUTTON_GAP: i32 = 12;
-/// Title font size (bold) and body/label font size, logical px-per-em.
-const TITLE_PX: f64 = 15.;
-const BODY_PX: f64 = 12.;
+/// Title font size (bold, GNOME `%title_3` = 15pt) and body/label font size (11pt),
+/// logical px-per-em.
+const TITLE_PX: f64 = crate::ui::pt_to_px(15.);
+const BODY_PX: f64 = crate::ui::pt_to_px(11.);
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 /// Box background, grey border, and the two button fills (accent when focused), straight RGBA.
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];

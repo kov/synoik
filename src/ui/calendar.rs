@@ -35,9 +35,12 @@ const WEEKCOL_W: f64 = 26.;
 const GRID_ROWS: usize = 6;
 const GRID_COLS: usize = 7;
 
-const HEADER_PX: f64 = 14.;
-const WEEKDAY_PX: f64 = 10.;
-const DAY_PX: f64 = 12.;
+// Month label is GNOME's `.calendar-month-label` (%heading, 11pt); the weekday headings
+// and day-number cells are 9pt (`_calendar.scss`). The month-nav chevron is a drawn
+// glyph, not a GNOME point size, so it keeps its own logical-px size.
+const HEADER_PX: f64 = crate::ui::pt_to_px(11.);
+const WEEKDAY_PX: f64 = crate::ui::pt_to_px(9.);
+const DAY_PX: f64 = crate::ui::pt_to_px(9.);
 const ARROW_PX: f64 = 18.;
 /// Diameter (logical px) of the today/selected highlight circle, drawn behind the
 /// day number with `render_rounded_rect` (a half-diameter radius clamps to a full

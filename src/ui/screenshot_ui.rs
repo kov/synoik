@@ -39,7 +39,7 @@ const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
-const FONT_PX: f64 = 14.;
+const FONT_PX: f64 = crate::ui::pt_to_px(11.);
 const BORDER: i32 = 4;
 
 /// Dark panel background, grey border, and the grey keycap patch (`#2C2C2C`).

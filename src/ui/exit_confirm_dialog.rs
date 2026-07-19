@@ -25,8 +25,8 @@ use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
 const PADDING: i32 = 16;
-/// Dialog font size, logical px-per-em.
-const FONT_PX: f64 = 14.;
+/// Dialog font size, GNOME message-dialog body 11pt, logical px-per-em.
+const FONT_PX: f64 = crate::ui::pt_to_px(11.);
 /// A generous non-wrapping layout width (logical px); the dialog is sized to its content, so this
 /// only needs to exceed the widest line.
 const WRAP_WIDTH: i32 = 1000;

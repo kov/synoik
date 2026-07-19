@@ -22,8 +22,8 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-/// Notification font size, logical px-per-em.
-const FONT_PX: f64 = 14.;
+/// Notification font size (body 11pt), logical px-per-em.
+const FONT_PX: f64 = crate::ui::pt_to_px(11.);
 /// A generous non-wrapping layout width (logical px); the notification is content-sized, so this
 /// only needs to exceed the natural line width (a very long config path wraps rather than
 /// producing an ultra-wide banner).

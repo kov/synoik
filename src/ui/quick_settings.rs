@@ -55,9 +55,9 @@ const TILE_ICON: f64 = 16.;
 const TILE_ICON_INSET: f64 = 12.;
 /// Tile-title / battery-percentage font size, logical px. GNOME's `.quick-toggle-title`
 /// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
-/// (`gnome-shell-sass/_common.scss`). 11pt maps to the same 13 logical px as the panel
-/// clock (`panel::FONT_PX`), drawn bold — not 11px regular, which reads too small.
-const LABEL_PX: f64 = 13.;
+/// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
+/// light/small.
+const LABEL_PX: f64 = crate::ui::pt_to_px(11.);
 
 /// The system row (Settings on the left, Lock/Power on the right) sits at the
 /// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,

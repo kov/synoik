@@ -20,7 +20,7 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-const FONT_PX: f64 = 14.;
+const FONT_PX: f64 = crate::ui::pt_to_px(11.);
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
