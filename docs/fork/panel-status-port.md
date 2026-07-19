@@ -203,8 +203,10 @@ carved these out as separate work — none block R1 for daily use:
 **Tier 1 — self-contained, no new daemon, real daily-driver gaps:**
 1. ✅ C4 TodayButton header (calendar) — done `e5b3ac6c`.
 2. ✅ R1 screen-recording indicator — done (native recorder track).
-3. Q18 unsafe-mode indicator + toggle — pure compositor state.  ← next
-4. R5 input-source (keyboard) indicator — xkb/gsettings; high value for multi-layout users.
+3. ✅ R5 input-source (keyboard) indicator — done `33c25f94` (xkb layout label; menu deferred).
+4. Q18 unsafe-mode indicator + toggle — deferred: no unsafe-mode state exists in the fork yet
+   (nothing sets/reads it), so the indicator would be inert chrome. Revisit once a privileged
+   surface actually gates on it.
 
 **Tier 2 — reuses backends already wired:**
 5. Q3 microphone input slider + mic privacy icon — PipeWire is already integrated.
