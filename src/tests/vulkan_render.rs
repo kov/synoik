@@ -775,6 +775,66 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
     );
 }
 
+/// The recorder capture path (`render_for_recorders`) runs real Vulkan work that no other test
+/// drives: `render_to_vec` of the scene, a `RelocateRenderElement` crop, and an offscreen readback
+/// into an area-sized buffer. Drive it here — whole-output (zero-offset relocate) and an odd-sized
+/// area (non-zero offset + even-rounding) — so `NIRI_VK_VALIDATION=1 cargo test` covers it. The
+/// assertion is implicit: the validation layer must report nothing (checked at process exit).
+#[test]
+fn vulkan_recorder_capture_path_is_clean() {
+    // The recording spawns an ffmpeg encoder; skip cleanly where ffmpeg is unavailable.
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ffmpeg {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    f.niri().update_render_elements(None);
+
+    let dir = std::env::temp_dir().join(format!("niri-vkrec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Whole-output (zero-offset relocate) and an odd-sized area (offset relocate + even-rounding).
+    f.niri()
+        .start_native_recording(&output, dir.join("full.webm"), 30, true, None)
+        .unwrap();
+    let area = Rectangle::new(Point::from((37, 21)), Size::from((641, 481)));
+    f.niri()
+        .start_native_recording(&output, dir.join("area.webm"), 30, false, Some(area))
+        .unwrap();
+
+    // Drive a few capture passes through the real Vulkan renderer (disjoint niri/backend borrows).
+    let base = f.niri().clock.now_unadjusted();
+    for i in 0..3u32 {
+        let time = base + Duration::from_millis(u64::from(i) * 40);
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| state.niri.render_for_recorders(vk, &output, time))
+            .expect("headless backend must hold a Vulkan renderer");
+    }
+
+    assert_eq!(f.niri().casting.recordings.len(), 2, "both recordings live");
+    f.niri().stop_screen_recordings();
+    assert!(
+        f.niri().casting.recordings.is_empty(),
+        "recordings cleared on stop"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Freeze the current screen into a crossfade, and return the time it starts at — feed that to
 /// [`pin_crossfade_at_start`] before rendering.
 ///
