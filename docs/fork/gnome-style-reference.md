@@ -11,6 +11,13 @@ the quick-settings menu alone; this table is so we stop.
 50.1 source and cite the file. This doc is a cache of that reading, not a substitute — if a row
 looks wrong, re-grep the reference and fix the row.
 
+**Positioning & child order are not in these tables.** They come from the JS construction order
+(`js/ui/quickSettings.js` `_addItems`/`addItem`, `js/ui/panel.js` box assembly, `add_child` calls),
+not the SCSS — the CSS says how a widget *looks*, never *where* it sits. Before placing a widget in
+a container, read that sequence and cite it, the same way you'd cite a color. (This is exactly the
+trap that put the volume slider at the bottom of the QS menu instead of between the system row and
+the toggle grid — the style was reference-checked, the order was assumed.)
+
 **How to read the tables.** Values are resolved to concrete units (px, pt, "fully rounded"). GNOME
 authors in `pt` for fonts and `$token` multiples for space; the token legend below resolves them.
 The `Source` column is `path:line` into the reference checkout, e.g. `widgets/_panel.scss:12` under

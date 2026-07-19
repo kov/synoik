@@ -34,6 +34,9 @@ Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
   full-width row at the *top*, not the bottom); grep the reference first, then implement.
   For *visual* specs (fonts, colors, radii, spacing, per-widget classes), `docs/fork/gnome-style-reference.md`
   is a cached, cited reading of the 50.1 theme — start there, but re-grep the reference if a row looks off.
+  This includes **where** a widget sits: derive child order/placement from the JS construction sequence
+  (`js/ui/*.js` `add_child`/`_addItems`), not from what looks right — the SCSS says how it looks, never
+  where it goes. (The QS volume slider first landed at the menu bottom because the order was assumed.)
 
 ## Git
 **Hard fork (2026-07):** `main` is the only living branch (ours, to push later). We no longer
