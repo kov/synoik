@@ -985,6 +985,8 @@ pub enum Action {
     },
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
+    /// Start or stop recording the focused screen to a WebM file.
+    ToggleScreenRecord {},
     /// Open the Overview.
     OpenOverview {},
     /// Close the Overview.

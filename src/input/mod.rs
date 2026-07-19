@@ -907,6 +907,33 @@ impl State {
         }
     }
 
+    /// Start recording the active output, or stop if one is already running (the
+    /// `ToggleScreenRecord` action / a future record button).
+    #[cfg(feature = "xdp-gnome-screencast")]
+    fn toggle_screen_record(&mut self) {
+        use crate::screencasting::RecordingKind;
+
+        let recording = self
+            .niri
+            .casting
+            .recordings
+            .iter()
+            .any(|r| matches!(r.kind, RecordingKind::Native(_)));
+        if recording {
+            self.niri.stop_screen_recordings();
+        } else if let Some(output) = self.niri.layout.active_output().cloned() {
+            match crate::recording::default_recording_path() {
+                Ok(path) => {
+                    if let Err(err) = self.niri.start_native_recording(&output, path) {
+                        warn!("could not start screen recording: {err:?}");
+                    }
+                }
+                Err(err) => warn!("could not choose a recording path: {err:?}"),
+            }
+        }
+        self.niri.queue_redraw_all();
+    }
+
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
@@ -2558,6 +2585,14 @@ impl State {
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();
+            }
+            #[cfg(feature = "xdp-gnome-screencast")]
+            Action::ToggleScreenRecord => {
+                self.toggle_screen_record();
+            }
+            #[cfg(not(feature = "xdp-gnome-screencast"))]
+            Action::ToggleScreenRecord => {
+                warn!("screen recording requires the xdp-gnome-screencast feature");
             }
             Action::OpenOverview => {
                 if self.niri.layout.open_overview() {

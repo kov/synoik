@@ -3225,3 +3225,73 @@ fn screen_recording_indicator_click_stops_the_recording() {
         .iter()
         .all(|i| i.role != ROLE_SCREEN_RECORDING));
 }
+
+#[test]
+fn native_screen_recording_registers_and_stops() {
+    use crate::screencasting::RecordingKind;
+    use crate::ui::panel::{WorkspaceState, ROLE_SCREEN_RECORDING};
+
+    // A native recording spawns an ffmpeg encoder; skip cleanly where ffmpeg is unavailable.
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ffmpeg {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let mut clock = f.niri().clock.clone();
+    let t0 = clock.now_unadjusted();
+    clock.set_unadjusted(t0);
+
+    let output = f.niri().global_space.outputs().next().cloned().unwrap();
+    let path = std::env::temp_dir().join(format!("niri-native-rec-{}.webm", std::process::id()));
+
+    // Starting registers a Native recording and shows the R1 pill.
+    f.niri()
+        .start_native_recording(&output, path.clone())
+        .unwrap();
+    assert!(f
+        .niri()
+        .casting
+        .recordings
+        .iter()
+        .any(|r| matches!(r.kind, RecordingKind::Native(_))));
+    let ws = WorkspaceState {
+        count: 1,
+        active: 0,
+    };
+    assert!(f
+        .niri()
+        .panel
+        .items(1920., ws)
+        .iter()
+        .any(|i| i.role == ROLE_SCREEN_RECORDING));
+
+    // Clicking the pill runs the real hit-test → stop_screen_recordings → finalize-encoder path;
+    // the ledger clears and the indicator disappears (regardless of the zero-frame file).
+    let r1 = f.niri().panel.screen_recording_rect(1920.);
+    let cx = r1.loc.x + r1.size.w / 2.;
+    f.pointer_motion(cx, 16.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        f.niri().casting.recordings.is_empty(),
+        "clicking the indicator stops the native recording",
+    );
+    assert!(f
+        .niri()
+        .panel
+        .items(1920., ws)
+        .iter()
+        .all(|i| i.role != ROLE_SCREEN_RECORDING));
+
+    std::fs::remove_file(&path).ok();
+}

@@ -5351,6 +5351,8 @@ impl Niri {
 
         self.render_area_for_screen_cast(renderer, output, target_presentation_time);
 
+        self.render_for_recorders(renderer, output, target_presentation_time);
+
         self.render_for_screencopy_with_damage(renderer, output);
     }
 

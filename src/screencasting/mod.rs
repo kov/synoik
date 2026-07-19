@@ -11,7 +11,7 @@ use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::desktop::Window;
-use smithay::output::Output;
+use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
@@ -55,6 +55,35 @@ pub struct ScreenRecording {
     pub session_id: CastSessionId,
     /// Monotonic time the recording started, for the `M:SS` elapsed label.
     pub started_at: Duration,
+    pub kind: RecordingKind,
+}
+
+/// How a recording is driven and stopped.
+pub enum RecordingKind {
+    /// A screencast started with the `is-recording` property (gnome-shell's recorder path).
+    /// Stopped by tearing down the cast via [`Niri::stop_cast`].
+    External,
+    /// Our own recorder: the compositor captures frames and feeds an encoder. Stopped by
+    /// finalizing the encoder.
+    Native(NativeRecording),
+}
+
+/// State for a compositor-driven ("native") recording.
+pub struct NativeRecording {
+    /// Output being captured.
+    output: WeakOutput,
+    /// The encoder worker; captured frames are pushed here, and `finish()` finalizes the file.
+    recorder: crate::recording::encoder::ThreadedRecorder,
+    /// Physical capture size (the output mode, transformed).
+    size: Size<i32, Physical>,
+    /// Output fractional scale.
+    scale: Scale<f64>,
+    /// Where the finished file lands.
+    path: std::path::PathBuf,
+    /// Presentation time of the last captured frame, for framerate pacing.
+    last_frame_time: Duration,
+    /// Minimum spacing between captured frames (the target framerate).
+    frame_interval: Duration,
 }
 
 /// A screencast request that hasn't been started yet.
@@ -922,12 +951,60 @@ impl Niri {
         self.casting.recordings.push(ScreenRecording {
             session_id,
             started_at: self.clock.now_unadjusted(),
+            kind: RecordingKind::External,
         });
         self.refresh_screen_recording();
     }
 
-    /// Stop every live recording (the R1 indicator's click action). Each `stop_cast` prunes the
-    /// ledger and refreshes the panel.
+    /// Start a compositor-driven recording of `output` to `path` (WebM/VP8 via ffmpeg). Returns the
+    /// synthetic session id tracking it. Frames are captured on the output's redraws by
+    /// [`Niri::render_for_recorders`]; stop it via [`Niri::stop_screen_recordings`].
+    pub fn start_native_recording(
+        &mut self,
+        output: &Output,
+        path: std::path::PathBuf,
+    ) -> anyhow::Result<CastSessionId> {
+        use crate::recording::encoder::{FfmpegEncoder, ThreadedRecorder};
+        use crate::recording::RecordConfig;
+
+        const FPS: u32 = 30;
+
+        let transform = output.current_transform();
+        let size =
+            transform.transform_size(output.current_mode().context("output has no mode")?.size);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+
+        let config = RecordConfig {
+            width: size.w as u32,
+            height: size.h as u32,
+            fps: FPS,
+            bitrate_kbps: 8000,
+        };
+        let encoder = FfmpegEncoder::new(&path, config).context("starting the recorder encoder")?;
+        // Queue a second of frames before dropping, so a brief encoder stall doesn't lose frames.
+        let recorder = ThreadedRecorder::spawn(Box::new(encoder), FPS as usize);
+
+        let session_id = CastSessionId::next();
+        self.casting.recordings.push(ScreenRecording {
+            session_id,
+            started_at: self.clock.now_unadjusted(),
+            kind: RecordingKind::Native(NativeRecording {
+                output: output.downgrade(),
+                recorder,
+                size,
+                scale,
+                path,
+                last_frame_time: Duration::ZERO,
+                frame_interval: Duration::from_nanos(1_000_000_000 / FPS as u64),
+            }),
+        });
+        self.refresh_screen_recording();
+        Ok(session_id)
+    }
+
+    /// Stop every live recording (the R1 indicator's click action). External casts are torn down
+    /// via `stop_cast`; native recordings finalize their encoder (writing the file trailer).
+    /// Both prune the ledger and refresh the panel.
     pub fn stop_screen_recordings(&mut self) {
         let ids: Vec<_> = self
             .casting
@@ -936,7 +1013,122 @@ impl Niri {
             .map(|r| r.session_id)
             .collect();
         for id in ids {
-            self.stop_cast(id);
+            let idx = self
+                .casting
+                .recordings
+                .iter()
+                .position(|r| r.session_id == id);
+            let Some(idx) = idx else { continue };
+            if matches!(self.casting.recordings[idx].kind, RecordingKind::Native(_)) {
+                let rec = self.casting.recordings.remove(idx);
+                if let RecordingKind::Native(n) = rec.kind {
+                    match n.recorder.finish() {
+                        Ok(()) => info!("saved screen recording to {}", n.path.display()),
+                        Err(err) => {
+                            warn!("error finalizing recording {}: {err:?}", n.path.display())
+                        }
+                    }
+                }
+                self.refresh_screen_recording();
+            } else {
+                self.stop_cast(id);
+            }
+        }
+    }
+
+    /// Capture this output's frame for any native recording targeting it, paced to the recording's
+    /// framerate. Renders the same `RenderTarget::Screencast` element list as the screencast path
+    /// (so block-out-from-screencast privacy holds), reads it back as RGBA, and hands it to the
+    /// encoder worker (dropping the frame if the worker is behind).
+    pub fn render_for_recorders(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::utils::Transform;
+
+        use crate::recording::encoder::PushResult;
+        use crate::recording::RecordFrame;
+        use crate::render_helpers::render_to_vec;
+
+        let weak = output.downgrade();
+
+        // Which native recordings target this output and are due for a frame?
+        let due: Vec<CastSessionId> = self
+            .casting
+            .recordings
+            .iter()
+            .filter(|r| match &r.kind {
+                RecordingKind::Native(n) => {
+                    n.output == weak
+                        && target_presentation_time.saturating_sub(n.last_frame_time)
+                            >= n.frame_interval
+                }
+                RecordingKind::External => false,
+            })
+            .map(|r| r.session_id)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+
+        for id in due {
+            let Some((size, scale, started_at)) =
+                self.casting.recordings.iter().find_map(|r| match &r.kind {
+                    RecordingKind::Native(n) if r.session_id == id => {
+                        Some((n.size, n.scale, r.started_at))
+                    }
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+
+            // Build the output's screencast elements and read them back as RGBA.
+            let ctx = RenderCtx {
+                renderer,
+                target: RenderTarget::Screencast,
+                xray: None,
+            };
+            let elements = self.render_to_vec(ctx, output, true);
+            let rgba = match render_to_vec(
+                renderer,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            ) {
+                Ok(rgba) => rgba,
+                Err(err) => {
+                    warn!("error capturing a recording frame: {err:?}");
+                    continue;
+                }
+            };
+
+            let pts = target_presentation_time.saturating_sub(started_at);
+            let disconnected = if let Some(RecordingKind::Native(n)) = self
+                .casting
+                .recordings
+                .iter_mut()
+                .find(|r| r.session_id == id)
+                .map(|r| &mut r.kind)
+            {
+                n.last_frame_time = target_presentation_time;
+                n.recorder.try_push(RecordFrame { rgba, pts }) == PushResult::Disconnected
+            } else {
+                false
+            };
+
+            // The encoder worker died (e.g. ffmpeg crashed); stop this recording so the panel
+            // indicator clears and the compositor keeps running.
+            if disconnected {
+                warn!("recorder worker exited unexpectedly; stopping the recording");
+                self.casting.recordings.retain(|r| r.session_id != id);
+                self.refresh_screen_recording();
+            }
         }
     }
 
