@@ -3060,6 +3060,9 @@ fn screencast_area_resolves_to_the_containing_output() {
         .cast_params_for_area(rect)
         .expect("a rect inside an output must resolve");
     assert_eq!(size, Size::from((300, 200)));
+    // The resolved target is matched by its output, so stopping the output stops this area
+    // cast (guards the zombie-on-output-removal path that would leave R1 ticking).
+    assert!(target.matches_output(&out.downgrade()));
     let CastTarget::Area {
         name, rect: got, ..
     } = target
@@ -3106,6 +3109,27 @@ fn screencast_area_picks_the_largest_intersection_output() {
         name,
         outs[1].name(),
         "the output with the larger intersection must win"
+    );
+}
+
+#[test]
+fn area_crop_offset_accounts_for_the_output_origin() {
+    use smithay::utils::{Point, Rectangle, Scale, Size};
+
+    use crate::screencasting::area_crop_offset;
+
+    // An output away from the global origin: the crop offset is the area's top-left relative to
+    // the output, not to the stage. Dropping the `- output_geo.loc` term would give (2020, 190).
+    let output_geo = Rectangle::new(Point::from((1920, 40)), Size::from((1920, 1080)));
+    let rect = Rectangle::new(Point::from((2020, 190)), Size::from((300, 200)));
+    assert_eq!(
+        area_crop_offset(rect, output_geo, Scale::from(1.0)),
+        Point::from((100, 150)),
+    );
+    // Scale doubles the physical offset.
+    assert_eq!(
+        area_crop_offset(rect, output_geo, Scale::from(2.0)),
+        Point::from((200, 300)),
     );
 }
 

@@ -113,7 +113,7 @@ All five are unbuilt in the fork. Order per `sessionMode.js:96-100`.
 
 | # | Role | Panel renders | Menu | Reference | Dep | Status |
 |---|---|---|---|---|---|---|
-| R1 | **screenRecording** | red ticking `M:SS` timer + `screencast-stop-symbolic`, only while a screencast is live; click stops it | none | `ScreenRecordingIndicator` `js/ui/status/remoteAccess.js:65`; label/icon `:78-88`; visibility+stop `:90-99` | `[self]` (compositor knows) | ⬜ |
+| R1 | **screenRecording** | red ticking `M:SS` timer + `screencast-stop-symbolic`, only while a screencast is live; click stops it | none | `ScreenRecordingIndicator` `js/ui/status/remoteAccess.js:65`; label/icon `:78-88`; visibility+stop `:90-99` | `[self]` (compositor knows) | ✅ (`914accbb`; `is-recording` ledger → panel pill; triggered by `RecordArea` `a4b8c72c`. See slice-1 follow-ups) |
 | R2 | **screenSharing** | `screen-shared-symbolic` + stop icon during remote sharing; click stops | none | `ScreenSharingIndicator` `remoteAccess.js:133`; icons `:146-153` | `[self]`/portal state | ⬜ |
 | R3 | **dwellClick** | dwell-click mode icon, only when the a11y feature is on | mode choices | `DwellClickIndicator` `js/ui/status/dwellClick.js:35`; icon `:42`; per-mode `:76-82` | `[self]` a11y gsettings | ⬜ |
 | R4 | **a11y** (`ATIndicator`) | `accessibility-menu-symbolic` | toggles: High Contrast, Zoom, Large Text, Screen Reader, Screen Keyboard, Visual Alerts, Sticky/Slow/Bounce Keys | `js/ui/status/accessibility.js:32`; icon `:39`; items `:45-75+` | `[self]` a11y gsettings | ⬜ |
@@ -167,6 +167,28 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 - **Shutdown submenu** in the system row (Q1) — needs the same submenu affordance.
 
 ---
+
+## Slice 1 (R1 + RecordArea) follow-ups
+
+Landed `a4b8c72c` (RecordArea capture) + `914accbb` (R1 indicator); the adversarial review
+carved these out as separate work — none block R1 for daily use:
+
+- **Cross-output area casts** — the fork records an area from the single output it overlaps most
+  (crop + `warn!` on span); mutter composites every intersecting view (`meta-stream-area.c:164-184`).
+  Needs a multi-output accumulation buffer we don't have.
+- **Client-vanish session cleanup** — mutter closes a client's sessions when its bus name vanishes
+  (`meta-dbus-session-watcher.c:56,74,92`); the fork does not watch names, so a crashed recorder
+  leaves a stuck session (R1 recoverable by clicking the pill). Add name-watching for mutter parity.
+- **Screenshot-UI record mode** — GNOME's real R1 trigger (`js/ui/screenshot.js`); until then R1 is
+  driven by the stock `org.gnome.Shell.Screencast` recorder or a direct `RecordArea` D-Bus call.
+- **Q15 `RemoteAccessApplet` privacy dot must exclude these sessions** (mutter excludes the shell's
+  own cast, `remoteAccess.js:36-43`) — the `recordings` ledger gives it the handle when Q15 lands.
+- **Metadata-cursor offset for area casts** — embedded/hidden cursor handled; Metadata mode's
+  location is area-local already, but only the recorder's Hidden/Embedded path is exercised.
+- **Accepted divergence:** the R1 pill has no hover-lighten (GNOME filled `panel_button` hovers to
+  `lighten($bg,5%)`, `_drawing.scss:418-421`); the static red pill is intentional for this slice.
+- **Live-only checks:** the 1 s tick cadence, area-on-rotated-output, and the full D-Bus+PipeWire
+  path (recorder → `is-recording` → pill → click → `Closed` → finalized `.webm`).
 
 ## Removed upstream in 50.1 — do NOT build
 - **App menu** (`AppMenuButton`) — gone; nothing sits left of activities.

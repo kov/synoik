@@ -5235,10 +5235,12 @@ fn vulkan_hotkey_overlay_draws() {
     );
 }
 
-/// An area screencast records a cropped sub-rectangle of the output. This pins the crop convention
-/// `Niri::render_area_for_screen_cast` uses — the shared `RenderTarget::Screencast` element list
-/// wrapped in `RelocateRenderElement` by `-area.loc` — at the pixel level, so an offset-sign or
-/// buffer-size error fails headlessly instead of only live. Slice 1, Half A.
+/// An area screencast records a cropped sub-rectangle of the output. This pins that the shared
+/// `RenderTarget::Screencast` element list, wrapped in `RelocateRenderElement` by the production
+/// `area_crop_offset`, reads back at the pixel level as exactly the output sub-rectangle — so a
+/// sign or buffer-size error in the shared offset helper fails headlessly. (The output-origin term
+/// of the offset is pinned separately by `area_crop_offset_accounts_for_the_output_origin`, since
+/// this fixture's single output sits at the global origin.) Slice 1, Half A.
 #[test]
 fn vulkan_area_cast_crops_to_the_output_subrect() {
     use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -5248,6 +5250,11 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
         return;
     };
     let output = f.niri_output(1);
+    let output_geo = f
+        .niri()
+        .global_space
+        .output_geometry(&output)
+        .expect("output geometry");
 
     // A sub-rectangle well inside the 1280×720 output (scale 1 → physical == logical).
     let area = Rectangle::new(Point::from((200, 150)), Size::from((400, 300)));
@@ -5279,8 +5286,9 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
                 elements.iter().rev(),
             )?;
 
-            // The same scene shifted by -area.loc into an area-sized buffer — the area-cast crop.
-            let neg = area.loc.to_physical_precise_round(scale).upscale(-1);
+            // The same scene shifted into an area-sized buffer via the production crop offset —
+            // the area-cast crop.
+            let neg = crate::screencasting::area_crop_offset(area, output_geo, scale).upscale(-1);
             let relocated: Vec<_> = elements
                 .iter()
                 .map(|e| RelocateRenderElement::from_element(e, neg, Relocate::Relative))

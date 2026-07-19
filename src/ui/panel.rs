@@ -177,6 +177,9 @@ const QS_ICON_GAP: f64 = 4.;
 /// (`$recording_indicator_color` = `$red_4` = `#c01c28`, `_panel.scss:5`).
 const SCREENCAST_STOP_ICON: &str = "screencast-stop-symbolic";
 const R1_ICON: f64 = 16.;
+/// Label↔icon gap inside the recording pill: GNOME's `.screen-recording-indicator`
+/// `StBoxLayout { spacing: $scaled_padding }` = 6px (`_panel.scss:64-66`, `_common.scss:57`).
+const R1_SPACING: f64 = 6.;
 const R1_BG: [f32; 4] = [
     0xc0 as f32 / 255.,
     0x1c as f32 / 255.,
@@ -705,7 +708,7 @@ impl Panel {
             return 0.;
         };
         let label_w = niri_vk::text::measure_line_width_weighted(&rec.label, FONT_PX as f32, true);
-        2. * INDICATOR_H_PADDING + label_w + QS_ICON_GAP + R1_ICON
+        2. * INDICATOR_H_PADDING + label_w + R1_SPACING + R1_ICON
     }
 
     /// The screen-recording indicator rect: leftmost in the right box, directly left

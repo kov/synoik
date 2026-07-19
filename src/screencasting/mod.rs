@@ -792,8 +792,7 @@ impl Niri {
             }
 
             // Shift output-local content so the area's top-left maps to the buffer origin.
-            let offset = (rect.loc - output_geo.loc).to_physical_precise_round(scale);
-            let neg_offset = offset.upscale(-1);
+            let neg_offset = area_crop_offset(rect, output_geo, scale).upscale(-1);
 
             let mut elements = Vec::new();
             let mut pointer_location = Point::default();
@@ -975,7 +974,15 @@ impl Niri {
         let mut saw_dynamic = false;
         let mut ids = Vec::new();
         for cast in &self.casting.casts {
-            if cast.target != target {
+            // Stopping an output stops everything sourced from it — including area casts
+            // resolved to that output, which a strict target compare would miss. Otherwise
+            // an area recording zombies on output removal, and its R1 ledger entry (only
+            // pruned by `stop_cast`) leaves the panel indicator ticking over a dead cast.
+            let matches = match &target {
+                CastTarget::Output { output, .. } => cast.target.matches_output(output),
+                _ => cast.target == target,
+            };
+            if !matches {
                 continue;
             }
 
@@ -1056,6 +1063,18 @@ impl Niri {
         };
         Some((target, size, refresh))
     }
+}
+
+/// The physical shift mapping output-local content into an area cast's cropped buffer: the
+/// area's top-left in the output's physical space. Negate it for `Relocate::Relative`. The
+/// `- output_geo.loc` term is what makes the crop correct for outputs that are not at the
+/// global origin.
+pub(crate) fn area_crop_offset(
+    rect: Rectangle<i32, Logical>,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) -> Point<i32, Physical> {
+    (rect.loc - output_geo.loc).to_physical_precise_round(scale)
 }
 
 fn cast_params_for_output(output: &Output) -> (Size<i32, Physical>, u32) {
