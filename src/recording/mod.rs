@@ -21,22 +21,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-/// Default output path for a recording:
-/// `$XDG_VIDEOS_DIR/Screencasts/niri-recording-<unix-secs>.webm`, falling back to `$HOME/Videos`.
-/// Creates the directory. (GNOME saves screencasts under `$VIDEOS/Screencasts`;
-/// `screencastService.js`.)
+/// Default output path for the keybind/pill trigger, matching GNOME's default exactly:
+/// `$XDG_VIDEOS_DIR/Screencasts/Screencast From <date> <time>.webm` (the same template
+/// gnome-shell's UI sends over D-Bus; `screenshot.js` builds `Screencasts/Screencast From %d %t`).
+/// Creates the directory.
 pub fn default_recording_path() -> anyhow::Result<PathBuf> {
-    let base = std::env::var_os("XDG_VIDEOS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Videos")))
-        .context("neither XDG_VIDEOS_DIR nor HOME is set")?;
-    let dir = base.join("Screencasts");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Ok(dir.join(format!("niri-recording-{secs}.webm")))
+    resolve_file_template("Screencasts/Screencast From %d %t", "webm")
 }
 
 /// Resolve a `org.gnome.Shell.Screencast` file template into an absolute path, matching
