@@ -140,7 +140,7 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 | # | Indicator | Panel icon | QS menu UI | Reference | Dep | Status |
 |---|---|---|---|---|---|---|
 | Q1 | **system** | battery/power icon + optional % (`system-shutdown-symbolic` w/o battery) | `SystemItem` row: PowerToggle (battery→power settings), Screenshot, Settings, Lock, **Shutdown w/ submenu** (Suspend/Restart/Power Off/Log Out) | `js/ui/status/system.js:308`; icon `:319-360`; row `:263-306`; PowerToggle `:32`; Screenshot `:110`; Settings `:133`; Lock `:240`; Shutdown+submenu `:167` | `[self]`/`[dbus:login1]` | ✅ screenshot/settings/lock + battery pill; **power button now opens the session submenu** (Suspend/Restart…/Power Off…/Log Out…) on the QuickMenuToggle framework, no longer power-offs directly. Switch User deferred (greeter jump). **No user avatar upstream** — don't add one. |
-| Q2 | **volume output** | speaker icon | `OutputStreamSlider` + output-device submenu | `OutputIndicator` `js/ui/status/volume.js:468`; icon `:439,487`; slider `:293,491`; device section `:77` | `[pw]` | 🟡 slider ✅; **device-picker submenu ⬜** |
+| Q2 | **volume output** | speaker icon | `OutputStreamSlider` + output-device submenu | `OutputIndicator` `js/ui/status/volume.js:468`; icon `:439,487`; slider `:293,491`; device section `:77` | `[pw]` | 🟡 slider ✅ + **device picker ✅** (slider `go-next` arrow when >1 sink → in-menu list of sinks, current default checked, click sets it default via a `default.configured.audio.sink` metadata write). Divergences: sink-level not gvc port-level; no per-row device icon; list capped not scrolled |
 | Q3 | **volume input (mic)** | mic privacy icon while recording | `InputStreamSlider` + input-device submenu | `InputIndicator` `volume.js:508`; icon `:544-549`; slider `:367,535` | `[pw]` | 🟡 privacy icon ✅ (orange while a non-skipped, non-monitor `Stream/Input/Audio` runs; white when source muted; leftmost in cluster); **input slider + device submenu + volume-graded sensitivity icon ⬜** |
 | Q4 | **brightness** | none | `BrightnessItem` slider; multi-monitor submenu | `js/ui/status/brightness.js:94`; slider `:38,99`; submenu `:12` | `[dbus:gsd/logind]` backlight | ⬜ |
 | Q5 | **keyboard backlight** | none | `KeyboardBrightnessToggle` (slider or discrete steps) | `js/ui/status/backlight.js:236`; toggle `:159,241`; slider `:21`; steps `:79` | `[dbus:UPower/logind]` | ⬜ |
@@ -216,8 +216,9 @@ carved these out as separate work — none block R1 for daily use:
 **Tier 2 — reuses backends already wired:**
 5. Q3 microphone input slider (privacy icon ✅) — PipeWire is already integrated.
 6. Q13 promote airplane to a standalone rfkill toggle + panel icon — NM `WirelessEnabled` already read.
-7. Q2 output-device picker submenu — **framework now landed**; needs sink enumeration + set-default
-   (pipewire already tracks the `sinks` map; add a `DetailOwner` arm hung off the slider's menu-button).
+7. ✅ Q2 output-device picker — done (`cae8fa05`): sink enumeration + descriptions + a
+   `default.configured.audio.sink` metadata write, `DetailOwner::Output` hung off the slider's
+   menu-button. (Input-device picker would mirror it off the deferred input slider.)
 
 **Tier 3 — new system-bus watchers (same pattern as `src/dbus/system_status.rs`):**
 8. Q7 bluetooth (bluez).
