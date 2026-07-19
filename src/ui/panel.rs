@@ -288,6 +288,12 @@ fn qs_indicator_icons(
     if let Some(audio) = audio {
         v.push((vec![crate::audio::volume_icon(&audio).to_string()], TEXT));
     }
+    // Power profile, shown only while active (not Balanced) — gnome-shell binds the rfkill-style
+    // indicator's `visible` to the toggle's `checked` (`powerProfiles.js`). Sits just before the
+    // battery (GNOME adds `_powerProfiles` right before `_system`, `panel.js`).
+    if status.power.show && status.power.is_active() {
+        v.push((vec![status.power.icon().to_string()], TEXT));
+    }
     if let Some(battery) = &status.battery {
         v.push((system_status::battery_icon(battery), TEXT));
     }
@@ -1571,6 +1577,73 @@ mod tests {
         let icons = qs_indicator_icons(toggles, &off, None, no_mic);
         assert_eq!(icons.len(), 1);
         assert_eq!(icons[0].0[0], "network-wired-symbolic");
+    }
+
+    /// The power-profile indicator appears (with the active profile's icon, before the battery)
+    /// only while the daemon is present AND the active profile isn't Balanced — GNOME binds it to
+    /// the toggle's `checked`. Balanced, or an absent daemon, shows nothing.
+    #[test]
+    fn power_profile_icon_shows_only_when_not_balanced() {
+        use crate::system_status::{
+            BatteryStatus, KnownProfile, NetworkStatus, PowerProfileStatus, SystemStatus,
+        };
+
+        let toggles = QuickToggles::default();
+        let no_mic = MicStatus::default();
+        let battery = || {
+            Some(BatteryStatus {
+                icon_name: "battery-level-90-symbolic".to_string(),
+                percentage: 90.,
+            })
+        };
+        let available = || {
+            vec![
+                KnownProfile::Performance,
+                KnownProfile::Balanced,
+                KnownProfile::PowerSaver,
+            ]
+        };
+
+        // Performance active → the performance icon sits between network and battery.
+        let perf = SystemStatus {
+            network: NetworkStatus::Wired,
+            battery: battery(),
+            power: PowerProfileStatus {
+                active: "performance".to_string(),
+                available: available(),
+                show: true,
+            },
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &perf, None, no_mic);
+        assert_eq!(icons.len(), 3);
+        assert_eq!(icons[0].0[0], "network-wired-symbolic");
+        assert_eq!(icons[1].0[0], "power-profile-performance-symbolic");
+        assert_eq!(icons[2].0[0], "battery-level-90-symbolic");
+
+        // Balanced → no power-profile icon (checked is false).
+        let balanced = SystemStatus {
+            power: PowerProfileStatus {
+                active: "balanced".to_string(),
+                ..perf.power.clone()
+            },
+            ..perf.clone()
+        };
+        let icons = qs_indicator_icons(toggles, &balanced, None, no_mic);
+        assert_eq!(icons.len(), 2);
+        assert!(!icons.iter().any(|(c, _)| c[0].starts_with("power-profile")));
+
+        // Daemon absent (show = false) → no icon even for a non-balanced active string.
+        let hidden = SystemStatus {
+            power: PowerProfileStatus {
+                active: "performance".to_string(),
+                available: available(),
+                show: false,
+            },
+            ..perf
+        };
+        let icons = qs_indicator_icons(toggles, &hidden, None, no_mic);
+        assert!(!icons.iter().any(|(c, _)| c[0].starts_with("power-profile")));
     }
 
     /// The mic privacy icon leads the cluster (leftmost) while recording, tinted orange when

@@ -1,11 +1,13 @@
-//! System-bus watcher for the panel status area: network (NetworkManager) and
-//! battery (UPower).
+//! System-bus watcher for the panel status area: network (NetworkManager),
+//! battery (UPower), and power profile (power-profiles-daemon).
 //!
 //! Mirrors [`crate::dbus::freedesktop_locale1`]: one `Connection::system()` with
-//! two tasks on its executor, each subscribing to a `PropertiesChanged` stream and
+//! a task per source on its executor, each subscribing to a `PropertiesChanged` stream and
 //! pushing a fresh [`crate::system_status`] snapshot to the compositor over a
 //! calloop channel. The panel turns those into icons ([`crate::system_status::network_icon`]
-//! / [`battery_icon`](crate::system_status::battery_icon)).
+//! / [`battery_icon`](crate::system_status::battery_icon)). The power-profiles task additionally
+//! tracks the daemon's bus-name owner (like [`crate::dbus::rfkill`]) because *visibility is owner
+//! presence* and the daemon may start after us or be absent entirely.
 
 use std::collections::HashMap;
 
@@ -13,14 +15,19 @@ use futures_util::StreamExt;
 use zbus::names::InterfaceName;
 use zbus::{fdo, zvariant};
 
-use crate::system_status::{BatteryStatus, NetworkStatus};
+use crate::system_status::{BatteryStatus, KnownProfile, NetworkStatus, PowerProfileStatus};
 
-/// A status update from one of the two watched services.
+const POWER_PROFILES_BUS: &str = "org.freedesktop.UPower.PowerProfiles";
+const POWER_PROFILES_PATH: &str = "/org/freedesktop/UPower/PowerProfiles";
+
+/// A status update from one of the watched services.
 pub enum SystemStatusToNiri {
     /// UPower's aggregate battery, or `None` when no battery is present.
     Battery(Option<BatteryStatus>),
     /// NetworkManager's primary-connection state.
     Network(NetworkStatus),
+    /// power-profiles-daemon's profile state (hidden when the daemon is absent).
+    PowerProfiles(PowerProfileStatus),
 }
 
 type Props = HashMap<String, zvariant::OwnedValue>;
@@ -131,7 +138,118 @@ pub fn start(
             .detach();
     }
 
+    // --- power-profiles-daemon ---
+    {
+        let to_niri = to_niri.clone();
+        let async_conn = async_conn.clone();
+        let future = async move {
+            let proxy = match fdo::PropertiesProxy::new(
+                &async_conn,
+                POWER_PROFILES_BUS,
+                POWER_PROFILES_PATH,
+            )
+            .await
+            {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    warn!("error creating PowerProfiles PropertiesProxy: {err:?}");
+                    return;
+                }
+            };
+            let iface = InterfaceName::try_from(POWER_PROFILES_BUS).unwrap();
+
+            let changed = match proxy.receive_properties_changed().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!("error subscribing to PowerProfiles PropertiesChanged: {err:?}");
+                    return;
+                }
+            };
+
+            // power-profiles-daemon may start after us or be absent, and *visibility is owner
+            // presence*, so also wake on the bus name gaining/losing an owner and re-read then
+            // (the same reason [`crate::dbus::rfkill`] does).
+            let dbus = match fdo::DBusProxy::new(&async_conn).await {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    warn!("error creating DBusProxy for PowerProfiles name tracking: {err:?}");
+                    return;
+                }
+            };
+            let owner_changed = match dbus
+                .receive_name_owner_changed_with_args(&[(0, POWER_PROFILES_BUS)])
+                .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!("error subscribing to PowerProfiles NameOwnerChanged: {err:?}");
+                    return;
+                }
+            };
+            let mut wake =
+                futures_util::stream::select(changed.map(|_| ()), owner_changed.map(|_| ()));
+
+            let mut last: Option<PowerProfileStatus> = None;
+            loop {
+                // A successful `get_all` means the daemon is present (show = true); a failure means
+                // it's gone — send the hidden default rather than skipping, so the tile/icon
+                // disappear when the daemon dies (NOT rfkill's skip-on-error, which would leave it
+                // stuck visible).
+                let status = match proxy.get_all(iface.clone()).await {
+                    Ok(props) => read_power_profile(&props),
+                    Err(_) => PowerProfileStatus::default(),
+                };
+                if last.as_ref() != Some(&status) {
+                    last = Some(status.clone());
+                    if to_niri
+                        .send(SystemStatusToNiri::PowerProfiles(status))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if wake.next().await.is_none() {
+                    return;
+                }
+            }
+        };
+        conn.inner()
+            .executor()
+            .spawn(future, "monitor power-profiles-daemon")
+            .detach();
+    }
+
     Ok(conn)
+}
+
+/// Set power-profiles-daemon's `ActiveProfile` (a QS click). Fire-and-forget on the connection's
+/// executor — a synchronous `Set` on the compositor thread would stall it for the D-Bus timeout.
+/// The tile is echo-driven (updates on the daemon's `PropertiesChanged`), not optimistic.
+pub fn set_active_profile(conn: &zbus::blocking::Connection, profile: String) {
+    let async_conn = conn.inner().clone();
+    let future = async move {
+        let proxy =
+            match fdo::PropertiesProxy::new(&async_conn, POWER_PROFILES_BUS, POWER_PROFILES_PATH)
+                .await
+            {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    warn!("error creating PowerProfiles PropertiesProxy for write: {err:?}");
+                    return;
+                }
+            };
+        let iface = InterfaceName::try_from(POWER_PROFILES_BUS).unwrap();
+        if let Err(err) = proxy
+            .set(iface, "ActiveProfile", zvariant::Value::from(profile))
+            .await
+        {
+            warn!("error setting ActiveProfile: {err:?}");
+        }
+    };
+    conn.inner()
+        .executor()
+        .spawn(future, "set power-profiles-daemon ActiveProfile")
+        .detach();
 }
 
 fn get_str(props: &Props, key: &str) -> Option<String> {
@@ -195,5 +313,34 @@ fn read_network(props: &Props) -> NetworkStatus {
         }
     } else {
         NetworkStatus::Offline
+    }
+}
+
+/// Build a [`PowerProfileStatus`] from power-profiles-daemon's properties. Called only on a
+/// successful `get_all`, so the daemon is present → `show = true`. `Profiles` is `aa{sv}` (an array
+/// of dicts each carrying a `Profile` string); we keep only the KNOWN ones and **reverse** them
+/// (daemon order power-saver→performance → GNOME's performance→power-saver menu order,
+/// `powerProfiles.js`).
+fn read_power_profile(props: &Props) -> PowerProfileStatus {
+    let active = get_str(props, "ActiveProfile").unwrap_or_default();
+    let available = props
+        .get("Profiles")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| Vec::<HashMap<String, zvariant::OwnedValue>>::try_from(v).ok())
+        .map(|dicts| {
+            dicts
+                .iter()
+                .filter_map(|dict| dict.get("Profile"))
+                .filter_map(|v| v.try_clone().ok())
+                .filter_map(|v| String::try_from(v).ok())
+                .filter_map(|id| KnownProfile::parse(&id))
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default();
+    PowerProfileStatus {
+        active,
+        available,
+        show: true,
     }
 }

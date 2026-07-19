@@ -18,6 +18,103 @@ pub struct SystemStatus {
     /// Airplane (rfkill) mode, from gsd-rfkill (the authoritative source, replacing the old coarse
     /// NM `WirelessEnabled` proxy).
     pub airplane: AirplaneStatus,
+    /// Power profile, from power-profiles-daemon (`org.freedesktop.UPower.PowerProfiles`).
+    pub power: PowerProfileStatus,
+}
+
+/// A power profile gnome-shell knows how to render, mirroring `PROFILE_PARAMS`
+/// (`js/ui/status/powerProfiles.js`). The daemon may expose others (custom vendor profiles); those
+/// are kept only as the raw [`PowerProfileStatus::active`] string and rendered via the "Custom"
+/// fallback, never listed in the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownProfile {
+    Performance,
+    Balanced,
+    PowerSaver,
+}
+
+impl KnownProfile {
+    /// The daemon's profile id (`ActiveProfile` / the `Profile` key), the value written back.
+    pub fn id(self) -> &'static str {
+        match self {
+            KnownProfile::Performance => "performance",
+            KnownProfile::Balanced => "balanced",
+            KnownProfile::PowerSaver => "power-saver",
+        }
+    }
+
+    /// Parse a daemon profile id; `None` for anything gnome-shell doesn't have params for.
+    pub fn parse(id: &str) -> Option<Self> {
+        match id {
+            "performance" => Some(KnownProfile::Performance),
+            "balanced" => Some(KnownProfile::Balanced),
+            "power-saver" => Some(KnownProfile::PowerSaver),
+            _ => None,
+        }
+    }
+
+    /// The display name (`PROFILE_PARAMS[*].name`).
+    pub fn name(self) -> &'static str {
+        match self {
+            KnownProfile::Performance => "Performance",
+            KnownProfile::Balanced => "Balanced",
+            KnownProfile::PowerSaver => "Power Saver",
+        }
+    }
+
+    /// The symbolic icon (`PROFILE_PARAMS[*].iconName`).
+    pub fn icon(self) -> &'static str {
+        match self {
+            KnownProfile::Performance => "power-profile-performance-symbolic",
+            KnownProfile::Balanced => "power-profile-balanced-symbolic",
+            KnownProfile::PowerSaver => "power-profile-power-saver-symbolic",
+        }
+    }
+}
+
+/// Power-profile state, mirroring gnome-shell's `PowerProfilesToggle`
+/// (`js/ui/status/powerProfiles.js`), fed by the power-profiles-daemon system-bus watcher. `show`
+/// gates the QS tile + panel icon (the daemon has a bus-name owner); `active` is the raw
+/// `ActiveProfile`; `available` is the KNOWN profiles the daemon exposes, **already filtered and
+/// reversed** (daemon order power-saver→performance → reversed = performance→power-saver, GNOME's
+/// menu order) so the picker's rows and its geometry agree by construction. [`Default`] (hidden)
+/// where the `dbus` feature / the daemon is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PowerProfileStatus {
+    /// The raw `ActiveProfile` (kept raw so a vendor "custom" profile still renders as Custom).
+    pub active: String,
+    /// The known profiles the daemon exposes, filtered + reversed (top = highest performance).
+    pub available: Vec<KnownProfile>,
+    /// Whether power-profiles-daemon is present (has a bus-name owner).
+    pub show: bool,
+}
+
+impl PowerProfileStatus {
+    /// gnome-shell's `checked`: the active profile is not Balanced (`powerProfiles.js`). Also the
+    /// panel-icon and tile "on" gate.
+    pub fn is_active(&self) -> bool {
+        self.active != KnownProfile::Balanced.id()
+    }
+
+    /// The active profile parsed to a [`KnownProfile`], or `None` for a custom/unknown one.
+    pub fn active_known(&self) -> Option<KnownProfile> {
+        KnownProfile::parse(&self.active)
+    }
+
+    /// The tile/panel icon for the active profile: its known icon, or the "Custom" fallback
+    /// (`FALLBACK_PARAMS.iconName`, `powerProfiles.js`).
+    pub fn icon(&self) -> &'static str {
+        self.active_known()
+            .map(KnownProfile::icon)
+            .unwrap_or("gnome-power-manager-symbolic")
+    }
+
+    /// The active profile's display name, or "Custom" for an unknown one.
+    pub fn name(&self) -> &'static str {
+        self.active_known()
+            .map(KnownProfile::name)
+            .unwrap_or("Custom")
+    }
 }
 
 /// Airplane mode, mirroring gnome-shell's `RfkillManager` (`js/ui/status/rfkill.js`), fed by the
@@ -134,6 +231,50 @@ mod tests {
             network_icon(NetworkStatus::Wireless(85)).unwrap()[0],
             "network-wireless-signal-excellent-symbolic"
         );
+    }
+
+    #[test]
+    fn known_profile_ids_round_trip_and_unknowns_fall_back() {
+        for p in [
+            KnownProfile::Performance,
+            KnownProfile::Balanced,
+            KnownProfile::PowerSaver,
+        ] {
+            assert_eq!(KnownProfile::parse(p.id()), Some(p));
+        }
+        assert_eq!(KnownProfile::parse("cool-vendor-mode"), None);
+    }
+
+    #[test]
+    fn power_profile_status_reflects_active_profile() {
+        let perf = PowerProfileStatus {
+            active: "performance".to_string(),
+            available: vec![
+                KnownProfile::Performance,
+                KnownProfile::Balanced,
+                KnownProfile::PowerSaver,
+            ],
+            show: true,
+        };
+        assert!(perf.is_active(), "performance is not balanced → checked");
+        assert_eq!(perf.icon(), "power-profile-performance-symbolic");
+        assert_eq!(perf.name(), "Performance");
+
+        let balanced = PowerProfileStatus {
+            active: "balanced".to_string(),
+            ..perf.clone()
+        };
+        assert!(!balanced.is_active(), "balanced → not checked");
+        assert_eq!(balanced.icon(), "power-profile-balanced-symbolic");
+
+        // A vendor/custom profile: checked (not balanced), but rendered via the Custom fallback.
+        let custom = PowerProfileStatus {
+            active: "cool-vendor-mode".to_string(),
+            ..perf
+        };
+        assert!(custom.is_active());
+        assert_eq!(custom.icon(), "gnome-power-manager-symbolic");
+        assert_eq!(custom.name(), "Custom");
     }
 
     #[test]

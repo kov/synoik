@@ -2491,6 +2491,7 @@ impl State {
         match msg {
             SystemStatusToNiri::Battery(battery) => self.niri.system_status.battery = battery,
             SystemStatusToNiri::Network(network) => self.niri.system_status.network = network,
+            SystemStatusToNiri::PowerProfiles(power) => self.niri.system_status.power = power,
         }
         trace!("system status changed: {:?}", self.niri.system_status);
         if self
