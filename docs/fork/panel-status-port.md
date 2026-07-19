@@ -151,7 +151,7 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 | Q10 | **dark mode** | none | `DarkModeToggle` "Dark Style" (plain) | `js/ui/status/darkMode.js:43`; toggle `:9-13,48` | `[self]` gsettings | ✅ |
 | Q11 | **do not disturb** | icon when active | `DoNotDisturbToggle` (plain) | `js/ui/status/doNotDisturb.js:24`; indicator `:32-35`; toggle `:7-12,36` | `[self]` gsettings | ✅ |
 | Q12 | **location** | `location-services-active-symbolic` privacy icon | none (owns `GeolocationDialog` prompt `:329`) | `js/ui/status/location.js:211`; icon `:218-219` | `[dbus:geoclue]` | ⬜ |
-| Q13 | **rfkill / airplane** | `airplane-mode-symbolic` when airplane on | `RfkillToggle` "Airplane Mode" | `js/ui/status/rfkill.js:114`; icon `:119-120,132`; toggle `:94-98,127` | `[dbus:rfkill]`/`[nm]` | 🟡 we model airplane as a `NetworkStatus` *state*, not a standalone toggle/icon — **promote to its own toggle** |
+| Q13 | **rfkill / airplane** | `airplane-mode-symbolic` when airplane on | `RfkillToggle` "Airplane Mode" | `js/ui/status/rfkill.js:114`; icon `:119-120,132`; toggle `:94-98,127` | `[dbus:rfkill]`/`[nm]` | ✅ standalone toggle (5th QS tile, appended when `HasAirplaneMode && ShouldShowAirplaneMode`) + panel icon (sibling of network, not replacing it) from gsd-rfkill session bus; echo-driven D-Bus write; dropped the `NetworkStatus::Airplane` heuristic. Headless/unit-verified; not live (this VM has no rfkill hw) |
 | Q14 | **thunderbolt** | `thunderbolt-symbolic` | device-authorize prompts (`AuthRobot` `:129`), no standing toggle | `js/ui/status/thunderbolt.js:216`; icon `:221-222,287-289` | `[dbus:bolt]` | ⬜ |
 | Q15 | **remote access** | `media-record-symbolic` privacy icon | indicator only | `RemoteAccessApplet` `js/ui/status/remoteAccess.js:14`; icon `:26-28` | `[self]`/portal | ⬜ |
 | Q16 | **camera** | `camera-web-symbolic` privacy icon | indicator only | `js/ui/status/camera.js:6`; icon `:11-17` | `[pw]`/portal | ⬜ |
@@ -218,7 +218,10 @@ carved these out as separate work — none block R1 for daily use:
    mute, recording-gated) below the output slider, `DetailOwner::Input` off its arrow, source
    enumeration + a `default.configured.audio.source` metadata write. Generalized the single-slider
    geometry to two stacked sliders (`Sliders`/`Slider`/`slider_row_y`).
-6. Q13 promote airplane to a standalone rfkill toggle + panel icon — NM `WirelessEnabled` already read.
+6. ✅ Q13 airplane → standalone rfkill toggle + panel icon — done (`9f74f342`, review fixes
+   `c0b9fd1e`): gsd-rfkill session-bus watcher (`src/dbus/rfkill.rs`), 5th QS tile appended when
+   `HasAirplaneMode && ShouldShowAirplaneMode`, echo-driven `AirplaneMode` write, panel icon as a
+   network sibling. Dropped the `NetworkStatus::Airplane` NM heuristic. Not live (VM has no rfkill).
 7. ✅ Q2 output-device picker — done (`cae8fa05`): sink enumeration + descriptions + a
    `default.configured.audio.sink` metadata write, `DetailOwner::Output` hung off the slider's
    menu-button.
