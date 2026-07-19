@@ -58,6 +58,10 @@ pub enum PopoverAction {
     SetVolume(f64),
     /// Toggle the default sink's mute (clicking the slider's speaker icon).
     ToggleMute,
+    /// Set the system default output sink to this `node.name` (an output-device-picker row). The
+    /// menu stays open (gnome-shell keeps the device list up after picking); the check moves when
+    /// the write echoes back.
+    SetDefaultSink(String),
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -219,6 +223,7 @@ impl PanelPopover {
         network: crate::system_status::NetworkStatus,
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
+        sink_list: crate::audio::SinkList,
         accent: [u8; 3],
     ) {
         if self.is_showing::<QuickSettingsTag>() {
@@ -230,7 +235,7 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
-            toggles, network, battery, audio, accent,
+            toggles, network, battery, audio, sink_list, accent,
         )));
         self.anim = Some(self.make_anim(0., 1.));
     }
@@ -242,6 +247,17 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_audio(audio)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh output-sink list to an open quick-settings popover, so the device picker tracks
+    /// sinks appearing/disappearing and default changes. Returns whether it changed anything.
+    pub fn set_sink_list(&mut self, sink_list: crate::audio::SinkList) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_sink_list(sink_list)
             }
             _ => false,
         }

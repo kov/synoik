@@ -59,6 +59,27 @@ pub struct MicStatus {
 /// (`js/ui/status/volume.js`), compared against `application.id` only (never `application.name`).
 pub const MIC_SKIP_APP_IDS: &[&str] = &["org.gnome.VolumeControl", "org.PulseAudio.pavucontrol"];
 
+/// One audio output sink, for the quick-settings output-device picker (gnome-shell's
+/// `OutputStreamSlider` device rows). `name` is the PipeWire `node.name` — the stable key we match
+/// the default against and write back to set the default; `description` is the human label
+/// (`node.description`, e.g. "Built-in Audio Analog Stereo"). Diverges from gnome-shell, whose list
+/// is port-level (gvc UIDevices, e.g. "Speakers"/"Headphones" on one card) rather than sink-level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// The set of output sinks + which is the current default, fed by the PipeWire watcher for the
+/// output-device picker. Sorted by PipeWire global id (stable across republishes). `default_name`
+/// is the default sink's `node.name`, so the picker can mark the selected row. [`Default`] (empty,
+/// no default) where the audio backend is absent (headless).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SinkList {
+    pub sinks: Vec<SinkInfo>,
+    pub default_name: Option<String>,
+}
+
 /// Whether any non-skipped application is actively recording, given `(application.id, running)` for
 /// each input-capture stream. Pure, so the PipeWire recording signal can be unit-tested. A stream
 /// counts only when its node is in the `Running` state (an idle/corked stream — e.g. a browser
@@ -98,6 +119,22 @@ pub fn pw_linear_to_volume(linear: f64) -> f64 {
 /// `channelVolumes` amplitude PipeWire wants.
 pub fn volume_to_pw_linear(volume: f64) -> f64 {
     volume.max(0.0).powi(3)
+}
+
+/// The JSON value written to the `default.configured.audio.sink` metadata key to set the default
+/// output — `{"name":"<node.name>"}`. A `node.name` can in principle carry a `"` or `\` (it's a
+/// free-form PipeWire string), so both are escaped; this is the write-side inverse of the read-side
+/// `parse_metadata_name` in `pipewire_audio` (kept honest by a round-trip test). Built by hand
+/// rather than pulling in a JSON crate for this one one-field object.
+pub fn sink_default_json(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c == '\\' || c == '"' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("{{\"name\":\"{escaped}\"}}")
 }
 
 #[cfg(test)]
@@ -149,6 +186,16 @@ mod tests {
             (Some("org.PulseAudio.pavucontrol"), true),
             (Some("org.mozilla.firefox"), true),
         ]));
+    }
+
+    #[test]
+    fn sink_default_json_escapes_and_wraps() {
+        assert_eq!(
+            sink_default_json("alsa_output.pci-0000_00_1f.3.analog-stereo"),
+            r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#
+        );
+        // A pathological name with a quote and a backslash stays valid JSON.
+        assert_eq!(sink_default_json(r#"we"ir\d"#), r#"{"name":"we\"ir\\d"}"#);
     }
 
     #[test]

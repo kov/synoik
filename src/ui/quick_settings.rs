@@ -39,7 +39,7 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
-use crate::audio::AudioStatus;
+use crate::audio::{AudioStatus, SinkList};
 use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
@@ -125,6 +125,11 @@ const SYS_FG: [f32; 4] = [0.9, 0.9, 0.9, 1.];
 const ARROW_W: f64 = 44.;
 const ARROW_ICON: f64 = 16.;
 const ARROW_ICONS: &[&str] = &["go-next-symbolic", "pan-end-symbolic"];
+/// The trailing check on the selected detail row (gnome-shell's `Ornament.CHECK`). Its native
+/// `ornament-check-symbolic` ships only in gnome-shell's gresource, invisible to our
+/// theme-directory icon cache — `object-select-symbolic` is the Adwaita equivalent that actually
+/// resolves.
+const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 /// The 1px divider between a menu tile's toggle-half and its arrow-half
 /// (`.quick-toggle-separator`); a faint line readable on both the off and accent backgrounds.
 const SEPARATOR_W: f64 = 1.;
@@ -164,20 +169,30 @@ struct DetailRow {
     icons: Vec<String>,
     action: PopoverAction,
     separator_before: bool,
+    /// Whether this row is the current selection (a trailing check, gnome-shell's
+    /// `Ornament.CHECK`).
+    selected: bool,
 }
 
 /// Who owns the currently-open detail view. Keyed by **identity**, not a grid index, so it also
-/// names the system-row power button (which no grid index can) and never desyncs if `GRID` is
-/// reordered. See gnome-shell's `QuickMenuToggle` / `ShutdownItem`, both `hasMenu` items sharing
-/// the same `QuickToggleMenu`.
+/// names the system-row power button and the volume slider (neither of which a grid index can
+/// name), and never desyncs if `GRID` is reordered. See gnome-shell's `QuickMenuToggle` /
+/// `ShutdownItem` / `QuickSlider`, all `hasMenu` items sharing the same `QuickToggleMenu`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailOwner {
     /// The Network grid tile's detail view (its expand-arrow half).
     Network,
-    /// The system-row power button's session submenu (gnome-shell's `ShutdownItem`, itself a
-    /// `hasMenu` item sharing this same detail-view mechanism).
+    /// The system-row power button's session submenu (gnome-shell's `ShutdownItem`).
     Power,
+    /// The volume slider's output-device picker (gnome-shell's `OutputStreamSlider` device menu).
+    Output,
 }
+
+/// The most output sink rows the picker renders (Fable): the card grows with the sink count and the
+/// popover has no scrolling, so cap the list to keep the trailing "Sound Settings" row on-screen.
+/// Beyond this the extra sinks are dropped (a rare config — many null-sinks or a big HDMI/BT
+/// fleet).
+const MAX_SINK_ROWS: usize = 6;
 
 /// A spawn `DetailRow` from a command's words.
 fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
@@ -186,6 +201,7 @@ fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
         icons: Vec::new(),
         action: PopoverAction::Spawn(cmd.iter().map(|s| s.to_string()).collect()),
         separator_before,
+        selected: false,
     }
 }
 
@@ -200,25 +216,34 @@ impl DetailOwner {
                 vec!["system-shutdown-symbolic".to_string()],
                 "Power Off".to_string(),
             ),
+            // gnome-shell's output slider header (`volume.js:314`).
+            DetailOwner::Output => (
+                vec!["audio-headphones-symbolic".to_string()],
+                "Sound Output".to_string(),
+            ),
         }
     }
 
     /// The action rows, top to bottom, given the live state.
-    fn rows(self, _network: NetworkStatus) -> Vec<DetailRow> {
+    fn rows(self, network: NetworkStatus, sink_list: &SinkList) -> Vec<DetailRow> {
         match self {
             // v1 Network detail: a single entry point to the full settings (the in-menu
             // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
-            DetailOwner::Network => vec![DetailRow {
-                label: "Network Settings".to_string(),
-                icons: Vec::new(),
-                action: PopoverAction::Spawn(
-                    ["gnome-control-center", "network"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                ),
-                separator_before: false,
-            }],
+            DetailOwner::Network => {
+                let _ = network;
+                vec![DetailRow {
+                    label: "Network Settings".to_string(),
+                    icons: Vec::new(),
+                    action: PopoverAction::Spawn(
+                        ["gnome-control-center", "network"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    separator_before: false,
+                    selected: false,
+                }]
+            }
             // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
             // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
             // ones that go through a confirmation dialog; Suspend acts immediately. Restart / Power
@@ -230,22 +255,53 @@ impl DetailOwner {
                 spawn_row("Power Off…", &["gnome-session-quit", "--power-off"], false),
                 spawn_row("Log Out…", &["gnome-session-quit", "--logout"], true),
             ],
+            // gnome-shell's output device list: one row per sink (label = description; the current
+            // default carries a trailing check; clicking sets it default via a metadata write),
+            // then a separator + a "Sound Settings" entry point (`volume.js:80-82,126-165`).
+            DetailOwner::Output => {
+                let mut rows: Vec<DetailRow> = sink_list
+                    .sinks
+                    .iter()
+                    .take(MAX_SINK_ROWS)
+                    .map(|sink| DetailRow {
+                        label: sink.description.clone(),
+                        icons: Vec::new(),
+                        action: PopoverAction::SetDefaultSink(sink.name.clone()),
+                        separator_before: false,
+                        selected: sink_list.default_name.as_deref() == Some(sink.name.as_str()),
+                    })
+                    .collect();
+                rows.push(spawn_row(
+                    "Sound Settings",
+                    &["gnome-control-center", "sound"],
+                    true,
+                ));
+                rows
+            }
         }
     }
 
-    /// `(action rows, group separators)` — fixed per owner, so the card's height is known without
-    /// building the row labels.
-    fn row_count(self) -> (usize, usize) {
+    /// The per-row `separator_before` flags, top to bottom — the card's row *shape*, derived purely
+    /// from the sink count (no label/state), so the geometry can size the card without building
+    /// rows. MUST match `rows()`'s length + separators (a debug_assert checks it at the draw/hit
+    /// sites). `sink_count` is ignored by the fixed owners.
+    fn row_shape(self, sink_count: usize) -> Vec<bool> {
         match self {
-            DetailOwner::Network => (1, 0),
-            DetailOwner::Power => (4, 1),
+            DetailOwner::Network => vec![false],
+            DetailOwner::Power => vec![false, false, false, true],
+            DetailOwner::Output => {
+                let mut shape = vec![false; sink_count.min(MAX_SINK_ROWS)];
+                shape.push(true); // the "Sound Settings" row, past a separator
+                shape
+            }
         }
     }
 
     /// The card's logical height: top pad + header + gap + rows + separators + bottom pad.
-    fn detail_height(self) -> f64 {
-        let (rows, seps) = self.row_count();
-        let (rows, seps) = (rows as f64, seps as f64);
+    fn detail_height(self, sink_count: usize) -> f64 {
+        let shape = self.row_shape(sink_count);
+        let rows = shape.len() as f64;
+        let seps = shape.iter().filter(|&&s| s).count() as f64;
         DETAIL_PAD
             + DETAIL_HEADER_H
             + DETAIL_HEADER_GAP
@@ -266,6 +322,9 @@ impl DetailOwner {
             // The power button lives in the top system row, so its detail pins right below it —
             // above the slider and the whole grid, which shift down.
             DetailOwner::Power => PAD + SYS_H,
+            // The output picker pins below the volume slider row (which only exists with a sink —
+            // `normalize_expanded` guarantees Output is open only then).
+            DetailOwner::Output => PAD + SYS_H + TILE_GAP + SLIDER_H,
         }
     }
 }
@@ -281,13 +340,15 @@ fn network_index() -> usize {
 /// The menu-local layout context: everything the pure geometry functions need to place elements,
 /// including the vertical shift a below-the-owner-row detail view imposes. Threaded through every
 /// geometry fn so hit-testing and rendering share one source of truth for the shift — and, via
-/// `network`, the same detail-row *set* the renderer draws (so row geometry can't diverge from what
-/// it hit-tests once rows become state-dependent, e.g. the Q6 Wi-Fi list).
+/// `sink_count`, size a dynamic detail view (the output picker's per-sink rows) identically to what
+/// the renderer draws.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     has_slider: bool,
     expanded: Option<DetailOwner>,
-    network: NetworkStatus,
+    /// Number of output sinks — the only state a detail card's *size* depends on (the Output
+    /// picker's row count). Fixed owners ignore it.
+    sink_count: usize,
 }
 
 impl Layout {
@@ -298,7 +359,7 @@ impl Layout {
         let owner = self.expanded?;
         Some((
             owner.anchor_row_bottom(self.has_slider),
-            DETAIL_MARGIN + owner.detail_height(),
+            DETAIL_MARGIN + owner.detail_height(self.sink_count),
         ))
     }
 
@@ -513,6 +574,9 @@ pub struct QuickSettings {
     accent: [f32; 4],
     /// Default-sink state for the volume slider; `None` hides the slider row.
     audio: Option<AudioStatus>,
+    /// The output sinks + current default, for the slider's device picker (empty → no picker
+    /// arrow).
+    sink_list: SinkList,
     /// Whether the volume slider is being dragged (a button is held on it).
     sliding: bool,
     /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
@@ -536,6 +600,7 @@ impl QuickSettings {
         network: NetworkStatus,
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
+        sink_list: SinkList,
         accent: [u8; 3],
     ) -> Self {
         Self {
@@ -543,6 +608,7 @@ impl QuickSettings {
             network,
             battery,
             audio,
+            sink_list,
             sliding: false,
             expanded: None,
             accent: [
@@ -564,14 +630,42 @@ impl QuickSettings {
         self.battery.is_some()
     }
 
-    /// The current layout context (slider presence + which detail view is open), the single
-    /// source of truth every geometry function shares.
+    /// The current layout context (slider presence + which detail view is open + sink count), the
+    /// single source of truth every geometry function shares.
     fn layout(&self) -> Layout {
         Layout {
             has_slider: self.audio.is_some(),
             expanded: self.expanded,
-            network: self.network,
+            sink_count: self.sink_list.sinks.len(),
         }
+    }
+
+    /// Enforce the invariant that an open detail view's owner still exists: the Output picker is
+    /// valid only while there's a slider (a bound sink) AND more than one sink to choose between —
+    /// the same `>1` gate that shows its arrow. If a sink is removed (down to one) or the default
+    /// unbinds while the picker is open, collapse it, so the card can't pin below a vanished slider
+    /// row (broken geometry) or strand the user with an open card and no arrow to close it. Returns
+    /// whether it collapsed (→ redraw). Network/Power owners always exist, so they're untouched.
+    fn normalize_expanded(&mut self) -> bool {
+        if self.expanded == Some(DetailOwner::Output)
+            && (self.audio.is_none() || self.sink_list.sinks.len() <= 1)
+        {
+            self.expanded = None;
+            self.revision += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Adopt a fresh output-sink list (from the PipeWire watcher). Returns whether it changed.
+    pub fn set_sink_list(&mut self, sink_list: SinkList) -> bool {
+        let mut changed = self.sink_list != sink_list;
+        if changed {
+            self.sink_list = sink_list;
+            self.revision += 1;
+        }
+        changed |= self.normalize_expanded();
+        changed
     }
 
     /// The menu's logical size: two tile columns + the system row, grown by the open detail view.
@@ -588,7 +682,11 @@ impl QuickSettings {
         // An open detail view is topmost: a row runs its action (a `Spawn`, which closes the
         // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
         if let Some(owner) = self.expanded {
-            for (k, row) in owner.rows(self.network).into_iter().enumerate() {
+            for (k, row) in owner
+                .rows(self.network, &self.sink_list)
+                .into_iter()
+                .enumerate()
+            {
                 if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
                     return row.action;
                 }
@@ -653,11 +751,22 @@ impl QuickSettings {
                 return button.action();
             }
         }
-        // The volume slider: the speaker icon toggles mute; the track jumps to (and
-        // begins dragging toward) the clicked position.
+        // The volume slider: the speaker icon toggles mute; the arrow (when >1 sink) toggles the
+        // output-device picker; the track jumps to (and begins dragging toward) the clicked
+        // position. The arrow is tested BEFORE the track so an arrow click never starts a drag (the
+        // track is genuinely shortened to make room, so `volume_from_x` stays in range).
         if self.audio.is_some() {
             if slider_icon_rect(layout).contains(pos) {
                 return PopoverAction::ToggleMute;
+            }
+            if slider_arrow_rect(layout).is_some_and(|r| r.contains(pos)) {
+                self.expanded = if self.expanded == Some(DetailOwner::Output) {
+                    None
+                } else {
+                    Some(DetailOwner::Output)
+                };
+                self.revision += 1;
+                return PopoverAction::Consumed;
             }
             if slider_track_rect(layout).contains(pos) {
                 self.sliding = true;
@@ -698,6 +807,9 @@ impl QuickSettings {
         }
         self.audio = audio;
         self.revision += 1;
+        // The slider vanishing (no bound sink) must also close an open output picker, or its card
+        // pins below a slider row that's no longer there.
+        self.normalize_expanded();
         true
     }
 
@@ -788,17 +900,41 @@ impl QuickSettings {
                 ) {
                     elements.push(el);
                 }
-                for (k, row) in owner.rows(self.network).into_iter().enumerate() {
-                    if row.icons.is_empty() {
+                for (k, row) in owner
+                    .rows(self.network, &self.sink_list)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
-                    }
-                    if let Some(rrect) = detail_row_rect(k, layout) {
+                    };
+                    // A leading row icon (none for the current consumers), if any.
+                    if !row.icons.is_empty() {
                         let center = Point::from((
                             rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON / 2.,
                             rrect.loc.y + rrect.size.h / 2.,
                         ));
                         if let Some(el) = icon_element(
                             renderer, icons, &row.icons, TILE_ICON, scale, FG_OFF, origin, center,
+                        ) {
+                            elements.push(el);
+                        }
+                    }
+                    // The trailing check on the selected row (gnome-shell's `Ornament.CHECK`).
+                    if row.selected {
+                        let center = Point::from((
+                            rrect.loc.x + rrect.size.w - DETAIL_ROW_INSET - TILE_ICON / 2.,
+                            rrect.loc.y + rrect.size.h / 2.,
+                        ));
+                        if let Some(el) = icon_element(
+                            renderer,
+                            icons,
+                            CHECK_ICONS,
+                            TILE_ICON,
+                            scale,
+                            FG_OFF,
+                            origin,
+                            center,
                         ) {
                             elements.push(el);
                         }
@@ -864,6 +1000,25 @@ impl QuickSettings {
                 center,
             ) {
                 elements.push(el);
+            }
+            // The device-picker arrow at the right of the slider row (when >1 sink).
+            if let Some(arrow) = slider_arrow_rect(layout) {
+                let center = Point::from((
+                    arrow.loc.x + arrow.size.w / 2.,
+                    arrow.loc.y + arrow.size.h / 2.,
+                ));
+                if let Some(el) = icon_element(
+                    renderer,
+                    icons,
+                    ARROW_ICONS,
+                    ARROW_ICON,
+                    scale,
+                    SYS_FG,
+                    origin,
+                    center,
+                ) {
+                    elements.push(el);
+                }
             }
         }
 
@@ -971,8 +1126,15 @@ impl QuickSettings {
             .map(|owner| -> anyhow::Result<_> {
                 let (_, title) = owner.header(self.network);
                 let title_run = renderer.build_glyph_run_weighted(&title, detail_title_px, true)?;
-                let row_runs = owner
-                    .rows(self.network)
+                let rows = owner.rows(self.network, &self.sink_list);
+                // The card is sized from the pure `row_shape`; assert the live rows match it (count
+                // + separator positions) so the geometry can't drift from what's drawn here.
+                debug_assert_eq!(
+                    rows.iter().map(|r| r.separator_before).collect::<Vec<_>>(),
+                    owner.row_shape(self.sink_list.sinks.len()),
+                    "rows() must match row_shape() for correct card sizing"
+                );
+                let row_runs = rows
                     .into_iter()
                     .map(|r| renderer.build_glyph_run_weighted(&r.label, detail_row_px, false))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1169,7 +1331,7 @@ impl QuickSettings {
                     };
                     let has_icon = self
                         .expanded
-                        .map(|o| o.rows(self.network))
+                        .map(|o| o.rows(self.network, &self.sink_list))
                         .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
                         .unwrap_or(false);
                     let label_x = if has_icon {
@@ -1241,15 +1403,34 @@ fn slider_icon_rect(layout: Layout) -> Rectangle<f64, Logical> {
     Rectangle::new(row.loc, Size::from((SLIDER_H, SLIDER_H)))
 }
 
-/// The slider's interactive track band (row minus the mute disc). The drawn trough
-/// is a thin bar centered in this band; the usable handle-center x-range is inset by
-/// half a handle so the handle never overhangs.
+/// The output-device picker's menu-button (`go-next` arrow) at the right end of the slider row —
+/// gnome-shell's `QuickSlider._menuButton`, shown **only when there's more than one sink** to pick
+/// between (`menuEnabled = _deviceItems.size > 1`). `None` otherwise.
+fn slider_arrow_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    if layout.sink_count <= 1 {
+        return None;
+    }
+    let row = slider_row_rect(layout);
+    Some(Rectangle::new(
+        Point::from((row.loc.x + row.size.w - ARROW_W, row.loc.y)),
+        Size::from((ARROW_W, SLIDER_H)),
+    ))
+}
+
+/// The slider's interactive track band (row minus the mute disc, and minus the device-picker arrow
+/// when shown). The drawn trough is a thin bar centered in this band; the usable handle-center
+/// x-range is inset by half a handle so the handle never overhangs. Genuinely shortened when the
+/// arrow is present, so an arrow click never lands on the track and `volume_from_x` stays in range.
 fn slider_track_rect(layout: Layout) -> Rectangle<f64, Logical> {
     let row = slider_row_rect(layout);
     let x = row.loc.x + SLIDER_H + SYS_GAP;
+    let right = match slider_arrow_rect(layout) {
+        Some(arrow) => arrow.loc.x - SYS_GAP,
+        None => row.loc.x + row.size.w,
+    };
     Rectangle::new(
         Point::from((x, row.loc.y)),
-        Size::from((row.loc.x + row.size.w - x, SLIDER_H)),
+        Size::from((right - x, SLIDER_H)),
     )
 }
 
@@ -1314,40 +1495,30 @@ fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let insert_y = owner.anchor_row_bottom(layout.has_slider);
     Some(Rectangle::new(
         Point::from((PAD, insert_y + DETAIL_MARGIN)),
-        Size::from((menu_w() - 2. * PAD, owner.detail_height())),
+        Size::from((menu_w() - 2. * PAD, owner.detail_height(layout.sink_count))),
     ))
 }
 
 /// The rectangle of detail row `k` (0-based, top to bottom), accounting for the header, inter-row
 /// gaps, and any group separators above earlier rows. `None` if there's no open detail / no row
-/// `k`.
+/// `k`. Placed from the pure `row_shape` (the same shape `detail_height` sizes the card from), so
+/// the geometry can't drift from the drawn rows; a debug_assert at the draw/hit sites ties the
+/// live `rows()` to this shape.
 fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
     let card = detail_rect(layout)?;
-    // Walk the SAME rows the renderer/hit-test build (keyed on the live state), so the geometry
-    // can't drift from what's drawn once rows become state-dependent. The card height comes from
-    // the static `row_count()`; assert they stay in lockstep (else the card mis-sizes / rows fall
-    // outside it) — the one thing to update together when a consumer's row set grows.
-    let rows = owner.rows(layout.network);
-    debug_assert_eq!(
-        (
-            rows.len(),
-            rows.iter().filter(|r| r.separator_before).count()
-        ),
-        owner.row_count(),
-        "detail row_count() must match rows() for correct card sizing"
-    );
-    if k >= rows.len() {
+    let shape = owner.row_shape(layout.sink_count);
+    if k >= shape.len() {
         return None;
     }
     // Walk from the first row's top, adding each earlier row's height + gap, plus a separator's
     // extra space wherever one opens a group.
     let mut y = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H + DETAIL_HEADER_GAP;
-    for (j, row) in rows.iter().enumerate() {
+    for (j, &separator_before) in shape.iter().enumerate() {
         if j > 0 {
             y += DETAIL_ROW_GAP;
         }
-        if row.separator_before {
+        if separator_before {
             y += DETAIL_SEP_EXTRA;
         }
         if j == k {
@@ -1453,7 +1624,7 @@ mod tests {
         Layout {
             has_slider,
             expanded: None,
-            network: NetworkStatus::Wired,
+            sink_count: 0,
         }
     }
 
@@ -1469,6 +1640,7 @@ mod tests {
                 NetworkStatus::Wired,
                 None,
                 audio,
+                SinkList::default(),
                 [0, 0, 0],
             )
             .logical_size();
@@ -1514,6 +1686,7 @@ mod tests {
             NetworkStatus::Wired,
             None,
             None,
+            SinkList::default(),
             [0, 0, 0],
         );
         let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
@@ -1538,6 +1711,7 @@ mod tests {
             NetworkStatus::Wired,
             None,
             None,
+            SinkList::default(),
             [0, 0, 0],
         );
         let before = qs.revision;
@@ -1559,6 +1733,7 @@ mod tests {
             NetworkStatus::Wired,
             None,
             None,
+            SinkList::default(),
             [0, 0, 0],
         );
 
@@ -1583,6 +1758,7 @@ mod tests {
             NetworkStatus::Wired,
             Some(battery(79.)),
             None,
+            SinkList::default(),
             [0, 0, 0],
         );
         let pill = pill_rect(true).expect("a battery must show the pill");
@@ -1605,6 +1781,7 @@ mod tests {
             NetworkStatus::Wired,
             None,
             None,
+            SinkList::default(),
             [0, 0, 0],
         );
         // Below the top system row, between the two tile columns.
@@ -1636,6 +1813,7 @@ mod tests {
             NetworkStatus::Unknown,
             Some(battery(79.)),
             None,
+            SinkList::default(),
             [0xff, 0x00, 0x00],
         );
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
@@ -1691,7 +1869,35 @@ mod tests {
     }
 
     fn qs(network: NetworkStatus, audio: Option<AudioStatus>) -> QuickSettings {
-        QuickSettings::new(QuickToggles::default(), network, None, audio, [0, 0, 0])
+        QuickSettings::new(
+            QuickToggles::default(),
+            network,
+            None,
+            audio,
+            SinkList::default(),
+            [0, 0, 0],
+        )
+    }
+
+    /// `n` output sinks with `sink0` the default, and a bound sink (so the slider — and thus the
+    /// picker arrow — exist).
+    fn make_sinks(n: usize) -> SinkList {
+        SinkList {
+            sinks: (0..n)
+                .map(|i| crate::audio::SinkInfo {
+                    name: format!("sink{i}"),
+                    description: format!("Sink {i}"),
+                })
+                .collect(),
+            default_name: (n > 0).then(|| "sink0".to_string()),
+        }
+    }
+
+    /// A quick-settings menu with a live volume slider and `n` output sinks.
+    fn qs_with_sinks(n: usize) -> QuickSettings {
+        let mut q = qs(NetworkStatus::Wired, Some(AudioStatus::default()));
+        q.sink_list = make_sinks(n);
+        q
     }
 
     /// A menu tile's arrow-half and toggle-body are disjoint hit regions; a plain toggle has no
@@ -1737,19 +1943,19 @@ mod tests {
         let collapsed = Layout {
             has_slider: false,
             expanded: None,
-            network: NetworkStatus::Wired,
+            sink_count: 0,
         };
         let expanded = Layout {
             has_slider: false,
             expanded: Some(DetailOwner::Network),
-            network: NetworkStatus::Wired,
+            sink_count: 0,
         };
         assert!(
             menu_h(expanded) > menu_h(collapsed),
             "the menu must grow taller"
         );
 
-        let block = DETAIL_MARGIN + DetailOwner::Network.detail_height();
+        let block = DETAIL_MARGIN + DetailOwner::Network.detail_height(0);
         // Row 0 (Network + its neighbor) does not move.
         for i in 0..COLS {
             assert_eq!(
@@ -1829,7 +2035,7 @@ mod tests {
                 let l = Layout {
                     has_slider,
                     expanded: Some(owner),
-                    network: NetworkStatus::Wired,
+                    sink_count: 0,
                 };
                 assert!(
                     menu_h(l) < 600.,
@@ -1856,7 +2062,7 @@ mod tests {
 
         let (_, title) = DetailOwner::Power.header(NetworkStatus::Unknown);
         assert_eq!(title, "Power Off");
-        let rows = DetailOwner::Power.rows(NetworkStatus::Unknown);
+        let rows = DetailOwner::Power.rows(NetworkStatus::Unknown, &SinkList::default());
         assert_eq!(rows.len(), 4);
         assert!(rows[3].separator_before, "Log Out starts the session group");
 
@@ -1889,14 +2095,14 @@ mod tests {
         let collapsed = Layout {
             has_slider: true,
             expanded: None,
-            network: NetworkStatus::Wired,
+            sink_count: 0,
         };
         let expanded = Layout {
             has_slider: true,
             expanded: Some(DetailOwner::Power),
-            network: NetworkStatus::Wired,
+            sink_count: 0,
         };
-        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height();
+        let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
         assert_eq!(
             sys_rect(SysButton::Power, false).loc.y,
             PAD,
@@ -1916,5 +2122,134 @@ mod tests {
         }
         let card = detail_rect(expanded).unwrap();
         assert!((card.loc.y - (PAD + SYS_H + DETAIL_MARGIN)).abs() < 0.01);
+    }
+
+    /// The output-device picker arrow shows only with more than one sink (gnome-shell's `>1` gate);
+    /// when shown it genuinely shortens the track so an arrow click can't start a volume drag.
+    #[test]
+    fn slider_arrow_appears_only_with_multiple_sinks() {
+        for (n, expect) in [(0, false), (1, false), (2, true), (5, true)] {
+            assert_eq!(
+                slider_arrow_rect(qs_with_sinks(n).layout()).is_some(),
+                expect,
+                "n={n}"
+            );
+        }
+        let one = qs_with_sinks(1);
+        let two = qs_with_sinks(2);
+        let t1 = slider_track_rect(one.layout());
+        let t2 = slider_track_rect(two.layout());
+        assert!(
+            t2.loc.x + t2.size.w < t1.loc.x + t1.size.w,
+            "the track must shrink to make room for the arrow"
+        );
+        // volume_from_x still maps the full 0..1 within the shortened track.
+        let l = two.layout();
+        let track = slider_track_rect(l);
+        assert!(volume_from_x(track.loc.x, l).abs() < 1e-9);
+        assert!((volume_from_x(track.loc.x + track.size.w, l) - 1.0).abs() < 1e-9);
+    }
+
+    /// The slider arrow toggles the output picker and never moves the volume; the slider row (its
+    /// owner) doesn't shift, so the arrow stays hittable to close it.
+    #[test]
+    fn slider_arrow_toggles_the_picker_without_changing_volume() {
+        let mut q = qs_with_sinks(2);
+        let before = q.audio.unwrap().volume;
+        let a = q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        assert!(matches!(a, PopoverAction::Consumed));
+        assert_eq!(q.expanded, Some(DetailOwner::Output));
+        assert_eq!(
+            q.audio.unwrap().volume,
+            before,
+            "arrow click must not move the volume"
+        );
+        let a = q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        assert!(matches!(a, PopoverAction::Consumed));
+        assert!(q.expanded.is_none());
+    }
+
+    /// The picker lists one row per sink (default checked) then a "Sound Settings" row; a sink row
+    /// sets that sink default, the settings row spawns.
+    #[test]
+    fn output_picker_lists_sinks_and_routes_actions() {
+        let mut q = qs_with_sinks(3); // default = sink0
+        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list);
+        assert_eq!(rows.len(), 4, "3 sinks + Sound Settings");
+        assert!(rows[0].selected && !rows[1].selected && !rows[2].selected);
+        assert!(rows[3].separator_before && !rows[3].selected);
+        assert_eq!(rows[3].label, "Sound Settings");
+        // Row geometry agrees with the shape.
+        assert_eq!(
+            DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
+            rows.len()
+        );
+
+        match q.pointer_click(center(detail_row_rect(1, q.layout()).unwrap())) {
+            PopoverAction::SetDefaultSink(name) => assert_eq!(name, "sink1"),
+            other => panic!("expected SetDefaultSink, got {other:?}"),
+        }
+        match q.pointer_click(center(detail_row_rect(3, q.layout()).unwrap())) {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "sound"]),
+            other => panic!("expected the sound-settings spawn, got {other:?}"),
+        }
+    }
+
+    /// The sink list is capped so the trailing settings row stays on-screen; the shape and rows
+    /// agree under the cap.
+    #[test]
+    fn output_picker_caps_the_sink_rows() {
+        let q = qs_with_sinks(MAX_SINK_ROWS + 3);
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list);
+        assert_eq!(rows.len(), MAX_SINK_ROWS + 1, "capped sinks + settings row");
+        assert_eq!(
+            DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
+            rows.len()
+        );
+    }
+
+    /// The picker pins below the slider row (the slider itself doesn't move) and grows the menu;
+    /// the grid shifts down.
+    #[test]
+    fn output_detail_anchors_below_the_slider() {
+        let collapsed = qs_with_sinks(2).layout();
+        let mut open = qs_with_sinks(2);
+        open.expanded = Some(DetailOwner::Output);
+        let expanded = open.layout();
+
+        assert!(menu_h(expanded) > menu_h(collapsed), "the menu must grow");
+        assert_eq!(
+            slider_row_rect(expanded).loc.y,
+            slider_row_rect(collapsed).loc.y,
+            "the slider row (owner) must not shift"
+        );
+        let card = detail_rect(expanded).unwrap();
+        let slider = slider_row_rect(expanded);
+        assert!(
+            card.loc.y >= slider.loc.y + SLIDER_H - 0.01,
+            "card sits below the slider"
+        );
+        assert!(
+            tile_rect(0, expanded).loc.y > tile_rect(0, collapsed).loc.y,
+            "the grid must shift down"
+        );
+    }
+
+    /// The picker collapses if its owner disappears while open: sinks dropping to one (no arrow to
+    /// close it) or the bound sink unbinding (the slider row itself vanishing).
+    #[test]
+    fn output_picker_collapses_when_its_owner_vanishes() {
+        let mut q = qs_with_sinks(2);
+        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        assert_eq!(q.expanded, Some(DetailOwner::Output));
+        assert!(q.set_sink_list(make_sinks(1)));
+        assert!(q.expanded.is_none(), "one sink left → no picker");
+
+        let mut q = qs_with_sinks(2);
+        q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
+        assert_eq!(q.expanded, Some(DetailOwner::Output));
+        assert!(q.set_audio(None));
+        assert!(q.expanded.is_none(), "slider vanished → no picker");
     }
 }

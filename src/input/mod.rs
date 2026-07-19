@@ -902,8 +902,19 @@ impl State {
                     self.on_audio_status(status);
                 }
             }
+            // Setting the default sink is fire-and-forget: the metadata write echoes back through
+            // the watcher, which moves the picker's check and the bound-sink volume. Not applied
+            // optimistically (a rejected write has no corrective echo).
+            #[cfg(feature = "pipewire")]
+            PopoverAction::SetDefaultSink(name) => {
+                if let Some(pw) = self.niri.pw_audio.as_ref() {
+                    pw.set_default_sink(&name);
+                }
+            }
             #[cfg(not(feature = "pipewire"))]
-            PopoverAction::SetVolume(_) | PopoverAction::ToggleMute => {}
+            PopoverAction::SetVolume(_)
+            | PopoverAction::ToggleMute
+            | PopoverAction::SetDefaultSink(_) => {}
         }
     }
 
@@ -3275,9 +3286,11 @@ impl State {
                                 let network = self.niri.system_status.network;
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
+                                let sink_list = self.niri.sink_list.clone();
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri.panel_popover.toggle_quick_settings(
-                                    output, anchor, toggles, network, battery, audio, accent,
+                                    output, anchor, toggles, network, battery, audio, sink_list,
+                                    accent,
                                 );
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();

@@ -38,7 +38,10 @@ use pipewire::spa::sys::{
 };
 use pipewire::types::ObjectType;
 
-use crate::audio::{pw_linear_to_volume, volume_to_pw_linear, AudioStatus, MicStatus, MAX_VOLUME};
+use crate::audio::{
+    pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioStatus, MicStatus, SinkInfo,
+    SinkList, MAX_VOLUME,
+};
 use crate::niri::State;
 
 /// The live audio connection, owned by the compositor for the whole session.
@@ -88,8 +91,10 @@ struct Inner {
     registry: Option<RegistryRc>,
     /// `default` metadata proxy + listener (bound once).
     metadata: Option<(Metadata, MetadataListener)>,
-    /// Known `Audio/Sink` nodes: id → (node.name, owned global for late binding).
-    sinks: HashMap<u32, (String, GlobalObject<PropertiesBox>)>,
+    /// Known `Audio/Sink` nodes: id → (node.name, node.description, owned global for late
+    /// binding). The description is captured once when the global appears (props are only live
+    /// in that callback) and never updated — sink descriptions are effectively static.
+    sinks: HashMap<u32, (String, String, GlobalObject<PropertiesBox>)>,
     /// The default sink's `node.name`, from `default.audio.sink`.
     default_name: Option<String>,
     /// The currently-bound default sink.
@@ -98,6 +103,10 @@ struct Inner {
     status: AudioStatus,
     present: bool,
     dirty: Option<Option<AudioStatus>>,
+    /// The last sink list handed to the compositor (for the output-device picker), and one it
+    /// hasn't drained yet — published only on an actual change, mirroring the mic path.
+    sink_list_last: Option<SinkList>,
+    sink_list_dirty: Option<SinkList>,
 
     // --- Microphone privacy indicator (input side) ---
     /// Known `Audio/Source` nodes: id → (node.name, owned global for late binding).
@@ -145,6 +154,32 @@ impl Inner {
             self.mic_dirty = Some(status);
         }
     }
+
+    /// Rebuild the sink list from the tracked sinks + current default, and flag it for the
+    /// compositor only if it actually changed. Sorted by PipeWire global id (registry-appearance
+    /// order) so the rows are stable across republishes — a `HashMap` iteration order would defeat
+    /// the change-dedup and shuffle the picker rows under the pointer.
+    fn publish_sinks(&mut self) {
+        let mut ids: Vec<u32> = self.sinks.keys().copied().collect();
+        ids.sort_unstable();
+        let list = SinkList {
+            sinks: ids
+                .iter()
+                .map(|id| {
+                    let (name, description, _) = &self.sinks[id];
+                    SinkInfo {
+                        name: name.clone(),
+                        description: description.clone(),
+                    }
+                })
+                .collect(),
+            default_name: self.default_name.clone(),
+        };
+        if self.sink_list_last.as_ref() != Some(&list) {
+            self.sink_list_last = Some(list.clone());
+            self.sink_list_dirty = Some(list);
+        }
+    }
 }
 
 /// Connect to PipeWire and start tracking the default sink. Returns `None`-worthy
@@ -177,17 +212,24 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
             let inner = inner.clone();
             move |_, wrapper, state: &mut State| {
                 wrapper.0.loop_().iterate(Duration::ZERO);
-                // Drain both signals under one borrow, then release it before calling into State
+                // Drain all signals under one borrow, then release it before calling into State
                 // (which redraws) so nothing can re-enter a borrowed Inner.
-                let (dirty, mic_dirty) = {
+                let (dirty, mic_dirty, sink_list_dirty) = {
                     let mut inner = inner.borrow_mut();
-                    (inner.dirty.take(), inner.mic_dirty.take())
+                    (
+                        inner.dirty.take(),
+                        inner.mic_dirty.take(),
+                        inner.sink_list_dirty.take(),
+                    )
                 };
                 if let Some(status) = dirty {
                     state.on_audio_status(status);
                 }
                 if let Some(mic) = mic_dirty {
                     state.on_mic_status(mic);
+                }
+                if let Some(list) = sink_list_dirty {
+                    state.on_sink_list(list);
                 }
                 Ok(PostAction::Continue)
             }
@@ -261,6 +303,39 @@ impl PwAudio {
         self.set_muted(!muted)
     }
 
+    /// The last-known sink list (for the output-device picker), empty until the first sink is seen.
+    pub fn sink_list(&self) -> SinkList {
+        self.inner
+            .borrow()
+            .sink_list_last
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Set the system default output to the sink with this `node.name`, by writing the persistent
+    /// `default.configured.audio.sink` metadata key (what `wpctl set-default` / gvc's
+    /// `change_output` write). The session manager (WirePlumber) echoes it back as
+    /// `default.audio.sink`, which flows through [`on_metadata_property`] → [`bind_default`] → the
+    /// volume path and the picker's selected marker — so, unlike volume, we do **not** flip the
+    /// marker optimistically here (a rejected write has no corrective echo). No-op if no `default`
+    /// metadata is bound. Safe from this thread: the pipewire loop runs on the compositor's
+    /// calloop, and `set_property` is a pure marshal (no synchronous callback, no `Inner`
+    /// re-entrancy).
+    pub fn set_default_sink(&self, node_name: &str) {
+        let inner = self.inner.borrow();
+        let Some((metadata, _)) = inner.metadata.as_ref() else {
+            return;
+        };
+        metadata.set_property(
+            0,
+            "default.configured.audio.sink",
+            Some("Spa:String:JSON"),
+            // `node.name` comes from a PipeWire C string, so it can't contain an interior NUL —
+            // `set_property`'s internal `CString::new().expect()` therefore can't panic here.
+            Some(&sink_default_json(node_name)),
+        );
+    }
+
     /// Manually pump the loop once (used at startup so the initial state lands
     /// without waiting for the first fd wakeup).
     pub fn pump(&self) {
@@ -294,14 +369,25 @@ fn on_global(
                     return;
                 };
                 let name = name.to_string();
+                // Human label for the picker, in gvc's preference order; last-resort the machine
+                // name. Captured now — props are only live inside this callback.
+                let description = props
+                    .get("node.description")
+                    .or_else(|| props.get("node.nick"))
+                    .or_else(|| props.get("device.description"))
+                    .unwrap_or(name.as_str())
+                    .to_string();
                 let mut inner = inner_rc.borrow_mut();
-                inner.sinks.insert(obj.id, (name.clone(), obj.to_owned()));
+                inner
+                    .sinks
+                    .insert(obj.id, (name.clone(), description, obj.to_owned()));
                 // If this is the default sink and nothing is bound yet, bind it now.
                 if inner.default_name.as_deref() == Some(name.as_str())
                     && inner.bound.as_ref().map(|b| b.id) != Some(obj.id)
                 {
                     bind_default(&mut inner, weak);
                 }
+                inner.publish_sinks();
             } else if class.starts_with("Audio/Source") {
                 // Prefix, not exact: virtual/processed mics (echo-cancel, the default source on
                 // many laptops) are `Audio/Source/Virtual`.
@@ -359,7 +445,9 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
         return;
     };
     let mut inner = inner_rc.borrow_mut();
-    inner.sinks.remove(&id);
+    if inner.sinks.remove(&id).is_some() {
+        inner.publish_sinks();
+    }
     inner.sources.remove(&id);
     if inner.bound.as_ref().map(|b| b.id) == Some(id) {
         inner.bound = None;
@@ -410,6 +498,8 @@ fn on_metadata_property(
         }
         inner.default_name = Some(name);
         bind_default(&mut inner, weak);
+        // The picker marks the default row, so a default change must republish the list.
+        inner.publish_sinks();
     }
 }
 
@@ -425,7 +515,7 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     let Some(id) = inner
         .sinks
         .iter()
-        .find(|(_, (n, _))| *n == name)
+        .find(|(_, (n, _, _))| *n == name)
         .map(|(id, _)| *id)
     else {
         return; // node not surfaced yet; on_global will bind it when it appears
@@ -435,7 +525,7 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     }
     // Bind from a borrow of the stored global (GlobalObject isn't Clone); the borrow
     // ends before we write `inner.bound` below.
-    let node = match registry.bind::<Node, _>(&inner.sinks[&id].1) {
+    let node = match registry.bind::<Node, _>(&inner.sinks[&id].2) {
         Ok(node) => node,
         Err(_) => {
             warn!("failed to bind default audio sink node {id}");
@@ -696,6 +786,7 @@ fn parse_metadata_name(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_metadata_name;
+    use crate::audio::sink_default_json;
 
     #[test]
     fn parses_default_sink_name() {
@@ -708,5 +799,22 @@ mod tests {
             Some("foo")
         );
         assert_eq!(parse_metadata_name("null"), None);
+    }
+
+    /// The write-side serializer and the read-side parser must agree for a real `node.name` (which
+    /// never carries a quote/backslash) — so a default we set round-trips through the metadata
+    /// echo.
+    #[test]
+    fn sink_default_json_round_trips_through_the_parser() {
+        for name in [
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            "bluez_output.AA_BB_CC_DD_EE_FF.1",
+            "my-null-sink",
+        ] {
+            assert_eq!(
+                parse_metadata_name(&sink_default_json(name)).as_deref(),
+                Some(name)
+            );
+        }
     }
 }
