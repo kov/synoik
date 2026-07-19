@@ -73,22 +73,25 @@ GNOME sizes text through a handful of placeholder classes, not per-widget px. Ea
 UI picked a px by eye, and they disagree (see §1.3). Treat the pt column as canonical intent and the
 px as a per-site choice to converge.
 
-### 1.3 Our pt→px choices today (divergence to converge)
+### 1.3 pt→px — one helper (`ui::pt_to_px`)
 
-| UI | our const | px | GNOME nominal | note |
-|---|---|---|---|---|
-| panel clock | `panel::FONT_PX` | 13 | 11pt (14.7) | bold; user-calibrated, "looks right" |
-| QS tile title / battery % | `quick_settings::LABEL_PX` | 13 | 11pt `%heading` (14.7) | bold |
-| end-session title | `end_session_dialog::TITLE_PX` | 15 | `%title_3` 15pt (20.0) | |
-| end-session body | `end_session_dialog::BODY_PX` | 12 | 11pt (14.7) | |
-| run-dialog base / small | `run_dialog::BASE/SMALL_FONT_PX` | 14 / 11 | — | |
-| exit-confirm | `exit_confirm_dialog::FONT_PX` | 14 | — | |
-| MRU window title | `mru::FONT_PX` | 14 | — | |
-| hotkey overlay | `hotkey_overlay::FONT_PX` | 14 | — | |
+**Resolved.** Font sizes now go through `ui::pt_to_px(pt)` over a single `PX_PER_PT` constant
+(GNOME's nominal 96 DPI, `4/3`), so every UI is expressed as its **GNOME point size** and scales
+together. Before this, our px drifted: 11pt was realized as 13px in the panel/QS but 12–14px in the
+dialogs/MRU/hotkey overlay (~10–25% under GNOME). To size text, look up the widget's `%`-placeholder
+pt in §1.2 and call `pt_to_px`.
 
-**Observation:** our px run ~10–25% under GNOME's 96-DPI px, and 11pt is realized as 13px (panel/QS)
-*and* 12–14px elsewhere. A single `pt→px` helper (one DPI constant + the `%`-scale) would remove the
-drift. Not done yet — tracked as a normalization TODO.
+| UI | our const | GNOME size → px (`4/3`) |
+|---|---|---|
+| panel clock (bold) | `panel::FONT_PX` | 11pt → 14.7 |
+| QS tile title / battery % (bold) | `quick_settings::LABEL_PX` | 11pt `%heading` → 14.7 |
+| end-session title / body | `end_session_dialog::TITLE_PX` / `BODY_PX` | 15pt `%title_3` → 20.0 / 11pt → 14.7 |
+| run-dialog base / small | `run_dialog::BASE/SMALL_FONT_PX` | 11pt → 14.7 / 9pt `%caption` → 12.0 |
+| exit-confirm / MRU / hotkey / config-error | `…::FONT_PX` | 11pt → 14.7 |
+| calendar month / weekday+day | `calendar::HEADER_PX` / `WEEKDAY_PX`,`DAY_PX` | 11pt → 14.7 / 9pt → 12.0 |
+
+One knob: if live output reads uniformly too large/small, adjust `PX_PER_PT` and every UI tracks it.
+Not yet live-validated on the seat.
 
 ### 1.4 Colors
 
@@ -638,7 +641,7 @@ you port; the §2 tables stay pure GNOME reference.
 
 | GNOME component (§2) | our module | status | notes |
 |---|---|---|---|
-| design tokens §1 | (constants across `ui/*`) | 🟡 | accent palette + white accent-fg + dark bg match; **pt→px is inconsistent** (§1.3) — the top normalization TODO |
+| design tokens §1 | `ui::pt_to_px` + constants across `ui/*` | 🟡 | accent palette + white accent-fg + dark bg match; pt→px unified via `ui::pt_to_px` (§1.3); the `%`-font scale + spacing/radii are not yet a shared token module |
 | shared button/entry/switch/slider primitives | — | ⬜ | no reusable `%button` primitive yet; each UI draws bespoke rounded rects. The QS tile approximates `%button`/`%default_button` inline |
 | **top panel** | `ui/panel.rs` | ✅ | see element map below |
 | **quick settings** | `ui/quick_settings.rs` | 🟡 | tiles + system row + battery pill done; sliders, submenus, network/bt sub-menus, subtitles TODO. Element map below |
