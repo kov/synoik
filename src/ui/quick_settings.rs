@@ -52,8 +52,13 @@ use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass quick-settings proportions).
-const PAD: f64 = 12.;
-const TILE_W: f64 = 150.;
+/// `.quick-settings` padding is `$base_padding * 3` (`$base_padding: 6px` → 18px) — the uniform
+/// outer margin every element insets from (`_quick-settings.scss:2`).
+const PAD: f64 = 18.;
+/// `.quick-toggle` is a fixed `12em` (`min/max-width`, `_quick-settings.scss:17-18`). `1em` is
+/// `$base_font_size` (11pt), so 12em = `12 * pt_to_px(11)` ≈ 176px — wider than the old 150, which
+/// cramped two-line tiles (Power Mode) and made the whole menu narrower than gnome-shell's.
+const TILE_W: f64 = 12.0 * crate::ui::pt_to_px(11.0);
 const TILE_H: f64 = 56.;
 const TILE_GAP: f64 = 8.;
 const COLS: usize = 2;
