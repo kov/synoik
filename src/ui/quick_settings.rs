@@ -196,6 +196,8 @@ enum DetailOwner {
     Network,
     /// The system-row power button's session submenu (gnome-shell's `ShutdownItem`).
     Power,
+    /// The Power Mode grid tile's profile picker (gnome-shell's `PowerProfilesToggle` menu).
+    PowerProfile,
     /// The volume slider's output-device picker (gnome-shell's `OutputStreamSlider` device menu).
     Output,
     /// The mic slider's input-device picker (gnome-shell's `InputStreamSlider` device menu).
@@ -281,6 +283,11 @@ impl DetailOwner {
                 vec!["system-shutdown-symbolic".to_string()],
                 "Power Off".to_string(),
             ),
+            // gnome-shell's `menu.setHeader('power-profile-balanced-symbolic', 'Power Mode')`.
+            DetailOwner::PowerProfile => (
+                vec!["power-profile-balanced-symbolic".to_string()],
+                "Power Mode".to_string(),
+            ),
             // gnome-shell's output slider header (`volume.js:314`).
             DetailOwner::Output => (
                 vec!["audio-headphones-symbolic".to_string()],
@@ -300,6 +307,7 @@ impl DetailOwner {
         network: NetworkStatus,
         sink_list: &SinkList,
         source_list: &SourceList,
+        power: &PowerProfileStatus,
     ) -> Vec<DetailRow> {
         match self {
             // v1 Network detail: a single entry point to the full settings (the in-menu
@@ -330,6 +338,30 @@ impl DetailOwner {
                 spawn_row("Power Off…", &["gnome-session-quit", "--power-off"], false),
                 spawn_row("Log Out…", &["gnome-session-quit", "--logout"], true),
             ],
+            // gnome-shell's power-profile list: one row per KNOWN profile (already reversed to
+            // performance→power-saver), the active one carrying a trailing check, clicking sets it;
+            // then a separator + a "Power Settings" entry point (`powerProfiles.js:75-81`). Kept
+            // text+check like the device pickers (no per-row profile icon, our accepted
+            // simplification).
+            DetailOwner::PowerProfile => {
+                let mut rows: Vec<DetailRow> = power
+                    .available
+                    .iter()
+                    .map(|profile| DetailRow {
+                        label: profile.name().to_string(),
+                        icons: Vec::new(),
+                        action: PopoverAction::SetPowerProfile(profile.id().to_string()),
+                        separator_before: false,
+                        selected: power.active == profile.id(),
+                    })
+                    .collect();
+                rows.push(spawn_row(
+                    "Power Settings",
+                    &["gnome-control-center", "power"],
+                    true,
+                ));
+                rows
+            }
             // gnome-shell's output device list: one row per sink (label = description; the current
             // default carries a trailing check; clicking sets it default via a metadata write),
             // then a separator + a "Sound Settings" entry point (`volume.js:80-82,126-165`).
@@ -381,14 +413,15 @@ impl DetailOwner {
     /// from the device count (no label/state), so the geometry can size the card without building
     /// rows. MUST match `rows()`'s length + separators (a debug_assert checks it at the draw/hit
     /// sites). `device_count` is ignored by the fixed owners; it's the sink count for Output, the
-    /// source count for Input.
+    /// source count for Input, and the profile count for PowerProfile.
     fn row_shape(self, device_count: usize) -> Vec<bool> {
         match self {
             DetailOwner::Network => vec![false],
             DetailOwner::Power => vec![false, false, false, true],
-            DetailOwner::Output | DetailOwner::Input => {
+            // N device/profile rows, then a trailing settings row past a separator.
+            DetailOwner::Output | DetailOwner::Input | DetailOwner::PowerProfile => {
                 let mut shape = vec![false; device_count.min(MAX_DEVICE_ROWS)];
-                shape.push(true); // the "Sound Settings" row, past a separator
+                shape.push(true);
                 shape
             }
         }
@@ -414,6 +447,12 @@ impl DetailOwner {
         match self {
             DetailOwner::Network => {
                 let row = (network_index() / COLS) as f64;
+                grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
+            }
+            // The Power Mode tile is the first appended conditional at the constant
+            // `power_profile_index()`, so its card pins below that row (same formula as Network).
+            DetailOwner::PowerProfile => {
+                let row = (power_profile_index() / COLS) as f64;
                 grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
             }
             // The power button lives in the top system row, so its detail pins right below it —
@@ -455,11 +494,12 @@ fn power_profile_index() -> usize {
 struct Layout {
     sliders: Sliders,
     expanded: Option<DetailOwner>,
-    /// Number of output sinks and input sources — the state a detail card's *size* depends on (the
-    /// picker row counts) and the state each slider's picker arrow is gated on. Fixed owners
-    /// ignore them.
+    /// Number of output sinks, input sources, and known power profiles — the state a detail card's
+    /// *size* depends on (the picker row counts) and the state each picker arrow is gated on.
+    /// Fixed owners ignore them.
     sink_count: usize,
     source_count: usize,
+    profile_count: usize,
     /// The slider being dragged and the device count frozen at drag start, so a device hot-plug
     /// mid-drag can't add/remove that slider's picker arrow (which would resize the track and
     /// remap `volume_from_x`, snapping the level). Scoped to the arrow/track only — the detail
@@ -489,6 +529,7 @@ impl Layout {
         match owner {
             DetailOwner::Output => self.sink_count,
             DetailOwner::Input => self.source_count,
+            DetailOwner::PowerProfile => self.profile_count,
             _ => 0,
         }
     }
@@ -658,12 +699,14 @@ impl GridTile {
     }
 
     /// Whether this tile carries an expand-arrow that opens a detail view (gnome-shell's
-    /// `QuickMenuToggle`). Only Network here; Power Mode gains its profile-picker arrow in the next
-    /// slice. The toggles/Airplane are plain [`QuickToggle`]s.
+    /// `QuickMenuToggle`): Network and Power Mode. The toggles/Airplane are plain [`QuickToggle`]s.
+    /// (Power Mode's arrow is additionally gated on >2 profiles in [`tile_arrow_rect`],
+    /// gnome-shell's `menuEnabled`.)
     fn detail_owner(self) -> Option<DetailOwner> {
         match self {
             GridTile::Network => Some(DetailOwner::Network),
-            GridTile::Toggle(_) | GridTile::PowerProfile | GridTile::Airplane => None,
+            GridTile::PowerProfile => Some(DetailOwner::PowerProfile),
+            GridTile::Toggle(_) | GridTile::Airplane => None,
         }
     }
 }
@@ -869,6 +912,7 @@ impl QuickSettings {
             expanded: self.expanded,
             sink_count: self.sink_list.sinks.len(),
             source_count: self.source_list.sources.len(),
+            profile_count: self.power.available.len(),
             drag: self.sliding,
             grid_len: self.grid().len(),
         }
@@ -886,14 +930,17 @@ impl QuickSettings {
     }
 
     /// Adopt a fresh power-profile snapshot (from power-profiles-daemon). `show` grows/shrinks the
-    /// grid by the Power Mode tile; `active`/`available` drive its subtitle, icon, and on-state.
-    /// Returns whether it changed.
+    /// grid by the Power Mode tile; `active`/`available` drive its subtitle, icon, on-state, and
+    /// the picker rows. Returns whether it changed. Calls `normalize_expanded` (unlike
+    /// `set_airplane`), because an open picker must collapse if the daemon vanishes or drops to
+    /// ≤2 profiles — its arrow gate — or the card would pin below a vanished/arrow-less tile.
     pub fn set_power_profile(&mut self, power: PowerProfileStatus) -> bool {
         if self.power == power {
             return false;
         }
         self.power = power;
         self.revision += 1;
+        self.normalize_expanded();
         true
     }
 
@@ -910,6 +957,8 @@ impl QuickSettings {
             Some(DetailOwner::Output) => !sliders.output || self.sink_list.sinks.len() <= 1,
             // Input the same, off the mic slider + source count.
             Some(DetailOwner::Input) => !sliders.mic || self.source_list.sources.len() <= 1,
+            // Power picker valid only while the daemon is present AND >2 profiles (its arrow gate).
+            Some(DetailOwner::PowerProfile) => !self.power.show || self.power.available.len() <= 2,
             _ => false,
         };
         if invalid {
@@ -946,7 +995,12 @@ impl QuickSettings {
         // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
         if let Some(owner) = self.expanded {
             for (k, row) in owner
-                .rows(self.network, &self.sink_list, &self.source_list)
+                .rows(
+                    self.network,
+                    &self.sink_list,
+                    &self.source_list,
+                    &self.power,
+                )
                 .into_iter()
                 .enumerate()
             {
@@ -1267,7 +1321,12 @@ impl QuickSettings {
                     elements.push(el);
                 }
                 for (k, row) in owner
-                    .rows(self.network, &self.sink_list, &self.source_list)
+                    .rows(
+                        self.network,
+                        &self.sink_list,
+                        &self.source_list,
+                        &self.power,
+                    )
                     .into_iter()
                     .enumerate()
                 {
@@ -1515,7 +1574,12 @@ impl QuickSettings {
             .map(|owner| -> anyhow::Result<_> {
                 let (_, title) = owner.header(self.network);
                 let title_run = renderer.build_glyph_run_weighted(&title, detail_title_px, true)?;
-                let rows = owner.rows(self.network, &self.sink_list, &self.source_list);
+                let rows = owner.rows(
+                    self.network,
+                    &self.sink_list,
+                    &self.source_list,
+                    &self.power,
+                );
                 // The card is sized from the pure `row_shape`; assert the live rows match it (count
                 // + separator positions) so the geometry can't drift from what's drawn here.
                 debug_assert_eq!(
@@ -1748,7 +1812,14 @@ impl QuickSettings {
                     };
                     let has_icon = self
                         .expanded
-                        .map(|o| o.rows(self.network, &self.sink_list, &self.source_list))
+                        .map(|o| {
+                            o.rows(
+                                self.network,
+                                &self.sink_list,
+                                &self.source_list,
+                                &self.power,
+                            )
+                        })
                         .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
                         .unwrap_or(false);
                     let label_x = if has_icon {
@@ -1896,6 +1967,11 @@ fn tile_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
 /// Takes the tile itself (the grid is dynamic now, so we can't index a global `GRID`).
 fn tile_arrow_rect(i: usize, tile: GridTile, layout: Layout) -> Option<Rectangle<f64, Logical>> {
     tile.detail_owner()?;
+    // Power Mode's picker arrow shows only with >2 known profiles (gnome-shell's `menuEnabled`);
+    // with ≤2 there's nothing to choose, so the tile is body-only (mirrors the slider's >1 gate).
+    if matches!(tile, GridTile::PowerProfile) && layout.profile_count <= 2 {
+        return None;
+    }
     let r = tile_rect(i, layout);
     Some(Rectangle::new(
         Point::from((r.loc.x + r.size.w - ARROW_W, r.loc.y)),
@@ -2038,6 +2114,7 @@ fn icon_element<S: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system_status::KnownProfile;
 
     fn battery(percentage: f64) -> BatteryStatus {
         BatteryStatus {
@@ -2061,6 +2138,7 @@ mod tests {
             expanded: None,
             sink_count: 0,
             source_count: 0,
+            profile_count: 0,
             drag: None,
             grid_len: BASE_GRID.len(),
         }
@@ -2482,7 +2560,7 @@ mod tests {
         ));
         assert_eq!(q.expanded, Some(DetailOwner::Input));
 
-        let rows = DetailOwner::Input.rows(q.network, &q.sink_list, &q.source_list);
+        let rows = DetailOwner::Input.rows(q.network, &q.sink_list, &q.source_list, &q.power);
         assert_eq!(rows.len(), 4, "3 sources + Sound Settings");
         assert!(rows[0].selected && !rows[1].selected);
         assert_eq!(rows[3].label, "Sound Settings");
@@ -2696,7 +2774,6 @@ mod tests {
     /// Airplane, the invariant `power_profile_index`/`anchor_row_bottom` depend on.
     #[test]
     fn power_mode_tile_appends_with_subtitle_and_body_toggles() {
-        use crate::system_status::KnownProfile;
         let power = PowerProfileStatus {
             active: "performance".to_string(),
             available: vec![
@@ -2757,6 +2834,122 @@ mod tests {
         assert_eq!(tiles[5], GridTile::Airplane);
     }
 
+    /// A QS with `n` known profiles present, `active` selected, daemon shown.
+    fn qs_profiles(active: &str, profiles: &[KnownProfile]) -> QuickSettings {
+        QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            PowerProfileStatus {
+                active: active.to_string(),
+                available: profiles.to_vec(),
+                show: true,
+            },
+            None,
+            None,
+            SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
+            [0, 0, 0],
+        )
+    }
+
+    /// The Power Mode picker: its arrow shows only with >2 profiles (gnome-shell's `menuEnabled`),
+    /// opening it lists the known profiles (reversed, active checked) + a Power Settings row, a row
+    /// click sets that profile, and a drop to ≤2 profiles collapses an open picker.
+    #[test]
+    fn power_mode_picker_lists_profiles_and_gates_on_count() {
+        let all = [
+            KnownProfile::Performance,
+            KnownProfile::Balanced,
+            KnownProfile::PowerSaver,
+        ];
+        let ppi = power_profile_index();
+
+        // >2 profiles → an arrow that opens the picker.
+        let mut qs = qs_profiles("performance", &all);
+        let arrow =
+            tile_arrow_rect(ppi, GridTile::PowerProfile, qs.layout()).expect("an arrow with 3");
+        assert!(matches!(
+            qs.pointer_click(center(arrow)),
+            PopoverAction::Consumed
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::PowerProfile));
+
+        // Rows: 3 profiles (reversed: performance→power-saver) + Power Settings; active checked.
+        let rows =
+            DetailOwner::PowerProfile.rows(qs.network, &qs.sink_list, &qs.source_list, &qs.power);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].label, "Performance");
+        assert_eq!(rows[2].label, "Power Saver");
+        assert!(rows[0].selected && !rows[1].selected);
+        assert!(rows[3].separator_before, "Power Settings past a separator");
+
+        // Clicking the Power Saver row sets that profile (echo-driven, menu stays open).
+        let row = detail_row_rect(2, qs.layout()).expect("the power-saver row");
+        match qs.pointer_click(center(row)) {
+            PopoverAction::SetPowerProfile(id) => assert_eq!(id, "power-saver"),
+            other => panic!("expected SetPowerProfile, got {other:?}"),
+        }
+
+        // ≤2 profiles → no arrow (menuEnabled off); the whole tile is the body toggle.
+        let mut qs2 = qs_profiles("balanced", &all[1..]);
+        assert!(tile_arrow_rect(ppi, GridTile::PowerProfile, qs2.layout()).is_none());
+        assert!(matches!(
+            qs2.pointer_click(center(tile_rect(ppi, qs2.layout()))),
+            PopoverAction::TogglePowerProfile
+        ));
+
+        // Collapse-on-vanish: open the picker, then drop to 2 profiles → it closes.
+        let mut qs3 = qs_profiles("performance", &all);
+        qs3.pointer_click(center(
+            tile_arrow_rect(ppi, GridTile::PowerProfile, qs3.layout()).unwrap(),
+        ));
+        assert_eq!(qs3.expanded, Some(DetailOwner::PowerProfile));
+        qs3.set_power_profile(PowerProfileStatus {
+            active: "balanced".to_string(),
+            available: all[1..].to_vec(),
+            show: true,
+        });
+        assert!(
+            qs3.expanded.is_none(),
+            "picker must collapse when profiles drop to <=2"
+        );
+    }
+
+    /// With BOTH conditional tiles shown, the Power Mode picker still anchors below the Power tile
+    /// (its constant index-4 row), not the Airplane tile beside it — the append-order invariant
+    /// that `power_profile_index`/`anchor_row_bottom` depend on. (Guards Fable's
+    /// conditional-append trap.)
+    #[test]
+    fn power_picker_anchors_below_its_tile_with_both_conditionals() {
+        let mut qs = qs_profiles(
+            "performance",
+            &[
+                KnownProfile::Performance,
+                KnownProfile::Balanced,
+                KnownProfile::PowerSaver,
+            ],
+        );
+        qs.set_airplane(AirplaneStatus {
+            active: false,
+            show: true,
+        });
+        let ppi = power_profile_index();
+        assert_eq!(qs.grid().len(), 6, "power + airplane both shown");
+
+        qs.pointer_click(center(
+            tile_arrow_rect(ppi, GridTile::PowerProfile, qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::PowerProfile));
+        let card = detail_rect(qs.layout()).expect("a card when expanded");
+        let tile = tile_rect(ppi, qs.layout());
+        assert!(
+            card.loc.y >= tile.loc.y + TILE_H - 0.01,
+            "card must pin below the Power Mode tile row, not elsewhere"
+        );
+    }
+
     /// The Network arrow opens the detail view; clicking it again collapses it. Both are internal
     /// state changes (Consumed) that bump the chrome revision.
     #[test]
@@ -2793,6 +2986,7 @@ mod tests {
             expanded: None,
             sink_count: 0,
             source_count: 0,
+            profile_count: 0,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -2804,6 +2998,7 @@ mod tests {
             expanded: Some(DetailOwner::Network),
             sink_count: 0,
             source_count: 0,
+            profile_count: 0,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -2897,6 +3092,7 @@ mod tests {
                     expanded: Some(owner),
                     sink_count: 0,
                     source_count: 0,
+                    profile_count: 0,
                     drag: None,
                     grid_len: BASE_GRID.len(),
                 };
@@ -2929,6 +3125,7 @@ mod tests {
             NetworkStatus::Unknown,
             &SinkList::default(),
             &SourceList::default(),
+            &PowerProfileStatus::default(),
         );
         assert_eq!(rows.len(), 4);
         assert!(rows[3].separator_before, "Log Out starts the session group");
@@ -2967,6 +3164,7 @@ mod tests {
             expanded: None,
             sink_count: 0,
             source_count: 0,
+            profile_count: 0,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -2978,6 +3176,7 @@ mod tests {
             expanded: Some(DetailOwner::Power),
             sink_count: 0,
             source_count: 0,
+            profile_count: 0,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -3104,7 +3303,7 @@ mod tests {
         q.pointer_click(center(
             slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
         ));
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list);
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list, &q.power);
         assert_eq!(rows.len(), 4, "3 sinks + Sound Settings");
         assert!(rows[0].selected && !rows[1].selected && !rows[2].selected);
         assert!(rows[3].separator_before && !rows[3].selected);
@@ -3130,7 +3329,7 @@ mod tests {
     #[test]
     fn output_picker_caps_the_sink_rows() {
         let q = qs_with_sinks(MAX_DEVICE_ROWS + 3);
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list);
+        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list, &q.power);
         assert_eq!(
             rows.len(),
             MAX_DEVICE_ROWS + 1,
