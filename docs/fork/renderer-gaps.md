@@ -149,9 +149,71 @@ both swizzles disappear and captures stay GPU-side end to end.
 
 ---
 
+## 6. Hardware video encode (Vulkan Video) — gated on host + Venus
+
+The screen recorder (the custom-recorder work replacing gnome-shell's gjs recorder) encodes on the
+**CPU** (libvpx VP8; VAAPI is not reachable through Venus). Real HW encode means
+`VK_KHR_video_encode_queue` + `video_encode_h264`/`h265`(/`av1`) — encoding on the same device we
+render on, no CPU readback. The Venus device currently exposes **no `VK_KHR_video_encode_*` /
+`video_decode_*` extensions and a single combined `GRAPHICS|COMPUTE|TRANSFER` queue** (no dedicated
+encode/decode/transfer queue), so this is blocked in the guest until the VMM/host forward Vulkan
+Video.
+
+**Plan (owner-confirmed): Vulkan Video is being added to the VMM we run on; once that lands, implement
+a Venus-backed `EncoderBackend`** — encode session + SPS/PPS + rate control + DPB, fed from our
+rendered images/dmabufs. It slots behind the recorder's `EncoderBackend` trait with no compositor-side
+change (the trait exists precisely as this seam). A VAAPI backend is worth adding for bare-metal GNOME
+targets, but that is a separate path (VAAPI ≠ Venus).
+
+---
+
+## 7. GPU-side color conversion (RGBA → NV12/I420) — available on today's Venus
+
+Independent of §1/§6 and **not gated on Vulkan Video**: the capture/encode path converts RGBA→I420 on
+the **CPU** (`yuv` crate). Doing the conversion + 4:2:0 subsample in a compute/graphics shader during
+the existing GPU readback (§5) removes that per-frame CPU cost **and shrinks the readback ~2.6×** (RGBA
+4 B/px → I420 1.5 B/px). It also lands frames in exactly the NV12 layout a future Vulkan-Video encoder
+(§6) wants. The compute queue is present today, so this is doable now and compounds with §5 — fold it
+into that readback rework.
+
+---
+
+## 8. Hardware cursor plane (KMS) — currently software cursor on the Venus path
+
+We composite the cursor in **software** on the Vulkan/virtio-gpu path because Smithay never sets the
+virtio-gpu cursor-plane hotspot (`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`), which otherwise produces a
+double cursor (see the cursor-plane-hotspot note / Smithay fork patches). Using the KMS cursor plane
+offloads cursor compositing entirely. Blocked on the Smithay patch; a real HW offload we are not using.
+
+---
+
+## 9. Direct scanout / overlay planes — verify it engages on virtio-gpu
+
+Zero-copy scanout of fullscreen/unoccluded client buffers straight to a KMS plane skips GPU
+compositing. The path exists (there is a `disable_direct_scanout` debug flag), but virtio-gpu plane
+support varies — **verify it actually engages on Venus and measure**. Efficiency, not a missing
+capability.
+
+### Not a hardware-acceleration target: JPEG-XL decode
+
+The 4K JPEG-XL wallpaper decode is a CPU hotspot (seconds; see the wallpaper-decode-slow note), but it
+is **not** GPU-accelerable in any practical way: no HW JXL decode block exists anywhere (JXL is covered
+by neither VA-API nor `VK_KHR_video_decode_*`), libjxl is CPU-SIMD only, and JXL's entropy stage
+(ANS/prefix coding) is inherently *sequential* — the GPU-hostile part, and often the bulk of the cost.
+A hybrid (CPU entropy → GPU compute for iDCT / XYB→RGB / upsample / filters) would need deep libjxl
+surgery and still leave the entropy stage on the CPU. **Fix it algorithmically instead: decode at/near
+target resolution (JXL is progressive — the 1:8 DC image gives an instant preview) + a variant cache.**
+Keep JXL decode on the CPU; make it decode *less*.
+
+---
+
 ## Roadmap order (recommended)
 
 1. **Multi-planar / non-LINEAR import** (§1) — affects every machine, including the VM.
 2. **DRM-node-aware device selection** (§4) — a day, fixes a real latent bug.
-3. **GPU-side capture readbacks** (§5).
-4. **Multi-GPU** (§2) — only when there is bare-metal multi-GPU hardware to validate on.
+3. **GPU-side capture readbacks** (§5) — fold in **GPU-side RGBA→NV12 color conversion** (§7) while there.
+4. **HW video encode via Vulkan Video** (§6) — when the VMM/host forward it (Vulkan Video is being added to our VMM); a Venus-backed `EncoderBackend`.
+5. **Multi-GPU** (§2) — only when there is bare-metal multi-GPU hardware to validate on.
+
+Independent and slottable anytime: **HW cursor plane** (§8, once the Smithay patch lands) and
+**direct-scanout verification** (§9).
