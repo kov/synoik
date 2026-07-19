@@ -194,6 +194,10 @@ become *projections* of one model; externalized UI state survives a shell-side c
 
 ### 3.5 Shell UI — per-surface placement (in-process vs layer-shell client)
 
+> **Visual spec:** how each GNOME shell surface should *look* (fonts, colors, radii, spacing, per-widget
+> CSS classes), grounded in the 50.1 theme with a port-status ledger, lives in
+> [`gnome-style-reference.md`](gnome-style-reference.md).
+
 **Litmus test:** a surface lives **in the compositor** iff it needs live zero-copy access
 to *other clients'* pixels, or to transform/sample the live composited scene, or an
 exclusive input grab, or security enforcement. Otherwise it can be a **layer-shell
