@@ -924,7 +924,8 @@ impl State {
         } else if let Some(output) = self.niri.layout.active_output().cloned() {
             match crate::recording::default_recording_path() {
                 Ok(path) => {
-                    if let Err(err) = self.niri.start_native_recording(&output, path) {
+                    // The keybind/pill records the active output at 30fps with the cursor drawn.
+                    if let Err(err) = self.niri.start_native_recording(&output, path, 30, true) {
                         warn!("could not start screen recording: {err:?}");
                     }
                 }

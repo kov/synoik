@@ -3255,7 +3255,7 @@ fn native_screen_recording_registers_and_stops() {
 
     // Starting registers a Native recording and shows the R1 pill.
     f.niri()
-        .start_native_recording(&output, path.clone())
+        .start_native_recording(&output, path.clone(), 30, true)
         .unwrap();
     assert!(f
         .niri()
@@ -3294,4 +3294,75 @@ fn native_screen_recording_registers_and_stops() {
         .all(|i| i.role != ROLE_SCREEN_RECORDING));
 
     std::fs::remove_file(&path).ok();
+}
+
+#[cfg(feature = "xdp-gnome-screencast")]
+#[test]
+fn shell_screencast_dbus_start_and_stop() {
+    use crate::dbus::gnome_shell_screencast::ScreencastToNiri;
+    use crate::screencasting::RecordingKind;
+
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ffmpeg {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Land the recording under a temp dir via an absolute template (no XDG env dependency).
+    let dir = std::env::temp_dir().join(format!("niri-shell-sc-{}", std::process::id()));
+    let template = dir.join("clip %%").to_string_lossy().into_owned();
+
+    let start = |f: &mut Fixture, template: String| {
+        let (reply, rx) = async_channel::bounded(1);
+        f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
+            area: None,
+            template,
+            draw_cursor: true,
+            framerate: 30,
+            reply,
+        });
+        rx.recv_blocking().unwrap()
+    };
+
+    // A D-Bus Start registers a Native recording and replies with the resolved absolute path.
+    let path = start(&mut f, template.clone()).expect("start should succeed");
+    assert_eq!(path, dir.join("clip %.webm").to_string_lossy());
+    assert!(f
+        .niri()
+        .casting
+        .recordings
+        .iter()
+        .any(|r| matches!(r.kind, RecordingKind::Native(_))));
+
+    // A second Start while recording is declined (one recording at a time).
+    assert!(start(&mut f, template).is_err(), "already recording");
+
+    // An area request is declined until that slice lands.
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
+        area: Some((0, 0, 100, 100)),
+        template: dir.join("area").to_string_lossy().into_owned(),
+        draw_cursor: true,
+        framerate: 30,
+        reply,
+    });
+    assert!(rx.recv_blocking().unwrap().is_err(), "area unsupported");
+
+    // Stop reports that a recording was torn down and clears the ledger.
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri()
+        .on_shell_screencast_msg(ScreencastToNiri::Stop { reply });
+    assert!(rx.recv_blocking().unwrap(), "stop found a live recording");
+    assert!(f.niri().casting.recordings.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -17,6 +17,8 @@ pub mod mutter_service_channel;
 pub mod system_status;
 
 #[cfg(feature = "xdp-gnome-screencast")]
+pub mod gnome_shell_screencast;
+#[cfg(feature = "xdp-gnome-screencast")]
 pub mod mutter_screen_cast;
 #[cfg(feature = "xdp-gnome-screencast")]
 use mutter_screen_cast::ScreenCast;
@@ -46,6 +48,8 @@ pub struct DBusServers {
     pub conn_end_session: Option<Connection>,
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_screen_cast: Option<Connection>,
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub conn_shell_screencast: Option<Connection>,
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
@@ -113,6 +117,21 @@ impl DBusServers {
                 .unwrap();
             let screenshot = gnome_shell_screenshot::Screenshot::new(to_niri, from_niri);
             dbus.conn_screen_shot = try_start(screenshot);
+
+            #[cfg(feature = "xdp-gnome-screencast")]
+            {
+                let (to_niri, from_screencast) = calloop::channel::channel();
+                niri.event_loop
+                    .insert_source(from_screencast, move |event, _, state| match event {
+                        calloop::channel::Event::Msg(msg) => {
+                            state.niri.on_shell_screencast_msg(msg)
+                        }
+                        calloop::channel::Event::Closed => (),
+                    })
+                    .unwrap();
+                let screencast = gnome_shell_screencast::Screencast::new(to_niri);
+                dbus.conn_shell_screencast = try_start(screencast);
+            }
 
             let (to_niri, from_introspect) = calloop::channel::channel();
             let (to_introspect, from_niri) = async_channel::unbounded();

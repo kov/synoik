@@ -78,6 +78,8 @@ pub struct NativeRecording {
     size: Size<i32, Physical>,
     /// Output fractional scale.
     scale: Scale<f64>,
+    /// Whether to composite the pointer into the recording (the `draw-cursor` option).
+    draw_cursor: bool,
     /// Where the finished file lands.
     path: std::path::PathBuf,
     /// Presentation time of the last captured frame, for framerate pacing.
@@ -960,6 +962,73 @@ impl Niri {
         self.refresh_screen_recording();
     }
 
+    /// Route an `org.gnome.Shell.Screencast` request (the high-level D-Bus recorder entry point) to
+    /// the native recorder. See [`crate::dbus::gnome_shell_screencast`].
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn on_shell_screencast_msg(
+        &mut self,
+        msg: crate::dbus::gnome_shell_screencast::ScreencastToNiri,
+    ) {
+        use crate::dbus::gnome_shell_screencast::ScreencastToNiri;
+
+        match msg {
+            ScreencastToNiri::Start {
+                area,
+                template,
+                draw_cursor,
+                framerate,
+                reply,
+            } => {
+                let result = self.start_shell_screencast(area, &template, draw_cursor, framerate);
+                let _ = reply.send_blocking(result);
+            }
+            ScreencastToNiri::Stop { reply } => {
+                let was_recording = self
+                    .casting
+                    .recordings
+                    .iter()
+                    .any(|r| matches!(r.kind, RecordingKind::Native(_)));
+                self.stop_screen_recordings();
+                self.queue_redraw_all();
+                let _ = reply.send_blocking(was_recording);
+            }
+        }
+    }
+
+    /// Start a recording for a `Screencast`/`ScreencastArea` request, returning the absolute output
+    /// path or a human-readable reason it was declined. Area recording is a later slice.
+    #[cfg(feature = "xdp-gnome-screencast")]
+    fn start_shell_screencast(
+        &mut self,
+        area: Option<(i32, i32, i32, i32)>,
+        template: &str,
+        draw_cursor: bool,
+        framerate: u32,
+    ) -> Result<String, String> {
+        if area.is_some() {
+            return Err("area recording is not yet supported".to_owned());
+        }
+        if self
+            .casting
+            .recordings
+            .iter()
+            .any(|r| matches!(r.kind, RecordingKind::Native(_)))
+        {
+            return Err("a recording is already in progress".to_owned());
+        }
+        let output = self
+            .layout
+            .active_output()
+            .cloned()
+            .ok_or_else(|| "no active output to record".to_owned())?;
+        let path = crate::recording::resolve_file_template(template, "webm")
+            .map_err(|err| format!("could not resolve the recording path: {err:#}"))?;
+        self.start_native_recording(&output, path.clone(), framerate, draw_cursor)
+            .map_err(|err| format!("could not start the recorder: {err:#}"))?;
+        self.queue_redraw_all();
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     /// Start a compositor-driven recording of `output` to `path` (WebM/VP8 via ffmpeg). Returns the
     /// synthetic session id tracking it. Frames are captured on the output's redraws by
     /// [`Niri::render_for_recorders`]; stop it via [`Niri::stop_screen_recordings`].
@@ -967,11 +1036,13 @@ impl Niri {
         &mut self,
         output: &Output,
         path: std::path::PathBuf,
+        fps: u32,
+        draw_cursor: bool,
     ) -> anyhow::Result<CastSessionId> {
         use crate::recording::encoder::{FfmpegEncoder, ThreadedRecorder};
         use crate::recording::RecordConfig;
 
-        const FPS: u32 = 30;
+        let fps = fps.clamp(1, 120);
 
         let transform = output.current_transform();
         let size =
@@ -981,12 +1052,12 @@ impl Niri {
         let config = RecordConfig {
             width: size.w as u32,
             height: size.h as u32,
-            fps: FPS,
+            fps,
             bitrate_kbps: 8000,
         };
         let encoder = FfmpegEncoder::new(&path, config).context("starting the recorder encoder")?;
         // Queue a second of frames before dropping, so a brief encoder stall doesn't lose frames.
-        let recorder = ThreadedRecorder::spawn(Box::new(encoder), FPS as usize);
+        let recorder = ThreadedRecorder::spawn(Box::new(encoder), fps as usize);
 
         let session_id = CastSessionId::next();
         self.casting.recordings.push(ScreenRecording {
@@ -997,9 +1068,10 @@ impl Niri {
                 recorder,
                 size,
                 scale,
+                draw_cursor,
                 path,
                 last_frame_time: Duration::ZERO,
-                frame_interval: Duration::from_nanos(1_000_000_000 / FPS as u64),
+                frame_interval: Duration::from_nanos(1_000_000_000 / fps as u64),
                 scheduled_redraw: None,
             }),
         });
@@ -1134,9 +1206,11 @@ impl Niri {
 
             let mut disconnected = false;
             if due {
-                let Some((size, scale)) =
+                let Some((size, scale, draw_cursor)) =
                     self.casting.recordings.iter().find_map(|r| match &r.kind {
-                        RecordingKind::Native(n) if r.session_id == id => Some((n.size, n.scale)),
+                        RecordingKind::Native(n) if r.session_id == id => {
+                            Some((n.size, n.scale, n.draw_cursor))
+                        }
                         _ => None,
                     })
                 else {
@@ -1149,7 +1223,7 @@ impl Niri {
                     target: RenderTarget::Screencast,
                     xray: None,
                 };
-                let elements = self.render_to_vec(ctx, output, true);
+                let elements = self.render_to_vec(ctx, output, draw_cursor);
                 match render_to_vec(
                     renderer,
                     size,
