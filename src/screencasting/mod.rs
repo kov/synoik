@@ -588,7 +588,19 @@ impl Niri {
                 continue;
             }
 
-            if !cast.target.matches_output(&weak) {
+            // Only full-output casts render here. Area casts share the same output but
+            // crop to a sub-rect at a different size — they are driven by
+            // render_area_for_screen_cast. matches_output() also matches Area (used by
+            // stop_casts_for_target), so filter to Output explicitly or the two passes
+            // fight over ensure_size every frame and the stream never stabilizes.
+            let CastTarget::Output {
+                output: cast_output,
+                ..
+            } = &cast.target
+            else {
+                continue;
+            };
+            if cast_output != &weak {
                 continue;
             }
 

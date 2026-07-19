@@ -175,7 +175,13 @@ const QS_ICON_GAP: f64 = 4.;
 
 /// The screen-recording indicator's stop glyph and its filled-pill color
 /// (`$recording_indicator_color` = `$red_4` = `#c01c28`, `_panel.scss:5`).
-const SCREENCAST_STOP_ICON: &str = "screencast-stop-symbolic";
+/// GNOME uses `screencast-stop-symbolic`, but that glyph ships bundled inside
+/// gnome-shell's gresource (`data/icons/`), not in Adwaita/hicolor, so our IconCache
+/// can't resolve it. Try it first (for hosts that do carry it), then fall back to
+/// Adwaita's `media-playback-stop-symbolic` (a filled stop square) so the pill is
+/// never iconless. First name that resolves wins.
+const SCREENCAST_STOP_ICONS: &[&str] =
+    &["screencast-stop-symbolic", "media-playback-stop-symbolic"];
 const R1_ICON: f64 = 16.;
 /// Label↔icon gap inside the recording pill: GNOME's `.screen-recording-indicator`
 /// `StBoxLayout { spacing: $scaled_padding }` = 6px (`_panel.scss:64-66`, `_common.scss:57`).
@@ -838,8 +844,11 @@ impl Panel {
         if self.is_recording() {
             let r1 = self.screen_recording_rect(width);
             let icon_x = r1.loc.x + r1.size.w - INDICATOR_H_PADDING - R1_ICON;
-            if let Some(buffer) = icons.buffer(SCREENCAST_STOP_ICON, R1_ICON, scale, TEXT) {
-                let key = (scale_key, SCREENCAST_STOP_ICON.to_string());
+            if let Some((name, buffer)) = SCREENCAST_STOP_ICONS
+                .iter()
+                .find_map(|n| icons.buffer(n, R1_ICON, scale, TEXT).map(|b| (*n, b)))
+            {
+                let key = (scale_key, name.to_string());
                 #[allow(clippy::map_entry)]
                 if !cache.qs_icons.contains_key(&key) {
                     if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
