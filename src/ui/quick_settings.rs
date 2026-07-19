@@ -975,11 +975,22 @@ impl QuickSettings {
         }
     }
 
-    /// Adopt a fresh sink state (from the PipeWire watcher). Ignored while dragging the OUTPUT
-    /// slider so the lagging echo doesn't yank the handle. Returns whether it changed.
+    /// Adopt a fresh sink state (from the PipeWire watcher). While dragging the OUTPUT slider the
+    /// lagging level echo is ignored (the optimistic drag value wins) — but the sink *vanishing*
+    /// (unplug) is always honored and cancels the drag, or the event-driven `None` (never re-sent,
+    /// `on_audio_status` dedups) would strand a dead slider forever, mirroring `set_mic`. Returns
+    /// whether it changed.
     pub fn set_audio(&mut self, audio: Option<AudioStatus>) -> bool {
-        if matches!(self.sliding, Some((Slider::Output, _))) || audio == self.audio {
+        if audio == self.audio {
             return false;
+        }
+        if matches!(self.sliding, Some((Slider::Output, _))) {
+            if audio.is_some() {
+                // Still present: keep the optimistic drag value, don't yank.
+                return false;
+            }
+            // The sink vanished under the drag: cancel it before the slider hides.
+            self.sliding = None;
         }
         self.audio = audio;
         self.revision += 1;
@@ -2347,6 +2358,44 @@ mod tests {
         assert!(q.set_mic(MicStatus::default()));
         assert!(q.sliding.is_none(), "recording stop must cancel the drag");
         assert!(!q.sliders().mic, "and hide the slider");
+    }
+
+    /// The output slider gets the same vanish-cancels-the-drag treatment as the mic (Fable M1): a
+    /// sink unplugged mid-drag adopts `None`, cancels the drag, and hides the slider — rather than
+    /// stranding a dead slider (the event-driven `None` is never re-sent).
+    #[test]
+    fn output_slider_drag_is_cancelled_when_the_sink_vanishes() {
+        let mut q = qs_with_sinks(1);
+        let track = slider_track_rect(Slider::Output, q.layout());
+        q.pointer_click(center(track));
+        assert!(matches!(q.sliding, Some((Slider::Output, _))));
+        assert!(
+            q.set_audio(None),
+            "the sink unplugging must be adopted mid-drag"
+        );
+        assert!(q.sliding.is_none(), "and cancel the drag");
+        assert!(!q.sliders().output, "and hide the slider");
+    }
+
+    /// A recording mic with no bound output sink is the *only* slider: it takes the top slot (where
+    /// a lone output slider would sit), and its picker anchors below it with no output slider
+    /// above.
+    #[test]
+    fn mic_only_slider_takes_the_top_slot() {
+        let mut q = qs(NetworkStatus::Wired, None); // audio None → no output slider
+        q.mic = recording_mic();
+        q.source_list = make_sources(2);
+        assert!(q.sliders().mic && !q.sliders().output);
+        let mic = slider_row_rect(Slider::Mic, q.layout());
+        assert!(
+            (mic.loc.y - (PAD + SYS_H + TILE_GAP)).abs() < 0.01,
+            "the lone mic slider sits in the top slot"
+        );
+        assert!(mic.loc.y + mic.size.h <= tile_rect(0, q.layout()).loc.y + 0.01);
+        q.pointer_click(center(slider_arrow_rect(Slider::Mic, q.layout()).unwrap()));
+        assert_eq!(q.expanded, Some(DetailOwner::Input));
+        let card = detail_rect(q.layout()).unwrap();
+        assert!(card.loc.y >= mic.loc.y + SLIDER_H - 0.01);
     }
 
     /// A menu tile's arrow-half and toggle-body are disjoint hit regions; a plain toggle has no
