@@ -23,6 +23,7 @@ pub mod niri;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
 pub mod protocols;
+pub mod recording;
 pub mod render_helpers;
 pub mod rubber_band;
 #[cfg(feature = "xdp-gnome-screencast")]
