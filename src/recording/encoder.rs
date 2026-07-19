@@ -265,6 +265,27 @@ impl ThreadedRecorder {
             None => Ok(()),
         }
     }
+
+    /// Finalize without blocking the caller. Closing the channel lets the worker drain its queue
+    /// and finalize the file on its own thread; the join (which waits for ffmpeg to flush and exit)
+    /// is handed to a short detached thread that logs the outcome. Use this on the compositor
+    /// thread, where a stop-click must not stall on encoder drain + WebM finalize.
+    ///
+    /// `label` names the recording in the log line. Returns the reaper's handle so tests can await
+    /// finalization deterministically; production drops it (the thread runs to completion
+    /// detached).
+    pub fn finish_async(mut self, label: String) -> Option<JoinHandle<()>> {
+        self.tx.take();
+        let handle = self.handle.take()?;
+        thread::Builder::new()
+            .name("niri-recorder-finalize".to_owned())
+            .spawn(move || match handle.join() {
+                Ok(Ok(())) => info!("saved screen recording to {label}"),
+                Ok(Err(err)) => warn!("error finalizing recording {label}: {err:?}"),
+                Err(_) => warn!("recorder worker panicked finalizing {label}"),
+            })
+            .ok()
+    }
 }
 
 impl Drop for ThreadedRecorder {
@@ -427,6 +448,33 @@ mod tests {
 
         // 30 filled slots + the final frame ≈ 31; demand clearly more than the 2 pushed.
         assert_valid_webm(&path, w, h, 25);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn finish_async_finalizes_a_valid_file() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let (w, h, n) = (32, 24, 20);
+        let path = temp_path("async");
+        let backend = Box::new(FfmpegEncoder::new(&path, config(w, h)).unwrap());
+        let mut rec = ThreadedRecorder::spawn(backend, 8);
+        for i in 0..n {
+            let _ = rec.try_push(RecordFrame {
+                rgba: frame(w, h, i),
+                pts: Duration::from_millis((i * 1000 / 30) as u64),
+            });
+        }
+        // Detached finalize: join the reaper so the assertion is deterministic. Production drops
+        // it.
+        rec.finish_async(path.display().to_string())
+            .expect("reaper thread spawned")
+            .join()
+            .expect("reaper joined");
+
+        assert_valid_webm(&path, w, h, 1);
         std::fs::remove_file(&path).ok();
     }
 

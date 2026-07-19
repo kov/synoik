@@ -1102,12 +1102,9 @@ impl Niri {
                     if let Some(token) = n.scheduled_redraw {
                         self.event_loop.remove(token);
                     }
-                    match n.recorder.finish() {
-                        Ok(()) => info!("saved screen recording to {}", n.path.display()),
-                        Err(err) => {
-                            warn!("error finalizing recording {}: {err:?}", n.path.display())
-                        }
-                    }
+                    // Finalize off-thread so the stop-click doesn't stall the compositor on encoder
+                    // drain + WebM finalize.
+                    n.recorder.finish_async(n.path.display().to_string());
                 }
                 self.refresh_screen_recording();
             } else {
@@ -1135,12 +1132,8 @@ impl Niri {
                     if let Some(token) = n.scheduled_redraw {
                         self.event_loop.remove(token);
                     }
-                    match n.recorder.finish() {
-                        Ok(()) => info!("saved screen recording to {}", n.path.display()),
-                        Err(err) => {
-                            warn!("error finalizing recording {}: {err:?}", n.path.display())
-                        }
-                    }
+                    // Finalize off-thread (an output can be removed on the compositor thread too).
+                    n.recorder.finish_async(n.path.display().to_string());
                 }
                 changed = true;
             } else {
