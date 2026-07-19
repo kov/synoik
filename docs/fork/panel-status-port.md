@@ -25,6 +25,41 @@ service, `PropertiesChanged` → calloop channel → observable model → panel 
 
 ---
 
+## Working method (one cycle per slice)
+
+Every backlog item is ported as one **advise → implement → adversarial-review** cycle, one commit at
+the end. The advisor/reviewer is a **Fable subagent** (model `fable`) — the advisor tool is down, so we
+use a subagent and **continue the same agent** (via SendMessage) into the review so it keeps the plan
+context, but the review is deliberately re-framed to *attack* the diff. See
+[[panel-status-port-backlog]] for the standing memo.
+
+**1. Advise (Fable).** Prompt Fable for an implementation plan. Every advise prompt must require:
+   - **Reference-first, both axes** — cite *where it goes* (JS `add_child`/`_addItems` construction
+     order) **and** *how it looks* (SCSS / `gnome-style-reference.md`), from the different files they
+     live in. [[reference-first-child-order]]. No design accepted without both citations.
+   - **Extension-fitness** — does the seam survive becoming an extension surface later? Flag any choice
+     that a future extension would have to fight. Decide the `QuickMenuToggle` detail-view framework
+     *before* the first item that needs a submenu, so indicators don't each grow a bespoke popover.
+   - **Verifiability, classified per item** — say up front which bucket each behavior is in and what
+     stays live-only: *functionality* → headless conformance test (`src/tests/gnome.rs`); *rendering* →
+     Vulkan render test (self-skips w/o device) + the `NIRI_VK_VALIDATION=1` grep gate; *animation* →
+     largely **not** honestly headless-testable (the clock trap, [[headless-animation-clock-trap]]) —
+     some is live-only on gsrs. Do not fake a unit test around an animation and call it pinned.
+
+**2. Implement, test-first.** Write the pinning test(s) from step 1's classification first, then the
+   code. `cargo test --workspace` green; run `NIRI_VK_VALIDATION=1 cargo test --workspace` and grep for
+   `VULKAN ERROR` (must be empty) after any renderer touch.
+
+**3. Adversarial review (same Fable agent).** Continue the agent via SendMessage; feed it the **actual
+   diff + test output + the GNOME 50.1 reference file:lines** and task it to *attack the diff* —
+   re-deriving from the 50.1 source, not trusting the plan's own citations. Fix what it finds or record
+   why not.
+
+**4. Commit** the slice (one commit), then bring it to Gustavo for the live gsrs pass (he drives the
+   restart on the freshly-built `target/debug/niri`).
+
+---
+
 ## Panel skeleton (reference)
 
 - Three `St.BoxLayout` boxes: `_leftBox` / `_centerBox` / `_rightBox` — `js/ui/panel.js:446-451`.
