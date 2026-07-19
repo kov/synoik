@@ -119,6 +119,163 @@ const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
 const FG_ON: [f32; 4] = [1., 1., 1., 1.];
 const SYS_FG: [f32; 4] = [0.9, 0.9, 0.9, 1.];
 
+/// The expand-arrow half of a menu-bearing tile (gnome-shell's `.quick-toggle-menu-button`):
+/// a right-edge, full-height region carrying a `go-next-symbolic` arrow that opens the tile's
+/// detail view. gnome-shell sizes it to the 16px icon plus `.icon-button` padding.
+const ARROW_W: f64 = 44.;
+const ARROW_ICON: f64 = 16.;
+const ARROW_ICONS: &[&str] = &["go-next-symbolic", "pan-end-symbolic"];
+/// The 1px divider between a menu tile's toggle-half and its arrow-half
+/// (`.quick-toggle-separator`); a faint line readable on both the off and accent backgrounds.
+const SEPARATOR_W: f64 = 1.;
+const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.22];
+
+/// The in-menu detail view (gnome-shell's `QuickToggleMenu`): a rounded card pinned directly
+/// **below its owner's row**, holding a header (icon + title) over a list of action rows.
+/// Opening it grows the menu; the rows below the owner shift down by the card's block height.
+/// v1 diverges from gnome-shell in three deferred ways: no slide-down height animation
+/// (instant grow), no dimming of the rest of the menu, and no per-row hover highlight (the menu
+/// has no pointer-motion routing yet).
+const DETAIL_MARGIN: f64 = 12.; // `.quick-toggle-menu { margin: $base_padding*2 0 0 }`
+const DETAIL_RADIUS: f64 = 24.; // `%card` → `$base_border_radius * 3`
+const DETAIL_PAD: f64 = 10.;
+const DETAIL_HEADER_H: f64 = 32.;
+const DETAIL_HEADER_ICON: f64 = 24.; // `$medium_scalable_icon_size`
+const DETAIL_HEADER_INSET: f64 = 10.;
+const DETAIL_HEADER_GAP: f64 = 8.;
+const DETAIL_ROW_H: f64 = 36.;
+const DETAIL_ROW_GAP: f64 = 2.;
+const DETAIL_ROW_INSET: f64 = 12.;
+/// Extra space above a row that follows a group separator (e.g. the machine-power vs session
+/// split in the shutdown menu). v1 renders the split as spacing rather than a drawn rule.
+const DETAIL_SEP_EXTRA: f64 = 8.;
+/// Detail-card surface (a touch lighter than `MENU_BG`, gnome-shell's `%card`).
+const CARD_BG: [f32; 4] = [0.18, 0.18, 0.18, 1.];
+/// Header-title / row-label font size, logical px. Rows are regular weight (`.popup-menu-item`),
+/// the header title is bold (`%title_3`).
+const DETAIL_TITLE_PX: f64 = crate::ui::pt_to_px(11.);
+const DETAIL_ROW_PX: f64 = crate::ui::pt_to_px(11.);
+
+/// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
+/// opens a visual group break above the row (the shutdown menu's power/session split).
+struct DetailRow {
+    label: String,
+    /// Optional leading symbolic-icon candidates (empty = label-only, like the shutdown rows).
+    icons: Vec<String>,
+    action: PopoverAction,
+    separator_before: bool,
+}
+
+/// Who owns the currently-open detail view. Keyed by **identity**, not a grid index, so it also
+/// names the system-row power button (which no grid index can) and never desyncs if `GRID` is
+/// reordered. See gnome-shell's `QuickMenuToggle` / `ShutdownItem`, both `hasMenu` items sharing
+/// the same `QuickToggleMenu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailOwner {
+    /// The Network grid tile's detail view (its expand-arrow half).
+    Network,
+}
+
+impl DetailOwner {
+    /// The header shown at the top of the detail card: symbolic-icon candidates + title, given
+    /// the live state the owner reflects.
+    fn header(self, network: NetworkStatus) -> (Vec<String>, String) {
+        match self {
+            DetailOwner::Network => (network_icons(network), network_label(network).to_string()),
+        }
+    }
+
+    /// The action rows, top to bottom, given the live state.
+    fn rows(self, _network: NetworkStatus) -> Vec<DetailRow> {
+        match self {
+            // v1 Network detail: a single entry point to the full settings (the in-menu
+            // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
+            DetailOwner::Network => vec![DetailRow {
+                label: "Network Settings".to_string(),
+                icons: Vec::new(),
+                action: PopoverAction::Spawn(
+                    ["gnome-control-center", "network"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+                separator_before: false,
+            }],
+        }
+    }
+
+    /// `(action rows, group separators)` — fixed per owner, so the card's height is known without
+    /// building the row labels.
+    fn row_count(self) -> (usize, usize) {
+        match self {
+            DetailOwner::Network => (1, 0),
+        }
+    }
+
+    /// The card's logical height: top pad + header + gap + rows + separators + bottom pad.
+    fn detail_height(self) -> f64 {
+        let (rows, seps) = self.row_count();
+        let (rows, seps) = (rows as f64, seps as f64);
+        DETAIL_PAD
+            + DETAIL_HEADER_H
+            + DETAIL_HEADER_GAP
+            + rows * DETAIL_ROW_H
+            + (rows - 1.).max(0.) * DETAIL_ROW_GAP
+            + seps * DETAIL_SEP_EXTRA
+            + DETAIL_PAD
+    }
+
+    /// The natural (pre-shift) y of the bottom edge of the owner's row — where the detail card is
+    /// pinned directly below (gnome-shell binds the menu container's Y to the source actor).
+    fn anchor_row_bottom(self, has_slider: bool) -> f64 {
+        match self {
+            DetailOwner::Network => {
+                let row = (network_index() / COLS) as f64;
+                grid_top(has_slider) + (row + 1.) * TILE_H + row * TILE_GAP
+            }
+        }
+    }
+}
+
+/// The grid slot the Network tile occupies (its detail view anchors below this row). Derived by
+/// identity so a `GRID` reorder can't desync the detail geometry.
+fn network_index() -> usize {
+    GRID.iter()
+        .position(|t| matches!(t, GridTile::Network))
+        .unwrap_or(0)
+}
+
+/// The menu-local layout context: everything the pure geometry functions need to place elements,
+/// including the vertical shift a below-the-owner-row detail view imposes. Threaded through every
+/// geometry fn so hit-testing and rendering share one source of truth for the shift.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    has_slider: bool,
+    expanded: Option<DetailOwner>,
+}
+
+impl Layout {
+    /// The detail card's `(natural insert y, block height)` when a view is open. The block height
+    /// is the card plus its top margin — exactly how far the rows below the owner shift down, and
+    /// how much taller the menu grows.
+    fn detail_block(self) -> Option<(f64, f64)> {
+        let owner = self.expanded?;
+        Some((
+            owner.anchor_row_bottom(self.has_slider),
+            DETAIL_MARGIN + owner.detail_height(),
+        ))
+    }
+
+    /// The downward shift applied to an element whose natural (un-expanded) top is `natural_y`:
+    /// the block height for anything at or below the owner's row bottom, else zero.
+    fn shift_below(self, natural_y: f64) -> f64 {
+        match self.detail_block() {
+            Some((insert_y, block_h)) if natural_y >= insert_y => block_h,
+            _ => 0.,
+        }
+    }
+}
+
 /// The gsettings-backed tiles, in grid order (row-major, two columns).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tile {
@@ -211,6 +368,15 @@ impl GridTile {
             }
         }
     }
+
+    /// Whether this tile carries an expand-arrow that opens a detail view (gnome-shell's
+    /// `QuickMenuToggle`). Only Network in v1; the gsettings toggles are plain [`QuickToggle`]s.
+    fn detail_owner(self) -> Option<DetailOwner> {
+        match self {
+            GridTile::Network => Some(DetailOwner::Network),
+            GridTile::Toggle(_) => None,
+        }
+    }
 }
 
 /// The Network tile's label. The status model carries no SSID / connection name yet,
@@ -300,6 +466,9 @@ pub struct QuickSettings {
     audio: Option<AudioStatus>,
     /// Whether the volume slider is being dragged (a button is held on it).
     sliding: bool,
+    /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
+    /// when collapsed. At most one at a time.
+    expanded: Option<DetailOwner>,
     /// Bumped on any toggle so the cached chrome texture is redrawn.
     revision: u64,
     cache: RefCell<TextureCache>,
@@ -326,6 +495,7 @@ impl QuickSettings {
             battery,
             audio,
             sliding: false,
+            expanded: None,
             accent: [
                 f32::from(accent[0]) / 255.,
                 f32::from(accent[1]) / 255.,
@@ -345,9 +515,18 @@ impl QuickSettings {
         self.battery.is_some()
     }
 
-    /// The menu's logical size (fixed: two tile columns + the system row).
+    /// The current layout context (slider presence + which detail view is open), the single
+    /// source of truth every geometry function shares.
+    fn layout(&self) -> Layout {
+        Layout {
+            has_slider: self.audio.is_some(),
+            expanded: self.expanded,
+        }
+    }
+
+    /// The menu's logical size: two tile columns + the system row, grown by the open detail view.
     pub fn logical_size(&self) -> Size<f64, Logical> {
-        Size::from((menu_w(), menu_h(self.audio.is_some())))
+        Size::from((menu_w(), menu_h(self.layout())))
     }
 
     /// Handle a click at a menu-local logical position, returning the action to
@@ -355,11 +534,33 @@ impl QuickSettings {
     /// actionable but is still inside the menu). A tile click also flips the
     /// tile's own state so it updates before the gsettings write round-trips.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
-        let has_slider = self.audio.is_some();
+        let layout = self.layout();
+        // An open detail view is topmost: a row runs its action (a `Spawn`, which closes the
+        // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
+        if let Some(owner) = self.expanded {
+            for (k, row) in owner.rows(self.network).into_iter().enumerate() {
+                if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+                    return row.action;
+                }
+            }
+            if detail_rect(layout).is_some_and(|r| r.contains(pos)) {
+                return PopoverAction::Consumed;
+            }
+        }
         for (i, item) in GRID.iter().enumerate() {
-            if tile_rect(i, has_slider).contains(pos) {
+            // A menu tile's arrow-half toggles its detail view (open, or close if already open —
+            // one at a time); the toggle-body keeps the tile's own behavior. A plain tile is all
+            // body.
+            if tile_arrow_rect(i, layout).is_some_and(|r| r.contains(pos)) {
+                let owner = item.detail_owner();
+                self.expanded = if self.expanded == owner { None } else { owner };
+                self.revision += 1;
+                return PopoverAction::Consumed;
+            }
+            if tile_body_rect(i, layout).contains(pos) {
                 return match item {
-                    // Network: open settings (the in-place toggle / sub-menu is deferred).
+                    // Network body: open settings (the in-place enable/disable toggle is deferred);
+                    // the arrow opens the detail view.
                     GridTile::Network => PopoverAction::Spawn(
                         ["gnome-control-center", "network"]
                             .iter()
@@ -394,12 +595,12 @@ impl QuickSettings {
         // The volume slider: the speaker icon toggles mute; the track jumps to (and
         // begins dragging toward) the clicked position.
         if self.audio.is_some() {
-            if slider_icon_rect().contains(pos) {
+            if slider_icon_rect(layout).contains(pos) {
                 return PopoverAction::ToggleMute;
             }
-            if slider_track_rect().contains(pos) {
+            if slider_track_rect(layout).contains(pos) {
                 self.sliding = true;
-                return self.set_local_volume(volume_from_x(pos.x));
+                return self.set_local_volume(volume_from_x(pos.x, layout));
             }
         }
         PopoverAction::Consumed
@@ -408,8 +609,9 @@ impl QuickSettings {
     /// Continue a slider drag: while a button is held on the track, motion updates
     /// the volume. Returns the action to apply, or `None` when not dragging.
     pub fn pointer_drag(&mut self, pos: Point<f64, Logical>) -> Option<PopoverAction> {
+        let layout = self.layout();
         self.sliding
-            .then(|| self.set_local_volume(volume_from_x(pos.x)))
+            .then(|| self.set_local_volume(volume_from_x(pos.x, layout)))
     }
 
     /// End a slider drag (pointer released).
@@ -457,13 +659,13 @@ impl QuickSettings {
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let mut elements = Vec::new();
-        let has_slider = self.audio.is_some();
+        let layout = self.layout();
 
         // Tile icons (drawn above the chrome, so pushed before it).
         for (i, item) in GRID.iter().enumerate() {
             let on = item.is_on(self.toggles, self.network);
             let color = if on { FG_ON } else { FG_OFF };
-            let rect = tile_rect(i, has_slider);
+            let rect = tile_rect(i, layout);
             let center = Point::from((
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
@@ -480,6 +682,67 @@ impl QuickSettings {
                 center,
             ) {
                 elements.push(el);
+            }
+
+            // A menu tile's expand-arrow, centered in its arrow-half (gnome-shell's static
+            // `go-next-symbolic`).
+            if let Some(arrow) = tile_arrow_rect(i, layout) {
+                let center = Point::from((
+                    arrow.loc.x + arrow.size.w / 2.,
+                    arrow.loc.y + arrow.size.h / 2.,
+                ));
+                if let Some(el) = icon_element(
+                    renderer,
+                    icons,
+                    ARROW_ICONS,
+                    ARROW_ICON,
+                    scale,
+                    color,
+                    origin,
+                    center,
+                ) {
+                    elements.push(el);
+                }
+            }
+        }
+
+        // The open detail view: its header icon and any per-row icons (the card background,
+        // title, and row labels are chrome, drawn below).
+        if let Some(owner) = self.expanded {
+            if let Some(card) = detail_rect(layout) {
+                let (cand, _title) = owner.header(self.network);
+                let center = Point::from((
+                    card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON / 2.,
+                    card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.,
+                ));
+                if let Some(el) = icon_element(
+                    renderer,
+                    icons,
+                    &cand,
+                    DETAIL_HEADER_ICON,
+                    scale,
+                    FG_OFF,
+                    origin,
+                    center,
+                ) {
+                    elements.push(el);
+                }
+                for (k, row) in owner.rows(self.network).into_iter().enumerate() {
+                    if row.icons.is_empty() {
+                        continue;
+                    }
+                    if let Some(rrect) = detail_row_rect(k, layout) {
+                        let center = Point::from((
+                            rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON / 2.,
+                            rrect.loc.y + rrect.size.h / 2.,
+                        ));
+                        if let Some(el) = icon_element(
+                            renderer, icons, &row.icons, TILE_ICON, scale, FG_OFF, origin, center,
+                        ) {
+                            elements.push(el);
+                        }
+                    }
+                }
             }
         }
 
@@ -525,7 +788,7 @@ impl QuickSettings {
 
         // The volume slider's mute/level speaker icon, in its disc.
         if let Some(audio) = self.audio {
-            let disc = slider_icon_rect();
+            let disc = slider_icon_rect(layout);
             let center =
                 Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
             let name = crate::audio::volume_icon(&audio).to_string();
@@ -613,6 +876,7 @@ impl QuickSettings {
     fn draw(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
         let _span = tracy_client::span!("quick_settings::draw");
 
+        let layout = self.layout();
         let size = self.logical_size();
         let w_px = to_physical_precise_round::<i32>(scale, size.w).max(1);
         let h_px = to_physical_precise_round::<i32>(scale, size.h).max(1);
@@ -636,6 +900,22 @@ impl QuickSettings {
                     label_px,
                     true,
                 )
+            })
+            .transpose()?;
+        // The open detail view's header title (bold, `%title_3`) and its regular-weight row labels.
+        let detail_title_px = (DETAIL_TITLE_PX * scale) as f32;
+        let detail_row_px = (DETAIL_ROW_PX * scale) as f32;
+        let detail_runs = self
+            .expanded
+            .map(|owner| -> anyhow::Result<_> {
+                let (_, title) = owner.header(self.network);
+                let title_run = renderer.build_glyph_run_weighted(&title, detail_title_px, true)?;
+                let row_runs = owner
+                    .rows(self.network)
+                    .into_iter()
+                    .map(|r| renderer.build_glyph_run_weighted(&r.label, detail_row_px, false))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((title_run, row_runs))
             })
             .transpose()?;
 
@@ -667,7 +947,7 @@ impl QuickSettings {
             };
 
             for (i, item) in GRID.iter().enumerate() {
-                let rect = tile_rect(i, self.audio.is_some());
+                let rect = tile_rect(i, layout);
                 let on = item.is_on(self.toggles, self.network);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
@@ -680,15 +960,29 @@ impl QuickSettings {
                     &[full],
                 )?;
 
+                // A menu tile's arrow-half is separated from the body by a 1px divider
+                // (`.quick-toggle-separator`); v1 keeps one pill background and marks the split
+                // with the divider + the arrow icon (the split-radius look is a later cosmetic).
+                if let Some(arrow) = tile_arrow_rect(i, layout) {
+                    let sep = Rectangle::new(
+                        Point::from((arrow.loc.x - SEPARATOR_W, arrow.loc.y + arrow.size.h * 0.2)),
+                        Size::from((SEPARATOR_W, arrow.size.h * 0.6)),
+                    );
+                    frame.render_rounded_rect(SEPARATOR_COLOR, 0., rect_px(sep), &[full])?;
+                }
+
                 let fg = if on { FG_ON } else { FG_OFF };
                 let label_x = px(rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.);
                 let label_cy = px(rect.loc.y + rect.size.h / 2.);
                 let run = &label_runs[i];
+                // Clip the label to the toggle-body so a long name can't run under the arrow
+                // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
+                let clip = rect_px(tile_body_rect(i, layout));
                 frame.render_glyphs(
                     run,
                     place_left(run.ink_bounds(), label_x, label_cy),
                     fg,
-                    full,
+                    clip,
                     &[full],
                 )?;
             }
@@ -737,7 +1031,7 @@ impl QuickSettings {
             // portion, and the round handle (`.quick-slider` + `_slider.scss`). The
             // speaker icon composites on top afterwards.
             if let Some(audio) = self.audio {
-                let disc = slider_icon_rect();
+                let disc = slider_icon_rect(layout);
                 frame.render_rounded_rect(
                     TILE_OFF,
                     (SLIDER_H / 2. * scale) as f32,
@@ -745,7 +1039,7 @@ impl QuickSettings {
                     &[full],
                 )?;
 
-                let track = slider_track_rect();
+                let track = slider_track_rect(layout);
                 let cy = track.loc.y + track.size.h / 2.;
                 let trough = Rectangle::new(
                     Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
@@ -758,7 +1052,7 @@ impl QuickSettings {
                     &[full],
                 )?;
 
-                let handle_cx = slider_handle_x(audio.volume);
+                let handle_cx = slider_handle_x(audio.volume, layout);
                 let fill_color = if audio.muted {
                     SLIDER_TROUGH_BG
                 } else {
@@ -787,6 +1081,52 @@ impl QuickSettings {
                 )?;
             }
 
+            // The open detail view: the `%card` background, its header title (the header icon
+            // composites on top in `render`), then the row labels. Row icons, if any, also
+            // composite on top.
+            if let (Some(card), Some((title_run, row_runs))) = (detail_rect(layout), &detail_runs) {
+                frame.render_rounded_rect(
+                    CARD_BG,
+                    (DETAIL_RADIUS * scale) as f32,
+                    rect_px(card),
+                    &[full],
+                )?;
+
+                let title_x = px(card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON + 8.);
+                let title_cy = px(card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.);
+                frame.render_glyphs(
+                    title_run,
+                    place_left(title_run.ink_bounds(), title_x, title_cy),
+                    FG_OFF,
+                    rect_px(card),
+                    &[full],
+                )?;
+
+                for (k, run) in row_runs.iter().enumerate() {
+                    let Some(rrect) = detail_row_rect(k, layout) else {
+                        continue;
+                    };
+                    let has_icon = self
+                        .expanded
+                        .map(|o| o.rows(self.network))
+                        .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
+                        .unwrap_or(false);
+                    let label_x = if has_icon {
+                        px(rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.)
+                    } else {
+                        px(rrect.loc.x + DETAIL_ROW_INSET)
+                    };
+                    let label_cy = px(rrect.loc.y + rrect.size.h / 2.);
+                    frame.render_glyphs(
+                        run,
+                        place_left(run.ink_bounds(), label_x, label_cy),
+                        FG_OFF,
+                        rect_px(rrect),
+                        &[full],
+                    )?;
+                }
+            }
+
             let _sync = frame.finish()?;
         }
 
@@ -811,38 +1151,40 @@ fn grid_top(has_slider: bool) -> f64 {
     y
 }
 
-/// The y of the grid's bottom edge (grid top + tile rows).
+/// The y of the grid's bottom edge (grid top + tile rows), before any detail shift.
 fn grid_bottom(has_slider: bool) -> f64 {
     let rows = GRID.len().div_ceil(COLS) as f64;
     grid_top(has_slider) + rows * TILE_H + (rows - 1.) * TILE_GAP
 }
 
-/// The menu's logical height: system row, optional volume slider, tile grid, padding.
-fn menu_h(has_slider: bool) -> f64 {
-    grid_bottom(has_slider) + PAD
+/// The menu's logical height: system row, optional volume slider, tile grid, padding — grown by
+/// the open detail view's block (the card plus its top margin) when one is expanded.
+fn menu_h(layout: Layout) -> f64 {
+    let base = grid_bottom(layout.has_slider) + PAD;
+    base + layout.detail_block().map(|(_, h)| h).unwrap_or(0.)
 }
 
 /// The volume-slider row rectangle (full content width), between the system row and
-/// the tile grid.
-fn slider_row_rect() -> Rectangle<f64, Logical> {
+/// the tile grid. Shifts down under a detail view whose owner sits above it.
+fn slider_row_rect(layout: Layout) -> Rectangle<f64, Logical> {
     let y = PAD + SYS_H + TILE_GAP;
     Rectangle::new(
-        Point::from((PAD, y)),
+        Point::from((PAD, y + layout.shift_below(y))),
         Size::from((menu_w() - 2. * PAD, SLIDER_H)),
     )
 }
 
 /// The mute-button disc at the left of the slider row.
-fn slider_icon_rect() -> Rectangle<f64, Logical> {
-    let row = slider_row_rect();
+fn slider_icon_rect(layout: Layout) -> Rectangle<f64, Logical> {
+    let row = slider_row_rect(layout);
     Rectangle::new(row.loc, Size::from((SLIDER_H, SLIDER_H)))
 }
 
 /// The slider's interactive track band (row minus the mute disc). The drawn trough
 /// is a thin bar centered in this band; the usable handle-center x-range is inset by
 /// half a handle so the handle never overhangs.
-fn slider_track_rect() -> Rectangle<f64, Logical> {
-    let row = slider_row_rect();
+fn slider_track_rect(layout: Layout) -> Rectangle<f64, Logical> {
+    let row = slider_row_rect(layout);
     let x = row.loc.x + SLIDER_H + SYS_GAP;
     Rectangle::new(
         Point::from((x, row.loc.y)),
@@ -851,29 +1193,99 @@ fn slider_track_rect() -> Rectangle<f64, Logical> {
 }
 
 /// Perceptual volume `0..=1` for a pointer x on the slider track.
-fn volume_from_x(x: f64) -> f64 {
-    let track = slider_track_rect();
+fn volume_from_x(x: f64, layout: Layout) -> f64 {
+    let track = slider_track_rect(layout);
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     ((x - left) / (right - left)).clamp(0.0, 1.0)
 }
 
 /// The x of the handle center for a given perceptual volume.
-fn slider_handle_x(volume: f64) -> f64 {
-    let track = slider_track_rect();
+fn slider_handle_x(volume: f64, layout: Layout) -> f64 {
+    let track = slider_track_rect(layout);
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     left + volume.clamp(0.0, 1.0) * (right - left)
 }
 
-/// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below
-/// the top system row (and the volume slider when a sink is present).
-fn tile_rect(i: usize, has_slider: bool) -> Rectangle<f64, Logical> {
+/// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below the top system
+/// row (and the volume slider when a sink is present); rows below an open detail view's owner
+/// shift down by the card block.
+fn tile_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
     let row = (i / COLS) as f64;
     let col = (i % COLS) as f64;
     let x = PAD + col * (TILE_W + TILE_GAP);
-    let y = grid_top(has_slider) + row * (TILE_H + TILE_GAP);
-    Rectangle::new(Point::from((x, y)), Size::from((TILE_W, TILE_H)))
+    let y = grid_top(layout.has_slider) + row * (TILE_H + TILE_GAP);
+    Rectangle::new(
+        Point::from((x, y + layout.shift_below(y))),
+        Size::from((TILE_W, TILE_H)),
+    )
+}
+
+/// The expand-arrow (menu-button) half of a menu-bearing tile — the right `ARROW_W`, full height —
+/// or `None` for a plain toggle. gnome-shell's `.quick-toggle-menu-button`, the second hit region.
+fn tile_arrow_rect(i: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    GRID[i].detail_owner()?;
+    let tile = tile_rect(i, layout);
+    Some(Rectangle::new(
+        Point::from((tile.loc.x + tile.size.w - ARROW_W, tile.loc.y)),
+        Size::from((ARROW_W, tile.size.h)),
+    ))
+}
+
+/// The toggle-body half of a tile (the whole tile for a plain toggle; the tile minus the arrow
+/// for a menu tile). Its click flips the toggle / opens settings; also the label's clip bound.
+fn tile_body_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
+    let tile = tile_rect(i, layout);
+    match tile_arrow_rect(i, layout) {
+        Some(_) => Rectangle::new(
+            tile.loc,
+            Size::from((tile.size.w - ARROW_W - SEPARATOR_W, tile.size.h)),
+        ),
+        None => tile,
+    }
+}
+
+/// The detail-view card rectangle (menu-local logical), pinned below its owner's row, or `None`
+/// when collapsed.
+fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    let owner = layout.expanded?;
+    let insert_y = owner.anchor_row_bottom(layout.has_slider);
+    Some(Rectangle::new(
+        Point::from((PAD, insert_y + DETAIL_MARGIN)),
+        Size::from((menu_w() - 2. * PAD, owner.detail_height())),
+    ))
+}
+
+/// The rectangle of detail row `k` (0-based, top to bottom), accounting for the header, inter-row
+/// gaps, and any group separators above earlier rows. `None` if there's no open detail / no row
+/// `k`.
+fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    let owner = layout.expanded?;
+    let card = detail_rect(layout)?;
+    let rows = owner.rows(NetworkStatus::Unknown);
+    if k >= rows.len() {
+        return None;
+    }
+    // Walk from the first row's top, adding each earlier row's height + gap, plus a separator's
+    // extra space wherever one opens a group.
+    let mut y = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H + DETAIL_HEADER_GAP;
+    for (j, row) in rows.iter().enumerate() {
+        if j > 0 {
+            y += DETAIL_ROW_GAP;
+        }
+        if row.separator_before {
+            y += DETAIL_SEP_EXTRA;
+        }
+        if j == k {
+            return Some(Rectangle::new(
+                Point::from((card.loc.x + DETAIL_PAD, y)),
+                Size::from((card.size.w - 2. * DETAIL_PAD, DETAIL_ROW_H)),
+            ));
+        }
+        y += DETAIL_ROW_H;
+    }
+    None
 }
 
 /// The battery pill's rectangle at the far left of the top system row, or `None`
@@ -963,6 +1375,14 @@ mod tests {
         Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
     }
 
+    /// A collapsed layout (no open detail view) with the given slider presence.
+    fn lay(has_slider: bool) -> Layout {
+        Layout {
+            has_slider,
+            expanded: None,
+        }
+    }
+
     /// The tile grid, system row, and (when a sink is present) the volume slider —
     /// which sits between the system row and the grid — lay out inside the menu
     /// without going off an edge, with and without the battery pill.
@@ -987,7 +1407,7 @@ mod tests {
                 assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
             };
             for i in 0..GRID.len() {
-                within(tile_rect(i, has_slider), "tile");
+                within(tile_rect(i, lay(has_slider)), "tile");
             }
             for has_pill in [false, true] {
                 for button in SYS_BUTTONS {
@@ -998,13 +1418,14 @@ mod tests {
                 }
             }
             if has_slider {
-                within(slider_row_rect(), "slider row");
-                within(slider_icon_rect(), "slider mute button");
-                within(slider_track_rect(), "slider track");
+                within(slider_row_rect(lay(has_slider)), "slider row");
+                within(slider_icon_rect(lay(has_slider)), "slider mute button");
+                within(slider_track_rect(lay(has_slider)), "slider track");
                 // The slider sits above the tile grid.
                 assert!(
-                    slider_row_rect().loc.y + slider_row_rect().size.h
-                        <= tile_rect(0, has_slider).loc.y + 0.01,
+                    slider_row_rect(lay(has_slider)).loc.y
+                        + slider_row_rect(lay(has_slider)).size.h
+                        <= tile_rect(0, lay(has_slider)).loc.y + 0.01,
                     "slider must be above the first tile row"
                 );
             }
@@ -1021,7 +1442,7 @@ mod tests {
             None,
             [0, 0, 0],
         );
-        let dnd = tile_rect(2, false); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
+        let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));
@@ -1046,7 +1467,8 @@ mod tests {
             [0, 0, 0],
         );
         let before = qs.revision;
-        let action = qs.pointer_click(center(tile_rect(0, false)));
+        // The tile center falls in the toggle-body (left of the arrow-half), which opens settings.
+        let action = qs.pointer_click(center(tile_rect(0, lay(false))));
         match action {
             PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
             other => panic!("expected network settings, got {other:?}"),
@@ -1160,7 +1582,7 @@ mod tests {
         );
 
         // The center of the Dark Style tile (grid cell 1) is the accent: high R, low G/B.
-        let r0 = tile_rect(1, false);
+        let r0 = tile_rect(1, lay(false));
         let cx = (r0.loc.x + r0.size.w * 0.15) as i32;
         let cy = (r0.loc.y + r0.size.h / 2.) as i32;
         let i = ((cy * size.w + cx) * 4) as usize;
@@ -1183,7 +1605,7 @@ mod tests {
         );
 
         // The Night Light tile (grid cell 3, off) is the dim grey, not the accent.
-        let r2 = tile_rect(3, false);
+        let r2 = tile_rect(3, lay(false));
         let gx = (r2.loc.x + r2.size.w * 0.15) as i32;
         let gy = (r2.loc.y + r2.size.h / 2.) as i32;
         let j = ((gy * size.w + gx) * 4) as usize;
@@ -1192,5 +1614,150 @@ mod tests {
             g[0] < 100 && g[1] < 100 && g[2] < 100,
             "an inactive tile must be dim grey, got {g:?}"
         );
+    }
+
+    fn qs(network: NetworkStatus, audio: Option<AudioStatus>) -> QuickSettings {
+        QuickSettings::new(QuickToggles::default(), network, None, audio, [0, 0, 0])
+    }
+
+    /// A menu tile's arrow-half and toggle-body are disjoint hit regions; a plain toggle has no
+    /// arrow and its body is the whole tile.
+    #[test]
+    fn tile_body_and_arrow_are_disjoint_regions() {
+        let l = lay(false);
+        let ni = network_index();
+        let body = tile_body_rect(ni, l);
+        let arrow = tile_arrow_rect(ni, l).expect("the Network tile carries an arrow");
+        // The body ends at (or before) the arrow's left edge — a separator sits between.
+        assert!(body.loc.x + body.size.w <= arrow.loc.x);
+        assert_eq!(arrow.loc.x + arrow.size.w, tile_rect(ni, l).loc.x + TILE_W);
+        // A gsettings toggle (Do Not Disturb, cell 2) is all body, no arrow.
+        assert!(tile_arrow_rect(2, l).is_none());
+        assert_eq!(tile_body_rect(2, l), tile_rect(2, l));
+    }
+
+    /// The Network arrow opens the detail view; clicking it again collapses it. Both are internal
+    /// state changes (Consumed) that bump the chrome revision.
+    #[test]
+    fn network_arrow_toggles_the_detail_view() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+        let ni = network_index();
+        assert!(qs.expanded.is_none());
+
+        let before = qs.revision;
+        let a = qs.pointer_click(center(tile_arrow_rect(ni, qs.layout()).unwrap()));
+        assert!(matches!(a, PopoverAction::Consumed));
+        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        assert!(qs.revision > before);
+
+        // Network is a row-0 tile, so opening its detail doesn't shift it — the arrow stays put.
+        let a = qs.pointer_click(center(tile_arrow_rect(ni, qs.layout()).unwrap()));
+        assert!(matches!(a, PopoverAction::Consumed));
+        assert!(qs.expanded.is_none());
+    }
+
+    /// Opening a detail view grows the menu (taller, same width) and shifts only the rows below
+    /// the owner's row; the card sits between the owner's row and the shifted rows.
+    #[test]
+    fn detail_view_grows_menu_and_shifts_lower_rows_only() {
+        let collapsed = Layout {
+            has_slider: false,
+            expanded: None,
+        };
+        let expanded = Layout {
+            has_slider: false,
+            expanded: Some(DetailOwner::Network),
+        };
+        assert!(
+            menu_h(expanded) > menu_h(collapsed),
+            "the menu must grow taller"
+        );
+
+        let block = DETAIL_MARGIN + DetailOwner::Network.detail_height();
+        // Row 0 (Network + its neighbor) does not move.
+        for i in 0..COLS {
+            assert_eq!(
+                tile_rect(i, expanded).loc.y,
+                tile_rect(i, collapsed).loc.y,
+                "row 0 must not shift"
+            );
+        }
+        // Row 1 shifts down by exactly the detail block.
+        for i in COLS..GRID.len() {
+            let d = tile_rect(i, expanded).loc.y - tile_rect(i, collapsed).loc.y;
+            assert!(
+                (d - block).abs() < 0.01,
+                "row 1 must shift by the block, got {d}"
+            );
+        }
+        // The card is pinned below the Network row and clears the shifted next row.
+        let card = detail_rect(expanded).expect("a card when expanded");
+        let ni = network_index();
+        assert!(card.loc.y >= tile_rect(ni, expanded).loc.y + TILE_H - 0.01);
+        assert!(card.loc.y + card.size.h <= tile_rect(COLS, expanded).loc.y + 0.01);
+        // Never wider than the collapsed menu (keeps the popover origin stable on expand).
+        assert!(card.loc.x + card.size.w <= menu_w() - PAD + 0.01);
+    }
+
+    /// With the Network detail open, clicking its row runs the row's action (a settings spawn,
+    /// which closes the menu); the row lies inside the card.
+    #[test]
+    fn detail_row_runs_its_action() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+
+        let row = detail_row_rect(0, qs.layout()).expect("one detail row");
+        let card = detail_rect(qs.layout()).unwrap();
+        assert!(
+            card.contains(row.loc) && card.contains(center(row)),
+            "row must lie in the card"
+        );
+
+        let action = qs.pointer_click(center(row));
+        match action {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
+            other => panic!("expected the network-settings spawn, got {other:?}"),
+        }
+    }
+
+    /// A click in the card but not on a row is swallowed (stays open); a click outside the whole
+    /// menu is the shell's concern, not ours.
+    #[test]
+    fn clicking_card_gutter_is_consumed_and_keeps_the_detail_open() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+        ));
+        let card = detail_rect(qs.layout()).unwrap();
+        // The header strip (above the first row) is card space with no action.
+        let header = Point::from((card.loc.x + card.size.w - 4., card.loc.y + 2.));
+        let a = qs.pointer_click(header);
+        assert!(matches!(a, PopoverAction::Consumed));
+        assert_eq!(
+            qs.expanded,
+            Some(DetailOwner::Network),
+            "the detail must stay open"
+        );
+    }
+
+    /// Even with a slider present and the detail open, the menu height stays modest — documents
+    /// the "no scroll needed, never clips a normal display" assumption (the popover doesn't clamp
+    /// its bottom edge).
+    #[test]
+    fn expanded_menu_stays_within_a_sane_height() {
+        for has_slider in [false, true] {
+            let l = Layout {
+                has_slider,
+                expanded: Some(DetailOwner::Network),
+            };
+            assert!(
+                menu_h(l) < 600.,
+                "expanded menu unexpectedly tall: {}",
+                menu_h(l)
+            );
+        }
     }
 }
