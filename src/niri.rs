@@ -3347,6 +3347,7 @@ impl Niri {
         }
 
         self.stop_casts_for_target(CastTarget::output(output));
+        self.stop_native_recordings_for_output(output);
         self.screencopy_state.remove_output(output);
 
         // Disable the output global and remove some time later to give the clients some time to

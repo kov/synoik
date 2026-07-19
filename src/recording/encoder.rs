@@ -26,8 +26,15 @@ pub trait EncoderBackend: Send {
     fn finish(self: Box<Self>) -> anyhow::Result<()>;
 }
 
-/// Streams RGBA frames to an `ffmpeg` subprocess encoding VP8-in-WebM. Frames are fed at the
-/// configured framerate as constant-rate input; the capture side paces to that rate.
+/// Streams RGBA frames to an `ffmpeg` subprocess encoding VP8-in-WebM.
+///
+/// The input is fixed-rate (`-framerate fps`), so ffmpeg spaces frames at `1/fps` regardless of
+/// when they were captured. Left there, a *dropped* frame (encoder behind → the capture side
+/// discards it) would silently compress wall-clock time: the encoder counts only frames it
+/// received. To keep the recording's duration truthful, [`FfmpegEncoder::push`] uses each frame's
+/// monotonic `pts` to detect gaps and repeats the previous frame into the missed slots, so the
+/// emitted frame count always matches elapsed real time. Output stays constant-rate (universally
+/// playable) while honoring the capture timeline.
 pub struct FfmpegEncoder {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -37,8 +44,18 @@ pub struct FfmpegEncoder {
     path: PathBuf,
     /// Expected bytes per frame (`width * height * 4`).
     frame_bytes: usize,
+    /// Configured framerate, used to map a frame's `pts` to its constant-rate slot index.
+    fps: f64,
+    /// The most recently written frame, repeated to fill slots lost to drops.
+    last: Option<Vec<u8>>,
     frames: u64,
 }
+
+/// Per-`push` cap on synthesized fill frames, bounding the burst written to ffmpeg's stdin in one
+/// call (~10s at 30fps). It does *not* cap total fill: a deficit larger than this is worked off
+/// over subsequent pushes, so wall-clock duration stays truthful — it just isn't dumped all at
+/// once.
+const MAX_GAP_FILL: u64 = 300;
 
 impl FfmpegEncoder {
     /// Spawn ffmpeg writing VP8/WebM to `path`. Fails if ffmpeg is not installed or refuses the
@@ -94,8 +111,24 @@ impl FfmpegEncoder {
             stderr: Some(stderr),
             path: path.to_owned(),
             frame_bytes: (config.width * config.height * 4) as usize,
+            fps: config.fps.max(1) as f64,
+            last: None,
             frames: 0,
         })
+    }
+
+    /// Write one raw RGBA frame to ffmpeg's stdin, surfacing its stderr on a broken pipe.
+    fn write_frame(&mut self, rgba: &[u8]) -> anyhow::Result<()> {
+        let stdin = self.stdin.as_mut().context("ffmpeg stdin already closed")?;
+        if let Err(err) = stdin.write_all(rgba) {
+            // A broken pipe means ffmpeg died; surface its stderr.
+            let details = self.take_stderr();
+            return Err(anyhow::Error::new(err)).context(format!(
+                "writing a frame to ffmpeg failed. ffmpeg said: {details}"
+            ));
+        }
+        self.frames += 1;
+        Ok(())
     }
 
     /// Collect ffmpeg's stderr (joining the drain thread) for error messages.
@@ -115,15 +148,26 @@ impl EncoderBackend for FfmpegEncoder {
             frame.rgba.len(),
             self.frame_bytes,
         );
-        let stdin = self.stdin.as_mut().context("ffmpeg stdin already closed")?;
-        if let Err(err) = stdin.write_all(&frame.rgba) {
-            // A broken pipe means ffmpeg died; surface its stderr.
-            let details = self.take_stderr();
-            return Err(anyhow::Error::new(err)).context(format!(
-                "writing a frame to ffmpeg failed. ffmpeg said: {details}"
-            ));
+
+        // This frame belongs in the constant-rate slot nearest its capture time. If drops left
+        // earlier slots empty, repeat the previous frame into them so the timeline stays honest.
+        let slot = (frame.pts.as_secs_f64() * self.fps).round() as u64;
+        if let Some(last) = self.last.take() {
+            let deficit = slot.saturating_sub(self.frames);
+            if deficit > self.fps as u64 {
+                debug!(
+                    "recorder filling a {deficit}-frame gap (dropped frames or a capture stall)"
+                );
+            }
+            let fill = deficit.min(MAX_GAP_FILL);
+            for _ in 0..fill {
+                self.write_frame(&last)?;
+            }
+            self.last = Some(last);
         }
-        self.frames += 1;
+
+        self.write_frame(&frame.rgba)?;
+        self.last = Some(frame.rgba);
         Ok(())
     }
 
@@ -354,6 +398,35 @@ mod tests {
         rec.finish().unwrap();
 
         assert_valid_webm(&path, w, h, 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_pts_gap_is_filled_so_duration_is_preserved() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        // Push only two frames but stamp the second a full second (30 slots) later, as if 29
+        // frames had been dropped. The gap-fill should synthesize the missing slots so the file
+        // holds ~30 frames, not 2 — i.e. one second of video, not two frames' worth.
+        let (w, h) = (32, 24);
+        let path = temp_path("gap");
+        let mut enc = Box::new(FfmpegEncoder::new(&path, config(w, h)).unwrap());
+        enc.push(RecordFrame {
+            rgba: frame(w, h, 0),
+            pts: Duration::ZERO,
+        })
+        .unwrap();
+        enc.push(RecordFrame {
+            rgba: frame(w, h, 1),
+            pts: Duration::from_secs(1),
+        })
+        .unwrap();
+        enc.finish().unwrap();
+
+        // 30 filled slots + the final frame ≈ 31; demand clearly more than the 2 pushed.
+        assert_valid_webm(&path, w, h, 25);
         std::fs::remove_file(&path).ok();
     }
 

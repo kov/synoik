@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::LoopHandle;
+use calloop::{LoopHandle, RegistrationToken};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
@@ -84,6 +84,10 @@ pub struct NativeRecording {
     last_frame_time: Duration,
     /// Minimum spacing between captured frames (the target framerate).
     frame_interval: Duration,
+    /// A pending self-driven redraw that keeps frames flowing while the output is otherwise idle.
+    /// Unlike a screencast (whose consumer pulls frames), a recording has no external driver, so
+    /// it schedules its own redraws at the frame cadence.
+    scheduled_redraw: Option<RegistrationToken>,
 }
 
 /// A screencast request that hasn't been started yet.
@@ -996,6 +1000,7 @@ impl Niri {
                 path,
                 last_frame_time: Duration::ZERO,
                 frame_interval: Duration::from_nanos(1_000_000_000 / FPS as u64),
+                scheduled_redraw: None,
             }),
         });
         self.refresh_screen_recording();
@@ -1022,6 +1027,9 @@ impl Niri {
             if matches!(self.casting.recordings[idx].kind, RecordingKind::Native(_)) {
                 let rec = self.casting.recordings.remove(idx);
                 if let RecordingKind::Native(n) = rec.kind {
+                    if let Some(token) = n.scheduled_redraw {
+                        self.event_loop.remove(token);
+                    }
                     match n.recorder.finish() {
                         Ok(()) => info!("saved screen recording to {}", n.path.display()),
                         Err(err) => {
@@ -1033,6 +1041,42 @@ impl Niri {
             } else {
                 self.stop_cast(id);
             }
+        }
+    }
+
+    /// Finalize and drop every native recording targeting `output` (its connector is going away).
+    /// External casts are handled by `stop_casts_for_target`; native recordings live in a separate
+    /// ledger, so without this an unplugged output would leave a zombie recording (live ffmpeg +
+    /// forever-ticking R1 indicator), and a replugged connector is a fresh `Output` that never
+    /// matches the stored weak.
+    pub fn stop_native_recordings_for_output(&mut self, output: &Output) {
+        let weak = output.downgrade();
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.casting.recordings.len() {
+            let is_here = matches!(
+                &self.casting.recordings[i].kind,
+                RecordingKind::Native(n) if n.output == weak
+            );
+            if is_here {
+                if let RecordingKind::Native(n) = self.casting.recordings.remove(i).kind {
+                    if let Some(token) = n.scheduled_redraw {
+                        self.event_loop.remove(token);
+                    }
+                    match n.recorder.finish() {
+                        Ok(()) => info!("saved screen recording to {}", n.path.display()),
+                        Err(err) => {
+                            warn!("error finalizing recording {}: {err:?}", n.path.display())
+                        }
+                    }
+                }
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if changed {
+            self.refresh_screen_recording();
         }
     }
 
@@ -1054,80 +1098,137 @@ impl Niri {
         use crate::render_helpers::render_to_vec;
 
         let weak = output.downgrade();
+        let loop_handle = self.event_loop.clone();
 
-        // Which native recordings target this output and are due for a frame?
-        let due: Vec<CastSessionId> = self
+        // Snapshot the native recordings on this output: (id, last_frame_time, interval,
+        // started_at). started_at anchors a fixed capture grid so timer latency can't accumulate.
+        let recs: Vec<(CastSessionId, Duration, Duration, Duration)> = self
             .casting
             .recordings
             .iter()
-            .filter(|r| match &r.kind {
-                RecordingKind::Native(n) => {
-                    n.output == weak
-                        && target_presentation_time.saturating_sub(n.last_frame_time)
-                            >= n.frame_interval
-                }
-                RecordingKind::External => false,
+            .filter_map(|r| match &r.kind {
+                RecordingKind::Native(n) if n.output == weak => Some((
+                    r.session_id,
+                    n.last_frame_time,
+                    n.frame_interval,
+                    r.started_at,
+                )),
+                _ => None,
             })
-            .map(|r| r.session_id)
             .collect();
-        if due.is_empty() {
-            return;
-        }
 
-        for id in due {
-            let Some((size, scale, started_at)) =
-                self.casting.recordings.iter().find_map(|r| match &r.kind {
-                    RecordingKind::Native(n) if r.session_id == id => {
-                        Some((n.size, n.scale, r.started_at))
-                    }
-                    _ => None,
-                })
-            else {
-                continue;
+        for (id, last_frame, interval, started_at) in recs {
+            // The capture grid: slot k covers [started_at + k*interval, started_at +
+            // (k+1)*interval). Anchoring the next deadline to this grid (not to
+            // last_frame + interval) keeps the cadence drift-free even when a redraw
+            // lands a refresh late.
+            let interval_ns = (interval.as_nanos() as u64).max(1);
+            let slot_of = |t: Duration| -> u64 {
+                (t.saturating_sub(started_at).as_nanos() as u64) / interval_ns
             };
 
-            // Build the output's screencast elements and read them back as RGBA.
-            let ctx = RenderCtx {
-                renderer,
-                target: RenderTarget::Screencast,
-                xray: None,
-            };
-            let elements = self.render_to_vec(ctx, output, true);
-            let rgba = match render_to_vec(
-                renderer,
-                size,
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elements.iter().rev(),
-            ) {
-                Ok(rgba) => rgba,
-                Err(err) => {
-                    warn!("error capturing a recording frame: {err:?}");
+            // Capture at most once per slot; a redraw that lands in an already-captured slot only
+            // reschedules.
+            let due =
+                last_frame.is_zero() || slot_of(target_presentation_time) > slot_of(last_frame);
+
+            let mut disconnected = false;
+            if due {
+                let Some((size, scale)) =
+                    self.casting.recordings.iter().find_map(|r| match &r.kind {
+                        RecordingKind::Native(n) if r.session_id == id => Some((n.size, n.scale)),
+                        _ => None,
+                    })
+                else {
                     continue;
-                }
-            };
+                };
 
-            let pts = target_presentation_time.saturating_sub(started_at);
-            let disconnected = if let Some(RecordingKind::Native(n)) = self
+                // Build the output's screencast elements and read them back as RGBA.
+                let ctx = RenderCtx {
+                    renderer,
+                    target: RenderTarget::Screencast,
+                    xray: None,
+                };
+                let elements = self.render_to_vec(ctx, output, true);
+                match render_to_vec(
+                    renderer,
+                    size,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                ) {
+                    Ok(rgba) => {
+                        let pts = target_presentation_time.saturating_sub(started_at);
+                        if let Some(RecordingKind::Native(n)) = self
+                            .casting
+                            .recordings
+                            .iter_mut()
+                            .find(|r| r.session_id == id)
+                            .map(|r| &mut r.kind)
+                        {
+                            n.last_frame_time = target_presentation_time;
+                            disconnected = n.recorder.try_push(RecordFrame { rgba, pts })
+                                == PushResult::Disconnected;
+                        }
+                    }
+                    // A transient capture failure must not abandon the self-drive chain: fall
+                    // through and reschedule so an idle recording keeps retrying.
+                    Err(err) => warn!("error capturing a recording frame: {err:?}"),
+                }
+            }
+
+            // The encoder worker died (e.g. ffmpeg crashed); stop this recording so the panel
+            // indicator clears and the compositor keeps running.
+            if disconnected {
+                warn!("recorder worker exited unexpectedly; stopping the recording");
+                if let Some(pos) = self
+                    .casting
+                    .recordings
+                    .iter()
+                    .position(|r| r.session_id == id)
+                {
+                    if let RecordingKind::Native(n) = self.casting.recordings.remove(pos).kind {
+                        if let Some(token) = n.scheduled_redraw {
+                            loop_handle.remove(token);
+                        }
+                    }
+                }
+                self.refresh_screen_recording();
+                continue;
+            }
+
+            // Keep frames flowing while the output is idle: schedule the next redraw at the next
+            // grid deadline. A screencast leans on its consumer to pull; a recording has none, so
+            // without this an unchanging screen would capture almost nothing.
+            let base = if due {
+                target_presentation_time
+            } else {
+                last_frame
+            };
+            let next_slot = slot_of(base) + 1;
+            let deadline = started_at + Duration::from_nanos(next_slot.saturating_mul(interval_ns));
+            if let Some(RecordingKind::Native(n)) = self
                 .casting
                 .recordings
                 .iter_mut()
                 .find(|r| r.session_id == id)
                 .map(|r| &mut r.kind)
             {
-                n.last_frame_time = target_presentation_time;
-                n.recorder.try_push(RecordFrame { rgba, pts }) == PushResult::Disconnected
-            } else {
-                false
-            };
-
-            // The encoder worker died (e.g. ffmpeg crashed); stop this recording so the panel
-            // indicator clears and the compositor keeps running.
-            if disconnected {
-                warn!("recorder worker exited unexpectedly; stopping the recording");
-                self.casting.recordings.retain(|r| r.session_id != id);
-                self.refresh_screen_recording();
+                if let Some(token) = n.scheduled_redraw.take() {
+                    loop_handle.remove(token);
+                }
+                let delay = deadline.saturating_sub(get_monotonic_time());
+                let out = output.clone();
+                let token = loop_handle
+                    .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                        if state.niri.output_state.contains_key(&out) {
+                            state.niri.queue_redraw(&out);
+                        }
+                        TimeoutAction::Drop
+                    })
+                    .unwrap();
+                n.scheduled_redraw = Some(token);
             }
         }
     }
