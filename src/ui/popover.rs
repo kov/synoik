@@ -497,11 +497,31 @@ impl PanelPopover {
                 Ok(texture) => {
                     use smithay::backend::renderer::element::Kind;
                     use smithay::backend::renderer::Texture as _;
-                    use smithay::utils::Transform;
+                    use smithay::utils::{Buffer as BufferCoord, Transform};
 
                     use crate::render_helpers::texture::TextureBuffer;
 
-                    let opaque = vec![Rectangle::from_size(texture.size())];
+                    // The calendar's outer corners are rounded (transparent), so report opacity as
+                    // the two bands that exclude the four corner squares — never claiming a
+                    // cut-away corner pixel is opaque (which would let
+                    // occlusion drop what shows through). Mirrors the
+                    // quick-settings menu.
+                    let size = texture.size();
+                    let r = (crate::ui::calendar::BOX_RADIUS * scale).round() as i32;
+                    let opaque = if r > 0 && size.w > 2 * r && size.h > 2 * r {
+                        vec![
+                            Rectangle::new(
+                                Point::<i32, BufferCoord>::from((0, r)),
+                                Size::from((size.w, size.h - 2 * r)),
+                            ),
+                            Rectangle::new(
+                                Point::<i32, BufferCoord>::from((r, 0)),
+                                Size::from((size.w - 2 * r, size.h)),
+                            ),
+                        ]
+                    } else {
+                        vec![Rectangle::from_size(size)]
+                    };
                     let buffer = TextureBuffer::from_texture(
                         renderer,
                         texture,

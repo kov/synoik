@@ -50,6 +50,12 @@ const ARROW_PX: f64 = 18.;
 const DISC_DIAM: f64 = 30.;
 
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// Fully transparent — the buffer is cleared to this so the rounded outer corners stay see-through.
+const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
+/// The popover's outer corner radius: gnome-shell's `.popup-menu-content` is
+/// `$modal_radius * 1.25` (`$modal_radius` = 16px → 20px, `_popovers.scss:30`) — the standard
+/// popup radius, smaller than the quick-settings menu's 2.25× modal radius.
+pub const BOX_RADIUS: f64 = 20.;
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// The selected (non-today) day's subtle filled circle — gnome-shell's flat-button
 /// selected state (a faint light fill), vs today's accent fill.
@@ -366,7 +372,12 @@ impl Calendar {
             let mut fb = renderer.bind(&mut target)?;
             let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
             let full = Rectangle::from_size(phys);
-            frame.clear(Color32F::from(BOX_BG), &[full])?;
+            // Rounded card: clear transparent, then fill the interior as a rounded rect so the four
+            // outer corners stay transparent (the composited element reports opacity excluding
+            // those corners — see `PanelPopover::render`). Matches the quick-settings
+            // menu's approach.
+            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            frame.render_rounded_rect(BOX_BG, (BOX_RADIUS * scale) as f32, full, &[full])?;
 
             let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
             let center = |rect: Rectangle<f64, Logical>| {
@@ -882,17 +893,24 @@ mod tests {
             .expect("copy_framebuffer");
         let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-        // Opaque dark background.
-        let corner = {
-            let (x, y) = (size.w - 3, size.h - 3);
+        let px_at = |x: i32, y: i32| {
             let i = ((y * size.w + x) * 4) as usize;
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
+        // The interior background is opaque dark (sample the left-edge padding, past the corner
+        // radius so it's inside the rounded rect).
+        let interior = px_at(3, size.h / 2);
         assert_eq!(
-            corner[3], 255,
-            "calendar box must be opaque, got {corner:?}"
+            interior[3], 255,
+            "calendar interior must be opaque, got {interior:?}"
         );
-        assert!(corner[0] < 60 && corner[1] < 60 && corner[2] < 60);
+        assert!(interior[0] < 60 && interior[1] < 60 && interior[2] < 60);
+        // The outer corners are rounded away — a pixel in the extreme corner is transparent.
+        let corner = px_at(size.w - 2, size.h - 2);
+        assert_eq!(
+            corner[3], 0,
+            "calendar outer corner must be transparent (rounded), got {corner:?}"
+        );
 
         // Bright glyph ink (day numbers / header).
         let bright = pixels
