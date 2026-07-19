@@ -59,6 +59,24 @@ const DIM: [f32; 4] = [0.5, 0.5, 0.5, 1.];
 /// Weekday header + week numbers, muted.
 const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
 
+// The "today" header card above the grid — gnome-shell's `TodayButton` (`js/ui/calendar.js`):
+// a button showing the weekday name over the full date, tapping it snaps the selection back to
+// today. GNOME stacks two labels (`.day-label` weekday over `.date-label` full date) inside a
+// framed button. We draw one flat rounded card with the same two lines. Sizes are logical px.
+const TODAY_PAD: f64 = 9.;
+const DAY_ROW: f64 = 18.;
+const DATE_ROW: f64 = 26.;
+const TODAY_CARD_H: f64 = TODAY_PAD + DAY_ROW + DATE_ROW + TODAY_PAD; // 62
+/// Gap between the today card and the month-nav header below it.
+const TODAY_GAP: f64 = 6.;
+const TODAY_RADIUS: f64 = 12.;
+/// The card fill: BOX_BG lightened, matching GNOME's `#36363a`→`#47474c` button delta (~7%).
+const TODAY_CARD_BG: [f32; 4] = [0.17, 0.17, 0.17, 1.];
+/// `.day-label` (weekday name) and `.date-label` (full date) point sizes. GNOME's date label is
+/// heavier (800) but the rasterizer tops out at bold (700); both draw bold here.
+const DAY_LABEL_PX: f64 = crate::ui::pt_to_px(11.);
+const DATE_LABEL_PX: f64 = crate::ui::pt_to_px(15.);
+
 /// A calendar month view. Displayed month + the selected day; `today` is fixed
 /// at construction. `week_start` is 0=Sunday..6=Saturday.
 pub struct Calendar {
@@ -127,7 +145,7 @@ impl Calendar {
     /// The calendar's logical size (depends only on whether the week column shows).
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let w = grid_left(self.show_week_numbers) + GRID_COLS as f64 * CELL + PAD;
-        let h = PAD + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
+        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
         Size::from((w, h))
     }
 
@@ -153,6 +171,17 @@ impl Calendar {
     /// hit something (so the caller keeps the popover open on any interior click).
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> bool {
         let layout = Layout::new(self.show_week_numbers);
+        // The today card: snap the selection back to today (matching gnome-shell's TodayButton).
+        // Unlike gnome-shell, paging keeps the selection put (`shift_month`), so `selected` can
+        // still be today while a different month is displayed — return-to-today must also snap the
+        // *view* back, so we act whenever the selection OR the displayed month is off today.
+        if layout.today_button().contains(pos) {
+            let showing_today = self.year == self.today.year && self.month == self.today.month;
+            if self.selected != self.today || !showing_today {
+                self.select(self.today);
+            }
+            return true;
+        }
         if layout.prev_arrow().contains(pos) {
             self.shift_month(-1);
             return true;
@@ -204,28 +233,46 @@ impl Layout {
 
     fn bounds(&self) -> Rectangle<f64, Logical> {
         let w = grid_left(self.week) + GRID_COLS as f64 * CELL + PAD;
-        let h = PAD + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
+        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
         Rectangle::new(Point::from((0., 0.)), Size::from((w, h)))
     }
 
+    /// The today-header card, spanning the full inner width above the month-nav header.
+    fn today_button(&self) -> Rectangle<f64, Logical> {
+        let w = self.bounds().size.w - 2. * PAD;
+        Rectangle::new(Point::from((PAD, PAD)), Size::from((w, TODAY_CARD_H)))
+    }
+
     fn prev_arrow(&self) -> Rectangle<f64, Logical> {
-        Rectangle::new(Point::from((PAD, PAD)), Size::from((HEADER_H, HEADER_H)))
+        Rectangle::new(
+            Point::from((PAD, grid_top())),
+            Size::from((HEADER_H, HEADER_H)),
+        )
     }
 
     fn next_arrow(&self) -> Rectangle<f64, Logical> {
         let x = self.bounds().size.w - PAD - HEADER_H;
-        Rectangle::new(Point::from((x, PAD)), Size::from((HEADER_H, HEADER_H)))
+        Rectangle::new(
+            Point::from((x, grid_top())),
+            Size::from((HEADER_H, HEADER_H)),
+        )
     }
 
     fn cell(&self, row: usize, col: usize) -> Rectangle<f64, Logical> {
         let x = grid_left(self.week) + col as f64 * CELL;
-        let y = PAD + HEADER_H + WEEKDAY_H + row as f64 * CELL;
+        let y = grid_top() + HEADER_H + WEEKDAY_H + row as f64 * CELL;
         Rectangle::new(Point::from((x, y)), Size::from((CELL, CELL)))
     }
 }
 
 fn grid_left(show_week_numbers: bool) -> f64 {
     PAD + if show_week_numbers { WEEKCOL_W } else { 0. }
+}
+
+/// Top y (logical px) of the month-nav header, below the today card. Everything under the header
+/// (arrows, weekday row, day grid) is offset by this instead of the bare leading `PAD`.
+fn grid_top() -> f64 {
+    PAD + TODAY_CARD_H + TODAY_GAP
 }
 
 impl Calendar {
@@ -303,6 +350,14 @@ impl Calendar {
             Vec::new()
         };
 
+        // Today card labels: weekday name over the full date, both bold (GNOME's TodayButton).
+        let day_label_px = (DAY_LABEL_PX * scale) as f32;
+        let date_label_px = (DATE_LABEL_PX * scale) as f32;
+        let day_label = strftime_ymd(self.today, c"%A");
+        let date_label = strftime_ymd(self.today, c"%B %-d %Y");
+        let day_label_run = renderer.build_glyph_run_weighted(&day_label, day_label_px, true)?;
+        let date_label_run = renderer.build_glyph_run_weighted(&date_label, date_label_px, true)?;
+
         let mut target = renderer.create_buffer(
             Fourcc::Abgr8888,
             Size::<i32, BufferCoord>::from((box_w, box_h)),
@@ -325,6 +380,42 @@ impl Calendar {
                 let (ix, iy, iw, ih) = ink;
                 Point::<i32, Physical>::from((cx - iw / 2 - ix, cy - ih / 2 - iy))
             };
+            // Left-align a shaped run's ink at `x`, vertically centered on `cy` (mirrors `place`'s
+            // vertical math — the ink's `min_y`/`iy` must be subtracted or the run sits `iy` low).
+            let place_left = |ink: (i32, i32, i32, i32), x: i32, cy: i32| {
+                let (ix, iy, _iw, ih) = ink;
+                Point::<i32, Physical>::from((x - ix, cy - ih / 2 - iy))
+            };
+
+            // Today card: a flat rounded fill with the weekday name over the full date.
+            let card = layout.today_button();
+            let card_rect = Rectangle::new(
+                Point::<i32, Physical>::from((px(card.loc.x), px(card.loc.y))),
+                Size::<i32, Physical>::from((px(card.size.w), px(card.size.h))),
+            );
+            frame.render_rounded_rect(
+                TODAY_CARD_BG,
+                (TODAY_RADIUS * scale) as f32,
+                card_rect,
+                &[full],
+            )?;
+            let label_x = px(PAD + TODAY_PAD);
+            let day_cy = px(PAD + TODAY_PAD + DAY_ROW / 2.);
+            frame.render_glyphs(
+                &day_label_run,
+                place_left(day_label_run.ink_bounds(), label_x, day_cy),
+                MUTED,
+                full,
+                &[full],
+            )?;
+            let date_cy = px(PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.);
+            frame.render_glyphs(
+                &date_label_run,
+                place_left(date_label_run.ink_bounds(), label_x, date_cy),
+                TEXT,
+                full,
+                &[full],
+            )?;
 
             // Header: ‹ arrows › and the centered "Month Year".
             let (px_, py_) = center(layout.prev_arrow());
@@ -344,7 +435,7 @@ impl Calendar {
                 &[full],
             )?;
             let title_cx = box_w / 2;
-            let title_cy = px(PAD + HEADER_H / 2.);
+            let title_cy = px(grid_top() + HEADER_H / 2.);
             frame.render_glyphs(
                 &title_run,
                 place(title_run.ink_bounds(), title_cx, title_cy),
@@ -354,7 +445,7 @@ impl Calendar {
             )?;
 
             // Weekday header row.
-            let wd_cy = px(PAD + HEADER_H + WEEKDAY_H / 2.);
+            let wd_cy = px(grid_top() + HEADER_H + WEEKDAY_H / 2.);
             for (c, run) in weekday_runs.iter().enumerate() {
                 let cx = px(grid_left(self.show_week_numbers) + (c as f64 + 0.5) * CELL);
                 frame.render_glyphs(
@@ -369,7 +460,7 @@ impl Calendar {
             // Week-number column.
             for (r, run) in week_runs.iter().enumerate() {
                 let cx = px(PAD + WEEKCOL_W / 2.);
-                let cy = px(PAD + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL);
+                let cy = px(grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL);
                 frame.render_glyphs(run, place(run.ink_bounds(), cx, cy), MUTED, full, &[full])?;
             }
 
@@ -695,6 +786,74 @@ mod tests {
             cell.loc.y + cell.size.h / 2.,
         )));
         assert!(cal.revision > before);
+    }
+
+    #[test]
+    fn today_button_returns_to_today_only_when_off_today() {
+        // The today card adds exactly its height + gap above the grid.
+        assert_eq!(grid_top() - PAD, TODAY_CARD_H + TODAY_GAP);
+        let cal = Calendar::new(0, false, [0, 0, 0]);
+        assert_eq!(
+            cal.logical_size().h,
+            grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD
+        );
+
+        // A fresh calendar is already on today: clicking the card is a no-op (no revision bump).
+        let mut cal = Calendar::new(0, false, [0, 0, 0]);
+        cal.revision = 0;
+        let layout = Layout::new(false);
+        let card = layout.today_button();
+        let center = Point::from((card.loc.x + card.size.w / 2., card.loc.y + card.size.h / 2.));
+        assert!(cal.pointer_click(center), "the card is a hit region");
+        assert_eq!(
+            cal.revision, 0,
+            "clicking the card while on today's month changes nothing"
+        );
+        assert_eq!(cal.selected, cal.today);
+
+        // Page away WITHOUT selecting another day: `selected` stays today but the view shows a
+        // different month (our divergence — paging keeps the selection). Clicking the card must
+        // still snap the *view* back, even though the selection never moved.
+        let next = layout.next_arrow();
+        let next_c = Point::from((next.loc.x + next.size.w / 2., next.loc.y + next.size.h / 2.));
+        cal.pointer_click(next_c);
+        assert_eq!(cal.selected, cal.today, "paging keeps the selection put");
+        assert_ne!(
+            (cal.year, cal.month),
+            (cal.today.year, cal.today.month),
+            "paged off today's month"
+        );
+        let before = cal.revision;
+        assert!(cal.pointer_click(center));
+        assert_eq!(
+            (cal.year, cal.month),
+            (cal.today.year, cal.today.month),
+            "the card snaps the view back to today's month"
+        );
+        assert!(
+            cal.revision > before,
+            "snapping the view back bumps the revision"
+        );
+
+        // Page away AND select a different day, then click the card: selection + view both return.
+        cal.pointer_click(next_c);
+        let cell = layout.cell(3, 3);
+        cal.pointer_click(Point::from((
+            cell.loc.x + cell.size.w / 2.,
+            cell.loc.y + cell.size.h / 2.,
+        )));
+        assert_ne!(cal.selected, cal.today, "moved off today");
+        let before = cal.revision;
+        assert!(cal.pointer_click(center));
+        assert_eq!(
+            cal.selected, cal.today,
+            "the card returns the selection to today"
+        );
+        assert_eq!((cal.year, cal.month), (cal.today.year, cal.today.month));
+        assert!(
+            cal.revision > before,
+            "returning to today bumps the revision"
+        );
     }
 
     #[test]
