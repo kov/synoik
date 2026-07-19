@@ -155,10 +155,34 @@ pub const ROLE_DATE_MENU: &str = "dateMenu";
 /// Role of the right-hand status area that opens quick settings (GNOME's
 /// `quickSettings`).
 pub const ROLE_QUICK_SETTINGS: &str = "quickSettings";
+/// Role of the standalone screen-recording indicator (GNOME's `screenRecording`,
+/// leftmost of the right box — `sessionMode.js:99`).
+pub const ROLE_SCREEN_RECORDING: &str = "screenRecording";
+
+/// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The four unbuilt
+/// standalone indicators are commented out; adding one is a new entry here plus a
+/// presence/width case. quickSettings anchors the right edge; earlier roles stack
+/// to its left in this order.
+const RIGHT_BOX_ORDER: &[&str] = &[
+    ROLE_SCREEN_RECORDING,
+    // screenSharing, dwellClick, a11y, keyboard,
+    ROLE_QUICK_SETTINGS,
+];
 
 /// Right-box status-indicator icon size and inter-icon gap, logical px.
 const QS_ICON: f64 = 16.;
 const QS_ICON_GAP: f64 = 4.;
+
+/// The screen-recording indicator's stop glyph and its filled-pill color
+/// (`$recording_indicator_color` = `$red_4` = `#c01c28`, `_panel.scss:5`).
+const SCREENCAST_STOP_ICON: &str = "screencast-stop-symbolic";
+const R1_ICON: f64 = 16.;
+const R1_BG: [f32; 4] = [
+    0xc0 as f32 / 255.,
+    0x1c as f32 / 255.,
+    0x28 as f32 / 255.,
+    1.,
+];
 
 /// Fallback anchor icon shown only when the status cluster would otherwise be
 /// empty (no `dbus` feature / no daemons), so the button is always clickable.
@@ -216,6 +240,19 @@ fn qs_indicator_width(
 ) -> f64 {
     let n = qs_indicator_icons(toggles, status, audio).len() as f64;
     2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+}
+
+/// A live screen recording as the panel sees it: when it started (monotonic, for the
+/// elapsed label) and the current `M:SS` string (recomputed on each 1 s tick).
+struct Recording {
+    started: Duration,
+    label: String,
+}
+
+/// Format elapsed seconds as GNOME's `ScreenRecordingIndicator` label — `'%d:%02d'`,
+/// minutes unbounded (`remoteAccess.js:103-105`).
+fn format_recording(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// One of the panel's three boxes, mirroring GNOME's `_leftBox`/`_centerBox`/`_rightBox`.
@@ -338,6 +375,10 @@ pub struct Panel {
     /// Default-sink audio state (from the PipeWire watcher); its speaker icon sits
     /// in the status cluster between network and battery.
     audio: Option<AudioStatus>,
+    /// Active screen recording, if any (mirrored from the screencast ledger). Drives
+    /// the standalone `screenRecording` indicator — a red pill with the `M:SS`
+    /// elapsed label and a stop glyph, leftmost in the right box.
+    recording: Option<Recording>,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -374,6 +415,7 @@ impl Panel {
             toggles: QuickToggles::default(),
             system_status: SystemStatus::default(),
             audio: None,
+            recording: None,
             clock,
             config,
             fills,
@@ -415,6 +457,46 @@ impl Panel {
         self.audio = audio;
         self.cache.borrow_mut().clear();
         true
+    }
+
+    /// Adopt the current screen-recording state: `Some(started)` (monotonic start of
+    /// the earliest recording) shows the indicator; `None` hides it. Returns whether
+    /// it changed, so the caller can queue a redraw. On a fresh recording the label
+    /// starts at the current elapsed (`0:00`).
+    pub fn set_recording(&mut self, started: Option<Duration>) -> bool {
+        if self.recording.as_ref().map(|r| r.started) == started {
+            return false;
+        }
+        self.recording = started.map(|started| {
+            let elapsed = self.clock.now_unadjusted().saturating_sub(started);
+            Recording {
+                started,
+                label: format_recording(elapsed.as_secs()),
+            }
+        });
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// Recompute the recording's `M:SS` label from the elapsed time. Returns whether
+    /// the displayed string changed (driven by the 1 s recording tick).
+    pub fn update_recording_label(&mut self) -> bool {
+        let Some(rec) = &self.recording else {
+            return false;
+        };
+        let elapsed = self.clock.now_unadjusted().saturating_sub(rec.started);
+        let label = format_recording(elapsed.as_secs());
+        if label == rec.label {
+            return false;
+        }
+        self.recording.as_mut().unwrap().label = label;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// The current recording label (for tests / introspection), or `None` when idle.
+    pub fn recording_label(&self) -> Option<&str> {
+        self.recording.as_ref().map(|r| r.label.as_str())
     }
 
     /// Recompute the clock from the wall clock. Returns whether it changed (so
@@ -616,11 +698,49 @@ impl Panel {
         )
     }
 
+    /// Logical width of the screen-recording indicator pill: padding + the `M:SS`
+    /// label + gap + stop icon + padding. Zero when not recording.
+    fn recording_width(&self) -> f64 {
+        let Some(rec) = &self.recording else {
+            return 0.;
+        };
+        let label_w = niri_vk::text::measure_line_width_weighted(&rec.label, FONT_PX as f32, true);
+        2. * INDICATOR_H_PADDING + label_w + QS_ICON_GAP + R1_ICON
+    }
+
+    /// The screen-recording indicator rect: leftmost in the right box, directly left
+    /// of (adjacent to) quick-settings — `sessionMode.js:99` order. Only meaningful
+    /// while recording (width 0 otherwise); callers guard on [`Self::is_recording`].
+    pub fn screen_recording_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+        let w = self.recording_width();
+        let qs_x = self.quick_settings_rect(output_width).loc.x;
+        Rectangle::new(Point::from((qs_x - w, 0.)), Size::from((w, PANEL_HEIGHT)))
+    }
+
+    /// Whether the screen-recording indicator is currently shown.
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// The rect of a right-box role while it is currently present, else `None`. The one
+    /// place a right-box indicator's presence + geometry is decided; [`RIGHT_BOX_ORDER`]
+    /// then fixes their left-to-right order for both [`Self::items`] and
+    /// [`Self::hit_test`], so a new indicator is one entry there plus one arm here.
+    fn right_box_rect(&self, role: &str, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        match role {
+            ROLE_QUICK_SETTINGS => Some(self.quick_settings_rect(output_width)),
+            ROLE_SCREEN_RECORDING if self.is_recording() => {
+                Some(self.screen_recording_rect(output_width))
+            }
+            _ => None,
+        }
+    }
+
     /// The panel's items with their current rectangles, for introspection and the
     /// (deferred) extension host. `output_width` is the output's logical width, used
     /// to place the centered clock and the right-anchored quick-settings indicator.
     pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
-        vec![
+        let mut items = vec![
             PanelItem {
                 role: ROLE_ACTIVITIES,
                 r#box: PanelBox::Left,
@@ -631,12 +751,20 @@ impl Panel {
                 r#box: PanelBox::Center,
                 rect: self.date_menu_rect(output_width),
             },
-            PanelItem {
-                role: ROLE_QUICK_SETTINGS,
-                r#box: PanelBox::Right,
-                rect: self.quick_settings_rect(output_width),
-            },
-        ]
+        ];
+        // The right box, in `sessionMode.js:99` order — each role present only when it
+        // has a rect (screenRecording comes and goes with the recording, like GNOME
+        // hiding the actor).
+        for &role in RIGHT_BOX_ORDER {
+            if let Some(rect) = self.right_box_rect(role, output_width) {
+                items.push(PanelItem {
+                    role,
+                    r#box: PanelBox::Right,
+                    rect,
+                });
+            }
+        }
+        items
     }
 
     /// Which panel *role*, if any, sits at an output-local logical position.
@@ -650,8 +778,11 @@ impl Panel {
     ) -> Option<&'static str> {
         if self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
-        } else if self.quick_settings_rect(output_width).contains(pos) {
-            Some(ROLE_QUICK_SETTINGS)
+        } else if let Some(role) = RIGHT_BOX_ORDER.iter().copied().find(|&role| {
+            self.right_box_rect(role, output_width)
+                .is_some_and(|rect| rect.contains(pos))
+        }) {
+            Some(role)
         } else if self.date_menu_rect(output_width).contains(pos) {
             Some(ROLE_DATE_MENU)
         } else {
@@ -699,10 +830,47 @@ impl Panel {
             icons,
         );
 
+        // The screen-recording indicator's stop glyph, composited on top of its red pill
+        // (which is drawn into the bar below). Same upload/caching as the QS cluster icons.
+        if self.is_recording() {
+            let r1 = self.screen_recording_rect(width);
+            let icon_x = r1.loc.x + r1.size.w - INDICATOR_H_PADDING - R1_ICON;
+            if let Some(buffer) = icons.buffer(SCREENCAST_STOP_ICON, R1_ICON, scale, TEXT) {
+                let key = (scale_key, SCREENCAST_STOP_ICON.to_string());
+                #[allow(clippy::map_entry)]
+                if !cache.qs_icons.contains_key(&key) {
+                    if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                        cache.qs_icons.insert(key.clone(), tb);
+                    } else {
+                        tracing::error!("error uploading the screen-recording stop icon");
+                    }
+                }
+                if let Some(tb) = cache.qs_icons.get(&key) {
+                    let logical = tb.logical_size();
+                    let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb.clone(),
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
+        }
+
         // The bar chrome (opaque background, button containers, workspace dots, clock).
         // Button container state (hover/active) invalidates the bar cache on change, so
         // the structural key can stay content-only.
-        let containers = self.button_containers(width, ws);
+        let mut containers = self.button_containers(width, ws);
+        // The screen-recording pill is an always-filled red container (not a hover fade),
+        // drawn by the same rounded-rect path; its M:SS label is drawn on top in the bar.
+        let recording_label = self.recording.as_ref().map(|rec| {
+            let r1 = self.screen_recording_rect(width);
+            containers.push((container_rect(r1), R1_BG));
+            (rec.label.clone(), r1.loc.x + INDICATOR_H_PADDING)
+        });
 
         // While a workspace switch animates, `position` is fractional and the dots morph
         // every frame; while a button-container fill fades, the pill alpha changes every
@@ -720,6 +888,7 @@ impl Panel {
                 &containers,
                 ws.count,
                 position,
+                recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -739,6 +908,7 @@ impl Panel {
                     &containers,
                     ws.count,
                     ws.active() as f64,
+                    recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
                 ) {
                     Ok(texture) => {
                         cache.textures.insert(bar_key, texture);
@@ -970,6 +1140,7 @@ fn draw_workspace_dots(
 /// workspace dots and the centered clock glyph run. The returned texture is
 /// `SHADER_READ_ONLY` (sampleable) so the caller can composite it directly. The
 /// right-box status icons are composited separately, on top.
+#[allow(clippy::too_many_arguments)]
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
@@ -978,6 +1149,7 @@ fn draw_bar_texture(
     containers: &[(Rectangle<f64, Logical>, [f32; 4])],
     count: usize,
     position: f64,
+    recording_label: Option<(&str, f64)>,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("panel::draw_bar_texture");
 
@@ -999,6 +1171,20 @@ fn draw_bar_texture(
     let (_c_ix, c_iy, _c_iw, c_ih) = clock_run.ink_bounds();
     let c_origin =
         Point::<i32, Physical>::from(((width_px - advance_w) / 2, (height_px - c_ih) / 2 - c_iy));
+
+    // The recording label's bold glyph run, left-aligned at the pill padding and
+    // ink-centered vertically like the clock. Built before binding the target.
+    let recording = recording_label
+        .map(|(label, lx)| -> anyhow::Result<_> {
+            let run = renderer.build_glyph_run_weighted(label, px, true)?;
+            let (_ix, iy, _iw, ih) = run.ink_bounds();
+            let origin = Point::<i32, Physical>::from((
+                to_physical_precise_round(scale, lx),
+                (height_px - ih) / 2 - iy,
+            ));
+            Ok((run, origin))
+        })
+        .transpose()?;
 
     let size = Size::<i32, Physical>::from((width_px, height_px));
     let mut target = renderer.create_buffer(
@@ -1030,6 +1216,10 @@ fn draw_bar_texture(
         }
         draw_workspace_dots(&mut frame, scale, count, position, full)?;
         frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
+        // The screen-recording pill's M:SS label, over its red container.
+        if let Some((run, origin)) = &recording {
+            frame.render_glyphs(run, *origin, TEXT, full, &[full])?;
+        }
         // finish() submits and fence-waits synchronously, so the sync point is already signaled.
         let _sync = frame.finish()?;
     }
@@ -1192,7 +1382,7 @@ mod tests {
         };
         let scale = 2.0;
         let width_px = to_physical_precise_round::<i32>(scale, 400.);
-        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws.count, 1.)
+        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", &[], ws.count, 1., None)
             .expect("bar texture");
         let size = tex.size();
 
@@ -1275,7 +1465,7 @@ mod tests {
 
         // Peak red over the band row across just the two-dot region (far from the clock).
         let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position)
+            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None)
                 .expect("bar texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -1460,6 +1650,7 @@ mod tests {
             &containers,
             ws.count,
             ws.active as f64,
+            None,
         )
         .expect("bar texture");
 
@@ -1498,5 +1689,135 @@ mod tests {
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 40, "expected visible glyph ink, got {bright}");
+    }
+
+    /// `format_recording` matches GNOME's `'%d:%02d'`: zero-padded seconds, unbounded minutes.
+    #[test]
+    fn recording_label_formats_minutes_and_seconds() {
+        assert_eq!(format_recording(0), "0:00");
+        assert_eq!(format_recording(5), "0:05");
+        assert_eq!(format_recording(65), "1:05");
+        assert_eq!(format_recording(600), "10:00");
+        assert_eq!(format_recording(3661), "61:01");
+    }
+
+    /// The screen-recording indicator appears only while recording, as a right-box item
+    /// directly left of (adjacent to) quick-settings, and hit-tests to its role.
+    /// `sessionMode.js:99` order; structural, no GPU.
+    #[test]
+    fn screen_recording_indicator_sits_left_of_quick_settings() {
+        let clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
+        let ws = WorkspaceState {
+            count: 1,
+            active: 0,
+        };
+        let ow = 1920.;
+
+        // Idle: no screenRecording item, and its rect region hit-tests to nothing.
+        assert!(panel
+            .items(ow, ws)
+            .iter()
+            .all(|i| i.role != ROLE_SCREEN_RECORDING));
+
+        // Recording (label 0:00 at the pinned now).
+        let now = clock.now_unadjusted();
+        assert!(panel.set_recording(Some(now)));
+        assert_eq!(panel.recording_label(), Some("0:00"));
+
+        let items = panel.items(ow, ws);
+        let r1 = items
+            .iter()
+            .find(|i| i.role == ROLE_SCREEN_RECORDING)
+            .expect("the recording indicator is present while recording");
+        let qs = items
+            .iter()
+            .find(|i| i.role == ROLE_QUICK_SETTINGS)
+            .unwrap();
+        assert_eq!(r1.r#box, PanelBox::Right);
+        assert!(
+            r1.rect.loc.x < qs.rect.loc.x,
+            "R1 is left of quick-settings"
+        );
+        assert!(
+            (r1.rect.loc.x + r1.rect.size.w - qs.rect.loc.x).abs() < 1e-6,
+            "R1 abuts quick-settings",
+        );
+
+        // A click at the indicator's center hit-tests to its role.
+        let center = Point::from((r1.rect.loc.x + r1.rect.size.w / 2., 16.));
+        assert_eq!(panel.hit_test(center, ow, ws), Some(ROLE_SCREEN_RECORDING));
+
+        // Stopping hides it again.
+        assert!(panel.set_recording(None));
+        assert!(panel
+            .items(ow, ws)
+            .iter()
+            .all(|i| i.role != ROLE_SCREEN_RECORDING));
+    }
+
+    /// The recording pill draws red (`#c01c28`) with its white `M:SS` label on top.
+    /// Skips with no device.
+    #[test]
+    fn draw_bar_texture_paints_the_recording_pill() {
+        use smithay::backend::renderer::{ExportMem, Texture as _};
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "skipping draw_bar_texture_paints_the_recording_pill: no Vulkan device ({e})"
+                );
+                return;
+            }
+        };
+        let scale = 2.0;
+        let width_px = to_physical_precise_round::<i32>(scale, 400.);
+
+        // A red pill on the right with a label just inside its left padding.
+        let pill = Rectangle::new(Point::from((300., 3.)), Size::from((90., 26.)));
+        let containers = [(pill, R1_BG)];
+        let mut tex = draw_bar_texture(
+            &mut vk,
+            scale,
+            width_px,
+            "12:34",
+            &containers,
+            3,
+            1.,
+            Some(("0:05", 306.)),
+        )
+        .expect("bar texture");
+        let size = tex.size();
+
+        let fb = vk.bind(&mut tex).expect("bind for readback");
+        let region = Rectangle::<i32, BufferCoord>::from_size(size);
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+        // Readback is [R, G, B, A] per pixel. Scan the pill's physical column range.
+        let w = size.w as usize;
+        let x0 = to_physical_precise_round::<i32>(scale, 300.).max(0) as usize;
+        let x1 = (to_physical_precise_round::<i32>(scale, 390.) as usize).min(w);
+        let mut red = 0usize;
+        let mut ink = 0usize;
+        for y in 0..size.h as usize {
+            for x in x0..x1 {
+                let p = &pixels[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                if p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200 {
+                    red += 1;
+                }
+                if p[0] > 200 && p[1] > 200 && p[2] > 200 {
+                    ink += 1;
+                }
+            }
+        }
+        assert!(red > 50, "expected a red recording pill, got {red} red px");
+        assert!(
+            ink > 5,
+            "expected white M:SS label ink over the pill, got {ink} px"
+        );
     }
 }

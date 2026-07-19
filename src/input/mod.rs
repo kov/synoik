@@ -3244,6 +3244,14 @@ impl State {
                                 self.niri.queue_redraw_all();
                                 return;
                             }
+                            Some(crate::ui::panel::ROLE_SCREEN_RECORDING) => {
+                                // Recognize on press (GNOME's `ScreenRecordingIndicator`):
+                                // clicking the indicator stops the recording(s).
+                                self.niri.suppressed_buttons.insert(button_code);
+                                self.niri.stop_screen_recordings();
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
                             _ => {}
                         }
                     }

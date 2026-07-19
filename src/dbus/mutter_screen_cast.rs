@@ -45,7 +45,7 @@ struct RecordMonitorProperties {
     #[zvariant(rename = "cursor-mode")]
     cursor_mode: Option<CursorMode>,
     #[zvariant(rename = "is-recording")]
-    _is_recording: Option<bool>,
+    is_recording: Option<bool>,
 }
 
 #[derive(Debug, DeserializeDict, Type)]
@@ -56,7 +56,7 @@ struct RecordWindowProperties {
     #[zvariant(rename = "cursor-mode")]
     cursor_mode: Option<CursorMode>,
     #[zvariant(rename = "is-recording")]
-    _is_recording: Option<bool>,
+    is_recording: Option<bool>,
 }
 
 #[derive(Debug, DeserializeDict, Type)]
@@ -65,7 +65,7 @@ struct RecordAreaProperties {
     #[zvariant(rename = "cursor-mode")]
     cursor_mode: Option<CursorMode>,
     #[zvariant(rename = "is-recording")]
-    _is_recording: Option<bool>,
+    is_recording: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -74,6 +74,10 @@ pub struct Stream {
     session_id: CastSessionId,
     target: StreamTarget,
     cursor_mode: CursorMode,
+    /// Whether this stream is a user-initiated screen *recording* (drives the R1 panel
+    /// indicator). Set by GNOME's recorder via the `is-recording` property; false for a plain
+    /// screencast (portal capture, remote view).
+    is_recording: bool,
     was_started: Arc<AtomicBool>,
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
 }
@@ -126,6 +130,7 @@ pub enum ScreenCastToNiri {
         stream_id: CastStreamId,
         target: StreamTargetId,
         cursor_mode: CursorMode,
+        is_recording: bool,
         signal_ctx: SignalEmitter<'static>,
     },
     StopCast {
@@ -239,6 +244,7 @@ impl Session {
         let path = OwnedObjectPath::try_from(path).unwrap();
 
         let cursor_mode = properties.cursor_mode.unwrap_or_default();
+        let is_recording = properties.is_recording.unwrap_or(false);
 
         let target = StreamTarget::Output(output);
         let stream = Stream::new(
@@ -246,6 +252,7 @@ impl Session {
             self.id,
             target,
             cursor_mode,
+            is_recording,
             self.to_niri.clone(),
         );
         match server.at(&path, stream.clone()).await {
@@ -276,6 +283,7 @@ impl Session {
         let path = OwnedObjectPath::try_from(path).unwrap();
 
         let cursor_mode = properties.cursor_mode.unwrap_or_default();
+        let is_recording = properties.is_recording.unwrap_or(false);
 
         let target = StreamTarget::Window {
             id: properties.window_id,
@@ -285,6 +293,7 @@ impl Session {
             self.id,
             target,
             cursor_mode,
+            is_recording,
             self.to_niri.clone(),
         );
         match server.at(&path, stream.clone()).await {
@@ -323,6 +332,7 @@ impl Session {
         let path = OwnedObjectPath::try_from(path).unwrap();
 
         let cursor_mode = properties.cursor_mode.unwrap_or_default();
+        let is_recording = properties.is_recording.unwrap_or(false);
 
         let target = StreamTarget::Area {
             x,
@@ -335,6 +345,7 @@ impl Session {
             self.id,
             target,
             cursor_mode,
+            is_recording,
             self.to_niri.clone(),
         );
         match server.at(&path, stream.clone()).await {
@@ -446,6 +457,7 @@ impl Stream {
         session_id: CastSessionId,
         target: StreamTarget,
         cursor_mode: CursorMode,
+        is_recording: bool,
         to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     ) -> Self {
         Self {
@@ -453,6 +465,7 @@ impl Stream {
             session_id,
             target,
             cursor_mode,
+            is_recording,
             was_started: Arc::new(AtomicBool::new(false)),
             to_niri,
         }
@@ -468,6 +481,7 @@ impl Stream {
             stream_id: self.id,
             target: self.target.make_id(),
             cursor_mode: self.cursor_mode,
+            is_recording: self.is_recording,
             signal_ctx: ctxt,
         };
 

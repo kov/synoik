@@ -342,6 +342,9 @@ pub struct Niri {
     pub end_session: crate::end_session::EndSession,
     /// The timer armed to the countdown's auto-confirm deadline (see `EndSession::deadline`).
     pub end_session_timer: Option<RegistrationToken>,
+    /// 1 s repeating timer that ticks the R1 screen-recording indicator's `M:SS` label while any
+    /// recording is live; `None` when nothing is recording.
+    pub recording_tick: Option<RegistrationToken>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
@@ -2955,6 +2958,7 @@ impl Niri {
             idle_monitor_timer: None,
             end_session: crate::end_session::EndSession::new(),
             end_session_timer: None,
+            recording_tick: None,
             idle_inhibit_manager_state,
             data_device_state,
             primary_selection_state,

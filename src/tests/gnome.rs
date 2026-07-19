@@ -3108,3 +3108,96 @@ fn screencast_area_picks_the_largest_intersection_output() {
         "the output with the larger intersection must win"
     );
 }
+
+// The R1 screen-recording indicator: a recording surfaces a right-box indicator that ticks its
+// M:SS label, and clicking it stops the recording. See docs/fork/panel-status-port.md (slice 1).
+
+#[test]
+fn screen_recording_indicator_appears_and_ticks() {
+    use crate::ui::panel::{PanelBox, WorkspaceState, ROLE_SCREEN_RECORDING};
+    use crate::utils::CastSessionId;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Pin the clock so the elapsed label is deterministic (avoids the clock-trap).
+    let mut clock = f.niri().clock.clone();
+    let t0 = clock.now_unadjusted();
+    clock.set_unadjusted(t0);
+
+    let ow = 1920.;
+    let ws = WorkspaceState {
+        count: 1,
+        active: 0,
+    };
+
+    // Nothing recording → no indicator.
+    assert!(f
+        .niri()
+        .panel
+        .items(ow, ws)
+        .iter()
+        .all(|i| i.role != ROLE_SCREEN_RECORDING));
+
+    let id = CastSessionId::next();
+    f.niri().screen_recording_started(id);
+
+    // Shows at 0:00, as a right-box item.
+    assert_eq!(f.niri().panel.recording_label(), Some("0:00"));
+    assert!(f
+        .niri()
+        .panel
+        .items(ow, ws)
+        .iter()
+        .any(|i| i.role == ROLE_SCREEN_RECORDING && i.r#box == PanelBox::Right));
+
+    // Re-ticking the label (the seam the 1 s recording timer calls) tracks elapsed time.
+    clock.set_unadjusted(t0 + Duration::from_secs(65));
+    assert!(f.niri().panel.update_recording_label());
+    assert_eq!(f.niri().panel.recording_label(), Some("1:05"));
+
+    clock.set_unadjusted(t0 + Duration::from_secs(600));
+    assert!(f.niri().panel.update_recording_label());
+    assert_eq!(f.niri().panel.recording_label(), Some("10:00"));
+}
+
+#[test]
+fn screen_recording_indicator_click_stops_the_recording() {
+    use crate::ui::panel::{WorkspaceState, ROLE_SCREEN_RECORDING};
+    use crate::utils::CastSessionId;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let mut clock = f.niri().clock.clone();
+    let t0 = clock.now_unadjusted();
+    clock.set_unadjusted(t0);
+
+    let id = CastSessionId::next();
+    f.niri().screen_recording_started(id);
+    assert!(!f.niri().casting.recordings.is_empty());
+
+    // Click the indicator's center (top panel band).
+    let r1 = f.niri().panel.screen_recording_rect(1920.);
+    let cx = r1.loc.x + r1.size.w / 2.;
+    f.pointer_motion(cx, 16.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    // Clicking it stops the recording through the real hit-test → stop_cast path, and the
+    // indicator disappears.
+    assert!(
+        f.niri().casting.recordings.is_empty(),
+        "clicking the indicator stops the recording",
+    );
+    let ws = WorkspaceState {
+        count: 1,
+        active: 0,
+    };
+    assert!(f
+        .niri()
+        .panel
+        .items(1920., ws)
+        .iter()
+        .all(|i| i.role != ROLE_SCREEN_RECORDING));
+}

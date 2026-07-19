@@ -4,6 +4,7 @@ use std::mem;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::LoopHandle;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
@@ -29,6 +30,11 @@ use crate::render_helpers::vulkan::VulkanRenderer;
 pub struct Screencasting {
     pub casts: Vec<Cast>,
 
+    /// Active screen *recordings* (casts started with `is-recording`), the source of truth for the
+    /// R1 panel indicator. Distinct from `casts`: a plain portal capture is a cast but not a
+    /// recording. One entry per recording session.
+    pub recordings: Vec<ScreenRecording>,
+
     /// Dynamic-target casts waiting for their first target to start.
     pub pending_dynamic_casts: Vec<PendingCast>,
 
@@ -42,6 +48,13 @@ pub struct Screencasting {
 
     // Drop PipeWire last, and specifically after casts, to prevent a double-free (yay).
     pub pipewire: Option<PipeWire>,
+}
+
+/// A live screen recording, tracked for the R1 panel indicator.
+pub struct ScreenRecording {
+    pub session_id: CastSessionId,
+    /// Monotonic time the recording started, for the `M:SS` elapsed label.
+    pub started_at: Duration,
 }
 
 /// A screencast request that hasn't been started yet.
@@ -67,6 +80,7 @@ impl Screencasting {
 
         Self {
             casts: vec![],
+            recordings: vec![],
             pending_dynamic_casts: vec![],
             pw_to_niri,
             mapped_cast_output: HashMap::new(),
@@ -347,6 +361,7 @@ impl State {
                 stream_id,
                 target,
                 cursor_mode,
+                is_recording,
                 signal_ctx,
             } => {
                 let _span = tracy_client::span!("StartCast");
@@ -422,6 +437,9 @@ impl State {
                 match res {
                     Ok(cast) => {
                         self.niri.casting.casts.push(cast);
+                        if is_recording {
+                            self.niri.screen_recording_started(session_id);
+                        }
                     }
                     Err(err) => {
                         warn!("error starting screencast: {err:?}");
@@ -831,6 +849,18 @@ impl Niri {
             .pending_dynamic_casts
             .retain(|p| p.session_id != session_id);
 
+        if self
+            .casting
+            .recordings
+            .iter()
+            .any(|r| r.session_id == session_id)
+        {
+            self.casting
+                .recordings
+                .retain(|r| r.session_id != session_id);
+            self.refresh_screen_recording();
+        }
+
         for i in (0..self.casting.casts.len()).rev() {
             let cast = &self.casting.casts[i];
             if cast.session_id != session_id {
@@ -843,8 +873,16 @@ impl Niri {
             }
         }
 
-        let dbus = &self.dbus.as_ref().unwrap();
-        let server = dbus.conn_screen_cast.as_ref().unwrap().object_server();
+        // Tolerate a missing D-Bus connection: the headless click-to-stop test reaches this path
+        // with no session bus, and skipping the object-server close there is strictly safer than
+        // panicking. In production the connection is always present.
+        let Some(dbus) = self.dbus.as_ref() else {
+            return;
+        };
+        let Some(conn) = dbus.conn_screen_cast.as_ref() else {
+            return;
+        };
+        let server = conn.object_server();
         let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
         if let Ok(iface) = server.interface::<_, mutter_screen_cast::Session>(path) {
             let _span = tracy_client::span!("invoking Session::stop");
@@ -855,6 +893,78 @@ impl Niri {
                     .stop(server.inner(), iface.signal_emitter().clone())
                     .await
             });
+        }
+    }
+
+    /// Record that `session_id` began a screen recording, and refresh the panel indicator. The
+    /// production seam the `StartCast` handler calls when a stream carries `is-recording`; also the
+    /// seam headless tests drive directly (no PipeWire).
+    pub fn screen_recording_started(&mut self, session_id: CastSessionId) {
+        if self
+            .casting
+            .recordings
+            .iter()
+            .any(|r| r.session_id == session_id)
+        {
+            return;
+        }
+        self.casting.recordings.push(ScreenRecording {
+            session_id,
+            started_at: self.clock.now_unadjusted(),
+        });
+        self.refresh_screen_recording();
+    }
+
+    /// Stop every live recording (the R1 indicator's click action). Each `stop_cast` prunes the
+    /// ledger and refreshes the panel.
+    pub fn stop_screen_recordings(&mut self) {
+        let ids: Vec<_> = self
+            .casting
+            .recordings
+            .iter()
+            .map(|r| r.session_id)
+            .collect();
+        for id in ids {
+            self.stop_cast(id);
+        }
+    }
+
+    /// Reconcile the panel's R1 indicator with the recording ledger: show it (timer from the
+    /// earliest active recording) while any recording lives, and drive a 1 s tick for the elapsed
+    /// label. Idempotent; called whenever the ledger changes.
+    pub fn refresh_screen_recording(&mut self) {
+        let started = self.casting.recordings.iter().map(|r| r.started_at).min();
+
+        let redraw = self.panel.set_recording(started);
+
+        if started.is_some() {
+            // Drive the M:SS label from a dedicated 1 s timer while recording, independent of the
+            // clock's minute cadence, so the elapsed time never sits frozen at 0:00.
+            if self.recording_tick.is_none() {
+                let token = self
+                    .event_loop
+                    .insert_source(
+                        Timer::from_duration(Duration::from_secs(1)),
+                        |_, _, state| {
+                            if state.niri.casting.recordings.is_empty() {
+                                state.niri.recording_tick = None;
+                                return TimeoutAction::Drop;
+                            }
+                            if state.niri.panel.update_recording_label() {
+                                state.niri.queue_redraw_all();
+                            }
+                            TimeoutAction::ToDuration(Duration::from_secs(1))
+                        },
+                    )
+                    .unwrap();
+                self.recording_tick = Some(token);
+            }
+        } else if let Some(token) = self.recording_tick.take() {
+            self.event_loop.remove(token);
+        }
+
+        if redraw {
+            self.queue_redraw_all();
         }
     }
 
