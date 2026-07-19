@@ -18,11 +18,15 @@
 //! composited as separate elements on top** from the shared [`IconCache`] —
 //! symbolic SVGs recolored to the fore/back color of their slot.
 //!
-//! Deferred vs gnome-shell: sliders (volume/brightness), the bluetooth toggle, the
+//! A **volume slider** (gnome-shell's output `.quick-slider`) sits between the system
+//! row and the tile grid when a sink is present: a mute icon-button plus a draggable
+//! track bound to the default sink's volume.
+//!
+//! Deferred vs gnome-shell: the brightness slider, the bluetooth toggle, the
 //! per-toggle detail sub-menus (the Network tile opens settings instead of an
 //! in-menu enable/disable + connection list), and SSID/connection-name labels. The
-//! self-contained tiles, the Network status tile, the system row, and the battery
-//! pill are here.
+//! self-contained tiles, the Network status tile, the system row, the battery
+//! pill, and the volume slider are here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -82,10 +86,10 @@ const SYS_ADVANCE: f64 = SYS_HIT + SYS_GAP;
 const PILL_W: f64 = 96.;
 const PILL_ICON_INSET: f64 = 12.;
 
-/// The volume slider row (gnome-shell's `.quick-slider`): a full-width row below the
-/// tile grid with a mute icon-button at the left and the slider track filling the
-/// rest. Height is the `.icon-button` disc; the track is a thin trough with an
-/// accent-filled portion and a round handle (`_slider.scss`).
+/// The volume slider row (gnome-shell's `.quick-slider`): a full-width row between the
+/// system row and the tile grid with a mute icon-button at the left and the slider
+/// track filling the rest. Height is the `.icon-button` disc; the track is a thin
+/// trough with an accent-filled portion and a round handle (`_slider.scss`).
 const SLIDER_H: f64 = 40.;
 const SLIDER_ICON: f64 = 16.;
 /// Slider handle diameter (`$slider_size` = 16px) and trough thickness
@@ -351,8 +355,9 @@ impl QuickSettings {
     /// actionable but is still inside the menu). A tile click also flips the
     /// tile's own state so it updates before the gsettings write round-trips.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
+        let has_slider = self.audio.is_some();
         for (i, item) in GRID.iter().enumerate() {
-            if tile_rect(i).contains(pos) {
+            if tile_rect(i, has_slider).contains(pos) {
                 return match item {
                     // Network: open settings (the in-place toggle / sub-menu is deferred).
                     GridTile::Network => PopoverAction::Spawn(
@@ -452,12 +457,13 @@ impl QuickSettings {
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let mut elements = Vec::new();
+        let has_slider = self.audio.is_some();
 
         // Tile icons (drawn above the chrome, so pushed before it).
         for (i, item) in GRID.iter().enumerate() {
             let on = item.is_on(self.toggles, self.network);
             let color = if on { FG_ON } else { FG_OFF };
-            let rect = tile_rect(i);
+            let rect = tile_rect(i, has_slider);
             let center = Point::from((
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
@@ -663,7 +669,7 @@ impl QuickSettings {
             };
 
             for (i, item) in GRID.iter().enumerate() {
-                let rect = tile_rect(i);
+                let rect = tile_rect(i, self.audio.is_some());
                 let on = item.is_on(self.toggles, self.network);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
@@ -792,26 +798,32 @@ fn menu_w() -> f64 {
     PAD * 2. + COLS as f64 * TILE_W + (COLS as f64 - 1.) * TILE_GAP
 }
 
-/// The y of the grid's bottom edge (system row + gap + tile rows).
-fn grid_bottom() -> f64 {
+/// The y of the tile grid's top edge. The grid sits below the system row, and below
+/// the volume slider too when a sink is present (gnome-shell orders the output slider
+/// right under the system item, above the toggle tiles).
+fn grid_top(has_slider: bool) -> f64 {
+    let mut y = PAD + SYS_H + TILE_GAP;
+    if has_slider {
+        y += SLIDER_H + TILE_GAP;
+    }
+    y
+}
+
+/// The y of the grid's bottom edge (grid top + tile rows).
+fn grid_bottom(has_slider: bool) -> f64 {
     let rows = GRID.len().div_ceil(COLS) as f64;
-    PAD + SYS_H + TILE_GAP + rows * TILE_H + (rows - 1.) * TILE_GAP
+    grid_top(has_slider) + rows * TILE_H + (rows - 1.) * TILE_GAP
 }
 
-/// The menu's logical height: system row, tile grid, and the volume slider row when
-/// a sink is present.
+/// The menu's logical height: system row, optional volume slider, tile grid, padding.
 fn menu_h(has_slider: bool) -> f64 {
-    let content = if has_slider {
-        grid_bottom() + TILE_GAP + SLIDER_H
-    } else {
-        grid_bottom()
-    };
-    content + PAD
+    grid_bottom(has_slider) + PAD
 }
 
-/// The volume-slider row rectangle (full content width, below the grid).
+/// The volume-slider row rectangle (full content width), between the system row and
+/// the tile grid.
 fn slider_row_rect() -> Rectangle<f64, Logical> {
-    let y = grid_bottom() + TILE_GAP;
+    let y = PAD + SYS_H + TILE_GAP;
     Rectangle::new(
         Point::from((PAD, y)),
         Size::from((menu_w() - 2. * PAD, SLIDER_H)),
@@ -853,12 +865,12 @@ fn slider_handle_x(volume: f64) -> f64 {
 }
 
 /// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below
-/// the top system row.
-fn tile_rect(i: usize) -> Rectangle<f64, Logical> {
+/// the top system row (and the volume slider when a sink is present).
+fn tile_rect(i: usize, has_slider: bool) -> Rectangle<f64, Logical> {
     let row = (i / COLS) as f64;
     let col = (i % COLS) as f64;
     let x = PAD + col * (TILE_W + TILE_GAP);
-    let y = PAD + SYS_H + TILE_GAP + row * (TILE_H + TILE_GAP);
+    let y = grid_top(has_slider) + row * (TILE_H + TILE_GAP);
     Rectangle::new(Point::from((x, y)), Size::from((TILE_W, TILE_H)))
 }
 
@@ -949,30 +961,46 @@ mod tests {
         Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
     }
 
-    /// The tile grid and system row (with and without the battery pill) lay out
-    /// inside the menu without going off an edge.
+    /// The tile grid, system row, and (when a sink is present) the volume slider —
+    /// which sits between the system row and the grid — lay out inside the menu
+    /// without going off an edge, with and without the battery pill.
     #[test]
     fn layout_places_tiles_and_system_row_within_bounds() {
-        let size =
-            QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0])
+        for audio in [None, Some(AudioStatus::default())] {
+            let has_slider = audio.is_some();
+            let size =
+                QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, audio, [
+                    0, 0, 0,
+                ])
                 .logical_size();
-        let within = |r: Rectangle<f64, Logical>, what: &str| {
-            assert!(
-                r.loc.x >= 0. && r.loc.y >= 0.,
-                "{what} off the top/left edge"
-            );
-            assert!(r.loc.x + r.size.w <= size.w + 0.01, "{what} off the right");
-            assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
-        };
-        for i in 0..GRID.len() {
-            within(tile_rect(i), "tile");
-        }
-        for has_pill in [false, true] {
-            for button in SYS_BUTTONS {
-                within(sys_rect(button, has_pill), "sys button");
+            let within = |r: Rectangle<f64, Logical>, what: &str| {
+                assert!(
+                    r.loc.x >= 0. && r.loc.y >= 0.,
+                    "{what} off the top/left edge"
+                );
+                assert!(r.loc.x + r.size.w <= size.w + 0.01, "{what} off the right");
+                assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
+            };
+            for i in 0..GRID.len() {
+                within(tile_rect(i, has_slider), "tile");
             }
-            if let Some(pill) = pill_rect(has_pill) {
-                within(pill, "battery pill");
+            for has_pill in [false, true] {
+                for button in SYS_BUTTONS {
+                    within(sys_rect(button, has_pill), "sys button");
+                }
+                if let Some(pill) = pill_rect(has_pill) {
+                    within(pill, "battery pill");
+                }
+            }
+            if has_slider {
+                within(slider_row_rect(), "slider row");
+                within(slider_icon_rect(), "slider mute button");
+                within(slider_track_rect(), "slider track");
+                // The slider sits above the tile grid.
+                assert!(
+                    slider_row_rect().loc.y + slider_row_rect().size.h <= tile_rect(0, has_slider).loc.y + 0.01,
+                    "slider must be above the first tile row"
+                );
             }
         }
     }
@@ -982,7 +1010,7 @@ mod tests {
     fn clicking_a_tile_flips_and_returns_the_action() {
         let mut qs =
             QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
-        let dnd = tile_rect(2); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
+        let dnd = tile_rect(2, false); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
         let before = qs.revision;
         let action = qs.pointer_click(center(dnd));
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));
@@ -1002,7 +1030,7 @@ mod tests {
         let mut qs =
             QuickSettings::new(QuickToggles::default(), NetworkStatus::Wired, None, None, [0, 0, 0]);
         let before = qs.revision;
-        let action = qs.pointer_click(center(tile_rect(0)));
+        let action = qs.pointer_click(center(tile_rect(0, false)));
         match action {
             PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
             other => panic!("expected network settings, got {other:?}"),
@@ -1106,7 +1134,7 @@ mod tests {
         );
 
         // The center of the Dark Style tile (grid cell 1) is the accent: high R, low G/B.
-        let r0 = tile_rect(1);
+        let r0 = tile_rect(1, false);
         let cx = (r0.loc.x + r0.size.w * 0.15) as i32;
         let cy = (r0.loc.y + r0.size.h / 2.) as i32;
         let i = ((cy * size.w + cx) * 4) as usize;
@@ -1128,7 +1156,7 @@ mod tests {
         );
 
         // The Night Light tile (grid cell 3, off) is the dim grey, not the accent.
-        let r2 = tile_rect(3);
+        let r2 = tile_rect(3, false);
         let gx = (r2.loc.x + r2.size.w * 0.15) as i32;
         let gy = (r2.loc.y + r2.size.h / 2.) as i32;
         let j = ((gy * size.w + gx) * 4) as usize;
