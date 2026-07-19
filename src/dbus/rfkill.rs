@@ -1,10 +1,11 @@
 //! Session-bus watcher for airplane (rfkill) mode, from gnome-settings-daemon.
 //!
 //! Mirrors [`crate::dbus::system_status`] but on the **session** bus: one
-//! `Connection::session()` with a single task subscribing to gsd-rfkill's
-//! `PropertiesChanged` and pushing a fresh [`AirplaneStatus`] to the compositor over a calloop
-//! channel. The same connection doubles as the writer for the QS toggle
-//! ([`set_airplane_mode`]). Ports gnome-shell's `RfkillManager` (`js/ui/status/rfkill.js`).
+//! `Connection::session()` with a single task that re-reads gsd-rfkill's properties on either its
+//! `PropertiesChanged` or the well-known name gaining an owner (gsd isn't dbus-activatable and
+//! starts after us), pushing a fresh [`AirplaneStatus`] to the compositor over a calloop channel.
+//! The same connection doubles as the writer for the QS toggle ([`set_airplane_mode`]). Ports
+//! gnome-shell's `RfkillManager` (`js/ui/status/rfkill.js`).
 
 use futures_util::StreamExt;
 use zbus::names::InterfaceName;
@@ -34,7 +35,7 @@ pub fn start(
         };
         let iface = InterfaceName::try_from(IFACE).unwrap();
 
-        let mut changed = match proxy.receive_properties_changed().await {
+        let changed = match proxy.receive_properties_changed().await {
             Ok(stream) => stream,
             Err(err) => {
                 warn!("error subscribing to gsd-rfkill PropertiesChanged: {err:?}");
@@ -42,10 +43,35 @@ pub fn start(
             }
         };
 
+        // gsd-rfkill is NOT dbus-activatable and the compositor starts before gnome-session spawns
+        // it, so the initial `get_all` routinely fails and gsd may never emit a `PropertiesChanged`
+        // after settling its state pre-export. Also wake on the well-known name gaining an owner
+        // and re-read then — this is what `Gio.DBusProxy` does for gnome-shell (re-runs
+        // GetAll on owner appearance). Without it the feature silently stays hidden on real
+        // rfkill hardware.
+        let dbus = match fdo::DBusProxy::new(&async_conn).await {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                warn!("error creating DBusProxy for gsd-rfkill name tracking: {err:?}");
+                return;
+            }
+        };
+        let owner_changed = match dbus
+            .receive_name_owner_changed_with_args(&[(0, BUS_NAME)])
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!("error subscribing to gsd-rfkill NameOwnerChanged: {err:?}");
+                return;
+            }
+        };
+
+        // Either signal is a reason to re-read the full property set.
+        let mut wake = futures_util::stream::select(changed.map(|_| ()), owner_changed.map(|_| ()));
+
         let mut last: Option<AirplaneStatus> = None;
         loop {
-            // `get_all` fails while gsd-rfkill isn't up yet; recovery relies on its
-            // `PropertiesChanged` once it appears (dbus resolves the well-known name at delivery).
             if let Ok(props) = proxy.get_all(iface.clone()).await {
                 let status = read_airplane(&props);
                 if last != Some(status) {
@@ -55,7 +81,7 @@ pub fn start(
                     }
                 }
             }
-            if changed.next().await.is_none() {
+            if wake.next().await.is_none() {
                 return;
             }
         }

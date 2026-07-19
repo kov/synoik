@@ -927,6 +927,11 @@ impl QuickSettings {
                     }
                     // Airplane: a D-Bus write (not optimistic — the tile updates on the gsd echo,
                     // like `SetDefaultSink`; a rejected/hw-blocked write has no corrective echo).
+                    // We target the negation of the last *echoed* state, so a rapid second click
+                    // before the echo re-sends the same value rather than toggling back
+                    // (gnome-shell reads its freshly-written cache and would
+                    // toggle back) — an accepted minor divergence for the
+                    // sub-round-trip double-click window.
                     GridTile::Airplane => PopoverAction::SetAirplaneMode(!self.airplane.active),
                 };
             }

@@ -269,15 +269,20 @@ fn qs_indicator_icons(
     if toggles.night_light {
         v.push((owned(QS_NIGHT_ICONS), TEXT));
     }
-    // Airplane mode kills the radios, so NM reads Offline; gnome-shell then shows *only* the
-    // airplane icon in the network slot (`rfkill.js` Indicator + network.js hiding). We do the
-    // same: suppress the network icon and show airplane in its place.
+    // The network and airplane indicators are independent siblings in GNOME (`panel.js` adds
+    // `_network` then `_rfkill`; `network.js` has no airplane input), so they can show together —
+    // e.g. a wired connection stays up under airplane mode and shows *both* icons. The rfkill
+    // indicator is visible when `show && active` (`rfkill.js` Indicator). Airplane only kills the
+    // radios, so a *wireless* machine reads Offline under it; GNOME hides its disconnected network
+    // indicator, so we suppress just the Offline network icon (never Wired/Wireless) when airplane
+    // is on, then append the airplane icon after the network slot (GNOME's order).
     let airplane_on = status.airplane.show && status.airplane.active;
-    if !airplane_on {
-        if let Some(candidates) = system_status::network_icon(status.network) {
+    if let Some(candidates) = system_status::network_icon(status.network) {
+        if !(airplane_on && matches!(status.network, system_status::NetworkStatus::Offline)) {
             v.push((owned(candidates), TEXT));
         }
-    } else {
+    }
+    if airplane_on {
         v.push((owned(system_status::airplane_icon()), TEXT));
     }
     if let Some(audio) = audio {
@@ -1514,6 +1519,58 @@ mod tests {
             wide > base,
             "the cluster ({wide}) should be wider than the anchor fallback ({base})"
         );
+    }
+
+    /// The airplane indicator is an independent sibling of the network one (GNOME `panel.js` adds
+    /// `_network` then `_rfkill`): it appears only when `show && active`, right after the network
+    /// slot, and a live wired connection keeps showing its icon alongside it. A *wireless* machine
+    /// reads Offline under airplane, and GNOME hides that disconnected network indicator — so the
+    /// Offline network icon (and only that one) is suppressed while airplane is on.
+    #[test]
+    fn airplane_icon_accompanies_network_and_suppresses_only_offline() {
+        use crate::system_status::{AirplaneStatus, NetworkStatus, SystemStatus};
+
+        let toggles = QuickToggles::default();
+        let no_mic = MicStatus::default();
+        let on = AirplaneStatus {
+            active: true,
+            show: true,
+        };
+
+        // Wired + airplane on → both the wired icon and the airplane icon, network first.
+        let wired = SystemStatus {
+            network: NetworkStatus::Wired,
+            airplane: on,
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &wired, None, no_mic);
+        assert_eq!(icons.len(), 2);
+        assert_eq!(icons[0].0[0], "network-wired-symbolic");
+        assert_eq!(icons[1].0[0], "airplane-mode-symbolic");
+
+        // Wireless machine goes Offline under airplane → the disconnected network icon is hidden,
+        // leaving just the airplane icon.
+        let offline = SystemStatus {
+            network: NetworkStatus::Offline,
+            airplane: on,
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &offline, None, no_mic);
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].0[0], "airplane-mode-symbolic");
+
+        // `show` without `active` (rfkill hardware present, airplane off) → no airplane icon.
+        let off = SystemStatus {
+            network: NetworkStatus::Wired,
+            airplane: AirplaneStatus {
+                active: false,
+                show: true,
+            },
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &off, None, no_mic);
+        assert_eq!(icons.len(), 1);
+        assert_eq!(icons[0].0[0], "network-wired-symbolic");
     }
 
     /// The mic privacy icon leads the cluster (leftmost) while recording, tinted orange when
