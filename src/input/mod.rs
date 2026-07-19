@@ -947,6 +947,16 @@ impl State {
             | PopoverAction::SetInputVolume(_)
             | PopoverAction::ToggleInputMute
             | PopoverAction::SetDefaultSource(_) => {}
+            // Airplane mode: fire-and-forget property write on gsd-rfkill's connection (never a
+            // blocking Set on this thread); the tile updates when gsd echoes `PropertiesChanged`.
+            #[cfg(feature = "dbus")]
+            PopoverAction::SetAirplaneMode(active) => {
+                if let Some(conn) = self.niri.dbus.as_ref().and_then(|d| d.conn_rfkill.as_ref()) {
+                    crate::dbus::rfkill::set_airplane_mode(conn, active);
+                }
+            }
+            #[cfg(not(feature = "dbus"))]
+            PopoverAction::SetAirplaneMode(_) => {}
         }
     }
 
@@ -3316,6 +3326,7 @@ impl State {
                                 let toggles = self.niri.gnome_settings.quick_toggles;
                                 let anchor = self.niri.panel.quick_settings_rect(output_w);
                                 let network = self.niri.system_status.network;
+                                let airplane = self.niri.system_status.airplane;
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
@@ -3327,6 +3338,7 @@ impl State {
                                     anchor,
                                     toggles,
                                     network,
+                                    airplane,
                                     battery,
                                     audio,
                                     sink_list,

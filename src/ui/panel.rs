@@ -269,8 +269,16 @@ fn qs_indicator_icons(
     if toggles.night_light {
         v.push((owned(QS_NIGHT_ICONS), TEXT));
     }
-    if let Some(candidates) = system_status::network_icon(status.network) {
-        v.push((owned(candidates), TEXT));
+    // Airplane mode kills the radios, so NM reads Offline; gnome-shell then shows *only* the
+    // airplane icon in the network slot (`rfkill.js` Indicator + network.js hiding). We do the
+    // same: suppress the network icon and show airplane in its place.
+    let airplane_on = status.airplane.show && status.airplane.active;
+    if !airplane_on {
+        if let Some(candidates) = system_status::network_icon(status.network) {
+            v.push((owned(candidates), TEXT));
+        }
+    } else {
+        v.push((owned(system_status::airplane_icon()), TEXT));
     }
     if let Some(audio) = audio {
         v.push((vec![crate::audio::volume_icon(&audio).to_string()], TEXT));
@@ -1475,6 +1483,7 @@ mod tests {
                 icon_name: "battery-level-90-symbolic".to_string(),
                 percentage: 90.,
             }),
+            ..Default::default()
         };
         let icons = qs_indicator_icons(toggles, &status, None, no_mic);
         assert_eq!(icons.len(), 2);
@@ -1518,6 +1527,7 @@ mod tests {
         let wired = || SystemStatus {
             network: NetworkStatus::Wired,
             battery: None,
+            ..Default::default()
         };
 
         // Not recording → no mic icon at all.

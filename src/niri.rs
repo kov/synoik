@@ -2502,6 +2502,21 @@ impl State {
         }
     }
 
+    /// Adopt a fresh airplane-mode snapshot from the gsd-rfkill watcher. Updates the panel airplane
+    /// icon and an open QS "Airplane Mode" toggle tile (which appears/vanishes with `show`).
+    #[cfg(feature = "dbus")]
+    pub fn on_airplane_status(&mut self, status: crate::system_status::AirplaneStatus) {
+        self.niri.system_status.airplane = status;
+        let mut redraw = self
+            .niri
+            .panel
+            .set_system_status(self.niri.system_status.clone());
+        redraw |= self.niri.panel_popover.set_airplane(status);
+        if redraw {
+            self.niri.queue_redraw_all();
+        }
+    }
+
     /// Adopt a fresh default-sink snapshot from the PipeWire watcher (`None` when
     /// no sink is bound). Updates the panel's output indicator + QS slider.
     pub fn on_audio_status(&mut self, status: Option<crate::audio::AudioStatus>) {

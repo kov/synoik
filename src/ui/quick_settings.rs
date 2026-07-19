@@ -45,7 +45,7 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::system_status::{self, BatteryStatus, NetworkStatus};
+use crate::system_status::{self, AirplaneStatus, BatteryStatus, NetworkStatus};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
@@ -417,9 +417,11 @@ impl DetailOwner {
 }
 
 /// The grid slot the Network tile occupies (its detail view anchors below this row). Derived by
-/// identity so a `GRID` reorder can't desync the detail geometry.
+/// identity over [`BASE_GRID`] — the Airplane tile is only ever appended (see [`grid`]), so
+/// Network's index is stable regardless of whether airplane shows.
 fn network_index() -> usize {
-    GRID.iter()
+    BASE_GRID
+        .iter()
         .position(|t| matches!(t, GridTile::Network))
         .unwrap_or(0)
 }
@@ -443,6 +445,9 @@ struct Layout {
     /// remap `volume_from_x`, snapping the level). Scoped to the arrow/track only — the detail
     /// card still sizes from the live count. `None` when not dragging.
     drag: Option<(Slider, usize)>,
+    /// The number of grid tiles (4, or 5 with the airplane tile shown) — the grid's row count, and
+    /// thus the menu height, depends on it.
+    grid_len: usize,
 }
 
 impl Layout {
@@ -542,17 +547,34 @@ impl Tile {
 enum GridTile {
     Network,
     Toggle(Tile),
+    /// Airplane (rfkill) mode — a live D-Bus-backed toggle (gsd-rfkill), shown only when the
+    /// hardware has rfkill switches (`ShouldShowAirplaneMode`). Unlike [`Toggle`](Self::Toggle)
+    /// its state isn't gsettings; unlike [`Network`](Self::Network) its click flips a value.
+    Airplane,
 }
 
-/// Grid order, row-major over two columns: Network leads in the prominent top-left
-/// cell (gnome-shell's quick-settings grid leads with connectivity), then the
-/// gsettings toggles fill out the 2×2 grid.
-const GRID: [GridTile; 4] = [
+/// The always-present grid tiles, row-major over two columns: Network leads in the prominent
+/// top-left cell (gnome-shell's quick-settings grid leads with connectivity), then the gsettings
+/// toggles fill out the 2×2. The Airplane tile is *appended* to this when shown (see [`grid`]) —
+/// gnome-shell adds rfkill after every tile we carry (`panel.js` `QUICK_SETTINGS_ITEMS` order).
+const BASE_GRID: [GridTile; 4] = [
     GridTile::Network,
     GridTile::Toggle(Tile::DarkStyle),
     GridTile::Toggle(Tile::DoNotDisturb),
     GridTile::Toggle(Tile::NightLight),
 ];
+
+/// The live grid: [`BASE_GRID`] plus the Airplane tile when rfkill hardware is present. **Airplane
+/// is always appended, never inserted** — `network_index`/`anchor_row_bottom` resolve tile identity
+/// by index over `BASE_GRID` and silently depend on that prefix staying put (a debug_assert at the
+/// call sites pins it).
+fn grid(show_airplane: bool) -> Vec<GridTile> {
+    let mut tiles = BASE_GRID.to_vec();
+    if show_airplane {
+        tiles.push(GridTile::Airplane);
+    }
+    tiles
+}
 
 impl GridTile {
     /// The tile's label given the live toggle + network state.
@@ -560,6 +582,7 @@ impl GridTile {
         match self {
             GridTile::Toggle(t) => t.label().to_string(),
             GridTile::Network => network_label(network).to_string(),
+            GridTile::Airplane => "Airplane Mode".to_string(),
         }
     }
 
@@ -568,26 +591,33 @@ impl GridTile {
         match self {
             GridTile::Toggle(t) => t.icons().iter().map(|s| s.to_string()).collect(),
             GridTile::Network => network_icons(network),
+            GridTile::Airplane => vec!["airplane-mode-symbolic".to_string()],
         }
     }
 
     /// Whether the tile reads as "on" (accent background): a toggle's gsettings
-    /// state, or — for Network — whether a connection is currently up.
-    fn is_on(self, toggles: QuickToggles, network: NetworkStatus) -> bool {
+    /// state, Network's connected state, or Airplane's active state.
+    fn is_on(
+        self,
+        toggles: QuickToggles,
+        network: NetworkStatus,
+        airplane: AirplaneStatus,
+    ) -> bool {
         match self {
             GridTile::Toggle(t) => t.is_on(toggles),
             GridTile::Network => {
                 matches!(network, NetworkStatus::Wired | NetworkStatus::Wireless(_))
             }
+            GridTile::Airplane => airplane.active,
         }
     }
 
     /// Whether this tile carries an expand-arrow that opens a detail view (gnome-shell's
-    /// `QuickMenuToggle`). Only Network in v1; the gsettings toggles are plain [`QuickToggle`]s.
+    /// `QuickMenuToggle`). Only Network in v1; the toggles are plain [`QuickToggle`]s.
     fn detail_owner(self) -> Option<DetailOwner> {
         match self {
             GridTile::Network => Some(DetailOwner::Network),
-            GridTile::Toggle(_) => None,
+            GridTile::Toggle(_) | GridTile::Airplane => None,
         }
     }
 }
@@ -599,7 +629,6 @@ fn network_label(network: NetworkStatus) -> &'static str {
         NetworkStatus::Wired => "Wired",
         NetworkStatus::Wireless(_) => "Wi-Fi",
         NetworkStatus::Offline => "Offline",
-        NetworkStatus::Airplane => "Airplane Mode",
         NetworkStatus::Unknown => "Network",
     }
 }
@@ -683,6 +712,9 @@ pub struct QuickSettings {
     toggles: QuickToggles,
     /// Live network state (from the system-bus watcher), for the Network grid tile.
     network: NetworkStatus,
+    /// Airplane (rfkill) state, for the conditionally-shown Airplane grid tile. `show` grows the
+    /// grid by one tile; `active` is the tile's on-state.
+    airplane: AirplaneStatus,
     /// The battery, for the far-left power pill; `None` hides it (desktop / VM
     /// without a battery), like gnome-shell's `PowerToggle.visible = IsPresent`.
     battery: Option<BatteryStatus>,
@@ -723,6 +755,7 @@ impl QuickSettings {
     pub fn new(
         toggles: QuickToggles,
         network: NetworkStatus,
+        airplane: AirplaneStatus,
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
@@ -733,6 +766,7 @@ impl QuickSettings {
         Self {
             toggles,
             network,
+            airplane,
             battery,
             audio,
             sink_list,
@@ -769,8 +803,13 @@ impl QuickSettings {
         }
     }
 
+    /// The live grid tiles (Network + toggles, plus Airplane when rfkill hardware is present).
+    fn grid(&self) -> Vec<GridTile> {
+        grid(self.airplane.show)
+    }
+
     /// The current layout context (slider presence + which detail view is open + device counts +
-    /// the active drag), the single source of truth every geometry function shares.
+    /// the active drag + tile count), the single source of truth every geometry function shares.
     fn layout(&self) -> Layout {
         Layout {
             sliders: self.sliders(),
@@ -778,7 +817,19 @@ impl QuickSettings {
             sink_count: self.sink_list.sinks.len(),
             source_count: self.source_list.sources.len(),
             drag: self.sliding,
+            grid_len: self.grid().len(),
         }
+    }
+
+    /// Adopt a fresh airplane-mode snapshot (from the gsd-rfkill watcher). `show` grows/shrinks the
+    /// grid (a 5th tile); `active` flips the tile. Returns whether it changed.
+    pub fn set_airplane(&mut self, airplane: AirplaneStatus) -> bool {
+        if self.airplane == airplane {
+            return false;
+        }
+        self.airplane = airplane;
+        self.revision += 1;
+        true
     }
 
     /// Enforce the invariant that an open detail view's owner still exists: the Output picker is
@@ -842,17 +893,23 @@ impl QuickSettings {
                 return PopoverAction::Consumed;
             }
         }
-        for (i, item) in GRID.iter().enumerate() {
+        let tiles = self.grid();
+        debug_assert_eq!(
+            &tiles[..BASE_GRID.len()],
+            &BASE_GRID,
+            "grid() must APPEND the airplane tile, never insert (network_index depends on it)"
+        );
+        for (i, &item) in tiles.iter().enumerate() {
             // A menu tile's arrow-half toggles its detail view (open, or close if already open —
             // one at a time); the toggle-body keeps the tile's own behavior. A plain tile is all
             // body.
-            if tile_arrow_rect(i, layout).is_some_and(|r| r.contains(pos)) {
+            if tile_arrow_rect(i, item, layout).is_some_and(|r| r.contains(pos)) {
                 let owner = item.detail_owner();
                 self.expanded = if self.expanded == owner { None } else { owner };
                 self.revision += 1;
                 return PopoverAction::Consumed;
             }
-            if tile_body_rect(i, layout).contains(pos) {
+            if tile_body_rect(i, item, layout).contains(pos) {
                 return match item {
                     // Network body: open settings (the in-place enable/disable toggle is deferred);
                     // the arrow opens the detail view.
@@ -864,10 +921,13 @@ impl QuickSettings {
                     ),
                     GridTile::Toggle(tile) => {
                         let on = !tile.is_on(self.toggles);
-                        self.set_tile(*tile, on);
+                        self.set_tile(tile, on);
                         self.revision += 1;
                         tile.action(on)
                     }
+                    // Airplane: a D-Bus write (not optimistic — the tile updates on the gsd echo,
+                    // like `SetDefaultSink`; a rejected/hw-blocked write has no corrective echo).
+                    GridTile::Airplane => PopoverAction::SetAirplaneMode(!self.airplane.active),
                 };
             }
         }
@@ -1058,8 +1118,8 @@ impl QuickSettings {
         let layout = self.layout();
 
         // Tile icons (drawn above the chrome, so pushed before it).
-        for (i, item) in GRID.iter().enumerate() {
-            let on = item.is_on(self.toggles, self.network);
+        for (i, item) in self.grid().into_iter().enumerate() {
+            let on = item.is_on(self.toggles, self.network, self.airplane);
             let color = if on { FG_ON } else { FG_OFF };
             let rect = tile_rect(i, layout);
             let center = Point::from((
@@ -1082,7 +1142,7 @@ impl QuickSettings {
 
             // A menu tile's expand-arrow, centered in its arrow-half (gnome-shell's static
             // `go-next-symbolic`).
-            if let Some(arrow) = tile_arrow_rect(i, layout) {
+            if let Some(arrow) = tile_arrow_rect(i, item, layout) {
                 let center = Point::from((
                     arrow.loc.x + arrow.size.w / 2.,
                     arrow.loc.y + arrow.size.h / 2.,
@@ -1331,7 +1391,11 @@ impl QuickSettings {
 
         // Shape the tile labels + the battery pill's percentage up front (immutable
         // borrows of the font system).
-        let labels: Vec<String> = GRID.iter().map(|item| item.label(self.network)).collect();
+        let labels: Vec<String> = self
+            .grid()
+            .iter()
+            .map(|item| item.label(self.network))
+            .collect();
         // `.quick-toggle-title` / the power toggle's percentage are %heading = weight 700.
         let label_runs: Vec<_> = labels
             .iter()
@@ -1399,9 +1463,9 @@ impl QuickSettings {
                 Point::<i32, Physical>::from((lx - ix, cy - ih / 2 - iy))
             };
 
-            for (i, item) in GRID.iter().enumerate() {
+            for (i, item) in self.grid().into_iter().enumerate() {
                 let rect = tile_rect(i, layout);
-                let on = item.is_on(self.toggles, self.network);
+                let on = item.is_on(self.toggles, self.network, self.airplane);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
                 // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
@@ -1416,7 +1480,7 @@ impl QuickSettings {
                 // A menu tile's arrow-half is separated from the body by a 1px divider
                 // (`.quick-toggle-separator`); v1 keeps one pill background and marks the split
                 // with the divider + the arrow icon (the split-radius look is a later cosmetic).
-                if let Some(arrow) = tile_arrow_rect(i, layout) {
+                if let Some(arrow) = tile_arrow_rect(i, item, layout) {
                     let sep = Rectangle::new(
                         Point::from((arrow.loc.x - SEPARATOR_W, arrow.loc.y + arrow.size.h * 0.2)),
                         Size::from((SEPARATOR_W, arrow.size.h * 0.6)),
@@ -1430,7 +1494,7 @@ impl QuickSettings {
                 let run = &label_runs[i];
                 // Clip the label to the toggle-body so a long name can't run under the arrow
                 // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
-                let clip = rect_px(tile_body_rect(i, layout));
+                let clip = rect_px(tile_body_rect(i, item, layout));
                 frame.render_glyphs(
                     run,
                     place_left(run.ink_bounds(), label_x, label_cy),
@@ -1612,16 +1676,17 @@ fn grid_top(sliders: Sliders) -> f64 {
     PAD + SYS_H + TILE_GAP + sliders.count() as f64 * (SLIDER_H + TILE_GAP)
 }
 
-/// The y of the grid's bottom edge (grid top + tile rows), before any detail shift.
-fn grid_bottom(sliders: Sliders) -> f64 {
-    let rows = GRID.len().div_ceil(COLS) as f64;
-    grid_top(sliders) + rows * TILE_H + (rows - 1.) * TILE_GAP
+/// The y of the grid's bottom edge (grid top + tile rows), before any detail shift. Uses the live
+/// tile count (`layout.grid_len`) so a 5th (airplane) tile adds a third row.
+fn grid_bottom(layout: Layout) -> f64 {
+    let rows = layout.grid_len.div_ceil(COLS) as f64;
+    grid_top(layout.sliders) + rows * TILE_H + (rows - 1.) * TILE_GAP
 }
 
 /// The menu's logical height: system row, sliders, tile grid, padding — grown by the open detail
 /// view's block (the card plus its top margin) when one is expanded.
 fn menu_h(layout: Layout) -> f64 {
-    let base = grid_bottom(layout.sliders) + PAD;
+    let base = grid_bottom(layout) + PAD;
     base + layout.detail_block().map(|(_, h)| h).unwrap_or(0.)
 }
 
@@ -1711,25 +1776,26 @@ fn tile_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
 
 /// The expand-arrow (menu-button) half of a menu-bearing tile — the right `ARROW_W`, full height —
 /// or `None` for a plain toggle. gnome-shell's `.quick-toggle-menu-button`, the second hit region.
-fn tile_arrow_rect(i: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> {
-    GRID[i].detail_owner()?;
-    let tile = tile_rect(i, layout);
+/// Takes the tile itself (the grid is dynamic now, so we can't index a global `GRID`).
+fn tile_arrow_rect(i: usize, tile: GridTile, layout: Layout) -> Option<Rectangle<f64, Logical>> {
+    tile.detail_owner()?;
+    let r = tile_rect(i, layout);
     Some(Rectangle::new(
-        Point::from((tile.loc.x + tile.size.w - ARROW_W, tile.loc.y)),
-        Size::from((ARROW_W, tile.size.h)),
+        Point::from((r.loc.x + r.size.w - ARROW_W, r.loc.y)),
+        Size::from((ARROW_W, r.size.h)),
     ))
 }
 
 /// The toggle-body half of a tile (the whole tile for a plain toggle; the tile minus the arrow
 /// for a menu tile). Its click flips the toggle / opens settings; also the label's clip bound.
-fn tile_body_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
-    let tile = tile_rect(i, layout);
-    match tile_arrow_rect(i, layout) {
+fn tile_body_rect(i: usize, tile: GridTile, layout: Layout) -> Rectangle<f64, Logical> {
+    let r = tile_rect(i, layout);
+    match tile_arrow_rect(i, tile, layout) {
         Some(_) => Rectangle::new(
-            tile.loc,
-            Size::from((tile.size.w - ARROW_W - SEPARATOR_W, tile.size.h)),
+            r.loc,
+            Size::from((r.size.w - ARROW_W - SEPARATOR_W, r.size.h)),
         ),
-        None => tile,
+        None => r,
     }
 }
 
@@ -1879,6 +1945,7 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             drag: None,
+            grid_len: BASE_GRID.len(),
         }
     }
 
@@ -1892,6 +1959,7 @@ mod tests {
             let size = QuickSettings::new(
                 QuickToggles::default(),
                 NetworkStatus::Wired,
+                AirplaneStatus::default(),
                 None,
                 audio,
                 SinkList::default(),
@@ -1908,7 +1976,7 @@ mod tests {
                 assert!(r.loc.x + r.size.w <= size.w + 0.01, "{what} off the right");
                 assert!(r.loc.y + r.size.h <= size.h + 0.01, "{what} off the bottom");
             };
-            for i in 0..GRID.len() {
+            for i in 0..BASE_GRID.len() {
                 within(tile_rect(i, lay(has_slider)), "tile");
             }
             for has_pill in [false, true] {
@@ -1941,6 +2009,7 @@ mod tests {
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
+            AirplaneStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -1960,14 +2029,15 @@ mod tests {
     /// opens network settings without flipping any local toggle state.
     #[test]
     fn network_tile_reflects_state_and_opens_settings() {
-        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired));
-        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wireless(60)));
-        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Offline));
-        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Airplane));
+        let off = AirplaneStatus::default();
+        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired, off));
+        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wireless(60), off));
+        assert!(!GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Offline, off));
 
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
+            AirplaneStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -1992,6 +2062,7 @@ mod tests {
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
+            AirplaneStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2019,6 +2090,7 @@ mod tests {
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
+            AirplaneStatus::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2044,6 +2116,7 @@ mod tests {
         let mut qs = QuickSettings::new(
             QuickToggles::default(),
             NetworkStatus::Wired,
+            AirplaneStatus::default(),
             None,
             None,
             SinkList::default(),
@@ -2078,6 +2151,7 @@ mod tests {
         let qs = QuickSettings::new(
             toggles,
             NetworkStatus::Unknown,
+            AirplaneStatus::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2141,6 +2215,7 @@ mod tests {
         QuickSettings::new(
             QuickToggles::default(),
             network,
+            AirplaneStatus::default(),
             None,
             audio,
             SinkList::default(),
@@ -2404,14 +2479,77 @@ mod tests {
     fn tile_body_and_arrow_are_disjoint_regions() {
         let l = lay(false);
         let ni = network_index();
-        let body = tile_body_rect(ni, l);
-        let arrow = tile_arrow_rect(ni, l).expect("the Network tile carries an arrow");
+        let body = tile_body_rect(ni, GridTile::Network, l);
+        let arrow =
+            tile_arrow_rect(ni, GridTile::Network, l).expect("the Network tile carries an arrow");
         // The body ends at (or before) the arrow's left edge — a separator sits between.
         assert!(body.loc.x + body.size.w <= arrow.loc.x);
         assert_eq!(arrow.loc.x + arrow.size.w, tile_rect(ni, l).loc.x + TILE_W);
         // A gsettings toggle (Do Not Disturb, cell 2) is all body, no arrow.
-        assert!(tile_arrow_rect(2, l).is_none());
-        assert_eq!(tile_body_rect(2, l), tile_rect(2, l));
+        assert!(tile_arrow_rect(2, BASE_GRID[2], l).is_none());
+        assert_eq!(tile_body_rect(2, BASE_GRID[2], l), tile_rect(2, l));
+    }
+
+    /// With rfkill hardware present the grid gains a 5th tile (Airplane Mode), always APPENDED at
+    /// index 4: a lone tile on a new third row (row 2, column 0). The menu grows by exactly one
+    /// tile row; the empty cell beside it (row 2, column 1) carries no tile and swallows clicks;
+    /// and clicking the Airplane body returns the non-optimistic D-Bus write — hit geometry agrees
+    /// with the live grid.
+    #[test]
+    fn airplane_tile_appends_a_third_row_and_toggles() {
+        // show = true appends the tile; active = false so a click turns it on.
+        let airplane = AirplaneStatus {
+            active: false,
+            show: true,
+        };
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            airplane,
+            None,
+            None,
+            SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
+            [0, 0, 0],
+        );
+
+        // Five tiles now, Airplane last (the append invariant network_index() depends on).
+        let tiles = qs.grid();
+        assert_eq!(tiles.len(), 5);
+        assert_eq!(tiles[4], GridTile::Airplane);
+
+        // The 5th tile sits alone on a new row 2, column 0.
+        let air = tile_rect(4, qs.layout());
+        let row0 = tile_rect(0, qs.layout());
+        assert!(
+            (air.loc.x - row0.loc.x).abs() < 0.01,
+            "airplane in column 0"
+        );
+        let expected_y = row0.loc.y + 2. * (TILE_H + TILE_GAP);
+        assert!(
+            (air.loc.y - expected_y).abs() < 0.01,
+            "airplane on the third row"
+        );
+
+        // The menu is exactly one tile row taller than the 4-tile grid (same sliders/detail state).
+        let grew = menu_h(qs.layout()) - menu_h(lay(false));
+        assert!(
+            (grew - (TILE_H + TILE_GAP)).abs() < 0.01,
+            "one extra tile row, got {grew}"
+        );
+
+        // Clicking the Airplane body returns the D-Bus write; echo-driven, so no local flip.
+        let action = qs.pointer_click(center(air));
+        assert!(matches!(action, PopoverAction::SetAirplaneMode(true)));
+        assert!(!qs.airplane.active, "the tile must not flip optimistically");
+
+        // The empty cell beside it (row 2, column 1) is grid space with no tile: consumed, no-op.
+        let empty = Point::from((
+            tile_rect(1, qs.layout()).loc.x + TILE_W / 2.,
+            air.loc.y + TILE_H / 2.,
+        ));
+        assert!(matches!(qs.pointer_click(empty), PopoverAction::Consumed));
     }
 
     /// The Network arrow opens the detail view; clicking it again collapses it. Both are internal
@@ -2423,13 +2561,17 @@ mod tests {
         assert!(qs.expanded.is_none());
 
         let before = qs.revision;
-        let a = qs.pointer_click(center(tile_arrow_rect(ni, qs.layout()).unwrap()));
+        let a = qs.pointer_click(center(
+            tile_arrow_rect(ni, GridTile::Network, qs.layout()).unwrap(),
+        ));
         assert!(matches!(a, PopoverAction::Consumed));
         assert_eq!(qs.expanded, Some(DetailOwner::Network));
         assert!(qs.revision > before);
 
         // Network is a row-0 tile, so opening its detail doesn't shift it — the arrow stays put.
-        let a = qs.pointer_click(center(tile_arrow_rect(ni, qs.layout()).unwrap()));
+        let a = qs.pointer_click(center(
+            tile_arrow_rect(ni, GridTile::Network, qs.layout()).unwrap(),
+        ));
         assert!(matches!(a, PopoverAction::Consumed));
         assert!(qs.expanded.is_none());
     }
@@ -2447,6 +2589,7 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             drag: None,
+            grid_len: BASE_GRID.len(),
         };
         let expanded = Layout {
             sliders: Sliders {
@@ -2457,6 +2600,7 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             drag: None,
+            grid_len: BASE_GRID.len(),
         };
         assert!(
             menu_h(expanded) > menu_h(collapsed),
@@ -2473,7 +2617,7 @@ mod tests {
             );
         }
         // Row 1 shifts down by exactly the detail block.
-        for i in COLS..GRID.len() {
+        for i in COLS..BASE_GRID.len() {
             let d = tile_rect(i, expanded).loc.y - tile_rect(i, collapsed).loc.y;
             assert!(
                 (d - block).abs() < 0.01,
@@ -2495,7 +2639,7 @@ mod tests {
     fn detail_row_runs_its_action() {
         let mut qs = qs(NetworkStatus::Wired, None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
         ));
         assert_eq!(qs.expanded, Some(DetailOwner::Network));
 
@@ -2519,7 +2663,7 @@ mod tests {
     fn clicking_card_gutter_is_consumed_and_keeps_the_detail_open() {
         let mut qs = qs(NetworkStatus::Wired, None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
         ));
         let card = detail_rect(qs.layout()).unwrap();
         // The header strip (above the first row) is card space with no action.
@@ -2549,6 +2693,7 @@ mod tests {
                     sink_count: 0,
                     source_count: 0,
                     drag: None,
+                    grid_len: BASE_GRID.len(),
                 };
                 assert!(
                     menu_h(l) < 600.,
@@ -2596,7 +2741,7 @@ mod tests {
     fn only_one_detail_view_is_open_at_a_time() {
         let mut qs = qs(NetworkStatus::Wired, None);
         qs.pointer_click(center(
-            tile_arrow_rect(network_index(), qs.layout()).unwrap(),
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
         ));
         assert_eq!(qs.expanded, Some(DetailOwner::Network));
         // The power button is in the top row (never shifted), so it's still hittable; opening it
@@ -2618,6 +2763,7 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             drag: None,
+            grid_len: BASE_GRID.len(),
         };
         let expanded = Layout {
             sliders: Sliders {
@@ -2628,6 +2774,7 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             drag: None,
+            grid_len: BASE_GRID.len(),
         };
         let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
         assert_eq!(
@@ -2641,7 +2788,7 @@ mod tests {
             (ds - block).abs() < 0.01,
             "the slider must shift by the block, got {ds}"
         );
-        for i in 0..GRID.len() {
+        for i in 0..BASE_GRID.len() {
             let d = tile_rect(i, expanded).loc.y - tile_rect(i, collapsed).loc.y;
             assert!(
                 (d - block).abs() < 0.01,

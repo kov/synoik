@@ -14,6 +14,7 @@ pub mod gnome_shell_screenshot;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
+pub mod rfkill;
 pub mod system_status;
 
 #[cfg(feature = "xdp-gnome-screencast")]
@@ -54,6 +55,10 @@ pub struct DBusServers {
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
+    /// gsd-rfkill (session bus), for airplane mode. Kept for its watcher task *and* reused to
+    /// write the `AirplaneMode` property when the QS toggle is clicked
+    /// ([`rfkill::set_airplane_mode`]).
+    pub conn_rfkill: Option<Connection>,
 }
 
 impl DBusServers {
@@ -254,6 +259,22 @@ impl DBusServers {
             }
             Err(err) => {
                 warn!("error starting system-status watcher: {err:?}");
+            }
+        }
+
+        let (to_niri, from_rfkill) = calloop::channel::channel();
+        niri.event_loop
+            .insert_source(from_rfkill, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_airplane_status(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match rfkill::start(to_niri) {
+            Ok(conn) => {
+                dbus.conn_rfkill = Some(conn);
+            }
+            Err(err) => {
+                warn!("error starting rfkill watcher: {err:?}");
             }
         }
 

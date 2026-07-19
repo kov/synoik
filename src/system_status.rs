@@ -15,6 +15,22 @@ pub struct SystemStatus {
     pub network: NetworkStatus,
     /// `None` when there's no battery (desktop / VM without one).
     pub battery: Option<BatteryStatus>,
+    /// Airplane (rfkill) mode, from gsd-rfkill (the authoritative source, replacing the old coarse
+    /// NM `WirelessEnabled` proxy).
+    pub airplane: AirplaneStatus,
+}
+
+/// Airplane mode, mirroring gnome-shell's `RfkillManager` (`js/ui/status/rfkill.js`), fed by the
+/// gsd-rfkill session-bus watcher. `show` gates both the QS toggle tile and the panel icon
+/// (`HasAirplaneMode && ShouldShowAirplaneMode`); `active` is `AirplaneMode`. [`Default`] (hidden,
+/// off) where the `dbus` feature / gsd-rfkill is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AirplaneStatus {
+    /// `AirplaneMode` — networking radios are killed.
+    pub active: bool,
+    /// Whether to surface airplane mode at all (`HasAirplaneMode && ShouldShowAirplaneMode`):
+    /// false on hardware with no rfkill switches (desktops, this VM).
+    pub show: bool,
 }
 
 /// The primary connection's state, mirroring what gnome-shell's
@@ -30,8 +46,6 @@ pub enum NetworkStatus {
     Wireless(u8),
     /// Not connected (but networking is enabled).
     Offline,
-    /// Wireless disabled with nothing else connected (our coarse airplane proxy).
-    Airplane,
 }
 
 /// The battery state, from UPower's aggregate `DisplayDevice`.
@@ -52,8 +66,12 @@ pub fn network_icon(status: NetworkStatus) -> Option<&'static [&'static str]> {
         NetworkStatus::Wired => Some(&["network-wired-symbolic"]),
         NetworkStatus::Wireless(strength) => Some(wireless_icon(strength)),
         NetworkStatus::Offline => Some(&["network-offline-symbolic"]),
-        NetworkStatus::Airplane => Some(&["airplane-mode-symbolic"]),
     }
+}
+
+/// The airplane-mode panel icon (gnome-shell's rfkill `Indicator`, `js/ui/status/rfkill.js`).
+pub fn airplane_icon() -> &'static [&'static str] {
+    &["airplane-mode-symbolic"]
 }
 
 /// GNOME's five wireless-signal buckets (`network-wireless-signal-*-symbolic`).
@@ -111,10 +129,7 @@ mod tests {
             network_icon(NetworkStatus::Offline).unwrap()[0],
             "network-offline-symbolic"
         );
-        assert_eq!(
-            network_icon(NetworkStatus::Airplane).unwrap()[0],
-            "airplane-mode-symbolic"
-        );
+        assert_eq!(airplane_icon()[0], "airplane-mode-symbolic");
         assert_eq!(
             network_icon(NetworkStatus::Wireless(85)).unwrap()[0],
             "network-wireless-signal-excellent-symbolic"

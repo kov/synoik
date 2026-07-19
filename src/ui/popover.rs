@@ -69,6 +69,9 @@ pub enum PopoverAction {
     /// Set the system default input source to this `node.name` (an input-device-picker row). The
     /// menu stays open, like [`SetDefaultSink`](Self::SetDefaultSink).
     SetDefaultSource(String),
+    /// Set gsd-rfkill's airplane mode (the QS "Airplane Mode" toggle). The menu stays open; the
+    /// tile updates on the gsd echo (not optimistic — a rejected/hw-blocked write has no echo).
+    SetAirplaneMode(bool),
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -228,6 +231,7 @@ impl PanelPopover {
         anchor: Rectangle<f64, Logical>,
         toggles: crate::gnome::QuickToggles,
         network: crate::system_status::NetworkStatus,
+        airplane: crate::system_status::AirplaneStatus,
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
@@ -246,6 +250,7 @@ impl PanelPopover {
         self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
             toggles,
             network,
+            airplane,
             battery,
             audio,
             sink_list,
@@ -296,6 +301,18 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_source_list(source_list)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh airplane-mode snapshot to an open quick-settings popover, so the "Airplane
+    /// Mode" toggle tile appears/vanishes with the hardware and reflects the live state. Returns
+    /// whether it changed.
+    pub fn set_airplane(&mut self, airplane: crate::system_status::AirplaneStatus) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_airplane(airplane)
             }
             _ => false,
         }

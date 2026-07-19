@@ -2262,6 +2262,7 @@ fn vulkan_renders_the_quick_settings_popover() {
         let toggles = f.niri().gnome_settings.quick_toggles;
         let anchor = f.niri().panel.quick_settings_rect(output_w);
         let network = f.niri().system_status.network;
+        let airplane = f.niri().system_status.airplane;
         let battery = f.niri().system_status.battery.clone();
         let audio = f.niri().audio;
         let sink_list = f.niri().sink_list.clone();
@@ -2273,6 +2274,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             anchor,
             toggles,
             network,
+            airplane,
             battery,
             audio,
             sink_list,

@@ -174,12 +174,13 @@ fn read_battery(props: &Props) -> Option<BatteryStatus> {
     })
 }
 
-/// Map NetworkManager's top-level properties to a [`NetworkStatus`].
+/// Map NetworkManager's top-level properties to a [`NetworkStatus`]. Airplane mode is no longer
+/// derived here (the old coarse `!WirelessEnabled` proxy) — gsd-rfkill owns it now
+/// ([`crate::dbus::rfkill`]); a disconnected primary is simply `Offline`.
 fn read_network(props: &Props) -> NetworkStatus {
     // NM_STATE: 70 CONNECTED_GLOBAL, 60 SITE, 50 LOCAL, 40 CONNECTING, 20 DISCONNECTED, 10 ASLEEP.
     let state = get_u32(props, "State").unwrap_or(0);
     let conn_type = get_str(props, "PrimaryConnectionType").unwrap_or_default();
-    let wireless_enabled = get_bool(props, "WirelessEnabled").unwrap_or(true);
 
     if state >= 50 {
         if conn_type.starts_with("802-11") {
@@ -192,8 +193,6 @@ fn read_network(props: &Props) -> NetworkStatus {
             // 802-3 (wired) and any other connected primary (vpn/tun/bridge).
             NetworkStatus::Wired
         }
-    } else if !wireless_enabled {
-        NetworkStatus::Airplane
     } else {
         NetworkStatus::Offline
     }
