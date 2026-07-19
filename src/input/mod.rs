@@ -3167,8 +3167,8 @@ impl State {
 
         // End any quick-settings volume-slider drag on button release (the press that
         // started it is suppressed below, so handle it before that early return).
-        if button_state == ButtonState::Released {
-            self.niri.panel_popover.end_drag();
+        if button_state == ButtonState::Released && self.niri.panel_popover.end_drag() {
+            self.niri.queue_redraw_all();
         }
 
         // Ignore release events for mouse clicks that triggered a bind.

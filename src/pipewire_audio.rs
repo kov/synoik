@@ -303,15 +303,6 @@ impl PwAudio {
         self.set_muted(!muted)
     }
 
-    /// The last-known sink list (for the output-device picker), empty until the first sink is seen.
-    pub fn sink_list(&self) -> SinkList {
-        self.inner
-            .borrow()
-            .sink_list_last
-            .clone()
-            .unwrap_or_default()
-    }
-
     /// Set the system default output to the sink with this `node.name`, by writing the persistent
     /// `default.configured.audio.sink` metadata key (what `wpctl set-default` / gvc's
     /// `change_output` write). The session manager (WirePlumber) echoes it back as
@@ -413,6 +404,12 @@ fn on_global(
                 return;
             }
             let mut inner = inner_rc.borrow_mut();
+            // Bound once and never released: `on_global_remove` doesn't track the metadata global's
+            // id, so if the session manager (WirePlumber) restarts, this proxy goes stale — the
+            // default-sink read stops updating and `set_default_sink` writes into the dead proxy.
+            // Pre-existing (the volume read path already relied on this single bind); fine in
+            // practice (WirePlumber rarely restarts mid-session). TODO: track the id and rebind on
+            // removal to harden both the read and the picker's write.
             if inner.metadata.is_some() {
                 return;
             }

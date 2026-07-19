@@ -579,6 +579,12 @@ pub struct QuickSettings {
     sink_list: SinkList,
     /// Whether the volume slider is being dragged (a button is held on it).
     sliding: bool,
+    /// The sink count frozen at drag start, so the slider track's geometry can't shift mid-drag if
+    /// a sink hot-plugs (which would otherwise make the picker arrow appear/vanish, resize the
+    /// track, and remap `volume_from_x` — snapping the volume under a stationary pointer).
+    /// `Some` only while `sliding`; [`layout`](Self::layout) reads it in place of the live
+    /// count.
+    slide_sink_count: Option<usize>,
     /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
     /// when collapsed. At most one at a time.
     expanded: Option<DetailOwner>,
@@ -610,6 +616,7 @@ impl QuickSettings {
             audio,
             sink_list,
             sliding: false,
+            slide_sink_count: None,
             expanded: None,
             accent: [
                 f32::from(accent[0]) / 255.,
@@ -636,7 +643,7 @@ impl QuickSettings {
         Layout {
             has_slider: self.audio.is_some(),
             expanded: self.expanded,
-            sink_count: self.sink_list.sinks.len(),
+            sink_count: self.slide_sink_count.unwrap_or(self.sink_list.sinks.len()),
         }
     }
 
@@ -770,6 +777,7 @@ impl QuickSettings {
             }
             if slider_track_rect(layout).contains(pos) {
                 self.sliding = true;
+                self.slide_sink_count = Some(self.sink_list.sinks.len());
                 return self.set_local_volume(volume_from_x(pos.x, layout));
             }
         }
@@ -784,9 +792,13 @@ impl QuickSettings {
             .then(|| self.set_local_volume(volume_from_x(pos.x, layout)))
     }
 
-    /// End a slider drag (pointer released).
-    pub fn end_drag(&mut self) {
+    /// End a slider drag (pointer released). Returns whether releasing the frozen sink count
+    /// changed the effective geometry (a sink hot-plugged mid-drag) — the caller redraws so the
+    /// picker arrow that was suppressed during the drag now appears.
+    pub fn end_drag(&mut self) -> bool {
         self.sliding = false;
+        let unfrozen = self.slide_sink_count.take();
+        unfrozen.is_some_and(|frozen| frozen != self.sink_list.sinks.len())
     }
 
     /// Optimistically move the slider locally (so the handle tracks the pointer
@@ -1340,11 +1352,17 @@ impl QuickSettings {
                         px(rrect.loc.x + DETAIL_ROW_INSET)
                     };
                     let label_cy = px(rrect.loc.y + rrect.size.h / 2.);
+                    // Reserve the trailing check zone (a check icon + its inset) on every row so a
+                    // long label (e.g. a verbose HDMI sink description) is clipped before it, not
+                    // drawn under the selected row's `object-select-symbolic`.
+                    let mut label_clip = rrect;
+                    label_clip.size.w =
+                        (label_clip.size.w - (DETAIL_ROW_INSET + TILE_ICON)).max(0.);
                     frame.render_glyphs(
                         run,
                         place_left(run.ink_bounds(), label_x, label_cy),
                         FG_OFF,
-                        rect_px(rrect),
+                        rect_px(label_clip),
                         &[full],
                     )?;
                 }
@@ -2167,6 +2185,49 @@ mod tests {
         let a = q.pointer_click(center(slider_arrow_rect(q.layout()).unwrap()));
         assert!(matches!(a, PopoverAction::Consumed));
         assert!(q.expanded.is_none());
+    }
+
+    /// A sink hot-plugging mid-drag must not move the volume: the slider track's geometry is frozen
+    /// at drag start, so the picker arrow can't appear, shrink the track, and remap `volume_from_x`
+    /// (which would snap the handle under a stationary pointer). The frozen geometry lifts on
+    /// release, and `end_drag` reports that the arrow now needs drawing.
+    #[test]
+    fn a_sink_hotplug_mid_drag_does_not_snap_the_volume() {
+        let mut q = qs_with_sinks(1); // one sink → no arrow, full-width track
+                                      // Press mid-track and hold.
+        let track = slider_track_rect(q.layout());
+        let press = Point::from((
+            track.loc.x + track.size.w * 0.5,
+            track.loc.y + track.size.h / 2.,
+        ));
+        q.pointer_click(press);
+        assert!(q.sliding);
+        let held = q.audio.unwrap().volume;
+
+        // A second sink appears while the button is held: the list updates, but the drag geometry
+        // stays frozen (no arrow, track unchanged).
+        assert!(q.set_sink_list(make_sinks(2)));
+        assert!(
+            slider_arrow_rect(q.layout()).is_none(),
+            "the picker arrow must stay suppressed mid-drag"
+        );
+
+        // The pointer hasn't moved → the volume must not have moved either.
+        let dragged = q.pointer_drag(press).unwrap();
+        assert!(matches!(dragged, PopoverAction::SetVolume(_)));
+        assert_eq!(
+            q.audio.unwrap().volume,
+            held,
+            "a stationary pointer must not snap the volume"
+        );
+
+        // Releasing lifts the freeze; the now-visible arrow needs a redraw, and its geometry is
+        // live.
+        assert!(
+            q.end_drag(),
+            "the mid-drag hotplug needs a redraw on release"
+        );
+        assert!(slider_arrow_rect(q.layout()).is_some());
     }
 
     /// The picker lists one row per sink (default checked) then a "Sound Settings" row; a sink row

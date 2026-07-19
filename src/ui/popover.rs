@@ -280,10 +280,13 @@ impl PanelPopover {
         }
     }
 
-    /// End any quick-settings slider drag (pointer released).
-    pub fn end_drag(&mut self) {
+    /// End any quick-settings slider drag (pointer released). Returns whether the release changed
+    /// the menu geometry (a sink hot-plugged mid-drag), so the caller can redraw.
+    pub fn end_drag(&mut self) -> bool {
         if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
-            qs.end_drag();
+            qs.end_drag()
+        } else {
+            false
         }
     }
 
