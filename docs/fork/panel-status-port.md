@@ -241,5 +241,10 @@ carved these out as separate work — none block R1 for daily use:
 
 **Tier 4 — larger subsystems:**
 13. Notification server (`org.freedesktop.Notifications`) → C2 dot + C3 message list.
+    **IN PROGRESS** — full design (Fable-reviewed, approved 2026-07-19) in the plan file
+    `~/.claude/plans/rustling-finding-popcorn.md`; slice 1 ✅ (`5ac65744`+`552336b3`: the fdo
+    server we own + the `NotificationStore` model in `src/notifications.rs`, sender-tracked
+    replace/close, unicast signals, live-validated against a real bus). Remaining: banner
+    overlay, calendar message-list column, C2 indicator.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
