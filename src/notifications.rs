@@ -425,6 +425,19 @@ impl NotificationStore {
             notification.transient = req.transient;
             notification.acknowledged = false;
             notification.timestamp = now;
+            // The source's presentation follows every Notify, replace included
+            // (`processNotification` runs outside the replace branch,
+            // `js/ui/notificationDaemon.js:263-266`).
+            let source = self
+                .sources
+                .iter_mut()
+                .find(|s| s.notifications.iter().any(|n| n.id == id))
+                .unwrap();
+            source.sender = req.sender;
+            source.title = req.app_name;
+            if req.source_icon.is_some() {
+                source.icon = req.source_icon;
+            }
             id
         } else {
             let id = self.next_id;
@@ -525,6 +538,10 @@ impl NotificationStore {
             return None;
         }
         if self.current_banner == Some(id) {
+            // Refreshing the shown banner re-acknowledges it, exactly like the
+            // first show: `_updateShowingNotification` runs for both and its
+            // first act is acking (`js/ui/messageTray.js:938-943,1166-1168`).
+            self.find_mut(id).unwrap().acknowledged = true;
             return Some(BannerEffect::RefreshCurrent);
         }
         if self.banner_queue.contains(&id) {
@@ -710,13 +727,20 @@ fn merge(into: &mut Effects, other: Effects) {
     }
 }
 
-/// The render floor for untrusted title/body text: flatten newlines to spaces
-/// (`js/ui/messageList.js:564-584`), strip the b/i/u tags gnome-shell would
+/// Newline flattening for untrusted TITLE text (`js/ui/messageList.js:564-568`).
+/// gnome-shell escapes the whole summary (`Util.fixMarkup(text, false)`), so a
+/// title displays verbatim — no tag stripping, no entity unescaping.
+pub fn flatten_text(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+}
+
+/// The render floor for untrusted BODY text: flatten newlines to spaces
+/// (`js/ui/messageList.js:575-578`), strip the b/i/u tags gnome-shell would
 /// render (`js/misc/util.js:184-202` allows exactly those), and unescape the
 /// predefined XML entities so escaped text reads correctly. Rich rendering of
 /// the stripped tags is deferred.
 pub fn sanitize_text(text: &str) -> String {
-    let mut s = text.replace(['\n', '\r'], " ");
+    let mut s = flatten_text(text);
     for tag in ["<b>", "</b>", "<i>", "</i>", "<u>", "</u>"] {
         s = s.replace(tag, "");
     }
@@ -819,6 +843,38 @@ mod tests {
         r.replaces_id = 42;
         let (id, _) = notify(&mut store, r);
         assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn replace_while_showing_refreshes_and_reacks() {
+        let mut store = NotificationStore::default();
+        let (id, _) = notify(&mut store, req("app", ":1.1"));
+        assert_eq!(store.pop_next_banner(), Some(id));
+
+        let mut update = req("app", ":1.1");
+        update.replaces_id = id;
+        let (_, effects) = store.notify(update, true, Duration::from_secs(2)).unwrap();
+        assert_eq!(effects.banner, Some(BannerEffect::RefreshCurrent));
+        assert_eq!(store.current_banner, Some(id));
+        // Refreshing the shown banner re-acks, exactly like the first show —
+        // otherwise the notification would count as unseen forever.
+        assert!(store.find(id).unwrap().acknowledged);
+        assert_eq!(store.unseen_count(), 0);
+    }
+
+    #[test]
+    fn replace_updates_source_presentation() {
+        let mut store = NotificationStore::default();
+        let (id, _) = notify(&mut store, req("Old Name", ":1.1"));
+        let mut update = req("New Name", ":1.1");
+        update.replaces_id = id;
+        update.source_icon = Some(NotificationIcon::Themed("new-icon".to_owned()));
+        store.notify(update, true, Duration::from_secs(2)).unwrap();
+        assert_eq!(store.sources[0].title, "New Name");
+        assert_eq!(
+            store.sources[0].icon,
+            Some(NotificationIcon::Themed("new-icon".to_owned()))
+        );
     }
 
     #[test]

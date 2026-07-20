@@ -29,8 +29,8 @@ use zbus::{interface, zvariant};
 
 use super::Start;
 use crate::notifications::{
-    sanitize_text, NiriToNotifications, NotificationIcon, NotificationsToNiri, NotifyRequest,
-    PixelIcon, Urgency,
+    flatten_text, sanitize_text, NiriToNotifications, NotificationIcon, NotificationsToNiri,
+    NotifyRequest, PixelIcon, Urgency,
 };
 
 pub const PATH: &str = "/org/freedesktop/Notifications";
@@ -194,7 +194,9 @@ impl Notifications {
             replaces_id,
             desktop_entry: hint_str(&hints, "desktop-entry"),
             source_icon: NotificationIcon::from_string(&app_icon),
-            title: sanitize_text(&summary),
+            // The summary displays verbatim in gnome-shell (escaped wholesale,
+            // `js/ui/messageList.js:564-568`); only the body is markup-capable.
+            title: flatten_text(&summary),
             body: sanitize_text(&body),
             icon: notification_icon(&hints),
             actions: action_pairs,
