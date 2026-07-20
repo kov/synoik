@@ -248,9 +248,19 @@ carved these out as separate work — none block R1 for daily use:
     (`7c08464b`: banner overlay in `src/ui/notification_banner.rs` — tray timing incl. idle
     gating, transient-destroy-on-hide, popover blocking, close/action/body clicks with real
     XDG activation tokens, untrusted-string/icon-name hardening; live-validated on the
-    headless harness incl. an action click via injected input). Divergences recorded in the
-    module docs: no expand/6-line clamp, no app focus on body click, QS popovers also block,
-    only left clicks intercepted. Remaining: calendar message-list column (3a/3b), C2
-    indicator.
+    headless harness incl. an action click via injected input); slice 3a ✅ (`49d6e952`+
+    `5abad02d`: the dateMenu popover is the two-column layout — message list first at 29em,
+    calendar second (`dateMenu.js:917-940`) — flat cards via the shared card renderer
+    (`src/ui/notification_card.rs`), store-order sources (move-to-front on add only),
+    ack-on-open exactly once + push-while-open without re-ack (`messageList.js:1193-1199`),
+    placeholder + Clear pill, card close/body/Clear clicks (body-activate closes the popover
+    like GNOME activation), bundled `no-notifications-symbolic` (gresource-only icon);
+    live-validated on the headless harness with injected clicks. Also fixed here: the shared
+    card's icons were z-buried under the card texture since slice 2 — output element lists
+    are top-to-bottom; icons now precede the card, pinned by a pixel test). Divergences
+    recorded in the module docs: no expand/6-line clamp, no app focus on body click, QS
+    popovers also block, only left clicks intercepted, no message-list scrolling (cards that
+    don't fully fit above the Clear row are dropped). Remaining: grouped card stacks (3b),
+    C2 indicator.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
