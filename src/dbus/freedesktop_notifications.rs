@@ -29,8 +29,8 @@ use zbus::{interface, zvariant};
 
 use super::Start;
 use crate::notifications::{
-    flatten_text, sanitize_text, NiriToNotifications, NotificationIcon, NotificationsToNiri,
-    NotifyRequest, PixelIcon, Urgency,
+    clamp_text, flatten_text, sanitize_text, NiriToNotifications, NotificationIcon,
+    NotificationsToNiri, NotifyRequest, PixelIcon, Urgency,
 };
 
 pub const PATH: &str = "/org/freedesktop/Notifications";
@@ -103,6 +103,35 @@ fn hint_str(hints: &Hints, key: &str) -> Option<String> {
     String::try_from(v).ok()
 }
 
+/// Nothing renders a notification icon above 48 logical px; retaining
+/// untrusted images any larger than 2x that is pure memory exposure.
+const MAX_ICON_PX: u32 = 96;
+
+/// Downscale an ingested pixel icon to [`MAX_ICON_PX`] on the long side
+/// (aspect preserved) so a hostile client can't park megapixel buffers in the
+/// compositor for the lifetime of a notification.
+fn bounded_pixels(pix: PixelIcon) -> Arc<PixelIcon> {
+    let long = pix.width.max(pix.height);
+    if long <= MAX_ICON_PX {
+        return Arc::new(pix);
+    }
+    let w = (pix.width * MAX_ICON_PX / long).max(1);
+    let h = (pix.height * MAX_ICON_PX / long).max(1);
+    let Some(img) = image::RgbaImage::from_raw(pix.width, pix.height, pix.rgba) else {
+        return Arc::new(PixelIcon {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        });
+    };
+    let resized = image::imageops::thumbnail(&img, w, h);
+    Arc::new(PixelIcon {
+        width: w,
+        height: h,
+        rgba: resized.into_raw(),
+    })
+}
+
 /// Decode an `image-data`-style hint: the `(iiibiiay)` pixbuf tuple, converted
 /// to a tight RGBA copy on this (untrusted-facing) side of the seam.
 fn hint_pixels(hints: &Hints, key: &str) -> Option<Arc<PixelIcon>> {
@@ -118,7 +147,36 @@ fn hint_pixels(hints: &Hints, key: &str) -> Option<Arc<PixelIcon>> {
         channels,
         &data,
     )
-    .map(Arc::new)
+    .map(bounded_pixels)
+}
+
+/// Decode a file-path icon (`image-path` / `app_icon` with a path or
+/// `file://` URI) into bounded pixels HERE, on the untrusted side of the seam,
+/// so the render path never opens client-named files. Undecodable → no icon.
+fn load_file_icon(path: &std::path::Path) -> Option<Arc<PixelIcon>> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    let mut reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let img = reader.decode().ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(bounded_pixels(PixelIcon {
+        width,
+        height,
+        rgba: img.into_raw(),
+    }))
+}
+
+/// Convert any `File` icon to bounded pixels; `Themed` passes through.
+fn resolve_file_icon(icon: NotificationIcon) -> Option<NotificationIcon> {
+    match icon {
+        NotificationIcon::File(path) => load_file_icon(&path).map(NotificationIcon::Pixels),
+        other => Some(other),
+    }
 }
 
 /// The notification's own icon from the image hints, with gnome-shell's exact
@@ -176,29 +234,35 @@ impl Notifications {
         }
 
         // Action pairs; the special `default` id maps to body-click activation
-        // instead of a button (`js/ui/notificationDaemon.js:218-241`).
+        // instead of a button (`js/ui/notificationDaemon.js:218-241`). Keys and
+        // labels are display/wire strings from an untrusted client: clamped,
+        // labels flattened, and the pair count bounded (the UI shows at most 3;
+        // a few spares survive for replaces).
         let mut has_default_action = false;
         let mut action_pairs = Vec::new();
         for pair in actions.chunks_exact(2) {
             if pair[0] == "default" {
                 has_default_action = true;
-            } else {
-                action_pairs.push((pair[0].clone(), pair[1].clone()));
+            } else if action_pairs.len() < 16 {
+                action_pairs.push((
+                    clamp_text(pair[0].clone(), 1024),
+                    clamp_text(flatten_text(&pair[1]), 1024),
+                ));
             }
         }
 
         let req = NotifyRequest {
             sender: Some(sender),
             pid,
-            app_name,
+            app_name: clamp_text(flatten_text(&app_name), 1024),
             replaces_id,
-            desktop_entry: hint_str(&hints, "desktop-entry"),
-            source_icon: NotificationIcon::from_string(&app_icon),
+            desktop_entry: hint_str(&hints, "desktop-entry").map(|s| clamp_text(s, 255)),
+            source_icon: NotificationIcon::from_string(&app_icon).and_then(resolve_file_icon),
             // The summary displays verbatim in gnome-shell (escaped wholesale,
             // `js/ui/messageList.js:564-568`); only the body is markup-capable.
-            title: flatten_text(&summary),
-            body: sanitize_text(&body),
-            icon: notification_icon(&hints),
+            title: clamp_text(flatten_text(&summary), 4096),
+            body: clamp_text(sanitize_text(&body), 8192),
+            icon: notification_icon(&hints).and_then(resolve_file_icon),
             actions: action_pairs,
             has_default_action,
             // Absent urgency defaults to normal (`js/ui/notificationDaemon.js:144`).
@@ -315,22 +379,65 @@ impl Start for Notifications {
             .spawn(
                 async move {
                     while let Ok(msg) = from_niri.recv().await {
-                        let NiriToNotifications::Closed { id, reason, sender } = msg;
-                        let Some(sender) = sender else { continue };
-                        let Ok(dest) = BusName::try_from(sender.as_str()) else {
-                            continue;
-                        };
-                        if let Err(err) = emit_conn
-                            .emit_signal(
-                                Some(dest),
-                                PATH,
-                                BUS_NAME,
-                                "NotificationClosed",
-                                &(id, reason.wire_code()),
-                            )
-                            .await
-                        {
-                            warn!("notifications: error emitting NotificationClosed: {err:?}");
+                        match msg {
+                            NiriToNotifications::Closed { id, reason, sender } => {
+                                let Some(sender) = sender else { continue };
+                                let Ok(dest) = BusName::try_from(sender.as_str()) else {
+                                    continue;
+                                };
+                                if let Err(err) = emit_conn
+                                    .emit_signal(
+                                        Some(dest),
+                                        PATH,
+                                        BUS_NAME,
+                                        "NotificationClosed",
+                                        &(id, reason.wire_code()),
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        "notifications: error emitting NotificationClosed: \
+                                         {err:?}"
+                                    );
+                                }
+                            }
+                            NiriToNotifications::ActionInvoked {
+                                id,
+                                action,
+                                token,
+                                sender,
+                            } => {
+                                let Some(sender) = sender else { continue };
+                                let Ok(dest) = BusName::try_from(sender.as_str()) else {
+                                    continue;
+                                };
+                                // ActivationToken always immediately precedes
+                                // ActionInvoked (`js/ui/notificationDaemon.js:224-236`).
+                                if let Err(err) = emit_conn
+                                    .emit_signal(
+                                        Some(dest.clone()),
+                                        PATH,
+                                        BUS_NAME,
+                                        "ActivationToken",
+                                        &(id, token),
+                                    )
+                                    .await
+                                {
+                                    warn!("notifications: error emitting ActivationToken: {err:?}");
+                                }
+                                if let Err(err) = emit_conn
+                                    .emit_signal(
+                                        Some(dest),
+                                        PATH,
+                                        BUS_NAME,
+                                        "ActionInvoked",
+                                        &(id, action),
+                                    )
+                                    .await
+                                {
+                                    warn!("notifications: error emitting ActionInvoked: {err:?}");
+                                }
+                            }
                         }
                     }
                 },

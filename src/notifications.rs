@@ -164,6 +164,12 @@ pub enum NotificationIcon {
 impl NotificationIcon {
     /// gnome-shell's `_iconForNotificationData` (`js/ui/notificationDaemon.js:62-72`):
     /// `file://` URI or absolute path → file icon, anything else → themed name.
+    ///
+    /// A themed name is an untrusted string that the render-side icon cache
+    /// joins into theme directory paths — a name containing a path separator
+    /// (or an absurd length) would let a client walk the compositor out of the
+    /// icon dirs, so those are dropped here, on the untrusted side of the seam
+    /// (GTK's icon-theme lookup would simply fail to find them anyway).
     pub fn from_string(s: &str) -> Option<Self> {
         if s.is_empty() {
             return None;
@@ -173,6 +179,9 @@ impl NotificationIcon {
         }
         if s.starts_with('/') {
             return Some(NotificationIcon::File(PathBuf::from(s)));
+        }
+        if s.len() > 255 || s.contains(['/', '\\']) || s.contains("..") {
+            return None;
         }
         Some(NotificationIcon::Themed(s.to_owned()))
     }
@@ -325,6 +334,15 @@ pub enum NiriToNotifications {
     Closed {
         id: u32,
         reason: CloseReason,
+        sender: Option<String>,
+    },
+    /// Emits `ActivationToken(id, token)` immediately followed by
+    /// `ActionInvoked(id, action)` — always paired, token first
+    /// (`js/ui/notificationDaemon.js:224-236`).
+    ActionInvoked {
+        id: u32,
+        action: String,
+        token: String,
         sender: Option<String>,
     },
 }
@@ -702,6 +720,41 @@ impl NotificationStore {
         }
     }
 
+    /// A notification was activated (banner/card body click with a default
+    /// action, or an action button): destroyed unless resident, reason
+    /// DISMISSED (`js/ui/messageTray.js:431-447,475-492`).
+    pub fn activate(&mut self, id: u32) -> Effects {
+        match self.find(id) {
+            Some(n) if !n.resident => self.close(id, CloseReason::Dismissed),
+            _ => Effects::default(),
+        }
+    }
+
+    /// A body click with NO default action: gnome-shell runs `source.open()`,
+    /// which destroys ALL the source's non-resident notifications
+    /// (`js/ui/notificationDaemon.js:369-373`, `js/ui/messageTray.js:621-626`;
+    /// the app-focus half is deferred — we have no window tracker).
+    pub fn activate_source(&mut self, id: u32) -> Effects {
+        let Some(source) = self
+            .sources
+            .iter()
+            .find(|s| s.notifications.iter().any(|n| n.id == id))
+        else {
+            return Effects::default();
+        };
+        let ids: Vec<u32> = source
+            .notifications
+            .iter()
+            .filter(|n| !n.resident)
+            .map(|n| n.id)
+            .collect();
+        let mut effects = Effects::default();
+        for id in ids {
+            merge(&mut effects, self.close(id, CloseReason::Dismissed));
+        }
+        effects
+    }
+
     /// The shown banner finished hiding on its own (timeout/hover-out): the
     /// notification survives unless it's transient, which is destroyed with
     /// reason EXPIRED (`js/ui/messageTray.js:1279-1292`). Not called when the
@@ -727,6 +780,34 @@ fn merge(into: &mut Effects, other: Effects) {
     }
 }
 
+/// gnome-shell's relative-time buckets for the message time label
+/// (`js/misc/dateUtils.js:54-100` `formatTimeSpan`). Static per display —
+/// upstream's `TimeLabel` only refreshes on map, and so do we.
+pub fn format_time_span(elapsed: Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    let weeks = days / 7;
+    if minutes < 5 {
+        "Just now".to_owned()
+    } else if hours < 1 {
+        format!(
+            "{minutes} minute{} ago",
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else if days < 1 {
+        format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+    } else if days < 2 {
+        "Yesterday".to_owned()
+    } else if days < 15 {
+        format!("{days} days ago")
+    } else if weeks < 8 {
+        format!("{weeks} week{} ago", if weeks == 1 { "" } else { "s" })
+    } else {
+        format!("{weeks} weeks ago")
+    }
+}
+
 /// Newline flattening for untrusted TITLE text (`js/ui/messageList.js:564-568`).
 /// gnome-shell escapes the whole summary (`Util.fixMarkup(text, false)`), so a
 /// title displays verbatim — no tag stripping, no entity unescaping.
@@ -749,6 +830,21 @@ pub fn sanitize_text(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// Bound an untrusted display string. Every wire string that reaches the glyph
+/// pipeline is clamped on the server side of the seam — an unbounded
+/// title/label would otherwise buy a multi-megabyte glyph run (and a retained
+/// texture) on the compositor main loop for the price of one `Notify`.
+pub fn clamp_text(mut s: String, max_bytes: usize) -> String {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 #[cfg(test)]
@@ -1088,10 +1184,71 @@ mod tests {
     }
 
     #[test]
+    fn time_span_buckets_match_gnome() {
+        let m = |mins: u64| format_time_span(Duration::from_secs(mins * 60));
+        assert_eq!(m(0), "Just now");
+        assert_eq!(m(4), "Just now");
+        assert_eq!(m(5), "5 minutes ago");
+        assert_eq!(m(59), "59 minutes ago");
+        assert_eq!(m(60), "1 hour ago");
+        assert_eq!(m(23 * 60), "23 hours ago");
+        assert_eq!(m(24 * 60), "Yesterday");
+        assert_eq!(m(3 * 24 * 60), "3 days ago");
+        assert_eq!(m(15 * 24 * 60), "2 weeks ago");
+    }
+
+    #[test]
+    fn activate_and_activate_source_respect_resident() {
+        let mut store = NotificationStore::default();
+        let mut resident = req("app", ":1.1");
+        resident.resident = true;
+        let (res_id, _) = notify(&mut store, resident);
+        let (plain_id, _) = notify(&mut store, req("app", ":1.1"));
+
+        // Activating a resident notification keeps it.
+        assert!(store.activate(res_id).is_empty());
+        assert!(store.find(res_id).is_some());
+        // Body click with no default action closes all non-resident of the source.
+        let effects = store.activate_source(plain_id);
+        assert_eq!(effects.closed.len(), 1);
+        assert_eq!(effects.closed[0].id, plain_id);
+        assert_eq!(effects.closed[0].reason, CloseReason::Dismissed);
+        assert!(store.find(res_id).is_some());
+    }
+
+    #[test]
     fn sanitize_flattens_strips_and_unescapes() {
         assert_eq!(
             sanitize_text("a\nb <b>bold</b> &amp; &lt;kept&gt;"),
             "a b bold & <kept>"
         );
+    }
+
+    #[test]
+    fn clamp_text_respects_char_boundaries() {
+        assert_eq!(clamp_text("abcdef".to_owned(), 4), "abcd");
+        // 'é' is 2 bytes; clamping mid-char backs off to the boundary.
+        assert_eq!(clamp_text("aéé".to_owned(), 2), "a");
+        assert_eq!(clamp_text("short".to_owned(), 100), "short");
+    }
+
+    #[test]
+    fn themed_icon_names_with_path_components_are_dropped() {
+        // The render-side icon cache joins themed names into theme dir paths;
+        // separators or dot-dot would walk the compositor out of them.
+        assert!(NotificationIcon::from_string("../../etc/passwd").is_none());
+        assert!(NotificationIcon::from_string("a/b").is_none());
+        assert!(NotificationIcon::from_string("a\\b").is_none());
+        assert!(NotificationIcon::from_string(&"x".repeat(300)).is_none());
+        assert!(matches!(
+            NotificationIcon::from_string("software-update-available"),
+            Some(NotificationIcon::Themed(_))
+        ));
+        // Absolute paths and file:// URIs still classify as File (they are
+        // decoded, bounded, on the server side of the seam).
+        assert!(matches!(
+            NotificationIcon::from_string("/tmp/x.png"),
+            Some(NotificationIcon::File(_))
+        ));
     }
 }

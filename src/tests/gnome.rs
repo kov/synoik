@@ -3470,11 +3470,14 @@ fn notifications_notify_replace_and_close_via_handler() {
         f.niri().notifications.sources.is_empty(),
         "a source with zero notifications removes itself",
     );
-    let emitted = emitted.recv_blocking().unwrap();
-    let crate::notifications::NiriToNotifications::Closed { id, reason, sender } = emitted;
-    assert_eq!(id, 1);
-    assert_eq!(reason.wire_code(), 3);
-    assert_eq!(sender.as_deref(), Some(":1.7"));
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::Closed { id, reason, sender } => {
+            assert_eq!(id, 1);
+            assert_eq!(reason.wire_code(), 3);
+            assert_eq!(sender.as_deref(), Some(":1.7"));
+        }
+        _ => panic!("expected a Closed emission"),
+    }
 }
 
 /// Sender-vanish teardown (`js/ui/notificationDaemon.js:340-348`): only
@@ -3523,4 +3526,351 @@ fn notifications_sender_vanish_via_handler() {
     let sources = &f.niri().notifications.sources;
     assert_eq!(sources.len(), 1);
     assert!(matches!(sources[0].key, SourceKey::PidName(..)));
+}
+
+// ---- Notification banner (slice 2) ----
+
+fn banner_req(app: &str, sender: &str) -> crate::notifications::NotifyRequest {
+    crate::notifications::NotifyRequest {
+        sender: Some(sender.to_owned()),
+        pid: 100,
+        app_name: app.to_owned(),
+        replaces_id: 0,
+        desktop_entry: None,
+        source_icon: None,
+        title: "title".to_owned(),
+        body: "body".to_owned(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        urgency: crate::notifications::Urgency::Normal,
+        resident: false,
+        transient: false,
+    }
+}
+
+fn banner_notify(f: &mut Fixture, req: crate::notifications::NotifyRequest) -> u32 {
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(crate::notifications::NotificationsToNiri::Notify { req, reply });
+    rx.recv_blocking().unwrap().unwrap()
+}
+
+/// Pin the clock forward and advance — the banner's deadline authority is the
+/// pinned clock, not the wake-up timer (see the headless-animation-clock trap).
+fn tick(f: &mut Fixture, ms: u64) {
+    let niri = f.niri();
+    let now = niri.clock.now_unadjusted();
+    niri.clock.set_unadjusted(now + Duration::from_millis(ms));
+    niri.advance_animations();
+}
+
+/// The tray's own timing (`js/ui/messageTray.js:19,1279-1292`): a banner shows on
+/// notify, auto-hides after 4 s, and hiding destroys ONLY transient notifications.
+#[test]
+fn notification_banner_shows_and_expires() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // Activity: the user is not idle at show time.
+    f.pointer_motion(1., 1.);
+
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    assert!(f.niri().notification_banner.is_visible());
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    // Showing acknowledged it (`js/ui/messageTray.js:1167`).
+    assert!(f.niri().notifications.find(id).unwrap().acknowledged);
+    // The deadline is armed at the Showing->Shown transition inside
+    // advance_animations — the wake-up timer must be re-armed there too, or a
+    // banner over a damage-free desktop would never wake the loop to expire.
+    assert!(f.niri().notification_banner_timer.is_some());
+
+    // The 4 s timeout elapses -> hide -> the notification SURVIVES in the store.
+    tick(&mut f, 4100);
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_visible());
+    assert!(f.niri().notifications.find(id).is_some());
+
+    // A transient notification is destroyed by its banner hiding (EXPIRED).
+    // Fresh activity first: the pinned clock has drifted past the idle
+    // threshold, which would otherwise idle-gate the expiry (a real behavior,
+    // pinned by `notification_banner_idle_gates_expiry`). `notify_activity`
+    // runs once per event-loop iteration; clear the guard by hand since no
+    // real iteration boundary passes in this test.
+    f.niri().notified_activity_this_iteration = false;
+    f.pointer_motion(1., 1.);
+    let mut transient = banner_req("app", ":1.1");
+    transient.transient = true;
+    let tid = banner_notify(&mut f, transient);
+    f.settle_animations();
+    tick(&mut f, 4100);
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_visible());
+    assert!(f.niri().notifications.find(tid).is_none());
+}
+
+/// LOW never banners; DND suppresses all but CRITICAL, and CRITICAL never
+/// auto-expires (`js/ui/messageTray.js:932-936,1211-1214`).
+#[test]
+fn notification_banner_policy_low_dnd_critical() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let mut low = banner_req("app", ":1.1");
+    low.urgency = crate::notifications::Urgency::Low;
+    banner_notify(&mut f, low);
+    assert!(!f.niri().notification_banner.is_visible());
+
+    f.niri().gnome_settings.quick_toggles.do_not_disturb = true;
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    assert!(!f.niri().notification_banner.is_visible());
+
+    let mut critical = banner_req("app", ":1.1");
+    critical.urgency = crate::notifications::Urgency::Critical;
+    let cid = banner_notify(&mut f, critical);
+    assert!(f.niri().notification_banner.is_visible());
+    f.settle_animations();
+    // No deadline: still up long past the normal timeout.
+    tick(&mut f, 60_000);
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(cid));
+}
+
+/// The queue drains highest-urgency-first once the current banner expires
+/// (`js/ui/messageTray.js:951-953,1070-1086`).
+#[test]
+fn notification_banner_queue_drains_urgency_first() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let first = banner_notify(&mut f, banner_req("app", ":1.1"));
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    let mut critical = banner_req("app", ":1.1");
+    critical.urgency = crate::notifications::Urgency::Critical;
+    let crit = banner_notify(&mut f, critical);
+
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(first));
+    tick(&mut f, 4100);
+    f.settle_animations();
+    // The critical one jumped the queue.
+    assert_eq!(f.niri().notification_banner.content_id(), Some(crit));
+}
+
+/// A replace re-enters banner admission: a dismissed-and-acked notification
+/// banners again (`js/ui/messageTray.js:589-595`), and replacing the shown one
+/// refreshes it in place and re-acks (`:938-943,1166-1168`).
+#[test]
+fn notification_banner_replace_rebanners() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    tick(&mut f, 4100);
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_visible());
+
+    // Replace the now-hidden, acked notification: it banners again.
+    let mut update = banner_req("app", ":1.1");
+    update.replaces_id = id;
+    assert_eq!(banner_notify(&mut f, update), id);
+    assert!(f.niri().notification_banner.is_visible());
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+
+    // Replace while showing: stays visible, re-acked (never counts unseen).
+    let mut update = banner_req("app", ":1.1");
+    update.replaces_id = id;
+    update.title = "updated".to_owned();
+    assert_eq!(banner_notify(&mut f, update), id);
+    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.niri().notifications.find(id).unwrap().acknowledged);
+    assert_eq!(f.niri().notifications.unseen_count(), 0);
+
+    // Replace while the banner is mid-hide: "we stop hiding it and show it
+    // again" (`js/ui/messageTray.js:938-943`). Fresh activity first so the
+    // deadline is armed, then let it lapse to start the hide animation.
+    f.niri().notified_activity_this_iteration = false;
+    f.pointer_motion(1., 1.);
+    tick(&mut f, 2100);
+    assert!(f.niri().notification_banner.is_visible()); // Hiding, not yet gone
+    let mut update = banner_req("app", ":1.1");
+    update.replaces_id = id;
+    update.title = "updated again".to_owned();
+    assert_eq!(banner_notify(&mut f, update), id);
+    f.settle_animations();
+    assert!(f.niri().notification_banner.is_visible());
+    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+}
+
+/// Clicking the close button destroys DISMISSED and the owed NotificationClosed
+/// emission reaches the server channel (`js/ui/messageList.js:725-728`).
+#[test]
+fn notification_banner_close_click_dismisses() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+    let (tx, emitted) = async_channel::unbounded();
+    f.niri().notifications_emit = Some(tx);
+
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+
+    // Banner geometry: 34em wide centered, y = panel(32) + margin(4); the close
+    // circle (28px) sits PAD from the right edge, centered in the header row.
+    let em = 11. * 4. / 3.;
+    let w = 34. * em;
+    let x0 = (1920. - w) / 2.;
+    let close_x = x0 + w - 6. - 14.;
+    let close_y = 36. + 6. + 12.;
+    pointer_motion_to(&mut f, close_x, close_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(!f.niri().notification_banner.is_visible());
+    assert!(f.niri().notifications.find(id).is_none());
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::Closed {
+            id: cid, reason, ..
+        } => {
+            assert_eq!(cid, id);
+            assert_eq!(reason.wire_code(), 2, "close button = DISMISSED");
+        }
+        _ => panic!("expected a Closed emission"),
+    }
+}
+
+/// Clicking an action button emits ActivationToken+ActionInvoked (as one paired
+/// command with a real token) and destroys the non-resident notification
+/// (`js/ui/notificationDaemon.js:218-241`, `js/ui/messageTray.js:431-447`).
+#[test]
+fn notification_banner_action_click_emits_and_dismisses() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+    let (tx, emitted) = async_channel::unbounded();
+    f.niri().notifications_emit = Some(tx);
+
+    let mut req = banner_req("app", ":1.1");
+    req.actions = vec![("ok".to_owned(), "OK".to_owned())];
+    let id = banner_notify(&mut f, req);
+    f.settle_animations();
+
+    // Single action button: centered in the action row below the body block.
+    let action_y = 36. + 6. + 24. + 6. + 48. + 6. + 14.;
+    pointer_motion_to(&mut f, 960., action_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(f.niri().notifications.find(id).is_none());
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::ActionInvoked {
+            id: aid,
+            action,
+            token,
+            sender,
+        } => {
+            assert_eq!(aid, id);
+            assert_eq!(action, "ok");
+            assert!(!token.is_empty(), "a real activation token is minted");
+            assert_eq!(sender.as_deref(), Some(":1.1"));
+        }
+        _ => panic!("expected an ActionInvoked emission"),
+    }
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::Closed { reason, .. } => {
+            assert_eq!(reason.wire_code(), 2);
+        }
+        _ => panic!("expected a Closed emission"),
+    }
+}
+
+/// While a panel popover is open the banner is blocked; queued banners show
+/// once it closes (GNOME blocks for the dateMenu box; blocking for QS too is a
+/// recorded divergence).
+#[test]
+fn notification_banner_blocked_by_open_popover() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    assert!(f.niri().notification_banner.is_visible());
+
+    // Open the calendar via a clock click (panel y < banner y: no overlap).
+    pointer_motion_to(&mut f, 960., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.niri().panel_popover.is_open());
+    f.settle_animations();
+    f.settle_animations();
+    assert!(
+        !f.niri().notification_banner.is_visible(),
+        "banners are blocked while a popover is open"
+    );
+
+    // A notification arriving while blocked stays queued.
+    let queued = banner_notify(&mut f, banner_req("other", ":1.2"));
+    assert!(!f.niri().notification_banner.is_visible());
+
+    // Closing the popover drains the queue.
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.settle_animations();
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(queued));
+}
+
+/// A banner shown while the user is idle never expires until their first
+/// activity, which arms a 2 s deadline (`js/ui/messageTray.js:1092-1133`).
+#[test]
+fn notification_banner_idle_gates_expiry() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // No activity while the pinned clock runs 5 s ahead: the user is idle.
+    tick(&mut f, 5000);
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+
+    // Long past the normal timeout, still up: waiting for the user.
+    tick(&mut f, 30_000);
+    f.settle_animations();
+    assert!(f.niri().notification_banner.is_visible());
+
+    // First activity arms the 2 s deadline.
+    f.pointer_motion(1., 1.);
+    tick(&mut f, 2500);
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_visible());
+    assert!(f.niri().notifications.find(id).is_some());
+}
+
+/// Activity while the banner is still sliding in also resolves the idle gate:
+/// the Showing->Shown transition then arms the short 2 s timeout (GNOME's
+/// user-active watch fires during the show animation just the same,
+/// `js/ui/messageTray.js:1118-1122`).
+#[test]
+fn notification_banner_activity_during_show_arms_short_timeout() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Idle at show time; activity arrives while the banner is still Showing.
+    tick(&mut f, 5000);
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    assert!(f.niri().notification_banner.is_visible());
+    f.pointer_motion(1., 1.);
+    f.settle_animations();
+    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+
+    // The short timeout applies — without the fix this waited forever.
+    tick(&mut f, 2500);
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_visible());
 }

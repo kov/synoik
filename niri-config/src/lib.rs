@@ -1633,6 +1633,17 @@ mod tests {
                         ),
                     },
                 ),
+                notification_open_close: NotificationOpenCloseAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 200,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
                 overview_open_close: OverviewOpenCloseAnim(
                     Animation {
                         off: false,

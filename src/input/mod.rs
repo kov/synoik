@@ -855,6 +855,41 @@ impl State {
     /// Apply a quick-settings popover click outcome: write the backing gsettings
     /// key (mirrored locally so the tile and the panel indicator update before the
     /// change round-trips through the watcher), or spawn a system-row command.
+    /// A click landed inside the shown notification banner: gnome-shell's exact
+    /// semantics — close destroys DISMISSED even resident
+    /// (`js/ui/messageList.js:725-728`); an action button (or a body click with
+    /// a `default` action) emits ActivationToken+ActionInvoked and destroys
+    /// unless resident (`js/ui/messageTray.js:431-447,475-492`); a body click
+    /// with no default action runs `source.open()`'s destroy-all-non-resident
+    /// (app focus deferred, `js/ui/notificationDaemon.js:369-373`).
+    fn on_banner_hit(&mut self, hit: crate::ui::notification_banner::BannerHit) {
+        use crate::notifications::CloseReason;
+        use crate::ui::notification_banner::BannerHit;
+
+        let Some(id) = self.niri.notification_banner.content_id() else {
+            return;
+        };
+        let effects = match hit {
+            BannerHit::Close => self.niri.notifications.close(id, CloseReason::Dismissed),
+            BannerHit::Action(idx) => {
+                let Some(action) = self.niri.notification_banner.action_key(idx) else {
+                    return;
+                };
+                self.niri.emit_notification_action(id, action);
+                self.niri.notifications.activate(id)
+            }
+            BannerHit::Body => {
+                if self.niri.notification_banner.has_default_action() {
+                    self.niri.emit_notification_action(id, "default".to_owned());
+                    self.niri.notifications.activate(id)
+                } else {
+                    self.niri.notifications.activate_source(id)
+                }
+            }
+        };
+        self.niri.apply_notification_effects(effects);
+    }
+
     fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
         use crate::ui::popover::PopoverAction;
 
@@ -2850,6 +2885,18 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
+        // Hovering the notification banner holds its expiry; leaving restarts
+        // the countdown (`js/ui/messageTray.js:970-1050`, simplified).
+        if self.niri.layout.is_gnome_mode() {
+            let inside = self
+                .niri
+                .output_under(pos)
+                .is_some_and(|(output, p)| self.niri.notification_banner.pointer_inside(output, p));
+            if self.niri.notification_banner.set_hovered(inside) {
+                self.niri.reschedule_notification_banner_timer();
+            }
+        }
+
         // While a quick-settings slider is being dragged, route motion to it.
         if self.niri.panel_popover.is_open() {
             if let Some((output, p)) = self.niri.output_under(pos).map(|(o, p)| (o.clone(), p)) {
@@ -3326,6 +3373,23 @@ impl State {
                     }
                     self.niri.queue_redraw_all();
                     return;
+                }
+
+                // A shown notification banner takes left clicks inside it (close button,
+                // action buttons, body-activate); clicks elsewhere pass through — banners
+                // never grab (`js/ui/messageList.js:730-736`, `js/ui/messageTray.js`).
+                // DIVERGENCE: only left clicks are intercepted — middle/right clicks and
+                // scrolls inside the banner still reach the window under it, where
+                // GNOME's banner actor would swallow them. Recorded in the plan.
+                if button == Some(MouseButton::Left) {
+                    if let Some((output, pos)) = &under {
+                        if let Some(hit) = self.niri.notification_banner.hit_test(output, *pos) {
+                            self.niri.suppressed_buttons.insert(button_code);
+                            self.on_banner_hit(hit);
+                            self.niri.queue_redraw_all();
+                            return;
+                        }
+                    }
                 }
 
                 // A left-click on a panel button: the workspace indicator toggles the overview

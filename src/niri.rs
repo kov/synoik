@@ -390,6 +390,11 @@ pub struct Niri {
     /// server isn't running.
     pub notifications_emit:
         Option<async_channel::Sender<crate::notifications::NiriToNotifications>>,
+    /// The on-screen notification banner (gnome-shell's MessageTray popup).
+    pub notification_banner: crate::ui::notification_banner::NotificationBanner,
+    /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
+    /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
+    pub notification_banner_timer: Option<RegistrationToken>,
     /// Default audio-sink state (volume + mute) for the panel output indicator and
     /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
     pub audio: Option<crate::audio::AudioStatus>,
@@ -2711,24 +2716,9 @@ impl State {
         }
     }
 
-    /// Apply a store mutation's [`Effects`](crate::notifications::Effects): hand the
-    /// owed signal emissions to the server task (which owns the connection and
-    /// emits unicast). The banner effect is consumed by the banner overlay (next
-    /// slice); nothing renders notifications yet.
+    /// See [`Niri::apply_notification_effects`].
     pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
-        use crate::notifications::NiriToNotifications;
-        if effects.is_empty() {
-            return;
-        }
-        if let Some(tx) = &self.niri.notifications_emit {
-            for closed in effects.closed {
-                let _ = tx.send_blocking(NiriToNotifications::Closed {
-                    id: closed.id,
-                    reason: closed.reason,
-                    sender: closed.sender,
-                });
-            }
-        }
+        self.niri.apply_notification_effects(effects);
     }
 
     /// gnome-session's `EndSessionDialog.Open`/`Close` land here (see `dbus::gnome_session`): raise
@@ -3008,6 +2998,10 @@ impl Niri {
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+        let notification_banner = crate::ui::notification_banner::NotificationBanner::new(
+            animation_clock.clone(),
+            config.clone(),
+        );
 
         let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
         if !config_.hotkey_overlay.skip_at_startup {
@@ -3186,6 +3180,8 @@ impl Niri {
             system_status: SystemStatus::default(),
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,
+            notification_banner,
+            notification_banner_timer: None,
             last_power_profile: "power-saver".to_string(),
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
@@ -3495,6 +3491,10 @@ impl Niri {
 
         self.layout.add_output(output.clone(), layout_config);
 
+        // A banner orphaned when its output (and every fallback) disappeared
+        // adopts the first output that returns.
+        self.notification_banner.adopt_output(&output);
+
         let lock_render_state = if self.is_locked() {
             // We haven't rendered anything yet so it's as good as locked.
             LockRenderState::Locked
@@ -3564,6 +3564,12 @@ impl Niri {
         self.stop_casts_for_target(CastTarget::output(output));
         self.stop_native_recordings_for_output(output);
         self.screencopy_state.remove_output(output);
+
+        // A banner shown on the removed output moves to the new active output
+        // (GNOME re-parents to the new primary) — a marooned CRITICAL banner
+        // would otherwise be unclickable and jam the queue forever.
+        let fallback = self.layout.active_output().cloned();
+        self.notification_banner.retarget_output(output, fallback);
 
         // Disable the output global and remove some time later to give the clients some time to
         // process it.
@@ -4793,6 +4799,34 @@ impl Niri {
         let _span = tracy_client::span!("Niri::advance_animations");
 
         self.layout.advance_animations();
+
+        // Banners are blocked while a panel popover is open; syncing here (once per
+        // frame) covers every open/close path with a single site. The drain check
+        // below re-shows queued banners once the popover closes.
+        self.notification_banner
+            .set_blocked(self.panel_popover.is_open());
+        if self.notification_banner.can_show() && !self.notifications.banner_queue.is_empty() {
+            self.maybe_show_banner();
+        }
+        let banner_wakeup = self.notification_banner.next_wakeup();
+        if let Some(event) = self.notification_banner.advance_animations() {
+            use crate::ui::notification_banner::BannerEvent;
+            if event == BannerEvent::HiddenNaturally {
+                // The natural-hide path destroys transient notifications
+                // (reason EXPIRED); a model-removed hide must not double-close.
+                let effects = self.notifications.banner_hidden();
+                self.apply_notification_effects(effects);
+            }
+            self.maybe_show_banner();
+        }
+        // The expiry deadline is armed inside the banner's `advance_animations`
+        // (at the Showing→Shown transition) — the ONLY site that knows about it
+        // is this comparison, so without it the wake-up timer is never armed and
+        // a banner over a static (damage-free) desktop would outlive its 4 s.
+        if self.notification_banner.next_wakeup() != banner_wakeup {
+            self.reschedule_notification_banner_timer();
+        }
+
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
@@ -5074,6 +5108,14 @@ impl Niri {
             // bar; the quick-settings menu composites several elements (chrome + icons).
             for element in self
                 .panel_popover
+                .render(ctx.renderer, &self.icon_cache, output)
+            {
+                push(element.into());
+            }
+            // The notification banner slides out from under the bar (pushed after
+            // the panel = below it in z, like gnome-shell's tray behind the panel).
+            for element in self
+                .notification_banner
                 .render(ctx.renderer, &self.icon_cache, output)
             {
                 push(element.into());
@@ -5444,6 +5486,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
@@ -7473,7 +7516,146 @@ impl Niri {
         self.emit_idle_watch_fired(&fired);
         self.reschedule_idle_monitor_timer();
 
+        // A banner shown while the user was idle arms its (shorter) expiry on
+        // their first activity (`js/ui/messageTray.js:1118-1122`).
+        if self.notification_banner.on_activity() {
+            self.reschedule_notification_banner_timer();
+        }
+
         self.notified_activity_this_iteration = true;
+    }
+
+    /// Apply a store mutation's [`Effects`](crate::notifications::Effects): hand the
+    /// owed signal emissions to the server task (which owns the connection and emits
+    /// unicast), and drive the banner surface.
+    pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
+        use crate::notifications::{BannerEffect, NiriToNotifications};
+        use crate::ui::notification_banner::content_for;
+
+        if let Some(tx) = &self.notifications_emit {
+            for closed in &effects.closed {
+                let _ = tx.send_blocking(NiriToNotifications::Closed {
+                    id: closed.id,
+                    reason: closed.reason,
+                    sender: closed.sender.clone(),
+                });
+            }
+        }
+
+        match effects.banner {
+            Some(BannerEffect::RefreshCurrent) => {
+                // The shown notification was replaced in place: refresh content
+                // and re-arm the timeout (`js/ui/messageTray.js:938-943`).
+                if let Some(id) = self.notification_banner.content_id() {
+                    let now = self.clock.now_unadjusted();
+                    if let Some(content) = content_for(&self.notifications, id, now) {
+                        let idle = self.user_is_idle();
+                        self.notification_banner.refresh(content, idle);
+                        self.reschedule_notification_banner_timer();
+                    }
+                }
+                self.queue_redraw_all();
+            }
+            Some(BannerEffect::HideCurrent) => {
+                // The model already destroyed the shown notification: hide
+                // without animation and never double-destroy a transient
+                // (`js/ui/messageTray.js:909-917,1282`), then drain the queue.
+                self.notification_banner.hide_removed();
+                self.reschedule_notification_banner_timer();
+                self.maybe_show_banner();
+                self.queue_redraw_all();
+            }
+            Some(BannerEffect::QueueChanged) => {
+                self.maybe_show_banner();
+                self.queue_redraw_all();
+            }
+            None => {
+                // Mutations that don't re-enter banner admission (e.g. a
+                // replace to LOW urgency) must still update the shown content —
+                // GNOME's banner widget live-binds the notification properties.
+                if let Some(id) = self.notification_banner.content_id() {
+                    let now = self.clock.now_unadjusted();
+                    if let Some(content) = content_for(&self.notifications, id, now) {
+                        self.notification_banner.sync_content(content);
+                        self.queue_redraw_all();
+                    }
+                }
+            }
+        }
+    }
+
+    fn user_is_idle(&mut self) -> bool {
+        let now = self.clock.now_unadjusted();
+        self.idle_monitor.idletime_ms(now) > crate::ui::notification_banner::IDLE_TIME_MS
+    }
+
+    /// Emit `ActivationToken` + `ActionInvoked` (in that order, unicast to the
+    /// notification's sender) for a clicked action. The token is a real XDG
+    /// activation token, so the app can activate itself with it
+    /// (`js/ui/notificationDaemon.js:224-236,310-316`).
+    pub fn emit_notification_action(&mut self, id: u32, action: String) {
+        use crate::notifications::NiriToNotifications;
+        let sender = self.notifications.find(id).and_then(|n| n.sender.clone());
+        let (token, _) = self.activation_state.create_external_token(None);
+        let token = token.as_str().to_owned();
+        if let Some(tx) = &self.notifications_emit {
+            let _ = tx.send_blocking(NiriToNotifications::ActionInvoked {
+                id,
+                action,
+                token,
+                sender,
+            });
+        }
+    }
+
+    /// Pop and show the next queued banner if the surface is free (hidden, no
+    /// popover open, GNOME mode, an output to show on).
+    pub fn maybe_show_banner(&mut self) {
+        if !self.layout.is_gnome_mode() || !self.notification_banner.can_show() {
+            return;
+        }
+        // The active output stands in for GNOME's primary monitor
+        // (`js/ui/messageTray.js:709-729`), fixed for the banner's lifetime.
+        let Some(output) = self.layout.active_output().cloned() else {
+            return;
+        };
+        let Some(id) = self.notifications.pop_next_banner() else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let Some(content) =
+            crate::ui::notification_banner::content_for(&self.notifications, id, now)
+        else {
+            return;
+        };
+        let idle = self.user_is_idle();
+        self.notification_banner.show(content, output, idle);
+        self.reschedule_notification_banner_timer();
+        self.queue_redraw_all();
+    }
+
+    /// Re-arm the banner's expiry wake-up to its current deadline (or cancel it).
+    /// The deadline itself is checked against the (pinnable) clock in
+    /// `advance_animations`; this timer only wakes an otherwise idle loop.
+    pub fn reschedule_notification_banner_timer(&mut self) {
+        if let Some(token) = self.notification_banner_timer.take() {
+            self.event_loop.remove(token);
+        }
+        let Some(deadline) = self.notification_banner.next_wakeup() else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let timer = Timer::from_duration(deadline.saturating_sub(now));
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.notification_banner_timer = None;
+                // The frame's advance_animations re-checks the deadline.
+                state.niri.queue_redraw_all();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.notification_banner_timer = Some(token);
     }
 
     /// Re-arm the single idle-watch timer to the earliest pending deadline (or cancel it if none).
