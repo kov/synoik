@@ -21,6 +21,7 @@ pub mod keyboard_layout;
 pub mod layer;
 pub mod layout;
 pub mod niri;
+pub mod notifications;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
 pub mod protocols;

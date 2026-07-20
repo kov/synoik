@@ -3381,3 +3381,146 @@ fn shell_screencast_dbus_start_and_stop() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The `org.freedesktop.Notifications` request path (`js/ui/notificationDaemon.js`
+/// `NotifyAsync`/`CloseNotification` + the fdo proxy's per-sender id checks,
+/// `js/dbusServices/notifications/notificationDaemon.js:76-90`), driven straight
+/// through `on_notifications_msg` the way the calloop channel would deliver it.
+#[test]
+fn notifications_notify_replace_and_close_via_handler() {
+    use crate::notifications::{NotificationsToNiri, NotifyRequest, Urgency};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let req = |app: &str, sender: &str, replaces: u32| NotifyRequest {
+        sender: Some(sender.to_owned()),
+        pid: 100,
+        app_name: app.to_owned(),
+        replaces_id: replaces,
+        desktop_entry: None,
+        source_icon: None,
+        title: "title".to_owned(),
+        body: "body".to_owned(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        urgency: Urgency::Normal,
+        resident: false,
+        transient: false,
+    };
+
+    // Notify allocates ids from 1 and stores the notification.
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify {
+            req: req("app", ":1.7", 0),
+            reply,
+        });
+    assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
+    assert_eq!(f.niri().notifications.sources.len(), 1);
+    assert_eq!(f.niri().notifications.find(1).unwrap().title, "title");
+
+    // Replace (same sender) mutates in place, same id, no new notification.
+    let mut update = req("app", ":1.7", 1);
+    update.title = "updated".to_owned();
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify { req: update, reply });
+    assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
+    assert_eq!(f.niri().notifications.sources[0].notifications.len(), 1);
+    assert_eq!(f.niri().notifications.find(1).unwrap().title, "updated");
+
+    // Replace from a different sender is rejected (the fdo proxy's
+    // "Invalid notification ID").
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify {
+            req: req("evil", ":1.66", 1),
+            reply,
+        });
+    assert!(rx.recv_blocking().unwrap().is_err());
+
+    // CloseNotification: foreign sender rejected, own sender destroys and the
+    // owed NotificationClosed emission (reason 3 = the app asked) reaches the
+    // server's emit channel.
+    let (to_notifications, emitted) = async_channel::unbounded();
+    f.niri_state().niri.notifications_emit = Some(to_notifications);
+
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Close {
+            id: 1,
+            sender: ":1.66".to_owned(),
+            reply,
+        });
+    assert!(rx.recv_blocking().unwrap().is_err());
+    assert!(f.niri().notifications.find(1).is_some());
+
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Close {
+            id: 1,
+            sender: ":1.7".to_owned(),
+            reply,
+        });
+    assert_eq!(rx.recv_blocking().unwrap(), Ok(()));
+    assert!(f.niri().notifications.find(1).is_none());
+    assert!(
+        f.niri().notifications.sources.is_empty(),
+        "a source with zero notifications removes itself",
+    );
+    let emitted = emitted.recv_blocking().unwrap();
+    let crate::notifications::NiriToNotifications::Closed { id, reason, sender } = emitted;
+    assert_eq!(id, 1);
+    assert_eq!(reason.wire_code(), 3);
+    assert_eq!(sender.as_deref(), Some(":1.7"));
+}
+
+/// Sender-vanish teardown (`js/ui/notificationDaemon.js:340-348`): only
+/// app-keyed (desktop-entry) sources die with their sender; pid-keyed
+/// `notify-send`-style sources survive.
+#[test]
+fn notifications_sender_vanish_via_handler() {
+    use crate::notifications::{NotificationsToNiri, NotifyRequest, SourceKey, Urgency};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let mut app = NotifyRequest {
+        sender: Some(":1.9".to_owned()),
+        pid: 100,
+        app_name: "App".to_owned(),
+        replaces_id: 0,
+        desktop_entry: Some("org.example.App".to_owned()),
+        source_icon: None,
+        title: "t".to_owned(),
+        body: String::new(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        urgency: Urgency::Normal,
+        resident: false,
+        transient: false,
+    };
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify {
+            req: app.clone(),
+            reply,
+        });
+    rx.recv_blocking().unwrap().unwrap();
+
+    app.desktop_entry = None;
+    app.app_name = "notify-send".to_owned();
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify { req: app, reply });
+    rx.recv_blocking().unwrap().unwrap();
+
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::SenderVanished(":1.9".to_owned()));
+    let sources = &f.niri().notifications.sources;
+    assert_eq!(sources.len(), 1);
+    assert!(matches!(sources[0].key, SourceKey::PidName(..)));
+}

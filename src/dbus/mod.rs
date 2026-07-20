@@ -6,6 +6,7 @@ use crate::niri::State;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
+pub mod freedesktop_notifications;
 pub mod freedesktop_screensaver;
 pub mod gnome_session;
 pub mod gnome_shell;
@@ -25,6 +26,7 @@ pub mod mutter_screen_cast;
 use mutter_screen_cast::ScreenCast;
 
 use self::freedesktop_a11y::KeyboardMonitor;
+use self::freedesktop_notifications::Notifications;
 use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
@@ -51,6 +53,7 @@ pub struct DBusServers {
     pub conn_screen_cast: Option<Connection>,
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_shell_screencast: Option<Connection>,
+    pub conn_notifications: Option<Connection>,
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
@@ -211,6 +214,20 @@ impl DBusServers {
             if let Some(x) = try_start(keyboard_monitor.clone()) {
                 dbus.conn_keyboard_monitor = Some(x);
                 niri.a11y_keyboard_monitor = Some(keyboard_monitor);
+            }
+
+            let (to_niri, from_notifications) = calloop::channel::channel();
+            let (to_notifications, from_niri) = async_channel::unbounded();
+            niri.event_loop
+                .insert_source(from_notifications, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_notifications_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let notifications = Notifications::new(to_niri, from_niri);
+            if let Some(conn) = try_start(notifications) {
+                dbus.conn_notifications = Some(conn);
+                niri.notifications_emit = Some(to_notifications);
             }
         }
 

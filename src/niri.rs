@@ -381,6 +381,15 @@ pub struct Niri {
     /// (not re-read from the gsettings model, which the watcher rebuilds from defaults on
     /// every unrelated change).
     pub last_power_profile: String,
+    /// The notifications model behind the banner/list/indicator surfaces and the
+    /// `org.freedesktop.Notifications` server (empty when the server isn't running,
+    /// e.g. headless or without the `dbus` feature).
+    pub notifications: crate::notifications::NotificationStore,
+    /// Emit-command channel back to the notifications server task, which owns the
+    /// bus connection and performs the (unicast) signal emission; `None` when the
+    /// server isn't running.
+    pub notifications_emit:
+        Option<async_channel::Sender<crate::notifications::NiriToNotifications>>,
     /// Default audio-sink state (volume + mute) for the panel output indicator and
     /// the QS volume slider; `None` until the PipeWire watcher binds a sink.
     pub audio: Option<crate::audio::AudioStatus>,
@@ -2664,6 +2673,64 @@ impl State {
         }
     }
 
+    /// `org.freedesktop.Notifications` requests land here (see
+    /// `dbus::freedesktop_notifications`): mutate the store, reply, and apply the
+    /// returned effects (signal emissions + banner-surface changes).
+    pub fn on_notifications_msg(&mut self, msg: crate::notifications::NotificationsToNiri) {
+        use crate::notifications::NotificationsToNiri;
+        match msg {
+            NotificationsToNiri::Notify { req, reply } => {
+                let now = self.niri.clock.now_unadjusted();
+                // DND is the inverse of `show-banners` (the Q11 QS toggle).
+                let show_banners = !self.niri.gnome_settings.quick_toggles.do_not_disturb;
+                match self.niri.notifications.notify(req, show_banners, now) {
+                    Ok((id, effects)) => {
+                        let _ = reply.send_blocking(Ok(id));
+                        self.apply_notification_effects(effects);
+                    }
+                    Err(err) => {
+                        let _ = reply.send_blocking(Err(err));
+                    }
+                }
+            }
+            NotificationsToNiri::Close { id, sender, reply } => {
+                match self.niri.notifications.close_checked(id, &sender) {
+                    Ok(effects) => {
+                        let _ = reply.send_blocking(Ok(()));
+                        self.apply_notification_effects(effects);
+                    }
+                    Err(err) => {
+                        let _ = reply.send_blocking(Err(err));
+                    }
+                }
+            }
+            NotificationsToNiri::SenderVanished(name) => {
+                let effects = self.niri.notifications.sender_vanished(&name);
+                self.apply_notification_effects(effects);
+            }
+        }
+    }
+
+    /// Apply a store mutation's [`Effects`](crate::notifications::Effects): hand the
+    /// owed signal emissions to the server task (which owns the connection and
+    /// emits unicast). The banner effect is consumed by the banner overlay (next
+    /// slice); nothing renders notifications yet.
+    pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
+        use crate::notifications::NiriToNotifications;
+        if effects.is_empty() {
+            return;
+        }
+        if let Some(tx) = &self.niri.notifications_emit {
+            for closed in effects.closed {
+                let _ = tx.send_blocking(NiriToNotifications::Closed {
+                    id: closed.id,
+                    reason: closed.reason,
+                    sender: closed.sender,
+                });
+            }
+        }
+    }
+
     /// gnome-session's `EndSessionDialog.Open`/`Close` land here (see `dbus::gnome_session`): raise
     /// or dismiss the logout/shutdown/restart confirmation. Confirm/cancel come from input, not the
     /// bus (`confirm_end_session`/`cancel_end_session`).
@@ -3117,6 +3184,8 @@ impl Niri {
             #[cfg(feature = "pipewire")]
             pw_audio: None,
             system_status: SystemStatus::default(),
+            notifications: crate::notifications::NotificationStore::default(),
+            notifications_emit: None,
             last_power_profile: "power-saver".to_string(),
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
