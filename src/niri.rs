@@ -7530,7 +7530,7 @@ impl Niri {
     /// unicast), and drive the banner surface.
     pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
         use crate::notifications::{BannerEffect, NiriToNotifications};
-        use crate::ui::notification_banner::content_for;
+        use crate::ui::notification_card::content_for;
 
         if let Some(tx) = &self.notifications_emit {
             for closed in &effects.closed {
@@ -7623,8 +7623,7 @@ impl Niri {
             return;
         };
         let now = self.clock.now_unadjusted();
-        let Some(content) =
-            crate::ui::notification_banner::content_for(&self.notifications, id, now)
+        let Some(content) = crate::ui::notification_card::content_for(&self.notifications, id, now)
         else {
             return;
         };

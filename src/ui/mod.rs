@@ -5,6 +5,7 @@ pub mod exit_confirm_dialog;
 pub mod hotkey_overlay;
 pub mod mru;
 pub mod notification_banner;
+pub mod notification_card;
 pub mod panel;
 pub mod popover;
 pub mod quick_settings;
