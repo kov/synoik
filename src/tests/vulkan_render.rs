@@ -2201,6 +2201,7 @@ fn vulkan_renders_the_calendar_popover() {
             cal.week_start,
             cal.show_week_numbers,
             accent,
+            Vec::new(),
         );
     }
     assert!(f.niri().panel_popover.is_open());
@@ -2242,6 +2243,111 @@ fn vulkan_renders_the_calendar_popover() {
         opaque > 0,
         "the calendar popover did not composite any opaque pixels on Vulkan"
     );
+}
+
+/// With a notification in the store, the calendar popover's message-list
+/// column composites the card: `.message`-bg pixels (#51515a — distinctly
+/// lighter than the popover box) must appear in the LEFT column, left of the
+/// calendar (`js/ui/dateMenu.js:917-940` puts the list first).
+#[test]
+fn vulkan_renders_the_message_list_card() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        let card = crate::ui::notification_card::CardContent {
+            id: 1,
+            source_title: "App".to_owned(),
+            source_icon: None,
+            title: "hello".to_owned(),
+            body: "world".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "Just now".to_owned(),
+        };
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            vec![card],
+        );
+    }
+    f.settle_animations();
+
+    let state = f.niri_state();
+    let origin = state.niri.panel_popover.content_location(&output);
+    let (_, card_rect, close_rect) = state.niri.panel_popover.date_menu().unwrap().card_rects()[0];
+    let close_icon_available = state
+        .niri
+        .icon_cache
+        .resolve("window-close-symbolic")
+        .is_some();
+    let (card_px, close_px) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 500.);
+            // The element list is top-to-bottom; `render_to_vec` paints in
+            // iteration order (bottom first), so reverse — like every capture
+            // path does.
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((w, h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elems.into_iter().rev(),
+            )
+            .expect("render popover");
+            let sample = |x: f64, y: f64| {
+                let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                let i = ((py * w + px) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+            // The card's lower area: must be the .message bg (#51515a), not
+            // the popover box (#1a1a1a).
+            let card_px = sample(
+                card_rect.loc.x + card_rect.size.w / 2.,
+                card_rect.loc.y + card_rect.size.h - 8.,
+            );
+            // The close button's center: the white × glyph composites ON TOP
+            // of the card (element order is top-to-bottom — a card pushed
+            // before its icons would bury them).
+            let close_px = sample(
+                close_rect.loc.x + close_rect.size.w / 2.,
+                close_rect.loc.y + close_rect.size.h / 2.,
+            );
+            (card_px, close_px)
+        })
+        .expect("vulkan renderer");
+
+    assert_eq!(card_px[3], 255, "the card must be opaque, got {card_px:?}");
+    assert!(
+        (0x45..=0x60).contains(&card_px[0]) && (0x50..=0x68).contains(&card_px[2]),
+        "expected the .message card bg (#51515a) in the list column, got {card_px:?}"
+    );
+    if close_icon_available {
+        assert!(
+            close_px[0] > 150 && close_px[1] > 150 && close_px[2] > 150,
+            "the close-button glyph must composite above the card, got {close_px:?}"
+        );
+    }
 }
 
 /// The quick-settings popover renders on the owned Vulkan renderer when open: the

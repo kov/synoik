@@ -3874,3 +3874,206 @@ fn notification_banner_activity_during_show_arms_short_timeout() {
     f.settle_animations();
     assert!(!f.niri().notification_banner.is_visible());
 }
+
+/// Open the calendar popover with a clock click.
+fn open_calendar(f: &mut Fixture) {
+    pointer_motion_to(f, 960., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.niri().panel_popover.is_open());
+}
+
+/// Opening the calendar message list acknowledges the whole store exactly
+/// once (`js/ui/messageList.js:1193-1199`) and drops queued banners
+/// (`js/ui/messageTray.js:1070-1078`); notifications arriving while it is
+/// open are pushed into the list but stay unseen; closing never re-acks.
+#[test]
+fn calendar_message_list_acks_on_open_once() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    banner_notify(&mut f, banner_req("app-a", ":1.1"));
+    banner_notify(&mut f, banner_req("app-b", ":1.2"));
+    f.settle_animations();
+    // The first banner showed (acked); the second sits queued, unseen.
+    assert_eq!(f.niri().notifications.unseen_count(), 1);
+    assert!(!f.niri().notifications.banner_queue.is_empty());
+
+    open_calendar(&mut f);
+    assert_eq!(
+        f.niri().notifications.unseen_count(),
+        0,
+        "opening the list acknowledges everything"
+    );
+    assert!(
+        f.niri().notifications.banner_queue.is_empty(),
+        "acked notifications drop out of the banner queue"
+    );
+    assert_eq!(
+        f.niri().panel_popover.date_menu().unwrap().list().len(),
+        2,
+        "the list snapshots the whole store"
+    );
+
+    // A notification arriving while open lands in the list WITHOUT an ack.
+    let id3 = banner_notify(&mut f, banner_req("app-c", ":1.3"));
+    assert_eq!(f.niri().panel_popover.date_menu().unwrap().list().len(), 3);
+    assert_eq!(
+        f.niri().notifications.unseen_count(),
+        1,
+        "arrivals while open stay unseen"
+    );
+
+    // Closing does not acknowledge: the still-unseen notification banners as
+    // soon as the popover unblocks the tray.
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.settle_animations();
+    f.settle_animations();
+    assert!(!f.niri().panel_popover.is_open());
+    assert_eq!(
+        f.niri().notification_banner.content_id(),
+        Some(id3),
+        "the unseen notification banners after close"
+    );
+}
+
+/// Message-list card interactions, end to end through real pointer clicks:
+/// the close button dismisses one notification, a body click activates
+/// (default action → ActionInvoked; none + resident → survives), and Clear
+/// empties the store — all with the popover staying open and the list
+/// snapshot tracking every change.
+#[test]
+fn calendar_message_list_click_close_body_and_clear() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+    let (tx, emitted) = async_channel::unbounded();
+    f.niri().notifications_emit = Some(tx);
+
+    // Three sources with distinct timestamps: a resident one, one with a
+    // default action, one plain (newest).
+    let mut resident = banner_req("app-a", ":1.1");
+    resident.resident = true;
+    let rid = banner_notify(&mut f, resident);
+    tick(&mut f, 1000);
+    let mut with_default = banner_req("app-b", ":1.2");
+    with_default.has_default_action = true;
+    let did = banner_notify(&mut f, with_default);
+    tick(&mut f, 1000);
+    let pid = banner_notify(&mut f, banner_req("app-c", ":1.3"));
+    f.settle_animations();
+
+    open_calendar(&mut f);
+    let output = f.niri_output(1);
+    let origin = f.niri().panel_popover.content_location(&output);
+    // Only two 90px cards fit above the Clear row at this popover height —
+    // the oldest is dropped (the no-scroll divergence). Newest renders first.
+    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    assert_eq!(
+        cards.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+        vec![pid, did],
+        "sources render newest-first; the overflowing oldest card is dropped"
+    );
+    assert_eq!(
+        f.niri().panel_popover.date_menu().unwrap().list().len(),
+        3,
+        "the snapshot still holds everything"
+    );
+
+    let click = |f: &mut Fixture, pos: smithay::utils::Point<f64, smithay::utils::Logical>| {
+        pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let rect_center = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        smithay::utils::Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+    };
+
+    // Close the newest card: dismissed, gone from store and list; still open.
+    let (_, _, close_rect) = cards[0];
+    click(&mut f, rect_center(close_rect));
+    assert!(f.niri().notifications.find(pid).is_none());
+    assert_eq!(f.niri().panel_popover.date_menu().unwrap().list().len(), 2);
+    assert!(f.niri().panel_popover.is_open(), "the popover stays open");
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::Closed { id, reason, .. } => {
+            assert_eq!((id, reason.wire_code()), (pid, 2), "Dismissed on the wire");
+        }
+        _ => panic!("expected a Closed emission"),
+    }
+
+    // Body-click the default-action card: ActionInvoked('default') unicast +
+    // destroyed (non-resident) — and the popover CLOSES (activation drops the
+    // menu, `js/ui/notificationDaemon.js:370-382`).
+    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let (_, card, _) = cards[0];
+    click(
+        &mut f,
+        smithay::utils::Point::from((card.loc.x + 30., card.loc.y + card.size.h - 10.)),
+    );
+    assert!(f.niri().notifications.find(did).is_none());
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::ActionInvoked {
+            id, action, sender, ..
+        } => {
+            assert_eq!(id, did);
+            assert_eq!(action, "default");
+            assert_eq!(sender.as_deref(), Some(":1.2"));
+        }
+        _ => panic!("expected an ActionInvoked emission"),
+    }
+    let _ = emitted.recv_blocking().unwrap(); // its Closed
+    f.settle_animations();
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "activating a notification closes the calendar"
+    );
+
+    // Body-click the resident card (no default action): `source.open()`
+    // destroys only non-resident notifications — it survives; the popover
+    // closes here too.
+    open_calendar(&mut f);
+    let origin = f.niri().panel_popover.content_location(&output);
+    let click = |f: &mut Fixture, pos: smithay::utils::Point<f64, smithay::utils::Logical>| {
+        pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let (_, card, _) = cards[0];
+    click(
+        &mut f,
+        smithay::utils::Point::from((card.loc.x + 30., card.loc.y + card.size.h - 10.)),
+    );
+    assert!(
+        f.niri().notifications.find(rid).is_some(),
+        "a resident notification survives activation"
+    );
+    f.settle_animations();
+    assert!(!f.niri().panel_popover.is_open());
+
+    // Clear: everything (resident included) closes; the placeholder is up.
+    open_calendar(&mut f);
+    let pill = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .clear_pill_rect()
+        .unwrap();
+    click(&mut f, rect_center(pill));
+    assert!(f.niri().notifications.sources.is_empty());
+    assert!(f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .list()
+        .is_empty());
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "Clear keeps the popover open"
+    );
+}

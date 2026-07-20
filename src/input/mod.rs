@@ -1025,6 +1025,29 @@ impl State {
             }
             #[cfg(not(feature = "dbus"))]
             PopoverAction::TogglePowerProfile | PopoverAction::SetPowerProfile(_) => {}
+            // Message-list card interactions: the same store paths as the
+            // banner's clicks (`on_banner_hit`); `apply_notification_effects`
+            // pushes the shrunk snapshot back into the open popover.
+            PopoverAction::CloseNotification(id) => {
+                let effects = self
+                    .niri
+                    .notifications
+                    .close(id, crate::notifications::CloseReason::Dismissed);
+                self.niri.apply_notification_effects(effects);
+            }
+            PopoverAction::ActivateNotification { id, has_default } => {
+                let effects = if has_default {
+                    self.niri.emit_notification_action(id, "default".to_owned());
+                    self.niri.notifications.activate(id)
+                } else {
+                    self.niri.notifications.activate_source(id)
+                };
+                self.niri.apply_notification_effects(effects);
+            }
+            PopoverAction::ClearNotifications => {
+                let effects = self.niri.notifications.clear_all();
+                self.niri.apply_notification_effects(effects);
+            }
         }
     }
 
@@ -3408,13 +3431,26 @@ impl State {
                                 let anchor = self.niri.panel.date_menu_rect(output_w);
                                 let cal = self.niri.gnome_settings.calendar;
                                 let accent = self.niri.gnome_settings.accent_color;
-                                self.niri.panel_popover.toggle_calendar(
+                                let now = self.niri.clock.now_unadjusted();
+                                let cards = crate::ui::notification_card::message_list_cards(
+                                    &self.niri.notifications,
+                                    now,
+                                );
+                                let opened = self.niri.panel_popover.toggle_calendar(
                                     output,
                                     anchor,
                                     cal.week_start,
                                     cal.show_week_numbers,
                                     accent,
+                                    cards,
                                 );
+                                // Opening the message list acknowledges everything
+                                // in the store, exactly once per open — never on
+                                // close (`js/ui/messageList.js:1193-1199`).
+                                if opened {
+                                    let effects = self.niri.notifications.acknowledge_all();
+                                    self.niri.apply_notification_effects(effects);
+                                }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
                                 return;

@@ -695,6 +695,23 @@ impl NotificationStore {
         effects
     }
 
+    /// The message list's Clear button: close every notification, reason
+    /// DISMISSED — gnome-shell clears everything whose message `canClose()`,
+    /// which is every notification card, resident or not
+    /// (`js/ui/messageList.js:734-736,1647-1671`).
+    pub fn clear_all(&mut self) -> Effects {
+        let ids: Vec<u32> = self
+            .sources
+            .iter()
+            .flat_map(|s| s.notifications.iter().map(|n| n.id))
+            .collect();
+        let mut effects = Effects::default();
+        for id in ids {
+            merge(&mut effects, self.close(id, CloseReason::Dismissed));
+        }
+        effects
+    }
+
     /// Take the next queued banner to show: purges acked entries, promotes the
     /// head (the queue is urgency-sorted), and marks it acknowledged the way
     /// showing a banner does (`js/ui/messageTray.js:1070-1078,1167`). Returns
@@ -872,6 +889,25 @@ mod tests {
 
     fn notify(store: &mut NotificationStore, r: NotifyRequest) -> (u32, Effects) {
         store.notify(r, true, Duration::from_secs(1)).unwrap()
+    }
+
+    #[test]
+    fn clear_all_closes_everything_dismissed_including_resident() {
+        let mut store = NotificationStore::default();
+        let (a, _) = notify(&mut store, req("app", ":1.1"));
+        let mut resident = req("other", ":1.2");
+        resident.resident = true;
+        let (b, _) = notify(&mut store, resident);
+
+        let effects = store.clear_all();
+        assert!(store.sources.is_empty(), "Clear closes every notification");
+        let mut closed: Vec<_> = effects.closed.iter().map(|c| (c.id, c.reason)).collect();
+        closed.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            closed,
+            vec![(a, CloseReason::Dismissed), (b, CloseReason::Dismissed)],
+            "everything (resident too) closes with reason Dismissed"
+        );
     }
 
     #[test]

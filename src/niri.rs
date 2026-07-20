@@ -7582,6 +7582,24 @@ impl Niri {
                 }
             }
         }
+
+        // Every store mutation ends here, so this keeps an open calendar
+        // popover's message list live — without re-acknowledging (arrivals
+        // while open stay unseen, `js/ui/messageList.js:1193-1199`).
+        self.refresh_popover_notifications();
+    }
+
+    /// Push a fresh store snapshot into an open calendar popover's message
+    /// list, if any.
+    pub fn refresh_popover_notifications(&mut self) {
+        if self.panel_popover.open_role() != Some(crate::ui::panel::ROLE_DATE_MENU) {
+            return;
+        }
+        let now = self.clock.now_unadjusted();
+        let cards = crate::ui::notification_card::message_list_cards(&self.notifications, now);
+        if self.panel_popover.set_notifications(cards) {
+            self.queue_redraw_all();
+        }
     }
 
     fn user_is_idle(&mut self) -> bool {
@@ -7612,6 +7630,14 @@ impl Niri {
     /// popover open, GNOME mode, an output to show on).
     pub fn maybe_show_banner(&mut self) {
         if !self.layout.is_gnome_mode() || !self.notification_banner.can_show() {
+            return;
+        }
+        // The banner's `blocked` flag is only synced to the popover once per
+        // frame (`advance_animations`), but this runs eagerly from the D-Bus
+        // path — a Notify landing in the same calloop cycle as a popover open
+        // must not banner (and self-acknowledge) over the open menu, so check
+        // the popover directly.
+        if self.panel_popover.is_open() {
             return;
         }
         // The active output stands in for GNOME's primary monitor

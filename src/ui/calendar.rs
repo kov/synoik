@@ -11,6 +11,14 @@
 //! Deferred vs gnome-shell: the events list, world clocks, weather, and keyboard
 //! grid navigation. Those hang off daemons/D-Bus (CalendarServer, GWeather) or
 //! are follow-ups; this is the self-contained core the popover opens on.
+//!
+//! The popover content itself is [`DateMenu`]: gnome-shell's dateMenu is a
+//! two-column hbox with the notification message list as the FIRST (left in
+//! LTR) column and the calendar column second (`js/ui/dateMenu.js:917-940`).
+//! The list ([`CalendarMessageList`], gnome-shell's `CalendarMessageList` +
+//! `MessageView`, `js/ui/calendar.js:794-879`) renders the shared notification
+//! cards flat (grouped stacks are a later slice), newest-first, with a
+//! placeholder when empty and a Clear pill when not.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,11 +27,16 @@ use std::ptr::null_mut;
 
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::notification_card::{self, CardCache, CardContent, CardLayout};
+use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass `_calendar.scss` proportions).
@@ -506,6 +519,514 @@ impl Calendar {
     }
 }
 
+// ---- The dateMenu popover: message list column + calendar ----
+
+/// 1em at the 11pt base font.
+const LIST_EM: f64 = crate::ui::pt_to_px(11.);
+/// `.message-list` width (`_message-list.scss:3`).
+const LIST_W: f64 = 29. * LIST_EM;
+/// `.popup-menu-content` padding (`_popovers.scss:28`).
+const LIST_PAD: f64 = 6.;
+/// `.message-list:ltr` margin-right, separating the two columns
+/// (`_message-list.scss:11`).
+const LIST_MARGIN_R: f64 = 4.;
+/// Space kept free right of the cards: the list's `padding-right:
+/// $base_padding` plus `.message-view:ltr` `margin-right: $base_margin * 3`
+/// (scrollbar room, `_message-list.scss:11,31`).
+const LIST_SCROLL_R: f64 = 18.;
+/// Card width in the list column.
+const CARD_W: f64 = LIST_W - LIST_SCROLL_R;
+/// `.message` `margin-bottom: $base_padding * 2` (`_message-list.scss:37`).
+const CARD_GAP: f64 = 12.;
+/// List-card radius: `$modal_radius + 2px` (`_message-list.scss:39`).
+const CARD_RADIUS: f64 = 18.;
+/// `.message-list-controls` padding: 12px sides/top, 9px bottom
+/// (`_message-list.scss:44-47`).
+const CONTROLS_PAD: f64 = 12.;
+const CONTROLS_PAD_B: f64 = 9.;
+/// The Clear pill (`.message-list-clear-button button`, forced-circular
+/// radius): `%heading` 11pt/700 label.
+const CLEAR_H: f64 = 28.;
+const CLEAR_PAD_X: f64 = 14.;
+const CLEAR_PX: f64 = crate::ui::pt_to_px(11.);
+/// `.button` flat fill on the dark theme (matches the card action pills).
+const CLEAR_BG: [f32; 4] = [1., 1., 1., 0.1];
+/// `.message-list-placeholder` (`_message-list.scss:14-26`): 96px icon over a
+/// `%title_3` (15pt/700) label, both at 45% fg.
+const PLACEHOLDER_ICON: f64 = 96.;
+const PLACEHOLDER_GAP: f64 = 12.;
+const PLACEHOLDER_PX: f64 = crate::ui::pt_to_px(15.);
+const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
+/// The 1px column separator: `.message-list`'s `border-right` in
+/// `$borders_color` = fg at 10% on the dark theme (`_message-list.scss:8,11`,
+/// `_colors.scss:39`).
+const SEPARATOR: [f32; 4] = [1., 1., 1., 0.1];
+
+/// A visible card's `(id, card rect, close-button rect)`, popover-local
+/// (introspection/test hook).
+pub type CardRects = (u32, Rectangle<f64, Logical>, Rectangle<f64, Logical>);
+
+/// What a click inside the message-list column hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListHit {
+    /// A card's close button: close that notification, reason Dismissed.
+    Close(u32),
+    /// A card body: activate the notification (same semantics as a banner
+    /// body click — the list card is a click-through to
+    /// `notification.activate()`, `js/ui/messageList.js:730-732`).
+    Body { id: u32, has_default: bool },
+    /// The Clear pill: close everything.
+    Clear,
+}
+
+/// The message-list column of the calendar popover: a plain-data snapshot of
+/// the notification store, rendered as flat cards newest-first.
+pub struct CalendarMessageList {
+    cards: Vec<CardContent>,
+    /// Bumped whenever the snapshot changes, to invalidate cached card
+    /// textures (cache keys carry the revision in their high 32 bits).
+    revision: u64,
+    cache: RefCell<CardCache>,
+}
+
+impl CalendarMessageList {
+    pub fn new(cards: Vec<CardContent>) -> Self {
+        Self {
+            cards,
+            revision: 0,
+            cache: RefCell::new(CardCache::new()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cards.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.cards.len()
+    }
+
+    /// Replace the snapshot (a store change pushed while the popover is
+    /// open). Returns whether anything changed.
+    pub fn set_cards(&mut self, cards: Vec<CardContent>) -> bool {
+        if self.cards == cards {
+            return false;
+        }
+        self.cards = cards;
+        self.revision += 1;
+        true
+    }
+
+    /// Height of the bottom controls row (the Clear pill), when shown.
+    fn controls_h(&self) -> f64 {
+        if self.is_empty() {
+            0.
+        } else {
+            CONTROLS_PAD + CLEAR_H + CONTROLS_PAD_B
+        }
+    }
+
+    /// The cards that fully fit above the controls row, with their popover-
+    /// local origins. Overflowing cards are dropped — the list doesn't scroll
+    /// yet (recorded divergence; gnome-shell scrolls).
+    fn visible_cards(&self, height: f64) -> Vec<(usize, Point<f64, Logical>, CardLayout)> {
+        let mut out = Vec::new();
+        let bottom = height - self.controls_h();
+        let mut y = LIST_PAD;
+        for (i, content) in self.cards.iter().enumerate() {
+            let layout = notification_card::layout(content, CARD_W, false);
+            if y + layout.size.h > bottom {
+                break;
+            }
+            let h = layout.size.h;
+            out.push((i, Point::from((LIST_PAD, y)), layout));
+            y += h + CARD_GAP;
+        }
+        out
+    }
+
+    /// The Clear pill's popover-local rect (only meaningful when non-empty).
+    fn clear_rect(&self, height: f64) -> Rectangle<f64, Logical> {
+        let label_w = niri_vk::text::measure_line_width_weighted("Clear", CLEAR_PX as f32, true);
+        Rectangle::new(
+            Point::from((LIST_PAD + CONTROLS_PAD, height - CONTROLS_PAD_B - CLEAR_H)),
+            Size::from((label_w + 2. * CLEAR_PAD_X, CLEAR_H)),
+        )
+    }
+
+    /// Hit-test a click at popover-local `pos` inside the list column.
+    fn hit(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHit> {
+        for (i, origin, layout) in self.visible_cards(height) {
+            let rect = Rectangle::new(origin, layout.size);
+            if !rect.contains(pos) {
+                continue;
+            }
+            let local = pos - origin;
+            let content = &self.cards[i];
+            if layout.close.contains(local) {
+                return Some(ListHit::Close(content.id));
+            }
+            return Some(ListHit::Body {
+                id: content.id,
+                has_default: content.has_default_action,
+            });
+        }
+        if !self.is_empty() && self.clear_rect(height).contains(pos) {
+            return Some(ListHit::Clear);
+        }
+        None
+    }
+
+    /// The card render elements (textures + icons), popover-relative to
+    /// `origin`.
+    fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        scale: f64,
+        origin: Point<f64, Logical>,
+        height: f64,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let mut elements = Vec::new();
+        let mut cache = self.cache.borrow_mut();
+        let rev = self.revision & 0xffff_ffff;
+        cache.retain(|key| key >> 32 == rev);
+        for (i, card_origin, layout) in self.visible_cards(height) {
+            let key = (rev << 32) | i as u64;
+            elements.extend(notification_card::card_elements(
+                renderer,
+                icons,
+                &mut cache,
+                key,
+                &self.cards[i],
+                &layout,
+                CARD_RADIUS,
+                origin + card_origin,
+                1.,
+                scale,
+            ));
+        }
+        elements
+    }
+}
+
+/// The dateMenu popover content: the message-list column (left) beside the
+/// calendar column (`js/ui/dateMenu.js:917-940`).
+pub struct DateMenu {
+    pub calendar: Calendar,
+    list: CalendarMessageList,
+    /// The popover background (rounded box + placeholder label / Clear pill),
+    /// cached per scale; the stored revision is 0/1 for empty/non-empty.
+    bg_cache: RefCell<TextureCache>,
+}
+
+/// The x where the calendar column starts (also the list column's width).
+fn calendar_col_x() -> f64 {
+    LIST_PAD + LIST_W + LIST_MARGIN_R
+}
+
+impl DateMenu {
+    pub fn new(
+        week_start: u8,
+        show_week_numbers: bool,
+        accent: [u8; 3],
+        cards: Vec<CardContent>,
+    ) -> Self {
+        Self {
+            calendar: Calendar::new(week_start, show_week_numbers, accent),
+            list: CalendarMessageList::new(cards),
+            bg_cache: RefCell::new(TextureCache {
+                context: None,
+                textures: HashMap::new(),
+            }),
+        }
+    }
+
+    pub fn logical_size(&self) -> Size<f64, Logical> {
+        let cal = self.calendar.logical_size();
+        Size::from((calendar_col_x() + cal.w, cal.h))
+    }
+
+    pub fn list(&self) -> &CalendarMessageList {
+        &self.list
+    }
+
+    /// Push a fresh store snapshot into the list. Returns whether it changed.
+    pub fn set_notifications(&mut self, cards: Vec<CardContent>) -> bool {
+        self.list.set_cards(cards)
+    }
+
+    /// Route a click at content-local `pos`: list hits map to notification
+    /// actions; everything else goes to the calendar (all consumed — the
+    /// popover stays open, like gnome-shell's grab).
+    pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
+        let size = self.logical_size();
+        if pos.x < calendar_col_x() {
+            return match self.list.hit(pos, size.h) {
+                Some(ListHit::Close(id)) => PopoverAction::CloseNotification(id),
+                Some(ListHit::Body { id, has_default }) => {
+                    PopoverAction::ActivateNotification { id, has_default }
+                }
+                Some(ListHit::Clear) => PopoverAction::ClearNotifications,
+                None => PopoverAction::Consumed,
+            };
+        }
+        self.calendar
+            .pointer_click(pos - Point::from((calendar_col_x(), 0.)));
+        PopoverAction::Consumed
+    }
+
+    /// Test hooks: the visible cards' popover-local rects, and the Clear pill.
+    pub fn card_rects(&self) -> Vec<CardRects> {
+        let h = self.logical_size().h;
+        self.list
+            .visible_cards(h)
+            .into_iter()
+            .map(|(i, origin, layout)| {
+                let close = Rectangle::new(origin + layout.close.loc, layout.close.size);
+                (
+                    self.list.cards[i].id,
+                    Rectangle::new(origin, layout.size),
+                    close,
+                )
+            })
+            .collect()
+    }
+
+    pub fn clear_pill_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        (!self.list.is_empty()).then(|| self.list.clear_rect(self.logical_size().h))
+    }
+
+    /// Draw the popover background: the full-size rounded box, plus the
+    /// placeholder label (empty) or the Clear pill (non-empty). The calendar
+    /// texture composites over the right column in the same bg color.
+    fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        let revision = u64::from(!self.list.is_empty());
+        let mut cache = self.bg_cache.borrow_mut();
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.textures.clear();
+            cache.context = Some(context);
+        }
+        let fresh = matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == revision);
+        if !fresh {
+            let tex = self.draw_bg(renderer, scale)?;
+            cache.textures.insert(scale_key, (revision, tex));
+        }
+        Ok(cache
+            .textures
+            .get(&scale_key)
+            .map(|(_, t)| t.clone())
+            .unwrap())
+    }
+
+    fn draw_bg(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let _span = tracy_client::span!("DateMenu::draw_bg");
+
+        let size = self.logical_size();
+        let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+        let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
+        let full = Rectangle::from_size(phys);
+
+        // Shape the text up front (immutable borrows of the font system).
+        let placeholder_run = self
+            .list
+            .is_empty()
+            .then(|| {
+                renderer.build_glyph_run_weighted(
+                    "No Notifications",
+                    (PLACEHOLDER_PX * scale) as f32,
+                    true,
+                )
+            })
+            .transpose()?;
+        let clear_run = (!self.list.is_empty())
+            .then(|| renderer.build_glyph_run_weighted("Clear", (CLEAR_PX * scale) as f32, true))
+            .transpose()?;
+
+        let mut target = renderer.create_buffer(
+            Fourcc::Abgr8888,
+            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
+        )?;
+        {
+            let mut fb = renderer.bind(&mut target)?;
+            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            frame.render_rounded_rect(BOX_BG, (BOX_RADIUS * scale) as f32, full, &[full])?;
+
+            // The faint 1px separator on the list column's right edge
+            // (`.message-list` border-right, `_message-list.scss:8,11`).
+            let sep_x = px(LIST_PAD + LIST_W);
+            let sep = Rectangle::new(
+                Point::<i32, Physical>::from((sep_x, 0)),
+                Size::<i32, Physical>::from((((scale).round() as i32).max(1), phys.h)),
+            );
+            frame.render_rounded_rect(SEPARATOR, 0., sep, &[full])?;
+
+            if let Some(run) = &placeholder_run {
+                // Centered under the (separately composited) 96px icon.
+                let (_, cy) = placeholder_centers(size.h);
+                let cx = px(LIST_PAD + LIST_W / 2.);
+                let (ix, iy, iw, ih) = run.ink_bounds();
+                let origin = Point::<i32, Physical>::from((cx - iw / 2 - ix, px(cy) - ih / 2 - iy));
+                frame.render_glyphs(run, origin, PLACEHOLDER_FG, full, &[full])?;
+            }
+
+            if let Some(run) = &clear_run {
+                let pill = self.list.clear_rect(size.h);
+                let rect = Rectangle::new(
+                    Point::<i32, Physical>::from((px(pill.loc.x), px(pill.loc.y))),
+                    Size::<i32, Physical>::from((px(pill.size.w), px(pill.size.h))),
+                );
+                frame.render_rounded_rect(
+                    CLEAR_BG,
+                    (CLEAR_H / 2. * scale) as f32,
+                    rect,
+                    &[full],
+                )?;
+                let (ix, iy, iw, ih) = run.ink_bounds();
+                let origin = Point::<i32, Physical>::from((
+                    rect.loc.x + (rect.size.w - iw) / 2 - ix,
+                    rect.loc.y + (rect.size.h - ih) / 2 - iy,
+                ));
+                frame.render_glyphs(run, origin, TEXT, rect, &[full])?;
+            }
+
+            let _sync = frame.finish()?;
+        }
+
+        renderer.make_offscreen_sampleable(&target)?;
+        Ok(target)
+    }
+
+    /// All the popover's render elements at `origin`, in output stacking
+    /// order (FIRST = topmost): message-list cards / placeholder icon, then
+    /// the calendar column, then the background box (carrying the
+    /// rounded-corner-aware opaque region) at the bottom.
+    pub fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        scale: f64,
+        origin: Point<f64, Logical>,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        use smithay::backend::renderer::Texture as _;
+
+        let mut elements = Vec::new();
+        let size = self.logical_size();
+
+        // The message-list cards, or the placeholder icon when empty.
+        if self.list.is_empty() {
+            let (icon_cy, _) = placeholder_centers(size.h);
+            let center = Point::from((LIST_PAD + LIST_W / 2., icon_cy));
+            if let Some(buffer) = icons.buffer(
+                "no-notifications-symbolic",
+                PLACEHOLDER_ICON,
+                scale,
+                PLACEHOLDER_FG,
+            ) {
+                if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                    let logical = tb.logical_size();
+                    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb,
+                        loc,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
+        } else {
+            elements.extend(self.list.render(renderer, icons, scale, origin, size.h));
+        }
+
+        // The calendar column (its own rounded box in the same bg color, so
+        // the seam is invisible; its right corners align with the popover's).
+        match self.calendar.texture(renderer, scale) {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin + Point::from((calendar_col_x(), 0.)),
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => {
+                tracing::error!("error drawing the calendar popover: {err:#}");
+            }
+        }
+
+        // The background box, at the bottom of the stack, reporting opacity
+        // as the two bands that exclude the rounded corners — never claiming
+        // a cut-away corner pixel is opaque (which would let occlusion drop
+        // what shows through).
+        match self.bg_texture(renderer, scale) {
+            Ok(texture) => {
+                let tex_size = texture.size();
+                let r = (BOX_RADIUS * scale).round() as i32;
+                let opaque = if r > 0 && tex_size.w > 2 * r && tex_size.h > 2 * r {
+                    vec![
+                        Rectangle::new(
+                            Point::<i32, BufferCoord>::from((0, r)),
+                            Size::from((tex_size.w, tex_size.h - 2 * r)),
+                        ),
+                        Rectangle::new(
+                            Point::<i32, BufferCoord>::from((r, 0)),
+                            Size::from((tex_size.w - 2 * r, tex_size.h)),
+                        ),
+                    ]
+                } else {
+                    vec![Rectangle::from_size(tex_size)]
+                };
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    opaque,
+                );
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => {
+                tracing::error!("error drawing the calendar popover background: {err:#}");
+            }
+        }
+
+        elements
+    }
+}
+
+/// The placeholder's vertical centers `(icon_cy, label_cy)`: the 96px icon
+/// over the label with a 12px gap, the stack centered in the column.
+fn placeholder_centers(height: f64) -> (f64, f64) {
+    let label_h = PLACEHOLDER_PX * 1.3;
+    let total = PLACEHOLDER_ICON + PLACEHOLDER_GAP + label_h;
+    let top = (height - total) / 2.;
+    (
+        top + PLACEHOLDER_ICON / 2.,
+        top + PLACEHOLDER_ICON + PLACEHOLDER_GAP + label_h / 2.,
+    )
+}
+
 // ---- libc-backed date math ----
 
 fn is_leap(year: i32) -> bool {
@@ -927,5 +1448,144 @@ mod tests {
             .filter(|p| p[0] > 150 && p[1] < 80 && p[2] < 80 && p[3] > 150)
             .count();
         assert!(accent > 20, "expected the accent today-disc, got {accent}");
+    }
+
+    // ---- The dateMenu two-column popover (message list + calendar) ----
+
+    fn sample_card(id: u32) -> CardContent {
+        CardContent {
+            id,
+            source_title: "App".to_owned(),
+            source_icon: None,
+            title: format!("title {id}"),
+            body: "body".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "Just now".to_owned(),
+        }
+    }
+
+    fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+        Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+    }
+
+    #[test]
+    fn date_menu_is_two_columns_list_first() {
+        // The message-list column comes FIRST (left in LTR), the calendar
+        // second (`js/ui/dateMenu.js:917-940`); the popover keeps the
+        // calendar's height.
+        let dm = DateMenu::new(0, false, [0, 0, 0], vec![sample_card(1)]);
+        let cal = dm.calendar.logical_size();
+        let size = dm.logical_size();
+        assert_eq!(size.w, calendar_col_x() + cal.w);
+        assert_eq!(size.h, cal.h);
+        assert!(
+            calendar_col_x() > 29. * LIST_EM,
+            "the list column is 29em wide plus its margins"
+        );
+    }
+
+    #[test]
+    fn date_menu_routes_clicks_to_list_and_calendar() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![sample_card(1), sample_card(2)]);
+
+        // A calendar-column click still works through the composition: the
+        // next-month pager is at the calendar's own coordinates shifted by
+        // the list column.
+        let before = (dm.calendar.year, dm.calendar.month);
+        let next = Layout::new(false).next_arrow();
+        let action =
+            dm.pointer_click(center(next) + Point::<f64, Logical>::from((calendar_col_x(), 0.)));
+        assert_eq!(action, PopoverAction::Consumed);
+        assert_ne!(
+            (dm.calendar.year, dm.calendar.month),
+            before,
+            "the pager click must reach the calendar"
+        );
+
+        // Card hits: close button, then body (with and without a default
+        // action), then the Clear pill.
+        let rects = dm.card_rects();
+        assert_eq!(rects.len(), 2);
+        let (id0, card0, close0) = rects[0];
+        assert_eq!(id0, 1, "cards render in snapshot order");
+        assert_eq!(
+            dm.pointer_click(center(close0)),
+            PopoverAction::CloseNotification(1)
+        );
+        // A body click low in the card (away from the close button).
+        let body_pos = Point::from((card0.loc.x + 30., card0.loc.y + card0.size.h - 10.));
+        assert_eq!(
+            dm.pointer_click(body_pos),
+            PopoverAction::ActivateNotification {
+                id: 1,
+                has_default: false
+            }
+        );
+        let mut with_default = sample_card(3);
+        with_default.has_default_action = true;
+        assert!(dm.set_notifications(vec![with_default]));
+        let (_, card, _) = dm.card_rects()[0];
+        assert_eq!(
+            dm.pointer_click(Point::from((
+                card.loc.x + 30.,
+                card.loc.y + card.size.h - 10.
+            ))),
+            PopoverAction::ActivateNotification {
+                id: 3,
+                has_default: true
+            }
+        );
+        let pill = dm
+            .clear_pill_rect()
+            .expect("non-empty list has a Clear pill");
+        assert_eq!(
+            dm.pointer_click(center(pill)),
+            PopoverAction::ClearNotifications
+        );
+
+        // Empty list-column space is consumed without an action (the popover
+        // stays open).
+        let dead = Point::from((LIST_PAD + 5., dm.logical_size().h - 120.));
+        assert_eq!(dm.pointer_click(dead), PopoverAction::Consumed);
+    }
+
+    #[test]
+    fn date_menu_placeholder_and_snapshot_pushes() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], Vec::new());
+        assert!(dm.list().is_empty());
+        assert!(
+            dm.clear_pill_rect().is_none(),
+            "the Clear pill hides with the placeholder"
+        );
+        assert!(!dm.set_notifications(Vec::new()), "no change, no redraw");
+        assert!(dm.set_notifications(vec![sample_card(1)]));
+        assert_eq!(dm.list().len(), 1);
+        assert!(dm.clear_pill_rect().is_some());
+        assert!(
+            !dm.set_notifications(vec![sample_card(1)]),
+            "an identical snapshot must not invalidate the cards"
+        );
+    }
+
+    #[test]
+    fn message_list_overflow_drops_cards_beyond_the_controls() {
+        // More cards than fit: only whole cards above the controls row render
+        // (no scrolling yet — recorded divergence; gnome-shell scrolls).
+        let cards: Vec<_> = (1..=10).map(sample_card).collect();
+        let dm = DateMenu::new(0, false, [0, 0, 0], cards);
+        let h = dm.logical_size().h;
+        let visible = dm.card_rects();
+        assert!(!visible.is_empty());
+        assert!(visible.len() < 10, "10 cards cannot fit the popover height");
+        let controls_top = h - (CONTROLS_PAD + CLEAR_H + CONTROLS_PAD_B);
+        for (_, rect, _) in &visible {
+            assert!(
+                rect.loc.y + rect.size.h <= controls_top,
+                "every visible card fits fully above the Clear row"
+            );
+        }
     }
 }

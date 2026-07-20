@@ -35,7 +35,8 @@ const POPOVER_RISE: f64 = 6.;
 const POPOVER_MARGIN: f64 = 6.;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::calendar::Calendar;
+use crate::ui::calendar::DateMenu;
+use crate::ui::notification_card::CardContent;
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::quick_settings::QuickSettings;
 use crate::utils::output_size;
@@ -85,26 +86,48 @@ pub enum PopoverAction {
     Screenshot,
     /// Spawn a command (a system-row button / the battery pill); popover closes.
     Spawn(Vec<String>),
+    /// Close this notification, reason Dismissed (a message-list card's close
+    /// button). The popover stays open.
+    CloseNotification(u32),
+    /// Activate this notification (a message-list card body click): with a
+    /// default action, emit ActivationToken+ActionInvoked and destroy unless
+    /// resident; without one, `source.open()`'s destroy-all-non-resident
+    /// (`js/ui/messageList.js:730-732`, `js/ui/notificationDaemon.js:231-240`).
+    ActivateNotification { id: u32, has_default: bool },
+    /// The message list's Clear pill: close every notification.
+    ClearNotifications,
 }
 
 impl PopoverAction {
     /// Whether applying this action dismisses the menu (GNOME closes quick
     /// settings when a system button is used, but keeps it open for a toggle).
     fn closes_menu(&self) -> bool {
-        matches!(self, PopoverAction::Screenshot | PopoverAction::Spawn(_))
+        // Activating a notification also closes the calendar: gnome-shell's
+        // no-default-action path runs `source.open()` → `Main.panel
+        // .closeCalendar()` (`js/ui/notificationDaemon.js:370-382`), and with
+        // a default action the activated app takes focus, dropping the menu
+        // grab — which we have no focus-driven dismissal for, so close
+        // explicitly in both cases (else the popover's modal key grab lingers
+        // over the newly raised window).
+        matches!(
+            self,
+            PopoverAction::Screenshot
+                | PopoverAction::Spawn(_)
+                | PopoverAction::ActivateNotification { .. }
+        )
     }
 }
 
 /// The content a popover hosts.
 pub enum PopoverContent {
-    Calendar(Calendar),
+    Calendar(DateMenu),
     QuickSettings(QuickSettings),
 }
 
 impl PopoverContent {
     fn logical_size(&self) -> Size<f64, Logical> {
         match self {
-            PopoverContent::Calendar(c) => c.logical_size(),
+            PopoverContent::Calendar(dm) => dm.logical_size(),
             PopoverContent::QuickSettings(qs) => qs.logical_size(),
         }
     }
@@ -204,8 +227,11 @@ impl PanelPopover {
         self.output.as_ref()
     }
 
-    /// Toggle the dateMenu calendar: open it anchored at `anchor` on `output`, or
-    /// close it if it's already open (from the same button).
+    /// Toggle the dateMenu popover (message list + calendar): open it anchored
+    /// at `anchor` on `output`, or close it if it's already open (from the same
+    /// button). `cards` is the notification-store snapshot for the message
+    /// list. Returns whether it opened — the caller acknowledges the store
+    /// exactly then (`js/ui/messageList.js:1193-1199`), never on close.
     pub fn toggle_calendar(
         &mut self,
         output: Output,
@@ -213,21 +239,51 @@ impl PanelPopover {
         week_start: u8,
         show_week_numbers: bool,
         accent: [u8; 3],
-    ) {
+        cards: Vec<CardContent>,
+    ) -> bool {
         if self.is_showing::<CalendarTag>() {
             self.close();
-            return;
+            return false;
         }
         self.open = true;
         self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
-        self.content = Some(PopoverContent::Calendar(Calendar::new(
+        self.content = Some(PopoverContent::Calendar(DateMenu::new(
             week_start,
             show_week_numbers,
             accent,
+            cards,
         )));
         self.anim = Some(self.make_anim(0., 1.));
+        true
+    }
+
+    /// Push a fresh notification snapshot to an open calendar popover, so the
+    /// message list tracks store changes live — WITHOUT re-acknowledging
+    /// (notifications arriving while open stay unseen,
+    /// `js/ui/messageList.js:1193-1199`). Returns whether it changed anything.
+    pub fn set_notifications(&mut self, cards: Vec<CardContent>) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
+                dm.set_notifications(cards)
+            }
+            _ => false,
+        }
+    }
+
+    /// Introspection/test hook: the open dateMenu content.
+    pub fn date_menu(&self) -> Option<&DateMenu> {
+        match &self.content {
+            Some(PopoverContent::Calendar(dm)) if self.open => Some(dm),
+            _ => None,
+        }
+    }
+
+    /// The popover's content origin on `output` (its resting top-left),
+    /// output-local logical — for tests that click inside the content.
+    pub fn content_location(&self, output: &Output) -> Point<f64, Logical> {
+        self.location(output)
     }
 
     /// Toggle the quick-settings menu, anchored at `anchor` on `output`. `battery`
@@ -429,10 +485,7 @@ impl PanelPopover {
         let inside = local.x >= 0. && local.y >= 0. && local.x < size.w && local.y < size.h;
         if inside {
             let action = match self.content.as_mut() {
-                Some(PopoverContent::Calendar(cal)) => {
-                    cal.pointer_click(local);
-                    PopoverAction::Consumed
-                }
+                Some(PopoverContent::Calendar(dm)) => dm.pointer_click(local),
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
@@ -493,56 +546,7 @@ impl PanelPopover {
         origin.y -= POPOVER_RISE * (1. - f64::from(progress));
 
         let mut elements = match self.content.as_ref() {
-            Some(PopoverContent::Calendar(cal)) => match cal.texture(renderer, scale) {
-                Ok(texture) => {
-                    use smithay::backend::renderer::element::Kind;
-                    use smithay::backend::renderer::Texture as _;
-                    use smithay::utils::{Buffer as BufferCoord, Transform};
-
-                    use crate::render_helpers::texture::TextureBuffer;
-
-                    // The calendar's outer corners are rounded (transparent), so report opacity as
-                    // the two bands that exclude the four corner squares — never claiming a
-                    // cut-away corner pixel is opaque (which would let
-                    // occlusion drop what shows through). Mirrors the
-                    // quick-settings menu.
-                    let size = texture.size();
-                    let r = (crate::ui::calendar::BOX_RADIUS * scale).round() as i32;
-                    let opaque = if r > 0 && size.w > 2 * r && size.h > 2 * r {
-                        vec![
-                            Rectangle::new(
-                                Point::<i32, BufferCoord>::from((0, r)),
-                                Size::from((size.w, size.h - 2 * r)),
-                            ),
-                            Rectangle::new(
-                                Point::<i32, BufferCoord>::from((r, 0)),
-                                Size::from((size.w - 2 * r, size.h)),
-                            ),
-                        ]
-                    } else {
-                        vec![Rectangle::from_size(size)]
-                    };
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        opaque,
-                    );
-                    vec![TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        origin,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    )]
-                }
-                Err(err) => {
-                    tracing::error!("error drawing the calendar popover: {err:#}");
-                    Vec::new()
-                }
-            },
+            Some(PopoverContent::Calendar(dm)) => dm.render(renderer, icons, scale, origin),
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             None => Vec::new(),
         };

@@ -98,8 +98,13 @@ impl IconCache {
         if let Some(buf) = self.buffers.borrow().get(&key) {
             return Some(buf.clone());
         }
-        let path = self.resolve(name)?;
-        match rasterize_symbolic(&path, px, color, scale) {
+        let result = if let Some(bytes) = embedded_icon(name) {
+            rasterize_symbolic_bytes(bytes, px, color, scale)
+        } else {
+            let path = self.resolve(name)?;
+            rasterize_symbolic(&path, px, color, scale)
+        };
+        match result {
             Ok(buf) => {
                 self.buffers.borrow_mut().insert(key, buf.clone());
                 Some(buf)
@@ -109,6 +114,18 @@ impl IconCache {
                 None
             }
         }
+    }
+}
+
+/// Icons gnome-shell ships inside its own gresource — they exist in NO icon
+/// theme on disk, so they are bundled from the 50.1 reference checkout
+/// (`data/icons/scalable/status/`, GPLv2+) into `resources/icons/`.
+fn embedded_icon(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "no-notifications-symbolic" => Some(include_bytes!(
+            "../../resources/icons/no-notifications-symbolic.svg"
+        )),
+        _ => None,
     }
 }
 
@@ -168,12 +185,22 @@ pub fn rasterize_symbolic(
     color: [f32; 4],
     scale: f64,
 ) -> anyhow::Result<MemoryBuffer> {
+    let data = std::fs::read(path).with_context(|| format!("reading icon {}", path.display()))?;
+    rasterize_symbolic_bytes(&data, px, color, scale)
+}
+
+/// [`rasterize_symbolic`] for in-memory SVG data (the bundled gresource icons).
+pub fn rasterize_symbolic_bytes(
+    data: &[u8],
+    px: u32,
+    color: [f32; 4],
+    scale: f64,
+) -> anyhow::Result<MemoryBuffer> {
     use resvg::{tiny_skia, usvg};
 
     let px = px.max(1);
-    let data = std::fs::read(path).with_context(|| format!("reading icon {}", path.display()))?;
     let opt = usvg::Options::default();
-    let tree = usvg::Tree::from_data(&data, &opt).context("parsing icon SVG")?;
+    let tree = usvg::Tree::from_data(data, &opt).context("parsing icon SVG")?;
 
     let mut pixmap = tiny_skia::Pixmap::new(px, px).context("allocating icon pixmap")?;
     let size = tree.size();

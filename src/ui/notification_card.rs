@@ -116,23 +116,17 @@ pub fn content_for(store: &NotificationStore, id: u32, now: Duration) -> Option<
     Some(card_for(source, n, now))
 }
 
-/// The calendar message list's card snapshots: sources most-recently-notified
-/// first, and within a source newest first — gnome-shell moves a group to the
-/// top whenever a notification is added (`js/ui/messageList.js:1824-1827`) and
-/// adds new messages at a group's top (`js/ui/messageList.js:1120-1123`).
-/// (Urgent-group pinning arrives with the grouped stacks slice.)
+/// The calendar message list's card snapshots, in the store's source order —
+/// which already carries gnome-shell's semantics: a source moves to the top
+/// only when a notification is ADDED to it (`js/ui/messageList.js:1824-1827`);
+/// a replace mutates in place and never reorders groups
+/// (`js/ui/messageTray.js:579-581`), and closes don't either. Within a source,
+/// newest first (new messages go to a group's top,
+/// `js/ui/messageList.js:1120-1123`). (Urgent-group pinning arrives with the
+/// grouped stacks slice.)
 pub fn message_list_cards(store: &NotificationStore, now: Duration) -> Vec<CardContent> {
-    let mut sources: Vec<&Source> = store.sources.iter().collect();
-    sources.sort_by_key(|s| {
-        std::cmp::Reverse(
-            s.notifications
-                .iter()
-                .map(|n| n.timestamp)
-                .max()
-                .unwrap_or_default(),
-        )
-    });
-    sources
+    store
+        .sources
         .iter()
         .flat_map(|s| s.notifications.iter().rev().map(|n| card_for(s, n, now)))
         .collect()
@@ -408,35 +402,15 @@ pub fn card_elements(
     alpha: f32,
     scale: f64,
 ) -> Vec<TextureRenderElement<VkTexture>> {
+    // The returned Vec is in the output stacking order: FIRST = topmost. The
+    // icons composite over the card, so they go in first and the card texture
+    // last (the quick-settings menu pushes icons before its chrome the same
+    // way).
     let mut elements = Vec::new();
     let Ok(scale_key) = NotNan::new(scale) else {
         return elements;
     };
     cache.ensure_context(renderer);
-
-    #[allow(clippy::map_entry)]
-    if !cache.cards.contains_key(&(scale_key, key)) {
-        match draw_card(renderer, scale, content, layout, radius) {
-            Ok(texture) => {
-                cache.cards.insert((scale_key, key), texture);
-            }
-            Err(err) => {
-                warn!("error rendering a notification card: {err:#}");
-            }
-        }
-    }
-    if let Some(card) = cache.cards.get(&(scale_key, key)).cloned() {
-        let buffer =
-            TextureBuffer::from_texture(renderer, card, scale, Transform::Normal, Vec::new());
-        elements.push(TextureRenderElement::from_texture_buffer(
-            buffer,
-            origin,
-            alpha,
-            None,
-            None,
-            Kind::Unspecified,
-        ));
-    }
 
     // Icons composite on top of the card, from the shared icon cache.
     let icon_at = |renderer: &mut VulkanRenderer,
@@ -544,5 +518,85 @@ pub fn card_elements(
         }
     }
 
+    // The card texture itself, below every icon.
+    #[allow(clippy::map_entry)]
+    if !cache.cards.contains_key(&(scale_key, key)) {
+        match draw_card(renderer, scale, content, layout, radius) {
+            Ok(texture) => {
+                cache.cards.insert((scale_key, key), texture);
+            }
+            Err(err) => {
+                warn!("error rendering a notification card: {err:#}");
+            }
+        }
+    }
+    if let Some(card) = cache.cards.get(&(scale_key, key)).cloned() {
+        let buffer =
+            TextureBuffer::from_texture(renderer, card, scale, Transform::Normal, Vec::new());
+        elements.push(TextureRenderElement::from_texture_buffer(
+            buffer,
+            origin,
+            alpha,
+            None,
+            None,
+            Kind::Unspecified,
+        ));
+    }
+
     elements
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notifications::NotifyRequest;
+
+    fn req(app: &str, sender: &str) -> NotifyRequest {
+        NotifyRequest {
+            sender: Some(sender.to_owned()),
+            pid: 100,
+            app_name: app.to_owned(),
+            replaces_id: 0,
+            desktop_entry: None,
+            source_icon: None,
+            title: "title".to_owned(),
+            body: "body".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            urgency: Urgency::Normal,
+            resident: false,
+            transient: false,
+        }
+    }
+
+    #[test]
+    fn message_list_is_newest_first_across_and_within_sources() {
+        let mut store = NotificationStore::default();
+        let at = |s: u64| Duration::from_secs(s);
+        let (a1, _) = store.notify(req("app-a", ":1.1"), true, at(1)).unwrap();
+        let (b1, _) = store.notify(req("app-b", ":1.2"), true, at(2)).unwrap();
+        let (a2, _) = store.notify(req("app-a", ":1.1"), true, at(3)).unwrap();
+
+        // app-a notified last (a2 at t=3), so its source leads, newest first
+        // within it; app-b follows.
+        let cards = message_list_cards(&store, at(4));
+        let ids: Vec<u32> = cards.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![a2, a1, b1]);
+        assert!(cards.iter().all(|c| c.time_text == "Just now"));
+
+        // A replace mutates in place and must NOT reorder the groups —
+        // gnome-shell moves a group only on notification-*added*
+        // (`js/ui/messageList.js:1824-1827`, `js/ui/messageTray.js:579-581`);
+        // progress notifications replace constantly and stay put.
+        let mut replace = req("app-b", ":1.2");
+        replace.replaces_id = b1;
+        replace.title = "updated".to_owned();
+        store.notify(replace, true, at(5)).unwrap();
+        let ids: Vec<u32> = message_list_cards(&store, at(6))
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, vec![a2, a1, b1], "a replace never reorders sources");
+    }
 }
