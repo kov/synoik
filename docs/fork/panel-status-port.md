@@ -281,8 +281,7 @@ carved these out as separate work — none block R1 for daily use:
     expand (no 200 ms ease), no focus grab on expand, list expansion state dropped with the
     popover, invisible caret not clickable, hover-cycle stands in for GNOME's mouse-away
     timeouts, `forceExpanded` deferred with per-app policies, no app focus on body click,
-    QS popovers also block, only left clicks intercepted, no message-list scrolling (cards
-    that don't fully fit above the Clear row are dropped)); grouped card stacks — slice 3b ✅
+    QS popovers also block, only left clicks intercepted); grouped card stacks — slice 3b ✅
     (`d5d4cdb0`: notifications from one source group into a `NotificationMessageGroup`
     (`messageList.js:858-949`); the snapshot is now `Vec<CardGroup>` via `message_list_groups`.
     A one-notification group renders as a plain card (unchanged); a larger one fans into a
@@ -302,7 +301,7 @@ carved these out as separate work — none block R1 for daily use:
     a source shrinks to one and un-expands member bodies on collapse
     (`messageList.js:988,1170-1173`); a click on the expanded header background / inter-card
     gap collapses the group (`messageList.js:879,934-935`).
-    Divergences: 200 ms expand animation, list scrolling (overflow cards drop), the group
+    Divergences: 200 ms expand animation, the group
     highlight fade, Escape group-collapse (Escape closes the whole popover; the header button,
     header background, and inter-card gap all collapse); the collapse button's click target is
     the 24px visible circle (GNOME's actor is 32px with an 8px transparent border) and the
@@ -315,9 +314,20 @@ carved these out as separate work — none block R1 for daily use:
     the QS DND-tile flip, and on the gsettings DND change; composited from the icon cache atop
     the bar; hit rect widens to keep the dot clickable while the lit pill stays on the clock
     alone; anchored 2px off the pill edge like GNOME's box spacing. Pinned by panel-geometry,
-    gnome.rs unseen/DND, and a Vulkan differential). **Notifications subsystem COMPLETE**
-    through the approved plan (slices 1/2/3a/3b/4 + message expansion); deferred items
-    (MPRIS media, GtkNotifications, per-app policies, sounds, scrolling, live time refresh,
+    gnome.rs unseen/DND, and a Vulkan differential). Message-list scrolling — un-deferred ✅
+    (`e1f44f6f`: gnome-shell's `St.ScrollView`, `calendar.js:816`. The list lays out in content
+    space (never dropping); when it overflows the fixed popover height the whole content is baked
+    into one texture (cached by scale+revision) and a scrolled, clipped src-crop window is shown
+    with an overlay scrollbar thumb; wheel/touchpad over an open popover scrolls it and is
+    consumed. An expanded card now shows its full ≤`EXPAND_LINES` wrap regardless of height (the
+    earlier height-clamp/collapse-fallback is gone — the list scrolls instead). Clicks register
+    only inside the viewport. Divergences: no vfade edge gradient (`_scrollbars.scss:4`
+    `-st-vfade-offset`), no scrollbar-handle drag (wheel/touchpad only), no scroll-to-focused
+    message (`ensureActorVisibleInScrollView`, `calendar.js:845`). Pinned by a scroll-reveal +
+    clamp unit test, a Vulkan differential (clipped card + thumb), and updated gnome.rs
+    conformance). **Notifications subsystem COMPLETE**
+    through the approved plan (slices 1/2/3a/3b/4 + message expansion + scrolling); deferred items
+    (MPRIS media, GtkNotifications, per-app policies, sounds, live time refresh,
     rich `<b>/<i>` spans) remain per the plan.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
