@@ -2715,6 +2715,114 @@ fn vulkan_renders_a_grouped_stack_and_header() {
     );
 }
 
+/// When the message list overflows the popover it renders through the baked,
+/// clipped scroll path with an overlay scrollbar thumb. Assert the clipped
+/// content shows a card in the viewport and the thumb composites in the
+/// reserved right strip (and the whole thing passes the validation layer).
+#[test]
+fn vulkan_renders_the_scrolled_message_list() {
+    use crate::ui::notification_card::{CardContent, CardGroup};
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    let make_group = |id: u32| CardGroup {
+        key: crate::notifications::SourceKey::PidName(id, format!("App{id}")),
+        source_title: format!("App {id}"),
+        source_icon: None,
+        has_urgent: false,
+        cards: vec![CardContent {
+            id,
+            source_title: format!("App {id}"),
+            source_icon: None,
+            title: format!("msg {id}"),
+            body: "body".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "Just now".to_owned(),
+        }],
+    };
+    // A dozen distinct sources: far more than fit, so the list must scroll.
+    let groups: Vec<_> = (1..=12).map(make_group).collect();
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            groups,
+        );
+    }
+    f.settle_animations();
+
+    let origin = f.niri().panel_popover.content_location(&output);
+    let w = to_physical_precise_round(scale.x, output_size(&output).w);
+    let h = to_physical_precise_round(scale.x, 500.);
+    let list_w = 29. * crate::ui::pt_to_px(11.);
+
+    let state = f.niri_state();
+    let samples = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((w, h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elems.into_iter().rev(),
+            )
+            .expect("render popover");
+            let at = |x: f64, y: f64| {
+                let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                let i = ((py * w + px) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+            // A card near the top of the viewport (clipped content).
+            let card = at(6. + (list_w - 18.) / 2., 6. + 40.);
+            // The scrollbar thumb strip, near the viewport top (scroll at 0).
+            let thumb = at(list_w - 7., 6. + 12.);
+            (card, thumb)
+        })
+        .expect("vulkan renderer");
+    let (card, thumb) = samples;
+
+    assert_eq!(
+        card[3], 255,
+        "the clipped card content is opaque, got {card:?}"
+    );
+    assert!(
+        card[0] > 0x40 && card[0] < 0x60,
+        "the viewport shows a card bg (~#51515a), got {card:?}"
+    );
+    assert_eq!(
+        thumb[3], 255,
+        "the scrollbar thumb is opaque, got {thumb:?}"
+    );
+    assert!(
+        thumb[0] > 0x60 && (thumb[0] as i32 - thumb[2] as i32).abs() < 20,
+        "the thumb is a light grey handle over the strip, got {thumb:?}"
+    );
+    assert!(
+        thumb[0] > card[0],
+        "the thumb is lighter than the card bg behind it: thumb {thumb:?} vs card {card:?}"
+    );
+}
+
 /// The quick-settings popover renders on the owned Vulkan renderer when open: the
 /// menu chrome (an offscreen box with tile backgrounds + labels) plus the icon
 /// elements composited on top. Assert `render` yields several elements that

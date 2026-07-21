@@ -29,10 +29,13 @@ use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 
 use crate::notifications::SourceKey;
 use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::render_to_texture;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -571,6 +574,14 @@ const PLACEHOLDER_ICON: f64 = 96.;
 const PLACEHOLDER_GAP: f64 = 12.;
 const PLACEHOLDER_PX: f64 = crate::ui::pt_to_px(15.);
 const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
+/// Overlay scrollbar handle: `StScrollBar` min-width 8px with a 3px transparent
+/// border → a ~6px visible handle (`_scrollbars.scss:10-25`), a
+/// `forced_circular` pill, `mix($fg,$bg,30%)`. Sits in the reserved right strip
+/// (`LIST_SCROLL_R`), a few px from the column edge.
+const SCROLLBAR_W: f64 = 6.;
+const SCROLLBAR_MIN_H: f64 = 24.;
+const SCROLLBAR_EDGE_GAP: f64 = 4.;
+const SCROLLBAR_THUMB: [f32; 4] = [0.45, 0.45, 0.47, 1.];
 /// The 1px column separator: `.message-list`'s `border-right` in
 /// `$borders_color` = fg at 10% on the dark theme (`_message-list.scss:8,11`,
 /// `_colors.scss:39`).
@@ -653,6 +664,41 @@ enum GroupKind {
     },
 }
 
+/// The content layout resolved against a popover height and the current scroll:
+/// content-space group layouts plus the transform into popover-local space.
+struct Placed {
+    /// Group layouts in content space (y from 0, un-clipped).
+    layouts: Vec<GroupLayout>,
+    /// Total content height (all groups, no drop).
+    content_h: f64,
+    /// Content→popover y offset: `LIST_PAD - clamped_scroll`.
+    off_y: f64,
+    /// Clamped scroll offset (content px from the top).
+    scroll: f64,
+    /// The scroll viewport, popover-local (list top to the controls row).
+    viewport: Rectangle<f64, Logical>,
+}
+
+impl Placed {
+    /// Whether the content overflows the viewport (so the list clips + shows a
+    /// scrollbar).
+    fn overflowing(&self) -> bool {
+        self.content_h > self.viewport.size.h + 0.5
+    }
+
+    /// A content-space rect mapped to popover-local space.
+    fn to_popover(&self, rect: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        Rectangle::new(rect.loc + Point::from((0., self.off_y)), rect.size)
+    }
+
+    /// Whether a popover-local rect is at least partly inside the viewport (so
+    /// it is visible / interactive).
+    fn viewport_visible(&self, rect: Rectangle<f64, Logical>) -> bool {
+        let v = self.viewport;
+        rect.size.h > 0. && rect.loc.y < v.loc.y + v.size.h && v.loc.y < rect.loc.y + rect.size.h
+    }
+}
+
 /// The message-list column of the calendar popover: a plain-data snapshot of
 /// the notification store, grouped per source (`NotificationMessageGroup`).
 /// One-notification groups render as plain cards; larger ones fan into a
@@ -669,7 +715,25 @@ pub struct CalendarMessageList {
     /// Bumped whenever the snapshot changes, to invalidate cached textures
     /// (cache keys carry the revision in their high 32 bits).
     revision: u64,
+    /// Scroll offset (content px from the top), like gnome-shell's
+    /// `St.ScrollView` over the message view. Clamped to `[0, max_scroll]` at
+    /// every use against the live popover height, so a content shrink (a
+    /// collapse, a close) re-snaps it without a separate hook.
+    scroll_y: f64,
     cache: RefCell<CardCache>,
+    /// The whole list content baked into one texture (all groups, no drop),
+    /// keyed by `(scale, revision)` — so scrolling only moves the src-crop
+    /// window and never re-bakes. Only populated on the overflow path.
+    content_cache: RefCell<Option<ContentTex>>,
+}
+
+/// A cached bake of the full (un-clipped) list content; scrolling re-samples a
+/// window of it rather than re-rendering.
+struct ContentTex {
+    scale: NotNan<f64>,
+    revision: u64,
+    context: ContextId<VkTexture>,
+    tex: VkTexture,
 }
 
 impl CalendarMessageList {
@@ -679,7 +743,9 @@ impl CalendarMessageList {
             body_expanded: HashSet::new(),
             group_expanded: None,
             revision: 0,
+            scroll_y: 0.,
             cache: RefCell::new(CardCache::new()),
+            content_cache: RefCell::new(None),
         }
     }
 
@@ -770,32 +836,14 @@ impl CalendarMessageList {
         }
     }
 
-    /// One card's layout, body-caret-aware and clamped to `avail` (the space
-    /// from the card's top to the controls row). The no-scroll clamp shrinks an
-    /// expanded body to what fits and falls back to the collapsed layout when
-    /// even one line + the action row cannot (never vanishing with no caret to
-    /// un-toggle it — recorded divergence; gnome-shell scrolls). `caret`
-    /// reserves the header expand slot (false on a collapsed stack's top card,
-    /// where the whole stack is the click target).
-    fn card_layout(&self, content: &CardContent, avail: f64, caret: bool) -> CardLayout {
-        use notification_card::{BODY_ICON, BTN_H, HEADER_H, LINE_H, PAD};
-
-        if caret && self.body_expanded.contains(&content.id) {
-            let base = PAD + HEADER_H + PAD + BODY_ICON + PAD;
-            let actions_h = if content.actions.is_empty() {
-                0.
-            } else {
-                BTN_H + PAD
-            };
-            let extra = ((avail - base - actions_h) / LINE_H).floor().max(0.);
-            let layout =
-                notification_card::layout_clamped(content, CARD_W, true, true, 1 + extra as usize);
-            if layout.size.h <= avail {
-                return layout;
-            }
-            // Even the clamped expansion overflows — fall back to collapsed.
-        }
-        notification_card::layout(content, CARD_W, false, caret)
+    /// One card's layout, body-caret-aware. An expanded body shows its full
+    /// (≤`EXPAND_LINES`) wrap; the list scrolls to reach overflow, so there is
+    /// no popover-height clamp any more. `caret` reserves the header expand
+    /// slot (false on a collapsed stack's top card, where the whole stack is
+    /// the click target).
+    fn card_layout(&self, content: &CardContent, caret: bool) -> CardLayout {
+        let expanded = caret && self.body_expanded.contains(&content.id);
+        notification_card::layout(content, CARD_W, expanded, caret)
     }
 
     /// Collapsed-stack geometry for a group with >1 card: the top card layout,
@@ -834,12 +882,13 @@ impl CalendarMessageList {
         (top, peeks, top_h + cumulative)
     }
 
-    /// Lay out every group in y-flow order, dropping overflow (no scroll —
-    /// recorded divergence; gnome-shell scrolls).
-    fn layout(&self, height: f64) -> Vec<GroupLayout> {
-        let bottom = height - self.controls_h();
+    /// Lay out every group in content space (y from 0), never dropping — the
+    /// list scrolls to reach overflow (`js/ui/calendar.js:816` `St.ScrollView`).
+    /// Returns the layouts and the total content height.
+    fn layout(&self) -> (Vec<GroupLayout>, f64) {
         let mut out = Vec::new();
-        let mut y = LIST_PAD;
+        let mut y = 0.0_f64;
+        let mut content_h = 0.0_f64;
         for (g, group) in self.groups.iter().enumerate() {
             // The store never yields an empty source (`notifications.rs:619`),
             // but `CardGroup` is public — skip rather than index-panic.
@@ -850,21 +899,16 @@ impl CalendarMessageList {
             let expanded = self.group_expanded.as_ref() == Some(&group.key);
             if group.cards.len() <= 1 {
                 let origin = Point::from((LIST_PAD, y));
-                let layout = self.card_layout(&group.cards[0], bottom - y, true);
-                if y + layout.size.h > bottom {
-                    break;
-                }
+                let layout = self.card_layout(&group.cards[0], true);
                 let h = layout.size.h;
                 out.push(GroupLayout {
                     group: g,
                     bounds: Rectangle::new(origin, layout.size),
                     kind: GroupKind::Single { origin, layout },
                 });
+                content_h = content_h.max(y + h);
                 y += h + CARD_GAP;
             } else if expanded {
-                if y + GROUP_HEADER_H > bottom {
-                    break;
-                }
                 let header = Rectangle::new(
                     Point::from((LIST_PAD, y)),
                     Size::from((CARD_W, GROUP_HEADER_H)),
@@ -879,10 +923,7 @@ impl CalendarMessageList {
                 let mut cy = y + GROUP_HEADER_H;
                 let mut cards = Vec::new();
                 for (ci, content) in group.cards.iter().enumerate() {
-                    let layout = self.card_layout(content, bottom - cy, true);
-                    if cy + layout.size.h > bottom {
-                        break; // drop overflow (no scroll)
-                    }
+                    let layout = self.card_layout(content, true);
                     let h = layout.size.h;
                     cards.push((ci, Point::from((LIST_PAD, cy)), layout));
                     cy += h + CARD_GAP;
@@ -904,14 +945,12 @@ impl CalendarMessageList {
                         cards,
                     },
                 });
+                content_h = content_h.max(group_bottom);
                 // The card margin plus an expanded group's extra bottom margin.
                 y = group_bottom + CARD_GAP + notification_card::GROUP_BOTTOM_MARGIN;
             } else {
                 let origin = Point::from((LIST_PAD, y));
                 let (top, peeks, stack_h) = self.stack_geometry(group, origin);
-                if y + stack_h > bottom {
-                    break;
-                }
                 let ids = group.cards.iter().map(|c| c.id).collect();
                 out.push(GroupLayout {
                     group: g,
@@ -923,10 +962,47 @@ impl CalendarMessageList {
                         ids,
                     },
                 });
+                content_h = content_h.max(y + stack_h);
                 y += stack_h + CARD_GAP;
             }
         }
-        out
+        (out, content_h)
+    }
+
+    /// The scroll viewport height: the list top (`LIST_PAD`) down to the
+    /// controls row.
+    fn viewport_h(&self, height: f64) -> f64 {
+        (height - self.controls_h() - LIST_PAD).max(0.)
+    }
+
+    /// Lay out and resolve the scroll transform for `height` in one pass.
+    fn placed(&self, height: f64) -> Placed {
+        let (layouts, content_h) = self.layout();
+        let vh = self.viewport_h(height);
+        let scroll = self.scroll_y.clamp(0., (content_h - vh).max(0.));
+        Placed {
+            layouts,
+            content_h,
+            off_y: LIST_PAD - scroll,
+            scroll,
+            viewport: Rectangle::new(Point::from((0., LIST_PAD)), Size::from((LIST_W, vh))),
+        }
+    }
+
+    /// Scroll by `delta` content px (positive = down); returns whether it moved
+    /// (so the caller can request a redraw).
+    fn scroll_by(&mut self, delta: f64, height: f64) -> bool {
+        let vh = self.viewport_h(height);
+        let max = (self.content_h() - vh).max(0.);
+        let before = self.scroll_y.clamp(0., max);
+        let after = (self.scroll_y + delta).clamp(0., max);
+        self.scroll_y = after;
+        (after - before).abs() > f64::EPSILON
+    }
+
+    /// Total content height (all groups, no drop).
+    fn content_h(&self) -> f64 {
+        self.layout().1
     }
 
     /// The Clear pill's popover-local rect (only meaningful when non-empty).
@@ -968,21 +1044,33 @@ impl CalendarMessageList {
 
     /// Hit-test a click at popover-local `pos` inside the list column.
     fn hit(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHit> {
-        for gl in self.layout(height) {
-            if !gl.bounds.contains(pos) {
+        // The Clear pill lives in the fixed controls row, below the viewport.
+        if !self.is_empty() && self.clear_rect(height).contains(pos) {
+            return Some(ListHit::Clear);
+        }
+        let p = self.placed(height);
+        // Clicks register only inside the scroll viewport — the scrollbar strip
+        // and the padding around the list are consumed but hit nothing.
+        if !p.viewport.contains(pos) {
+            return None;
+        }
+        // Map the click into content space (undo the scroll translation).
+        let cpos = pos - Point::from((0., p.off_y));
+        for gl in &p.layouts {
+            if !gl.bounds.contains(cpos) {
                 continue;
             }
             let group = &self.groups[gl.group];
             match &gl.kind {
                 GroupKind::Single { origin, layout } => {
-                    return Some(Self::card_hit(pos - *origin, &group.cards[0], layout));
+                    return Some(Self::card_hit(cpos - *origin, &group.cards[0], layout));
                 }
                 GroupKind::Collapsed {
                     origin, top, ids, ..
                 } => {
                     // The top card's close closes the whole group; anything
                     // else on the stack expands it.
-                    if top.close.contains(pos - *origin) {
+                    if top.close.contains(cpos - *origin) {
                         return Some(ListHit::CloseGroup(ids.clone()));
                     }
                     return Some(ListHit::ExpandGroup(group.key.clone()));
@@ -990,12 +1078,12 @@ impl CalendarMessageList {
                 GroupKind::Expanded {
                     collapse, cards, ..
                 } => {
-                    if collapse.contains(pos) {
+                    if collapse.contains(cpos) {
                         return Some(ListHit::CollapseGroup);
                     }
                     for (ci, origin, layout) in cards {
-                        if Rectangle::new(*origin, layout.size).contains(pos) {
-                            return Some(Self::card_hit(pos - *origin, &group.cards[*ci], layout));
+                        if Rectangle::new(*origin, layout.size).contains(cpos) {
+                            return Some(Self::card_hit(cpos - *origin, &group.cards[*ci], layout));
                         }
                     }
                     // A click on the header (off the button) or an inter-card
@@ -1006,13 +1094,14 @@ impl CalendarMessageList {
                 }
             }
         }
-        if !self.is_empty() && self.clear_rect(height).contains(pos) {
-            return Some(ListHit::Clear);
-        }
         None
     }
 
     /// The render elements (textures + icons), popover-relative to `origin`.
+    /// When the content fits, groups are placed directly; when it overflows,
+    /// the whole content is baked into one texture and a scrolled, clipped
+    /// window of it is presented, with an overlay scrollbar thumb on top
+    /// (gnome-shell's `St.ScrollView`, `js/ui/calendar.js:816`).
     fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -1020,6 +1109,58 @@ impl CalendarMessageList {
         scale: f64,
         origin: Point<f64, Logical>,
         height: f64,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let p = self.placed(height);
+        if !p.overflowing() {
+            // Everything fits: place the groups directly (scroll is 0, so
+            // `off_y == LIST_PAD`).
+            let base = origin + Point::from((0., p.off_y));
+            return self.render_groups(renderer, icons, scale, base, &p.layouts);
+        }
+
+        // Overflow: present a clipped, scrolled window of the baked content,
+        // with the scrollbar thumb composited on top (FIRST = topmost).
+        let mut elements = Vec::new();
+        if let Some(thumb) = self.scrollbar_thumb(renderer, scale, origin, &p) {
+            elements.push(thumb);
+        }
+        match self.content_texture(renderer, icons, scale, &p) {
+            Ok(tex) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    tex,
+                    scale,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                let src = Rectangle::new(
+                    Point::from((0., p.scroll)),
+                    Size::from((LIST_W, p.viewport.size.h)),
+                );
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin + p.viewport.loc,
+                    1.,
+                    Some(src),
+                    Some(p.viewport.size),
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => tracing::error!("error baking the message list: {err:#}"),
+        }
+        elements
+    }
+
+    /// Build the group render elements at `base` (a content-space origin),
+    /// managing the per-card texture cache. Shared by the direct (in-place) and
+    /// the baked (offscreen → clipped) render paths.
+    fn render_groups(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        scale: f64,
+        base: Point<f64, Logical>,
+        layouts: &[GroupLayout],
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let mut elements = Vec::new();
         let mut cache = self.cache.borrow_mut();
@@ -1033,9 +1174,9 @@ impl CalendarMessageList {
             next += 1;
             k
         };
-        for gl in self.layout(height) {
+        for gl in layouts {
             let group = &self.groups[gl.group];
-            match gl.kind {
+            match &gl.kind {
                 GroupKind::Single { origin: o, layout } => {
                     elements.extend(notification_card::card_elements(
                         renderer,
@@ -1043,9 +1184,9 @@ impl CalendarMessageList {
                         &mut cache,
                         key(),
                         &group.cards[0],
-                        &layout,
+                        layout,
                         CARD_RADIUS,
-                        origin + o,
+                        base + *o,
                         1.,
                         scale,
                     ));
@@ -1063,9 +1204,9 @@ impl CalendarMessageList {
                         &mut cache,
                         key(),
                         &group.cards[0],
-                        &top,
+                        top,
                         CARD_RADIUS,
-                        origin + o,
+                        base + *o,
                         1.,
                         scale,
                     ));
@@ -1074,10 +1215,10 @@ impl CalendarMessageList {
                             renderer,
                             &mut cache,
                             key(),
-                            size,
+                            *size,
                             CARD_RADIUS,
-                            bg,
-                            origin + peek_o,
+                            *bg,
+                            base + *peek_o,
                             scale,
                         ) {
                             elements.push(elem);
@@ -1095,10 +1236,10 @@ impl CalendarMessageList {
                         icons,
                         &mut cache,
                         key(),
-                        &title,
-                        header,
-                        collapse,
-                        origin,
+                        title,
+                        *header,
+                        *collapse,
+                        base,
                         scale,
                     ));
                     for (ci, card_o, layout) in cards {
@@ -1107,10 +1248,10 @@ impl CalendarMessageList {
                             icons,
                             &mut cache,
                             key(),
-                            &group.cards[ci],
-                            &layout,
+                            &group.cards[*ci],
+                            layout,
                             CARD_RADIUS,
-                            origin + card_o,
+                            base + *card_o,
                             1.,
                             scale,
                         ));
@@ -1119,6 +1260,84 @@ impl CalendarMessageList {
             }
         }
         elements
+    }
+
+    /// Bake the full (un-clipped) list content into one texture, cached by
+    /// `(scale, revision)` so scrolling only slides the src-crop and never
+    /// re-bakes.
+    fn content_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        scale: f64,
+        p: &Placed,
+    ) -> anyhow::Result<VkTexture> {
+        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        let context = renderer.context_id();
+        {
+            let cache = self.content_cache.borrow();
+            if let Some(c) = cache.as_ref() {
+                if c.scale == scale_key && c.revision == self.revision && c.context == context {
+                    return Ok(c.tex.clone());
+                }
+            }
+        }
+        let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+        let phys = Size::<i32, Physical>::from((px(LIST_W).max(1), px(p.content_h).max(1)));
+        let elements =
+            self.render_groups(renderer, icons, scale, Point::from((0., 0.)), &p.layouts);
+        let (tex, _sync) = render_to_texture(
+            renderer,
+            phys,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements.into_iter(),
+        )?;
+        renderer.make_offscreen_sampleable(&tex)?;
+        *self.content_cache.borrow_mut() = Some(ContentTex {
+            scale: scale_key,
+            revision: self.revision,
+            context,
+            tex: tex.clone(),
+        });
+        Ok(tex)
+    }
+
+    /// The overlay scrollbar thumb (drawn on top of the clipped content) when
+    /// the content overflows; its length tracks the visible fraction and its
+    /// position the scroll offset. The texture is cached by revision (only its
+    /// location moves as you scroll).
+    fn scrollbar_thumb(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        origin: Point<f64, Logical>,
+        p: &Placed,
+    ) -> Option<TextureRenderElement<VkTexture>> {
+        let vh = p.viewport.size.h;
+        let max_scroll = (p.content_h - vh).max(0.);
+        if max_scroll <= 0. {
+            return None;
+        }
+        let thumb_h = (vh * vh / p.content_h).clamp(SCROLLBAR_MIN_H, vh);
+        let thumb_y = p.viewport.loc.y + (p.scroll / max_scroll) * (vh - thumb_h);
+        let thumb_x = LIST_W - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
+        let mut cache = self.cache.borrow_mut();
+        let rev = self.revision & 0xffff_ffff;
+        // A fixed key well above `render_groups`' running counter (which stays
+        // small), so the thumb never collides with a card slot.
+        let key = (rev << 32) | 0x00ff_ffff;
+        notification_card::stack_shadow_element(
+            renderer,
+            &mut cache,
+            key,
+            Size::from((SCROLLBAR_W, thumb_h)),
+            SCROLLBAR_W / 2.,
+            SCROLLBAR_THUMB,
+            origin + Point::from((thumb_x, thumb_y)),
+            scale,
+        )
     }
 
     /// The expanded group's header: the title glyphs + collapse-button circle
@@ -1259,16 +1478,34 @@ impl CalendarMessageList {
         &self,
         height: f64,
     ) -> Vec<(u32, Point<f64, Logical>, CardLayout)> {
+        let Placed {
+            layouts,
+            off_y,
+            viewport,
+            ..
+        } = self.placed(height);
+        let shift = Point::from((0., off_y));
+        let vis = |rect: Rectangle<f64, Logical>| {
+            rect.size.h > 0.
+                && rect.loc.y < viewport.loc.y + viewport.size.h
+                && viewport.loc.y < rect.loc.y + rect.size.h
+        };
         let mut out = Vec::new();
-        for gl in self.layout(height) {
+        for gl in layouts {
             let group = &self.groups[gl.group];
             match gl.kind {
                 GroupKind::Single { origin, layout } => {
-                    out.push((group.cards[0].id, origin, layout));
+                    let po = origin + shift;
+                    if vis(Rectangle::new(po, layout.size)) {
+                        out.push((group.cards[0].id, po, layout));
+                    }
                 }
                 GroupKind::Expanded { cards, .. } => {
                     for (ci, origin, layout) in cards {
-                        out.push((group.cards[ci].id, origin, layout));
+                        let po = origin + shift;
+                        if vis(Rectangle::new(po, layout.size)) {
+                            out.push((group.cards[ci].id, po, layout));
+                        }
                     }
                 }
                 GroupKind::Collapsed { .. } => {}
@@ -1278,14 +1515,18 @@ impl CalendarMessageList {
     }
 
     /// Visible groups as `(source key, popover-local bounds, expanded?)` — the
-    /// test/introspection view of the grouping.
+    /// test/introspection view of the grouping (scrolled-off groups omitted).
     fn visible_groups(&self, height: f64) -> Vec<GroupRect> {
-        self.layout(height)
-            .into_iter()
-            .map(|gl| {
-                let key = self.groups[gl.group].key.clone();
-                let expanded = matches!(gl.kind, GroupKind::Expanded { .. });
-                (key, gl.bounds, expanded)
+        let p = self.placed(height);
+        p.layouts
+            .iter()
+            .filter_map(|gl| {
+                let bounds = p.to_popover(gl.bounds);
+                p.viewport_visible(bounds).then(|| {
+                    let key = self.groups[gl.group].key.clone();
+                    let expanded = matches!(gl.kind, GroupKind::Expanded { .. });
+                    (key, bounds, expanded)
+                })
             })
             .collect()
     }
@@ -1293,13 +1534,16 @@ impl CalendarMessageList {
     /// A collapsed stack's top-card close button, popover-local (`None` unless
     /// that group is a visible collapsed stack).
     fn stack_close_rect(&self, key: &SourceKey, height: f64) -> Option<Rectangle<f64, Logical>> {
-        self.layout(height).into_iter().find_map(|gl| {
+        let p = self.placed(height);
+        p.layouts.iter().find_map(|gl| {
             if &self.groups[gl.group].key != key {
                 return None;
             }
-            match gl.kind {
+            match &gl.kind {
                 GroupKind::Collapsed { origin, top, .. } => {
-                    Some(Rectangle::new(origin + top.close.loc, top.close.size))
+                    let rect =
+                        p.to_popover(Rectangle::new(*origin + top.close.loc, top.close.size));
+                    p.viewport_visible(rect).then_some(rect)
                 }
                 _ => None,
             }
@@ -1308,12 +1552,16 @@ impl CalendarMessageList {
 
     /// An expanded group's collapse button, popover-local.
     fn group_collapse_rect(&self, key: &SourceKey, height: f64) -> Option<Rectangle<f64, Logical>> {
-        self.layout(height).into_iter().find_map(|gl| {
+        let p = self.placed(height);
+        p.layouts.iter().find_map(|gl| {
             if &self.groups[gl.group].key != key {
                 return None;
             }
-            match gl.kind {
-                GroupKind::Expanded { collapse, .. } => Some(collapse),
+            match &gl.kind {
+                GroupKind::Expanded { collapse, .. } => {
+                    let rect = p.to_popover(*collapse);
+                    p.viewport_visible(rect).then_some(rect)
+                }
                 _ => None,
             }
         })
@@ -1402,6 +1650,16 @@ impl DateMenu {
         self.calendar
             .pointer_click(pos - Point::from((calendar_col_x(), 0.)));
         PopoverAction::Consumed
+    }
+
+    /// A wheel/scroll of `delta` content px over the popover. Scrolls the
+    /// message list when the pointer is over its column; returns whether the
+    /// offset moved (so the caller can redraw).
+    pub fn scroll(&mut self, pos: Point<f64, Logical>, delta: f64) -> bool {
+        if pos.x < calendar_col_x() {
+            return self.list.scroll_by(delta, self.logical_size().h);
+        }
+        false
     }
 
     /// Test hooks: the visible per-card interactive rects (single-card groups +
@@ -2167,32 +2425,33 @@ mod tests {
         }
     }
 
-    /// The no-scroll expansion clamp: an expanded card's line budget shrinks
-    /// to the space left above the controls; when even the one-line-plus-
-    /// actions minimum (124px) doesn't fit, the card falls back to its
-    /// collapsed layout instead of vanishing with no caret to un-toggle it.
+    /// An expanded card shows its full (≤`EXPAND_LINES`) wrap regardless of the
+    /// popover height — the list scrolls to reach overflow, so there is no
+    /// height-dependent clamp any more.
     #[test]
-    fn message_list_expansion_clamps_and_never_vanishes() {
+    fn message_list_expansion_shows_full_wrap_regardless_of_height() {
         let mut card = sample_card(1);
         card.body = "word ".repeat(120).trim_end().to_owned();
         card.actions = vec![("ok".to_owned(), "OK".to_owned())];
         let mut list = CalendarMessageList::new(vec![single_group(card)]);
         list.toggle_body_expanded(1);
 
-        // Controls row = 49px; card starts at y=6. Plenty of room: expanded,
-        // budget-clamped to the space (height 200 → 145 free → 2 lines).
-        let visible = list.visible_interactive_cards(200.);
-        assert_eq!(visible.len(), 1);
-        assert!(visible[0].2.expanded);
-        assert_eq!(visible[0].2.size.h, 90. + 18. + 28. + 6.);
-
-        // Tight slot (height 150 → 95 free): the minimum expanded layout
-        // (124) can't fit, the collapsed one (90) can — fall back, stay
-        // visible.
-        let visible = list.visible_interactive_cards(150.);
-        assert_eq!(visible.len(), 1);
-        assert!(!visible[0].2.expanded, "falls back to the collapsed layout");
-        assert_eq!(visible[0].2.size.h, 90.);
+        // The expanded layout is identical at a roomy and a tight height (the
+        // body wraps to the full EXPAND_LINES budget either way).
+        let roomy = list.visible_interactive_cards(400.);
+        let tight = list.visible_interactive_cards(150.);
+        assert_eq!(roomy.len(), 1);
+        assert_eq!(tight.len(), 1);
+        assert!(roomy[0].2.expanded && tight[0].2.expanded);
+        assert_eq!(
+            roomy[0].2.body_lines.len(),
+            notification_card::EXPAND_LINES,
+            "a long body expands to the full line budget"
+        );
+        assert_eq!(
+            roomy[0].2.size.h, tight[0].2.size.h,
+            "the expansion no longer depends on the popover height"
+        );
     }
 
     #[test]
@@ -2300,22 +2559,51 @@ mod tests {
     }
 
     #[test]
-    fn message_list_overflow_drops_cards_beyond_the_controls() {
-        // More single-card groups than fit: only whole cards above the controls
-        // row render (no scrolling yet — recorded divergence; gnome-shell scrolls).
+    fn message_list_scrolls_to_reveal_overflow() {
+        // More single-card groups than fit: the viewport shows a subset, and
+        // scrolling reveals the rest (gnome-shell's St.ScrollView).
         let groups: Vec<_> = (1..=10).map(|i| single_group(sample_card(i))).collect();
-        let dm = DateMenu::new(0, false, [0, 0, 0], groups);
-        let h = dm.logical_size().h;
-        let visible = dm.card_rects();
-        assert!(!visible.is_empty());
-        assert!(visible.len() < 10, "10 cards cannot fit the popover height");
-        let controls_top = h - (CONTROLS_PAD + CLEAR_H + CONTROLS_PAD_B);
-        for (_, rect, _) in &visible {
-            assert!(
-                rect.loc.y + rect.size.h <= controls_top,
-                "every visible card fits fully above the Clear row"
-            );
-        }
+        let mut list = CalendarMessageList::new(groups);
+        let h = 346.;
+        assert!(
+            list.placed(h).overflowing(),
+            "10 cards overflow the popover"
+        );
+
+        let top_ids: Vec<u32> = list
+            .visible_interactive_cards(h)
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        assert!(!top_ids.is_empty());
+        assert!(top_ids.len() < 10, "not all 10 fit the viewport at once");
+        assert!(
+            top_ids.contains(&1),
+            "the newest card is visible at the top"
+        );
+        assert!(
+            !top_ids.contains(&10),
+            "the last card is initially scrolled off"
+        );
+
+        // Scroll to the bottom: the last card becomes visible, the first leaves.
+        assert!(list.scroll_by(10_000., h), "a big scroll moves the offset");
+        assert!(
+            !list.scroll_by(10_000., h),
+            "scrolling past the end is clamped (no further move)"
+        );
+        let bottom_ids: Vec<u32> = list
+            .visible_interactive_cards(h)
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        assert!(bottom_ids.contains(&10), "scrolling reveals the last card");
+        assert!(!bottom_ids.contains(&1), "the first card scrolled away");
+
+        // Scroll back up past the top: clamped to 0, first card visible again.
+        assert!(list.scroll_by(-10_000., h));
+        assert!(!list.scroll_by(-10_000., h), "clamped at the top");
+        assert!(list.visible_interactive_cards(h).iter().any(|c| c.0 == 1));
     }
 
     /// A multi-notification group renders as a collapsed fanned stack: one

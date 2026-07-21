@@ -513,6 +513,26 @@ impl PanelPopover {
         Some(PopoverAction::Consumed)
     }
 
+    /// Route a wheel/scroll of `delta` content px at output-local `pos` to the
+    /// open popover (the dateMenu message list). Returns whether the content
+    /// scrolled (so the caller can redraw).
+    pub fn pointer_scroll(
+        &mut self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+        delta: f64,
+    ) -> bool {
+        if !self.open || self.closing || self.output.as_ref() != Some(output) {
+            return false;
+        }
+        let origin = self.location(output);
+        let local = pos - origin;
+        match self.content.as_mut() {
+            Some(PopoverContent::Calendar(dm)) => dm.scroll(local, delta),
+            _ => false,
+        }
+    }
+
     /// The popover's resting top-left, output-local logical: centered under the anchor,
     /// clamped into the output with a `POPOVER_MARGIN` inset from the screen edges, and
     /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.

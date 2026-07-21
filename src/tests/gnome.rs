@@ -4072,13 +4072,13 @@ fn calendar_message_list_click_close_body_and_clear() {
     open_calendar(&mut f);
     let output = f.niri_output(1);
     let origin = f.niri().panel_popover.content_location(&output);
-    // Only two 90px cards fit above the Clear row at this popover height —
-    // the oldest is dropped (the no-scroll divergence). Newest renders first.
+    // All three cards are reachable now (the list scrolls); they render
+    // newest-first.
     let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
     assert_eq!(
         cards.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
-        vec![pid, did],
-        "sources render newest-first; the overflowing oldest card is dropped"
+        vec![pid, did, rid],
+        "sources render newest-first; scrolling keeps every card reachable"
     );
     assert_eq!(
         f.niri().panel_popover.date_menu().unwrap().list().len(),
@@ -4255,17 +4255,17 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     assert_eq!(actions.len(), 2);
     assert!(expand.is_some(), "the caret stays live to collapse");
 
-    // A snapshot push while open (new notification) keeps the card expanded,
-    // its line budget clamped to the space left below the new card.
+    // A snapshot push while open (new notification) keeps the card expanded at
+    // its full budget — the list scrolls to fit rather than clamping the body.
     banner_notify(&mut f, banner_req("app-b", ":1.2"));
     let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
     assert_eq!(rects.len(), 2, "both cards visible");
     let (aid, a_card, _) = rects[1];
     assert_eq!(aid, id);
-    assert!(
-        a_card.size.h > 90. && a_card.size.h < 90. + 5. * 18. + 28. + 6.,
-        "still expanded, clamped below the full budget: {}",
-        a_card.size.h
+    assert_eq!(
+        a_card.size.h,
+        90. + 5. * 18. + 28. + 6.,
+        "still fully expanded (six lines); the list scrolls, no clamp"
     );
 
     // Caret click again: collapse back to the flat card.
@@ -4298,6 +4298,13 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         .card_expand_rect(id)
         .unwrap();
     click(&mut f, rect_center(caret));
+    // The expanded card's action row now sits below the second card, past the
+    // fold — scroll the list down to bring it into view (as a user would).
+    f.niri().panel_popover.pointer_scroll(
+        &output,
+        origin + smithay::utils::Point::from((30., 30.)),
+        1000.,
+    );
     let actions = f
         .niri()
         .panel_popover
