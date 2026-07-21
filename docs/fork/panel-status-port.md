@@ -168,8 +168,17 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
   Settings row) and the **power button** (Q1 session submenu). This is the prerequisite for Q6/Q7/Q8's
   in-menu device/profile lists — each now just adds a `DetailOwner` arm (`header`/`rows`/`row_count`/
   `anchor_row_bottom`) + the backend to enumerate/act. Deferred v1 polish: slide-down grow animation,
-  dim-the-rest, per-row hover, split-radius tile look.
+  dim-the-rest, split-radius tile look.
 - **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
+- **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24`. A GNOME-faithful additive fg-wash
+  (`≈white@0.10`, `_message-list.scss:72-75` `:hover` step) behind every interactive popover control,
+  baked behind its glyphs; a `pointer_hover` route parallels `pointer_click`, and a hover change bumps
+  the widget's texture revision to re-bake. Covers QS tiles / pill / system buttons / slider mute
+  icons / detail rows, calendar day cells / month arrows / today card, and card close/action/caret /
+  group collapse / Clear. Cursor stays the arrow (GNOME uses none on shell widgets). Divergences:
+  QS tiles light whole (not per body/arrow half); the slider picker arrow and the card body are not
+  highlighted (the latter is faithful — `.message` has no `:hover`). Not live-validated yet
+  (unit + Vulkan-differential only).
 
 ---
 
