@@ -128,6 +128,12 @@ const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
 /// the four outer corners transparent (they blend to whatever is beneath the popover).
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
+/// Hover highlight: an additive white wash painted over a control's existing
+/// background, behind its glyphs (GNOME raises a button's fg-wash by ~0.10 on
+/// `:hover`, `_message-list.scss:72-75`; quick toggles use `button(hover)`, a
+/// lightened bg). For flat detail rows with no base bg this is the whole
+/// indication. Subtle by design; tune live.
+const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.1];
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
 /// Text/icon on an active (accent) tile. GNOME's `-st-accent-fg-color` is hardcoded white
@@ -836,9 +842,24 @@ pub struct QuickSettings {
     /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
     /// when collapsed. At most one at a time.
     expanded: Option<DetailOwner>,
+    /// The control the pointer is hovering, highlighted on render.
+    hovered: Option<QsHover>,
     /// Bumped on any toggle so the cached chrome texture is redrawn.
     revision: u64,
     cache: RefCell<TextureCache>,
+}
+
+/// A hoverable control in the quick-settings menu, for the hover highlight. A
+/// menu tile lights as a whole (its body and picker-arrow halves together — a
+/// small divergence from gnome-shell's per-half hover) and the slider picker
+/// arrow is not separately highlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QsHover {
+    Tile(usize),
+    Pill,
+    Sys(SysButton),
+    SliderIcon(Slider),
+    DetailRow(usize),
 }
 
 struct TextureCache {
@@ -874,6 +895,7 @@ impl QuickSettings {
             source_list,
             sliding: None,
             expanded: None,
+            hovered: None,
             accent: [
                 f32::from(accent[0]) / 255.,
                 f32::from(accent[1]) / 255.,
@@ -1147,6 +1169,64 @@ impl QuickSettings {
         let layout = self.layout();
         let (slider, _) = self.sliding?;
         Some(self.set_local_volume(slider, volume_from_x(slider, pos.x, layout)))
+    }
+
+    /// Update the hovered control from a menu-local position (`None` clears the
+    /// hover). Returns whether it changed, so the caller can redraw; a change
+    /// bumps `revision`, re-baking the chrome with the highlight.
+    pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
+        let new = pos.and_then(|pos| self.hover_zone(pos));
+        if new == self.hovered {
+            return false;
+        }
+        self.hovered = new;
+        self.revision += 1;
+        true
+    }
+
+    /// The hoverable control at menu-local `pos`, mirroring the hit order of
+    /// [`pointer_click`](Self::pointer_click) but only for controls that carry a
+    /// visible highlight (the whole tile, the pill, a system button, a slider
+    /// mute icon, or a detail-view row).
+    fn hover_zone(&self, pos: Point<f64, Logical>) -> Option<QsHover> {
+        let layout = self.layout();
+        // An open detail view is topmost: a row highlights; the rest of the card
+        // swallows the hover (no tile leaks through).
+        if let Some(owner) = self.expanded {
+            let rows = owner.rows(
+                self.network,
+                &self.sink_list,
+                &self.source_list,
+                &self.power,
+            );
+            for k in 0..rows.len() {
+                if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+                    return Some(QsHover::DetailRow(k));
+                }
+            }
+            if detail_rect(layout).is_some_and(|r| r.contains(pos)) {
+                return None;
+            }
+        }
+        for (i, _item) in self.grid().iter().enumerate() {
+            if tile_rect(i, layout).contains(pos) {
+                return Some(QsHover::Tile(i));
+            }
+        }
+        if pill_rect(self.has_pill()).is_some_and(|p| p.contains(pos)) {
+            return Some(QsHover::Pill);
+        }
+        for button in SYS_BUTTONS {
+            if sys_rect(button, self.has_pill()).contains(pos) {
+                return Some(QsHover::Sys(button));
+            }
+        }
+        for slider in [Slider::Output, Slider::Mic] {
+            if layout.sliders.present(slider) && slider_icon_rect(slider, layout).contains(pos) {
+                return Some(QsHover::SliderIcon(slider));
+            }
+        }
+        None
     }
 
     /// End a slider drag (pointer released). Returns whether releasing the frozen device count
@@ -1640,6 +1720,14 @@ impl QuickSettings {
                     rect_px(rect),
                     &[full],
                 )?;
+                if self.hovered == Some(QsHover::Tile(i)) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (rect.size.h / 2. * scale) as f32,
+                        rect_px(rect),
+                        &[full],
+                    )?;
+                }
 
                 // A menu tile's arrow-half is separated from the body by a 1px divider
                 // (`.quick-toggle-separator`); v1 keeps one pill background and marks the split
@@ -1699,6 +1787,14 @@ impl QuickSettings {
                     rect_px(pill),
                     &[full],
                 )?;
+                if self.hovered == Some(QsHover::Pill) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (pill.size.h / 2. * scale) as f32,
+                        rect_px(pill),
+                        &[full],
+                    )?;
+                }
                 let label_x = px(pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.);
                 let label_cy = px(pill.loc.y + pill.size.h / 2.);
                 frame.render_glyphs(
@@ -1728,6 +1824,14 @@ impl QuickSettings {
                     rect_px(disc),
                     &[full],
                 )?;
+                if self.hovered == Some(QsHover::Sys(button)) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (SYS_HIT / 2. * scale) as f32,
+                        rect_px(disc),
+                        &[full],
+                    )?;
+                }
             }
 
             // Each present slider: mute-button disc, the trough, its accent-filled portion, and the
@@ -1751,6 +1855,14 @@ impl QuickSettings {
                     rect_px(disc),
                     &[full],
                 )?;
+                if self.hovered == Some(QsHover::SliderIcon(slider)) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (SLIDER_H / 2. * scale) as f32,
+                        rect_px(disc),
+                        &[full],
+                    )?;
+                }
 
                 let track = slider_track_rect(slider, layout);
                 let cy = track.loc.y + track.size.h / 2.;
@@ -1815,6 +1927,16 @@ impl QuickSettings {
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
+                    // A hovered picker row: a faint rounded fill (it has no base
+                    // bg) behind the label, matching GNOME's flat menu-item hover.
+                    if self.hovered == Some(QsHover::DetailRow(k)) {
+                        frame.render_rounded_rect(
+                            HOVER_WASH,
+                            (8. * scale) as f32,
+                            rect_px(rrect),
+                            &[full],
+                        )?;
+                    }
                     let has_icon = self
                         .expanded
                         .map(|o| {
@@ -2225,6 +2347,39 @@ mod tests {
         assert!(matches!(action, PopoverAction::SetDoNotDisturb(true)));
         assert!(qs.toggles.do_not_disturb);
         assert!(qs.revision > before);
+    }
+
+    /// The menu tracks the hovered control (tile / system button) and clears it
+    /// when the pointer leaves; each change bumps the revision so the chrome
+    /// re-bakes with the highlight, and re-hovering the same control is a no-op.
+    #[test]
+    fn hover_tracks_controls() {
+        let mut qs = QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            PowerProfileStatus::default(),
+            None,
+            None,
+            SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
+            [0, 0, 0],
+        );
+        let rev0 = qs.revision;
+        assert!(qs.pointer_hover(Some(center(tile_rect(1, lay(false))))));
+        assert_eq!(qs.hovered, Some(QsHover::Tile(1)));
+        assert!(qs.revision > rev0, "a hover change bumps the revision");
+
+        let rev1 = qs.revision;
+        assert!(!qs.pointer_hover(Some(center(tile_rect(1, lay(false))))));
+        assert_eq!(qs.revision, rev1, "re-hovering the same tile is a no-op");
+
+        assert!(qs.pointer_hover(Some(center(sys_rect(SysButton::Settings, false)))));
+        assert_eq!(qs.hovered, Some(QsHover::Sys(SysButton::Settings)));
+
+        assert!(qs.pointer_hover(None), "leaving the menu clears the hover");
+        assert_eq!(qs.hovered, None);
     }
 
     /// The Network tile (grid cell 0) reads as "on" when connected and, clicked,

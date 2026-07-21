@@ -424,6 +424,31 @@ impl PanelPopover {
         }
     }
 
+    /// Update the hovered control from the current pointer position. The content
+    /// highlights the control under `pos` when the popover is open and `pos` is
+    /// inside its content rect; otherwise the hover is cleared (the pointer left
+    /// the content, or the popover is closed/closing/on another output). Returns
+    /// whether the highlight changed, so the caller can redraw.
+    pub fn pointer_hover(&mut self, output: &Output, pos: Point<f64, Logical>) -> bool {
+        let local = if self.open && !self.closing && self.output.as_ref() == Some(output) {
+            let origin = self.location(output);
+            let size = self
+                .content
+                .as_ref()
+                .map(|c| c.logical_size())
+                .unwrap_or_default();
+            let l = pos - origin;
+            (l.x >= 0. && l.y >= 0. && l.x < size.w && l.y < size.h).then_some(l)
+        } else {
+            None
+        };
+        match self.content.as_mut() {
+            Some(PopoverContent::Calendar(dm)) => dm.pointer_hover(local),
+            Some(PopoverContent::QuickSettings(qs)) => qs.pointer_hover(local),
+            None => false,
+        }
+    }
+
     /// End any quick-settings slider drag (pointer released). Returns whether the release changed
     /// the menu geometry (a sink hot-plugged mid-drag), so the caller can redraw.
     pub fn end_drag(&mut self) -> bool {

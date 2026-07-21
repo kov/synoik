@@ -100,6 +100,13 @@ const TODAY_CARD_BG: [f32; 4] = [0.17, 0.17, 0.17, 1.];
 const DAY_LABEL_PX: f64 = crate::ui::pt_to_px(11.);
 const DATE_LABEL_PX: f64 = crate::ui::pt_to_px(15.);
 
+/// Hover highlight: an additive fg-wash painted over an element's existing
+/// background (behind its glyphs), and a faint standalone fill for flat
+/// elements that have no base bg. GNOME raises a button's fg-wash by ~0.10 on
+/// `:hover` (`_message-list.scss:72-75`; `_calendar.scss` flat day buttons use
+/// a similar faint `transparentize($fg_color,…)`). Subtle by design; tune live.
+const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.10];
+
 /// A calendar month view. Displayed month + the selected day; `today` is fixed
 /// at construction. `week_start` is 0=Sunday..6=Saturday.
 pub struct Calendar {
@@ -114,9 +121,21 @@ pub struct Calendar {
     show_week_numbers: bool,
     /// Accent color for the today disc (straight RGB from gsettings).
     accent: [f32; 4],
+    /// The region the pointer is hovering, highlighted in `draw`.
+    hovered: Option<CalHover>,
     /// Bumped on any content change to invalidate the rendered texture.
     revision: u64,
     cache: RefCell<TextureCache>,
+}
+
+/// A hoverable region of the calendar (the today card, a month-nav arrow, or a
+/// grid cell by its 0-based index), for the hover highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalHover {
+    Today,
+    Prev,
+    Next,
+    Cell(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +168,7 @@ impl Calendar {
                 f32::from(accent[2]) / 255.,
                 1.,
             ],
+            hovered: None,
             revision: 0,
             cache: RefCell::new(TextureCache {
                 context: None,
@@ -232,6 +252,38 @@ impl Calendar {
         }
         // A click inside the box background is still "handled" (keeps it open).
         layout.bounds().contains(pos)
+    }
+
+    /// Update the hovered region from a calendar-local position (`None` clears
+    /// it, e.g. the pointer left the calendar). Returns whether the hover
+    /// changed, so the caller can redraw.
+    pub fn hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
+        let new = pos.and_then(|pos| self.hover_zone(pos));
+        if new == self.hovered {
+            return false;
+        }
+        self.hovered = new;
+        self.revision += 1;
+        true
+    }
+
+    fn hover_zone(&self, pos: Point<f64, Logical>) -> Option<CalHover> {
+        let layout = Layout::new(self.show_week_numbers);
+        if layout.today_button().contains(pos) {
+            return Some(CalHover::Today);
+        }
+        if layout.prev_arrow().contains(pos) {
+            return Some(CalHover::Prev);
+        }
+        if layout.next_arrow().contains(pos) {
+            return Some(CalHover::Next);
+        }
+        for i in 0..GRID_ROWS * GRID_COLS {
+            if layout.cell(i / GRID_COLS, i % GRID_COLS).contains(pos) {
+                return Some(CalHover::Cell(i));
+            }
+        }
+        None
     }
 
     /// The 42 dates filling the 6×7 grid, row-major from the week-start column of
@@ -437,6 +489,14 @@ impl Calendar {
                 card_rect,
                 &[full],
             )?;
+            if self.hovered == Some(CalHover::Today) {
+                frame.render_rounded_rect(
+                    HOVER_WASH,
+                    (TODAY_RADIUS * scale) as f32,
+                    card_rect,
+                    &[full],
+                )?;
+            }
             let label_x = px(PAD + TODAY_PAD);
             let day_cy = px(PAD + TODAY_PAD + DAY_ROW / 2.);
             frame.render_glyphs(
@@ -455,8 +515,18 @@ impl Calendar {
                 &[full],
             )?;
 
-            // Header: ‹ arrows › and the centered "Month Year".
+            // Header: ‹ arrows › and the centered "Month Year". A hovered arrow
+            // gets a circular highlight behind its chevron (GNOME's pager
+            // buttons are circular flat buttons).
+            let hover_disc = px(DISC_DIAM);
             let (px_, py_) = center(layout.prev_arrow());
+            if self.hovered == Some(CalHover::Prev) {
+                let disc = Rectangle::new(
+                    Point::<i32, Physical>::from((px_ - hover_disc / 2, py_ - hover_disc / 2)),
+                    Size::<i32, Physical>::from((hover_disc, hover_disc)),
+                );
+                frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
+            }
             frame.render_glyphs(
                 &prev_run,
                 place(prev_run.ink_bounds(), px_, py_),
@@ -465,6 +535,13 @@ impl Calendar {
                 &[full],
             )?;
             let (nx, ny) = center(layout.next_arrow());
+            if self.hovered == Some(CalHover::Next) {
+                let disc = Rectangle::new(
+                    Point::<i32, Physical>::from((nx - hover_disc / 2, ny - hover_disc / 2)),
+                    Size::<i32, Physical>::from((hover_disc, hover_disc)),
+                );
+                frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
+            }
             frame.render_glyphs(
                 &next_run,
                 place(next_run.ink_bounds(), nx, ny),
@@ -510,14 +587,23 @@ impl Calendar {
                 // Today: accent-filled circle; selected (not today): a subtle filled circle —
                 // matching gnome-shell's circular calendar-day buttons. The day number draws on
                 // top. A half-diameter radius clamps to a full circle in `sdf_rect.frag`.
-                if is_today || is_selected {
+                let is_hovered = self.hovered == Some(CalHover::Cell(i));
+                if is_today || is_selected || is_hovered {
                     let side = px(DISC_DIAM);
                     let disc = Rectangle::new(
                         Point::<i32, Physical>::from((cx - side / 2, cy - side / 2)),
                         Size::<i32, Physical>::from((side, side)),
                     );
-                    let bg = if is_today { self.accent } else { SELECTED_BG };
-                    frame.render_rounded_rect(bg, (side / 2) as f32, disc, &[full])?;
+                    // Today: accent fill; selected: subtle fill; plain hover: a
+                    // faint standalone disc. Hovering a today/selected day adds
+                    // the wash on top of its existing disc.
+                    if is_today || is_selected {
+                        let bg = if is_today { self.accent } else { SELECTED_BG };
+                        frame.render_rounded_rect(bg, (side / 2) as f32, disc, &[full])?;
+                    }
+                    if is_hovered {
+                        frame.render_rounded_rect(HOVER_WASH, (side / 2) as f32, disc, &[full])?;
+                    }
                 }
                 let in_month = date.month == self.month;
                 let color = if is_today || in_month { TEXT } else { DIM };
@@ -630,6 +716,23 @@ pub enum ListHit {
     Clear,
 }
 
+/// A hoverable region of the message list, for the hover highlight. Only the
+/// interactive controls highlight — GNOME's `.message` card body has no
+/// `:hover` rule, but its buttons do (`_message-list.scss:72-75`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListHover {
+    /// A button on a specific card (by notification id): its close ×, expand
+    /// caret, or one action pill.
+    Card {
+        id: u32,
+        zone: notification_card::CardZone,
+    },
+    /// The expanded group header's collapse button.
+    GroupCollapse,
+    /// The Clear pill in the controls row.
+    Clear,
+}
+
 /// A peeking lower card in a collapsed stack: `(origin, size, darkened bg)`.
 type StackPeek = (Point<f64, Logical>, Size<f64, Logical>, [f32; 4]);
 /// A visible group for introspection: `(source key, popover-local bounds, expanded?)`.
@@ -722,6 +825,8 @@ pub struct CalendarMessageList {
     /// (`js/ui/messageList._expandedGroup` — a single group at a time,
     /// `:1870-1897`). Retained across snapshot pushes while the source lives.
     group_expanded: Option<SourceKey>,
+    /// The control the pointer is hovering, highlighted on render.
+    hovered: Option<ListHover>,
     /// Bumped whenever the snapshot changes, to invalidate cached textures
     /// (cache keys carry the revision in their high 32 bits).
     revision: u64,
@@ -755,6 +860,7 @@ impl CalendarMessageList {
             groups,
             body_expanded: HashSet::new(),
             group_expanded: None,
+            hovered: None,
             revision: 0,
             scroll_y: 0.,
             cache: RefCell::new(CardCache::new()),
@@ -1113,6 +1219,114 @@ impl CalendarMessageList {
         None
     }
 
+    /// Update the hovered control from a popover-local position (`None` clears
+    /// it). Returns whether the hover changed, so the caller can redraw. A hover
+    /// change bumps `revision`, re-baking the affected textures with the wash.
+    pub fn hover(&mut self, pos: Option<Point<f64, Logical>>, height: f64) -> bool {
+        let new = pos.and_then(|pos| self.hover_zone(pos, height));
+        if new == self.hovered {
+            return false;
+        }
+        self.hovered = new;
+        self.revision += 1;
+        true
+    }
+
+    /// The hoverable control at popover-local `pos`, mirroring [`hit`](Self::hit)
+    /// but only for controls that carry a visible highlight (card buttons, the
+    /// group collapse button, the Clear pill — not card bodies or the stack).
+    fn hover_zone(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHover> {
+        if !self.is_empty() && self.clear_rect(height).contains(pos) {
+            return Some(ListHover::Clear);
+        }
+        let p = self.placed(height);
+        if !p.viewport.contains(pos) {
+            return None;
+        }
+        let cpos = pos - Point::from((0., p.off_y));
+        for gl in &p.layouts {
+            if !gl.bounds.contains(cpos) {
+                continue;
+            }
+            let group = &self.groups[gl.group];
+            match &gl.kind {
+                GroupKind::Single { origin, layout } => {
+                    return Self::card_hover(cpos - *origin, &group.cards[0], layout);
+                }
+                GroupKind::Collapsed { origin, top, .. } => {
+                    // The collapsed top card's close closes the whole group; it
+                    // highlights like the top card's close button. Elsewhere on
+                    // the stack (expand-on-click) has no highlight.
+                    if top.close.contains(cpos - *origin) {
+                        return group.cards.first().map(|c| ListHover::Card {
+                            id: c.id,
+                            zone: notification_card::CardZone::Close,
+                        });
+                    }
+                    return None;
+                }
+                GroupKind::Expanded {
+                    collapse, cards, ..
+                } => {
+                    if collapse.contains(cpos) {
+                        return Some(ListHover::GroupCollapse);
+                    }
+                    for (ci, origin, layout) in cards {
+                        if Rectangle::new(*origin, layout.size).contains(cpos) {
+                            return Self::card_hover(cpos - *origin, &group.cards[*ci], layout);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// The hovered button within one card (close/caret/action), or `None` for
+    /// the card body (which has no hover highlight).
+    fn card_hover(
+        local: Point<f64, Logical>,
+        content: &CardContent,
+        layout: &CardLayout,
+    ) -> Option<ListHover> {
+        use notification_card::CardZone;
+        if layout.close.contains(local) {
+            return Some(ListHover::Card {
+                id: content.id,
+                zone: CardZone::Close,
+            });
+        }
+        if layout
+            .expand
+            .filter(|_| layout.can_expand)
+            .is_some_and(|e| e.contains(local))
+        {
+            return Some(ListHover::Card {
+                id: content.id,
+                zone: CardZone::Caret,
+            });
+        }
+        for (idx, rect) in layout.actions.iter().enumerate() {
+            if rect.contains(local) {
+                return Some(ListHover::Card {
+                    id: content.id,
+                    zone: CardZone::Action(idx),
+                });
+            }
+        }
+        None
+    }
+
+    /// The card-button hover zone for the card with notification `id`, if that
+    /// is what the pointer is over (fed into [`notification_card::card_elements`]).
+    fn card_zone_for(&self, id: u32) -> Option<notification_card::CardZone> {
+        match &self.hovered {
+            Some(ListHover::Card { id: hid, zone }) if *hid == id => Some(*zone),
+            _ => None,
+        }
+    }
+
     /// The render elements (textures + icons), popover-relative to `origin`.
     /// When the content fits, groups are placed directly; when it overflows,
     /// the whole content is baked into one texture and a scrolled, clipped
@@ -1204,6 +1418,7 @@ impl CalendarMessageList {
                         base + *o,
                         1.,
                         scale,
+                        self.card_zone_for(group.cards[0].id),
                     ));
                 }
                 GroupKind::Collapsed {
@@ -1224,6 +1439,7 @@ impl CalendarMessageList {
                         base + *o,
                         1.,
                         scale,
+                        self.card_zone_for(group.cards[0].id),
                     ));
                     for (peek_o, size, bg) in peeks {
                         if let Some(elem) = notification_card::stack_shadow_element(
@@ -1256,6 +1472,7 @@ impl CalendarMessageList {
                         *collapse,
                         base,
                         scale,
+                        self.hovered == Some(ListHover::GroupCollapse),
                     ));
                     for (ci, card_o, layout) in cards {
                         elements.extend(notification_card::card_elements(
@@ -1269,6 +1486,7 @@ impl CalendarMessageList {
                             base + *card_o,
                             1.,
                             scale,
+                            self.card_zone_for(group.cards[*ci].id),
                         ));
                     }
                 }
@@ -1389,6 +1607,7 @@ impl CalendarMessageList {
         collapse: Rectangle<f64, Logical>,
         origin: Point<f64, Logical>,
         scale: f64,
+        hover_collapse: bool,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         use notification_card::SMALL_ICON;
 
@@ -1419,7 +1638,14 @@ impl CalendarMessageList {
         }
         // The header texture (title + button circle) below the chevron.
         if !cache.has_card(scale_key, key) {
-            match self.draw_group_header(renderer, scale, title, &collapse, header.loc) {
+            match self.draw_group_header(
+                renderer,
+                scale,
+                title,
+                &collapse,
+                header.loc,
+                hover_collapse,
+            ) {
                 Ok(texture) => cache.insert_card(scale_key, key, texture),
                 Err(err) => tracing::error!("error drawing a group header: {err:#}"),
             }
@@ -1454,6 +1680,7 @@ impl CalendarMessageList {
         collapse: &Rectangle<f64, Logical>,
         header_origin: Point<f64, Logical>,
         // header rect is `(CARD_W, GROUP_HEADER_H)` at `header_origin`.
+        hover_collapse: bool,
     ) -> anyhow::Result<VkTexture> {
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
         let phys = Size::<i32, Physical>::from((px(CARD_W).max(1), px(GROUP_HEADER_H).max(1)));
@@ -1484,6 +1711,14 @@ impl CalendarMessageList {
                 btn,
                 &[full],
             )?;
+            if hover_collapse {
+                frame.render_rounded_rect(
+                    HOVER_WASH,
+                    (GROUP_COLLAPSE_D / 2. * scale) as f32,
+                    btn,
+                    &[full],
+                )?;
+            }
 
             // The title, left-aligned at the header padding + title margin,
             // vertically centered.
@@ -1686,6 +1921,22 @@ impl DateMenu {
         PopoverAction::Consumed
     }
 
+    /// Update the hovered element from a popover-local pointer position (`None`
+    /// clears the hover, e.g. the pointer left the popover). Routes to whichever
+    /// column the pointer is over and clears the other's hover. Returns whether
+    /// anything changed (so the caller can redraw).
+    pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
+        let size = self.logical_size();
+        let (list_pos, cal_pos) = match pos {
+            Some(p) if p.x < calendar_col_x() => (Some(p), None),
+            Some(p) => (None, Some(p - Point::from((calendar_col_x(), 0.)))),
+            None => (None, None),
+        };
+        let mut changed = self.list.hover(list_pos, size.h);
+        changed |= self.calendar.hover(cal_pos);
+        changed
+    }
+
     /// A wheel/scroll of `delta` over the popover. Over the message-list column
     /// it scrolls the list (content px); over the calendar column it pages the
     /// month (gnome-shell `Calendar.vfunc_scroll_event`). Returns whether
@@ -1769,7 +2020,9 @@ impl DateMenu {
     /// texture composites over the right column in the same bg color.
     fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
-        let revision = u64::from(!self.list.is_empty());
+        // The bg carries the Clear pill, so its hover must re-bake it too.
+        let clear_hover = matches!(self.list.hovered, Some(ListHover::Clear));
+        let revision = u64::from(!self.list.is_empty()) | (u64::from(clear_hover) << 1);
         let mut cache = self.bg_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
@@ -1852,6 +2105,14 @@ impl DateMenu {
                     rect,
                     &[full],
                 )?;
+                if matches!(self.list.hovered, Some(ListHover::Clear)) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (CLEAR_H / 2. * scale) as f32,
+                        rect,
+                        &[full],
+                    )?;
+                }
                 let (ix, iy, iw, ih) = run.ink_bounds();
                 let origin = Point::<i32, Physical>::from((
                     rect.loc.x + (rect.size.w - iw) / 2 - ix,
@@ -2202,6 +2463,7 @@ mod tests {
             week_start: 0,
             show_week_numbers: false,
             accent: [0., 0., 0., 1.],
+            hovered: None,
             revision: 0,
             cache: RefCell::new(TextureCache {
                 context: None,
@@ -2813,5 +3075,97 @@ mod tests {
             !dm.group_rects()[0].2,
             "clicking the header background collapsed the group"
         );
+    }
+
+    /// The calendar tracks the hovered region (today card, month-nav arrows,
+    /// grid cells) and clears it when the pointer leaves; each change bumps the
+    /// revision so the texture re-bakes with the highlight.
+    #[test]
+    fn calendar_hover_tracks_regions() {
+        let mut cal = Calendar::new(0, false, [0, 0, 0]);
+        let layout = Layout::new(false);
+
+        let today = layout.today_button();
+        let today_pt = today.loc + Point::from((today.size.w / 2., today.size.h / 2.));
+        let rev0 = cal.revision();
+        assert!(cal.hover(Some(today_pt)));
+        assert_eq!(cal.hovered, Some(CalHover::Today));
+        assert!(cal.revision() > rev0, "a hover change bumps the revision");
+        // Re-hovering the same region is a no-op (no redraw, no revision bump).
+        let rev1 = cal.revision();
+        assert!(!cal.hover(Some(today_pt)));
+        assert_eq!(cal.revision(), rev1);
+
+        let next = layout.next_arrow();
+        let next_pt = next.loc + Point::from((next.size.w / 2., next.size.h / 2.));
+        assert!(cal.hover(Some(next_pt)));
+        assert_eq!(cal.hovered, Some(CalHover::Next));
+
+        let cell = layout.cell(2, 3);
+        let cell_pt = cell.loc + Point::from((cell.size.w / 2., cell.size.h / 2.));
+        assert!(cal.hover(Some(cell_pt)));
+        assert_eq!(cal.hovered, Some(CalHover::Cell(2 * GRID_COLS + 3)));
+
+        assert!(cal.hover(None), "leaving the calendar clears the hover");
+        assert_eq!(cal.hovered, None);
+    }
+
+    /// The message list highlights a card's buttons (close/caret/action), the
+    /// group collapse button, and the Clear pill — but not a card body — and
+    /// clears the highlight when the pointer leaves.
+    #[test]
+    fn message_list_hover_tracks_card_buttons() {
+        use notification_card::CardZone;
+        let mut card = sample_card(1);
+        card.actions = vec![("ok".to_owned(), "OK".to_owned())];
+        let mut list =
+            CalendarMessageList::new(vec![single_group(card), single_group(sample_card(2))]);
+        list.toggle_body_expanded(1);
+        let h = 600.;
+
+        let (_, origin, layout) = list
+            .visible_interactive_cards(h)
+            .into_iter()
+            .find(|(id, _, _)| *id == 1)
+            .expect("card 1 is visible");
+
+        // The close button highlights as a card-close hover.
+        let close = layout.close;
+        let close_pt = origin + close.loc + Point::from((close.size.w / 2., close.size.h / 2.));
+        assert!(list.hover(Some(close_pt), h));
+        assert_eq!(
+            list.hovered,
+            Some(ListHover::Card {
+                id: 1,
+                zone: CardZone::Close
+            })
+        );
+
+        // An action pill highlights by its index.
+        let action = layout.actions[0];
+        let action_pt = origin + action.loc + Point::from((action.size.w / 2., action.size.h / 2.));
+        assert!(list.hover(Some(action_pt), h));
+        assert_eq!(
+            list.hovered,
+            Some(ListHover::Card {
+                id: 1,
+                zone: CardZone::Action(0)
+            })
+        );
+
+        // The card body carries no highlight (mid-card, clear of the top-right
+        // buttons and the bottom action row).
+        let body_pt = origin + Point::from((layout.size.w / 2., layout.size.h / 2.));
+        assert!(list.hover(Some(body_pt), h));
+        assert_eq!(list.hovered, None);
+
+        // The Clear pill highlights.
+        let clear = list.clear_rect(h);
+        let clear_pt = clear.loc + Point::from((clear.size.w / 2., clear.size.h / 2.));
+        assert!(list.hover(Some(clear_pt), h));
+        assert_eq!(list.hovered, Some(ListHover::Clear));
+
+        assert!(list.hover(None, h), "leaving the list clears the hover");
+        assert_eq!(list.hovered, None);
     }
 }

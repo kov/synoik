@@ -2956,8 +2956,13 @@ impl State {
                 .cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
 
-            // While a quick-settings slider is being dragged, route motion to it.
             if let Some((output, p)) = self.niri.output_under(pos).map(|(o, p)| (o.clone(), p)) {
+                // Highlight the control under the pointer (or clear it when the
+                // pointer leaves the popover content).
+                if self.niri.panel_popover.pointer_hover(&output, p) {
+                    self.niri.queue_redraw_all();
+                }
+                // While a quick-settings slider is being dragged, route motion to it.
                 if let Some(action) = self.niri.panel_popover.pointer_drag(&output, p) {
                     self.apply_popover_action(action);
                     self.niri.queue_redraw_all();

@@ -2433,6 +2433,112 @@ fn vulkan_renders_the_message_list_card() {
     }
 }
 
+/// Hovering a card's close button lightens its circle (GNOME's `:hover` raises
+/// the button's fg-wash, `_message-list.scss:72-75`): the same close-circle
+/// background pixel is strictly brighter once the pointer is over the button,
+/// proving the hover wash re-bakes and composites. Skips with no Vulkan device.
+#[test]
+fn vulkan_hovering_a_card_close_button_lightens_it() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            vec![crate::ui::notification_card::CardGroup {
+                key: crate::notifications::SourceKey::PidName(1, "App".to_owned()),
+                source_title: "App".to_owned(),
+                source_icon: None,
+                has_urgent: false,
+                cards: vec![crate::ui::notification_card::CardContent {
+                    id: 1,
+                    source_title: "App".to_owned(),
+                    source_icon: None,
+                    title: "hello".to_owned(),
+                    body: "world".to_owned(),
+                    icon: None,
+                    actions: Vec::new(),
+                    has_default_action: false,
+                    critical: false,
+                    time_text: "Just now".to_owned(),
+                }],
+            }],
+        );
+    }
+    f.settle_animations();
+
+    let origin = f.niri().panel_popover.content_location(&output);
+    let (_, _card, close) = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
+    // A point inside the close circle in the top-middle gap of the × glyph, so
+    // we sample the circle's background (not the opaque white glyph) — the only
+    // spot whose brightness reflects the hover wash.
+    let sample = origin
+        + Point::from((
+            close.loc.x + close.size.w / 2.,
+            close.loc.y + close.size.h * 0.15,
+        ));
+    let center = origin
+        + Point::from((
+            close.loc.x + close.size.w / 2.,
+            close.loc.y + close.size.h / 2.,
+        ));
+
+    let w = to_physical_precise_round::<i32>(scale.x, output_size(&output).w);
+    let h = to_physical_precise_round::<i32>(scale.x, 500.);
+    let sx = to_physical_precise_round::<i32>(scale.x, sample.x);
+    let sy = to_physical_precise_round::<i32>(scale.x, sample.y);
+
+    let render_sample = |f: &mut Fixture| -> [u8; 4] {
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let elems = state
+                    .niri
+                    .panel_popover
+                    .render(vk, &state.niri.icon_cache, &output);
+                let pixels = render_to_vec(
+                    vk,
+                    Size::<i32, Physical>::from((w, h)),
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elems.into_iter().rev(),
+                )
+                .expect("render popover");
+                let i = ((sy * w + sx) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            })
+            .expect("vulkan renderer")
+    };
+
+    let cold = render_sample(&mut f);
+    assert!(
+        f.niri().panel_popover.pointer_hover(&output, center),
+        "the pointer over the close button registers a hover"
+    );
+    let hot = render_sample(&mut f);
+
+    let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
+    assert_eq!(cold[3], 255, "the close circle bg is opaque, got {cold:?}");
+    assert_eq!(hot[3], 255, "the close circle bg is opaque, got {hot:?}");
+    assert!(
+        sum(hot) > sum(cold),
+        "hovering the close button must lighten its circle: cold {cold:?} hot {hot:?}"
+    );
+}
+
 /// Clicking a card's expand caret grows the card: the multi-line body area
 /// (below the collapsed 90px height) composites `.message`-bg pixels where the
 /// popover box showed before, and the caret's chevron glyph (an embedded

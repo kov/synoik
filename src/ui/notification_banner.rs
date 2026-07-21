@@ -553,6 +553,9 @@ impl NotificationBanner {
             origin,
             alpha,
             scale,
+            // The banner has no per-button hover highlight (its hover triggers
+            // the whole-banner expand instead).
+            None,
         )
     }
 }

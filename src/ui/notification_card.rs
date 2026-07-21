@@ -87,6 +87,20 @@ const BTN_BG: [f32; 4] = [1., 1., 1., 0.15];
 /// `.message-themed-icon` circle bg (white@7%, `_message-list.scss:176`).
 const CIRCLE_BG: [f32; 4] = [1., 1., 1., 0.07];
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
+/// Hover highlight: GNOME raises a flat button's fg-wash by ~0.10 alpha on
+/// `:hover` (`_message-list.scss:72-75`, `transparentize($fg_color,.8)`→`.7`).
+/// We paint this as an additive white wash over the element's existing bg,
+/// behind its glyphs, so a hovered circle/pill reads a step lighter.
+const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.10];
+
+/// A hoverable zone within a single card, resolved by the owner's hit-test and
+/// fed back so [`draw_card`] can highlight it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardZone {
+    Close,
+    Caret,
+    Action(usize),
+}
 
 /// Darkened backgrounds for the lower cards peeking under a collapsed stack:
 /// `second-in-stack` = `darken($card_bg, 1%)`, `lower-in-stack` =
@@ -368,6 +382,7 @@ pub fn draw_card(
     content: &CardContent,
     layout: &CardLayout,
     radius: f64,
+    hover: Option<CardZone>,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("notification_card::draw_card");
 
@@ -415,16 +430,20 @@ pub fn draw_card(
         frame.clear(Color32F::from(TRANSPARENT), &[full])?;
         frame.render_rounded_rect(CARD_BG, (radius * scale) as f32, full, &[full])?;
 
-        // Close-button circle, and the expand caret's when it's live.
+        // Close-button circle, and the expand caret's when it's live. A hovered
+        // button gets an additive fg-wash over its bg (behind the glyph).
         let close = rect_px(layout.close);
-        frame.render_rounded_rect(BTN_BG, (CLOSE_D / 2. * scale) as f32, close, &[full])?;
+        let close_r = (CLOSE_D / 2. * scale) as f32;
+        frame.render_rounded_rect(BTN_BG, close_r, close, &[full])?;
+        if hover == Some(CardZone::Close) {
+            frame.render_rounded_rect(HOVER_WASH, close_r, close, &[full])?;
+        }
         if let Some(expand) = layout.expand.filter(|_| layout.can_expand) {
-            frame.render_rounded_rect(
-                BTN_BG,
-                (CLOSE_D / 2. * scale) as f32,
-                rect_px(expand),
-                &[full],
-            )?;
+            let expand = rect_px(expand);
+            frame.render_rounded_rect(BTN_BG, close_r, expand, &[full])?;
+            if hover == Some(CardZone::Caret) {
+                frame.render_rounded_rect(HOVER_WASH, close_r, expand, &[full])?;
+            }
         }
 
         // Themed body icons sit on the `.message-themed-icon` circle.
@@ -510,9 +529,13 @@ pub fn draw_card(
         }
 
         // Action buttons: pills with centered bold labels.
-        for (rect, run) in layout.actions.iter().zip(&action_runs) {
+        let pill_r = (BTN_RADIUS * scale) as f32;
+        for (i, (rect, run)) in layout.actions.iter().zip(&action_runs).enumerate() {
             let r = rect_px(*rect);
-            frame.render_rounded_rect(BTN_BG, (BTN_RADIUS * scale) as f32, r, &[full])?;
+            frame.render_rounded_rect(BTN_BG, pill_r, r, &[full])?;
+            if hover == Some(CardZone::Action(i)) {
+                frame.render_rounded_rect(HOVER_WASH, pill_r, r, &[full])?;
+            }
             let (ix, iy, iw, ih) = run.ink_bounds();
             let origin = Point::<i32, Physical>::from((
                 r.loc.x + (r.size.w - iw) / 2 - ix,
@@ -600,6 +623,7 @@ pub fn card_elements(
     origin: Point<f64, Logical>,
     alpha: f32,
     scale: f64,
+    hover: Option<CardZone>,
 ) -> Vec<TextureRenderElement<VkTexture>> {
     // The returned Vec is in the output stacking order: FIRST = topmost. The
     // icons composite over the card, so they go in first and the card texture
@@ -738,7 +762,7 @@ pub fn card_elements(
     // The card texture itself, below every icon.
     #[allow(clippy::map_entry)]
     if !cache.cards.contains_key(&(scale_key, key)) {
-        match draw_card(renderer, scale, content, layout, radius) {
+        match draw_card(renderer, scale, content, layout, radius, hover) {
             Ok(texture) => {
                 cache.cards.insert((scale_key, key), texture);
             }
