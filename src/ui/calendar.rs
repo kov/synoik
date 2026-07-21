@@ -904,6 +904,10 @@ impl CalendarMessageList {
                 self.group_expanded = None;
             }
         }
+        // The cards just shifted (added/removed/reordered), so a hover captured
+        // against the old layout is stale — drop it; the next pointer motion
+        // re-resolves it against the new layout.
+        self.hovered = None;
         self.revision += 1;
         true
     }
@@ -1227,8 +1231,22 @@ impl CalendarMessageList {
         if new == self.hovered {
             return false;
         }
+        // A card/collapse wash is baked into the (revision-keyed) card and header
+        // textures, so entering/leaving one must re-bake them. The Clear pill
+        // lives in the separately-keyed bg texture (its own clear-hover bit), so
+        // a Clear/None transition needs a redraw but NOT a full card re-bake —
+        // don't bump the revision for it. (A card→card crossing still re-bakes
+        // every visible card; acceptable at popover card counts.)
+        let touches_cards = |h: &Option<ListHover>| {
+            matches!(
+                h,
+                Some(ListHover::Card { .. }) | Some(ListHover::GroupCollapse)
+            )
+        };
+        if touches_cards(&self.hovered) || touches_cards(&new) {
+            self.revision += 1;
+        }
         self.hovered = new;
-        self.revision += 1;
         true
     }
 
@@ -3167,5 +3185,55 @@ mod tests {
 
         assert!(list.hover(None, h), "leaving the list clears the hover");
         assert_eq!(list.hovered, None);
+    }
+
+    /// A content change (a notification arriving/closing) shifts the cards, so a
+    /// hover captured against the old layout must clear — otherwise its wash
+    /// re-bakes onto whatever card now sits where the old one was, until the
+    /// next pointer motion.
+    #[test]
+    fn message_list_hover_clears_on_content_change() {
+        let mut list = CalendarMessageList::new(vec![
+            single_group(sample_card(1)),
+            single_group(sample_card(2)),
+        ]);
+        let h = 600.;
+        let (_, origin, layout) = list
+            .visible_interactive_cards(h)
+            .into_iter()
+            .find(|(id, _, _)| *id == 1)
+            .unwrap();
+        let close = layout.close;
+        let close_pt = origin + close.loc + Point::from((close.size.w / 2., close.size.h / 2.));
+        list.hover(Some(close_pt), h);
+        assert!(matches!(list.hovered, Some(ListHover::Card { id: 1, .. })));
+
+        list.set_groups(vec![
+            single_group(sample_card(1)),
+            single_group(sample_card(2)),
+            single_group(sample_card(3)),
+        ]);
+        assert_eq!(
+            list.hovered, None,
+            "a content change clears the now-stale hover"
+        );
+    }
+
+    /// The Clear pill lives in the separately-keyed bg texture, so hovering it
+    /// must NOT bump the card revision (which would needlessly re-bake every
+    /// card); only card/collapse hovers do.
+    #[test]
+    fn message_list_clear_hover_does_not_rebake_cards() {
+        let mut list = CalendarMessageList::new(vec![single_group(sample_card(1))]);
+        let h = 600.;
+        let rev0 = list.revision;
+        let clear = list.clear_rect(h);
+        let clear_pt = clear.loc + Point::from((clear.size.w / 2., clear.size.h / 2.));
+        assert!(list.hover(Some(clear_pt), h));
+        assert_eq!(list.hovered, Some(ListHover::Clear));
+        assert_eq!(
+            list.revision, rev0,
+            "a Clear-pill hover must not bump the card revision"
+        );
     }
 }

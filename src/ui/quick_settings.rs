@@ -945,6 +945,16 @@ impl QuickSettings {
         }
     }
 
+    /// An external content change (device list, profile, airplane, audio) can move or remove the
+    /// hovered control, so bump the chrome revision AND drop the stale hover — it re-resolves on
+    /// the next pointer motion. Used by the update setters below, NOT by click/hover
+    /// interactions (a click leaves the pointer over the same control, so its hover stays
+    /// valid).
+    fn content_bumped(&mut self) {
+        self.revision += 1;
+        self.hovered = None;
+    }
+
     /// Adopt a fresh airplane-mode snapshot (from the gsd-rfkill watcher). `show` grows/shrinks the
     /// grid (a 5th tile); `active` flips the tile. Returns whether it changed.
     pub fn set_airplane(&mut self, airplane: AirplaneStatus) -> bool {
@@ -952,7 +962,7 @@ impl QuickSettings {
             return false;
         }
         self.airplane = airplane;
-        self.revision += 1;
+        self.content_bumped();
         true
     }
 
@@ -966,7 +976,7 @@ impl QuickSettings {
             return false;
         }
         self.power = power;
-        self.revision += 1;
+        self.content_bumped();
         self.normalize_expanded();
         true
     }
@@ -990,7 +1000,7 @@ impl QuickSettings {
         };
         if invalid {
             self.expanded = None;
-            self.revision += 1;
+            self.content_bumped();
             return true;
         }
         false
@@ -1001,7 +1011,7 @@ impl QuickSettings {
         let mut changed = self.sink_list != sink_list;
         if changed {
             self.sink_list = sink_list;
-            self.revision += 1;
+            self.content_bumped();
         }
         changed |= self.normalize_expanded();
         changed
@@ -1275,7 +1285,7 @@ impl QuickSettings {
             self.sliding = None;
         }
         self.audio = audio;
-        self.revision += 1;
+        self.content_bumped();
         // The slider vanishing (no bound sink) must also close an open output picker, or its card
         // pins below a slider row that's no longer there.
         self.normalize_expanded();
@@ -1301,7 +1311,7 @@ impl QuickSettings {
             self.sliding = None;
         }
         self.mic = mic;
-        self.revision += 1;
+        self.content_bumped();
         // The mic slider vanishing must also close an open input picker.
         self.normalize_expanded();
         true
@@ -1312,7 +1322,7 @@ impl QuickSettings {
         let mut changed = self.source_list != source_list;
         if changed {
             self.source_list = source_list;
-            self.revision += 1;
+            self.content_bumped();
         }
         changed |= self.normalize_expanded();
         changed
@@ -2380,6 +2390,19 @@ mod tests {
 
         assert!(qs.pointer_hover(None), "leaving the menu clears the hover");
         assert_eq!(qs.hovered, None);
+
+        // A content change that shifts the grid (airplane tile appears) clears a
+        // stale hover, so its wash can't land on a now-different tile.
+        qs.pointer_hover(Some(center(tile_rect(1, lay(false)))));
+        assert!(qs.hovered.is_some());
+        assert!(qs.set_airplane(AirplaneStatus {
+            active: false,
+            show: true,
+        }));
+        assert_eq!(
+            qs.hovered, None,
+            "an external content change clears the stale hover"
+        );
     }
 
     /// The Network tile (grid cell 0) reads as "on" when connected and, clicked,
