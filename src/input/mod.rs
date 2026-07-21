@@ -3885,11 +3885,12 @@ impl State {
 
         let is_mru_open = self.niri.window_mru_ui.is_open();
 
-        // An open panel popover grabs the wheel: a scroll over the dateMenu
-        // message list scrolls it (gnome-shell's `St.ScrollView`). Consume the
-        // event whenever a popover is up, so it never leaks to workspace
-        // switching underneath. Wheel notches move a fixed step; a touchpad's
-        // pixel deltas pass through as-is.
+        // A scroll OVER an open panel popover is grabbed by it: the dateMenu
+        // scrolls its message list (or pages the calendar month), gnome-shell's
+        // `St.ScrollView` / `Calendar.vfunc_scroll_event`. Consume it so it
+        // never leaks to workspace switching underneath. A scroll elsewhere
+        // (the panel indicators, a window) still falls through to the handlers
+        // below. Wheel notches move a fixed step; touchpad pixels pass as-is.
         if self.niri.panel_popover.is_open() {
             let location = pointer.current_location();
             let target = self
@@ -3897,15 +3898,17 @@ impl State {
                 .output_under(location)
                 .map(|(output, pos)| (output.clone(), pos));
             if let Some((output, pos)) = target {
-                // ~60 px per wheel notch (120 v120 units), else touchpad pixels.
-                let step = vertical_amount_v120
-                    .map(|v| v / 120. * 60.)
-                    .or_else(|| event.amount(Axis::Vertical))
-                    .unwrap_or(0.);
-                if self.niri.panel_popover.pointer_scroll(&output, pos, step) {
-                    self.niri.queue_redraw_all();
+                if self.niri.panel_popover.contains(&output, pos) {
+                    // ~60 px per wheel notch (120 v120 units), else touchpad pixels.
+                    let step = vertical_amount_v120
+                        .map(|v| v / 120. * 60.)
+                        .or_else(|| event.amount(Axis::Vertical))
+                        .unwrap_or(0.);
+                    if self.niri.panel_popover.pointer_scroll(&output, pos, step) {
+                        self.niri.queue_redraw_all();
+                    }
+                    return;
                 }
-                return;
             }
         }
 

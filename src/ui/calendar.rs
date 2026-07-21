@@ -180,6 +180,16 @@ impl Calendar {
         self.revision += 1;
     }
 
+    /// A wheel/scroll over the grid: up (`delta < 0`) → previous month, down →
+    /// next (gnome-shell `Calendar.vfunc_scroll_event`, `js/ui/calendar.js:560-571`).
+    pub fn scroll(&mut self, delta: f64) -> bool {
+        if delta == 0. {
+            return false;
+        }
+        self.shift_month(if delta < 0. { -1 } else { 1 });
+        true
+    }
+
     /// Select a grid date, following an out-of-month click into that month.
     fn select(&mut self, date: Ymd) {
         self.selected = date;
@@ -732,6 +742,9 @@ pub struct CalendarMessageList {
 struct ContentTex {
     scale: NotNan<f64>,
     revision: u64,
+    /// The scroll offset (rounded px) the window was baked at — the bake is
+    /// viewport-sized, so it re-bakes when the scroll moves.
+    scroll: i64,
     context: ContextId<VkTexture>,
     tex: VkTexture,
 }
@@ -990,14 +1003,17 @@ impl CalendarMessageList {
     }
 
     /// Scroll by `delta` content px (positive = down); returns whether it moved
-    /// (so the caller can request a redraw).
+    /// (so the caller can request a redraw). The delta is applied to the
+    /// *clamped* current offset, so a scroll right after the content shrank
+    /// (leaving `scroll_y` stale-too-large) still moves instead of eating a
+    /// notch.
     fn scroll_by(&mut self, delta: f64, height: f64) -> bool {
         let vh = self.viewport_h(height);
         let max = (self.content_h() - vh).max(0.);
-        let before = self.scroll_y.clamp(0., max);
-        let after = (self.scroll_y + delta).clamp(0., max);
+        let cur = self.scroll_y.clamp(0., max);
+        let after = (cur + delta).clamp(0., max);
         self.scroll_y = after;
-        (after - before).abs() > f64::EPSILON
+        (after - cur).abs() > f64::EPSILON
     }
 
     /// Total content height (all groups, no drop).
@@ -1118,14 +1134,17 @@ impl CalendarMessageList {
             return self.render_groups(renderer, icons, scale, base, &p.layouts);
         }
 
-        // Overflow: present a clipped, scrolled window of the baked content,
-        // with the scrollbar thumb composited on top (FIRST = topmost).
+        // Overflow: bake just the visible window (a viewport-sized texture, so
+        // its dimensions stay bounded however much content there is) and
+        // present it, with the scrollbar thumb composited on top (FIRST =
+        // topmost). On a bake failure, draw nothing — never a lone thumb over
+        // an empty column.
         let mut elements = Vec::new();
-        if let Some(thumb) = self.scrollbar_thumb(renderer, scale, origin, &p) {
-            elements.push(thumb);
-        }
         match self.content_texture(renderer, icons, scale, &p) {
             Ok(tex) => {
+                if let Some(thumb) = self.scrollbar_thumb(renderer, scale, origin, &p) {
+                    elements.push(thumb);
+                }
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     tex,
@@ -1133,15 +1152,11 @@ impl CalendarMessageList {
                     Transform::Normal,
                     Vec::new(),
                 );
-                let src = Rectangle::new(
-                    Point::from((0., p.scroll)),
-                    Size::from((LIST_W, p.viewport.size.h)),
-                );
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     origin + p.viewport.loc,
                     1.,
-                    Some(src),
+                    None,
                     Some(p.viewport.size),
                     Kind::Unspecified,
                 ));
@@ -1262,9 +1277,13 @@ impl CalendarMessageList {
         elements
     }
 
-    /// Bake the full (un-clipped) list content into one texture, cached by
-    /// `(scale, revision)` so scrolling only slides the src-crop and never
-    /// re-bakes.
+    /// Bake the visible window of the list into a viewport-sized texture, the
+    /// content shifted up by the scroll offset (elements outside the window are
+    /// clipped by the texture bounds). Sizing to the viewport — not the full
+    /// content — keeps the texture dimensions bounded regardless of how many
+    /// notifications there are. Cached by `(scale, revision, scroll)`: idle
+    /// re-renders reuse it, a scroll re-bakes (bounded, cheap: it re-composites
+    /// the already-cached per-card textures).
     fn content_texture(
         &self,
         renderer: &mut VulkanRenderer,
@@ -1273,19 +1292,26 @@ impl CalendarMessageList {
         p: &Placed,
     ) -> anyhow::Result<VkTexture> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        let scroll_key = p.scroll.round() as i64;
         let context = renderer.context_id();
         {
             let cache = self.content_cache.borrow();
             if let Some(c) = cache.as_ref() {
-                if c.scale == scale_key && c.revision == self.revision && c.context == context {
+                if c.scale == scale_key
+                    && c.revision == self.revision
+                    && c.scroll == scroll_key
+                    && c.context == context
+                {
                     return Ok(c.tex.clone());
                 }
             }
         }
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-        let phys = Size::<i32, Physical>::from((px(LIST_W).max(1), px(p.content_h).max(1)));
-        let elements =
-            self.render_groups(renderer, icons, scale, Point::from((0., 0.)), &p.layouts);
+        let phys = Size::<i32, Physical>::from((px(LIST_W).max(1), px(p.viewport.size.h).max(1)));
+        // Content y=scroll lands at the texture top; everything above/below the
+        // window falls outside the buffer and is clipped.
+        let base = Point::from((0., -p.scroll));
+        let elements = self.render_groups(renderer, icons, scale, base, &p.layouts);
         let (tex, _sync) = render_to_texture(
             renderer,
             phys,
@@ -1298,6 +1324,7 @@ impl CalendarMessageList {
         *self.content_cache.borrow_mut() = Some(ContentTex {
             scale: scale_key,
             revision: self.revision,
+            scroll: scroll_key,
             context,
             tex: tex.clone(),
         });
@@ -1320,7 +1347,9 @@ impl CalendarMessageList {
         if max_scroll <= 0. {
             return None;
         }
-        let thumb_h = (vh * vh / p.content_h).clamp(SCROLLBAR_MIN_H, vh);
+        // Track the visible fraction, floored at a min handle — but never
+        // above `vh` (a very short viewport must not make `min > max`).
+        let thumb_h = (vh * vh / p.content_h).clamp(SCROLLBAR_MIN_H.min(vh), vh);
         let thumb_y = p.viewport.loc.y + (p.scroll / max_scroll) * (vh - thumb_h);
         let thumb_x = LIST_W - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
         let mut cache = self.cache.borrow_mut();
@@ -1652,14 +1681,16 @@ impl DateMenu {
         PopoverAction::Consumed
     }
 
-    /// A wheel/scroll of `delta` content px over the popover. Scrolls the
-    /// message list when the pointer is over its column; returns whether the
-    /// offset moved (so the caller can redraw).
+    /// A wheel/scroll of `delta` over the popover. Over the message-list column
+    /// it scrolls the list (content px); over the calendar column it pages the
+    /// month (gnome-shell `Calendar.vfunc_scroll_event`). Returns whether
+    /// anything changed (so the caller can redraw).
     pub fn scroll(&mut self, pos: Point<f64, Logical>, delta: f64) -> bool {
         if pos.x < calendar_col_x() {
-            return self.list.scroll_by(delta, self.logical_size().h);
+            self.list.scroll_by(delta, self.logical_size().h)
+        } else {
+            self.calendar.scroll(delta)
         }
-        false
     }
 
     /// Test hooks: the visible per-card interactive rects (single-card groups +
@@ -2604,6 +2635,33 @@ mod tests {
         assert!(list.scroll_by(-10_000., h));
         assert!(!list.scroll_by(-10_000., h), "clamped at the top");
         assert!(list.visible_interactive_cards(h).iter().any(|c| c.0 == 1));
+    }
+
+    /// A scroll over the calendar column pages the month (up→prev, down→next,
+    /// `js/ui/calendar.js:560-571`); a scroll over the list column does not.
+    #[test]
+    fn date_menu_scroll_routes_to_the_right_column() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![single_group(sample_card(1))]);
+        dm.calendar.year = 2024;
+        dm.calendar.month = 6;
+
+        let cal_pt = Point::from((calendar_col_x() + 10., 50.));
+        assert!(
+            dm.scroll(cal_pt, 1.),
+            "down over the calendar pages a month"
+        );
+        assert_eq!((dm.calendar.year, dm.calendar.month), (2024, 7));
+        assert!(dm.scroll(cal_pt, -1.), "up over the calendar pages back");
+        assert_eq!((dm.calendar.year, dm.calendar.month), (2024, 6));
+
+        // Over the list column, the month must not change.
+        let list_pt = Point::from((LIST_PAD + 10., 50.));
+        dm.scroll(list_pt, 1.);
+        assert_eq!(
+            (dm.calendar.year, dm.calendar.month),
+            (2024, 6),
+            "a list-column scroll must not page the calendar"
+        );
     }
 
     /// A multi-notification group renders as a collapsed fanned stack: one

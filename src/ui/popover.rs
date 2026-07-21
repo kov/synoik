@@ -513,6 +513,23 @@ impl PanelPopover {
         Some(PopoverAction::Consumed)
     }
 
+    /// Whether output-local `pos` falls inside the open popover's content rect
+    /// (so a wheel event there belongs to the popover, not the panel/window
+    /// beneath).
+    pub fn contains(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
+        if !self.open || self.output.as_ref() != Some(output) {
+            return false;
+        }
+        let origin = self.location(output);
+        let size = self
+            .content
+            .as_ref()
+            .map(|c| c.logical_size())
+            .unwrap_or_default();
+        let local = pos - origin;
+        local.x >= 0. && local.y >= 0. && local.x < size.w && local.y < size.h
+    }
+
     /// Route a wheel/scroll of `delta` content px at output-local `pos` to the
     /// open popover (the dateMenu message list). Returns whether the content
     /// scrolled (so the caller can redraw).
