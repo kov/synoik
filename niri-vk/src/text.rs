@@ -93,6 +93,82 @@ pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
         .fold(0.0_f32, f32::max) as f64
 }
 
+/// Shape `text` wrapped to `wrap_px` and return each visual line's byte range. Ranges come from
+/// the laid-out glyphs, so they follow the same word-then-glyph break rules the draw path uses
+/// (cosmic-text's default wrap, the equivalent of Pango's `WORD_CHAR`).
+fn shape_line_ranges(
+    fonts: &mut FontSystem,
+    text: &str,
+    px: f32,
+    bold: bool,
+    wrap_px: f32,
+) -> Vec<(usize, usize)> {
+    let mut buffer = Buffer::new(fonts, Metrics::new(px, (px * 1.25).round()));
+    {
+        let mut b = buffer.borrow_with(fonts);
+        b.set_size(Some(wrap_px), None);
+        let mut attrs = Attrs::new().family(Family::SansSerif);
+        if bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        b.set_text(text, &attrs, Shaping::Advanced, None);
+        b.shape_until_scroll(false);
+    }
+    buffer
+        .layout_runs()
+        .map(|run| {
+            let start = run.glyphs.first().map_or(0, |g| g.start);
+            let end = run.glyphs.last().map_or(start, |g| g.end);
+            (start, end)
+        })
+        .collect()
+}
+
+/// Wrap single-paragraph `text` (pre-flatten newlines) at `wrap_px` into at most `max_lines`
+/// visual lines; when it doesn't fit, the last line is truncated with a `…`. Returns each line's
+/// text, top to bottom, so a caller can lay the lines out itself (at whatever pixel density) with
+/// scale-independent break points. GPU-free (shaping only), like [`measure_line_width`]. This is
+/// the notification-card body path: GNOME clamps a message body to one ellipsized line collapsed
+/// and six expanded (`LabelExpanderLayout`, gnome-shell `js/ui/messageList.js:220-275`).
+pub fn wrap_lines_weighted(
+    text: &str,
+    px: f32,
+    bold: bool,
+    wrap_px: f64,
+    max_lines: usize,
+) -> Vec<String> {
+    const ELLIPSIS: char = '\u{2026}';
+    let max_lines = max_lines.max(1);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut fonts = measure_fonts().lock().unwrap();
+    let wrap = wrap_px as f32;
+    let ranges = shape_line_ranges(&mut fonts, text, px, bold, wrap);
+    if ranges.len() <= max_lines {
+        return ranges.iter().map(|&(s, e)| text[s..e].to_owned()).collect();
+    }
+    // Cut at the end of the last kept line, append the ellipsis, and pop characters until the
+    // ellipsis no longer spills onto an extra line (word wrap can pull the whole last word down
+    // with it, so this may retreat past a word boundary).
+    let (_, mut cut) = ranges[max_lines - 1];
+    loop {
+        let head = text[..cut].trim_end();
+        let candidate = format!("{head}{ELLIPSIS}");
+        let ranges = shape_line_ranges(&mut fonts, &candidate, px, bold, wrap);
+        if ranges.len() <= max_lines {
+            return ranges
+                .iter()
+                .map(|&(s, e)| candidate[s..e].to_owned())
+                .collect();
+        }
+        match head.char_indices().next_back() {
+            Some((idx, _)) if idx > 0 => cut = idx,
+            _ => return vec![ELLIPSIS.to_string()],
+        }
+    }
+}
+
 /// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
 /// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and
 /// cheap to reuse, so the compositor holds ONE `TextContext` for the life of the renderer and
@@ -648,6 +724,47 @@ mod tests {
             .chunks_exact(4)
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count()
+    }
+
+    /// GPU-free wrapping: short text passes through, long text wraps to width, a `max_lines`
+    /// clamp ellipsizes the last line, and no line ever exceeds the wrap width.
+    #[test]
+    fn wrap_lines_wraps_and_ellipsizes() {
+        let px = 15.0;
+        assert_eq!(
+            wrap_lines_weighted("hello", px, false, 400., 6),
+            vec!["hello"]
+        );
+
+        let text = "The quick brown fox jumps over the lazy dog and keeps running on through the quiet woods";
+        let lines = wrap_lines_weighted(text, px, false, 200., 32);
+        assert!(lines.len() > 1, "expected a wrap: {lines:?}");
+        for line in &lines {
+            assert!(
+                measure_line_width(line, px) <= 201.,
+                "line too wide: {line:?}"
+            );
+        }
+        // No words lost or reordered across the breaks.
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
+
+        for max in [1, 2] {
+            let clamped = wrap_lines_weighted(text, px, false, 200., max);
+            assert_eq!(clamped.len(), max, "clamped: {clamped:?}");
+            let last = clamped.last().unwrap();
+            assert!(last.ends_with('\u{2026}'), "no ellipsis: {clamped:?}");
+            for line in &clamped {
+                assert!(
+                    measure_line_width(line, px) <= 201.,
+                    "clamped line too wide: {line:?}"
+                );
+            }
+            // Clamping only truncates: lines before the last match the unclamped wrap.
+            assert_eq!(clamped[..max - 1], lines[..max - 1]);
+        }
     }
 
     /// The persistent context rasterizes crisp coverage, and reusing it for a second string —
