@@ -315,17 +315,22 @@ carved these out as separate work — none block R1 for daily use:
     the bar; hit rect widens to keep the dot clickable while the lit pill stays on the clock
     alone; anchored 2px off the pill edge like GNOME's box spacing. Pinned by panel-geometry,
     gnome.rs unseen/DND, and a Vulkan differential). Message-list scrolling — un-deferred ✅
-    (`e1f44f6f`: gnome-shell's `St.ScrollView`, `calendar.js:816`. The list lays out in content
-    space (never dropping); when it overflows the fixed popover height the whole content is baked
-    into one texture (cached by scale+revision) and a scrolled, clipped src-crop window is shown
-    with an overlay scrollbar thumb; wheel/touchpad over an open popover scrolls it and is
-    consumed. An expanded card now shows its full ≤`EXPAND_LINES` wrap regardless of height (the
+    (`e1f44f6f` + review follow-ups `e20033fe`: gnome-shell's `St.ScrollView`, `calendar.js:816`.
+    The list lays out in content space (never dropping); when it overflows the fixed popover
+    height the visible window is baked into a **viewport-sized** texture (content shifted up by
+    the scroll offset and clipped by the buffer, so its dimensions stay bounded however many
+    notifications there are; cached by scale+revision+scroll) and presented with an overlay
+    scrollbar thumb. A wheel/touchpad scroll *over the popover* scrolls the list, or — over the
+    calendar column — pages the month (`Calendar.vfunc_scroll_event`, `calendar.js:560-571`); it
+    is consumed there, but a scroll over a panel indicator still reaches its own handler (e.g. QS
+    volume). An expanded card shows its full ≤`EXPAND_LINES` wrap regardless of height (the
     earlier height-clamp/collapse-fallback is gone — the list scrolls instead). Clicks register
     only inside the viewport. Divergences: no vfade edge gradient (`_scrollbars.scss:4`
     `-st-vfade-offset`), no scrollbar-handle drag (wheel/touchpad only), no scroll-to-focused
-    message (`ensureActorVisibleInScrollView`, `calendar.js:845`). Pinned by a scroll-reveal +
-    clamp unit test, a Vulkan differential (clipped card + thumb), and updated gnome.rs
-    conformance). **Notifications subsystem COMPLETE**
+    message (`ensureActorVisibleInScrollView`, `calendar.js:845`); `card_rects` reports a
+    partially-clipped card as visible though only its in-viewport part is clickable. Pinned by
+    scroll-reveal/clamp + calendar-vs-list routing unit tests, a Vulkan differential (clipped
+    card + thumb), and updated gnome.rs conformance). **Notifications subsystem COMPLETE**
     through the approved plan (slices 1/2/3a/3b/4 + message expansion + scrolling); deferred items
     (MPRIS media, GtkNotifications, per-app policies, sounds, live time refresh,
     rich `<b>/<i>` spans) remain per the plan.
