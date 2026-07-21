@@ -7654,7 +7654,19 @@ impl Niri {
             return;
         };
         let idle = self.user_is_idle();
-        self.notification_banner.show(content, output, idle);
+        // Output-local pointer position, for the popped-up-under-the-pointer
+        // hover-expand guard (`js/ui/messageTray.js:1149-1156`).
+        let pointer = self
+            .seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .and_then(|loc| {
+                let geo = self.global_space.output_geometry(&output)?;
+                geo.contains(Point::from((loc.x as i32, loc.y as i32)))
+                    .then(|| loc - geo.loc.to_f64())
+            });
+        self.notification_banner
+            .show(content, output, idle, pointer);
         self.reschedule_notification_banner_timer();
         self.queue_redraw_all();
     }

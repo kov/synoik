@@ -2350,6 +2350,132 @@ fn vulkan_renders_the_message_list_card() {
     }
 }
 
+/// Clicking a card's expand caret grows the card: the multi-line body area
+/// (below the collapsed 90px height) composites `.message`-bg pixels where the
+/// popover box showed before, and the caret's chevron glyph (an embedded
+/// gresource icon) composites on top of the card
+/// (`js/ui/messageList.js:521-538,614-666`).
+#[test]
+fn vulkan_renders_the_expanded_card_body() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        let card = crate::ui::notification_card::CardContent {
+            id: 1,
+            source_title: "App".to_owned(),
+            source_icon: None,
+            title: "hello".to_owned(),
+            body: "a long body ".repeat(40).trim_end().to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "Just now".to_owned(),
+        };
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            vec![card],
+        );
+    }
+    f.settle_animations();
+
+    let state = f.niri_state();
+    let origin = state.niri.panel_popover.content_location(&output);
+    let caret = state
+        .niri
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_expand_rect(1)
+        .expect("a long body makes the caret live");
+
+    // Expand through the real click path.
+    let caret_pos = origin + caret.loc + Point::from((caret.size.w / 2., caret.size.h / 2.));
+    state.niri.panel_popover.pointer_click(&output, caret_pos);
+    let (_, card_rect, _) = state.niri.panel_popover.date_menu().unwrap().card_rects()[0];
+    assert!(
+        card_rect.size.h > 90.,
+        "the card grew: {}",
+        card_rect.size.h
+    );
+    let caret = state
+        .niri
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_expand_rect(1)
+        .unwrap();
+
+    let (body_px, caret_px) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 500.);
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((w, h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elems.into_iter().rev(),
+            )
+            .expect("render popover");
+            let sample = |x: f64, y: f64| {
+                let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                let i = ((py * w + px) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+            // Deep in the expanded body area — beyond the collapsed height.
+            let body_px = sample(
+                card_rect.loc.x + card_rect.size.w / 2.,
+                card_rect.loc.y + 110.,
+            );
+            // The (now collapse-)chevron glyph over the caret circle: a
+            // chevron has no ink at its exact center, so take the brightest
+            // pixel in the button.
+            let mut caret_px = [0u8; 4];
+            for dy in -7..=7 {
+                for dx in -7..=7 {
+                    let p = sample(
+                        caret.loc.x + caret.size.w / 2. + f64::from(dx),
+                        caret.loc.y + caret.size.h / 2. + f64::from(dy),
+                    );
+                    if p[0] > caret_px[0] {
+                        caret_px = p;
+                    }
+                }
+            }
+            (body_px, caret_px)
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        (0x45..=0x60).contains(&body_px[0]) && (0x50..=0x68).contains(&body_px[2]),
+        "expected the .message card bg (#51515a) in the expanded body area, got {body_px:?}"
+    );
+    assert!(
+        caret_px[0] > 150 && caret_px[1] > 150 && caret_px[2] > 150,
+        "the chevron glyph must composite above the card, got {caret_px:?}"
+    );
+}
+
 /// The quick-settings popover renders on the owned Vulkan renderer when open: the
 /// menu chrome (an offscreen box with tile backgrounds + labels) plus the icon
 /// elements composited on top. Assert `render` yields several elements that

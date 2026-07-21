@@ -94,6 +94,10 @@ pub enum PopoverAction {
     /// resident; without one, `source.open()`'s destroy-all-non-resident
     /// (`js/ui/messageList.js:730-732`, `js/ui/notificationDaemon.js:231-240`).
     ActivateNotification { id: u32, has_default: bool },
+    /// An expanded message-list card's action button: emit
+    /// ActivationToken+ActionInvoked for `key` and destroy unless resident
+    /// (`js/ui/notificationDaemon.js:224-227`, `js/ui/messageTray.js:430-442`).
+    InvokeNotificationAction { id: u32, key: String },
     /// The message list's Clear pill: close every notification.
     ClearNotifications,
 }
@@ -108,12 +112,15 @@ impl PopoverAction {
         // a default action the activated app takes focus, dropping the menu
         // grab — which we have no focus-driven dismissal for, so close
         // explicitly in both cases (else the popover's modal key grab lingers
-        // over the newly raised window).
+        // over the newly raised window). Invoking an action button gets the
+        // same treatment: it carries an activation token, so the common case
+        // is the app raising a window under our grab.
         matches!(
             self,
             PopoverAction::Screenshot
                 | PopoverAction::Spawn(_)
                 | PopoverAction::ActivateNotification { .. }
+                | PopoverAction::InvokeNotificationAction { .. }
         )
     }
 }

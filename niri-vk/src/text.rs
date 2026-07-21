@@ -117,8 +117,13 @@ fn shape_line_ranges(
     buffer
         .layout_runs()
         .map(|run| {
-            let start = run.glyphs.first().map_or(0, |g| g.start);
-            let end = run.glyphs.last().map_or(start, |g| g.end);
+            // Glyphs come in VISUAL order — a bidi run (RTL words in an LTR
+            // paragraph, or vice versa) stores them byte-reversed, so
+            // first/last would produce an inverted (panicking) range. A
+            // visual line still covers one contiguous logical span, so
+            // min/max over the glyph ranges recovers it.
+            let start = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0);
+            let end = run.glyphs.iter().map(|g| g.end).max().unwrap_or(start);
             (start, end)
         })
         .collect()
@@ -764,6 +769,30 @@ mod tests {
             }
             // Clamping only truncates: lines before the last match the unclamped wrap.
             assert_eq!(clamped[..max - 1], lines[..max - 1]);
+        }
+    }
+
+    /// Bidi bodies (untrusted notification content) must not panic the
+    /// wrapper: cosmic-text stores a bidi run's glyphs in visual order with
+    /// byte-reversed ranges, so a line of pure RTL inside an LTR paragraph
+    /// (and the mirrored case) needs min/max range recovery, not first/last.
+    #[test]
+    fn wrap_lines_survives_bidi_text() {
+        let px = 15.0;
+        let rtl_in_ltr = format!(
+            "From: {}",
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd} ".repeat(12)
+        );
+        let ltr_in_rtl = format!(
+            "{} see https://example.com/x for details",
+            "\u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645} ".repeat(8)
+        );
+        for text in [rtl_in_ltr, ltr_in_rtl] {
+            for max in [1, 3, 32] {
+                let lines = wrap_lines_weighted(&text, px, false, 120., max);
+                assert!(!lines.is_empty());
+                assert!(lines.len() <= max.max(1));
+            }
         }
     }
 

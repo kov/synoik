@@ -21,7 +21,7 @@
 //! placeholder when empty and a Clear pill when not.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::ptr::null_mut;
 
@@ -571,6 +571,13 @@ pub type CardRects = (u32, Rectangle<f64, Logical>, Rectangle<f64, Logical>);
 pub enum ListHit {
     /// A card's close button: close that notification, reason Dismissed.
     Close(u32),
+    /// A card's expand caret: toggle its body/action-row expansion — pure UI
+    /// state, no store mutation (`js/ui/messageList.js:521-526`).
+    ToggleExpand(u32),
+    /// An action button on an expanded card: emit
+    /// ActivationToken+ActionInvoked and destroy unless resident
+    /// (`js/ui/notificationDaemon.js:224-227`, `js/ui/messageTray.js:430-442`).
+    Action { id: u32, key: String },
     /// A card body: activate the notification (same semantics as a banner
     /// body click — the list card is a click-through to
     /// `notification.activate()`, `js/ui/messageList.js:730-732`).
@@ -583,6 +590,10 @@ pub enum ListHit {
 /// the notification store, rendered as flat cards newest-first.
 pub struct CalendarMessageList {
     cards: Vec<CardContent>,
+    /// Notification ids whose cards are expanded (caret-toggled). Kept across
+    /// snapshot pushes, dropped with the popover (GNOME's long-lived list
+    /// widgets persist expansion across opens — recorded divergence).
+    expanded: HashSet<u32>,
     /// Bumped whenever the snapshot changes, to invalidate cached card
     /// textures (cache keys carry the revision in their high 32 bits).
     revision: u64,
@@ -593,6 +604,7 @@ impl CalendarMessageList {
     pub fn new(cards: Vec<CardContent>) -> Self {
         Self {
             cards,
+            expanded: HashSet::new(),
             revision: 0,
             cache: RefCell::new(CardCache::new()),
         }
@@ -613,8 +625,18 @@ impl CalendarMessageList {
             return false;
         }
         self.cards = cards;
+        self.expanded
+            .retain(|id| self.cards.iter().any(|c| c.id == *id));
         self.revision += 1;
         true
+    }
+
+    /// Toggle a card's expansion (its caret was clicked).
+    fn toggle_expanded(&mut self, id: u32) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+        self.revision += 1;
     }
 
     /// Height of the bottom controls row (the Clear pill), when shown.
@@ -628,13 +650,36 @@ impl CalendarMessageList {
 
     /// The cards that fully fit above the controls row, with their popover-
     /// local origins. Overflowing cards are dropped — the list doesn't scroll
-    /// yet (recorded divergence; gnome-shell scrolls).
+    /// yet (recorded divergence; gnome-shell scrolls) — and for the same
+    /// reason an expanded card's line budget is clamped to the space left
+    /// below it. When even the minimum expanded layout (one body line + the
+    /// action row) doesn't fit, the card renders collapsed instead of
+    /// vanishing with no caret left to un-toggle it.
     fn visible_cards(&self, height: f64) -> Vec<(usize, Point<f64, Logical>, CardLayout)> {
+        use notification_card::{BODY_ICON, BTN_H, HEADER_H, LINE_H, PAD};
+
         let mut out = Vec::new();
         let bottom = height - self.controls_h();
         let mut y = LIST_PAD;
         for (i, content) in self.cards.iter().enumerate() {
-            let layout = notification_card::layout(content, CARD_W, false);
+            let mut layout = if self.expanded.contains(&content.id) {
+                // Collapsed card height + the action row it will reveal.
+                let base = PAD + HEADER_H + PAD + BODY_ICON + PAD;
+                let actions_h = if content.actions.is_empty() {
+                    0.
+                } else {
+                    BTN_H + PAD
+                };
+                let extra = (((bottom - y) - base - actions_h) / LINE_H).floor().max(0.);
+                notification_card::layout_clamped(content, CARD_W, true, true, 1 + extra as usize)
+            } else {
+                notification_card::layout(content, CARD_W, false, true)
+            };
+            if layout.expanded && y + layout.size.h > bottom {
+                // The clamp floors at one line, but the action row can still
+                // overflow a tight slot — fall back to the collapsed layout.
+                layout = notification_card::layout(content, CARD_W, false, true);
+            }
             if y + layout.size.h > bottom {
                 break;
             }
@@ -665,6 +710,23 @@ impl CalendarMessageList {
             let content = &self.cards[i];
             if layout.close.contains(local) {
                 return Some(ListHit::Close(content.id));
+            }
+            // The caret only hits while live (GNOME technically keeps its
+            // opacity-0 button reactive; we don't follow that quirk).
+            if layout
+                .expand
+                .filter(|_| layout.can_expand)
+                .is_some_and(|e| e.contains(local))
+            {
+                return Some(ListHit::ToggleExpand(content.id));
+            }
+            for (idx, rect) in layout.actions.iter().enumerate() {
+                if rect.contains(local) {
+                    return Some(ListHit::Action {
+                        id: content.id,
+                        key: content.actions[idx].0.clone(),
+                    });
+                }
             }
             return Some(ListHit::Body {
                 id: content.id,
@@ -764,6 +826,14 @@ impl DateMenu {
         if pos.x < calendar_col_x() {
             return match self.list.hit(pos, size.h) {
                 Some(ListHit::Close(id)) => PopoverAction::CloseNotification(id),
+                Some(ListHit::ToggleExpand(id)) => {
+                    // Pure UI state: expand/collapse in place, popover open.
+                    self.list.toggle_expanded(id);
+                    PopoverAction::Consumed
+                }
+                Some(ListHit::Action { id, key }) => {
+                    PopoverAction::InvokeNotificationAction { id, key }
+                }
                 Some(ListHit::Body { id, has_default }) => {
                     PopoverAction::ActivateNotification { id, has_default }
                 }
@@ -795,6 +865,40 @@ impl DateMenu {
 
     pub fn clear_pill_rect(&self) -> Option<Rectangle<f64, Logical>> {
         (!self.list.is_empty()).then(|| self.list.clear_rect(self.logical_size().h))
+    }
+
+    /// Test hook: a visible card's live expand-caret rect (popover-local);
+    /// `None` when the card isn't visible or its caret isn't live.
+    pub fn card_expand_rect(&self, id: u32) -> Option<Rectangle<f64, Logical>> {
+        let h = self.logical_size().h;
+        self.list
+            .visible_cards(h)
+            .into_iter()
+            .find(|(i, _, _)| self.list.cards[*i].id == id)
+            .and_then(|(_, origin, layout)| {
+                layout
+                    .expand
+                    .filter(|_| layout.can_expand)
+                    .map(|e| Rectangle::new(origin + e.loc, e.size))
+            })
+    }
+
+    /// Test hook: a visible card's action-button rects (popover-local; empty
+    /// unless expanded).
+    pub fn card_action_rects(&self, id: u32) -> Vec<Rectangle<f64, Logical>> {
+        let h = self.logical_size().h;
+        self.list
+            .visible_cards(h)
+            .into_iter()
+            .find(|(i, _, _)| self.list.cards[*i].id == id)
+            .map(|(_, origin, layout)| {
+                layout
+                    .actions
+                    .iter()
+                    .map(|a| Rectangle::new(origin + a.loc, a.size))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Draw the popover background: the full-size rounded box, plus the
@@ -1469,6 +1573,34 @@ mod tests {
 
     fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
         Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+    }
+
+    /// The no-scroll expansion clamp: an expanded card's line budget shrinks
+    /// to the space left above the controls; when even the one-line-plus-
+    /// actions minimum (124px) doesn't fit, the card falls back to its
+    /// collapsed layout instead of vanishing with no caret to un-toggle it.
+    #[test]
+    fn message_list_expansion_clamps_and_never_vanishes() {
+        let mut card = sample_card(1);
+        card.body = "word ".repeat(120).trim_end().to_owned();
+        card.actions = vec![("ok".to_owned(), "OK".to_owned())];
+        let mut list = CalendarMessageList::new(vec![card]);
+        list.toggle_expanded(1);
+
+        // Controls row = 49px; card starts at y=6. Plenty of room: expanded,
+        // budget-clamped to the space (height 200 → 145 free → 2 lines).
+        let visible = list.visible_cards(200.);
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].2.expanded);
+        assert_eq!(visible[0].2.size.h, 90. + 18. + 28. + 6.);
+
+        // Tight slot (height 150 → 95 free): the minimum expanded layout
+        // (124) can't fit, the collapsed one (90) can — fall back, stay
+        // visible.
+        let visible = list.visible_cards(150.);
+        assert_eq!(visible.len(), 1);
+        assert!(!visible[0].2.expanded, "falls back to the collapsed layout");
+        assert_eq!(visible[0].2.size.h, 90.);
     }
 
     #[test]

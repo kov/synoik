@@ -3,13 +3,15 @@
 //! gnome-shell draws one `.message` card design everywhere a notification
 //! shows (`js/ui/messageList.js:444-529`, `_message-list.scss:81-218`): a
 //! rounded card with a header row (16px source icon, bold app title, 9pt
-//! relative-time label, circular close button) over a body row (48px icon,
-//! bold title, single-line body), plus an action row on the banner. The
-//! banner (`ui/notification_banner.rs`) and the calendar message list
-//! (`ui/calendar.rs`) both render it through this module, parameterized by
-//! width / corner radius / whether the action row shows (collapsed list cards
-//! never show actions — `js/ui/messageList.js:598-601` keeps the action bin
-//! hidden until expanded).
+//! relative-time label, expand caret, circular close button) over a body row
+//! (48px icon, bold title, body). The card is expandable: collapsed it shows
+//! one ellipsized body line and no action row; expanded the body wraps to up
+//! to six lines and the action buttons appear (`LabelExpanderLayout` +
+//! `js/ui/messageList.js:598-666`). The banner (`ui/notification_banner.rs`)
+//! and the calendar message list (`ui/calendar.rs`) both render it through
+//! this module, parameterized by width / corner radius / expansion; the
+//! banner hides the caret (`js/ui/messageTray.js:1137`) and expands on hover
+//! or CRITICAL urgency instead.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -44,6 +46,14 @@ const BTN_RADIUS: f64 = 8.;
 const BTN_GAP: f64 = 4.;
 const TITLE_PX: f64 = crate::ui::pt_to_px(11.);
 const TIME_PX: f64 = crate::ui::pt_to_px(9.);
+/// An expanded body shows at most this many wrapped lines
+/// (`DEFAULT_EXPAND_LINES`, `js/ui/messageList.js:23`).
+pub const EXPAND_LINES: usize = 6;
+/// Body line pitch: cosmic-text's `round(px * 1.25)` at the 11pt body size.
+pub const LINE_H: f64 = 18.;
+/// Gap between the expand and close buttons: header spacing (6) + the close
+/// button's balancing margin (3) (`_message-list.scss:101,152-155`).
+const EXPAND_GAP: f64 = 9.;
 
 /// `.message` bg, dark variant (`lighten($card_bg_color, 5%)` ≈ `#51515a`).
 const CARD_BG: [f32; 4] = [
@@ -132,43 +142,123 @@ pub fn message_list_cards(store: &NotificationStore, now: Duration) -> Vec<CardC
         .collect()
 }
 
-/// A card's pure geometry: card-relative logical rects shared by the draw and
-/// the hit-test.
+/// A card's geometry: card-relative logical rects shared by the draw and the
+/// hit-test, plus the body's pre-wrapped lines (breaks computed once, at
+/// logical size, so hit-test and draw agree at every scale).
 pub struct CardLayout {
     pub size: Size<f64, Logical>,
     pub source_icon: Rectangle<f64, Logical>,
     pub close: Rectangle<f64, Logical>,
+    /// The expand-caret slot, before the close button; `None` on the banner,
+    /// which hides the button (`js/ui/messageTray.js:1137`). List cards always
+    /// reserve the slot (GNOME parks it at opacity 0 to avoid relayout,
+    /// `js/ui/messageList.js:531-538`); the chevron only draws/hits when
+    /// [`can_expand`](Self::can_expand).
+    pub expand: Option<Rectangle<f64, Logical>>,
+    /// The caret is live: the collapsed body is ellipsized, or there are
+    /// action buttons to reveal, or the card is already expanded
+    /// (`js/ui/messageList.js:531-538`).
+    pub can_expand: bool,
+    pub expanded: bool,
     /// The 48px body-icon slot; `None` when the notification has no icon.
     pub body_icon: Option<Rectangle<f64, Logical>>,
-    /// Empty when the action row is suppressed (collapsed list cards).
+    /// Body text, one entry per visual line: a single ellipsized line
+    /// collapsed, up to [`EXPAND_LINES`] wrapped lines expanded
+    /// (`LabelExpanderLayout`, `js/ui/messageList.js:220-275`).
+    pub body_lines: Vec<String>,
+    /// Empty unless expanded — the action row stays hidden until expand
+    /// (`js/ui/messageList.js:598-601,620`).
     pub actions: Vec<Rectangle<f64, Logical>>,
 }
 
-/// Lay out a card of `width`; `show_actions` gates the action-button row (the
-/// banner shows it, collapsed list cards keep it hidden until expand,
-/// `js/ui/messageList.js:598-601`).
-pub fn layout(content: &CardContent, width: f64, show_actions: bool) -> CardLayout {
+/// Lay out a card of `width`. `expanded` grows the body to its wrapped lines
+/// and reveals the action row; `expand_button` reserves the header caret slot
+/// (list cards true, the banner false).
+pub fn layout(
+    content: &CardContent,
+    width: f64,
+    expanded: bool,
+    expand_button: bool,
+) -> CardLayout {
+    layout_clamped(content, width, expanded, expand_button, EXPAND_LINES)
+}
+
+/// [`layout`] with the expanded line budget clamped below [`EXPAND_LINES`] —
+/// the no-scroll message list caps an expanded card to the space left above
+/// its controls row (gnome-shell scrolls instead; recorded divergence).
+///
+/// TODO(perf): this is no longer pure arithmetic — a non-empty body is shaped
+/// (wrap + width measure) under the global measure-font mutex on every call,
+/// and callers re-layout per hit-test / per render-element collection. Fine at
+/// today's card counts; cache per (body, width, lines) if it ever shows up.
+pub fn layout_clamped(
+    content: &CardContent,
+    width: f64,
+    expanded: bool,
+    expand_button: bool,
+    max_lines: usize,
+) -> CardLayout {
     let header_y = PAD;
     let body_y = header_y + HEADER_H + PAD;
-    let body_h = BODY_ICON;
-    let show_actions = show_actions && !content.actions.is_empty();
+    let show_actions = expanded && !content.actions.is_empty();
     let actions_h = if show_actions { BTN_H + PAD } else { 0. };
-    let h = body_y + body_h + PAD + actions_h;
 
     let source_icon = Rectangle::new(
         Point::from((PAD * 2., header_y + (HEADER_H - SMALL_ICON) / 2.)),
         Size::from((SMALL_ICON, SMALL_ICON)),
     );
+    // Close sits card-padding (6) + its balancing margin (3) from the right
+    // edge (`.message-header:ltr { padding-right: 0 }` + `.message` padding +
+    // `margin: $base_padding * 0.5`, `_message-list.scss:83,106-108,152-155`).
     let close = Rectangle::new(
-        Point::from((width - PAD - CLOSE_D, header_y + (HEADER_H - CLOSE_D) / 2.)),
+        Point::from((
+            width - PAD - 3. - CLOSE_D,
+            header_y + (HEADER_H - CLOSE_D) / 2.,
+        )),
         Size::from((CLOSE_D, CLOSE_D)),
     );
+    let expand = expand_button.then(|| {
+        Rectangle::new(
+            Point::from((close.loc.x - EXPAND_GAP - CLOSE_D, close.loc.y)),
+            close.size,
+        )
+    });
     let body_icon = content.icon.is_some().then(|| {
         Rectangle::new(
             Point::from((PAD * 2., body_y)),
             Size::from((BODY_ICON, BODY_ICON)),
         )
     });
+
+    // The body column: wrapped to the space right of the icon, minus the
+    // card's edge padding.
+    let text_x = PAD * 2. + body_icon.map_or(0., |_| BODY_ICON + PAD);
+    let text_w = (width - text_x - PAD).max(1.);
+    let body_lines = if content.body.is_empty() {
+        Vec::new()
+    } else {
+        let lines = if expanded {
+            max_lines.clamp(1, EXPAND_LINES)
+        } else {
+            1
+        };
+        niri_vk::text::wrap_lines_weighted(&content.body, TITLE_PX as f32, false, text_w, lines)
+    };
+    let can_expand = expand_button
+        && (expanded
+            || !content.actions.is_empty()
+            || (!content.body.is_empty()
+                && niri_vk::text::measure_line_width_weighted(
+                    &content.body,
+                    TITLE_PX as f32,
+                    false,
+                ) > text_w));
+
+    // Collapsed height is the 48px icon row; every wrapped line past the
+    // first grows it (one line expanded == collapsed, so toggling a short
+    // body only reveals the action row).
+    let body_h = BODY_ICON + (body_lines.len().saturating_sub(1)) as f64 * LINE_H;
+    let h = body_y + body_h + PAD + actions_h;
 
     let mut actions = Vec::new();
     if show_actions {
@@ -188,7 +278,11 @@ pub fn layout(content: &CardContent, width: f64, show_actions: bool) -> CardLayo
         size: Size::from((width, h)),
         source_icon,
         close,
+        expand,
+        can_expand,
+        expanded,
         body_icon,
+        body_lines,
         actions,
     }
 }
@@ -225,9 +319,11 @@ pub fn draw_card(
     let source_run = renderer.build_glyph_run_weighted(&content.source_title, title_px, true)?;
     let time_run = renderer.build_glyph_run_weighted(&content.time_text, time_px, false)?;
     let title_run = renderer.build_glyph_run_weighted(&content.title, title_px, true)?;
-    let body_run = (!content.body.is_empty())
-        .then(|| renderer.build_glyph_run_weighted(&content.body, title_px, false))
-        .transpose()?;
+    let body_runs: Vec<_> = layout
+        .body_lines
+        .iter()
+        .map(|line| renderer.build_glyph_run_weighted(line, title_px, false))
+        .collect::<Result<_, _>>()?;
     let action_runs: Vec<_> = layout
         .actions
         .iter()
@@ -247,9 +343,17 @@ pub fn draw_card(
         frame.clear(Color32F::from(TRANSPARENT), &[full])?;
         frame.render_rounded_rect(CARD_BG, (radius * scale) as f32, full, &[full])?;
 
-        // Close-button circle.
+        // Close-button circle, and the expand caret's when it's live.
         let close = rect_px(layout.close);
         frame.render_rounded_rect(BTN_BG, (CLOSE_D / 2. * scale) as f32, close, &[full])?;
+        if let Some(expand) = layout.expand.filter(|_| layout.can_expand) {
+            frame.render_rounded_rect(
+                BTN_BG,
+                (CLOSE_D / 2. * scale) as f32,
+                rect_px(expand),
+                &[full],
+            )?;
+        }
 
         // Themed body icons sit on the `.message-themed-icon` circle.
         if let Some(body_icon) = layout.body_icon {
@@ -264,11 +368,12 @@ pub fn draw_card(
         }
 
         // Header: bold source title after the icon, time right-aligned before
-        // the close button.
+        // the caret slot (or the close button on the banner).
         let header_cy = px(PAD + HEADER_H / 2.);
         let title_x = px(PAD * 2. + SMALL_ICON + PAD);
+        let time_anchor = layout.expand.map_or(layout.close.loc.x, |e| e.loc.x);
         let time_w = niri_vk::text::measure_line_width_weighted(&content.time_text, time_px, false);
-        let time_x = px(layout.close.loc.x - PAD) - time_w.round() as i32;
+        let time_x = px(time_anchor - PAD) - time_w.round() as i32;
         let header_clip = Rectangle::new(
             Point::from((title_x, 0)),
             Size::from(((time_x - title_x).max(0), size.h)),
@@ -288,8 +393,8 @@ pub fn draw_card(
             &[full],
         )?;
 
-        // Body: bold title over the single-line body, clipped at the card edge
-        // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
+        // Body: bold title over the pre-wrapped body lines (a single
+        // ellipsized line collapsed, up to six expanded).
         let body_y = PAD + HEADER_H + PAD;
         let text_x = px(PAD * 2.
             + if layout.body_icon.is_some() {
@@ -301,22 +406,7 @@ pub fn draw_card(
             Point::from((text_x, 0)),
             Size::from(((size.w - text_x - px(PAD)).max(0), size.h)),
         );
-        if let Some(body_run) = &body_run {
-            frame.render_glyphs(
-                &title_run,
-                place_left(title_run.ink_bounds(), text_x, px(body_y + 14.)),
-                TEXT,
-                text_clip,
-                &[full],
-            )?;
-            frame.render_glyphs(
-                body_run,
-                place_left(body_run.ink_bounds(), text_x, px(body_y + 33.)),
-                TEXT,
-                text_clip,
-                &[full],
-            )?;
-        } else {
+        if body_runs.is_empty() {
             frame.render_glyphs(
                 &title_run,
                 place_left(title_run.ink_bounds(), text_x, px(body_y + BODY_ICON / 2.)),
@@ -324,6 +414,27 @@ pub fn draw_card(
                 text_clip,
                 &[full],
             )?;
+        } else {
+            frame.render_glyphs(
+                &title_run,
+                place_left(title_run.ink_bounds(), text_x, px(body_y + 14.)),
+                TEXT,
+                text_clip,
+                &[full],
+            )?;
+            for (i, body_run) in body_runs.iter().enumerate() {
+                frame.render_glyphs(
+                    body_run,
+                    place_left(
+                        body_run.ink_bounds(),
+                        text_x,
+                        px(body_y + 33. + i as f64 * LINE_H),
+                    ),
+                    TEXT,
+                    text_clip,
+                    &[full],
+                )?;
+            }
         }
 
         // Action buttons: pills with centered bold labels.
@@ -463,6 +574,24 @@ pub fn card_elements(
         elements.push(elem);
     }
 
+    // Expand caret: a chevron that flips when expanded (GNOME rotates the
+    // button actor 180°, `js/ui/messageList.js:635-638`; ours is a baked
+    // rotated SVG). Only drawn while live (`can_expand`).
+    if let Some(expand) = layout.expand.filter(|_| layout.can_expand) {
+        let center = Point::from((
+            expand.loc.x + expand.size.w / 2.,
+            expand.loc.y + expand.size.h / 2.,
+        ));
+        let name = if layout.expanded {
+            "notification-collapse-symbolic"
+        } else {
+            "notification-expand-symbolic"
+        };
+        if let Some(elem) = icon_at(renderer, name, SMALL_ICON, TEXT, center) {
+            elements.push(elem);
+        }
+    }
+
     // Body icon: pixels (app image) or a symbolic on the circle the card
     // already drew (`.message-themed-icon`).
     if let Some(body_icon) = layout.body_icon {
@@ -568,6 +697,74 @@ mod tests {
             resident: false,
             transient: false,
         }
+    }
+
+    /// The expansion geometry rules (`js/ui/messageList.js:531-666`): the
+    /// caret is live iff the body is ellipsized / there are actions / already
+    /// expanded; actions only lay out when expanded; every wrapped line past
+    /// the first grows the card by LINE_H; the banner variant has no caret
+    /// slot (`js/ui/messageTray.js:1137`).
+    #[test]
+    fn layout_expansion_rules() {
+        let mut content = CardContent {
+            id: 1,
+            source_title: "app".to_owned(),
+            source_icon: None,
+            title: "title".to_owned(),
+            body: "short".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "Just now".to_owned(),
+        };
+        let w = 400.;
+
+        // Short body, no actions: nothing to expand.
+        let collapsed = layout(&content, w, false, true);
+        assert!(collapsed.expand.is_some(), "the caret slot is reserved");
+        assert!(!collapsed.can_expand);
+        assert!(collapsed.actions.is_empty());
+        assert_eq!(collapsed.body_lines, vec!["short"]);
+
+        // Actions alone make the caret live; expanding reveals them and only
+        // them (one body line: no height change from text).
+        content.actions = vec![("ok".to_owned(), "OK".to_owned())];
+        let collapsed = layout(&content, w, false, true);
+        assert!(collapsed.can_expand);
+        assert!(collapsed.actions.is_empty());
+        let expanded = layout(&content, w, true, true);
+        assert_eq!(expanded.actions.len(), 1);
+        assert_eq!(
+            expanded.size.h,
+            collapsed.size.h + BTN_H + PAD,
+            "one-line body: expanding only adds the action row"
+        );
+
+        // A long body ellipsizes collapsed and wraps expanded, growing the
+        // card by LINE_H per extra line, capped at EXPAND_LINES.
+        content.actions = Vec::new();
+        content.body = "word ".repeat(120).trim_end().to_owned();
+        let collapsed = layout(&content, w, false, true);
+        assert!(collapsed.can_expand);
+        assert_eq!(collapsed.body_lines.len(), 1);
+        assert!(collapsed.body_lines[0].ends_with('\u{2026}'));
+        let expanded = layout(&content, w, true, true);
+        assert_eq!(expanded.body_lines.len(), EXPAND_LINES);
+        assert!(expanded.body_lines.last().unwrap().ends_with('\u{2026}'));
+        assert_eq!(
+            expanded.size.h,
+            collapsed.size.h + (EXPAND_LINES - 1) as f64 * LINE_H
+        );
+        // The no-scroll list can clamp the line budget below EXPAND_LINES.
+        let clamped = layout_clamped(&content, w, true, true, 3);
+        assert_eq!(clamped.body_lines.len(), 3);
+
+        // The banner variant reserves no caret slot and its time label
+        // anchors on the close button.
+        let banner = layout(&content, w, false, false);
+        assert!(banner.expand.is_none());
+        assert!(!banner.can_expand);
     }
 
     #[test]

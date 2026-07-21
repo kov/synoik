@@ -3721,11 +3721,12 @@ fn notification_banner_close_click_dismisses() {
     f.settle_animations();
 
     // Banner geometry: 34em wide centered, y = panel(32) + margin(4); the close
-    // circle (28px) sits PAD from the right edge, centered in the header row.
+    // circle (28px) sits PAD + its 3px margin from the right edge, centered in
+    // the header row (`_message-list.scss:152-155`).
     let em = 11. * 4. / 3.;
     let w = 34. * em;
     let x0 = (1920. - w) / 2.;
-    let close_x = x0 + w - 6. - 14.;
+    let close_x = x0 + w - 6. - 3. - 14.;
     let close_y = 36. + 6. + 12.;
     pointer_motion_to(&mut f, close_x, close_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -3747,6 +3748,8 @@ fn notification_banner_close_click_dismisses() {
 /// Clicking an action button emits ActivationToken+ActionInvoked (as one paired
 /// command with a real token) and destroys the non-resident notification
 /// (`js/ui/notificationDaemon.js:218-241`, `js/ui/messageTray.js:431-447`).
+/// The action row only exists once the banner expands — here via hover
+/// (`js/ui/messageList.js:598-601`, `js/ui/messageTray.js:1102-1105`).
 #[test]
 fn notification_banner_action_click_emits_and_dismisses() {
     let mut f = Fixture::new();
@@ -3759,6 +3762,11 @@ fn notification_banner_action_click_emits_and_dismisses() {
     req.actions = vec![("ok".to_owned(), "OK".to_owned())];
     let id = banner_notify(&mut f, req);
     f.settle_animations();
+    assert!(!f.niri().notification_banner.is_expanded());
+
+    // Hovering the shown banner expands it, revealing the action row.
+    pointer_motion_to(&mut f, 960., 80.);
+    assert!(f.niri().notification_banner.is_expanded());
 
     // Single action button: centered in the action row below the body block.
     let action_y = 36. + 6. + 24. + 6. + 48. + 6. + 14.;
@@ -4075,5 +4083,233 @@ fn calendar_message_list_click_close_body_and_clear() {
     assert!(
         f.niri().panel_popover.is_open(),
         "Clear keeps the popover open"
+    );
+}
+
+/// The list card's expand caret (`js/ui/messageList.js:521-538,614-666`):
+/// collapsed cards show one body line and no action row; clicking the caret
+/// wraps the body and reveals the actions; expansion survives a snapshot push
+/// (with its line budget clamped to the remaining space); clicking again
+/// collapses; an expanded card's action button emits
+/// ActivationToken+ActionInvoked and destroys the notification, closing the
+/// popover.
+#[test]
+fn calendar_message_list_caret_expands_and_actions_invoke() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+    let (tx, emitted) = async_channel::unbounded();
+    f.niri().notifications_emit = Some(tx);
+
+    let mut req = banner_req("app-a", ":1.1");
+    req.body = "a long body ".repeat(40).trim_end().to_owned();
+    req.actions = vec![
+        ("ok".to_owned(), "OK".to_owned()),
+        ("no".to_owned(), "No".to_owned()),
+    ];
+    let id = banner_notify(&mut f, req);
+    f.settle_animations();
+
+    open_calendar(&mut f);
+    let output = f.niri_output(1);
+    let origin = f.niri().panel_popover.content_location(&output);
+    let click = |f: &mut Fixture, pos: smithay::utils::Point<f64, smithay::utils::Logical>| {
+        pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let rect_center = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        smithay::utils::Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+    };
+    let dm = |f: &mut Fixture| {
+        let card = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
+        let expand = f
+            .niri()
+            .panel_popover
+            .date_menu()
+            .unwrap()
+            .card_expand_rect(card.0);
+        let actions = f
+            .niri()
+            .panel_popover
+            .date_menu()
+            .unwrap()
+            .card_action_rects(card.0);
+        (card, expand, actions)
+    };
+
+    // Collapsed: 90px card, live caret, no action row.
+    let ((cid, card, _), expand, actions) = dm(&mut f);
+    assert_eq!(cid, id);
+    assert_eq!(card.size.h, 90.);
+    assert!(actions.is_empty(), "actions hidden until expanded");
+    let caret = expand.expect("a long body makes the caret live");
+
+    // Caret click: the body wraps to its six-line budget and the action row
+    // appears; the popover stays open, the store is untouched.
+    click(&mut f, rect_center(caret));
+    assert!(f.niri().panel_popover.is_open());
+    assert!(f.niri().notifications.find(id).is_some());
+    let ((_, card, _), expand, actions) = dm(&mut f);
+    assert_eq!(
+        card.size.h,
+        90. + 5. * 18. + 28. + 6.,
+        "six body lines + the action row"
+    );
+    assert_eq!(actions.len(), 2);
+    assert!(expand.is_some(), "the caret stays live to collapse");
+
+    // A snapshot push while open (new notification) keeps the card expanded,
+    // its line budget clamped to the space left below the new card.
+    banner_notify(&mut f, banner_req("app-b", ":1.2"));
+    let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    assert_eq!(rects.len(), 2, "both cards visible");
+    let (aid, a_card, _) = rects[1];
+    assert_eq!(aid, id);
+    assert!(
+        a_card.size.h > 90. && a_card.size.h < 90. + 5. * 18. + 28. + 6.,
+        "still expanded, clamped below the full budget: {}",
+        a_card.size.h
+    );
+
+    // Caret click again: collapse back to the flat card.
+    let caret = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_expand_rect(id)
+        .unwrap();
+    click(&mut f, rect_center(caret));
+    let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    assert_eq!(rects[1].1.size.h, 90.);
+    assert!(f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_action_rects(id)
+        .is_empty());
+
+    // Expand once more and invoke the second action: ActionInvoked('no')
+    // unicast with a real token, the notification destroyed (non-resident),
+    // and the popover closes (the app it raised takes over).
+    let caret = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_expand_rect(id)
+        .unwrap();
+    click(&mut f, rect_center(caret));
+    let actions = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_action_rects(id);
+    click(&mut f, rect_center(actions[1]));
+    assert!(f.niri().notifications.find(id).is_none());
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::ActionInvoked {
+            id: aid,
+            action,
+            token,
+            sender,
+        } => {
+            assert_eq!(aid, id);
+            assert_eq!(action, "no");
+            assert!(!token.is_empty());
+            assert_eq!(sender.as_deref(), Some(":1.1"));
+        }
+        _ => panic!("expected an ActionInvoked emission"),
+    }
+    match emitted.recv_blocking().unwrap() {
+        crate::notifications::NiriToNotifications::Closed { reason, .. } => {
+            assert_eq!(reason.wire_code(), 2);
+        }
+        _ => panic!("expected a Closed emission"),
+    }
+    f.settle_animations();
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "invoking an action closes the calendar"
+    );
+}
+
+/// Hover expands the shown banner (`js/ui/messageTray.js:1102-1105`) — unless
+/// it popped up under the pointer, in which case the pointer must leave and
+/// come back first (`:978-991`).
+#[test]
+fn notification_banner_hover_expand_and_under_pointer_guard() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Park the pointer where the banner is about to land.
+    f.pointer_motion(1., 1.);
+    pointer_motion_to(&mut f, 960., 80.);
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    assert!(!f.niri().notification_banner.is_expanded());
+
+    // Hovering in place (it popped up under us) must NOT expand.
+    pointer_motion_to(&mut f, 961., 80.);
+    assert!(
+        !f.niri().notification_banner.is_expanded(),
+        "popped-under-pointer: hover without leaving first doesn't expand"
+    );
+
+    // Leave, come back: now it expands.
+    pointer_motion_to(&mut f, 960., 400.);
+    pointer_motion_to(&mut f, 960., 80.);
+    assert!(f.niri().notification_banner.is_expanded());
+}
+
+/// A pointer that moves onto the banner DURING the slide-in registers as
+/// hover (GNOME tracks the banner bin from SHOWING, `js/ui/messageTray.js:970-996`)
+/// and expands at the SHOWN transition (`:1102-1105`).
+#[test]
+fn notification_banner_hover_during_slide_expands_when_shown() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    // Mid-slide: move onto the banner's area and stop.
+    pointer_motion_to(&mut f, 960., 80.);
+    assert!(!f.niri().notification_banner.is_expanded());
+
+    f.settle_animations();
+    assert!(
+        f.niri().notification_banner.is_expanded(),
+        "the settled pointer expands the banner at the Showing→Shown transition"
+    );
+}
+
+/// CRITICAL banners auto-expand at show (`js/ui/messageTray.js:1170-1174`):
+/// the action row is clickable without any hover.
+#[test]
+fn notification_banner_critical_auto_expands() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let mut req = banner_req("app", ":1.1");
+    req.urgency = crate::notifications::Urgency::Critical;
+    req.actions = vec![("ok".to_owned(), "OK".to_owned())];
+    banner_notify(&mut f, req);
+    assert!(
+        f.niri().notification_banner.is_expanded(),
+        "critical expands at show, before any hover"
+    );
+    f.settle_animations();
+
+    // The action row is present in the hit-test (short body: one line, so the
+    // row sits right below the 48px body block).
+    let output = f.niri_output(1);
+    let action_pos = smithay::utils::Point::from((960., 36. + 6. + 24. + 6. + 48. + 6. + 14.));
+    assert_eq!(
+        f.niri().notification_banner.hit_test(&output, action_pos),
+        Some(crate::ui::notification_banner::BannerHit::Action(0))
     );
 }

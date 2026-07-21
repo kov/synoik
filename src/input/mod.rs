@@ -1044,6 +1044,11 @@ impl State {
                 };
                 self.niri.apply_notification_effects(effects);
             }
+            PopoverAction::InvokeNotificationAction { id, key } => {
+                self.niri.emit_notification_action(id, key);
+                let effects = self.niri.notifications.activate(id);
+                self.niri.apply_notification_effects(effects);
+            }
             PopoverAction::ClearNotifications => {
                 let effects = self.niri.notifications.clear_all();
                 self.niri.apply_notification_effects(effects);
@@ -2908,8 +2913,9 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
-        // Hovering the notification banner holds its expiry; leaving restarts
-        // the countdown (`js/ui/messageTray.js:970-1050`, simplified).
+        // Hovering the notification banner holds its expiry and expands the
+        // banner; leaving restarts the countdown
+        // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
         if self.niri.layout.is_gnome_mode() {
             let inside = self
                 .niri
@@ -2917,6 +2923,8 @@ impl State {
                 .is_some_and(|(output, p)| self.niri.notification_banner.pointer_inside(output, p));
             if self.niri.notification_banner.set_hovered(inside) {
                 self.niri.reschedule_notification_banner_timer();
+                // Hover-expand changes the banner's layout.
+                self.niri.queue_redraw_all();
             }
         }
 

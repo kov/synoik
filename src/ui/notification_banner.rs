@@ -4,8 +4,7 @@
 //! GNOME's primary monitor), sliding down from above the panel with a fade
 //! (`js/ui/messageTray.js:1124-1160`, 200 ms). The widget is the shared
 //! message card (`ui/notification_card.rs`) at `.notification-banner` metrics:
-//! 34em wide, radius `$modal_radius` (`_notifications.scss:1-17`), with the
-//! action row shown (`js/ui/messageList.js:19,444-529`).
+//! 34em wide, radius `$modal_radius` (`_notifications.scss:1-17`).
 //!
 //! Timing is the tray's own — the client's `expire_timeout` is ignored:
 //! 4000 ms (`NOTIFICATION_TIMEOUT`, `js/ui/messageTray.js:19`), CRITICAL never
@@ -17,10 +16,21 @@
 //! the idle-machine wake-up. `are_animations_ongoing` is true only while
 //! actually animating — a statically Shown banner must not busy-redraw.
 //!
-//! What the banner does NOT do (deferred, recorded in the plan): expand /
-//! 6-line body clamp / CRITICAL auto-expand (renders collapsed), app focus on
-//! body click, per-app policies, Escape (GNOME's banner is not key-focusable,
-//! `js/ui/messageTray.js:1136` — a global grab would steal Escape from apps).
+//! The banner expands like GNOME's (`js/ui/messageTray.js`): collapsed it
+//! shows one ellipsized body line and no action row; CRITICAL auto-expands at
+//! show (`:1170-1174`), and hovering expands it (`:1102-1105`) — unless it
+//! popped up under the pointer, in which case the pointer must leave and
+//! come back first (`:978-991`); it never un-expands while shown. It has no
+//! expand caret (`:1137`) — that's the message list's.
+//!
+//! What the banner does NOT do (deferred, recorded in the plan): animate the
+//! expansion (GNOME eases 200 ms; ours is instant, like the other popover
+//! chrome pending the animations pass), grab key focus on hover-expand
+//! (`:1306-1311`), the `policy.forceExpanded` auto-expand (the same cited
+//! line also expands for the per-app force-expanded policy — per-app
+//! policies as a whole are deferred), app focus on body click, Escape
+//! (GNOME's banner is not key-focusable, `js/ui/messageTray.js:1136` — a
+//! global grab would steal Escape from apps).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -94,6 +104,14 @@ pub struct NotificationBanner {
     hovered: bool,
     blocked: bool,
     idle_at_show: bool,
+    /// Expanded body + action row. Set at show for CRITICAL
+    /// (`js/ui/messageTray.js:1170-1174`), or by hover once fully shown
+    /// (`:1102-1105`); never cleared until the next show.
+    expanded: bool,
+    /// The banner appeared under a stationary pointer: hovering must not
+    /// expand it until the pointer has left and come back
+    /// (`js/ui/messageTray.js:978-991`).
+    popped_under_pointer: bool,
     /// The user became active while the banner was still sliding in — the
     /// idle gate resolves at the `Showing`→`Shown` transition by arming the
     /// short [`ACTIVE_TIMEOUT`] (GNOME's user-active watch fires during the
@@ -114,6 +132,8 @@ impl NotificationBanner {
             hovered: false,
             blocked: false,
             idle_at_show: false,
+            expanded: false,
+            popped_under_pointer: false,
             active_during_show: false,
             revision: 0,
             cache: RefCell::new(CardCache::new()),
@@ -133,9 +153,23 @@ impl NotificationBanner {
         )
     }
 
-    /// The banner's card layout (34em wide, action row shown).
-    fn layout(content: &CardContent) -> CardLayout {
-        layout(content, WIDTH, true)
+    /// The banner's card layout: 34em wide, no expand-caret slot
+    /// (`js/ui/messageTray.js:1137`); the action row appears when expanded.
+    fn layout(&self, content: &CardContent) -> CardLayout {
+        layout(content, WIDTH, self.expanded, false)
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Expand in place (one-way until the next show). The revision bump
+    /// invalidates the cached card texture.
+    fn expand(&mut self) {
+        if !self.expanded {
+            self.expanded = true;
+            self.revision += 1;
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -161,10 +195,25 @@ impl NotificationBanner {
     }
 
     /// Show a freshly popped banner. `user_idle` = idletime exceeded
-    /// [`IDLE_TIME_MS`] at show time.
-    pub fn show(&mut self, content: CardContent, output: Output, user_idle: bool) {
+    /// [`IDLE_TIME_MS`] at show time; `pointer` = the pointer's output-local
+    /// position when it sits on the banner's output — a pointer already
+    /// inside where the banner lands arms the hover-expand guard
+    /// (`js/ui/messageTray.js:1149-1156`).
+    pub fn show(
+        &mut self,
+        content: CardContent,
+        output: Output,
+        user_idle: bool,
+        pointer: Option<Point<f64, Logical>>,
+    ) {
+        // CRITICAL auto-expands, without animation (`js/ui/messageTray.js:1170-1174`).
+        self.expanded = content.critical;
         self.content = Some(content);
         self.output = Some(output);
+        self.popped_under_pointer = pointer.is_some_and(|p| {
+            let output = self.output.clone().unwrap();
+            self.shown_rect(&output).is_some_and(|r| r.contains(p))
+        });
         self.hovered = false;
         self.idle_at_show = user_idle;
         self.active_during_show = false;
@@ -179,6 +228,12 @@ impl NotificationBanner {
         if self.content.as_ref() != Some(&content) {
             self.content = Some(content);
             self.revision += 1;
+        }
+        // A replace to CRITICAL auto-expands, like the initial show
+        // (`_updateShowingNotification` re-runs on update,
+        // `js/ui/messageTray.js:938-943,1170-1174`).
+        if critical {
+            self.expand();
         }
         match &mut self.state {
             State::Shown {
@@ -276,14 +331,29 @@ impl NotificationBanner {
         }
     }
 
-    /// Hover holds expiry; leaving restarts the full countdown
-    /// (`js/ui/messageTray.js:970-1050`, simplified). Returns true when the
-    /// deadline changed (re-arm the wake-up timer).
+    /// Hover holds expiry and expands the (fully shown) banner; leaving
+    /// restarts the full countdown (`js/ui/messageTray.js:970-1050,1102-1105`,
+    /// simplified). A banner that popped up under the pointer doesn't expand
+    /// until the pointer leaves and comes back (`:978-991`; our hover cycle
+    /// stands in for GNOME's mouse-away tracking). Returns true when anything
+    /// changed (re-arm the wake-up timer and redraw).
     pub fn set_hovered(&mut self, hovered: bool) -> bool {
         if self.hovered == hovered {
             return false;
         }
         self.hovered = hovered;
+        let mut changed = false;
+        if hovered {
+            if self.popped_under_pointer {
+                // The guarded hover still holds expiry (GNOME switches to its
+                // longer hide timeout here) — it just doesn't expand.
+            } else if matches!(self.state, State::Shown { .. }) {
+                changed = !self.expanded;
+                self.expand();
+            }
+        } else {
+            self.popped_under_pointer = false;
+        }
         let critical = self.content.as_ref().is_some_and(|c| c.critical);
         if let State::Shown {
             deadline,
@@ -291,13 +361,13 @@ impl NotificationBanner {
         } = &mut self.state
         {
             if hovered {
-                return deadline.take().is_some();
+                return deadline.take().is_some() || changed;
             } else if !critical && !*waiting_for_activity {
                 *deadline = Some(self.clock.now_unadjusted() + TIMEOUT);
                 return true;
             }
         }
-        false
+        changed
     }
 
     /// User input arrived: a banner waiting on idle gating arms its (shorter)
@@ -354,6 +424,13 @@ impl NotificationBanner {
                         deadline,
                         waiting_for_activity: waiting,
                     };
+                    // Hover-expand only applies once fully shown (GNOME's
+                    // `_updateState`, `js/ui/messageTray.js:1102-1105`); a
+                    // pointer that settled on the banner mid-slide expands it
+                    // now.
+                    if self.hovered && !self.popped_under_pointer {
+                        self.expand();
+                    }
                 }
             }
             State::Shown { deadline, .. } => {
@@ -382,7 +459,7 @@ impl NotificationBanner {
     /// The banner's rectangle on its output when fully shown (for hit-tests).
     fn shown_rect(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
         let content = self.content.as_ref()?;
-        let layout = Self::layout(content);
+        let layout = self.layout(content);
         let ow = output_size(output).w;
         let x = ((ow - layout.size.w) / 2.).max(0.);
         let y = crate::ui::panel::PANEL_HEIGHT + MARGIN;
@@ -404,7 +481,7 @@ impl NotificationBanner {
             return None;
         }
         let content = self.content.as_ref()?;
-        let layout = Self::layout(content);
+        let layout = self.layout(content);
         let local = pos - rect.loc;
         if layout.close.contains(local) {
             return Some(BannerHit::Close);
@@ -417,9 +494,14 @@ impl NotificationBanner {
         Some(BannerHit::Body)
     }
 
-    /// Whether the pointer is currently over the (fully shown) banner.
+    /// Whether the pointer is currently over the banner's (final) area. This
+    /// includes the slide-in: GNOME tracks hover on the banner bin from the
+    /// SHOWING state (`js/ui/messageTray.js:970-996`) — a pointer that
+    /// settles on the banner mid-slide must hold expiry, expand at the
+    /// SHOWN transition, and clear the popped-under-pointer guard when it
+    /// leaves during the slide.
     pub fn pointer_inside(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
-        matches!(self.state, State::Shown { .. })
+        matches!(self.state, State::Showing(_) | State::Shown { .. })
             && self.output.as_ref() == Some(output)
             && self
                 .shown_rect(output)
@@ -440,7 +522,7 @@ impl NotificationBanner {
         };
 
         let scale = output.current_scale().fractional_scale();
-        let layout = Self::layout(content);
+        let layout = self.layout(content);
         let ow = output_size(output).w;
 
         let progress = match &self.state {

@@ -119,11 +119,20 @@ impl IconCache {
 
 /// Icons gnome-shell ships inside its own gresource — they exist in NO icon
 /// theme on disk, so they are bundled from the 50.1 reference checkout
-/// (`data/icons/scalable/status/`, GPLv2+) into `resources/icons/`.
+/// (`data/icons/scalable/`, GPLv2+) into `resources/icons/`.
+/// `notification-collapse-symbolic` is our derived name for the expand chevron
+/// rotated 180° — gnome-shell rotates the button actor instead
+/// (`js/ui/messageList.js:635-638`); we bake the rotation into the SVG.
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
     match name {
         "no-notifications-symbolic" => Some(include_bytes!(
             "../../resources/icons/no-notifications-symbolic.svg"
+        )),
+        "notification-expand-symbolic" => Some(include_bytes!(
+            "../../resources/icons/notification-expand-symbolic.svg"
+        )),
+        "notification-collapse-symbolic" => Some(include_bytes!(
+            "../../resources/icons/notification-collapse-symbolic.svg"
         )),
         _ => None,
     }
