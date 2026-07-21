@@ -4279,6 +4279,113 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     );
 }
 
+/// Notifications from ONE source group into a fanned stack
+/// (`NotificationMessageGroup`): collapsed it shows no per-card rects, a click
+/// expands it into a vertical list, the header collapse button fans it back,
+/// and closing the collapsed stack closes the WHOLE group
+/// (`js/ui/messageList.js:1106-1118,1236-1242`). End to end through real clicks.
+#[test]
+fn calendar_message_list_groups_and_group_close() {
+    use smithay::utils::{Logical, Point, Rectangle};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    // Two notifications from the SAME app + sender → one source → one group.
+    let id1 = banner_notify(&mut f, banner_req("chat", ":1.5"));
+    let id2 = banner_notify(&mut f, banner_req("chat", ":1.5"));
+    f.settle_animations();
+
+    open_calendar(&mut f);
+    let output = f.niri_output(1);
+    let origin = f.niri().panel_popover.content_location(&output);
+    let click = |f: &mut Fixture, pos: Point<f64, Logical>| {
+        pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let rect_center = |r: Rectangle<f64, Logical>| {
+        Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+    };
+    let groups = |f: &mut Fixture| f.niri().panel_popover.date_menu().unwrap().group_rects();
+
+    // Collapsed: one group, not expanded, no per-card interactive rects.
+    let g = groups(&mut f);
+    assert_eq!(g.len(), 1, "both notifications collapse into one stack");
+    assert!(!g[0].2, "the stack starts collapsed");
+    assert!(f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .card_rects()
+        .is_empty());
+
+    // A click clear of the top card's close button expands the group.
+    let bounds = g[0].1;
+    click(
+        &mut f,
+        Point::from((bounds.loc.x + 20., bounds.loc.y + bounds.size.h - 6.)),
+    );
+    assert!(f.niri().panel_popover.is_open());
+    assert!(groups(&mut f)[0].2, "clicking the stack expanded it");
+    assert_eq!(
+        f.niri()
+            .panel_popover
+            .date_menu()
+            .unwrap()
+            .card_rects()
+            .len(),
+        2,
+        "expanded: both cards individually interactive"
+    );
+    // Expanding is pure UI — the store is untouched.
+    assert!(f.niri().notifications.find(id1).is_some());
+    assert!(f.niri().notifications.find(id2).is_some());
+
+    // The header collapse button fans it back to a stack.
+    let key = groups(&mut f)[0].0.clone();
+    let collapse = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .group_collapse_rect(&key)
+        .expect("expanded group has a collapse button");
+    click(&mut f, rect_center(collapse));
+    assert!(
+        !groups(&mut f)[0].2,
+        "the collapse button re-fanned the stack"
+    );
+
+    // Closing the collapsed stack closes the WHOLE group.
+    let key = groups(&mut f)[0].0.clone();
+    let stack_close = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .stack_close_rect(&key)
+        .expect("collapsed stack has a top-card close");
+    click(&mut f, rect_center(stack_close));
+    assert!(f.niri().notifications.find(id1).is_none());
+    assert!(f.niri().notifications.find(id2).is_none());
+    assert!(
+        f.niri()
+            .panel_popover
+            .date_menu()
+            .unwrap()
+            .list()
+            .is_empty(),
+        "closing the group empties the list"
+    );
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "a group close keeps the popover open"
+    );
+}
+
 /// Hover expands the shown banner (`js/ui/messageTray.js:1102-1105`) — unless
 /// it popped up under the pointer, in which case the pointer must leave and
 /// come back first (`:978-991`).

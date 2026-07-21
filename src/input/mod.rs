@@ -1035,6 +1035,19 @@ impl State {
                     .close(id, crate::notifications::CloseReason::Dismissed);
                 self.niri.apply_notification_effects(effects);
             }
+            PopoverAction::CloseNotificationGroup(ids) => {
+                // Closing a collapsed group closes every notification in it
+                // (`js/ui/messageList.js:1236-1242`), each reason Dismissed.
+                let mut effects = crate::notifications::Effects::default();
+                for id in ids {
+                    let e = self
+                        .niri
+                        .notifications
+                        .close(id, crate::notifications::CloseReason::Dismissed);
+                    effects.merge(e);
+                }
+                self.niri.apply_notification_effects(effects);
+            }
             PopoverAction::ActivateNotification { id, has_default } => {
                 let effects = if has_default {
                     self.niri.emit_notification_action(id, "default".to_owned());
@@ -3440,7 +3453,7 @@ impl State {
                                 let cal = self.niri.gnome_settings.calendar;
                                 let accent = self.niri.gnome_settings.accent_color;
                                 let now = self.niri.clock.now_unadjusted();
-                                let cards = crate::ui::notification_card::message_list_cards(
+                                let cards = crate::ui::notification_card::message_list_groups(
                                     &self.niri.notifications,
                                     now,
                                 );

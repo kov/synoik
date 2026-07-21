@@ -7613,7 +7613,7 @@ impl Niri {
             return;
         }
         let now = self.clock.now_unadjusted();
-        let cards = crate::ui::notification_card::message_list_cards(&self.notifications, now);
+        let cards = crate::ui::notification_card::message_list_groups(&self.notifications, now);
         if self.panel_popover.set_notifications(cards) {
             self.queue_redraw_all();
         }

@@ -2355,7 +2355,13 @@ fn vulkan_renders_the_message_list_card() {
             cal.week_start,
             cal.show_week_numbers,
             accent,
-            vec![card],
+            vec![crate::ui::notification_card::CardGroup {
+                key: crate::notifications::SourceKey::PidName(1, "App".to_owned()),
+                source_title: card.source_title.clone(),
+                source_icon: None,
+                has_urgent: card.critical,
+                cards: vec![card],
+            }],
         );
     }
     f.settle_animations();
@@ -2461,7 +2467,13 @@ fn vulkan_renders_the_expanded_card_body() {
             cal.week_start,
             cal.show_week_numbers,
             accent,
-            vec![card],
+            vec![crate::ui::notification_card::CardGroup {
+                key: crate::notifications::SourceKey::PidName(1, "App".to_owned()),
+                source_title: card.source_title.clone(),
+                source_icon: None,
+                has_urgent: card.critical,
+                cards: vec![card],
+            }],
         );
     }
     f.settle_animations();
@@ -2549,6 +2561,137 @@ fn vulkan_renders_the_expanded_card_body() {
     assert!(
         caret_px[0] > 150 && caret_px[1] > 150 && caret_px[2] > 150,
         "the chevron glyph must composite above the card, got {caret_px:?}"
+    );
+}
+
+/// A multi-notification group renders as a fanned stack: a darkened peek shows
+/// below the top card when collapsed, and the group header's collapse chevron
+/// composites when expanded (`js/ui/messageList.js:1370-1404`,
+/// `_message-list.scss:89-98`). Exercises the new stack-shadow and group-header
+/// draw paths (and the bundled `group-collapse-symbolic`).
+#[test]
+fn vulkan_renders_a_grouped_stack_and_header() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let key = crate::notifications::SourceKey::PidName(9, "App".to_owned());
+
+    let make_card = |id: u32| crate::ui::notification_card::CardContent {
+        id,
+        source_title: "App".to_owned(),
+        source_icon: None,
+        title: format!("msg {id}"),
+        body: "body".to_owned(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        critical: false,
+        time_text: "Just now".to_owned(),
+    };
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            vec![crate::ui::notification_card::CardGroup {
+                key: key.clone(),
+                source_title: "App".to_owned(),
+                source_icon: None,
+                has_urgent: false,
+                cards: vec![make_card(1), make_card(2)],
+            }],
+        );
+    }
+    f.settle_animations();
+
+    let origin = f.niri().panel_popover.content_location(&output);
+    let w = to_physical_precise_round(scale.x, output_size(&output).w);
+    let h = to_physical_precise_round(scale.x, 500.);
+    let render_sample = |f: &mut Fixture, pts: Vec<(f64, f64)>| -> Vec<[u8; 4]> {
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let elems = state
+                    .niri
+                    .panel_popover
+                    .render(vk, &state.niri.icon_cache, &output);
+                let pixels = render_to_vec(
+                    vk,
+                    Size::<i32, Physical>::from((w, h)),
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elems.into_iter().rev(),
+                )
+                .expect("render popover");
+                pts.into_iter()
+                    .map(|(x, y)| {
+                        let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                        let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                        let i = ((py * w + px) * 4) as usize;
+                        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                    })
+                    .collect()
+            })
+            .expect("vulkan renderer")
+    };
+
+    // Collapsed: a darkened peek strip shows just below the top card (which is
+    // 90px tall). Sample near the bottom of the stack bounds, centered.
+    let bounds = f.niri().panel_popover.date_menu().unwrap().group_rects()[0].1;
+    let peek = render_sample(
+        &mut f,
+        vec![(bounds.size.w / 2., bounds.loc.y + bounds.size.h - 4.)],
+    )[0];
+    assert_eq!(peek[3], 255, "the peek strip is opaque, got {peek:?}");
+    assert!(
+        peek[0] < 0x51 && peek[0] > 0x30,
+        "the peek is a darkened card bg (below #51515a), got {peek:?}"
+    );
+
+    // Expand the group through the real click path (clear of the close button).
+    let expand_pt = origin + bounds.loc + Point::from((20., bounds.size.h - 6.));
+    f.niri().panel_popover.pointer_click(&output, expand_pt);
+    assert!(
+        f.niri().panel_popover.date_menu().unwrap().group_rects()[0].2,
+        "the group expanded"
+    );
+
+    // The header collapse chevron composites bright over its button (a chevron
+    // has no ink at its exact center — brightest pixel in the button).
+    let collapse = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .group_collapse_rect(&key)
+        .expect("expanded group has a collapse button");
+    let pts: Vec<(f64, f64)> = (-7..=7)
+        .flat_map(|dy| {
+            (-7..=7).map(move |dx| {
+                (
+                    collapse.loc.x + collapse.size.w / 2. + f64::from(dx),
+                    collapse.loc.y + collapse.size.h / 2. + f64::from(dy),
+                )
+            })
+        })
+        .collect();
+    let chevron = render_sample(&mut f, pts)
+        .into_iter()
+        .max_by_key(|p| p[0])
+        .unwrap();
+    assert!(
+        chevron[0] > 150 && chevron[1] > 150 && chevron[2] > 150,
+        "the group collapse chevron must composite, got {chevron:?}"
     );
 }
 

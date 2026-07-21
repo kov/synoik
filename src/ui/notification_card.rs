@@ -55,6 +55,18 @@ pub const LINE_H: f64 = 18.;
 /// button's balancing margin (3) (`_message-list.scss:101,152-155`).
 const EXPAND_GAP: f64 = 9.;
 
+/// Fanned-stack geometry for a collapsed multi-notification group
+/// (`js/ui/messageList.js:26-30`): at most three cards peek, each lower card
+/// inset [`STACK_WIDTH_INSET`] per side and revealed [`STACK_HEIGHT_OFFSET`]
+/// (then divided by [`STACK_HEIGHT_REDUCTION`] each step) below the one above.
+pub const STACK_MAX_VISIBLE: usize = 3;
+pub const STACK_WIDTH_INSET: f64 = 6.;
+pub const STACK_HEIGHT_OFFSET: f64 = 10.;
+pub const STACK_HEIGHT_REDUCTION: f64 = 1.4;
+/// Extra space below an expanded group (`ADDITIONAL_BOTTOM_MARGIN_EXPANDED_GROUP`,
+/// `js/ui/messageList.js:27`).
+pub const GROUP_BOTTOM_MARGIN: f64 = 15.;
+
 /// `.message` bg, dark variant (`lighten($card_bg_color, 5%)` ≈ `#51515a`).
 const CARD_BG: [f32; 4] = [
     0x51 as f32 / 255.,
@@ -75,6 +87,23 @@ const BTN_BG: [f32; 4] = [1., 1., 1., 0.15];
 /// `.message-themed-icon` circle bg (white@7%, `_message-list.scss:176`).
 const CIRCLE_BG: [f32; 4] = [1., 1., 1., 0.07];
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
+
+/// Darkened backgrounds for the lower cards peeking under a collapsed stack:
+/// `second-in-stack` = `darken($card_bg, 1%)`, `lower-in-stack` =
+/// `darken($card_bg, 4%)` on the dark variant (`_message-list.scss:89-98`),
+/// i.e. ~6%/~9% below the normal `.message` fill.
+const STACK_SECOND_BG: [f32; 4] = [
+    0x47 as f32 / 255.,
+    0x47 as f32 / 255.,
+    0x4f as f32 / 255.,
+    1.,
+];
+const STACK_LOWER_BG: [f32; 4] = [
+    0x42 as f32 / 255.,
+    0x42 as f32 / 255.,
+    0x4a as f32 / 255.,
+    1.,
+];
 
 /// A display snapshot of one notification (plus its source header), rebuilt
 /// from the store on every content change.
@@ -126,20 +155,63 @@ pub fn content_for(store: &NotificationStore, id: u32, now: Duration) -> Option<
     Some(card_for(source, n, now))
 }
 
-/// The calendar message list's card snapshots, in the store's source order —
-/// which already carries gnome-shell's semantics: a source moves to the top
-/// only when a notification is ADDED to it (`js/ui/messageList.js:1824-1827`);
-/// a replace mutates in place and never reorders groups
-/// (`js/ui/messageTray.js:579-581`), and closes don't either. Within a source,
-/// newest first (new messages go to a group's top,
-/// `js/ui/messageList.js:1120-1123`). (Urgent-group pinning arrives with the
-/// grouped stacks slice.)
-pub fn message_list_cards(store: &NotificationStore, now: Duration) -> Vec<CardContent> {
-    store
+/// One source's notifications rendered as a group (`NotificationMessageGroup`,
+/// `js/ui/messageList.js:858-949`): a fanned card stack when it holds more than
+/// one, a plain card when it holds exactly one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardGroup {
+    /// Stable identity across snapshots, for the per-group expansion state
+    /// (source order reshuffles as notifications arrive; the key does not).
+    pub key: crate::notifications::SourceKey,
+    pub source_title: String,
+    pub source_icon: Option<NotificationIcon>,
+    /// Any notification in the group is CRITICAL — urgent groups sort first
+    /// (`js/ui/messageList.js:1815-1826`).
+    pub has_urgent: bool,
+    /// Newest-first, criticals first within the source
+    /// (`js/ui/messageList.js:1120-1123` newest-to-top, `:1078-1082` urgent-to-0).
+    pub cards: Vec<CardContent>,
+}
+
+/// The calendar message list's groups, one per source. Source order already
+/// carries gnome-shell's semantics: a source moves to the top only when a
+/// notification is ADDED (`js/ui/messageList.js:1824-1827`); a replace mutates
+/// in place and never reorders (`js/ui/messageTray.js:579-581`), nor do closes.
+/// Urgent groups are then pinned to the front, stably
+/// (`js/ui/messageList.js:1815-1832`).
+pub fn message_list_groups(store: &NotificationStore, now: Duration) -> Vec<CardGroup> {
+    let mut groups: Vec<CardGroup> = store
         .sources
         .iter()
-        .flat_map(|s| s.notifications.iter().rev().map(|n| card_for(s, n, now)))
-        .collect()
+        .map(|s| {
+            // Newest-first, then stably float criticals to the top — the net of
+            // gnome-shell's newest-to-top insert plus urgent-to-index-0 move.
+            let mut cards: Vec<CardContent> = s
+                .notifications
+                .iter()
+                .rev()
+                .map(|n| card_for(s, n, now))
+                .collect();
+            cards.sort_by_key(|c| !c.critical);
+            CardGroup {
+                key: s.key.clone(),
+                source_title: if s.title.is_empty() {
+                    "Unknown App".to_owned()
+                } else {
+                    s.title.clone()
+                },
+                source_icon: s.icon.clone(),
+                has_urgent: s
+                    .notifications
+                    .iter()
+                    .any(|n| n.urgency == Urgency::Critical),
+                cards,
+            }
+        })
+        .collect();
+    // Urgent groups first, preserving relative order (`!has_urgent`: urgent=false sorts first).
+    groups.sort_by_key(|g| !g.has_urgent);
+    groups
 }
 
 /// A card's geometry: card-relative logical rects shared by the draw and the
@@ -481,13 +553,29 @@ impl CardCache {
         self.pixels.retain(|key, _| keep(*key));
     }
 
-    fn ensure_context(&mut self, renderer: &VulkanRenderer) {
+    /// Drop textures if the renderer context changed (callers building their
+    /// own textures — e.g. the group header — must call this too).
+    pub fn ensure_context(&mut self, renderer: &VulkanRenderer) {
         let context = renderer.context_id();
         if self.context.as_ref() != Some(&context) {
             self.cards.clear();
             self.pixels.clear();
             self.context = Some(context);
         }
+    }
+
+    /// Whether a `(scale, key)` card texture is cached (for owners that draw
+    /// their own textures into the shared slot, like the group header).
+    pub fn has_card(&self, scale_key: NotNan<f64>, key: u64) -> bool {
+        self.cards.contains_key(&(scale_key, key))
+    }
+
+    pub fn insert_card(&mut self, scale_key: NotNan<f64>, key: u64, texture: VkTexture) {
+        self.cards.insert((scale_key, key), texture);
+    }
+
+    pub fn get_card(&self, scale_key: NotNan<f64>, key: u64) -> Option<VkTexture> {
+        self.cards.get(&(scale_key, key)).cloned()
     }
 }
 
@@ -675,6 +763,86 @@ pub fn card_elements(
     elements
 }
 
+/// The darkened background color for a card at `depth` in a collapsed stack:
+/// depth 1 = `second-in-stack`, depth ≥2 = `lower-in-stack`
+/// (`_message-list.scss:89-98`). Depth 0 (the top card) uses the normal fill.
+pub fn stack_bg(depth: usize) -> [f32; 4] {
+    match depth {
+        0 => CARD_BG,
+        1 => STACK_SECOND_BG,
+        _ => STACK_LOWER_BG,
+    }
+}
+
+/// A lower card peeking under a collapsed stack shows only its inset, offset
+/// bottom edge — which is card background, no content — so it renders as a
+/// cached darkened rounded rect rather than a full card. Returns the composited
+/// element (below the cards above it).
+#[allow(clippy::too_many_arguments)]
+pub fn stack_shadow_element(
+    renderer: &mut VulkanRenderer,
+    cache: &mut CardCache,
+    key: u64,
+    size: Size<f64, Logical>,
+    radius: f64,
+    bg: [f32; 4],
+    origin: Point<f64, Logical>,
+    scale: f64,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let scale_key = NotNan::new(scale).ok()?;
+    cache.ensure_context(renderer);
+    #[allow(clippy::map_entry)]
+    if !cache.cards.contains_key(&(scale_key, key)) {
+        match draw_solid_rounded(renderer, scale, size, radius, bg) {
+            Ok(texture) => {
+                cache.cards.insert((scale_key, key), texture);
+            }
+            Err(err) => {
+                warn!("error rendering a stack shadow: {err:#}");
+                return None;
+            }
+        }
+    }
+    let texture = cache.cards.get(&(scale_key, key))?.clone();
+    let buffer =
+        TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+    Some(TextureRenderElement::from_texture_buffer(
+        buffer,
+        origin,
+        1.,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
+
+/// Draw a solid rounded-rect fill into a fresh sampleable texture (the stacked
+/// cards' darkened peeks; the corners outside the radius stay transparent).
+fn draw_solid_rounded(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    size: Size<f64, Logical>,
+    radius: f64,
+    bg: [f32; 4],
+) -> anyhow::Result<VkTexture> {
+    let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+    let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
+    let full = Rectangle::from_size(phys);
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((phys.w, phys.h)),
+    )?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+        frame.render_rounded_rect(bg, (radius * scale) as f32, full, &[full])?;
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,32 +936,63 @@ mod tests {
     }
 
     #[test]
-    fn message_list_is_newest_first_across_and_within_sources() {
+    fn message_list_groups_by_source_newest_first_within() {
         let mut store = NotificationStore::default();
         let at = |s: u64| Duration::from_secs(s);
         let (a1, _) = store.notify(req("app-a", ":1.1"), true, at(1)).unwrap();
         let (b1, _) = store.notify(req("app-b", ":1.2"), true, at(2)).unwrap();
         let (a2, _) = store.notify(req("app-a", ":1.1"), true, at(3)).unwrap();
 
-        // app-a notified last (a2 at t=3), so its source leads, newest first
-        // within it; app-b follows.
-        let cards = message_list_cards(&store, at(4));
-        let ids: Vec<u32> = cards.iter().map(|c| c.id).collect();
-        assert_eq!(ids, vec![a2, a1, b1]);
-        assert!(cards.iter().all(|c| c.time_text == "Just now"));
+        // Two groups: app-a leads (it notified last), holding both of its
+        // notifications newest-first; app-b follows with one.
+        let groups = message_list_groups(&store, at(4));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].source_title, "app-a");
+        let a_ids: Vec<u32> = groups[0].cards.iter().map(|c| c.id).collect();
+        assert_eq!(a_ids, vec![a2, a1], "newest first within the group");
+        assert_eq!(
+            groups[1].cards.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![b1]
+        );
+        assert!(groups
+            .iter()
+            .flat_map(|g| &g.cards)
+            .all(|c| c.time_text == "Just now"));
 
         // A replace mutates in place and must NOT reorder the groups —
         // gnome-shell moves a group only on notification-*added*
-        // (`js/ui/messageList.js:1824-1827`, `js/ui/messageTray.js:579-581`);
-        // progress notifications replace constantly and stay put.
+        // (`js/ui/messageList.js:1824-1827`, `js/ui/messageTray.js:579-581`).
         let mut replace = req("app-b", ":1.2");
         replace.replaces_id = b1;
         replace.title = "updated".to_owned();
         store.notify(replace, true, at(5)).unwrap();
-        let ids: Vec<u32> = message_list_cards(&store, at(6))
-            .iter()
-            .map(|c| c.id)
-            .collect();
-        assert_eq!(ids, vec![a2, a1, b1], "a replace never reorders sources");
+        let regrouped = message_list_groups(&store, at(6));
+        let titles: Vec<&str> = regrouped.iter().map(|g| g.source_title.as_str()).collect();
+        assert_eq!(titles, vec!["app-a", "app-b"], "a replace never reorders");
+    }
+
+    #[test]
+    fn message_list_groups_pin_urgent_first_and_criticals_within() {
+        let mut store = NotificationStore::default();
+        let at = |s: u64| Duration::from_secs(s);
+        // A normal group, then a group that gains a critical: the critical
+        // group must sort ahead, and its critical card must lead the group.
+        store.notify(req("calm", ":1.1"), true, at(1)).unwrap();
+        let (loud1, _) = store.notify(req("loud", ":1.2"), true, at(2)).unwrap();
+        let mut crit = req("loud", ":1.2");
+        crit.urgency = Urgency::Critical;
+        let (loud_crit, _) = store.notify(crit, true, at(3)).unwrap();
+
+        let groups = message_list_groups(&store, at(4));
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].has_urgent, "the urgent group is pinned first");
+        assert_eq!(groups[0].source_title, "loud");
+        let ids: Vec<u32> = groups[0].cards.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec![loud_crit, loud1],
+            "criticals lead within the group"
+        );
+        assert!(!groups[1].has_urgent);
     }
 }

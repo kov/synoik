@@ -36,7 +36,7 @@ const POPOVER_MARGIN: f64 = 6.;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::DateMenu;
-use crate::ui::notification_card::CardContent;
+use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::quick_settings::QuickSettings;
 use crate::utils::output_size;
@@ -89,6 +89,10 @@ pub enum PopoverAction {
     /// Close this notification, reason Dismissed (a message-list card's close
     /// button). The popover stays open.
     CloseNotification(u32),
+    /// Close every notification in a group, reason Dismissed (the close button
+    /// of a COLLAPSED group's top card closes the whole group,
+    /// `js/ui/messageList.js:1106-1112,1236-1242`). The popover stays open.
+    CloseNotificationGroup(Vec<u32>),
     /// Activate this notification (a message-list card body click): with a
     /// default action, emit ActivationToken+ActionInvoked and destroy unless
     /// resident; without one, `source.open()`'s destroy-all-non-resident
@@ -246,7 +250,7 @@ impl PanelPopover {
         week_start: u8,
         show_week_numbers: bool,
         accent: [u8; 3],
-        cards: Vec<CardContent>,
+        groups: Vec<CardGroup>,
     ) -> bool {
         if self.is_showing::<CalendarTag>() {
             self.close();
@@ -260,7 +264,7 @@ impl PanelPopover {
             week_start,
             show_week_numbers,
             accent,
-            cards,
+            groups,
         )));
         self.anim = Some(self.make_anim(0., 1.));
         true
@@ -270,10 +274,10 @@ impl PanelPopover {
     /// message list tracks store changes live — WITHOUT re-acknowledging
     /// (notifications arriving while open stay unseen,
     /// `js/ui/messageList.js:1193-1199`). Returns whether it changed anything.
-    pub fn set_notifications(&mut self, cards: Vec<CardContent>) -> bool {
+    pub fn set_notifications(&mut self, groups: Vec<CardGroup>) -> bool {
         match &mut self.content {
             Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
-                dm.set_notifications(cards)
+                dm.set_notifications(groups)
             }
             _ => false,
         }

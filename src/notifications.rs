@@ -192,7 +192,7 @@ impl NotificationIcon {
 /// `desktop-entry` hint when present, else (pid, app_name) with the pid the
 /// D-Bus server resolved from the sender (GNOME's fdo proxy injects it the
 /// same way, `js/dbusServices/notifications/notificationDaemon.js:99-121`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceKey {
     DesktopEntry(String),
     PidName(u32, String),
@@ -303,6 +303,13 @@ pub struct Effects {
 impl Effects {
     pub fn is_empty(&self) -> bool {
         self.closed.is_empty() && self.banner.is_none()
+    }
+
+    /// Fold `other` into `self`, preserving [`BannerEffect::HideCurrent`]
+    /// precedence (a later `QueueChanged` must not mask it) — for callers that
+    /// batch several store mutations (e.g. closing a whole group).
+    pub fn merge(&mut self, other: Effects) {
+        merge(self, other);
     }
 }
 

@@ -31,11 +31,12 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::notifications::SourceKey;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::notification_card::{self, CardCache, CardContent, CardLayout};
+use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
 use crate::utils::to_physical_precise_round;
 
@@ -540,6 +541,19 @@ const CARD_W: f64 = LIST_W - LIST_SCROLL_R;
 const CARD_GAP: f64 = 12.;
 /// List-card radius: `$modal_radius + 2px` (`_message-list.scss:39`).
 const CARD_RADIUS: f64 = 18.;
+/// `.message-group-header` padding (`_message-list.scss:61`).
+const GROUP_HEADER_PAD: f64 = 6.;
+/// The group title `%title_2` (15pt/800; the rasterizer caps at bold, like the
+/// today date label) (`_common.scss:251-254`, `_message-list.scss:62-65`).
+const GROUP_TITLE_PX: f64 = crate::ui::pt_to_px(15.);
+/// `.message-group-title` side margin (`$base_margin`, `_message-list.scss:64`).
+const GROUP_TITLE_MARGIN: f64 = 4.;
+/// The header's collapse button (`.message-collapse-button`, `group-collapse-symbolic`):
+/// a small icon-button, white@20% bg (`_message-list.scss:69-77`).
+const GROUP_COLLAPSE_D: f64 = 24.;
+const GROUP_COLLAPSE_BG: [f32; 4] = [1., 1., 1., 0.2];
+/// Header block height: padding + the button row + padding.
+const GROUP_HEADER_H: f64 = GROUP_HEADER_PAD + GROUP_COLLAPSE_D + GROUP_HEADER_PAD;
 /// `.message-list-controls` padding: 12px sides/top, 9px bottom
 /// (`_message-list.scss:44-47`).
 const CONTROLS_PAD: f64 = 12.;
@@ -582,61 +596,147 @@ pub enum ListHit {
     /// body click — the list card is a click-through to
     /// `notification.activate()`, `js/ui/messageList.js:730-732`).
     Body { id: u32, has_default: bool },
+    /// A click anywhere on a collapsed multi-notification stack: expand the
+    /// group into a vertical list (`js/ui/messageList.js:1113-1118`).
+    ExpandGroup(SourceKey),
+    /// The expanded group's header collapse button: fan it back into a stack
+    /// (`js/ui/messageList.js:934,1809-1814`).
+    CollapseGroup,
+    /// The close button of a COLLAPSED group's top card: closes the WHOLE group
+    /// (`js/ui/messageList.js:1106-1112`, `close()` :1236-1242).
+    CloseGroup(Vec<u32>),
     /// The Clear pill: close everything.
     Clear,
 }
 
+/// A peeking lower card in a collapsed stack: `(origin, size, darkened bg)`.
+type StackPeek = (Point<f64, Logical>, Size<f64, Logical>, [f32; 4]);
+/// A visible group for introspection: `(source key, popover-local bounds, expanded?)`.
+type GroupRect = (SourceKey, Rectangle<f64, Logical>, bool);
+
+/// A group laid out in the visible list: the y-flow is computed once and
+/// shared by the hit-test, the render, and the test hooks.
+struct GroupLayout {
+    /// Index into [`CalendarMessageList::groups`].
+    group: usize,
+    /// The group's total popover-local bounds (for the coarse hit-test).
+    bounds: Rectangle<f64, Logical>,
+    kind: GroupKind,
+}
+
+enum GroupKind {
+    /// A single plain card — a one-notification group, laid out and hit-tested
+    /// exactly like a flat card (`js/ui/messageList.js:951-954`).
+    Single {
+        origin: Point<f64, Logical>,
+        layout: CardLayout,
+    },
+    /// A collapsed fanned stack: the interactive top card over darkened peeks
+    /// (`js/ui/messageList.js:1370-1404`).
+    Collapsed {
+        origin: Point<f64, Logical>,
+        top: CardLayout,
+        /// Back-to-front: `(origin, size, bg)` of each peeking lower card.
+        peeks: Vec<StackPeek>,
+        /// Every notification id in the group (a collapsed close closes them all).
+        ids: Vec<u32>,
+    },
+    /// An expanded group: a header (title + collapse button) over each card
+    /// laid out full-height (`js/ui/messageList.js:971-985,1276-1294`).
+    Expanded {
+        header: Rectangle<f64, Logical>,
+        collapse: Rectangle<f64, Logical>,
+        title: String,
+        /// `(card index within the group, origin, layout)`.
+        cards: Vec<(usize, Point<f64, Logical>, CardLayout)>,
+    },
+}
+
 /// The message-list column of the calendar popover: a plain-data snapshot of
-/// the notification store, rendered as flat cards newest-first.
+/// the notification store, grouped per source (`NotificationMessageGroup`).
+/// One-notification groups render as plain cards; larger ones fan into a
+/// collapsed stack that expands into a vertical list on click.
 pub struct CalendarMessageList {
-    cards: Vec<CardContent>,
-    /// Notification ids whose cards are expanded (caret-toggled). Kept across
-    /// snapshot pushes, dropped with the popover (GNOME's long-lived list
-    /// widgets persist expansion across opens — recorded divergence).
-    expanded: HashSet<u32>,
-    /// Bumped whenever the snapshot changes, to invalidate cached card
-    /// textures (cache keys carry the revision in their high 32 bits).
+    groups: Vec<CardGroup>,
+    /// Notification ids whose card BODY is expanded (the header caret). Kept
+    /// across snapshot pushes, dropped with the popover (recorded divergence).
+    body_expanded: HashSet<u32>,
+    /// The one group fanned open into a vertical list, keyed by its source
+    /// (`js/ui/messageList._expandedGroup` — a single group at a time,
+    /// `:1870-1897`). Retained across snapshot pushes while the source lives.
+    group_expanded: Option<SourceKey>,
+    /// Bumped whenever the snapshot changes, to invalidate cached textures
+    /// (cache keys carry the revision in their high 32 bits).
     revision: u64,
     cache: RefCell<CardCache>,
 }
 
 impl CalendarMessageList {
-    pub fn new(cards: Vec<CardContent>) -> Self {
+    pub fn new(groups: Vec<CardGroup>) -> Self {
         Self {
-            cards,
-            expanded: HashSet::new(),
+            groups,
+            body_expanded: HashSet::new(),
+            group_expanded: None,
             revision: 0,
             cache: RefCell::new(CardCache::new()),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cards.is_empty()
+        self.groups.is_empty()
     }
 
+    /// Total notification count across every group.
     pub fn len(&self) -> usize {
-        self.cards.len()
+        self.groups.iter().map(|g| g.cards.len()).sum()
     }
 
-    /// Replace the snapshot (a store change pushed while the popover is
-    /// open). Returns whether anything changed.
-    pub fn set_cards(&mut self, cards: Vec<CardContent>) -> bool {
-        if self.cards == cards {
+    /// Replace the snapshot (a store change pushed while the popover is open).
+    /// Returns whether anything changed.
+    pub fn set_groups(&mut self, groups: Vec<CardGroup>) -> bool {
+        if self.groups == groups {
             return false;
         }
-        self.cards = cards;
-        self.expanded
-            .retain(|id| self.cards.iter().any(|c| c.id == *id));
+        self.groups = groups;
+        // Drop expansion state for ids/sources that are gone.
+        let live: HashSet<u32> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.cards.iter().map(|c| c.id))
+            .collect();
+        self.body_expanded.retain(|id| live.contains(id));
+        if let Some(key) = &self.group_expanded {
+            if !self.groups.iter().any(|g| &g.key == key) {
+                self.group_expanded = None;
+            }
+        }
         self.revision += 1;
         true
     }
 
-    /// Toggle a card's expansion (its caret was clicked).
-    fn toggle_expanded(&mut self, id: u32) {
-        if !self.expanded.remove(&id) {
-            self.expanded.insert(id);
+    /// Toggle a card's body expansion (its caret was clicked).
+    fn toggle_body_expanded(&mut self, id: u32) {
+        if !self.body_expanded.remove(&id) {
+            self.body_expanded.insert(id);
         }
         self.revision += 1;
+    }
+
+    /// Expand `key`'s stack (collapsing any other), or collapse it if it is
+    /// already the expanded group (`js/ui/messageList.js:1809-1814`).
+    fn toggle_group(&mut self, key: SourceKey) {
+        self.group_expanded = if self.group_expanded.as_ref() == Some(&key) {
+            None
+        } else {
+            Some(key)
+        };
+        self.revision += 1;
+    }
+
+    fn collapse_group(&mut self) {
+        if self.group_expanded.take().is_some() {
+            self.revision += 1;
+        }
     }
 
     /// Height of the bottom controls row (the Clear pill), when shown.
@@ -648,44 +748,153 @@ impl CalendarMessageList {
         }
     }
 
-    /// The cards that fully fit above the controls row, with their popover-
-    /// local origins. Overflowing cards are dropped — the list doesn't scroll
-    /// yet (recorded divergence; gnome-shell scrolls) — and for the same
-    /// reason an expanded card's line budget is clamped to the space left
-    /// below it. When even the minimum expanded layout (one body line + the
-    /// action row) doesn't fit, the card renders collapsed instead of
-    /// vanishing with no caret left to un-toggle it.
-    fn visible_cards(&self, height: f64) -> Vec<(usize, Point<f64, Logical>, CardLayout)> {
+    /// One card's layout, body-caret-aware and clamped to `avail` (the space
+    /// from the card's top to the controls row). The no-scroll clamp shrinks an
+    /// expanded body to what fits and falls back to the collapsed layout when
+    /// even one line + the action row cannot (never vanishing with no caret to
+    /// un-toggle it — recorded divergence; gnome-shell scrolls). `caret`
+    /// reserves the header expand slot (false on a collapsed stack's top card,
+    /// where the whole stack is the click target).
+    fn card_layout(&self, content: &CardContent, avail: f64, caret: bool) -> CardLayout {
         use notification_card::{BODY_ICON, BTN_H, HEADER_H, LINE_H, PAD};
 
-        let mut out = Vec::new();
-        let bottom = height - self.controls_h();
-        let mut y = LIST_PAD;
-        for (i, content) in self.cards.iter().enumerate() {
-            let mut layout = if self.expanded.contains(&content.id) {
-                // Collapsed card height + the action row it will reveal.
-                let base = PAD + HEADER_H + PAD + BODY_ICON + PAD;
-                let actions_h = if content.actions.is_empty() {
-                    0.
-                } else {
-                    BTN_H + PAD
-                };
-                let extra = (((bottom - y) - base - actions_h) / LINE_H).floor().max(0.);
-                notification_card::layout_clamped(content, CARD_W, true, true, 1 + extra as usize)
+        if caret && self.body_expanded.contains(&content.id) {
+            let base = PAD + HEADER_H + PAD + BODY_ICON + PAD;
+            let actions_h = if content.actions.is_empty() {
+                0.
             } else {
-                notification_card::layout(content, CARD_W, false, true)
+                BTN_H + PAD
             };
-            if layout.expanded && y + layout.size.h > bottom {
-                // The clamp floors at one line, but the action row can still
-                // overflow a tight slot — fall back to the collapsed layout.
-                layout = notification_card::layout(content, CARD_W, false, true);
+            let extra = ((avail - base - actions_h) / LINE_H).floor().max(0.);
+            let layout =
+                notification_card::layout_clamped(content, CARD_W, true, true, 1 + extra as usize);
+            if layout.size.h <= avail {
+                return layout;
             }
-            if y + layout.size.h > bottom {
-                break;
+            // Even the clamped expansion overflows — fall back to collapsed.
+        }
+        notification_card::layout(content, CARD_W, false, caret)
+    }
+
+    /// Collapsed-stack geometry for a group with >1 card: the top card layout,
+    /// the peeking lower cards' rects (back-to-front), and the total stack
+    /// height (`js/ui/messageList.js:1314-1350,1370-1404`).
+    fn stack_geometry(
+        &self,
+        group: &CardGroup,
+        origin: Point<f64, Logical>,
+    ) -> (CardLayout, Vec<StackPeek>, f64) {
+        use notification_card::{
+            stack_bg, STACK_HEIGHT_OFFSET, STACK_HEIGHT_REDUCTION, STACK_MAX_VISIBLE,
+            STACK_WIDTH_INSET,
+        };
+        // The top card carries no caret: the whole stack is one click target.
+        let top = notification_card::layout(&group.cards[0], CARD_W, false, false);
+        let top_h = top.size.h;
+        let visible = group.cards.len().min(STACK_MAX_VISIBLE);
+        let mut peeks = Vec::new();
+        let mut cumulative = 0.;
+        let mut offset = STACK_HEIGHT_OFFSET;
+        for depth in 1..visible {
+            cumulative += offset;
+            offset /= STACK_HEIGHT_REDUCTION;
+            let inset = STACK_WIDTH_INSET * depth as f64;
+            peeks.push((
+                Point::from((origin.x + inset, origin.y + cumulative)),
+                Size::from((CARD_W - 2. * inset, top_h)),
+                stack_bg(depth),
+            ));
+        }
+        // Deepest peek drawn first (backmost).
+        peeks.reverse();
+        (top, peeks, top_h + cumulative)
+    }
+
+    /// Lay out every group in y-flow order, dropping overflow (no scroll —
+    /// recorded divergence; gnome-shell scrolls).
+    fn layout(&self, height: f64) -> Vec<GroupLayout> {
+        let bottom = height - self.controls_h();
+        let mut out = Vec::new();
+        let mut y = LIST_PAD;
+        for (g, group) in self.groups.iter().enumerate() {
+            let expanded = self.group_expanded.as_ref() == Some(&group.key);
+            if group.cards.len() <= 1 {
+                let origin = Point::from((LIST_PAD, y));
+                let layout = self.card_layout(&group.cards[0], bottom - y, true);
+                if y + layout.size.h > bottom {
+                    break;
+                }
+                let h = layout.size.h;
+                out.push(GroupLayout {
+                    group: g,
+                    bounds: Rectangle::new(origin, layout.size),
+                    kind: GroupKind::Single { origin, layout },
+                });
+                y += h + CARD_GAP;
+            } else if expanded {
+                if y + GROUP_HEADER_H > bottom {
+                    break;
+                }
+                let header = Rectangle::new(
+                    Point::from((LIST_PAD, y)),
+                    Size::from((CARD_W, GROUP_HEADER_H)),
+                );
+                let collapse = Rectangle::new(
+                    Point::from((
+                        LIST_PAD + CARD_W - GROUP_HEADER_PAD - GROUP_COLLAPSE_D,
+                        y + (GROUP_HEADER_H - GROUP_COLLAPSE_D) / 2.,
+                    )),
+                    Size::from((GROUP_COLLAPSE_D, GROUP_COLLAPSE_D)),
+                );
+                let mut cy = y + GROUP_HEADER_H;
+                let mut cards = Vec::new();
+                for (ci, content) in group.cards.iter().enumerate() {
+                    let layout = self.card_layout(content, bottom - cy, true);
+                    if cy + layout.size.h > bottom {
+                        break; // drop overflow (no scroll)
+                    }
+                    let h = layout.size.h;
+                    cards.push((ci, Point::from((LIST_PAD, cy)), layout));
+                    cy += h + CARD_GAP;
+                }
+                let group_bottom = cards
+                    .last()
+                    .map_or(cy, |(_, o, l)| o.y + l.size.h)
+                    .max(header.loc.y + GROUP_HEADER_H);
+                out.push(GroupLayout {
+                    group: g,
+                    bounds: Rectangle::new(
+                        Point::from((LIST_PAD, y)),
+                        Size::from((CARD_W, group_bottom - y)),
+                    ),
+                    kind: GroupKind::Expanded {
+                        header,
+                        collapse,
+                        title: group.source_title.clone(),
+                        cards,
+                    },
+                });
+                // The card margin plus an expanded group's extra bottom margin.
+                y = group_bottom + CARD_GAP + notification_card::GROUP_BOTTOM_MARGIN;
+            } else {
+                let origin = Point::from((LIST_PAD, y));
+                let (top, peeks, stack_h) = self.stack_geometry(group, origin);
+                if y + stack_h > bottom {
+                    break;
+                }
+                let ids = group.cards.iter().map(|c| c.id).collect();
+                out.push(GroupLayout {
+                    group: g,
+                    bounds: Rectangle::new(origin, Size::from((CARD_W, stack_h))),
+                    kind: GroupKind::Collapsed {
+                        origin,
+                        top,
+                        peeks,
+                        ids,
+                    },
+                });
+                y += stack_h + CARD_GAP;
             }
-            let h = layout.size.h;
-            out.push((i, Point::from((LIST_PAD, y)), layout));
-            y += h + CARD_GAP;
         }
         out
     }
@@ -699,39 +908,70 @@ impl CalendarMessageList {
         )
     }
 
+    /// Resolve a card click at card-local `local` against `layout` for the
+    /// notification `content` — the shared per-card interaction (close, caret,
+    /// action, body).
+    fn card_hit(local: Point<f64, Logical>, content: &CardContent, layout: &CardLayout) -> ListHit {
+        if layout.close.contains(local) {
+            return ListHit::Close(content.id);
+        }
+        if layout
+            .expand
+            .filter(|_| layout.can_expand)
+            .is_some_and(|e| e.contains(local))
+        {
+            return ListHit::ToggleExpand(content.id);
+        }
+        for (idx, rect) in layout.actions.iter().enumerate() {
+            if rect.contains(local) {
+                return ListHit::Action {
+                    id: content.id,
+                    key: content.actions[idx].0.clone(),
+                };
+            }
+        }
+        ListHit::Body {
+            id: content.id,
+            has_default: content.has_default_action,
+        }
+    }
+
     /// Hit-test a click at popover-local `pos` inside the list column.
     fn hit(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHit> {
-        for (i, origin, layout) in self.visible_cards(height) {
-            let rect = Rectangle::new(origin, layout.size);
-            if !rect.contains(pos) {
+        for gl in self.layout(height) {
+            if !gl.bounds.contains(pos) {
                 continue;
             }
-            let local = pos - origin;
-            let content = &self.cards[i];
-            if layout.close.contains(local) {
-                return Some(ListHit::Close(content.id));
-            }
-            // The caret only hits while live (GNOME technically keeps its
-            // opacity-0 button reactive; we don't follow that quirk).
-            if layout
-                .expand
-                .filter(|_| layout.can_expand)
-                .is_some_and(|e| e.contains(local))
-            {
-                return Some(ListHit::ToggleExpand(content.id));
-            }
-            for (idx, rect) in layout.actions.iter().enumerate() {
-                if rect.contains(local) {
-                    return Some(ListHit::Action {
-                        id: content.id,
-                        key: content.actions[idx].0.clone(),
-                    });
+            let group = &self.groups[gl.group];
+            match &gl.kind {
+                GroupKind::Single { origin, layout } => {
+                    return Some(Self::card_hit(pos - *origin, &group.cards[0], layout));
+                }
+                GroupKind::Collapsed {
+                    origin, top, ids, ..
+                } => {
+                    // The top card's close closes the whole group; anything
+                    // else on the stack expands it.
+                    if top.close.contains(pos - *origin) {
+                        return Some(ListHit::CloseGroup(ids.clone()));
+                    }
+                    return Some(ListHit::ExpandGroup(group.key.clone()));
+                }
+                GroupKind::Expanded {
+                    collapse, cards, ..
+                } => {
+                    if collapse.contains(pos) {
+                        return Some(ListHit::CollapseGroup);
+                    }
+                    for (ci, origin, layout) in cards {
+                        if Rectangle::new(*origin, layout.size).contains(pos) {
+                            return Some(Self::card_hit(pos - *origin, &group.cards[*ci], layout));
+                        }
+                    }
+                    // Header or inter-card gap: consumed, popover stays open.
+                    return None;
                 }
             }
-            return Some(ListHit::Body {
-                id: content.id,
-                has_default: content.has_default_action,
-            });
         }
         if !self.is_empty() && self.clear_rect(height).contains(pos) {
             return Some(ListHit::Clear);
@@ -739,8 +979,7 @@ impl CalendarMessageList {
         None
     }
 
-    /// The card render elements (textures + icons), popover-relative to
-    /// `origin`.
+    /// The render elements (textures + icons), popover-relative to `origin`.
     fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -753,22 +992,298 @@ impl CalendarMessageList {
         let mut cache = self.cache.borrow_mut();
         let rev = self.revision & 0xffff_ffff;
         cache.retain(|key| key >> 32 == rev);
-        for (i, card_origin, layout) in self.visible_cards(height) {
-            let key = (rev << 32) | i as u64;
-            elements.extend(notification_card::card_elements(
+        // A monotonic per-render key (top 32 bits = revision) so every texture
+        // (cards, peeks, headers) gets a distinct, revision-scoped cache slot.
+        let mut next = 0u64;
+        let mut key = || {
+            let k = (rev << 32) | next;
+            next += 1;
+            k
+        };
+        for gl in self.layout(height) {
+            let group = &self.groups[gl.group];
+            match gl.kind {
+                GroupKind::Single { origin: o, layout } => {
+                    elements.extend(notification_card::card_elements(
+                        renderer,
+                        icons,
+                        &mut cache,
+                        key(),
+                        &group.cards[0],
+                        &layout,
+                        CARD_RADIUS,
+                        origin + o,
+                        1.,
+                        scale,
+                    ));
+                }
+                GroupKind::Collapsed {
+                    origin: o,
+                    top,
+                    peeks,
+                    ..
+                } => {
+                    // Top card on top, then the darkened peeks below it.
+                    elements.extend(notification_card::card_elements(
+                        renderer,
+                        icons,
+                        &mut cache,
+                        key(),
+                        &group.cards[0],
+                        &top,
+                        CARD_RADIUS,
+                        origin + o,
+                        1.,
+                        scale,
+                    ));
+                    for (peek_o, size, bg) in peeks {
+                        if let Some(elem) = notification_card::stack_shadow_element(
+                            renderer,
+                            &mut cache,
+                            key(),
+                            size,
+                            CARD_RADIUS,
+                            bg,
+                            origin + peek_o,
+                            scale,
+                        ) {
+                            elements.push(elem);
+                        }
+                    }
+                }
+                GroupKind::Expanded {
+                    header,
+                    collapse,
+                    title,
+                    cards,
+                } => {
+                    elements.extend(self.header_elements(
+                        renderer,
+                        icons,
+                        &mut cache,
+                        key(),
+                        &title,
+                        header,
+                        collapse,
+                        origin,
+                        scale,
+                    ));
+                    for (ci, card_o, layout) in cards {
+                        elements.extend(notification_card::card_elements(
+                            renderer,
+                            icons,
+                            &mut cache,
+                            key(),
+                            &group.cards[ci],
+                            &layout,
+                            CARD_RADIUS,
+                            origin + card_o,
+                            1.,
+                            scale,
+                        ));
+                    }
+                }
+            }
+        }
+        elements
+    }
+
+    /// The expanded group's header: the title glyphs + collapse-button circle
+    /// (one cached texture), with the `group-collapse-symbolic` chevron
+    /// composited on top.
+    #[allow(clippy::too_many_arguments)]
+    fn header_elements(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        cache: &mut CardCache,
+        key: u64,
+        title: &str,
+        header: Rectangle<f64, Logical>,
+        collapse: Rectangle<f64, Logical>,
+        origin: Point<f64, Logical>,
+        scale: f64,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        use notification_card::SMALL_ICON;
+
+        let mut elements = Vec::new();
+        let Ok(scale_key) = NotNan::new(scale) else {
+            return elements;
+        };
+        cache.ensure_context(renderer);
+        // The collapse chevron, composited over the header texture.
+        let icon_center = origin
+            + Point::from((
+                collapse.loc.x + collapse.size.w / 2.,
+                collapse.loc.y + collapse.size.h / 2.,
+            ));
+        if let Some(buffer) = icons.buffer("group-collapse-symbolic", SMALL_ICON, scale, TEXT) {
+            if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                let logical = tb.logical_size();
+                let loc = icon_center - Point::from((logical.w / 2., logical.h / 2.));
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    tb,
+                    loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+        }
+        // The header texture (title + button circle) below the chevron.
+        if !cache.has_card(scale_key, key) {
+            match self.draw_group_header(renderer, scale, title, &collapse, header.loc) {
+                Ok(texture) => cache.insert_card(scale_key, key, texture),
+                Err(err) => tracing::error!("error drawing a group header: {err:#}"),
+            }
+        }
+        if let Some(texture) = cache.get_card(scale_key, key) {
+            let buffer = TextureBuffer::from_texture(
                 renderer,
-                icons,
-                &mut cache,
-                key,
-                &self.cards[i],
-                &layout,
-                CARD_RADIUS,
-                origin + card_origin,
-                1.,
+                texture,
                 scale,
+                Transform::Normal,
+                Vec::new(),
+            );
+            elements.push(TextureRenderElement::from_texture_buffer(
+                buffer,
+                origin + header.loc,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
             ));
         }
         elements
+    }
+
+    /// Draw the expanded group's header into a texture: the bold title, and the
+    /// collapse button's white@20% circle (the chevron composites on top).
+    fn draw_group_header(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        title: &str,
+        collapse: &Rectangle<f64, Logical>,
+        header_origin: Point<f64, Logical>,
+        // header rect is `(CARD_W, GROUP_HEADER_H)` at `header_origin`.
+    ) -> anyhow::Result<VkTexture> {
+        let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+        let phys = Size::<i32, Physical>::from((px(CARD_W).max(1), px(GROUP_HEADER_H).max(1)));
+        let full = Rectangle::from_size(phys);
+        let title_run =
+            renderer.build_glyph_run_weighted(title, (GROUP_TITLE_PX * scale) as f32, true)?;
+
+        let mut target = renderer.create_buffer(
+            Fourcc::Abgr8888,
+            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
+        )?;
+        {
+            let mut fb = renderer.bind(&mut target)?;
+            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+
+            // The collapse button circle (header-local coordinates).
+            let btn = Rectangle::new(
+                Point::<i32, Physical>::from((
+                    px(collapse.loc.x - header_origin.x),
+                    px(collapse.loc.y - header_origin.y),
+                )),
+                Size::<i32, Physical>::from((px(collapse.size.w), px(collapse.size.h))),
+            );
+            frame.render_rounded_rect(
+                GROUP_COLLAPSE_BG,
+                (GROUP_COLLAPSE_D / 2. * scale) as f32,
+                btn,
+                &[full],
+            )?;
+
+            // The title, left-aligned at the header padding + title margin,
+            // vertically centered.
+            let (ix, iy, _iw, ih) = title_run.ink_bounds();
+            let tx = px(GROUP_HEADER_PAD + GROUP_TITLE_MARGIN) - ix;
+            let ty = (phys.h - ih) / 2 - iy;
+            frame.render_glyphs(
+                &title_run,
+                Point::<i32, Physical>::from((tx, ty)),
+                TEXT,
+                full,
+                &[full],
+            )?;
+
+            let _sync = frame.finish()?;
+        }
+        renderer.make_offscreen_sampleable(&target)?;
+        Ok(target)
+    }
+
+    /// The visible per-card interactions: single-card groups and every card of
+    /// an EXPANDED group (a collapsed stack's top card is not here — its close
+    /// closes the whole group, so it goes through the group hooks instead).
+    /// `(id, popover-local origin, layout)`.
+    fn visible_interactive_cards(
+        &self,
+        height: f64,
+    ) -> Vec<(u32, Point<f64, Logical>, CardLayout)> {
+        let mut out = Vec::new();
+        for gl in self.layout(height) {
+            let group = &self.groups[gl.group];
+            match gl.kind {
+                GroupKind::Single { origin, layout } => {
+                    out.push((group.cards[0].id, origin, layout));
+                }
+                GroupKind::Expanded { cards, .. } => {
+                    for (ci, origin, layout) in cards {
+                        out.push((group.cards[ci].id, origin, layout));
+                    }
+                }
+                GroupKind::Collapsed { .. } => {}
+            }
+        }
+        out
+    }
+
+    /// Visible groups as `(source key, popover-local bounds, expanded?)` — the
+    /// test/introspection view of the grouping.
+    fn visible_groups(&self, height: f64) -> Vec<GroupRect> {
+        self.layout(height)
+            .into_iter()
+            .map(|gl| {
+                let key = self.groups[gl.group].key.clone();
+                let expanded = matches!(gl.kind, GroupKind::Expanded { .. });
+                (key, gl.bounds, expanded)
+            })
+            .collect()
+    }
+
+    /// A collapsed stack's top-card close button, popover-local (`None` unless
+    /// that group is a visible collapsed stack).
+    fn stack_close_rect(&self, key: &SourceKey, height: f64) -> Option<Rectangle<f64, Logical>> {
+        self.layout(height).into_iter().find_map(|gl| {
+            if &self.groups[gl.group].key != key {
+                return None;
+            }
+            match gl.kind {
+                GroupKind::Collapsed { origin, top, .. } => {
+                    Some(Rectangle::new(origin + top.close.loc, top.close.size))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// An expanded group's collapse button, popover-local.
+    fn group_collapse_rect(&self, key: &SourceKey, height: f64) -> Option<Rectangle<f64, Logical>> {
+        self.layout(height).into_iter().find_map(|gl| {
+            if &self.groups[gl.group].key != key {
+                return None;
+            }
+            match gl.kind {
+                GroupKind::Expanded { collapse, .. } => Some(collapse),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -792,11 +1307,11 @@ impl DateMenu {
         week_start: u8,
         show_week_numbers: bool,
         accent: [u8; 3],
-        cards: Vec<CardContent>,
+        groups: Vec<CardGroup>,
     ) -> Self {
         Self {
             calendar: Calendar::new(week_start, show_week_numbers, accent),
-            list: CalendarMessageList::new(cards),
+            list: CalendarMessageList::new(groups),
             bg_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -814,8 +1329,8 @@ impl DateMenu {
     }
 
     /// Push a fresh store snapshot into the list. Returns whether it changed.
-    pub fn set_notifications(&mut self, cards: Vec<CardContent>) -> bool {
-        self.list.set_cards(cards)
+    pub fn set_notifications(&mut self, groups: Vec<CardGroup>) -> bool {
+        self.list.set_groups(groups)
     }
 
     /// Route a click at content-local `pos`: list hits map to notification
@@ -827,8 +1342,8 @@ impl DateMenu {
             return match self.list.hit(pos, size.h) {
                 Some(ListHit::Close(id)) => PopoverAction::CloseNotification(id),
                 Some(ListHit::ToggleExpand(id)) => {
-                    // Pure UI state: expand/collapse in place, popover open.
-                    self.list.toggle_expanded(id);
+                    // Pure UI state: expand/collapse the body in place.
+                    self.list.toggle_body_expanded(id);
                     PopoverAction::Consumed
                 }
                 Some(ListHit::Action { id, key }) => {
@@ -837,6 +1352,16 @@ impl DateMenu {
                 Some(ListHit::Body { id, has_default }) => {
                     PopoverAction::ActivateNotification { id, has_default }
                 }
+                Some(ListHit::ExpandGroup(key)) => {
+                    // Fan the stack open (pure UI state, popover stays).
+                    self.list.toggle_group(key);
+                    PopoverAction::Consumed
+                }
+                Some(ListHit::CollapseGroup) => {
+                    self.list.collapse_group();
+                    PopoverAction::Consumed
+                }
+                Some(ListHit::CloseGroup(ids)) => PopoverAction::CloseNotificationGroup(ids),
                 Some(ListHit::Clear) => PopoverAction::ClearNotifications,
                 None => PopoverAction::Consumed,
             };
@@ -846,21 +1371,32 @@ impl DateMenu {
         PopoverAction::Consumed
     }
 
-    /// Test hooks: the visible cards' popover-local rects, and the Clear pill.
+    /// Test hooks: the visible per-card interactive rects (single-card groups +
+    /// expanded-group cards), and the Clear pill.
     pub fn card_rects(&self) -> Vec<CardRects> {
         let h = self.logical_size().h;
         self.list
-            .visible_cards(h)
+            .visible_interactive_cards(h)
             .into_iter()
-            .map(|(i, origin, layout)| {
+            .map(|(id, origin, layout)| {
                 let close = Rectangle::new(origin + layout.close.loc, layout.close.size);
-                (
-                    self.list.cards[i].id,
-                    Rectangle::new(origin, layout.size),
-                    close,
-                )
+                (id, Rectangle::new(origin, layout.size), close)
             })
             .collect()
+    }
+
+    /// Test hooks: the visible groups `(key, bounds, expanded)`, a collapsed
+    /// stack's top-card close, and an expanded group's collapse button.
+    pub fn group_rects(&self) -> Vec<GroupRect> {
+        self.list.visible_groups(self.logical_size().h)
+    }
+
+    pub fn stack_close_rect(&self, key: &SourceKey) -> Option<Rectangle<f64, Logical>> {
+        self.list.stack_close_rect(key, self.logical_size().h)
+    }
+
+    pub fn group_collapse_rect(&self, key: &SourceKey) -> Option<Rectangle<f64, Logical>> {
+        self.list.group_collapse_rect(key, self.logical_size().h)
     }
 
     pub fn clear_pill_rect(&self) -> Option<Rectangle<f64, Logical>> {
@@ -872,9 +1408,9 @@ impl DateMenu {
     pub fn card_expand_rect(&self, id: u32) -> Option<Rectangle<f64, Logical>> {
         let h = self.logical_size().h;
         self.list
-            .visible_cards(h)
+            .visible_interactive_cards(h)
             .into_iter()
-            .find(|(i, _, _)| self.list.cards[*i].id == id)
+            .find(|(cid, _, _)| *cid == id)
             .and_then(|(_, origin, layout)| {
                 layout
                     .expand
@@ -888,9 +1424,9 @@ impl DateMenu {
     pub fn card_action_rects(&self, id: u32) -> Vec<Rectangle<f64, Logical>> {
         let h = self.logical_size().h;
         self.list
-            .visible_cards(h)
+            .visible_interactive_cards(h)
             .into_iter()
-            .find(|(i, _, _)| self.list.cards[*i].id == id)
+            .find(|(cid, _, _)| *cid == id)
             .map(|(_, origin, layout)| {
                 layout
                     .actions
@@ -1575,6 +2111,29 @@ mod tests {
         Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
     }
 
+    /// A one-notification group (renders as a plain card), keyed distinctly by
+    /// the card id so each is its own source.
+    fn single_group(card: CardContent) -> CardGroup {
+        CardGroup {
+            key: SourceKey::PidName(card.id, "App".to_owned()),
+            source_title: card.source_title.clone(),
+            source_icon: card.source_icon.clone(),
+            has_urgent: card.critical,
+            cards: vec![card],
+        }
+    }
+
+    /// A multi-notification group under one source (a fanned stack).
+    fn multi_group(pid: u32, cards: Vec<CardContent>) -> CardGroup {
+        CardGroup {
+            key: SourceKey::PidName(pid, "App".to_owned()),
+            source_title: "App".to_owned(),
+            source_icon: None,
+            has_urgent: cards.iter().any(|c| c.critical),
+            cards,
+        }
+    }
+
     /// The no-scroll expansion clamp: an expanded card's line budget shrinks
     /// to the space left above the controls; when even the one-line-plus-
     /// actions minimum (124px) doesn't fit, the card falls back to its
@@ -1584,12 +2143,12 @@ mod tests {
         let mut card = sample_card(1);
         card.body = "word ".repeat(120).trim_end().to_owned();
         card.actions = vec![("ok".to_owned(), "OK".to_owned())];
-        let mut list = CalendarMessageList::new(vec![card]);
-        list.toggle_expanded(1);
+        let mut list = CalendarMessageList::new(vec![single_group(card)]);
+        list.toggle_body_expanded(1);
 
         // Controls row = 49px; card starts at y=6. Plenty of room: expanded,
         // budget-clamped to the space (height 200 → 145 free → 2 lines).
-        let visible = list.visible_cards(200.);
+        let visible = list.visible_interactive_cards(200.);
         assert_eq!(visible.len(), 1);
         assert!(visible[0].2.expanded);
         assert_eq!(visible[0].2.size.h, 90. + 18. + 28. + 6.);
@@ -1597,7 +2156,7 @@ mod tests {
         // Tight slot (height 150 → 95 free): the minimum expanded layout
         // (124) can't fit, the collapsed one (90) can — fall back, stay
         // visible.
-        let visible = list.visible_cards(150.);
+        let visible = list.visible_interactive_cards(150.);
         assert_eq!(visible.len(), 1);
         assert!(!visible[0].2.expanded, "falls back to the collapsed layout");
         assert_eq!(visible[0].2.size.h, 90.);
@@ -1608,7 +2167,7 @@ mod tests {
         // The message-list column comes FIRST (left in LTR), the calendar
         // second (`js/ui/dateMenu.js:917-940`); the popover keeps the
         // calendar's height.
-        let dm = DateMenu::new(0, false, [0, 0, 0], vec![sample_card(1)]);
+        let dm = DateMenu::new(0, false, [0, 0, 0], vec![single_group(sample_card(1))]);
         let cal = dm.calendar.logical_size();
         let size = dm.logical_size();
         assert_eq!(size.w, calendar_col_x() + cal.w);
@@ -1621,7 +2180,12 @@ mod tests {
 
     #[test]
     fn date_menu_routes_clicks_to_list_and_calendar() {
-        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![sample_card(1), sample_card(2)]);
+        let mut dm = DateMenu::new(
+            0,
+            false,
+            [0, 0, 0],
+            vec![single_group(sample_card(1)), single_group(sample_card(2))],
+        );
 
         // A calendar-column click still works through the composition: the
         // next-month pager is at the calendar's own coordinates shifted by
@@ -1658,7 +2222,7 @@ mod tests {
         );
         let mut with_default = sample_card(3);
         with_default.has_default_action = true;
-        assert!(dm.set_notifications(vec![with_default]));
+        assert!(dm.set_notifications(vec![single_group(with_default)]));
         let (_, card, _) = dm.card_rects()[0];
         assert_eq!(
             dm.pointer_click(Point::from((
@@ -1693,21 +2257,21 @@ mod tests {
             "the Clear pill hides with the placeholder"
         );
         assert!(!dm.set_notifications(Vec::new()), "no change, no redraw");
-        assert!(dm.set_notifications(vec![sample_card(1)]));
+        assert!(dm.set_notifications(vec![single_group(sample_card(1))]));
         assert_eq!(dm.list().len(), 1);
         assert!(dm.clear_pill_rect().is_some());
         assert!(
-            !dm.set_notifications(vec![sample_card(1)]),
+            !dm.set_notifications(vec![single_group(sample_card(1))]),
             "an identical snapshot must not invalidate the cards"
         );
     }
 
     #[test]
     fn message_list_overflow_drops_cards_beyond_the_controls() {
-        // More cards than fit: only whole cards above the controls row render
-        // (no scrolling yet — recorded divergence; gnome-shell scrolls).
-        let cards: Vec<_> = (1..=10).map(sample_card).collect();
-        let dm = DateMenu::new(0, false, [0, 0, 0], cards);
+        // More single-card groups than fit: only whole cards above the controls
+        // row render (no scrolling yet — recorded divergence; gnome-shell scrolls).
+        let groups: Vec<_> = (1..=10).map(|i| single_group(sample_card(i))).collect();
+        let dm = DateMenu::new(0, false, [0, 0, 0], groups);
         let h = dm.logical_size().h;
         let visible = dm.card_rects();
         assert!(!visible.is_empty());
@@ -1719,5 +2283,78 @@ mod tests {
                 "every visible card fits fully above the Clear row"
             );
         }
+    }
+
+    /// A multi-notification group renders as a collapsed fanned stack: one
+    /// interactive card (no separate card per notification), a taller block
+    /// than a lone card, and up to three visible members
+    /// (`js/ui/messageList.js:1314-1350`).
+    #[test]
+    fn message_list_collapses_a_multi_notification_group() {
+        let cards: Vec<_> = (1..=4).map(sample_card).collect();
+        let dm = DateMenu::new(0, false, [0, 0, 0], vec![multi_group(7, cards)]);
+
+        // Collapsed: not broken out into interactive cards.
+        assert!(
+            dm.card_rects().is_empty(),
+            "a collapsed stack exposes no per-card rects"
+        );
+        let groups = dm.group_rects();
+        assert_eq!(groups.len(), 1);
+        let (_, bounds, expanded) = &groups[0];
+        assert!(!expanded);
+        // A lone card is 90px; the stack adds the two visible peeks' offsets
+        // (10 + 10/1.4), i.e. it is taller but not by a whole card.
+        let expected = 90. + STACK_HEIGHT_OFFSET_LOCAL;
+        assert!(
+            (bounds.size.h - expected).abs() < 0.01,
+            "stack height {} vs {expected}",
+            bounds.size.h
+        );
+    }
+
+    // The two visible peeks add 10 + 10/1.4 to the top card's 90px.
+    const STACK_HEIGHT_OFFSET_LOCAL: f64 = 10. + 10. / 1.4;
+
+    /// Clicking a collapsed stack expands it into a header + vertical list;
+    /// the close button in the collapsed state closes the WHOLE group, and the
+    /// header collapse button fans it back (`js/ui/messageList.js:1106-1118`).
+    #[test]
+    fn message_list_group_expand_collapse_and_group_close() {
+        // Two cards so the expanded list fits the popover height (the no-scroll
+        // list would otherwise drop overflow — a separate, tested divergence).
+        let cards: Vec<_> = (1..=2).map(sample_card).collect();
+        let key = SourceKey::PidName(7, "App".to_owned());
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![multi_group(7, cards)]);
+
+        // The collapsed stack's top-card close closes the whole group.
+        let close = dm
+            .stack_close_rect(&key)
+            .expect("collapsed stack has a close");
+        assert_eq!(
+            dm.pointer_click(center(close)),
+            PopoverAction::CloseNotificationGroup(vec![1, 2])
+        );
+
+        // A click elsewhere on the stack expands the group.
+        let (_, bounds, _) = dm.group_rects()[0].clone();
+        // A point clear of the close button (lower-left of the stack).
+        let expand_pt = Point::from((bounds.loc.x + 20., bounds.loc.y + bounds.size.h - 6.));
+        assert_eq!(dm.pointer_click(expand_pt), PopoverAction::Consumed);
+        let (_, _, expanded) = &dm.group_rects()[0];
+        assert!(expanded, "clicking the stack expanded the group");
+        // Now both cards are individually interactive.
+        assert_eq!(dm.card_rects().len(), 2);
+
+        // The header collapse button fans it back to a stack.
+        let collapse = dm
+            .group_collapse_rect(&key)
+            .expect("expanded group has a collapse button");
+        assert_eq!(dm.pointer_click(center(collapse)), PopoverAction::Consumed);
+        assert!(
+            !dm.group_rects()[0].2,
+            "the collapse button re-fanned the stack"
+        );
+        assert!(dm.card_rects().is_empty());
     }
 }

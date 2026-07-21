@@ -137,6 +137,9 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         "message-indicator-symbolic" => Some(include_bytes!(
             "../../resources/icons/message-indicator-symbolic.svg"
         )),
+        "group-collapse-symbolic" => Some(include_bytes!(
+            "../../resources/icons/group-collapse-symbolic.svg"
+        )),
         _ => None,
     }
 }
