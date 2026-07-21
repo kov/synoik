@@ -2122,6 +2122,82 @@ fn vulkan_renders_the_top_panel() {
     );
 }
 
+/// The dateMenu messages-indicator dot composites right of the clock when shown,
+/// and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`). A
+/// differential over the same panel proves it's the dot — bundled from
+/// `message-indicator-symbolic` through the embedded-icon fallback — not a stray
+/// clock glyph, and that the bundled SVG rasterizes at all.
+#[test]
+fn vulkan_renders_the_messages_indicator_dot() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let ow = output_size(&output).w;
+    let width = to_physical_precise_round(scale.x, ow);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+
+    // The dot's center, in physical pixels: 2px right of the clock button, then
+    // half the 16px icon.
+    let clock = f.niri().panel.date_menu_rect(ow);
+    let dot_cx = to_physical_precise_round::<i32>(scale.x, clock.loc.x + clock.size.w + 2. + 8.);
+    let dot_cy = bar_h / 2;
+    // Count near-white opaque pixels within a small box around the dot center.
+    let bright_at_dot = |pixels: &[u8]| -> usize {
+        let mut n = 0;
+        for dy in -7i32..=7 {
+            for dx in -7i32..=7 {
+                let (x, y) = (dot_cx + dx, dot_cy + dy);
+                if x < 0 || y < 0 || x >= width || y >= bar_h {
+                    continue;
+                }
+                let i = ((y * width + x) * 4) as usize;
+                let p = &pixels[i..i + 4];
+                if p[0] > 180 && p[1] > 180 && p[2] > 180 && p[3] > 180 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    let state = f.niri_state();
+    let (off, on) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let ws = state.niri.workspace_state_for(&output);
+            let position = state.niri.workspace_position_for(&output);
+            let render_panel = |vk: &mut VulkanRenderer, niri: &crate::niri::Niri| {
+                let elems = niri
+                    .panel
+                    .render(vk, &output, ws, position, &niri.icon_cache);
+                render_to_vec(
+                    vk,
+                    Size::<i32, Physical>::from((width, bar_h)),
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    // Panel elements are first=topmost; render_to_vec paints in
+                    // iteration order, so reverse to composite bottom-up (else
+                    // the bar paints over the dot).
+                    elems.into_iter().rev(),
+                )
+                .expect("render panel")
+            };
+            // Hidden: nothing bright where the dot would sit.
+            let off = bright_at_dot(&render_panel(vk, &state.niri));
+            state.niri.panel.set_messages_indicator(true);
+            let on = bright_at_dot(&render_panel(vk, &state.niri));
+            (off, on)
+        })
+        .expect("vulkan renderer");
+
+    assert_eq!(off, 0, "no dot before it's enabled (got {off} bright px)");
+    assert!(on > 10, "the dot composites bright when enabled (got {on})");
+}
+
 /// A recolored symbolic icon composites through the owned Vulkan renderer with the
 /// tint intact: rasterize an icon red, upload it, composite, and read it back — the
 /// covered pixels must be red (proving the `Abgr8888` recolor buffer composites with

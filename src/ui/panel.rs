@@ -84,6 +84,14 @@ const INACTIVE_DOT_OPACITY: f64 = 0.5;
 /// clock sits `BTN_H_PADDING` inside its lit pill, like the other buttons.
 const H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
 
+/// The dateMenu messages-indicator dot: `message-indicator-symbolic` at
+/// `$scalable_icon_size` (`_panel.scss:92-94`), sitting AFTER the clock with a
+/// size-matched invisible pad BEFORE it, so the clock stays centered
+/// (`js/ui/dateMenu.js:871-883`). `MESSAGES_INDICATOR_SPACING` is the
+/// `.clock-display-box` spacing between the box children (`_panel.scss:159-160`).
+const MESSAGES_INDICATOR_ICON: f64 = 16.;
+const MESSAGES_INDICATOR_SPACING: f64 = 2.;
+
 /// Bar background (opaque black — GNOME's dark panel), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 
@@ -465,6 +473,11 @@ pub struct Panel {
     /// layouts are configured. Drives the `keyboard` right-box indicator (GNOME's
     /// `InputSourceIndicator`); computed by the compositor from xkb state.
     keyboard_layout: Option<String>,
+    /// The dateMenu unread-messages dot (GNOME's `MessagesIndicator`): shown when
+    /// `show-banners && unseen − queued > 0` (`js/ui/dateMenu.js:787-798`). The
+    /// compositor recomputes it from the notification store; a size-matched pad
+    /// keeps the clock centered whether it's shown or not.
+    messages_indicator: bool,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -504,6 +517,7 @@ impl Panel {
             mic: MicStatus::default(),
             recording: None,
             keyboard_layout: None,
+            messages_indicator: false,
             clock,
             config,
             fills,
@@ -610,6 +624,23 @@ impl Panel {
     /// The current recording label (for tests / introspection), or `None` when idle.
     pub fn recording_label(&self) -> Option<&str> {
         self.recording.as_ref().map(|r| r.label.as_str())
+    }
+
+    /// Show/hide the dateMenu unread-messages dot (the compositor computes
+    /// `show-banners && unseen − queued > 0`). Returns whether it changed so the
+    /// caller can queue a redraw. The dot composites on top of the bar (from the
+    /// icon cache), so this doesn't invalidate the bar texture.
+    pub fn set_messages_indicator(&mut self, visible: bool) -> bool {
+        if visible == self.messages_indicator {
+            return false;
+        }
+        self.messages_indicator = visible;
+        true
+    }
+
+    /// Whether the dateMenu messages dot is currently shown (tests/introspection).
+    pub fn messages_indicator_visible(&self) -> bool {
+        self.messages_indicator
     }
 
     /// Recompute the clock from the wall clock. Returns whether it changed (so
@@ -800,6 +831,40 @@ impl Panel {
         )
     }
 
+    /// The messages-indicator dot's rect (logical), or `None` when hidden: the
+    /// 16px icon sitting `MESSAGES_INDICATOR_SPACING` right of the clock button,
+    /// vertically centered (`js/ui/dateMenu.js:880-883`, `_panel.scss:159-160`).
+    fn messages_indicator_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        if !self.messages_indicator {
+            return None;
+        }
+        let clock = self.date_menu_rect(output_width);
+        Some(Rectangle::new(
+            Point::from((
+                clock.loc.x + clock.size.w + MESSAGES_INDICATOR_SPACING,
+                (PANEL_HEIGHT - MESSAGES_INDICATOR_ICON) / 2.,
+            )),
+            Size::from((MESSAGES_INDICATOR_ICON, MESSAGES_INDICATOR_ICON)),
+        ))
+    }
+
+    /// The dateMenu's full clickable extent: the clock button, plus the
+    /// messages-indicator dot and its size-matched leading pad when the dot is
+    /// shown (GNOME's whole `clock-display-box` is the button, with the pill only
+    /// on the clock — `js/ui/dateMenu.js:871-886`). The clock stays centered
+    /// because the pad mirrors the dot, so only this hit rect widens.
+    fn date_menu_hit_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+        let clock = self.date_menu_rect(output_width);
+        if !self.messages_indicator {
+            return clock;
+        }
+        let ext = MESSAGES_INDICATOR_SPACING + MESSAGES_INDICATOR_ICON;
+        Rectangle::new(
+            Point::from((clock.loc.x - ext, clock.loc.y)),
+            Size::from((clock.size.w + 2. * ext, clock.size.h)),
+        )
+    }
+
     /// The quick-settings status indicator rect: the icon cluster plus a padding
     /// on each side, right-anchored on the output. Its width tracks how many
     /// status icons (toggles + live network/battery) are currently shown.
@@ -934,7 +999,7 @@ impl Panel {
                 .is_some_and(|rect| rect.contains(pos))
         }) {
             Some(role)
-        } else if self.date_menu_rect(output_width).contains(pos) {
+        } else if self.date_menu_hit_rect(output_width).contains(pos) {
             Some(ROLE_DATE_MENU)
         } else {
             None
@@ -1002,6 +1067,47 @@ impl Panel {
                 if let Some(tb) = cache.qs_icons.get(&key) {
                     let logical = tb.logical_size();
                     let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb.clone(),
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
+        }
+
+        // The dateMenu messages-indicator dot (`message-indicator-symbolic`),
+        // composited on top of the bar after the clock, in the panel fg. Same
+        // upload/caching as the recording stop glyph and the QS cluster icons.
+        if let Some(rect) = self.messages_indicator_rect(width) {
+            if let Some(buffer) = icons.buffer(
+                "message-indicator-symbolic",
+                MESSAGES_INDICATOR_ICON,
+                scale,
+                TEXT,
+            ) {
+                let key = (
+                    scale_key,
+                    "message-indicator-symbolic".to_string(),
+                    color_key(TEXT),
+                );
+                #[allow(clippy::map_entry)]
+                if !cache.qs_icons.contains_key(&key) {
+                    if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                        cache.qs_icons.insert(key.clone(), tb);
+                    } else {
+                        tracing::error!("error uploading the messages-indicator icon");
+                    }
+                }
+                if let Some(tb) = cache.qs_icons.get(&key) {
+                    let logical = tb.logical_size();
+                    let location = Point::from((
+                        rect.loc.x + (rect.size.w - logical.w) / 2.,
+                        (PANEL_HEIGHT - logical.h) / 2.,
+                    ));
                     elements.push(TextureRenderElement::from_texture_buffer(
                         tb.clone(),
                         location,
@@ -1698,6 +1804,56 @@ mod tests {
         assert!(panel.set_mic(MicStatus::default()));
         assert_eq!(panel.quick_settings_rect(1920.).size.w, base);
         assert!(!panel.set_mic(MicStatus::default()), "no-op re-set");
+    }
+
+    /// The dateMenu messages-indicator dot (`js/ui/dateMenu.js:871-886`): the
+    /// setter is a no-op-detecting toggle; the dot sits right of the clock; the
+    /// clock stays centered whether or not the dot shows (the pad mirrors it);
+    /// and clicking the dot still opens the calendar (the button's hit rect
+    /// widens to include it). Structural, no GPU.
+    #[test]
+    fn messages_indicator_sits_right_of_a_centered_clock() {
+        let ow = 1920.;
+        let mut panel = test_panel();
+
+        // Hidden by default: no dot rect, hit rect == the bare clock rect.
+        assert!(!panel.messages_indicator_visible());
+        assert!(panel.messages_indicator_rect(ow).is_none());
+        let clock = panel.date_menu_rect(ow);
+        assert_eq!(panel.date_menu_hit_rect(ow), clock);
+
+        // Show it: the setter reports the change once, then no-ops.
+        assert!(panel.set_messages_indicator(true));
+        assert!(!panel.set_messages_indicator(true), "no-op re-set");
+        assert!(panel.messages_indicator_visible());
+
+        // The clock rect is UNCHANGED — the dot doesn't push the clock off
+        // center (the invisible leading pad mirrors it).
+        assert_eq!(panel.date_menu_rect(ow), clock);
+        let center = clock.loc.x + clock.size.w / 2.;
+        assert!((center - ow / 2.).abs() < 1., "clock stays centered");
+
+        // The dot is a 16px square just right of the clock button.
+        let dot = panel.messages_indicator_rect(ow).unwrap();
+        assert_eq!(dot.size.w, MESSAGES_INDICATOR_ICON);
+        assert_eq!(
+            dot.loc.x,
+            clock.loc.x + clock.size.w + MESSAGES_INDICATOR_SPACING
+        );
+
+        // The hit rect grew symmetrically to cover the dot (and its leading
+        // pad), so a click on the dot opens the calendar.
+        let hit = panel.date_menu_hit_rect(ow);
+        assert!(hit.contains(Point::from((dot.loc.x + 8., 10.))));
+        let ws = WorkspaceState {
+            count: 3,
+            active: 1,
+        };
+        assert_eq!(
+            panel.hit_test(Point::from((dot.loc.x + 8., 10.)), ow, ws),
+            Some(ROLE_DATE_MENU),
+            "clicking the dot opens the dateMenu"
+        );
     }
 
     /// The panel exposes both roles in their boxes (extension-representable model).

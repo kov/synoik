@@ -3947,6 +3947,48 @@ fn calendar_message_list_acks_on_open_once() {
     );
 }
 
+/// The panel MessagesIndicator dot (`js/ui/dateMenu.js:787-798`): lit when
+/// banners are enabled and there are unseen notifications not still queued for a
+/// banner, hidden under DND, and cleared by opening the calendar (which acks
+/// everything on map, `js/ui/messageList.js:1193-1199`).
+#[test]
+fn messages_indicator_reflects_unseen_and_dnd() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    // A LOW notification never banners, so it stays unseen and unqueued — the
+    // dot lights immediately (unseen − queued = 1 > 0).
+    let mut low = banner_req("app", ":1.1");
+    low.urgency = crate::notifications::Urgency::Low;
+    banner_notify(&mut f, low);
+    assert!(!f.niri().notification_banner.is_visible());
+    assert!(
+        f.niri().panel.messages_indicator_visible(),
+        "an unseen low notification lights the dot"
+    );
+
+    // Opening the calendar acknowledges everything → the dot clears.
+    open_calendar(&mut f);
+    assert!(
+        !f.niri().panel.messages_indicator_visible(),
+        "opening the list clears the dot"
+    );
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.settle_animations();
+
+    // Under DND, an unseen notification does NOT light the dot — GNOME gates the
+    // indicator on `show-banners` (`js/ui/dateMenu.js:796-797`).
+    f.niri().gnome_settings.quick_toggles.do_not_disturb = true;
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    assert!(f.niri().notifications.unseen_count() > 0);
+    assert!(
+        !f.niri().panel.messages_indicator_visible(),
+        "DND hides the dot even with unseen notifications"
+    );
+}
+
 /// Message-list card interactions, end to end through real pointer clicks:
 /// the close button dismisses one notification, a body click activates
 /// (default action → ActionInvoked; none + resident → survives), and Clear

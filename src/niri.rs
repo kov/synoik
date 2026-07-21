@@ -946,8 +946,10 @@ impl State {
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
-                        state.niri.queue_redraw_all();
                         state.niri.gnome_settings = settings;
+                        // A DND (`show-banners`) flip toggles the dateMenu dot.
+                        state.niri.update_messages_indicator();
+                        state.niri.queue_redraw_all();
                     }
                 })
                 .unwrap();
@@ -7587,6 +7589,21 @@ impl Niri {
         // popover's message list live — without re-acknowledging (arrivals
         // while open stay unseen, `js/ui/messageList.js:1193-1199`).
         self.refresh_popover_notifications();
+        // ...and the panel's unread-messages dot in sync with the store.
+        self.update_messages_indicator();
+    }
+
+    /// Recompute the panel's `MessagesIndicator` dot from the store: shown when
+    /// banners are enabled and there are unseen notifications not still queued
+    /// for a banner (`js/ui/dateMenu.js:787-798`). Called from every store
+    /// mutation (via [`Self::apply_notification_effects`]) and whenever the
+    /// `show-banners`/DND setting flips.
+    pub fn update_messages_indicator(&mut self) {
+        let show_banners = !self.gnome_settings.quick_toggles.do_not_disturb;
+        let visible = show_banners && self.notifications.indicator_count() > 0;
+        if self.panel.set_messages_indicator(visible) {
+            self.queue_redraw_all();
+        }
     }
 
     /// Push a fresh store snapshot into an open calendar popover's message
