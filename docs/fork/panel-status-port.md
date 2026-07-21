@@ -257,10 +257,32 @@ carved these out as separate work — none block R1 for daily use:
     like GNOME activation), bundled `no-notifications-symbolic` (gresource-only icon);
     live-validated on the headless harness with injected clicks. Also fixed here: the shared
     card's icons were z-buried under the card texture since slice 2 — output element lists
-    are top-to-bottom; icons now precede the card, pinned by a pixel test). Divergences
-    recorded in the module docs: no expand/6-line clamp, no app focus on body click, QS
-    popovers also block, only left clicks intercepted, no message-list scrolling (cards that
-    don't fully fit above the Clear row are dropped). Remaining: grouped card stacks (3b),
-    C2 indicator.
+    are top-to-bottom; icons now precede the card, pinned by a pixel test); message
+    expansion ✅ (`7bcf2787`+`ca3befe1`: the shared card is expandable per GNOME —
+    collapsed = ONE ellipsized body line + no action row, expanded = wrapped body up to 6
+    lines + actions (`LabelExpanderLayout` + action-bin gating,
+    `messageList.js:220-275,598-666`); list cards get the header expand caret
+    (`notification-expand-symbolic`, bundled + a baked-180° collapse variant; live iff
+    ellipsized/has-actions/expanded, `messageList.js:521-538`), per-id expansion state
+    surviving snapshot pushes with the line budget clamped to the no-scroll space (falls
+    back to collapsed when even 1 line + actions can't fit); expanded list action buttons
+    emit token+ActionInvoked, destroy unless resident, close the popover; the banner has NO
+    caret (`messageTray.js:1137`) — hover expands once shown incl. hover started mid-slide
+    (`:970-996,1102-1105`) with the popped-under-pointer guard (`:978-991`), CRITICAL
+    auto-expands at show/replace (`:1170-1174`); this made the slice-2 always-visible
+    action row faithful (actions only when expanded). niri-vk grew GPU-free
+    `wrap_lines_weighted` (scale-independent breaks; bidi-safe after a Fable-review HIGH —
+    visual-order glyph ranges panicked on RTL-in-LTR bodies, now min/max + a bidi test).
+    Live-validated on the harness: collapsed/hover-expanded/critical banner shots, banner +
+    list action clicks received by `notify-send -A`, caret expand/collapse with the flipped
+    chevron; also re-confirmed critical queues behind a showing banner and action-destroyed
+    notifications never re-banner. Close button gained its missing 3px margin
+    (`_message-list.scss:152-155`)). Divergences recorded in the module docs: instant
+    expand (no 200 ms ease), no focus grab on expand, list expansion state dropped with the
+    popover, invisible caret not clickable, hover-cycle stands in for GNOME's mouse-away
+    timeouts, `forceExpanded` deferred with per-app policies, no app focus on body click,
+    QS popovers also block, only left clicks intercepted, no message-list scrolling (cards
+    that don't fully fit above the Clear row are dropped). Remaining: grouped card stacks
+    (3b), C2 indicator.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
