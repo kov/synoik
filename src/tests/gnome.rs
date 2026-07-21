@@ -4001,6 +4001,65 @@ fn calendar_message_list_acks_on_open_once() {
     );
 }
 
+/// A panel popover grabs input modally: while it is open no window under it may
+/// receive pointer focus, so the app can't keep driving the cursor image (a
+/// maximized terminal was leaving its I-beam over the clock popover). Mirrors how
+/// the screenshot UI / MRU already suppress the underlying surface in
+/// `contents_under`.
+#[test]
+fn open_popover_suppresses_underlying_pointer_focus() {
+    use smithay::utils::{Logical, Point};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+    let id = f.add_client();
+    // A large floating window covering the top-center where the popover opens.
+    let _w = map_window_sized(&mut f, id, (1800, 1000), None);
+
+    // A point inside the window, before the popover opens, focuses the window.
+    let over_window = Point::<f64, Logical>::from((900., 120.));
+    pointer_motion_to(&mut f, over_window.x, over_window.y);
+    assert!(
+        f.niri().contents_under(over_window).surface.is_some(),
+        "the window under the pointer normally receives pointer focus"
+    );
+    assert!(
+        f.niri()
+            .seat
+            .get_pointer()
+            .unwrap()
+            .current_focus()
+            .is_some(),
+        "the seat pointer focuses the window"
+    );
+
+    open_calendar(&mut f);
+
+    // A point over the open popover (which sits over the window) must NOT focus
+    // the window, so the app can't set the cursor image there.
+    let origin = f.niri().panel_popover.content_location(&output);
+    let over_popover = origin + Point::from((50., 50.));
+    assert!(
+        f.niri().panel_popover.contains(&output, over_popover),
+        "the sampled point is inside the popover content"
+    );
+    pointer_motion_to(&mut f, over_popover.x, over_popover.y);
+    assert!(
+        f.niri().contents_under(over_popover).surface.is_none(),
+        "no window under the open popover receives pointer focus"
+    );
+    assert!(
+        f.niri()
+            .seat
+            .get_pointer()
+            .unwrap()
+            .current_focus()
+            .is_none(),
+        "the seat pointer focus is cleared while the popover is open"
+    );
+}
+
 /// The panel MessagesIndicator dot (`js/ui/dateMenu.js:787-798`): lit when
 /// banners are enabled and there are unseen notifications not still queued for a
 /// banner, hidden under DND, and cleared by opening the calendar (which acks

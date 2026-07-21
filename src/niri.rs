@@ -4037,7 +4037,13 @@ impl Niri {
             return rv;
         }
 
-        if self.screenshot_ui.is_open() || self.window_mru_ui.is_open() {
+        if self.screenshot_ui.is_open()
+            || self.window_mru_ui.is_open()
+            || self.panel_popover.is_open()
+        {
+            // A panel popover grabs input modally (clicks and motion): while it is open no
+            // window under it should receive pointer focus, so the app can't keep driving the
+            // cursor image (e.g. a maximized terminal's I-beam over the clock popover).
             return rv;
         }
 
