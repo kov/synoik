@@ -296,9 +296,19 @@ carved these out as separate work — none block R1 for daily use:
     shows only bg); the header is a cached texture + composited chevron; `SourceKey` gained
     `Hash`. Pinned by model/list unit tests, a gnome.rs same-source grouping conformance test
     (real clicks), and a Vulkan render differential (peek + expanded-header chevron).
+    Review follow-ups (`bc0e674b`): the collapsed peek z-order was inverted (deepest painted
+    over the shallower peek for 3+ groups — the 2-card render test could not catch it; now a
+    3-card differential asserts the upper peek band is lighter); the expanded state drops when
+    a source shrinks to one and un-expands member bodies on collapse
+    (`messageList.js:988,1170-1173`); a click on the expanded header background / inter-card
+    gap collapses the group (`messageList.js:879,934-935`).
     Divergences: 200 ms expand animation, list scrolling (overflow cards drop), the group
-    highlight fade, and outside-click/Escape group-collapse (header button collapses; Escape
-    closes the whole popover)); C2 MessagesIndicator — slice 4 ✅ (`44e1a1c9`+`704f02a6`: the
+    highlight fade, Escape group-collapse (Escape closes the whole popover; the header button,
+    header background, and inter-card gap all collapse); the collapse button's click target is
+    the 24px visible circle (GNOME's actor is 32px with an 8px transparent border) and the
+    header is 36px (GNOME ≈44px); the header source title is not ellipsized (a hostile long app
+    name overdraws under the always-on-top chevron); the peek bgs are within a few /255 of the
+    exact `darken()` values (style-reference tolerance)); C2 MessagesIndicator — slice 4 ✅ (`44e1a1c9`+`704f02a6`: the
     dateMenu unread dot (`message-indicator-symbolic`, bundled) after the clock with a
     size-matched leading pad so the clock stays centered (`dateMenu.js:871-886`); visible iff
     `show-banners && unseen − queued > 0` (`:787-798`), recomputed on every store mutation, on
