@@ -2789,6 +2789,60 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     );
 }
 
+/// Flipping DND from the quick-settings tile toggles the panel messages dot
+/// WITHOUT a new notification (`js/ui/dateMenu.js:757-761,796-797`): the dot is
+/// gated on `show-banners`, and the QS-toggle path must recompute it (there is
+/// no gsettings writer headless, so the settings round-trip can't cover it).
+#[test]
+fn messages_indicator_toggles_with_dnd_tile() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    // An unseen LOW notification lights the dot (it never banners).
+    let mut low = banner_req("app", ":1.1");
+    low.urgency = crate::notifications::Urgency::Low;
+    banner_notify(&mut f, low);
+    assert!(f.niri().panel.messages_indicator_visible());
+
+    // The DND tile center, computed the way `panel_quick_settings_*` does.
+    let output_w = 1920.0_f64;
+    let anchor = f.niri().panel.quick_settings_rect(output_w);
+    let menu_w = 332.0_f64;
+    let margin = 6.0_f64;
+    let center_x = anchor.loc.x + anchor.size.w / 2.;
+    let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
+    let tile_x = origin_x + 12. + 75.;
+    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    let open_qs = |f: &mut Fixture| {
+        pointer_motion_to(f, 1906., 10.);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let click_dnd = |f: &mut Fixture| {
+        pointer_motion_to(f, tile_x, tile_y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    // Enable DND → the dot clears even though the notification is still unseen.
+    open_qs(&mut f);
+    click_dnd(&mut f);
+    assert!(f.niri().gnome_settings.quick_toggles.do_not_disturb);
+    assert!(
+        !f.niri().panel.messages_indicator_visible(),
+        "DND hides the dot with no new notification"
+    );
+
+    // Disable DND again → the dot re-lights (the notification is still unseen).
+    click_dnd(&mut f);
+    assert!(!f.niri().gnome_settings.quick_toggles.do_not_disturb);
+    assert!(
+        f.niri().panel.messages_indicator_visible(),
+        "clearing DND re-lights the dot"
+    );
+}
+
 /// The popover opens and closes with an animation (gnome-shell's `BoxPointer` fade):
 /// opening starts a running animation; dismissing does NOT drop the popover instantly
 /// but keeps it visible (fading) with an ongoing animation until it settles.

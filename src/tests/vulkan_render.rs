@@ -2138,10 +2138,11 @@ fn vulkan_renders_the_messages_indicator_dot() {
     let width = to_physical_precise_round(scale.x, ow);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
 
-    // The dot's center, in physical pixels: 2px right of the clock button, then
-    // half the 16px icon.
+    // The dot's center, in physical pixels: 2px right of the clock PILL edge
+    // (the clock rect inset by BTN_MARGIN_X = 4), then half the 16px icon.
     let clock = f.niri().panel.date_menu_rect(ow);
-    let dot_cx = to_physical_precise_round::<i32>(scale.x, clock.loc.x + clock.size.w + 2. + 8.);
+    let dot_cx =
+        to_physical_precise_round::<i32>(scale.x, clock.loc.x + clock.size.w - 4. + 2. + 8.);
     let dot_cy = bar_h / 2;
     // Count near-white opaque pixels within a small box around the dot center.
     let bright_at_dot = |pixels: &[u8]| -> usize {

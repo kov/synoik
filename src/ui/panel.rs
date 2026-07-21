@@ -832,16 +832,20 @@ impl Panel {
     }
 
     /// The messages-indicator dot's rect (logical), or `None` when hidden: the
-    /// 16px icon sitting `MESSAGES_INDICATOR_SPACING` right of the clock button,
-    /// vertically centered (`js/ui/dateMenu.js:880-883`, `_panel.scss:159-160`).
+    /// 16px icon sitting `MESSAGES_INDICATOR_SPACING` right of the CLOCK PILL —
+    /// GNOME measures the `.clock-display-box` spacing from the `.clock`
+    /// element's edge, and the lit pill is the `.clock` background
+    /// (`js/ui/dateMenu.js:880-883`, `_panel.scss:81-86,159-160`). The pill is
+    /// `date_menu_rect` inset by `BTN_MARGIN_X` (see [`container_rect`]).
     fn messages_indicator_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
         if !self.messages_indicator {
             return None;
         }
         let clock = self.date_menu_rect(output_width);
+        let pill_right = clock.loc.x + clock.size.w - BTN_MARGIN_X;
         Some(Rectangle::new(
             Point::from((
-                clock.loc.x + clock.size.w + MESSAGES_INDICATOR_SPACING,
+                pill_right + MESSAGES_INDICATOR_SPACING,
                 (PANEL_HEIGHT - MESSAGES_INDICATOR_ICON) / 2.,
             )),
             Size::from((MESSAGES_INDICATOR_ICON, MESSAGES_INDICATOR_ICON)),
@@ -858,7 +862,10 @@ impl Panel {
         if !self.messages_indicator {
             return clock;
         }
-        let ext = MESSAGES_INDICATOR_SPACING + MESSAGES_INDICATOR_ICON;
+        // Extend to cover the dot (which sits past the clock's right edge), and
+        // mirror that on the left so the clickable box stays centered.
+        let dot = self.messages_indicator_rect(output_width).unwrap();
+        let ext = (dot.loc.x + dot.size.w) - (clock.loc.x + clock.size.w);
         Rectangle::new(
             Point::from((clock.loc.x - ext, clock.loc.y)),
             Size::from((clock.size.w + 2. * ext, clock.size.h)),
@@ -1833,12 +1840,13 @@ mod tests {
         let center = clock.loc.x + clock.size.w / 2.;
         assert!((center - ow / 2.).abs() < 1., "clock stays centered");
 
-        // The dot is a 16px square just right of the clock button.
+        // The dot is a 16px square 2px right of the CLOCK PILL edge (the pill is
+        // the clock rect inset by BTN_MARGIN_X), matching GNOME's box spacing.
         let dot = panel.messages_indicator_rect(ow).unwrap();
         assert_eq!(dot.size.w, MESSAGES_INDICATOR_ICON);
         assert_eq!(
             dot.loc.x,
-            clock.loc.x + clock.size.w + MESSAGES_INDICATOR_SPACING
+            clock.loc.x + clock.size.w - BTN_MARGIN_X + MESSAGES_INDICATOR_SPACING
         );
 
         // The hit rect grew symmetrically to cover the dot (and its leading

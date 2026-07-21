@@ -914,6 +914,12 @@ impl State {
                     w.set_do_not_disturb(v);
                 }
                 set_toggle(self, |t, v| t.do_not_disturb = v, v);
+                // DND gates the panel's messages dot (`js/ui/dateMenu.js:796-797`).
+                // `set_toggle` already updated `quick_toggles`; recompute the dot
+                // from it now so the toggle reflects immediately even without a
+                // gsettings writer (the settings round-trip is the only other path,
+                // and it's absent headless).
+                self.niri.update_messages_indicator();
             }
             PopoverAction::SetNightLight(v) => {
                 if let Some(w) = &self.niri.gnome_settings_writer {
