@@ -94,8 +94,8 @@ dot; popover = **two columns** (`calendarArea` hbox, `dateMenu.js:893-897`).
 | # | Element | Renders | Reference | Dep | Status |
 |---|---|---|---|---|---|
 | C1 | Clock label | wall-clock text | `dateMenu.js:865,882` | `[self]` | ✅ (`panel.rs` `format_clock`) |
-| C2 | **Notifications dot** (`MessagesIndicator`) | small dot on clock when unread | `dateMenu.js:743,869,883` | `[subsystem]` notifications | ⬜ |
-| C3 | **Message-list column** (`CalendarMessageList`) | notifications + media controls + **Clear** button + "No Notifications" placeholder | `js/ui/calendar.js:794`; placeholder `:775,804`; view `:814-821`; clear button `:823-837`; added `dateMenu.js:918-919` | `[subsystem]` `org.freedesktop.Notifications` server (we have none) | ⬜ |
+| C2 | **Notifications dot** (`MessagesIndicator`) | small dot on clock when unread | `dateMenu.js:743,869,883` | `[subsystem]` notifications | ✅ `44e1a1c9`+`704f02a6` (slice 4; see item 13) |
+| C3 | **Message-list column** (`CalendarMessageList`) | notifications + media controls + **Clear** button + "No Notifications" placeholder | `js/ui/calendar.js:794`; placeholder `:775,804`; view `:814-821`; clear button `:823-837`; added `dateMenu.js:918-919` | `[subsystem]` `org.freedesktop.Notifications` server (we own it) | ✅ slices 3a/3b (see item 13); media controls deferred |
 | C4 | **TodayButton header** | day-of-week + full date above the grid | `TodayButton` `dateMenu.js:52,70-77`; added `:942` | `[self]` | ✅ `e5b3ac6c` (header card in `calendar.rs`; click snaps to today; one-surface divergence) |
 | C5 | Calendar month grid | 6×7 day grid | `Calendar.Calendar()` `dateMenu.js:899,943` | `[self]` | ✅ (`calendar.rs`) |
 | C6 | **Events section** | today's calendar events / "No Events" | `EventsSection` `dateMenu.js:111`; added `:960-961`; placeholder `:289-293` | `[dbus:evolution-data-server]` (CalendarServer) | ⬜ (noted deferred `calendar.rs:11`) |
@@ -282,7 +282,32 @@ carved these out as separate work — none block R1 for daily use:
     popover, invisible caret not clickable, hover-cycle stands in for GNOME's mouse-away
     timeouts, `forceExpanded` deferred with per-app policies, no app focus on body click,
     QS popovers also block, only left clicks intercepted, no message-list scrolling (cards
-    that don't fully fit above the Clear row are dropped). Remaining: grouped card stacks
-    (3b), C2 indicator.
+    that don't fully fit above the Clear row are dropped)); grouped card stacks — slice 3b ✅
+    (`d5d4cdb0`: notifications from one source group into a `NotificationMessageGroup`
+    (`messageList.js:858-949`); the snapshot is now `Vec<CardGroup>` via `message_list_groups`.
+    A one-notification group renders as a plain card (unchanged); a larger one fans into a
+    collapsed stack — newest card on top over ≤2 darkened peeks (`second/lower-in-stack`,
+    `_message-list.scss:89-98`), each inset 6px/side and revealed 10px then ÷1.4
+    (`:1314-1350,1370-1404`); urgent groups sort first, criticals lead within a group
+    (`:1815-1826`). Clicking a collapsed stack expands it into a header (source title +
+    `group-collapse-symbolic`, bundled) over the cards; the header button re-collapses; a
+    collapsed close closes the WHOLE group, expanded closes one card (`:1106-1118,1236-1242`);
+    one group expanded at a time. Peeks render as cached darkened rounded rects (the peek
+    shows only bg); the header is a cached texture + composited chevron; `SourceKey` gained
+    `Hash`. Pinned by model/list unit tests, a gnome.rs same-source grouping conformance test
+    (real clicks), and a Vulkan render differential (peek + expanded-header chevron).
+    Divergences: 200 ms expand animation, list scrolling (overflow cards drop), the group
+    highlight fade, and outside-click/Escape group-collapse (header button collapses; Escape
+    closes the whole popover)); C2 MessagesIndicator — slice 4 ✅ (`44e1a1c9`+`704f02a6`: the
+    dateMenu unread dot (`message-indicator-symbolic`, bundled) after the clock with a
+    size-matched leading pad so the clock stays centered (`dateMenu.js:871-886`); visible iff
+    `show-banners && unseen − queued > 0` (`:787-798`), recomputed on every store mutation, on
+    the QS DND-tile flip, and on the gsettings DND change; composited from the icon cache atop
+    the bar; hit rect widens to keep the dot clickable while the lit pill stays on the clock
+    alone; anchored 2px off the pill edge like GNOME's box spacing. Pinned by panel-geometry,
+    gnome.rs unseen/DND, and a Vulkan differential). **Notifications subsystem COMPLETE**
+    through the approved plan (slices 1/2/3a/3b/4 + message expansion); deferred items
+    (MPRIS media, GtkNotifications, per-app policies, sounds, scrolling, live time refresh,
+    rich `<b>/<i>` spans) remain per the plan.
 14. C6 events / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
