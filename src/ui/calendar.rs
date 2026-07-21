@@ -636,7 +636,8 @@ enum GroupKind {
     Collapsed {
         origin: Point<f64, Logical>,
         top: CardLayout,
-        /// Back-to-front: `(origin, size, bg)` of each peeking lower card.
+        /// Shallow-first (`(origin, size, bg)` of each peeking lower card):
+        /// FIRST = topmost, so second-in-stack paints over lower-in-stack.
         peeks: Vec<StackPeek>,
         /// Every notification id in the group (a collapsed close closes them all).
         ids: Vec<u32>,
@@ -705,8 +706,16 @@ impl CalendarMessageList {
             .flat_map(|g| g.cards.iter().map(|c| c.id))
             .collect();
         self.body_expanded.retain(|id| live.contains(id));
+        // Drop the expanded-group state when its source is gone OR has shrunk
+        // to a single notification — gnome-shell collapses a group down to one
+        // (`messageList.js:1170-1173`), so a later arrival shows a fresh
+        // collapsed stack, not a resurrected expansion.
         if let Some(key) = &self.group_expanded {
-            if !self.groups.iter().any(|g| &g.key == key) {
+            let still_grouped = self
+                .groups
+                .iter()
+                .any(|g| &g.key == key && g.cards.len() > 1);
+            if !still_grouped {
                 self.group_expanded = None;
             }
         }
@@ -722,10 +731,22 @@ impl CalendarMessageList {
         self.revision += 1;
     }
 
+    /// Un-expand every member body of the group keyed by `key` — gnome-shell's
+    /// `collapse()` runs `message.unexpand()` on all members
+    /// (`js/ui/messageList.js:988`), so a re-expand shows collapsed bodies.
+    fn unexpand_group_bodies(&mut self, key: &SourceKey) {
+        if let Some(group) = self.groups.iter().find(|g| &g.key == key) {
+            for card in &group.cards {
+                self.body_expanded.remove(&card.id);
+            }
+        }
+    }
+
     /// Expand `key`'s stack (collapsing any other), or collapse it if it is
     /// already the expanded group (`js/ui/messageList.js:1809-1814`).
     fn toggle_group(&mut self, key: SourceKey) {
         self.group_expanded = if self.group_expanded.as_ref() == Some(&key) {
+            self.unexpand_group_bodies(&key);
             None
         } else {
             Some(key)
@@ -734,7 +755,8 @@ impl CalendarMessageList {
     }
 
     fn collapse_group(&mut self) {
-        if self.group_expanded.take().is_some() {
+        if let Some(key) = self.group_expanded.take() {
+            self.unexpand_group_bodies(&key);
             self.revision += 1;
         }
     }
@@ -805,8 +827,10 @@ impl CalendarMessageList {
                 stack_bg(depth),
             ));
         }
-        // Deepest peek drawn first (backmost).
-        peeks.reverse();
+        // `peeks` is shallow-first (depth 1, 2, …). The element convention is
+        // FIRST = topmost, so pushing them after the top card in this order
+        // paints the second-in-stack ABOVE the lower-in-stack (matching
+        // gnome-shell's reversed child paint, `messageList.js:1179-1191`).
         (top, peeks, top_h + cumulative)
     }
 
@@ -817,6 +841,12 @@ impl CalendarMessageList {
         let mut out = Vec::new();
         let mut y = LIST_PAD;
         for (g, group) in self.groups.iter().enumerate() {
+            // The store never yields an empty source (`notifications.rs:619`),
+            // but `CardGroup` is public — skip rather than index-panic.
+            debug_assert!(!group.cards.is_empty(), "a CardGroup must have >=1 card");
+            if group.cards.is_empty() {
+                continue;
+            }
             let expanded = self.group_expanded.as_ref() == Some(&group.key);
             if group.cards.len() <= 1 {
                 let origin = Point::from((LIST_PAD, y));
@@ -968,8 +998,11 @@ impl CalendarMessageList {
                             return Some(Self::card_hit(pos - *origin, &group.cards[*ci], layout));
                         }
                     }
-                    // Header or inter-card gap: consumed, popover stays open.
-                    return None;
+                    // A click on the header (off the button) or an inter-card
+                    // gap collapses the group — gnome-shell's group-wide gesture
+                    // fires `expand-toggle-requested` on any unclaimed click
+                    // (`js/ui/messageList.js:879,934-935`).
+                    return Some(ListHit::CollapseGroup);
                 }
             }
         }
@@ -2356,5 +2389,78 @@ mod tests {
             "the collapse button re-fanned the stack"
         );
         assert!(dm.card_rects().is_empty());
+    }
+
+    /// A group that shrinks to one notification collapses; a later arrival must
+    /// show a fresh COLLAPSED stack, not resurrect the earlier expansion
+    /// (`js/ui/messageList.js:1170-1173`).
+    #[test]
+    fn message_list_group_expansion_does_not_resurrect_after_shrink() {
+        let key = SourceKey::PidName(7, "App".to_owned());
+        let mut list =
+            CalendarMessageList::new(vec![multi_group(7, vec![sample_card(1), sample_card(2)])]);
+        list.toggle_group(key.clone());
+        assert!(list.visible_groups(400.)[0].2, "the group is expanded");
+
+        // Shrink to one notification: renders as a plain card and drops the
+        // expansion state entirely.
+        assert!(list.set_groups(vec![multi_group(7, vec![sample_card(1)])]));
+        assert!(
+            list.group_expanded.is_none(),
+            "shrink-to-one clears the expanded-group state"
+        );
+
+        // A later arrival re-grows the source: a COLLAPSED stack, not a
+        // resurrected expansion.
+        assert!(list.set_groups(vec![multi_group(7, vec![sample_card(1), sample_card(2)])]));
+        assert!(
+            !list.visible_groups(400.)[0].2,
+            "the re-grown group is collapsed, not expanded"
+        );
+    }
+
+    /// Collapsing a group un-expands every member's body — gnome-shell's
+    /// `collapse()` runs `message.unexpand()` on all members
+    /// (`js/ui/messageList.js:988`), so re-expanding shows collapsed bodies.
+    #[test]
+    fn message_list_collapse_unexpands_member_bodies() {
+        let key = SourceKey::PidName(7, "App".to_owned());
+        let mut list =
+            CalendarMessageList::new(vec![multi_group(7, vec![sample_card(1), sample_card(2)])]);
+        list.toggle_group(key.clone());
+        list.toggle_body_expanded(1);
+        assert!(list.body_expanded.contains(&1));
+        list.collapse_group();
+        assert!(
+            !list.body_expanded.contains(&1),
+            "collapsing the group un-expanded the member body"
+        );
+    }
+
+    /// Clicking the expanded group's header background (off the collapse
+    /// button) collapses it — gnome-shell's group-wide gesture fires on any
+    /// unclaimed click (`js/ui/messageList.js:879,934-935`).
+    #[test]
+    fn message_list_header_background_click_collapses_the_group() {
+        let mut dm = DateMenu::new(
+            0,
+            false,
+            [0, 0, 0],
+            vec![multi_group(7, vec![sample_card(1), sample_card(2)])],
+        );
+        let (_, bounds, _) = dm.group_rects()[0].clone();
+        let expand_pt = Point::from((bounds.loc.x + 20., bounds.loc.y + bounds.size.h - 6.));
+        dm.pointer_click(expand_pt);
+        assert!(dm.group_rects()[0].2, "the stack expanded");
+
+        // The header row (top of the group), to the left of the collapse
+        // button at the far right.
+        let (_, hbounds, _) = dm.group_rects()[0].clone();
+        let header_pt = Point::from((hbounds.loc.x + 10., hbounds.loc.y + 5.));
+        assert_eq!(dm.pointer_click(header_pt), PopoverAction::Consumed);
+        assert!(
+            !dm.group_rects()[0].2,
+            "clicking the header background collapsed the group"
+        );
     }
 }

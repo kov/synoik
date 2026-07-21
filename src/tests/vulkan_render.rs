@@ -2606,7 +2606,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
                 source_title: "App".to_owned(),
                 source_icon: None,
                 has_urgent: false,
-                cards: vec![make_card(1), make_card(2)],
+                cards: vec![make_card(1), make_card(2), make_card(3)],
             }],
         );
     }
@@ -2646,17 +2646,36 @@ fn vulkan_renders_a_grouped_stack_and_header() {
             .expect("vulkan renderer")
     };
 
-    // Collapsed: a darkened peek strip shows just below the top card (which is
-    // 90px tall). Sample near the bottom of the stack bounds, centered.
+    // Collapsed (3 cards → two peeks): darkened strips show below the 90px top
+    // card. The second-in-stack occupies the band [90,100] and the deeper
+    // lower-in-stack [100,107]. Both must be opaque and darker than the top
+    // card, AND the second-in-stack must render OVER the lower-in-stack — with
+    // the z-order inverted, the darker deeper card paints on top and the upper
+    // band comes out darker than the lower one (the exact bug a 2-card group
+    // cannot expose). Sampled at the card's horizontal center, clear of the
+    // rounded corners.
     let bounds = f.niri().panel_popover.date_menu().unwrap().group_rects()[0].1;
-    let peek = render_sample(
+    let samples = render_sample(
         &mut f,
-        vec![(bounds.size.w / 2., bounds.loc.y + bounds.size.h - 4.)],
-    )[0];
-    assert_eq!(peek[3], 255, "the peek strip is opaque, got {peek:?}");
+        vec![
+            (bounds.size.w / 2., bounds.loc.y + 95.), // second-in-stack
+            (bounds.size.w / 2., bounds.loc.y + 103.5), // lower-in-stack
+        ],
+    );
+    let (second, lower) = (samples[0], samples[1]);
+    assert_eq!(
+        second[3], 255,
+        "second-in-stack band opaque, got {second:?}"
+    );
+    assert_eq!(lower[3], 255, "lower-in-stack band opaque, got {lower:?}");
     assert!(
-        peek[0] < 0x51 && peek[0] > 0x30,
-        "the peek is a darkened card bg (below #51515a), got {peek:?}"
+        second[0] < 0x51 && second[0] > 0x30,
+        "the peek is a darkened card bg (below #51515a), got {second:?}"
+    );
+    assert!(
+        second[2] > lower[2] && second[0] >= lower[0],
+        "second-in-stack must paint OVER the darker lower-in-stack (z-order): \
+         second {second:?} vs lower {lower:?}"
     );
 
     // Expand the group through the real click path (clear of the close button).
