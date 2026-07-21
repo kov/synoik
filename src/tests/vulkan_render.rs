@@ -2728,26 +2728,29 @@ fn vulkan_renders_the_scrolled_message_list() {
     let output = f.niri_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
-    let make_group = |id: u32| CardGroup {
+    let card = |id: u32| CardContent {
+        id,
+        source_title: format!("App {id}"),
+        source_icon: None,
+        title: format!("msg {id}"),
+        body: "body".to_owned(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        critical: false,
+        time_text: "Just now".to_owned(),
+    };
+    let group = |id: u32, cards: Vec<CardContent>| CardGroup {
         key: crate::notifications::SourceKey::PidName(id, format!("App{id}")),
         source_title: format!("App {id}"),
         source_icon: None,
         has_urgent: false,
-        cards: vec![CardContent {
-            id,
-            source_title: format!("App {id}"),
-            source_icon: None,
-            title: format!("msg {id}"),
-            body: "body".to_owned(),
-            icon: None,
-            actions: Vec::new(),
-            has_default_action: false,
-            critical: false,
-            time_text: "Just now".to_owned(),
-        }],
+        cards,
     };
-    // A dozen distinct sources: far more than fit, so the list must scroll.
-    let groups: Vec<_> = (1..=12).map(make_group).collect();
+    // A collapsed 3-card stack at the top (so the bake exercises internal
+    // peek z-order) plus enough single sources that the list must scroll.
+    let mut groups = vec![group(1, vec![card(1), card(2), card(3)])];
+    groups.extend((4..=13).map(|id| group(id, vec![card(id)])));
     {
         let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
         let cal = f.niri().gnome_settings.calendar;
@@ -2792,14 +2795,22 @@ fn vulkan_renders_the_scrolled_message_list() {
                 let i = ((py * w + px) * 4) as usize;
                 [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
             };
-            // A card near the top of the viewport (clipped content).
-            let card = at(6. + (list_w - 18.) / 2., 6. + 40.);
+            let cx = 6. + (list_w - 18.) / 2.;
+            // The top card's bg (clipped content in the viewport).
+            let card = at(cx, 6. + 40.);
+            // The collapsed stack's two peek bands, baked through the scroll
+            // path: second-in-stack [90,100] must render OVER (lighter than)
+            // the deeper lower-in-stack [100,107]. If the bake's z-order is
+            // wrong (missing the `.rev()`), the card bg paints over the peeks
+            // and the icons, and this ordering flips.
+            let second = at(cx, 6. + 95.);
+            let lower = at(cx, 6. + 103.5);
             // The scrollbar thumb strip, near the viewport top (scroll at 0).
             let thumb = at(list_w - 7., 6. + 12.);
-            (card, thumb)
+            (card, second, lower, thumb)
         })
         .expect("vulkan renderer");
-    let (card, thumb) = samples;
+    let (card, second, lower, thumb) = samples;
 
     assert_eq!(
         card[3], 255,
@@ -2808,6 +2819,16 @@ fn vulkan_renders_the_scrolled_message_list() {
     assert!(
         card[0] > 0x40 && card[0] < 0x60,
         "the viewport shows a card bg (~#51515a), got {card:?}"
+    );
+    assert_eq!(
+        second[3], 255,
+        "second-in-stack band opaque, got {second:?}"
+    );
+    assert_eq!(lower[3], 255, "lower-in-stack band opaque, got {lower:?}");
+    assert!(
+        second[2] > lower[2] && second[0] >= lower[0],
+        "through the scroll bake, second-in-stack must paint OVER the darker \
+         lower-in-stack (z-order): second {second:?} vs lower {lower:?}"
     );
     assert_eq!(
         thumb[3], 255,

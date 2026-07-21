@@ -1312,13 +1312,18 @@ impl CalendarMessageList {
         // window falls outside the buffer and is clipped.
         let base = Point::from((0., -p.scroll));
         let elements = self.render_groups(renderer, icons, scale, base, &p.layouts);
+        // `render_groups` returns FIRST = topmost (the compositor's convention,
+        // `notification_card.rs:604`), but `render_to_texture` paints in
+        // iteration order (first = backmost). Reverse so the bake matches what
+        // the compositor would draw — else the card background paints over the
+        // close-× / caret icons (empty circles) and peek/group z-order inverts.
         let (tex, _sync) = render_to_texture(
             renderer,
             phys,
             Scale::from(scale),
             Transform::Normal,
             Fourcc::Abgr8888,
-            elements.into_iter(),
+            elements.into_iter().rev(),
         )?;
         renderer.make_offscreen_sampleable(&tex)?;
         *self.content_cache.borrow_mut() = Some(ContentTex {
