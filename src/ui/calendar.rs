@@ -97,10 +97,6 @@ const TODAY_CARD_H: f64 = TODAY_PAD + DAY_ROW + DATE_ROW + TODAY_PAD; // 62
 /// Gap between the today card and the month-nav header below it.
 const TODAY_GAP: f64 = 6.;
 const TODAY_RADIUS: f64 = 12.;
-/// The today card fill — GNOME's `$card_bg_color` = `lighten($bg_color, 7%)` ≈ `#47474c`, one
-/// step lighter than the `.popup-menu-content` box (`$bg_color` #36363a). Shared
-/// [`widget::style::CARD_BG`].
-const TODAY_CARD_BG: [f32; 4] = widget::style::CARD_BG;
 /// `.day-label` (weekday name) and `.date-label` (full date) point sizes. GNOME's date label is
 /// heavier (800) but the rasterizer tops out at bold (700); both draw bold here.
 const DAY_LABEL_PT: f64 = 11.;
@@ -499,9 +495,10 @@ impl Calendar {
                 )
             };
 
-            // Today card: a flat rounded fill with the weekday name over the full date.
+            // Today button: weekday name over the full date. gnome-shell's `.datemenu-today-button`
+            // extends `%card_flat` = `button(undecorated, flat)` — NO resting background (flat on
+            // the popover bg); only a hover wash (`_calendar.scss:23`, `_common.scss:163`).
             let card = layout.today_button();
-            p.fill_rounded(card, TODAY_RADIUS, TODAY_CARD_BG)?;
             if self.hovered == Some(CalHover::Today) {
                 p.fill_rounded(card, TODAY_RADIUS, HOVER_WASH)?;
             }
