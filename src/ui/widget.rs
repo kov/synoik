@@ -55,6 +55,18 @@ pub mod style {
     pub const HOVER_WASH: Rgba = [1., 1., 1., 0.1];
     /// Icon-name fallback chain for an "active/selected" check mark.
     pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
+
+    /// Modal-dialog card background — GNOME `$bg_color` `#36363a` (`_dialogs.scss:4`,
+    /// `_colors.scss:12`). Flat, borderless; corners rounded to `$alert_radius` (18px).
+    pub const DIALOG_BG: Rgba = [0.212, 0.212, 0.227, 1.];
+    /// `.button` normal fill — the subtle raised gray `mix($fg, $bg, 9%)` over the
+    /// dialog card (`_drawing.scss:171`, `$background_mix_factor` 9%).
+    pub const BUTTON_BG: Rgba = [0.283, 0.283, 0.297, 1.];
+    /// `.modal-dialog-button` fill — translucent white `rgba(255,255,255,0.1)`
+    /// (`%dialog_button`, `_drawing.scss:218`). Neutral dialog action button.
+    pub const DIALOG_BUTTON_BG: Rgba = [1., 1., 1., 0.1];
+    /// `.destructive-action` fill — `$red_4 #c01c28` (`_default-colors.scss:11`).
+    pub const DESTRUCTIVE_BG: Rgba = [0.753, 0.110, 0.157, 1.];
 }
 
 /// Composite a symbolic icon — the first of `candidates` that resolves — centered
@@ -455,6 +467,93 @@ impl Align {
     };
 }
 
+/// GNOME's button families (`_buttons.scss` / `_dialogs.scss`) — the styling a
+/// [`Button`] renders with. All carry bold white text; they differ in fill + radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonStyle {
+    /// `.button` (`%button`) — a subtle raised gray `mix($fg,$bg,9%)`, 8px radius.
+    Normal,
+    /// `.modal-dialog-button` (`%dialog_button`) — translucent white, 12px radius.
+    /// The neutral dialog action button (Cancel / Log Out / …); accent shows only
+    /// as the focus ring, matching GNOME 50.1's end-session dialog.
+    Dialog,
+    /// `.button.default` (`%default_button`) — solid accent fill, 8px radius. A
+    /// suggested/primary action.
+    Suggested,
+    /// `.destructive-action` — solid red `#c01c28`, 8px radius.
+    Destructive,
+}
+
+impl ButtonStyle {
+    /// Corner radius, logical px (`$base_border_radius` 8; dialog buttons `*1.5` = 12).
+    pub fn radius(self) -> f64 {
+        match self {
+            ButtonStyle::Dialog => 12.,
+            _ => 8.,
+        }
+    }
+
+    /// Base (non-hovered) fill; `accent` is the system accent, used by [`Suggested`].
+    fn bg(self, accent: Rgba) -> Rgba {
+        match self {
+            ButtonStyle::Normal => style::BUTTON_BG,
+            ButtonStyle::Dialog => style::DIALOG_BUTTON_BG,
+            ButtonStyle::Suggested => accent,
+            ButtonStyle::Destructive => style::DESTRUCTIVE_BG,
+        }
+    }
+}
+
+/// A clickable button: a rounded [`ButtonStyle`] fill with a centered bold-white
+/// label, the toolkit's standard hover wash, and an optional accent focus ring. The
+/// owner holds the logical `rect` (from its own layout) and the interaction flags;
+/// [`Painter::button`] draws it so every button behaves identically wherever it
+/// appears. The single higher-level widget in the otherwise-primitive toolkit.
+#[derive(Debug, Clone, Copy)]
+pub struct Button {
+    pub rect: Rectangle<f64, Logical>,
+    pub style: ButtonStyle,
+    pub hovered: bool,
+    /// Keyboard-focused / default action — draws the accent focus ring.
+    pub focused: bool,
+    /// The surface color behind the button, used to mask the focus ring out of the
+    /// interior so a translucent fill still composites over the card. Defaults to the
+    /// dialog card bg; override with [`on_surface`](Self::on_surface) elsewhere.
+    pub surface: Rgba,
+}
+
+impl Button {
+    pub fn new(rect: Rectangle<f64, Logical>, style: ButtonStyle) -> Self {
+        Self {
+            rect,
+            style,
+            hovered: false,
+            focused: false,
+            surface: style::DIALOG_BG,
+        }
+    }
+
+    pub fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = hovered;
+        self
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    pub fn on_surface(mut self, surface: Rgba) -> Self {
+        self.surface = surface;
+        self
+    }
+
+    /// Hit-test a point in the button's own logical coordinate space.
+    pub fn contains(&self, p: Point<f64, Logical>) -> bool {
+        self.rect.contains(p)
+    }
+}
+
 /// A scale-correct drawing surface over a bound [`VulkanFrame`]. Every verb takes
 /// **logical** coordinates/sizes (and points, for text); the single `× scale`
 /// conversion lives here. Construct one inside a [`bake`] `paint` closure.
@@ -629,6 +728,38 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     ) -> anyhow::Result<()> {
         self.frame
             .render_glyphs_spans(&shaped.run, origin, colors, self.full, &[self.full])?;
+        Ok(())
+    }
+
+    /// Draw a [`Button`]: the rounded style fill (+ hover wash), an accent focus ring
+    /// when focused, then the centered bold-white `label`. `accent` is the system
+    /// accent — the focus-ring color, and the fill for [`ButtonStyle::Suggested`].
+    ///
+    /// The focus ring is a 2px accent frame around the button. Because a
+    /// [`ButtonStyle::Dialog`] fill is translucent, the ring is painted as an outset
+    /// accent rect with the button's [`surface`](Button::surface) re-masked over the
+    /// interior, so the translucent fill still composites over the card, not the ring.
+    pub fn button(&mut self, b: &Button, label: &ShapedText, accent: Rgba) -> anyhow::Result<()> {
+        let radius = b.style.radius();
+        if b.focused {
+            const RING: f64 = 2.;
+            let ring = Rectangle::new(
+                Point::from((b.rect.loc.x - RING, b.rect.loc.y - RING)),
+                Size::from((b.rect.size.w + RING * 2., b.rect.size.h + RING * 2.)),
+            );
+            let ring_color = [accent[0], accent[1], accent[2], 0.8];
+            self.fill_rounded(ring, radius + RING, ring_color)?;
+            self.fill_rounded(b.rect, radius, b.surface)?;
+        }
+        self.fill_rounded(b.rect, radius, b.style.bg(accent))?;
+        if b.hovered {
+            self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
+        }
+        let center = Point::from((
+            b.rect.loc.x + b.rect.size.w / 2.,
+            b.rect.loc.y + b.rect.size.h / 2.,
+        ));
+        self.text_clipped(label, center, Align::CENTER, style::TEXT, b.rect)?;
         Ok(())
     }
 }
