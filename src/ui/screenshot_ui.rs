@@ -9,7 +9,7 @@ use niri_ipc::SizeChange;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
+use smithay::backend::renderer::{ContextId, Renderer, Texture};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -23,7 +23,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderTarget;
-use crate::ui::widget::{self, ParagraphSpan, TextShaper};
+use crate::ui::widget::{self, Painter, ParagraphSpan, TextShaper};
 use crate::utils::to_physical_precise_round;
 
 /// Per-element cache of a neutral CPU buffer uploaded once to a `VkTexture` (see
@@ -1461,7 +1461,6 @@ fn generate_panel(
     let text_x = padding + radius * 2 + padding - half_border_width;
 
     let size = Size::<i32, Physical>::from((width, height));
-    let full = Rectangle::from_size(size);
     let inner = Rectangle::new(
         Point::from((half_border_width, half_border_width)),
         Size::from((
@@ -1476,9 +1475,10 @@ fn generate_panel(
     // use `render_rounded_rect` — the offscreen "rounded misrenders" belief was a misdiagnosis
     // (see the quick-settings / calendar / panel-dot chrome) — but is left for a later pass.
     widget::bake_uncached_sized(renderer, size, |frame| {
+        let mut p = Painter::new(frame, scale, size);
         // Grey border = whole box grey, then the inner rect dark.
-        frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
-        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
+        p.clear(PANEL_BORDER_COLOR)?;
+        p.fill_rect_px(inner, PANEL_BG)?;
 
         // Two help lines, left-aligned at `text_x`.
         for (i, run) in runs.iter().enumerate() {
@@ -1494,10 +1494,10 @@ fn generate_panel(
                     Size::from((sw + kpad_x * 2, sh + kpad_y * 2)),
                 );
                 if let Some(patch) = patch.intersection(inner) {
-                    frame.clear(Color32F::from(KEYCAP_BG), &[patch])?;
+                    p.fill_rect_px(patch, KEYCAP_BG)?;
                 }
             }
-            frame.render_glyphs(run.run(), origin, TEXT_COLOR, full, &[full])?;
+            p.paragraph(run, origin, TEXT_COLOR)?;
         }
 
         Ok(())
