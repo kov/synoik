@@ -10,35 +10,29 @@
 //! commands table (`lg`, `rt`, ...).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::Path;
 
 use gio::glib;
-use niri_vk::text::{SpanFamily, TextSpan};
-use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, Frame as _, Texture};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Padding around the dialog text block, logical px.
 const PADDING: i32 = 16;
 /// Wrap width of the dialog text area, logical px.
 const WIDTH: i32 = 400;
-/// Base dialog font size (title + entry), GNOME body 11pt, logical px-per-em.
-const BASE_FONT_PX: f64 = crate::ui::pt_to_px(11.);
-/// Small (description/hint) font size, GNOME `%caption` 9pt, logical px-per-em.
-const SMALL_FONT_PX: f64 = crate::ui::pt_to_px(9.);
+/// Base dialog font size (title + entry), GNOME body, GNOME points.
+const BASE_PT: f64 = 11.;
+/// Small (description/hint) font size, GNOME `%caption`, GNOME points.
+const SMALL_PT: f64 = 9.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 /// Dialog box background (opaque dark grey), straight RGBA.
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
@@ -59,24 +53,7 @@ pub struct RunDialog {
     history_index: Option<usize>,
     /// Bumped on every content change to invalidate rendered buffers.
     revision: u64,
-    cache: RefCell<DialogCache>,
-}
-
-/// Cached dialog box textures per output scale, tagged with the content
-/// revision they were rendered at. Tied to a renderer context: dropped
-/// wholesale when the renderer changes.
-struct DialogCache {
-    context: Option<ContextId<VkTexture>>,
-    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
-}
-
-impl DialogCache {
-    fn new() -> Self {
-        Self {
-            context: None,
-            textures: HashMap::new(),
-        }
-    }
+    cache: RefCell<ContentCache>,
 }
 
 niri_render_elements! {
@@ -106,7 +83,7 @@ impl RunDialog {
             esc_pressed: false,
             history_index: None,
             revision: 0,
-            cache: RefCell::new(DialogCache::new()),
+            cache: RefCell::new(ContentCache::new()),
         }
     }
 
@@ -230,40 +207,28 @@ impl RunDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-        let Some(scale_key) = NotNan::new(scale).ok() else {
-            return;
-        };
 
         let texture = {
             let mut cache = self.cache.borrow_mut();
-
-            // The cached textures belong to one renderer context; drop them all if it changed.
-            let context = renderer.context_id();
-            if cache.context.as_ref() != Some(&context) {
-                cache.textures.clear();
-                cache.context = Some(context);
-            }
-
-            let fresh =
-                matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == self.revision);
-            if !fresh {
-                match draw_dialog_texture(renderer, scale, &self.entry, self.error.as_deref()) {
-                    Ok(texture) => {
-                        cache.textures.insert(scale_key, (self.revision, texture));
-                    }
-                    // Keep the last good texture for this scale (the failed draw never overwrote
-                    // the cache entry) and fall through to always draw the backdrop below. This
-                    // dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`): a draw failure
-                    // must NEVER make it vanish, or the seat is left in an invisible keyboard trap.
-                    // An out-of-date box beats an invisible one.
-                    Err(err) => {
-                        warn!(
-                            "error rendering the run dialog, keeping the previous frame: {err:#}"
-                        );
-                    }
+            // This dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`); a
+            // draw failure must never leave an invisible trap. On error we skip the
+            // box but still draw the backdrop below, so the modal stays visible.
+            let entry = &self.entry;
+            let error = self.error.as_deref();
+            match widget::bake_content(
+                renderer,
+                &mut cache,
+                scale,
+                self.revision,
+                |renderer| prepare_dialog(renderer, scale, entry, error),
+                paint_dialog,
+            ) {
+                Ok(texture) => Some(texture),
+                Err(err) => {
+                    warn!("error rendering the run dialog: {err:#}");
+                    None
                 }
             }
-            cache.textures.get(&scale_key).map(|(_, t)| t.clone())
         };
 
         if let Some(texture) = texture {
@@ -321,59 +286,40 @@ impl Default for RunDialog {
 /// Unlike the old pango path (which ellipsized a too-long entry from the start),
 /// a long command now *wraps* to more lines and the box grows — acceptable, and
 /// keeps every glyph visible.
-fn draw_dialog_texture(
+/// The dialog box layout (fixed width `WIDTH`, content-sized height), produced by
+/// [`prepare_dialog`] and drawn by [`paint_dialog`] (the [`widget::bake_content`]
+/// phases).
+struct DialogLayout {
+    run: ShapedParagraph,
+    origin: Point<i32, Physical>,
+}
+
+/// Shape the title/entry/hint paragraph and size the box — the prepare phase for
+/// [`widget::bake_content`]. A long command wraps (the box grows in height) rather
+/// than ellipsizing, keeping every glyph visible.
+fn prepare_dialog(
     renderer: &mut VulkanRenderer,
     scale: f64,
     entry: &str,
     error: Option<&str>,
-) -> anyhow::Result<VkTexture> {
-    let _span = tracy_client::span!("run_dialog::draw_dialog_texture");
+) -> anyhow::Result<(Size<i32, Physical>, DialogLayout)> {
+    let _span = tracy_client::span!("run_dialog::prepare_dialog");
 
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let padding = padding.max(0);
-    let wrap_px: i32 = to_physical_precise_round(scale, WIDTH);
-    let wrap_px = wrap_px.max(1);
-
-    let base_px = (BASE_FONT_PX * scale) as f32;
-    let small_px = (SMALL_FONT_PX * scale) as f32;
+    let padding = to_physical_precise_round::<i32>(scale, f64::from(PADDING)).max(0);
+    let wrap_px = to_physical_precise_round::<i32>(scale, f64::from(WIDTH)).max(1);
 
     let description = error.unwrap_or("Press ESC to close");
     // The entry line carries a trailing cursor bar (U+258F), like gnome-shell.
     let entry_line = format!("{entry}\u{258f}");
     let spans = [
-        TextSpan {
-            text: "Run a Command",
-            family: SpanFamily::Sans,
-            bold: true,
-            px: base_px,
-        },
-        TextSpan {
-            text: "\n\n",
-            family: SpanFamily::Sans,
-            bold: false,
-            px: base_px,
-        },
-        TextSpan {
-            text: &entry_line,
-            family: SpanFamily::Mono,
-            bold: false,
-            px: base_px,
-        },
-        TextSpan {
-            text: "\n\n",
-            family: SpanFamily::Sans,
-            bold: false,
-            px: small_px,
-        },
-        TextSpan {
-            text: description,
-            family: SpanFamily::Sans,
-            bold: false,
-            px: small_px,
-        },
+        ParagraphSpan::new("Run a Command", BASE_PT).bold(),
+        ParagraphSpan::new("\n\n", BASE_PT),
+        ParagraphSpan::new(&entry_line, BASE_PT).mono(),
+        ParagraphSpan::new("\n\n", SMALL_PT),
+        ParagraphSpan::new(description, SMALL_PT),
     ];
-
-    let run = renderer.build_glyph_paragraph(&spans, wrap_px as f32, base_px)?;
+    let mut shaper = TextShaper::new(renderer, scale);
+    let run = shaper.paragraph(&spans, f64::from(WIDTH), BASE_PT)?;
 
     // The paragraph is laid out in a [0, wrap_px] frame; size the box to its ink
     // plus padding and place the block at (padding, padding) (keeping the
@@ -385,25 +331,20 @@ fn draw_dialog_texture(
     let origin = Point::<i32, Physical>::from((padding, padding - iy));
 
     let size = Size::<i32, Physical>::from((box_w, box_h));
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((box_w, box_h)),
-    )?;
+    Ok((size, DialogLayout { run, origin }))
+}
 
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
-        let full = Rectangle::from_size(size);
-
-        frame.clear(Color32F::from(BOX_BG), &[full])?;
-        frame.render_glyphs(&run, origin, TEXT, full, &[full])?;
-        // finish() submits and fence-waits synchronously, so the sync point is already signaled.
-        let _sync = frame.finish()?;
-    }
-
-    // The box is sampled by its own render element; transition it to shader-read.
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+/// Draw the dark box and the paragraph — the paint phase for
+/// [`widget::bake_content`].
+fn paint_dialog(
+    frame: &mut VulkanFrame,
+    phys: Size<i32, Physical>,
+    layout: &DialogLayout,
+) -> anyhow::Result<()> {
+    let full = Rectangle::from_size(phys);
+    frame.clear(Color32F::from(BOX_BG), &[full])?;
+    frame.render_glyphs(layout.run.run(), layout.origin, TEXT, full, &[full])?;
+    Ok(())
 }
 
 /// Tokenize and resolve a run dialog command line the way gnome-shell does:
@@ -514,8 +455,11 @@ mod tests {
     /// cleanly with no Vulkan device.
     #[test]
     fn draws_the_dialog_with_glyph_coverage() {
-        use smithay::backend::renderer::ExportMem;
-        use smithay::utils::Rectangle;
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{Bind, ExportMem};
+        use smithay::utils::{Buffer as BufferCoord, Rectangle};
+
+        use crate::ui::widget::ContentCache;
 
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
@@ -537,8 +481,16 @@ mod tests {
             (1., "cat<", Some("error with <markup> & entities")),
             (2., long_entry.as_str(), None),
         ] {
-            let mut tex =
-                draw_dialog_texture(&mut vk, scale, entry, error).expect("dialog texture");
+            let mut cache = ContentCache::new();
+            let mut tex = widget::bake_content(
+                &mut vk,
+                &mut cache,
+                scale,
+                0,
+                |r| prepare_dialog(r, scale, entry, error),
+                paint_dialog,
+            )
+            .expect("dialog texture");
             let size = tex.size();
             assert!(size.w > 0 && size.h > 0);
 
