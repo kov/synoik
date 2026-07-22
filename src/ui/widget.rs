@@ -316,7 +316,9 @@ impl<'a> ParagraphSpan<'a> {
 
 /// A shaped, wrapped, multi-span paragraph — the dialog/notification text block.
 /// Its ink metrics are **physical** (content-sized widgets lay out in physical px
-/// directly); draw it with [`Painter::paragraph`].
+/// directly); draw it with [`Painter::paragraph`]. Cheap to clone (the glyph
+/// atlas is ref-counted), so a widget can shape into a `Vec` then move rows around.
+#[derive(Clone)]
 pub struct ShapedParagraph {
     run: GlyphRun,
 }

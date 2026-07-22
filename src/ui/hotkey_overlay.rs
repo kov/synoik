@@ -1,26 +1,24 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
 use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
-use niri_vk::text::{SpanFamily, TextSpan};
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, Frame as _, Texture};
 use smithay::input::keyboard::xkb::keysym_get_name;
-use smithay::output::{Output, WeakOutput};
-use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
+use smithay::output::Output;
+use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-const FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Overlay font size, GNOME points. `FONT_PX` is its logical px, used only for the
+/// inline key/spawn patch padding geometry; shaping goes through [`ParagraphSpan`].
+const FONT_PT: f64 = 11.;
+const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
@@ -60,13 +58,11 @@ pub struct HotkeyOverlay {
     is_open: bool,
     config: Rc<RefCell<Config>>,
     mod_key: ModKey,
-    buffers: RefCell<HashMap<WeakOutput, RenderedOverlay>>,
-}
-
-pub struct RenderedOverlay {
-    texture: Option<VkTexture>,
-    scale: f64,
-    context: Option<ContextId<VkTexture>>,
+    /// Content-sized bake, keyed by `(scale, revision)`. The content depends only on the config +
+    /// mod key, so [`revision`](Self::revision) is a generation counter bumped whenever those
+    /// change (a scale change is already a fresh key).
+    cache: RefCell<ContentCache>,
+    revision: u64,
 }
 
 impl HotkeyOverlay {
@@ -75,7 +71,8 @@ impl HotkeyOverlay {
             is_open: false,
             config,
             mod_key,
-            buffers: RefCell::new(HashMap::new()),
+            cache: RefCell::new(ContentCache::new()),
+            revision: 0,
         }
     }
 
@@ -103,7 +100,7 @@ impl HotkeyOverlay {
 
     pub fn on_hotkey_config_updated(&mut self, mod_key: ModKey) {
         self.mod_key = mod_key;
-        self.buffers.borrow_mut().clear();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn render(
@@ -117,30 +114,29 @@ impl HotkeyOverlay {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-
-        let mut buffers = self.buffers.borrow_mut();
-        buffers.retain(|output, _| output.is_alive());
-
-        let context = renderer.context_id();
+        let config = self.config.borrow();
+        let mod_key = self.mod_key;
 
         // FIXME: should probably use the working area rather than view size.
-        let weak = output.downgrade();
-        if let Some(rendered) = buffers.get(&weak) {
-            if rendered.scale != scale || rendered.context.as_ref() != Some(&context) {
-                buffers.remove(&weak);
-            }
-        }
-
-        let rendered = buffers.entry(weak).or_insert_with(|| {
-            // The overlay is drawn straight into a VkTexture by the owned renderer.
-            let texture = generate(renderer, &self.config.borrow(), self.mod_key, scale).ok();
-            RenderedOverlay {
-                texture,
+        let texture = {
+            let mut cache = self.cache.borrow_mut();
+            match widget::bake_content(
+                renderer,
+                &mut cache,
                 scale,
-                context: Some(context),
+                self.revision,
+                |r| prepare(r, &config, mod_key, scale),
+                paint,
+            ) {
+                Ok(texture) => Some(texture),
+                Err(err) => {
+                    // Empty table (nothing bound with `hide-not-bound`) or a GPU error: draw
+                    // nothing. Not cached, so it re-attempts next frame — cheap while empty.
+                    debug!("not rendering the hotkey overlay: {err:#}");
+                    None
+                }
             }
-        });
-        let texture = rendered.texture.as_ref()?;
+        }?;
 
         let size = Size::<f64, _>::from((
             f64::from(texture.width()) / scale,
@@ -151,13 +147,8 @@ impl HotkeyOverlay {
         location.x = f64::max(0., location.x);
         location.y = f64::max(0., location.y);
 
-        let buffer = TextureBuffer::from_texture(
-            renderer,
-            texture.clone(),
-            scale,
-            Transform::Normal,
-            Vec::new(),
-        );
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
 
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
@@ -393,25 +384,47 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
     actions
 }
 
-/// Draw the whole hotkey table straight into a `VkTexture`: a dark panel with a light-blue border,
-/// a centered bold title, then one row per action — a monospace key on a grey patch (a black patch
-/// behind a spawn command) and the action label. No cairo/pango.
-fn generate(
+/// A single laid-out table row: the shaped key + action runs and their draw origins, plus the
+/// pre-clipped background patches (the grey key patch, any black spawn-command patch).
+struct RowLayout {
+    key_run: ShapedParagraph,
+    key_origin: Point<i32, Physical>,
+    key_patch: Option<Rectangle<i32, Physical>>,
+    action_run: ShapedParagraph,
+    action_origin: Point<i32, Physical>,
+    /// Inline action patches (rect + color), already clipped to the inner panel.
+    action_patches: Vec<(Rectangle<i32, Physical>, [f32; 4])>,
+}
+
+/// The computed physical layout of the whole overlay panel, produced by [`prepare`] and drawn by
+/// [`paint`].
+struct OverlayLayout {
+    title_run: ShapedParagraph,
+    title_origin: Point<i32, Physical>,
+    inner: Rectangle<i32, Physical>,
+    rows: Vec<RowLayout>,
+}
+
+/// Shape the whole hotkey table and compute its content-sized layout — the prepare phase for
+/// [`widget::bake_content`]. A dark panel with a light-blue border, a centered bold title, then one
+/// row per action: a monospace key on a grey patch (a black patch behind a spawn command) and the
+/// action label. No cairo/pango.
+fn prepare(
     renderer: &mut VulkanRenderer,
     config: &Config,
     mod_key: ModKey,
     scale: f64,
-) -> anyhow::Result<VkTexture> {
-    let _span = tracy_client::span!("hotkey_overlay::generate");
+) -> anyhow::Result<(Size<i32, Physical>, OverlayLayout)> {
+    let _span = tracy_client::span!("hotkey_overlay::prepare");
 
-    let px = (FONT_PX * scale) as f32;
+    let font_px = FONT_PX * scale;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
     let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
     // Keep the border width even to avoid blurry edges.
     let border: i32 = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
     // Horizontal / vertical breathing room around the grey/black inline patches.
-    let hpad: i32 = (px * 0.3).round() as i32;
-    let vpad: i32 = (px * 0.12).round() as i32;
+    let hpad: i32 = (font_px * 0.3).round() as i32;
+    let vpad: i32 = (font_px * 0.12).round() as i32;
 
     let rows: Vec<(String, Label)> = collect_actions(config)
         .into_iter()
@@ -424,50 +437,31 @@ fn generate(
         .collect();
     anyhow::ensure!(!rows.is_empty(), "no hotkeys to show");
 
-    // Shape everything up front (each run owns its atlas), then measure, then draw.
-    const WRAP: f32 = 100_000.;
-    let title_run = renderer.build_glyph_paragraph(
-        &[TextSpan {
-            text: TITLE,
-            family: SpanFamily::Sans,
-            bold: true,
-            px,
-        }],
-        WRAP,
-        px,
-    )?;
+    // Shape everything up front (each run owns its atlas), then measure, then place. A generous
+    // non-wrapping width (logical px) — every line is short.
+    const WRAP: f64 = 100_000.;
+    let mut shaper = TextShaper::new(renderer, scale);
+    let title_run =
+        shaper.paragraph(&[ParagraphSpan::new(TITLE, FONT_PT).bold()], WRAP, FONT_PT)?;
     let key_runs = rows
         .iter()
-        .map(|(key, _)| {
-            renderer.build_glyph_paragraph(
-                &[TextSpan {
-                    text: key,
-                    family: SpanFamily::Mono,
-                    bold: false,
-                    px,
-                }],
-                WRAP,
-                px,
-            )
-        })
+        .map(|(key, _)| shaper.paragraph(&[ParagraphSpan::new(key, FONT_PT).mono()], WRAP, FONT_PT))
         .collect::<Result<Vec<_>, _>>()?;
     let action_runs = rows
         .iter()
         .map(|(_, label)| {
-            let spans: Vec<TextSpan> = label
+            let spans: Vec<ParagraphSpan> = label
                 .iter()
-                .map(|s| TextSpan {
-                    text: &s.text,
-                    family: if s.mono {
-                        SpanFamily::Mono
+                .map(|s| {
+                    let span = ParagraphSpan::new(&s.text, FONT_PT);
+                    if s.mono {
+                        span.mono()
                     } else {
-                        SpanFamily::Sans
-                    },
-                    bold: false,
-                    px,
+                        span
+                    }
                 })
                 .collect();
-            renderer.build_glyph_paragraph(&spans, WRAP, px)
+            shaper.paragraph(&spans, WRAP, FONT_PT)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -492,69 +486,110 @@ fn generate(
     let height = table_top + (n - 1) * row_advance + line_bottom + padding;
 
     let size = Size::<i32, Physical>::from((width, height));
-    let full = Rectangle::from_size(size);
     let inner = Rectangle::new(
         Point::from((border, border)),
         Size::from(((width - border * 2).max(0), (height - border * 2).max(0))),
     );
 
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((width, height)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    let title_origin = Point::<i32, Physical>::from(((width - tiw) / 2 - tix, padding - tiy));
 
-        // Light-blue border = whole panel border-coloured, then the inner rect dark.
-        frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
+    let action_x = padding + key_width + padding;
+    let mut row_layouts = Vec::with_capacity(rows.len());
+    for (i, (_, label)) in rows.iter().enumerate() {
+        let y_line = table_top + i as i32 * row_advance;
 
-        // Centered title.
-        let title_origin = Point::<i32, Physical>::from(((width - tiw) / 2 - tix, padding - tiy));
-        frame.render_glyphs(&title_run, title_origin, TEXT_COLOR, full, &[full])?;
-
-        for i in 0..rows.len() {
-            let y_line = table_top + i as i32 * row_advance;
-
-            // Key cell: grey patch hugging the mono text, then the text.
-            let (kx, ky, kw, kh) = key_ink[i];
-            let key_origin = Point::<i32, Physical>::from((padding - kx, y_line));
-            if kw > 0 && kh > 0 {
-                let patch = Rectangle::new(
+        // Key cell: grey patch hugging the mono text.
+        let (kx, ky, kw, kh) = key_ink[i];
+        let key_origin = Point::<i32, Physical>::from((padding - kx, y_line));
+        let key_patch = (kw > 0 && kh > 0)
+            .then(|| {
+                Rectangle::new(
                     Point::from((key_origin.x + kx - hpad, key_origin.y + ky - vpad)),
                     Size::from((kw + hpad * 2, kh + vpad * 2)),
+                )
+                .intersection(inner)
+            })
+            .flatten();
+
+        // Action cell: any inline background patches (spawn command).
+        let (ax, ..) = act_ink[i];
+        let act_origin = Point::<i32, Physical>::from((action_x - ax, y_line));
+        let mut action_patches = Vec::new();
+        for (si, span) in label.iter().enumerate() {
+            let Some(bg) = span.bg else { continue };
+            let (sx, sy, sw, sh) = action_runs[i].span_ink_bounds(si as u32);
+            if sw > 0 && sh > 0 {
+                let patch = Rectangle::new(
+                    Point::from((act_origin.x + sx - hpad / 2, act_origin.y + sy - vpad)),
+                    Size::from((sw + hpad, sh + vpad * 2)),
                 );
                 if let Some(patch) = patch.intersection(inner) {
-                    frame.clear(Color32F::from(KEY_BG), &[patch])?;
+                    action_patches.push((patch, bg));
                 }
             }
-            frame.render_glyphs(&key_runs[i], key_origin, TEXT_COLOR, full, &[full])?;
-
-            // Action cell: any inline background patches (spawn command), then the text.
-            let (ax, ..) = act_ink[i];
-            let action_x = padding + key_width + padding;
-            let act_origin = Point::<i32, Physical>::from((action_x - ax, y_line));
-            for (si, span) in rows[i].1.iter().enumerate() {
-                let Some(bg) = span.bg else { continue };
-                let (sx, sy, sw, sh) = action_runs[i].span_ink_bounds(si as u32);
-                if sw > 0 && sh > 0 {
-                    let patch = Rectangle::new(
-                        Point::from((act_origin.x + sx - hpad / 2, act_origin.y + sy - vpad)),
-                        Size::from((sw + hpad, sh + vpad * 2)),
-                    );
-                    if let Some(patch) = patch.intersection(inner) {
-                        frame.clear(Color32F::from(bg), &[patch])?;
-                    }
-                }
-            }
-            frame.render_glyphs(&action_runs[i], act_origin, TEXT_COLOR, full, &[full])?;
         }
 
-        let _sync = frame.finish()?;
+        row_layouts.push(RowLayout {
+            key_run: key_runs[i].clone(),
+            key_origin,
+            key_patch,
+            action_run: action_runs[i].clone(),
+            action_origin: act_origin,
+            action_patches,
+        });
     }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+
+    Ok((
+        size,
+        OverlayLayout {
+            title_run,
+            title_origin,
+            inner,
+            rows: row_layouts,
+        },
+    ))
+}
+
+/// Draw the bordered panel, the title, and every row — the paint phase for
+/// [`widget::bake_content`].
+fn paint(
+    frame: &mut VulkanFrame,
+    phys: Size<i32, Physical>,
+    layout: &OverlayLayout,
+) -> anyhow::Result<()> {
+    let full = Rectangle::from_size(phys);
+
+    // Light-blue border = whole panel border-coloured, then the inner rect dark.
+    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
+    frame.clear(Color32F::from(PANEL_BG), &[layout.inner])?;
+
+    frame.render_glyphs(
+        layout.title_run.run(),
+        layout.title_origin,
+        TEXT_COLOR,
+        full,
+        &[full],
+    )?;
+
+    for row in &layout.rows {
+        if let Some(patch) = row.key_patch {
+            frame.clear(Color32F::from(KEY_BG), &[patch])?;
+        }
+        frame.render_glyphs(row.key_run.run(), row.key_origin, TEXT_COLOR, full, &[full])?;
+
+        for (patch, bg) in &row.action_patches {
+            frame.clear(Color32F::from(*bg), &[*patch])?;
+        }
+        frame.render_glyphs(
+            row.action_run.run(),
+            row.action_origin,
+            TEXT_COLOR,
+            full,
+            &[full],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn action_name(action: &Action) -> String {
