@@ -281,11 +281,11 @@ impl TextStyle {
 }
 
 /// A shaped, rasterized run ready to draw — produced by [`TextShaper::shape`] at a
-/// specific scale, drawn by [`Painter::text`]. Opaque wrapper over the physical
-/// [`GlyphRun`]. [`Painter::text`] covers the common anchored+clipped-to-buffer
-/// case; widgets needing a custom clip rect (a header label clipped short of a
-/// right-aligned time) read [`ink_bounds`](Self::ink_bounds) and draw the
-/// [`run`](Self::run) with `VulkanFrame::render_glyphs` directly.
+/// specific scale. Opaque wrapper over the physical [`GlyphRun`]. Drawn via
+/// [`Painter::text`] (ink-box anchored + clipped to the buffer),
+/// [`text_clipped`](Painter::text_clipped) (a custom clip rect — a header label
+/// stopping short of a right-aligned time), or [`text_px`](Painter::text_px) (a
+/// hand-computed physical origin — the advance-centered panel clock).
 #[derive(Clone)]
 pub struct ShapedText {
     run: GlyphRun,
@@ -295,11 +295,6 @@ impl ShapedText {
     /// Ink bounding box, physical px: `(x, y, w, h)`.
     pub fn ink_bounds(&self) -> (i32, i32, i32, i32) {
         self.run.ink_bounds()
-    }
-
-    /// The shaped run, for a custom-clip `VulkanFrame::render_glyphs`.
-    pub(crate) fn run(&self) -> &GlyphRun {
-        &self.run
     }
 }
 
@@ -355,12 +350,6 @@ impl ShapedParagraph {
     /// patch behind a monospace command span.
     pub fn span_ink_bounds(&self, i: u32) -> (i32, i32, i32, i32) {
         self.run.span_ink_bounds(i)
-    }
-
-    /// The shaped run, for drawing with [`Painter::paragraph`] or (content-sized
-    /// widgets laying out in physical px) `VulkanFrame::render_glyphs` directly.
-    pub(crate) fn run(&self) -> &GlyphRun {
-        &self.run
     }
 }
 
@@ -582,6 +571,22 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             clip,
             &[self.full],
         )?;
+        Ok(())
+    }
+
+    /// Draw a shaped run at a precomputed **physical** glyph-layout `origin`, tinted
+    /// `color`, clipped to the whole buffer. The physical-coordinate counterpart to
+    /// [`text`](Self::text) for a run whose placement isn't a simple ink-box anchor —
+    /// the panel clock is *advance-centered* (tabular figures keep it from jittering as
+    /// the seconds tick), so its origin is computed by hand rather than via [`Align`].
+    pub fn text_px(
+        &mut self,
+        shaped: &ShapedText,
+        origin: Point<i32, Physical>,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        self.frame
+            .render_glyphs(&shaped.run, origin, color, self.full, &[self.full])?;
         Ok(())
     }
 

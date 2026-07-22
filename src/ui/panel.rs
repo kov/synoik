@@ -35,7 +35,7 @@ use std::time::Duration;
 use niri_config::Config;
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
+use smithay::backend::renderer::{ContextId, Renderer, Texture};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
@@ -44,9 +44,9 @@ use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::system_status::{self, SystemStatus};
-use crate::ui::widget::{self, TextShaper, TextStyle};
+use crate::ui::widget::{self, Painter, TextShaper, TextStyle};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Logical height of the panel. GNOME's is `2.2em` at an `11pt` base font,
@@ -1374,13 +1374,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// rect, and the button pill — stay the same width throughout the slide. Laid out at the
 /// left, vertically centered; fully rounded (`$forced_circular_radius`). Drawn over the
 /// opaque bar background, so the texture stays fully opaque.
-fn draw_workspace_dots(
-    frame: &mut VulkanFrame,
-    scale: f64,
-    count: usize,
-    position: f64,
-    full: Rectangle<i32, Physical>,
-) -> anyhow::Result<()> {
+fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::Result<()> {
     if count == 0 {
         return Ok(());
     }
@@ -1401,18 +1395,11 @@ fn draw_workspace_dots(
         let draw_h = DOT_DIAMETER * dot_scale;
         let slot_cx = x + slot_w / 2.;
         let rect = Rectangle::new(
-            Point::<i32, Physical>::from((
-                to_physical_precise_round::<i32>(scale, slot_cx - draw_w / 2.),
-                to_physical_precise_round::<i32>(scale, band_cy - draw_h / 2.),
-            )),
-            Size::<i32, Physical>::from((
-                to_physical_precise_round::<i32>(scale, draw_w).max(1),
-                to_physical_precise_round::<i32>(scale, draw_h).max(1),
-            )),
+            Point::<f64, Logical>::from((slot_cx - draw_w / 2., band_cy - draw_h / 2.)),
+            Size::<f64, Logical>::from((draw_w, draw_h)),
         );
-        // Half the physical height clamps to a full circle (small dot) or stadium (pill).
-        let radius = rect.size.h as f32 / 2.;
-        frame.render_rounded_rect([1., 1., 1., opacity], radius, rect, &[full])?;
+        // Half the height clamps to a full circle (small dot) or stadium (pill).
+        p.fill_rounded(rect, draw_h / 2., [1., 1., 1., opacity])?;
         x += slot_w + DOT_SPACING;
     }
     Ok(())
@@ -1481,34 +1468,23 @@ fn draw_bar_texture(
     let size = Size::<i32, Physical>::from((width_px, height_px));
 
     widget::bake_uncached_sized(renderer, size, |frame| {
-        let full = Rectangle::from_size(size);
+        let mut p = Painter::new(frame, scale, size);
 
-        frame.clear(Color32F::from(BAR_BG), &[full])?;
+        p.clear(BAR_BG)?;
         // The rounded button containers (hover/active), behind the button content.
+        // Half the height clamps the SDF to a stadium (fully rounded pill).
         for (rect, color) in containers {
-            let phys = Rectangle::new(
-                Point::<i32, Physical>::from((
-                    to_physical_precise_round(scale, rect.loc.x),
-                    to_physical_precise_round(scale, rect.loc.y),
-                )),
-                Size::<i32, Physical>::from((
-                    to_physical_precise_round::<i32>(scale, rect.size.w).max(1),
-                    to_physical_precise_round::<i32>(scale, rect.size.h).max(1),
-                )),
-            );
-            // Half the physical height clamps the SDF to a stadium (fully rounded pill).
-            let radius = phys.size.h as f32 / 2.;
-            frame.render_rounded_rect(*color, radius, phys, &[full])?;
+            p.fill_rounded(*rect, rect.size.h / 2., *color)?;
         }
-        draw_workspace_dots(frame, scale, count, position, full)?;
-        frame.render_glyphs(clock_run.run(), c_origin, TEXT, full, &[full])?;
+        draw_workspace_dots(&mut p, count, position)?;
+        p.text_px(&clock_run, c_origin, TEXT)?;
         // The screen-recording pill's M:SS label, over its red container.
         if let Some((run, origin)) = &recording {
-            frame.render_glyphs(run.run(), *origin, TEXT, full, &[full])?;
+            p.text_px(run, *origin, TEXT)?;
         }
         // The keyboard input-source short label.
         if let Some((run, origin)) = &keyboard {
-            frame.render_glyphs(run.run(), *origin, TEXT, full, &[full])?;
+            p.text_px(run, *origin, TEXT)?;
         }
         Ok(())
     })
