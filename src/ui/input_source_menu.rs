@@ -219,9 +219,12 @@ impl InputSourceMenu {
                 RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
                 RowKind::Settings => ("Keyboard Settings".to_owned(), None),
             };
-            let label_run = renderer.build_glyph_run_weighted(&label, TEXT_PX as f32, false)?;
+            // Physical font size: the buffer is scale-sized, so the glyph run
+            // must be too (else the text renders at 1/scale — minuscule on HiDPI).
+            let font_px = (TEXT_PX * scale) as f32;
+            let label_run = renderer.build_glyph_run_weighted(&label, font_px, false)?;
             let short_run = short
-                .map(|s| renderer.build_glyph_run_weighted(&s, TEXT_PX as f32, false))
+                .map(|s| renderer.build_glyph_run_weighted(&s, font_px, false))
                 .transpose()?;
             row_runs.push((label_run, short_run));
         }
