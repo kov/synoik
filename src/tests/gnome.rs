@@ -3582,6 +3582,101 @@ fn notifications_sender_vanish_via_handler() {
     assert!(matches!(sources[0].key, SourceKey::PidName(..)));
 }
 
+/// The `org.gtk.Notifications` request path (`js/ui/notificationDaemon.js`
+/// `GtkNotificationDaemon` — `AddNotification`/`RemoveNotification` keyed by
+/// `(app_id, gtk_id)`, action routing by `app.` prefix), driven through
+/// `on_notifications_msg`. `.desktop` resolution is server-side and tested in
+/// `dbus::gtk_notifications`; here the request arrives already resolved.
+#[test]
+fn notifications_gtk_add_action_and_remove_via_handler() {
+    use crate::notifications::{
+        GtkNotifyRequest, GtkToNotifications, NotificationsToNiri, SourceKey, Urgency,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let gtk_req = |gtk_id: &str| GtkNotifyRequest {
+        app_id: "org.example.Chat".to_owned(),
+        gtk_id: gtk_id.to_owned(),
+        app_title: "Chat".to_owned(),
+        app_icon: None,
+        title: "title".to_owned(),
+        body: "body".to_owned(),
+        icon: None,
+        actions: vec![("reply".to_owned(), "Reply".to_owned())],
+        default_action: Some("app.open".to_owned()),
+        urgency: Urgency::Normal,
+    };
+
+    // Add: a GtkApp source appears, keyed by application-id, with the
+    // server-resolved display name.
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::AddGtk {
+            req: gtk_req("msg-1"),
+        });
+    assert_eq!(f.niri().notifications.sources.len(), 1);
+    let source = &f.niri().notifications.sources[0];
+    assert!(matches!(&source.key, SourceKey::GtkApp(a) if a == "org.example.Chat"));
+    assert_eq!(source.title, "Chat");
+    let id = source.notifications[0].id;
+
+    // Add with the same (app_id, gtk_id) replaces in place — no second card.
+    let mut update = gtk_req("msg-1");
+    update.title = "updated".to_owned();
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::AddGtk { req: update });
+    assert_eq!(f.niri().notifications.sources[0].notifications.len(), 1);
+    assert_eq!(f.niri().notifications.find(id).unwrap().title, "updated");
+
+    // A non-`app.` action routes to the Gtk emit channel (NOT the fdo one).
+    let (to_gtk, gtk_emitted) = async_channel::unbounded();
+    f.niri_state().niri.gtk_notifications_emit = Some(to_gtk);
+    let (to_fdo, fdo_emitted) = async_channel::unbounded();
+    f.niri_state().niri.notifications_emit = Some(to_fdo);
+
+    f.niri_state()
+        .niri
+        .emit_notification_action(id, "reply".to_owned());
+    match gtk_emitted.recv_blocking().unwrap() {
+        GtkToNotifications::ActionInvoked {
+            app_id,
+            gtk_id,
+            action,
+            ..
+        } => {
+            assert_eq!(app_id, "org.example.Chat");
+            assert_eq!(gtk_id, "msg-1");
+            assert_eq!(action, "reply");
+        }
+    }
+    assert!(
+        fdo_emitted.try_recv().is_err(),
+        "a Gtk notification must not emit on the fdo channel"
+    );
+
+    // The body-click pseudo-key resolves to the payload's default-action.
+    f.niri_state()
+        .niri
+        .emit_notification_action(id, "default".to_owned());
+    match gtk_emitted.recv_blocking().unwrap() {
+        GtkToNotifications::ActionInvoked { action, .. } => assert_eq!(action, "app.open"),
+    }
+
+    // Remove destroys it and emits no fdo NotificationClosed (no sender).
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::RemoveGtk {
+            app_id: "org.example.Chat".to_owned(),
+            gtk_id: "msg-1".to_owned(),
+        });
+    assert!(f.niri().notifications.find(id).is_none());
+    assert!(f.niri().notifications.sources.is_empty());
+    assert!(
+        fdo_emitted.try_recv().is_err(),
+        "removing a Gtk notification emits no NotificationClosed"
+    );
+}
+
 // ---- Notification banner (slice 2) ----
 
 fn banner_req(app: &str, sender: &str) -> crate::notifications::NotifyRequest {

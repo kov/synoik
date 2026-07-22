@@ -390,6 +390,11 @@ pub struct Niri {
     /// server isn't running.
     pub notifications_emit:
         Option<async_channel::Sender<crate::notifications::NiriToNotifications>>,
+    /// Emit-command channel to the `org.gtk.Notifications` server task (separate
+    /// from [`Self::notifications_emit`] because that interface's `ActionInvoked`
+    /// differs in shape and is broadcast); `None` when the server isn't running.
+    pub gtk_notifications_emit:
+        Option<async_channel::Sender<crate::notifications::GtkToNotifications>>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
@@ -2715,6 +2720,16 @@ impl State {
                 let effects = self.niri.notifications.sender_vanished(&name);
                 self.apply_notification_effects(effects);
             }
+            NotificationsToNiri::AddGtk { req } => {
+                let now = self.niri.clock.now_unadjusted();
+                let show_banners = !self.niri.gnome_settings.quick_toggles.do_not_disturb;
+                let effects = self.niri.notifications.add_gtk(req, show_banners, now);
+                self.apply_notification_effects(effects);
+            }
+            NotificationsToNiri::RemoveGtk { app_id, gtk_id } => {
+                let effects = self.niri.notifications.remove_gtk(&app_id, &gtk_id);
+                self.apply_notification_effects(effects);
+            }
         }
     }
 
@@ -3182,6 +3197,7 @@ impl Niri {
             system_status: SystemStatus::default(),
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,
+            gtk_notifications_emit: None,
             notification_banner,
             notification_banner_timer: None,
             last_power_profile: "power-saver".to_string(),
@@ -7553,10 +7569,17 @@ impl Niri {
 
         if let Some(tx) = &self.notifications_emit {
             for closed in &effects.closed {
+                // `NotificationClosed` is an fdo signal, unicast to the posting
+                // client; a notification with no sender has nothing to emit to
+                // (an untracked fdo notification, or any `org.gtk.Notifications`
+                // one — that interface has no closed signal at all).
+                let Some(sender) = closed.sender.clone() else {
+                    continue;
+                };
                 let _ = tx.send_blocking(NiriToNotifications::Closed {
                     id: closed.id,
                     reason: closed.reason,
-                    sender: closed.sender.clone(),
+                    sender: Some(sender),
                 });
             }
         }
@@ -7641,22 +7664,60 @@ impl Niri {
         self.idle_monitor.idletime_ms(now) > crate::ui::notification_banner::IDLE_TIME_MS
     }
 
-    /// Emit `ActivationToken` + `ActionInvoked` (in that order, unicast to the
-    /// notification's sender) for a clicked action. The token is a real XDG
-    /// activation token, so the app can activate itself with it
-    /// (`js/ui/notificationDaemon.js:224-236,310-316`).
+    /// A clicked action (button, or a body click resolving to the default
+    /// action) routed to the notification's D-Bus origin. The token is a real
+    /// XDG activation token so the app can activate itself with it.
+    ///
+    /// - fdo (`js/ui/notificationDaemon.js:224-236,310-316`): `ActivationToken` then
+    ///   `ActionInvoked`, unicast to the notification's sender.
+    /// - `org.gtk.Notifications` (`js/ui/notificationDaemon.js:453-465`): the body-click pseudo-key
+    ///   `"default"` resolves to the payload's stored default-action string; the resulting key
+    ///   routes to the app (`app.` prefix, slice 2) or broadcasts `ActionInvoked` — the server
+    ///   decides.
     pub fn emit_notification_action(&mut self, id: u32, action: String) {
-        use crate::notifications::NiriToNotifications;
-        let sender = self.notifications.find(id).and_then(|n| n.sender.clone());
+        use crate::notifications::{GtkToNotifications, NiriToNotifications, NotifKind};
+        let Some(notification) = self.notifications.find(id) else {
+            return;
+        };
+        let kind = notification.kind.clone();
+        let sender = notification.sender.clone();
         let (token, _) = self.activation_state.create_external_token(None);
         let token = token.as_str().to_owned();
-        if let Some(tx) = &self.notifications_emit {
-            let _ = tx.send_blocking(NiriToNotifications::ActionInvoked {
-                id,
-                action,
-                token,
-                sender,
-            });
+
+        match kind {
+            NotifKind::Fdo => {
+                if let Some(tx) = &self.notifications_emit {
+                    let _ = tx.send_blocking(NiriToNotifications::ActionInvoked {
+                        id,
+                        action,
+                        token,
+                        sender,
+                    });
+                }
+            }
+            NotifKind::Gtk {
+                app_id,
+                gtk_id,
+                default_action,
+            } => {
+                // Resolve the body-click pseudo-key to the real default action.
+                let action = if action == "default" {
+                    match default_action {
+                        Some(action) => action,
+                        None => return,
+                    }
+                } else {
+                    action
+                };
+                if let Some(tx) = &self.gtk_notifications_emit {
+                    let _ = tx.send_blocking(GtkToNotifications::ActionInvoked {
+                        app_id,
+                        gtk_id,
+                        action,
+                        token,
+                    });
+                }
+            }
         }
     }
 

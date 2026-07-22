@@ -192,10 +192,35 @@ impl NotificationIcon {
 /// `desktop-entry` hint when present, else (pid, app_name) with the pid the
 /// D-Bus server resolved from the sender (GNOME's fdo proxy injects it the
 /// same way, `js/dbusServices/notifications/notificationDaemon.js:99-121`).
+///
+/// `GtkApp` keys `org.gtk.Notifications` notifications by their application-id,
+/// kept distinct from the fdo variants so the two front-ends never share a
+/// source (gnome-shell runs them as two independent daemons, each adding its
+/// own sources to the tray — `js/ui/notificationDaemon.js:714-719`). This also
+/// keeps Gtk sources out of the fdo sender-vanish teardown, which they must be:
+/// the Gtk daemon watches no bus names and its notifications persist.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceKey {
     DesktopEntry(String),
     PidName(u32, String),
+    GtkApp(String),
+}
+
+/// Which D-Bus front-end created a notification. Signals route by origin: fdo
+/// notifications emit `NotificationClosed`/`ActionInvoked` unicast to their
+/// sender; `org.gtk.Notifications` has no closed signal and broadcasts
+/// `ActionInvoked(app_id, id, …)` keyed by application-id + the app-supplied
+/// string id (`js/ui/notificationDaemon.js:508-534`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifKind {
+    Fdo,
+    Gtk {
+        app_id: String,
+        gtk_id: String,
+        /// The `default-action` key (body-click), possibly `app.`-prefixed;
+        /// `None` when the payload set none (`js/ui/notificationDaemon.js:466`).
+        default_action: Option<String>,
+    },
 }
 
 /// A fully-parsed, validated `Notify()` call, produced by the D-Bus server
@@ -225,6 +250,35 @@ pub struct NotifyRequest {
     pub transient: bool,
 }
 
+/// A fully-parsed, validated `org.gtk.Notifications` `AddNotification` call,
+/// produced by the Gtk D-Bus server (the untrusted side of the seam) and
+/// consumed by [`NotificationStore::add_gtk`]. Unlike the fdo path there is no
+/// app name/icon in the payload: the server resolves `${app_id}.desktop` for
+/// `app_title`/`app_icon`, exactly like gnome-shell's `lookup_app`
+/// (`js/ui/notificationDaemon.js:493-501`). Action targets (`av`) stay on the
+/// server side of the seam (they are untrusted `GVariant`s); the model only
+/// carries the plain action keys and labels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GtkNotifyRequest {
+    /// The application-id (`.desktop` id), source key + `ActionInvoked` route.
+    pub app_id: String,
+    /// The app-supplied notification id string (replace/remove key).
+    pub gtk_id: String,
+    /// The `.desktop` `Name` (falls back to `app_id` when unreadable).
+    pub app_title: String,
+    /// The `.desktop` `Icon`.
+    pub app_icon: Option<NotificationIcon>,
+    pub title: String,
+    pub body: String,
+    /// The payload's serialized `GIcon`.
+    pub icon: Option<NotificationIcon>,
+    /// (action key, label) button pairs; keys may be `app.`-prefixed.
+    pub actions: Vec<(String, String)>,
+    /// The `default-action` key (body click), if any.
+    pub default_action: Option<String>,
+    pub urgency: Urgency,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notification {
     pub id: u32,
@@ -244,6 +298,8 @@ pub struct Notification {
     /// Clock-based (pinned in tests). Refreshed by any change except
     /// acknowledgement (`js/ui/messageTray.js:364-380`).
     pub timestamp: Duration,
+    /// Which D-Bus front-end created it; drives signal routing.
+    pub kind: NotifKind,
 }
 
 /// One app's notifications, FIFO like gnome-shell's `Source.notifications`
@@ -333,6 +389,12 @@ pub enum NotificationsToNiri {
     },
     /// A unique bus name left the bus.
     SenderVanished(String),
+    /// `org.gtk.Notifications` `AddNotification` — already validated and
+    /// `.desktop`-resolved by the Gtk server (fire-and-forget: `INVALID_APP` is
+    /// decided server-side before this is sent, so there is no reply).
+    AddGtk { req: GtkNotifyRequest },
+    /// `org.gtk.Notifications` `RemoveNotification(app_id, id)`.
+    RemoveGtk { app_id: String, gtk_id: String },
 }
 
 /// Emit commands from the compositor back to the D-Bus server, which owns the
@@ -351,6 +413,23 @@ pub enum NiriToNotifications {
         action: String,
         token: String,
         sender: Option<String>,
+    },
+}
+
+/// Emit commands from the compositor to the `org.gtk.Notifications` server,
+/// which owns that connection. Kept separate from [`NiriToNotifications`]
+/// because the Gtk interface's `ActionInvoked` has a different signature and is
+/// broadcast (not unicast), and `app.`-prefixed actions route to the app
+/// instead of a signal (`js/ui/notificationDaemon.js:456-465,508-534`).
+pub enum GtkToNotifications {
+    ActionInvoked {
+        app_id: String,
+        gtk_id: String,
+        /// The action key; `app.`-prefixed keys route to the app (slice 2),
+        /// others broadcast `ActionInvoked`.
+        action: String,
+        /// XDG activation token, carried in `platform_data`.
+        token: String,
     },
 }
 
@@ -393,6 +472,19 @@ impl NotificationStore {
             .iter_mut()
             .flat_map(|s| s.notifications.iter_mut())
             .find(|n| n.id == id)
+    }
+
+    /// Find a live `org.gtk.Notifications` notification by its `(app_id, gtk_id)`.
+    fn find_gtk(&self, app_id: &str, gtk_id: &str) -> Option<&Notification> {
+        self.sources
+            .iter()
+            .flat_map(|s| s.notifications.iter())
+            .find(|n| {
+                matches!(
+                    &n.kind,
+                    NotifKind::Gtk { app_id: a, gtk_id: g, .. } if a == app_id && g == gtk_id
+                )
+            })
     }
 
     pub fn unseen_count(&self) -> usize {
@@ -500,6 +592,7 @@ impl NotificationStore {
                 transient: req.transient,
                 acknowledged: false,
                 timestamp: now,
+                kind: NotifKind::Fdo,
             };
 
             let idx = match self.sources.iter().position(|s| s.key == key) {
@@ -544,6 +637,124 @@ impl NotificationStore {
             });
         }
         Ok((id, effects))
+    }
+
+    /// Handle an `org.gtk.Notifications` `AddNotification`: replace in place when
+    /// a notification with the same `(app_id, gtk_id)` is live (gnome-shell
+    /// destroys+re-adds by id, `js/ui/notificationDaemon.js:544-551`), else
+    /// allocate the next id. There is no numeric id to return and NO
+    /// `NotificationClosed` is ever emitted for Gtk notifications — the
+    /// interface has only `ActionInvoked`. Sources key by application-id and
+    /// carry no bus name (`sender: None`): the Gtk daemon watches no senders, so
+    /// its notifications persist across the posting process exiting.
+    pub fn add_gtk(&mut self, req: GtkNotifyRequest, show_banners: bool, now: Duration) -> Effects {
+        let mut effects = Effects::default();
+        let key = SourceKey::GtkApp(req.app_id.clone());
+        let kind = NotifKind::Gtk {
+            app_id: req.app_id.clone(),
+            gtk_id: req.gtk_id.clone(),
+            default_action: req.default_action.clone(),
+        };
+
+        let id = if let Some(id) = self.find_gtk(&req.app_id, &req.gtk_id).map(|n| n.id) {
+            // Replace: mutate in place, reset `acknowledged`, refresh timestamp,
+            // no NotificationClosed (mirrors the fdo replace branch).
+            let notification = self.find_mut(id).unwrap();
+            notification.title = req.title;
+            notification.body = req.body;
+            notification.icon = req.icon;
+            notification.actions = req.actions;
+            notification.has_default_action = req.default_action.is_some();
+            notification.urgency = req.urgency;
+            notification.acknowledged = false;
+            notification.timestamp = now;
+            notification.kind = kind;
+            let source = self
+                .sources
+                .iter_mut()
+                .find(|s| s.notifications.iter().any(|n| n.id == id))
+                .unwrap();
+            source.title = req.app_title;
+            source.icon = req.app_icon;
+            id
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+
+            // Evict oldest-first past the per-source cap BEFORE pushing.
+            if let Some(source) = self.sources.iter().find(|s| s.key == key) {
+                let excess =
+                    (source.notifications.len() + 1).saturating_sub(MAX_NOTIFICATIONS_PER_SOURCE);
+                let evict: Vec<u32> = source.notifications[..excess]
+                    .iter()
+                    .map(|n| n.id)
+                    .collect();
+                for evicted in evict {
+                    merge(&mut effects, self.close(evicted, CloseReason::Expired));
+                }
+            }
+
+            let notification = Notification {
+                id,
+                sender: None,
+                title: req.title,
+                body: req.body,
+                icon: req.icon,
+                actions: req.actions,
+                has_default_action: req.default_action.is_some(),
+                urgency: req.urgency,
+                resident: false,
+                transient: false,
+                acknowledged: false,
+                timestamp: now,
+                kind,
+            };
+
+            let idx = match self.sources.iter().position(|s| s.key == key) {
+                Some(idx) => idx,
+                None => {
+                    self.sources.insert(
+                        0,
+                        Source {
+                            key,
+                            sender: None,
+                            title: String::new(),
+                            icon: None,
+                            notifications: Vec::new(),
+                        },
+                    );
+                    0
+                }
+            };
+            let source = self.sources.remove(idx);
+            self.sources.insert(0, source);
+            let source = &mut self.sources[0];
+            source.sender = None;
+            source.title = req.app_title;
+            source.icon = req.app_icon;
+            source.notifications.push(notification);
+            id
+        };
+
+        if let Some(banner) = self.request_banner(id, show_banners) {
+            effects.banner = Some(match effects.banner {
+                Some(BannerEffect::HideCurrent) if banner != BannerEffect::RefreshCurrent => {
+                    BannerEffect::HideCurrent
+                }
+                _ => banner,
+            });
+        }
+        effects
+    }
+
+    /// `org.gtk.Notifications` `RemoveNotification(app_id, id)`: destroy the
+    /// matching notification (internal SOURCE_CLOSED); unknown ids are a no-op
+    /// (`js/ui/notificationDaemon.js:566-570`). No D-Bus signal is emitted.
+    pub fn remove_gtk(&mut self, app_id: &str, gtk_id: &str) -> Effects {
+        match self.find_gtk(app_id, gtk_id).map(|n| n.id) {
+            Some(id) => self.close(id, CloseReason::AppClosed),
+            None => Effects::default(),
+        }
     }
 
     /// The single banner-admission gate, shared by notify and replace
@@ -1292,6 +1503,123 @@ mod tests {
         assert!(matches!(
             NotificationIcon::from_string("/tmp/x.png"),
             Some(NotificationIcon::File(_))
+        ));
+    }
+
+    fn gtk_req(app_id: &str, gtk_id: &str) -> GtkNotifyRequest {
+        GtkNotifyRequest {
+            app_id: app_id.to_owned(),
+            gtk_id: gtk_id.to_owned(),
+            app_title: "App".to_owned(),
+            app_icon: None,
+            title: "title".to_owned(),
+            body: "body".to_owned(),
+            icon: None,
+            actions: Vec::new(),
+            default_action: None,
+            urgency: Urgency::Normal,
+        }
+    }
+
+    #[test]
+    fn gtk_add_creates_gtk_source_and_banners() {
+        let mut store = NotificationStore::default();
+        let effects = store.add_gtk(
+            gtk_req("org.example.App", "n1"),
+            true,
+            Duration::from_secs(1),
+        );
+        assert_eq!(effects.banner, Some(BannerEffect::QueueChanged));
+        assert_eq!(store.sources.len(), 1);
+        assert!(matches!(&store.sources[0].key, SourceKey::GtkApp(a) if a == "org.example.App"));
+        assert_eq!(store.sources[0].title, "App");
+        assert!(store.sources[0].sender.is_none());
+        let n = &store.sources[0].notifications[0];
+        assert!(matches!(&n.kind, NotifKind::Gtk { gtk_id, .. } if gtk_id == "n1"));
+        assert!(n.sender.is_none(), "Gtk notifications carry no fdo sender");
+    }
+
+    #[test]
+    fn gtk_add_same_id_replaces_in_place_without_closed_signal() {
+        let mut store = NotificationStore::default();
+        store.add_gtk(gtk_req("app.id", "n1"), true, Duration::from_secs(1));
+        store.pop_next_banner();
+        store.banner_hidden();
+        let id = store.sources[0].notifications[0].id;
+
+        let mut update = gtk_req("app.id", "n1");
+        update.title = "new".to_owned();
+        let effects = store.add_gtk(update, true, Duration::from_secs(5));
+        assert!(
+            effects.closed.is_empty(),
+            "Gtk replace emits no NotificationClosed"
+        );
+        // The replace re-enters banner admission (the previously-acked
+        // notification banners again).
+        assert_eq!(effects.banner, Some(BannerEffect::QueueChanged));
+        assert_eq!(store.sources[0].notifications.len(), 1);
+        let n = &store.sources[0].notifications[0];
+        assert_eq!(n.id, id, "same (app_id, gtk_id) reuses the id");
+        assert_eq!(n.title, "new");
+        assert_eq!(n.timestamp, Duration::from_secs(5));
+        assert!(!n.acknowledged);
+    }
+
+    #[test]
+    fn gtk_distinct_ids_coexist_and_remove_targets_one() {
+        let mut store = NotificationStore::default();
+        store.add_gtk(gtk_req("app.id", "n1"), true, Duration::from_secs(1));
+        store.add_gtk(gtk_req("app.id", "n2"), true, Duration::from_secs(1));
+        assert_eq!(store.sources.len(), 1, "same app-id shares one source");
+        assert_eq!(store.sources[0].notifications.len(), 2);
+
+        let effects = store.remove_gtk("app.id", "n1");
+        assert_eq!(effects.closed.len(), 1);
+        assert!(
+            effects.closed[0].sender.is_none(),
+            "no sender → the fdo emitter drops it, so no NotificationClosed goes out"
+        );
+        assert_eq!(store.sources[0].notifications.len(), 1);
+        assert!(matches!(
+            &store.sources[0].notifications[0].kind,
+            NotifKind::Gtk { gtk_id, .. } if gtk_id == "n2"
+        ));
+        assert!(
+            store.remove_gtk("app.id", "nope").is_empty(),
+            "unknown id is a no-op"
+        );
+    }
+
+    #[test]
+    fn gtk_sources_survive_sender_vanish() {
+        // The Gtk daemon watches no bus names — its notifications persist even
+        // after the posting process exits.
+        let mut store = NotificationStore::default();
+        store.add_gtk(gtk_req("app.id", "n1"), true, Duration::from_secs(1));
+        let effects = store.sender_vanished(":1.5");
+        assert!(effects.is_empty());
+        assert_eq!(store.sources.len(), 1);
+    }
+
+    #[test]
+    fn gtk_priority_default_action_and_dnd_critical_bypass() {
+        let mut store = NotificationStore::default();
+        let mut r = gtk_req("app.id", "n1");
+        r.urgency = Urgency::Critical;
+        r.default_action = Some("app.open".to_owned());
+        r.actions = vec![("app.reply".to_owned(), "Reply".to_owned())];
+        // DND on: only Critical still banners.
+        let effects = store.add_gtk(r, false, Duration::from_secs(1));
+        assert_eq!(effects.banner, Some(BannerEffect::QueueChanged));
+        let n = &store.sources[0].notifications[0];
+        assert!(n.has_default_action);
+        assert_eq!(
+            n.actions,
+            vec![("app.reply".to_owned(), "Reply".to_owned())]
+        );
+        assert!(matches!(
+            &n.kind,
+            NotifKind::Gtk { default_action: Some(a), .. } if a == "app.open"
         ));
     }
 }

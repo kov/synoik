@@ -110,7 +110,7 @@ const MAX_ICON_PX: u32 = 96;
 /// Downscale an ingested pixel icon to [`MAX_ICON_PX`] on the long side
 /// (aspect preserved) so a hostile client can't park megapixel buffers in the
 /// compositor for the lifetime of a notification.
-fn bounded_pixels(pix: PixelIcon) -> Arc<PixelIcon> {
+pub(crate) fn bounded_pixels(pix: PixelIcon) -> Arc<PixelIcon> {
     let long = pix.width.max(pix.height);
     if long <= MAX_ICON_PX {
         return Arc::new(pix);
@@ -171,12 +171,32 @@ fn load_file_icon(path: &std::path::Path) -> Option<Arc<PixelIcon>> {
     }))
 }
 
-/// Convert any `File` icon to bounded pixels; `Themed` passes through.
-fn resolve_file_icon(icon: NotificationIcon) -> Option<NotificationIcon> {
+/// Convert any `File` icon to bounded pixels; `Themed`/`Pixels` pass through.
+pub(crate) fn resolve_file_icon(icon: NotificationIcon) -> Option<NotificationIcon> {
     match icon {
         NotificationIcon::File(path) => load_file_icon(&path).map(NotificationIcon::Pixels),
         other => Some(other),
     }
+}
+
+/// Decode in-band image bytes (an `org.gtk.Notifications` `("bytes", <ay>)`
+/// serialized `GBytesIcon`, `glib/gio/gbytesicon.c`) into bounded pixels HERE,
+/// on the untrusted side of the seam. Undecodable/oversized → no icon.
+pub(crate) fn decode_bytes_icon(bytes: &[u8]) -> Option<NotificationIcon> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let img = reader.decode().ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(NotificationIcon::Pixels(bounded_pixels(PixelIcon {
+        width,
+        height,
+        rgba: img.into_raw(),
+    })))
 }
 
 /// The notification's own icon from the image hints, with gnome-shell's exact

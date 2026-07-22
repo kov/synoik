@@ -12,6 +12,7 @@ pub mod gnome_session;
 pub mod gnome_shell;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
+pub mod gtk_notifications;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
@@ -31,6 +32,7 @@ use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
 use self::gnome_shell_introspect::Introspect;
+use self::gtk_notifications::GtkNotifications;
 use self::mutter_display_config::DisplayConfig;
 use self::mutter_idle_monitor::IdleMonitor;
 use self::mutter_service_channel::ServiceChannel;
@@ -54,6 +56,7 @@ pub struct DBusServers {
     #[cfg(feature = "xdp-gnome-screencast")]
     pub conn_shell_screencast: Option<Connection>,
     pub conn_notifications: Option<Connection>,
+    pub conn_gtk_notifications: Option<Connection>,
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
@@ -224,10 +227,21 @@ impl DBusServers {
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            let notifications = Notifications::new(to_niri, from_niri);
+            let notifications = Notifications::new(to_niri.clone(), from_niri);
             if let Some(conn) = try_start(notifications) {
                 dbus.conn_notifications = Some(conn);
                 niri.notifications_emit = Some(to_notifications);
+            }
+
+            // The Gtk daemon shares the inbound channel (both front-ends feed
+            // the one store via `on_notifications_msg`) but owns a separate
+            // outbound channel: its `ActionInvoked` signal differs in shape and
+            // is broadcast (`js/ui/notificationDaemon.js:508-534`).
+            let (to_gtk, gtk_from_niri) = async_channel::unbounded();
+            let gtk_notifications = GtkNotifications::new(to_niri, gtk_from_niri);
+            if let Some(conn) = try_start(gtk_notifications) {
+                dbus.conn_gtk_notifications = Some(conn);
+                niri.gtk_notifications_emit = Some(to_gtk);
             }
         }
 
