@@ -514,13 +514,44 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     }
 
     /// Draw a shaped run, anchoring its ink box to `at` (logical) per `align`,
-    /// tinted `color`.
+    /// tinted `color`. Clipped to the whole buffer.
     pub fn text(
         &mut self,
         shaped: &ShapedText,
         at: Point<f64, Logical>,
         align: Align,
         color: Rgba,
+    ) -> anyhow::Result<()> {
+        self.render_run(shaped, at, align, color, self.full)
+    }
+
+    /// Like [`text`](Self::text), but clips the glyphs to `clip` (logical) instead of
+    /// the whole buffer — for a run that must not overrun a sibling (a header label
+    /// stopping short of a right-aligned time, a body column, a button-width label).
+    /// This is what lets content-driven widgets draw every run through the `Painter`
+    /// rather than reaching for `VulkanFrame::render_glyphs`.
+    pub fn text_clipped(
+        &mut self,
+        shaped: &ShapedText,
+        at: Point<f64, Logical>,
+        align: Align,
+        color: Rgba,
+        clip: Rectangle<f64, Logical>,
+    ) -> anyhow::Result<()> {
+        let clip = self.rect_px(clip);
+        self.render_run(shaped, at, align, color, clip)
+    }
+
+    /// Shared origin math for [`text`](Self::text)/[`text_clipped`](Self::text_clipped):
+    /// place the run's ink box at `at` per `align`, then draw clipped to `clip` (physical),
+    /// damaging the whole buffer.
+    fn render_run(
+        &mut self,
+        shaped: &ShapedText,
+        at: Point<f64, Logical>,
+        align: Align,
+        color: Rgba,
+        clip: Rectangle<i32, Physical>,
     ) -> anyhow::Result<()> {
         let (ix, iy, iw, ih) = shaped.run.ink_bounds();
         let ax = self.px(at.x);
@@ -539,7 +570,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             &shaped.run,
             Point::from((ox, oy)),
             color,
-            self.full,
+            clip,
             &[self.full],
         )?;
         Ok(())

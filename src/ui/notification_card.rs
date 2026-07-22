@@ -19,15 +19,14 @@ use std::time::Duration;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer};
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::backend::renderer::{ContextId, Renderer};
+use smithay::utils::{Buffer as BufferCoord, Logical, Point, Rectangle, Size, Transform};
 
 use crate::notifications::{Notification, NotificationIcon, NotificationStore, Source, Urgency};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::widget::{self, ShapedText, TextShaper, TextStyle};
-use crate::utils::to_physical_precise_round;
+use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
 
 /// `.message` padding = `$base_padding` (`_message-list.scss:83`).
 pub const PAD: f64 = 6.;
@@ -403,18 +402,6 @@ pub fn draw_card(
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("notification_card::draw_card");
 
-    let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-    let rect_px = |r: Rectangle<f64, Logical>| {
-        Rectangle::new(
-            Point::<i32, Physical>::from((px(r.loc.x), px(r.loc.y))),
-            Size::<i32, Physical>::from((px(r.size.w), px(r.size.h))),
-        )
-    };
-    let place_left = |ink: (i32, i32, i32, i32), lx: i32, cy: i32| {
-        let (ix, iy, _iw, ih) = ink;
-        Point::<i32, Physical>::from((lx - ix, cy - ih / 2 - iy))
-    };
-
     // Shape every run up front (needs `&mut renderer`, which the frame holds, so
     // it must precede the bake). `TextShaper` owns the single pt → physical-px
     // multiply — no `* scale` at this call site.
@@ -440,13 +427,13 @@ pub fn draw_card(
     };
 
     widget::bake_uncached(renderer, scale, layout.size, |frame, size| {
-        let full = Rectangle::from_size(size);
+        let mut p = Painter::new(frame, scale, size);
 
         // Transparent beyond the rounded corners; the card is an SDF fill. A
         // hovered card body darkens (`%card:hover`).
-        frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+        p.clear(TRANSPARENT)?;
         let card_bg = if card_hovered { CARD_HOVER_BG } else { CARD_BG };
-        frame.render_rounded_rect(card_bg, (radius * scale) as f32, full, &[full])?;
+        p.fill_rounded(Rectangle::from_size(layout.size), radius, card_bg)?;
 
         // Close-button circle, and the expand caret's when it's live. A hovered
         // button lightens (`%notification_button:hover`), behind its glyph.
@@ -457,107 +444,87 @@ pub fn draw_card(
                 BTN_BG
             }
         };
-        let close = rect_px(layout.close);
-        let close_r = (CLOSE_D / 2. * scale) as f32;
-        frame.render_rounded_rect(btn_bg(CardZone::Close), close_r, close, &[full])?;
+        p.fill_rounded(layout.close, CLOSE_D / 2., btn_bg(CardZone::Close))?;
         if let Some(expand) = layout.expand.filter(|_| layout.can_expand) {
-            let expand = rect_px(expand);
-            frame.render_rounded_rect(btn_bg(CardZone::Caret), close_r, expand, &[full])?;
+            p.fill_rounded(expand, CLOSE_D / 2., btn_bg(CardZone::Caret))?;
         }
 
         // Themed body icons sit on the `.message-themed-icon` circle.
         if let Some(body_icon) = layout.body_icon {
             if matches!(content.icon, Some(NotificationIcon::Themed(_))) {
-                frame.render_rounded_rect(
-                    CIRCLE_BG,
-                    (BODY_ICON / 2. * scale) as f32,
-                    rect_px(body_icon),
-                    &[full],
-                )?;
+                p.fill_rounded(body_icon, BODY_ICON / 2., CIRCLE_BG)?;
             }
         }
 
-        // Header: bold source title after the icon, time right-aligned before
-        // the caret slot (or the close button on the banner).
-        let header_cy = px(PAD + HEADER_H / 2.);
-        let title_x = px(PAD * 2. + SMALL_ICON + PAD);
+        // Header: bold source title after the icon, time right-aligned before the caret slot
+        // (or the close button on the banner). The title is clipped to stop short of the time,
+        // whose logical ink width sets the clip's right edge.
+        let header_cy = PAD + HEADER_H / 2.;
+        let title_x = PAD * 2. + SMALL_ICON + PAD;
         let time_anchor = layout.expand.map_or(layout.close.loc.x, |e| e.loc.x);
-        let time_w = time_run.ink_bounds().2;
-        let time_x = px(time_anchor - PAD) - time_w;
+        let time_w = time_run.ink_bounds().2 as f64 / scale;
+        let time_x = time_anchor - PAD - time_w;
         let header_clip = Rectangle::new(
-            Point::from((title_x, 0)),
-            Size::from(((time_x - title_x).max(0), size.h)),
+            Point::from((title_x, 0.)),
+            Size::from(((time_x - title_x).max(0.), layout.size.h)),
         );
-        frame.render_glyphs(
-            source_run.run(),
-            place_left(source_run.ink_bounds(), title_x, header_cy),
+        p.text_clipped(
+            &source_run,
+            Point::from((title_x, header_cy)),
+            Align::LEFT_MIDDLE,
             HEADER_FG,
             header_clip,
-            &[full],
         )?;
-        frame.render_glyphs(
-            time_run.run(),
-            place_left(time_run.ink_bounds(), time_x, header_cy),
+        p.text(
+            &time_run,
+            Point::from((time_anchor - PAD, header_cy)),
+            Align::RIGHT_MIDDLE,
             HEADER_FG,
-            full,
-            &[full],
         )?;
 
         // Body: bold title over the pre-wrapped body lines (a single
         // ellipsized line collapsed, up to six expanded).
         let body_y = PAD + HEADER_H + PAD;
-        let text_x = px(PAD * 2.
+        let text_x = PAD * 2.
             + if layout.body_icon.is_some() {
                 BODY_ICON + PAD
             } else {
                 0.
-            });
+            };
         let text_clip = Rectangle::new(
-            Point::from((text_x, 0)),
-            Size::from(((size.w - text_x - px(PAD)).max(0), size.h)),
+            Point::from((text_x, 0.)),
+            Size::from(((layout.size.w - text_x - PAD).max(0.), layout.size.h)),
         );
-        if body_runs.is_empty() {
-            frame.render_glyphs(
-                title_run.run(),
-                place_left(title_run.ink_bounds(), text_x, px(body_y + BODY_ICON / 2.)),
-                TEXT,
-                text_clip,
-                &[full],
-            )?;
+        // Single-line body: the title vertically centers on the 48px icon row; multi-line: the
+        // title sits above the first body line and each line steps down by LINE_H.
+        let title_cy = if body_runs.is_empty() {
+            body_y + BODY_ICON / 2.
         } else {
-            frame.render_glyphs(
-                title_run.run(),
-                place_left(title_run.ink_bounds(), text_x, px(body_y + 14.)),
+            body_y + 14.
+        };
+        p.text_clipped(
+            &title_run,
+            Point::from((text_x, title_cy)),
+            Align::LEFT_MIDDLE,
+            TEXT,
+            text_clip,
+        )?;
+        for (i, body_run) in body_runs.iter().enumerate() {
+            p.text_clipped(
+                body_run,
+                Point::from((text_x, body_y + 33. + i as f64 * LINE_H)),
+                Align::LEFT_MIDDLE,
                 TEXT,
                 text_clip,
-                &[full],
             )?;
-            for (i, body_run) in body_runs.iter().enumerate() {
-                frame.render_glyphs(
-                    body_run.run(),
-                    place_left(
-                        body_run.ink_bounds(),
-                        text_x,
-                        px(body_y + 33. + i as f64 * LINE_H),
-                    ),
-                    TEXT,
-                    text_clip,
-                    &[full],
-                )?;
-            }
         }
 
         // Action buttons: pills with centered bold labels.
-        let pill_r = (BTN_RADIUS * scale) as f32;
         for (i, (rect, run)) in layout.actions.iter().zip(&action_runs).enumerate() {
-            let r = rect_px(*rect);
-            frame.render_rounded_rect(btn_bg(CardZone::Action(i)), pill_r, r, &[full])?;
-            let (ix, iy, iw, ih) = run.ink_bounds();
-            let origin = Point::<i32, Physical>::from((
-                r.loc.x + (r.size.w - iw) / 2 - ix,
-                r.loc.y + (r.size.h - ih) / 2 - iy,
-            ));
-            frame.render_glyphs(run.run(), origin, TEXT, r, &[full])?;
+            p.fill_rounded(*rect, BTN_RADIUS, btn_bg(CardZone::Action(i)))?;
+            let center =
+                Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
+            p.text_clipped(run, center, Align::CENTER, TEXT, *rect)?;
         }
 
         Ok(())
@@ -872,9 +839,9 @@ fn draw_solid_rounded(
     bg: [f32; 4],
 ) -> anyhow::Result<VkTexture> {
     widget::bake_uncached(renderer, scale, size, |frame, phys| {
-        let full = Rectangle::from_size(phys);
-        frame.clear(Color32F::from(TRANSPARENT), &[full])?;
-        frame.render_rounded_rect(bg, (radius * scale) as f32, full, &[full])?;
+        let mut p = Painter::new(frame, scale, phys);
+        p.clear(TRANSPARENT)?;
+        p.fill_rounded(Rectangle::from_size(size), radius, bg)?;
         Ok(())
     })
 }
