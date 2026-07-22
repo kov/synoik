@@ -1851,6 +1851,11 @@ impl DateMenu {
         Size::from((calendar_col_x() + cal.w, h))
     }
 
+    /// The popover box corner radius — for the drop shadow behind it.
+    pub fn corner_radius(&self) -> f64 {
+        BOX_RADIUS
+    }
+
     pub fn list(&self) -> &CalendarMessageList {
         &self.list
     }

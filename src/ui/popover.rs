@@ -17,9 +17,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use niri_config::Config;
+use smithay::backend::renderer::element::Kind;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::IconCache;
@@ -33,13 +34,25 @@ const POPOVER_RISE: f64 = 6.;
 /// `.popup-menu-boxpointer { -arrow-rise: $base_padding }` is documented as the "distance
 /// from the panel & screen edge" (6px), so the menu doesn't sit flush against either.
 const POPOVER_MARGIN: f64 = 6.;
-use crate::render_helpers::texture::TextureRenderElement;
+
+/// `.popup-menu-content` `box-shadow: 0 2px 4px 0 $shadow_color` (`_popovers.scss:32`) — the drop
+/// shadow every panel popover (QS / date / input-source BoxPointer) casts; `$shadow_color` (dark)
+/// = `rgba(0,0,0,0.2)`. Spread 0.
+const POPOVER_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
+    blur: 4.,
+    offset: (0., 2.),
+    spread: 0.,
+    color: [0., 0., 0., 0.2],
+};
+
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::DateMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::quick_settings::QuickSettings;
+use crate::ui::widget;
 use crate::utils::output_size;
 
 /// The side effect a popover click asks the caller (the input handler) to apply.
@@ -151,6 +164,15 @@ impl PopoverContent {
             PopoverContent::InputSources(m) => m.logical_size(),
         }
     }
+
+    /// The content box's corner radius, for the `.popup-menu-content` drop shadow behind it.
+    fn corner_radius(&self) -> f64 {
+        match self {
+            PopoverContent::Calendar(dm) => dm.corner_radius(),
+            PopoverContent::QuickSettings(qs) => qs.corner_radius(),
+            PopoverContent::InputSources(m) => m.corner_radius(),
+        }
+    }
 }
 
 /// A single panel popover, owned on `Niri` alongside the other overlays.
@@ -171,6 +193,10 @@ pub struct PanelPopover {
     /// While closing, the content is kept and rendered (fading out) until the animation
     /// settles, then dropped by [`advance_animations`](Self::advance_animations).
     closing: bool,
+    /// The `.popup-menu-content` drop shadow, baked into its own texture and cached by
+    /// `(scale, size)` (keyed on the content radius so a same-size different-radius content
+    /// re-bakes). Composited behind whatever content is up.
+    shadow_cache: RefCell<widget::BakeCache>,
 }
 
 impl PanelPopover {
@@ -184,6 +210,7 @@ impl PanelPopover {
             config,
             anim: None,
             closing: false,
+            shadow_cache: RefCell::new(widget::BakeCache::new()),
         }
     }
 
@@ -663,6 +690,44 @@ impl PanelPopover {
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             None => Vec::new(),
         };
+
+        // The `.popup-menu-content` drop shadow, behind the content (appended last in the
+        // FIRST=topmost Vec). Added before the fade+scale pass below so it animates with the
+        // popover. Keyed by the content radius so a same-size, different-radius content re-bakes.
+        if let Some(content) = self.content.as_ref() {
+            let card = content.logical_size();
+            let radius = content.corner_radius();
+            let mut cache = self.shadow_cache.borrow_mut();
+            match widget::bake_card_shadow(
+                renderer,
+                &mut cache,
+                scale,
+                radius as u64,
+                card,
+                radius,
+                POPOVER_SHADOW,
+            ) {
+                Ok((tex, off)) => {
+                    let loc = origin - off.to_f64().to_logical(scale);
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        tex,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        loc,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::warn!("error baking popover shadow: {err:?}"),
+            }
+        }
 
         // Fade + scale the whole popover by the open/close progress. gnome-shell's
         // BoxPointer opens from 0.96→1.0 scale about the panel-adjacent edge it emerges

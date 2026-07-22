@@ -1005,6 +1005,11 @@ impl QuickSettings {
         Size::from((menu_w(), menu_h(self.layout())))
     }
 
+    /// The menu box corner radius — for the drop shadow behind it.
+    pub fn corner_radius(&self) -> f64 {
+        MENU_RADIUS
+    }
+
     /// Handle a click at a menu-local logical position, returning the action to
     /// apply (or [`PopoverAction::Consumed`] for a click that hit nothing
     /// actionable but is still inside the menu). A tile click also flips the

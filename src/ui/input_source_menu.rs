@@ -150,6 +150,11 @@ impl InputSourceMenu {
         Size::from((width, height))
     }
 
+    /// The menu box corner radius — for the drop shadow behind it.
+    pub fn corner_radius(&self) -> f64 {
+        RADIUS
+    }
+
     /// Route a menu-local click to its action.
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
         let width = self.logical_size().w;
