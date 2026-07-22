@@ -6,6 +6,15 @@ License: GPL-3.0.
 
 Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
 
+**Tenet — GNOME's way replaces niri's.** We are turning this niri fork into a faithful Rust
+rewrite of gnome-shell. When niri merely does the same thing *differently* (its own config knob,
+its own default, its own settings surface), throw niri's way away and implement GNOME's — e.g.
+keyboard layouts come from `org.gnome.desktop.input-sources`, not niri's `input.keyboard.xkb`.
+Do NOT discard *additional capabilities* we might still want (systemd-localed, an owned renderer,
+extra protocols); those are kept, just re-homed behind GNOME's model. Removing niri-specific
+config/features is expected and often desirable; when unsure whether something is "just niri's
+way" vs. a capability worth keeping, ask.
+
 ## Conventions
 - Each GNOME behavior we port is pinned by a headless test in `src/tests/gnome.rs` (the
   "conformance corpus"): drive the real `State::do_action` / synthetic input against the
