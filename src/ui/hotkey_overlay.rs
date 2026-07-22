@@ -4,14 +4,14 @@ use std::rc::Rc;
 
 use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
@@ -126,7 +126,7 @@ impl HotkeyOverlay {
                 scale,
                 self.revision,
                 |r| prepare(r, &config, mod_key, scale),
-                paint,
+                |frame, phys, layout| paint(frame, phys, layout, scale),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -556,37 +556,26 @@ fn paint(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
     layout: &OverlayLayout,
+    scale: f64,
 ) -> anyhow::Result<()> {
-    let full = Rectangle::from_size(phys);
+    let mut p = Painter::new(frame, scale, phys);
 
     // Light-blue border = whole panel border-coloured, then the inner rect dark.
-    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-    frame.clear(Color32F::from(PANEL_BG), &[layout.inner])?;
+    p.clear(BORDER_COLOR)?;
+    p.fill_rect_px(layout.inner, PANEL_BG)?;
 
-    frame.render_glyphs(
-        layout.title_run.run(),
-        layout.title_origin,
-        TEXT_COLOR,
-        full,
-        &[full],
-    )?;
+    p.paragraph(&layout.title_run, layout.title_origin, TEXT_COLOR)?;
 
     for row in &layout.rows {
         if let Some(patch) = row.key_patch {
-            frame.clear(Color32F::from(KEY_BG), &[patch])?;
+            p.fill_rect_px(patch, KEY_BG)?;
         }
-        frame.render_glyphs(row.key_run.run(), row.key_origin, TEXT_COLOR, full, &[full])?;
+        p.paragraph(&row.key_run, row.key_origin, TEXT_COLOR)?;
 
         for (patch, bg) in &row.action_patches {
-            frame.clear(Color32F::from(*bg), &[*patch])?;
+            p.fill_rect_px(*patch, *bg)?;
         }
-        frame.render_glyphs(
-            row.action_run.run(),
-            row.action_origin,
-            TEXT_COLOR,
-            full,
-            &[full],
-        )?;
+        p.paragraph(&row.action_run, row.action_origin, TEXT_COLOR)?;
     }
 
     Ok(())
