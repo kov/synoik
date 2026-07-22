@@ -8,9 +8,13 @@
 //! so a size change auto-invalidates (the calendar-height-freeze class of bug,
 //! commit `128d112e`, cannot recur). See `docs/fork/widget-layer-design.md`.
 //!
-//! The `paint` closure draws in **physical** pixels for now; a later slice threads
-//! a logical/pt `Painter` through it so no call site touches `scale` (H2 in the
-//! design doc, the structural fix for the HiDPI-glyph bug class).
+//! The `paint` closure draws through a [`Painter`] over the bound [`VulkanFrame`]:
+//! logical/pt verbs ([`clear`](Painter::clear), [`fill_rounded`](Painter::fill_rounded),
+//! [`text`](Painter::text)/[`text_clipped`](Painter::text_clipped)) fold the single
+//! `× scale` conversion inside the toolkit (H2 in the design doc, the structural fix
+//! for the HiDPI-glyph bug class); content-sized text blocks laid out in physical px
+//! use the physical-coordinate verbs ([`paragraph`](Painter::paragraph),
+//! [`paragraph_spans`](Painter::paragraph_spans), [`fill_rect_px`](Painter::fill_rect_px)).
 
 use std::collections::HashMap;
 
@@ -455,6 +459,11 @@ impl Align {
         h: HAlign::Center,
         v: VAlign::Middle,
     };
+    /// Ink top-left corner at `at` (a run baked into an exactly-ink-sized buffer).
+    pub const TOP_LEFT: Align = Align {
+        h: HAlign::Left,
+        v: VAlign::Top,
+    };
 }
 
 /// A scale-correct drawing surface over a bound [`VulkanFrame`]. Every verb takes
@@ -573,6 +582,48 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             clip,
             &[self.full],
         )?;
+        Ok(())
+    }
+
+    /// Fill a **physical** sub-rect with a solid `color` (no rounding). The
+    /// physical-coordinate counterpart to [`fill_rounded`](Self::fill_rounded) for
+    /// content-sized widgets whose chrome (a dialog's border/interior, a keycap
+    /// patch) is laid out in physical px next to a [`ShapedParagraph`].
+    pub fn fill_rect_px(
+        &mut self,
+        rect: Rectangle<i32, Physical>,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        self.frame.clear(Color32F::from(color), &[rect])?;
+        Ok(())
+    }
+
+    /// Draw a shaped paragraph block with its layout frame's top-left at `origin`
+    /// (**physical** — paragraphs are physical-native; see [`ShapedParagraph`]),
+    /// tinted `color`, clipped to the whole buffer. The physical-coordinate
+    /// counterpart to [`text`](Self::text) for wrapped, multi-span text blocks.
+    pub fn paragraph(
+        &mut self,
+        shaped: &ShapedParagraph,
+        origin: Point<i32, Physical>,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        self.frame
+            .render_glyphs(&shaped.run, origin, color, self.full, &[self.full])?;
+        Ok(())
+    }
+
+    /// Draw a shaped paragraph with per-span colors: `colors[i]` tints span `i`
+    /// (`origin` **physical**, clipped to the whole buffer). For runs whose spans
+    /// carry distinct colors — the MRU scope panel's selected/unselected tokens.
+    pub fn paragraph_spans(
+        &mut self,
+        shaped: &ShapedParagraph,
+        origin: Point<i32, Physical>,
+        colors: &[Rgba],
+    ) -> anyhow::Result<()> {
+        self.frame
+            .render_glyphs_spans(&shaped.run, origin, colors, self.full, &[self.full])?;
         Ok(())
     }
 }
