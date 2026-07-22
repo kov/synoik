@@ -247,6 +247,36 @@ pub fn bake_card_shadow(
     Ok((tex, Point::from((off, off))))
 }
 
+/// Bake (cached by `(scale, size, revision)`) a card's 1px inset border into its own transparent
+/// texture — a `stroke_rounded_full` ring at `radius`, `color` — to composite ON TOP of the card
+/// (at the card's own origin, no offset). The `.popup-menu-content` border counterpart to
+/// [`bake_card_shadow`]; a top overlay so it works for a multi-texture card (the calendar popover
+/// stacks a column over its background box) without a seam. Width is GNOME's fixed 1px.
+pub fn bake_card_border(
+    renderer: &mut VulkanRenderer,
+    cache: &mut BakeCache,
+    scale: f64,
+    revision: u64,
+    card_size: Size<f64, Logical>,
+    radius: f64,
+    color: Rgba,
+) -> anyhow::Result<VkTexture> {
+    bake(
+        renderer,
+        cache,
+        scale,
+        card_size,
+        revision,
+        |_| Ok(()),
+        |frame, phys, ()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(style::TRANSPARENT)?;
+            p.stroke_rounded_full(radius, 1., color)?;
+            Ok(())
+        },
+    )
+}
+
 /// A cache for [`bake_content`] — a content-sized bake whose physical size is not
 /// known until its text is shaped, so it is keyed by `(scale, revision)` alone
 /// (the revision determines the content, hence the size). Clears on context change.

@@ -45,6 +45,10 @@ const POPOVER_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
     color: [0., 0., 0., 0.2],
 };
 
+/// `.popup-menu-content` `border: 1px solid $outer_borders_color` (`_popovers.scss:31`);
+/// `$outer_borders_color` (dark) = `lighten($bg_color #36363a, 5%)` = `#424247`.
+const POPOVER_BORDER: widget::Rgba = [0.260, 0.260, 0.279, 1.];
+
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::DateMenu;
@@ -197,6 +201,9 @@ pub struct PanelPopover {
     /// `(scale, size)` (keyed on the content radius so a same-size different-radius content
     /// re-bakes). Composited behind whatever content is up.
     shadow_cache: RefCell<widget::BakeCache>,
+    /// The `.popup-menu-content` 1px border, baked as a transparent ring texture and composited
+    /// on top (a multi-texture popover would otherwise seam if bordered per-texture). Same keying.
+    border_cache: RefCell<widget::BakeCache>,
 }
 
 impl PanelPopover {
@@ -211,6 +218,7 @@ impl PanelPopover {
             anim: None,
             closing: false,
             shadow_cache: RefCell::new(widget::BakeCache::new()),
+            border_cache: RefCell::new(widget::BakeCache::new()),
         }
     }
 
@@ -726,6 +734,46 @@ impl PanelPopover {
                     ));
                 }
                 Err(err) => tracing::warn!("error baking popover shadow: {err:?}"),
+            }
+        }
+
+        // The `.popup-menu-content` 1px border, on TOP of everything (front of the FIRST=topmost
+        // Vec) as a transparent ring texture — so a multi-texture popover (calendar column over its
+        // bg box) is bordered on its true outer edge without an inner seam.
+        if let Some(content) = self.content.as_ref() {
+            let card = content.logical_size();
+            let radius = content.corner_radius();
+            let mut cache = self.border_cache.borrow_mut();
+            match widget::bake_card_border(
+                renderer,
+                &mut cache,
+                scale,
+                radius as u64,
+                card,
+                radius,
+                POPOVER_BORDER,
+            ) {
+                Ok(tex) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        tex,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.insert(
+                        0,
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            origin,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    );
+                }
+                Err(err) => tracing::warn!("error baking popover border: {err:?}"),
             }
         }
 
