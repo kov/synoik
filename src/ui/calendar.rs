@@ -28,7 +28,7 @@ use std::ptr::null_mut;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer};
+use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
@@ -41,7 +41,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, ShapedText, TextShaper, TextStyle};
+use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass `_calendar.scss` proportions).
@@ -458,144 +458,86 @@ impl Calendar {
         };
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
-            let full = Rectangle::from_size(phys);
+            let mut p = Painter::new(frame, scale, phys);
             // Rounded card: clear transparent, then fill the interior as a rounded rect so the four
             // outer corners stay transparent (the composited element reports opacity excluding
             // those corners — see `PanelPopover::render`). Matches the quick-settings
             // menu's approach.
-            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
-            frame.render_rounded_rect(BOX_BG, (BOX_RADIUS * scale) as f32, full, &[full])?;
+            p.clear(TRANSPARENT)?;
+            p.fill_rounded(Rectangle::from_size(size), BOX_RADIUS, BOX_BG)?;
 
-            let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-            let center = |rect: Rectangle<f64, Logical>| {
-                (
-                    px(rect.loc.x + rect.size.w / 2.),
-                    px(rect.loc.y + rect.size.h / 2.),
+            // Logical center of a rect (Painter places by logical coords + Align).
+            let lc = |rect: Rectangle<f64, Logical>| {
+                Point::<f64, Logical>::from((
+                    rect.loc.x + rect.size.w / 2.,
+                    rect.loc.y + rect.size.h / 2.,
+                ))
+            };
+            // A centered disc of DISC_DIAM around a logical center point.
+            let disc_at = |c: Point<f64, Logical>| {
+                Rectangle::new(
+                    Point::<f64, Logical>::from((c.x - DISC_DIAM / 2., c.y - DISC_DIAM / 2.)),
+                    Size::<f64, Logical>::from((DISC_DIAM, DISC_DIAM)),
                 )
-            };
-            // Center a shaped run's ink at a physical point.
-            let place = |ink: (i32, i32, i32, i32), cx: i32, cy: i32| {
-                let (ix, iy, iw, ih) = ink;
-                Point::<i32, Physical>::from((cx - iw / 2 - ix, cy - ih / 2 - iy))
-            };
-            // Left-align a shaped run's ink at `x`, vertically centered on `cy` (mirrors `place`'s
-            // vertical math — the ink's `min_y`/`iy` must be subtracted or the run sits `iy` low).
-            let place_left = |ink: (i32, i32, i32, i32), x: i32, cy: i32| {
-                let (ix, iy, _iw, ih) = ink;
-                Point::<i32, Physical>::from((x - ix, cy - ih / 2 - iy))
             };
 
             // Today card: a flat rounded fill with the weekday name over the full date.
             let card = layout.today_button();
-            let card_rect = Rectangle::new(
-                Point::<i32, Physical>::from((px(card.loc.x), px(card.loc.y))),
-                Size::<i32, Physical>::from((px(card.size.w), px(card.size.h))),
-            );
-            frame.render_rounded_rect(
-                TODAY_CARD_BG,
-                (TODAY_RADIUS * scale) as f32,
-                card_rect,
-                &[full],
-            )?;
+            p.fill_rounded(card, TODAY_RADIUS, TODAY_CARD_BG)?;
             if self.hovered == Some(CalHover::Today) {
-                frame.render_rounded_rect(
-                    HOVER_WASH,
-                    (TODAY_RADIUS * scale) as f32,
-                    card_rect,
-                    &[full],
-                )?;
+                p.fill_rounded(card, TODAY_RADIUS, HOVER_WASH)?;
             }
-            let label_x = px(PAD + TODAY_PAD);
-            let day_cy = px(PAD + TODAY_PAD + DAY_ROW / 2.);
-            frame.render_glyphs(
-                day_label_run.run(),
-                place_left(day_label_run.ink_bounds(), label_x, day_cy),
+            let label_x = PAD + TODAY_PAD;
+            p.text(
+                &day_label_run,
+                Point::from((label_x, PAD + TODAY_PAD + DAY_ROW / 2.)),
+                Align::LEFT_MIDDLE,
                 MUTED,
-                full,
-                &[full],
             )?;
-            let date_cy = px(PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.);
-            frame.render_glyphs(
-                date_label_run.run(),
-                place_left(date_label_run.ink_bounds(), label_x, date_cy),
+            p.text(
+                &date_label_run,
+                Point::from((label_x, PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.)),
+                Align::LEFT_MIDDLE,
                 TEXT,
-                full,
-                &[full],
             )?;
 
             // Header: ‹ arrows › and the centered "Month Year". A hovered arrow
             // gets a circular highlight behind its chevron (GNOME's pager
             // buttons are circular flat buttons).
-            let hover_disc = px(DISC_DIAM);
-            let (px_, py_) = center(layout.prev_arrow());
+            let prev_c = lc(layout.prev_arrow());
             if self.hovered == Some(CalHover::Prev) {
-                let disc = Rectangle::new(
-                    Point::<i32, Physical>::from((px_ - hover_disc / 2, py_ - hover_disc / 2)),
-                    Size::<i32, Physical>::from((hover_disc, hover_disc)),
-                );
-                frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
+                p.fill_rounded(disc_at(prev_c), DISC_DIAM / 2., HOVER_WASH)?;
             }
-            frame.render_glyphs(
-                prev_run.run(),
-                place(prev_run.ink_bounds(), px_, py_),
-                MUTED,
-                full,
-                &[full],
-            )?;
-            let (nx, ny) = center(layout.next_arrow());
+            p.text(&prev_run, prev_c, Align::CENTER, MUTED)?;
+            let next_c = lc(layout.next_arrow());
             if self.hovered == Some(CalHover::Next) {
-                let disc = Rectangle::new(
-                    Point::<i32, Physical>::from((nx - hover_disc / 2, ny - hover_disc / 2)),
-                    Size::<i32, Physical>::from((hover_disc, hover_disc)),
-                );
-                frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
+                p.fill_rounded(disc_at(next_c), DISC_DIAM / 2., HOVER_WASH)?;
             }
-            frame.render_glyphs(
-                next_run.run(),
-                place(next_run.ink_bounds(), nx, ny),
-                MUTED,
-                full,
-                &[full],
-            )?;
-            let title_cx = box_w / 2;
-            let title_cy = px(grid_top() + HEADER_H / 2.);
-            frame.render_glyphs(
-                title_run.run(),
-                place(title_run.ink_bounds(), title_cx, title_cy),
+            p.text(&next_run, next_c, Align::CENTER, MUTED)?;
+            p.text(
+                &title_run,
+                Point::from((size.w / 2., grid_top() + HEADER_H / 2.)),
+                Align::CENTER,
                 TEXT,
-                full,
-                &[full],
             )?;
 
             // Weekday header row.
-            let wd_cy = px(grid_top() + HEADER_H + WEEKDAY_H / 2.);
+            let wd_cy = grid_top() + HEADER_H + WEEKDAY_H / 2.;
             for (c, run) in weekday_runs.iter().enumerate() {
-                let cx = px(grid_left(self.show_week_numbers) + (c as f64 + 0.5) * CELL);
-                frame.render_glyphs(
-                    run.run(),
-                    place(run.ink_bounds(), cx, wd_cy),
-                    MUTED,
-                    full,
-                    &[full],
-                )?;
+                let cx = grid_left(self.show_week_numbers) + (c as f64 + 0.5) * CELL;
+                p.text(run, Point::from((cx, wd_cy)), Align::CENTER, MUTED)?;
             }
 
             // Week-number column.
             for (r, run) in week_runs.iter().enumerate() {
-                let cx = px(PAD + WEEKCOL_W / 2.);
-                let cy = px(grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL);
-                frame.render_glyphs(
-                    run.run(),
-                    place(run.ink_bounds(), cx, cy),
-                    MUTED,
-                    full,
-                    &[full],
-                )?;
+                let cx = PAD + WEEKCOL_W / 2.;
+                let cy = grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL;
+                p.text(run, Point::from((cx, cy)), Align::CENTER, MUTED)?;
             }
 
             // Day grid.
             for (i, date) in grid.iter().enumerate() {
-                let (cx, cy) = center(layout.cell(i / GRID_COLS, i % GRID_COLS));
+                let c = lc(layout.cell(i / GRID_COLS, i % GRID_COLS));
                 let is_today = *date == self.today;
                 let is_selected = *date == self.selected;
                 // Today: accent-filled circle; selected (not today): a subtle filled circle —
@@ -603,32 +545,21 @@ impl Calendar {
                 // top. A half-diameter radius clamps to a full circle in `sdf_rect.frag`.
                 let is_hovered = self.hovered == Some(CalHover::Cell(i));
                 if is_today || is_selected || is_hovered {
-                    let side = px(DISC_DIAM);
-                    let disc = Rectangle::new(
-                        Point::<i32, Physical>::from((cx - side / 2, cy - side / 2)),
-                        Size::<i32, Physical>::from((side, side)),
-                    );
+                    let disc = disc_at(c);
                     // Today: accent fill; selected: subtle fill; plain hover: a
                     // faint standalone disc. Hovering a today/selected day adds
                     // the wash on top of its existing disc.
                     if is_today || is_selected {
                         let bg = if is_today { self.accent } else { SELECTED_BG };
-                        frame.render_rounded_rect(bg, (side / 2) as f32, disc, &[full])?;
+                        p.fill_rounded(disc, DISC_DIAM / 2., bg)?;
                     }
                     if is_hovered {
-                        frame.render_rounded_rect(HOVER_WASH, (side / 2) as f32, disc, &[full])?;
+                        p.fill_rounded(disc, DISC_DIAM / 2., HOVER_WASH)?;
                     }
                 }
                 let in_month = date.month == self.month;
                 let color = if is_today || in_month { TEXT } else { DIM };
-                let run = &day_runs[i];
-                frame.render_glyphs(
-                    run.run(),
-                    place(run.ink_bounds(), cx, cy),
-                    color,
-                    full,
-                    &[full],
-                )?;
+                p.text(&day_runs[i], c, Align::CENTER, color)?;
             }
 
             Ok(())
@@ -1733,49 +1664,35 @@ impl CalendarMessageList {
     ) -> anyhow::Result<VkTexture> {
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
         let phys = Size::<i32, Physical>::from((px(CARD_W).max(1), px(GROUP_HEADER_H).max(1)));
-        let full = Rectangle::from_size(phys);
         let title_run = {
             let mut shaper = TextShaper::new(renderer, scale);
             shaper.shape(title, TextStyle::new(GROUP_TITLE_PT).bold())?
         };
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
-            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(TRANSPARENT)?;
 
             // The collapse button circle (header-local coordinates).
             let btn = Rectangle::new(
-                Point::<i32, Physical>::from((
-                    px(collapse.loc.x - header_origin.x),
-                    px(collapse.loc.y - header_origin.y),
+                Point::<f64, Logical>::from((
+                    collapse.loc.x - header_origin.x,
+                    collapse.loc.y - header_origin.y,
                 )),
-                Size::<i32, Physical>::from((px(collapse.size.w), px(collapse.size.h))),
+                collapse.size,
             );
-            frame.render_rounded_rect(
-                GROUP_COLLAPSE_BG,
-                (GROUP_COLLAPSE_D / 2. * scale) as f32,
-                btn,
-                &[full],
-            )?;
+            p.fill_rounded(btn, GROUP_COLLAPSE_D / 2., GROUP_COLLAPSE_BG)?;
             if hover_collapse {
-                frame.render_rounded_rect(
-                    HOVER_WASH,
-                    (GROUP_COLLAPSE_D / 2. * scale) as f32,
-                    btn,
-                    &[full],
-                )?;
+                p.fill_rounded(btn, GROUP_COLLAPSE_D / 2., HOVER_WASH)?;
             }
 
             // The title, left-aligned at the header padding + title margin,
             // vertically centered.
-            let (ix, iy, _iw, ih) = title_run.ink_bounds();
-            let tx = px(GROUP_HEADER_PAD + GROUP_TITLE_MARGIN) - ix;
-            let ty = (phys.h - ih) / 2 - iy;
-            frame.render_glyphs(
-                title_run.run(),
-                Point::<i32, Physical>::from((tx, ty)),
+            p.text(
+                &title_run,
+                Point::from((GROUP_HEADER_PAD + GROUP_TITLE_MARGIN, GROUP_HEADER_H / 2.)),
+                Align::LEFT_MIDDLE,
                 TEXT,
-                full,
-                &[full],
             )?;
 
             Ok(())
@@ -2114,7 +2031,6 @@ impl DateMenu {
         let size = self.logical_size();
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
         let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
-        let full = Rectangle::from_size(phys);
 
         // Shape the text up front (needs `&mut renderer`, before the bake frame opens).
         // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the font sizes.
@@ -2132,53 +2048,38 @@ impl DateMenu {
         };
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
-            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
-            frame.render_rounded_rect(BOX_BG, (BOX_RADIUS * scale) as f32, full, &[full])?;
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(TRANSPARENT)?;
+            p.fill_rounded(Rectangle::from_size(size), BOX_RADIUS, BOX_BG)?;
 
             // The faint 1px separator on the list column's right edge
             // (`.message-list` border-right, `_message-list.scss:8,11`).
-            let sep_x = px(LIST_PAD + LIST_W);
             let sep = Rectangle::new(
-                Point::<i32, Physical>::from((sep_x, 0)),
-                Size::<i32, Physical>::from((((scale).round() as i32).max(1), phys.h)),
+                Point::<f64, Logical>::from((LIST_PAD + LIST_W, 0.)),
+                Size::<f64, Logical>::from((1., size.h)),
             );
-            frame.render_rounded_rect(SEPARATOR, 0., sep, &[full])?;
+            p.fill_rounded(sep, 0., SEPARATOR)?;
 
             if let Some(run) = &placeholder_run {
                 // Centered under the (separately composited) 96px icon.
                 let (_, cy) = placeholder_centers(size.h);
-                let cx = px(LIST_PAD + LIST_W / 2.);
-                let (ix, iy, iw, ih) = run.ink_bounds();
-                let origin = Point::<i32, Physical>::from((cx - iw / 2 - ix, px(cy) - ih / 2 - iy));
-                frame.render_glyphs(run.run(), origin, PLACEHOLDER_FG, full, &[full])?;
+                p.text(
+                    run,
+                    Point::from((LIST_PAD + LIST_W / 2., cy)),
+                    Align::CENTER,
+                    PLACEHOLDER_FG,
+                )?;
             }
 
             if let Some(run) = &clear_run {
                 let pill = self.list.clear_rect(size.h);
-                let rect = Rectangle::new(
-                    Point::<i32, Physical>::from((px(pill.loc.x), px(pill.loc.y))),
-                    Size::<i32, Physical>::from((px(pill.size.w), px(pill.size.h))),
-                );
-                frame.render_rounded_rect(
-                    CLEAR_BG,
-                    (CLEAR_H / 2. * scale) as f32,
-                    rect,
-                    &[full],
-                )?;
+                p.fill_rounded(pill, CLEAR_H / 2., CLEAR_BG)?;
                 if matches!(self.list.hovered, Some(ListHover::Clear)) {
-                    frame.render_rounded_rect(
-                        HOVER_WASH,
-                        (CLEAR_H / 2. * scale) as f32,
-                        rect,
-                        &[full],
-                    )?;
+                    p.fill_rounded(pill, CLEAR_H / 2., HOVER_WASH)?;
                 }
-                let (ix, iy, iw, ih) = run.ink_bounds();
-                let origin = Point::<i32, Physical>::from((
-                    rect.loc.x + (rect.size.w - iw) / 2 - ix,
-                    rect.loc.y + (rect.size.h - ih) / 2 - iy,
-                ));
-                frame.render_glyphs(run.run(), origin, TEXT, rect, &[full])?;
+                let center =
+                    Point::from((pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.));
+                p.text_clipped(run, center, Align::CENTER, TEXT, pill)?;
             }
 
             Ok(())
