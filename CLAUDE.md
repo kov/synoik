@@ -46,6 +46,13 @@ way" vs. a capability worth keeping, ask.
   This includes **where** a widget sits: derive child order/placement from the JS construction sequence
   (`js/ui/*.js` `add_child`/`_addItems`), not from what looks right — the SCSS says how it looks, never
   where it goes. (The QS volume slider first landed at the menu bottom because the order was assumed.)
+- **Toolkit-first — no faked chrome.** When a widget/CSS you're porting needs a draw op the toolkit
+  lacks (border/outline, gradient, shadow, a new shape) or a control that shows up on more than one
+  surface (button, slider, switch, entry), add it as a reusable `Painter` verb or `widget::` type —
+  never a one-off in the caller. The `clear(border); fill_rect_px(inner)` fill-full+inner idiom is a
+  fake-border smell: it can't round and duplicates behavior; use `Painter::stroke_rounded`. Shared
+  controls become a `widget::` primitive so hover/focus/geometry stay consistent (see `widget::Button`,
+  the inset-accent focus ring). Grow the toolkit as the port surfaces new interface, don't paint around it.
 
 ## Git
 **Hard fork (2026-07):** `main` is the only living branch (ours, to push later). We no longer
