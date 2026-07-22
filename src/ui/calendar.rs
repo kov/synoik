@@ -2069,7 +2069,14 @@ impl DateMenu {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         // The bg carries the Clear pill, so its hover must re-bake it too.
         let clear_hover = matches!(self.list.hovered, Some(ListHover::Clear));
-        let revision = u64::from(!self.list.is_empty()) | (u64::from(clear_hover) << 1);
+        // The box grows/shrinks with the list (`logical_size`), so its physical
+        // height must be part of the freshness key — otherwise a bg baked at the
+        // open-time height stays frozen while the list keeps growing, and the
+        // extra cards render below the (stale, too-short) background.
+        let height_key = to_physical_precise_round::<i64>(scale, self.logical_size().h).max(0);
+        let revision = u64::from(!self.list.is_empty())
+            | (u64::from(clear_hover) << 1)
+            | ((height_key as u64) << 2);
         let mut cache = self.bg_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
@@ -2992,6 +2999,63 @@ mod tests {
             empty.logical_size().h,
             cal_h,
             "an empty popover is exactly the calendar height"
+        );
+    }
+
+    /// The popover background re-bakes when the list grows or shrinks — its
+    /// physical height must track `logical_size`, never stay frozen at the
+    /// height it was first baked at. (Regression: the bg cache keyed only on
+    /// empty-vs-nonempty + Clear-hover, so a bg baked at open time stayed short
+    /// while notifications kept arriving and the extra cards rendered *below*
+    /// the stale, too-short background.)
+    #[test]
+    fn date_menu_background_tracks_the_growing_and_shrinking_height() {
+        use smithay::backend::renderer::Texture as _;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping bg-tracks-height: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let px = |dm: &DateMenu| to_physical_precise_round::<i32>(1., dm.logical_size().h).max(1);
+
+        // Open with a couple of cards: the bg bakes to this (small) height.
+        let mut dm = DateMenu::new(
+            0,
+            false,
+            [0, 0, 0],
+            vec![single_group(sample_card(1)), single_group(sample_card(2))],
+        );
+        let small = px(&dm);
+        assert_eq!(
+            dm.bg_texture(&mut vk, 1.).expect("bake small").size().h,
+            small,
+            "the freshly-baked bg matches the popover height"
+        );
+
+        // Notifications arrive while open: the popover grows, and re-baking must
+        // yield a taller texture (not the cached short one).
+        let groups: Vec<_> = (1..=12).map(|i| single_group(sample_card(i))).collect();
+        assert!(dm.set_notifications(groups));
+        let grown = px(&dm);
+        assert!(grown > small, "the popover grew ({grown} vs {small})");
+        assert_eq!(
+            dm.bg_texture(&mut vk, 1.).expect("bake grown").size().h,
+            grown,
+            "the bg re-bakes to the grown height, not the stale short one"
+        );
+
+        // Notifications are dismissed: the popover shrinks, and the bg must
+        // re-bake smaller again.
+        assert!(dm.set_notifications(vec![single_group(sample_card(1))]));
+        let shrunk = px(&dm);
+        assert!(shrunk < grown, "the popover shrank ({shrunk} vs {grown})");
+        assert_eq!(
+            dm.bg_texture(&mut vk, 1.).expect("bake shrunk").size().h,
+            shrunk,
+            "the bg re-bakes to the shrunk height"
         );
     }
 
