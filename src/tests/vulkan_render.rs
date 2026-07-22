@@ -2433,10 +2433,12 @@ fn vulkan_renders_the_message_list_card() {
     }
 }
 
-/// Hovering a card's close button lightens its circle (GNOME's `:hover` raises
-/// the button's fg-wash, `_message-list.scss:72-75`): the same close-circle
-/// background pixel is strictly brighter once the pointer is over the button,
-/// proving the hover wash re-bakes and composites. Skips with no Vulkan device.
+/// Hovering a card highlights it two ways (GNOME `%card:hover` +
+/// `%notification_button:hover`): the card body darkens (`button(hover, card)`
+/// = `lighten($card_bg,4%)`, one step below the resting `+5%`) while the button
+/// under the pointer lightens (white@.15 → white@.30). With the pointer over the
+/// close button, the close-circle bg is strictly brighter AND a body-bg pixel is
+/// strictly darker than un-hovered — proving both re-bake. Skips with no Vulkan.
 #[test]
 fn vulkan_hovering_a_card_close_button_lightens_it() {
     let Some(mut f) = window_fixture(GREEN) else {
@@ -2478,15 +2480,17 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
     f.settle_animations();
 
     let origin = f.niri().panel_popover.content_location(&output);
-    let (_, _card, close) = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
-    // A point inside the close circle in the top-middle gap of the × glyph, so
-    // we sample the circle's background (not the opaque white glyph) — the only
-    // spot whose brightness reflects the hover wash.
-    let sample = origin
+    let (_, card, close) = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
+    // The close circle's background, in the top-middle gap of the × glyph (not
+    // the opaque white glyph); and a card-body pixel at the right edge,
+    // mid-height (clear of the left-aligned text and the top-right buttons).
+    let btn_pt = origin
         + Point::from((
             close.loc.x + close.size.w / 2.,
             close.loc.y + close.size.h * 0.15,
         ));
+    let body_pt =
+        origin + Point::from((card.loc.x + card.size.w - 8., card.loc.y + card.size.h / 2.));
     let center = origin
         + Point::from((
             close.loc.x + close.size.w / 2.,
@@ -2495,10 +2499,13 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
 
     let w = to_physical_precise_round::<i32>(scale.x, output_size(&output).w);
     let h = to_physical_precise_round::<i32>(scale.x, 500.);
-    let sx = to_physical_precise_round::<i32>(scale.x, sample.x);
-    let sy = to_physical_precise_round::<i32>(scale.x, sample.y);
+    let bx = to_physical_precise_round::<i32>(scale.x, btn_pt.x);
+    let by = to_physical_precise_round::<i32>(scale.x, btn_pt.y);
+    let dx = to_physical_precise_round::<i32>(scale.x, body_pt.x);
+    let dy = to_physical_precise_round::<i32>(scale.x, body_pt.y);
 
-    let render_sample = |f: &mut Fixture| -> [u8; 4] {
+    // Render once and read both sample pixels.
+    let render_samples = |f: &mut Fixture| -> ([u8; 4], [u8; 4]) {
         let state = f.niri_state();
         state
             .backend
@@ -2517,25 +2524,33 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
                     elems.into_iter().rev(),
                 )
                 .expect("render popover");
-                let i = ((sy * w + sx) * 4) as usize;
-                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                let at = |x: i32, y: i32| {
+                    let i = ((y * w + x) * 4) as usize;
+                    [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+                };
+                (at(bx, by), at(dx, dy))
             })
             .expect("vulkan renderer")
     };
 
-    let cold = render_sample(&mut f);
+    let (btn_cold, body_cold) = render_samples(&mut f);
     assert!(
         f.niri().panel_popover.pointer_hover(&output, center),
         "the pointer over the close button registers a hover"
     );
-    let hot = render_sample(&mut f);
+    let (btn_hot, body_hot) = render_samples(&mut f);
 
     let sum = |p: [u8; 4]| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]);
-    assert_eq!(cold[3], 255, "the close circle bg is opaque, got {cold:?}");
-    assert_eq!(hot[3], 255, "the close circle bg is opaque, got {hot:?}");
+    for p in [btn_cold, btn_hot, body_cold, body_hot] {
+        assert_eq!(p[3], 255, "sampled card pixels must be opaque, got {p:?}");
+    }
     assert!(
-        sum(hot) > sum(cold),
-        "hovering the close button must lighten its circle: cold {cold:?} hot {hot:?}"
+        sum(btn_hot) > sum(btn_cold),
+        "hovering must lighten the close circle: cold {btn_cold:?} hot {btn_hot:?}"
+    );
+    assert!(
+        sum(body_hot) < sum(body_cold),
+        "hovering must darken the card body: cold {body_cold:?} hot {body_hot:?}"
     );
 }
 

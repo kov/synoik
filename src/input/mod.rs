@@ -2945,6 +2945,14 @@ impl State {
                 // Hover-expand changes the banner's layout.
                 self.niri.queue_redraw_all();
             }
+            // The banner takes the pointer (`contents_under` suppresses the window
+            // beneath it), so force the arrow — the app can no longer paint its
+            // own cursor (e.g. an I-beam) under the banner.
+            if inside {
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::default_named());
+            }
         }
 
         // A panel popover grabs input modally: no window under it receives pointer focus

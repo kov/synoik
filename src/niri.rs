@@ -4047,6 +4047,17 @@ impl Niri {
             return rv;
         }
 
+        // A visible notification banner sits above the windows and takes the pointer: while it's
+        // under the cursor, suppress the window beneath it so the app can't keep pointer focus and
+        // paint its own cursor (e.g. an I-beam) over the banner. Its own clicks/hover are handled
+        // separately (`NotificationBanner::hit_test`), and it is blocked while a popover is open.
+        if self
+            .notification_banner
+            .pointer_inside(output, pos_within_output)
+        {
+            return rv;
+        }
+
         let layers = layer_map_for_output(output);
         let layer_surface_under = |layer, popup| {
             layers

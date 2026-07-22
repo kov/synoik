@@ -716,16 +716,17 @@ pub enum ListHit {
     Clear,
 }
 
-/// A hoverable region of the message list, for the hover highlight. Only the
-/// interactive controls highlight — GNOME's `.message` card body has no
-/// `:hover` rule, but its buttons do (`_message-list.scss:72-75`).
+/// A hoverable region of the message list, for the hover highlight. A card
+/// (`.message` = `%card`) darkens its body whenever it is hovered anywhere;
+/// `zone` additionally names the button under the pointer, which lightens on top
+/// (`%notification_button:hover`) (`_common.scss:154-161`, `_message-list.scss`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ListHover {
-    /// A button on a specific card (by notification id): its close ×, expand
-    /// caret, or one action pill.
+    /// The card with this notification id is hovered; `zone` is the button under
+    /// the pointer (close ×, caret, or an action pill), or `None` for the body.
     Card {
         id: u32,
-        zone: notification_card::CardZone,
+        zone: Option<notification_card::CardZone>,
     },
     /// The expanded group header's collapse button.
     GroupCollapse,
@@ -1272,16 +1273,17 @@ impl CalendarMessageList {
                     return Self::card_hover(cpos - *origin, &group.cards[0], layout);
                 }
                 GroupKind::Collapsed { origin, top, .. } => {
-                    // The collapsed top card's close closes the whole group; it
-                    // highlights like the top card's close button. Elsewhere on
-                    // the stack (expand-on-click) has no highlight.
-                    if top.close.contains(cpos - *origin) {
-                        return group.cards.first().map(|c| ListHover::Card {
-                            id: c.id,
-                            zone: notification_card::CardZone::Close,
-                        });
-                    }
-                    return None;
+                    // Hovering the collapsed stack darkens its (interactive) top
+                    // card; over the top card's close, that button also lightens
+                    // — it closes the whole group.
+                    let zone = top
+                        .close
+                        .contains(cpos - *origin)
+                        .then_some(notification_card::CardZone::Close);
+                    return group
+                        .cards
+                        .first()
+                        .map(|c| ListHover::Card { id: c.id, zone });
                 }
                 GroupKind::Expanded {
                     collapse, cards, ..
@@ -1301,47 +1303,43 @@ impl CalendarMessageList {
         None
     }
 
-    /// The hovered button within one card (close/caret/action), or `None` for
-    /// the card body (which has no hover highlight).
+    /// Hovering anywhere on a card marks it hovered (its body darkens); if the
+    /// pointer is over a button (close/caret/action), that `zone` is named so it
+    /// also lightens.
     fn card_hover(
         local: Point<f64, Logical>,
         content: &CardContent,
         layout: &CardLayout,
     ) -> Option<ListHover> {
         use notification_card::CardZone;
-        if layout.close.contains(local) {
-            return Some(ListHover::Card {
-                id: content.id,
-                zone: CardZone::Close,
-            });
-        }
-        if layout
+        let zone = if layout.close.contains(local) {
+            Some(CardZone::Close)
+        } else if layout
             .expand
             .filter(|_| layout.can_expand)
             .is_some_and(|e| e.contains(local))
         {
-            return Some(ListHover::Card {
-                id: content.id,
-                zone: CardZone::Caret,
-            });
-        }
-        for (idx, rect) in layout.actions.iter().enumerate() {
-            if rect.contains(local) {
-                return Some(ListHover::Card {
-                    id: content.id,
-                    zone: CardZone::Action(idx),
-                });
-            }
-        }
-        None
+            Some(CardZone::Caret)
+        } else {
+            layout
+                .actions
+                .iter()
+                .position(|rect| rect.contains(local))
+                .map(CardZone::Action)
+        };
+        Some(ListHover::Card {
+            id: content.id,
+            zone,
+        })
     }
 
-    /// The card-button hover zone for the card with notification `id`, if that
-    /// is what the pointer is over (fed into [`notification_card::card_elements`]).
-    fn card_zone_for(&self, id: u32) -> Option<notification_card::CardZone> {
+    /// Whether the card with notification `id` is hovered (body darkens) and,
+    /// if so, which of its buttons the pointer is over (that button lightens) —
+    /// fed into [`notification_card::card_elements`].
+    fn card_hover_for(&self, id: u32) -> (bool, Option<notification_card::CardZone>) {
         match &self.hovered {
-            Some(ListHover::Card { id: hid, zone }) if *hid == id => Some(*zone),
-            _ => None,
+            Some(ListHover::Card { id: hid, zone }) if *hid == id => (true, *zone),
+            _ => (false, None),
         }
     }
 
@@ -1425,6 +1423,7 @@ impl CalendarMessageList {
             let group = &self.groups[gl.group];
             match &gl.kind {
                 GroupKind::Single { origin: o, layout } => {
+                    let (card_hovered, button) = self.card_hover_for(group.cards[0].id);
                     elements.extend(notification_card::card_elements(
                         renderer,
                         icons,
@@ -1436,7 +1435,8 @@ impl CalendarMessageList {
                         base + *o,
                         1.,
                         scale,
-                        self.card_zone_for(group.cards[0].id),
+                        card_hovered,
+                        button,
                     ));
                 }
                 GroupKind::Collapsed {
@@ -1446,6 +1446,7 @@ impl CalendarMessageList {
                     ..
                 } => {
                     // Top card on top, then the darkened peeks below it.
+                    let (card_hovered, button) = self.card_hover_for(group.cards[0].id);
                     elements.extend(notification_card::card_elements(
                         renderer,
                         icons,
@@ -1457,7 +1458,8 @@ impl CalendarMessageList {
                         base + *o,
                         1.,
                         scale,
-                        self.card_zone_for(group.cards[0].id),
+                        card_hovered,
+                        button,
                     ));
                     for (peek_o, size, bg) in peeks {
                         if let Some(elem) = notification_card::stack_shadow_element(
@@ -1493,6 +1495,7 @@ impl CalendarMessageList {
                         self.hovered == Some(ListHover::GroupCollapse),
                     ));
                     for (ci, card_o, layout) in cards {
+                        let (card_hovered, button) = self.card_hover_for(group.cards[*ci].id);
                         elements.extend(notification_card::card_elements(
                             renderer,
                             icons,
@@ -1504,7 +1507,8 @@ impl CalendarMessageList {
                             base + *card_o,
                             1.,
                             scale,
-                            self.card_zone_for(group.cards[*ci].id),
+                            card_hovered,
+                            button,
                         ));
                     }
                 }
@@ -3147,7 +3151,7 @@ mod tests {
             .find(|(id, _, _)| *id == 1)
             .expect("card 1 is visible");
 
-        // The close button highlights as a card-close hover.
+        // The close button: the card is hovered AND the close zone is named.
         let close = layout.close;
         let close_pt = origin + close.loc + Point::from((close.size.w / 2., close.size.h / 2.));
         assert!(list.hover(Some(close_pt), h));
@@ -3155,11 +3159,11 @@ mod tests {
             list.hovered,
             Some(ListHover::Card {
                 id: 1,
-                zone: CardZone::Close
+                zone: Some(CardZone::Close)
             })
         );
 
-        // An action pill highlights by its index.
+        // An action pill: named by its index.
         let action = layout.actions[0];
         let action_pt = origin + action.loc + Point::from((action.size.w / 2., action.size.h / 2.));
         assert!(list.hover(Some(action_pt), h));
@@ -3167,15 +3171,15 @@ mod tests {
             list.hovered,
             Some(ListHover::Card {
                 id: 1,
-                zone: CardZone::Action(0)
+                zone: Some(CardZone::Action(0))
             })
         );
 
-        // The card body carries no highlight (mid-card, clear of the top-right
-        // buttons and the bottom action row).
+        // The card body: the card is still hovered (it darkens), with no button
+        // zone (mid-card, clear of the top-right buttons and the action row).
         let body_pt = origin + Point::from((layout.size.w / 2., layout.size.h / 2.));
         assert!(list.hover(Some(body_pt), h));
-        assert_eq!(list.hovered, None);
+        assert_eq!(list.hovered, Some(ListHover::Card { id: 1, zone: None }));
 
         // The Clear pill highlights.
         let clear = list.clear_rect(h);

@@ -342,6 +342,10 @@ impl NotificationBanner {
             return false;
         }
         self.hovered = hovered;
+        // The card body darkens while hovered (`%card:hover`); re-bake it even
+        // when the hover doesn't also expand the banner (popped-under-pointer or
+        // an already-expanded critical banner).
+        self.revision += 1;
         let mut changed = false;
         if hovered {
             if self.popped_under_pointer {
@@ -553,8 +557,10 @@ impl NotificationBanner {
             origin,
             alpha,
             scale,
-            // The banner has no per-button hover highlight (its hover triggers
-            // the whole-banner expand instead).
+            // The whole banner darkens while hovered (`%card:hover`); it tracks
+            // only whole-banner hover, so no per-button highlight (a minor gap
+            // vs the popover list, which does light individual buttons).
+            self.hovered,
             None,
         )
     }
