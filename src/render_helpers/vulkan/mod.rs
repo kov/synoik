@@ -31,4 +31,5 @@ pub use error::VulkanError;
 pub use frame::VulkanFrame;
 pub(crate) use frame::{pack_mat3, ClipParams};
 pub use renderer::{dmabuf_formats, VulkanRenderer};
+pub(crate) use types::GlyphRun;
 pub use types::{VkMapping, VkTexture};

@@ -13,6 +13,7 @@ pub mod quick_settings;
 pub mod run_dialog;
 pub mod screen_transition;
 pub mod screenshot_ui;
+pub mod widget;
 
 /// GNOME authors font sizes in points; St realizes them at the stage font DPI —
 /// nominally 96 DPI, i.e. `1pt = 96/72 px = 4/3 px`. We size glyphs in logical

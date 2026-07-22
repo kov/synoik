@@ -14,19 +14,16 @@
 //! sub-menus are absent (no IBus in this fork).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
-use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::backend::renderer::{Color32F, Frame as _};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
+use crate::ui::widget::{self, BakeCache};
 use crate::utils::to_physical_precise_round;
 
 const PAD: f64 = 8.;
@@ -74,18 +71,13 @@ enum RowKind {
     Settings,
 }
 
-struct TextureCache {
-    context: Option<ContextId<VkTexture>>,
-    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
-}
-
 /// The input-source popover menu content.
 pub struct InputSourceMenu {
     items: Vec<InputSourceItem>,
     active: usize,
     hovered: Option<usize>,
     revision: u64,
-    bg_cache: RefCell<TextureCache>,
+    bg_cache: RefCell<BakeCache>,
 }
 
 impl InputSourceMenu {
@@ -95,10 +87,7 @@ impl InputSourceMenu {
             active,
             hovered: None,
             revision: 0,
-            bg_cache: RefCell::new(TextureCache {
-                context: None,
-                textures: HashMap::new(),
-            }),
+            bg_cache: RefCell::new(BakeCache::new()),
         }
     }
 
@@ -194,12 +183,50 @@ impl InputSourceMenu {
         }
     }
 
-    /// Bake the card chrome (background, hover wash, separator, and all text) into
-    /// one texture; the active row's check icon composites on top in `render`.
-    fn draw_bg(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    /// Shape every row's text at the physical (`× scale`) font size — the miss-only
+    /// prepare phase for [`widget::bake`]. Returns one `(label, optional short)` run
+    /// per row, in row order.
+    #[allow(clippy::type_complexity)]
+    fn shape_rows(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<Vec<(GlyphRun, Option<GlyphRun>)>> {
+        // The buffer is scale-sized, so the glyph run must be too (else the text
+        // renders at 1/scale — minuscule on HiDPI). This one `× scale` is the last
+        // manual one in this widget; H2's `Painter` removes it entirely.
+        let font_px = (TEXT_PX * scale) as f32;
+        (0..self.row_count())
+            .map(|k| {
+                let (label, short) = match self.row_kind(k) {
+                    RowKind::Layout(i) => (
+                        self.items[i].display.clone(),
+                        Some(self.items[i].short.clone()),
+                    ),
+                    RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
+                    RowKind::Settings => ("Keyboard Settings".to_owned(), None),
+                };
+                let label_run = renderer.build_glyph_run_weighted(&label, font_px, false)?;
+                let short_run = short
+                    .map(|s| renderer.build_glyph_run_weighted(&s, font_px, false))
+                    .transpose()?;
+                Ok((label_run, short_run))
+            })
+            .collect()
+    }
+
+    /// Paint the card chrome (background, hover wash, separator, all row text) into
+    /// the bound frame — the paint phase for [`widget::bake`]. `phys` is the full
+    /// buffer size; `row_runs` are the runs shaped in [`Self::shape_rows`].
+    fn paint_bg(
+        &self,
+        frame: &mut VulkanFrame,
+        phys: Size<i32, Physical>,
+        scale: f64,
+        row_runs: &[(GlyphRun, Option<GlyphRun>)],
+    ) -> anyhow::Result<()> {
         let size = self.logical_size();
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-        let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
         let full = Rectangle::from_size(phys);
         let rect_px = |r: Rectangle<f64, Logical>| {
             Rectangle::new(
@@ -208,102 +235,60 @@ impl InputSourceMenu {
             )
         };
 
-        // Shape every row's text up front (immutable font-system borrows).
-        let mut row_runs = Vec::new();
-        for k in 0..self.row_count() {
-            let (label, short) = match self.row_kind(k) {
-                RowKind::Layout(i) => (
-                    self.items[i].display.clone(),
-                    Some(self.items[i].short.clone()),
-                ),
-                RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
-                RowKind::Settings => ("Keyboard Settings".to_owned(), None),
-            };
-            // Physical font size: the buffer is scale-sized, so the glyph run
-            // must be too (else the text renders at 1/scale — minuscule on HiDPI).
-            let font_px = (TEXT_PX * scale) as f32;
-            let label_run = renderer.build_glyph_run_weighted(&label, font_px, false)?;
-            let short_run = short
-                .map(|s| renderer.build_glyph_run_weighted(&s, font_px, false))
-                .transpose()?;
-            row_runs.push((label_run, short_run));
-        }
+        frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+        frame.render_rounded_rect(BG, (RADIUS * scale) as f32, full, &[full])?;
 
-        let mut target = renderer.create_buffer(
-            Fourcc::Abgr8888,
-            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
-        )?;
-        {
-            let mut fb = renderer.bind(&mut target)?;
-            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
-            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
-            frame.render_rounded_rect(BG, (RADIUS * scale) as f32, full, &[full])?;
+        // The separator rule centered in the break above the trailing items.
+        let sep_y = self.row_top(self.items.len()) - SEP_EXTRA / 2.;
+        let sep = Rectangle::new(
+            Point::from((TEXT_INSET, sep_y)),
+            Size::from((size.w - 2. * TEXT_INSET, 1.)),
+        );
+        frame.render_rounded_rect(SEPARATOR, 0., rect_px(sep), &[full])?;
 
-            // The separator rule centered in the break above the trailing items.
-            let sep_y = self.row_top(self.items.len()) - SEP_EXTRA / 2.;
-            let sep = Rectangle::new(
-                Point::from((TEXT_INSET, sep_y)),
-                Size::from((size.w - 2. * TEXT_INSET, 1.)),
-            );
-            frame.render_rounded_rect(SEPARATOR, 0., rect_px(sep), &[full])?;
-
-            for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
-                let rrect = self.row_rect(k, size.w);
-                if self.hovered == Some(k) {
-                    frame.render_rounded_rect(
-                        HOVER_WASH,
-                        (8. * scale) as f32,
-                        rect_px(rrect),
-                        &[full],
-                    )?;
-                }
-                // Layout rows reserve the ornament column; trailing items don't.
-                let is_layout = matches!(self.row_kind(k), RowKind::Layout(_));
-                let label_x = if is_layout {
-                    px(TEXT_INSET + ORN_W)
-                } else {
-                    px(TEXT_INSET)
-                };
-                let cy = px(rrect.loc.y + rrect.size.h / 2.);
-                let (lx, ly, _, lh) = label_run.ink_bounds();
-                let origin = Point::<i32, Physical>::from((label_x - lx, cy - lh / 2 - ly));
-                frame.render_glyphs(label_run, origin, TEXT, full, &[full])?;
-
-                // The short label, right-aligned and dimmed.
-                if let Some(run) = short_run {
-                    let (sx, sy, sw, sh) = run.ink_bounds();
-                    let right = px(size.w - TEXT_INSET);
-                    let origin = Point::<i32, Physical>::from((right - sw - sx, cy - sh / 2 - sy));
-                    frame.render_glyphs(run, origin, MUTED, full, &[full])?;
-                }
+        for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
+            let rrect = self.row_rect(k, size.w);
+            if self.hovered == Some(k) {
+                frame.render_rounded_rect(
+                    HOVER_WASH,
+                    (8. * scale) as f32,
+                    rect_px(rrect),
+                    &[full],
+                )?;
             }
+            // Layout rows reserve the ornament column; trailing items don't.
+            let is_layout = matches!(self.row_kind(k), RowKind::Layout(_));
+            let label_x = if is_layout {
+                px(TEXT_INSET + ORN_W)
+            } else {
+                px(TEXT_INSET)
+            };
+            let cy = px(rrect.loc.y + rrect.size.h / 2.);
+            let (lx, ly, _, lh) = label_run.ink_bounds();
+            let origin = Point::<i32, Physical>::from((label_x - lx, cy - lh / 2 - ly));
+            frame.render_glyphs(label_run, origin, TEXT, full, &[full])?;
 
-            let _sync = frame.finish()?;
+            // The short label, right-aligned and dimmed.
+            if let Some(run) = short_run {
+                let (sx, sy, sw, sh) = run.ink_bounds();
+                let right = px(size.w - TEXT_INSET);
+                let origin = Point::<i32, Physical>::from((right - sw - sx, cy - sh / 2 - sy));
+                frame.render_glyphs(run, origin, MUTED, full, &[full])?;
+            }
         }
-
-        renderer.make_offscreen_sampleable(&target)?;
-        Ok(target)
+        Ok(())
     }
 
     fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
-        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
-        let mut cache = self.bg_cache.borrow_mut();
-        let context = renderer.context_id();
-        if cache.context.as_ref() != Some(&context) {
-            cache.textures.clear();
-            cache.context = Some(context);
-        }
-        let fresh =
-            matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == self.revision);
-        if !fresh {
-            let tex = self.draw_bg(renderer, scale)?;
-            cache.textures.insert(scale_key, (self.revision, tex));
-        }
-        Ok(cache
-            .textures
-            .get(&scale_key)
-            .map(|(_, t)| t.clone())
-            .unwrap())
+        widget::bake(
+            renderer,
+            &mut self.bg_cache.borrow_mut(),
+            scale,
+            self.logical_size(),
+            self.revision,
+            |renderer| self.shape_rows(renderer, scale),
+            |frame, phys, row_runs| self.paint_bg(frame, phys, scale, row_runs),
+        )
     }
 
     /// The menu's render elements at `origin`, topmost first: the active row's
@@ -441,5 +426,24 @@ mod tests {
         // Leaving clears it.
         assert!(m.pointer_hover(None));
         assert_eq!(m.hovered, None);
+    }
+
+    /// The regression pin for the minuscule-text bug (`3c7473be`): baked at scales
+    /// {1, 1.5, 2} the buffer must be physically scaled AND the glyph ink must grow
+    /// with the scale, not shrink. Shaping the text at logical px (the bug) would
+    /// render it ~½-height at scale 2 and trip the harness. Skips with no device.
+    #[test]
+    fn popover_text_scales_with_output() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping popover_text_scales_with_output: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let m = menu(2, 0);
+        crate::ui::widget::assert_scale_correct(&mut vk, m.logical_size(), |vk, scale| {
+            m.bg_texture(vk, scale).expect("bake input-source popover")
+        });
     }
 }
