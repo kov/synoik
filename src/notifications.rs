@@ -425,12 +425,17 @@ pub enum GtkToNotifications {
     ActionInvoked {
         app_id: String,
         gtk_id: String,
-        /// The action key; `app.`-prefixed keys route to the app (slice 2),
-        /// others broadcast `ActionInvoked`.
+        /// The action key; `app.`-prefixed keys activate the app's action
+        /// (`org.freedesktop.Application.ActivateAction`), others broadcast
+        /// `ActionInvoked` (`js/ui/notificationDaemon.js:453-465`).
         action: String,
         /// XDG activation token, carried in `platform_data`.
         token: String,
     },
+    /// A body click on a notification with no default action: gnome-shell's
+    /// `source.open()` = `this._app.activate()` (`js/ui/notificationDaemon.js:539`),
+    /// i.e. `org.freedesktop.Application.Activate` (D-Bus-activating the app).
+    Activate { app_id: String, token: String },
 }
 
 /// The authoritative store behind all notification surfaces.

@@ -7721,6 +7721,24 @@ impl Niri {
         }
     }
 
+    /// A body click on a notification with NO default action: gnome-shell's
+    /// `source.open()`. For an `org.gtk.Notifications` source this D-Bus-activates
+    /// the app (`js/ui/notificationDaemon.js:539`); fdo app-focus is deferred (no
+    /// window tracker). Call BEFORE `activate_source`, which destroys the card.
+    pub fn open_notification_app(&mut self, id: u32) {
+        use crate::notifications::{GtkToNotifications, NotifKind};
+        let Some(NotifKind::Gtk { app_id, .. }) =
+            self.notifications.find(id).map(|n| n.kind.clone())
+        else {
+            return;
+        };
+        let (token, _) = self.activation_state.create_external_token(None);
+        let token = token.as_str().to_owned();
+        if let Some(tx) = &self.gtk_notifications_emit {
+            let _ = tx.send_blocking(GtkToNotifications::Activate { app_id, token });
+        }
+    }
+
     /// Pop and show the next queued banner if the surface is free (hidden, no
     /// popover open, GNOME mode, an output to show on).
     pub fn maybe_show_banner(&mut self) {

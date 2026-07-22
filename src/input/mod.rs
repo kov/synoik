@@ -883,6 +883,7 @@ impl State {
                     self.niri.emit_notification_action(id, "default".to_owned());
                     self.niri.notifications.activate(id)
                 } else {
+                    self.niri.open_notification_app(id);
                     self.niri.notifications.activate_source(id)
                 }
             }
@@ -1059,6 +1060,7 @@ impl State {
                     self.niri.emit_notification_action(id, "default".to_owned());
                     self.niri.notifications.activate(id)
                 } else {
+                    self.niri.open_notification_app(id);
                     self.niri.notifications.activate_source(id)
                 };
                 self.niri.apply_notification_effects(effects);

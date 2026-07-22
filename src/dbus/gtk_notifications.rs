@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::lock::Mutex;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -44,6 +45,21 @@ pub const BUS_NAME: &str = "org.gtk.Notifications";
 
 type Dict = HashMap<String, zvariant::OwnedValue>;
 
+/// Per-notification action targets kept on the untrusted side of the seam: the
+/// `av` parameter each action carries (`js/ui/notificationDaemon.js` button
+/// `target` / `default-action-target`). Keyed `(app_id, gtk_id) -> action_key
+/// -> target`, so the model never has to carry untrusted `GVariant`s. Populated
+/// on `AddNotification`, dropped on `RemoveNotification`, and read by the
+/// emitter task when an action fires.
+type TargetMap = HashMap<(String, String), HashMap<String, zvariant::OwnedValue>>;
+
+/// Backstop against unbounded growth: notifications dismissed via the card
+/// close button (not `RemoveNotification`) leave a dead entry behind. Far above
+/// any realistic count of simultaneously-live Gtk notifications
+/// (`MAX_NOTIFICATIONS_PER_SOURCE` is 10), so a live notification's targets are
+/// never evicted in practice.
+const MAX_TARGET_ENTRIES: usize = 256;
+
 /// The `org.gtk.Notifications.Error.InvalidApp` D-Bus error (GNOME registers
 /// this domain in `js/misc/dbusErrors.js:32-36`), returned when the app-id has
 /// no installed desktop file.
@@ -61,6 +77,8 @@ pub struct GtkNotifications {
     /// Serialize method calls, like the fdo server: zbus dispatches concurrent
     /// tasks, but `Add`/`Remove` for one `(app_id, id)` must stay ordered.
     serial: Mutex<()>,
+    /// Shared with the emitter task (see [`Start::start`]).
+    targets: Arc<StdMutex<TargetMap>>,
 }
 
 impl GtkNotifications {
@@ -72,8 +90,45 @@ impl GtkNotifications {
             to_niri,
             from_niri,
             serial: Mutex::new(()),
+            targets: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
+
+    /// Record (or, on a replace, overwrite) the action targets for a
+    /// notification, with the [`MAX_TARGET_ENTRIES`] anti-leak backstop.
+    fn store_targets(
+        &self,
+        app_id: String,
+        gtk_id: String,
+        targets: HashMap<String, zvariant::OwnedValue>,
+    ) {
+        let mut map = self.targets.lock().unwrap();
+        map.remove(&(app_id.clone(), gtk_id.clone()));
+        if targets.is_empty() {
+            return;
+        }
+        if map.len() >= MAX_TARGET_ENTRIES {
+            if let Some(key) = map.keys().next().cloned() {
+                map.remove(&key);
+            }
+        }
+        map.insert((app_id, gtk_id), targets);
+    }
+}
+
+/// The app's `org.freedesktop.Application` object path from its id: prepend `/`,
+/// `.`→`/`, `-`→`_` (`glib/gio/gapplicationimpl-dbus.c` `application_path_from_appid`).
+fn app_object_path(app_id: &str) -> String {
+    let mut path = String::with_capacity(app_id.len() + 1);
+    path.push('/');
+    for ch in app_id.chars() {
+        path.push(match ch {
+            '.' => '/',
+            '-' => '_',
+            other => other,
+        });
+    }
+    path
 }
 
 /// The display identity gnome-shell pulls from the app's desktop file.
@@ -247,33 +302,36 @@ fn parse_urgency(dict: &Dict) -> Urgency {
     Urgency::Normal
 }
 
-/// The `buttons` array (`aa{sv}`), each `{label, action, target}`; the `target`
-/// (`av`) stays server-side (slice 2) so the model carries only plain strings.
-fn parse_buttons(dict: &Dict) -> Vec<(String, String)> {
+/// The `buttons` array (`aa{sv}`), each `{label, action, target}`. Returns the
+/// plain (key, label) pairs for the model plus each action's `target` value
+/// (kept server-side in the [`TargetMap`], never crossing the seam).
+fn parse_buttons(dict: &Dict) -> (Vec<(String, String)>, HashMap<String, zvariant::OwnedValue>) {
+    let mut actions = Vec::new();
+    let mut targets = HashMap::new();
     let Some(value) = dict.get("buttons") else {
-        return Vec::new();
+        return (actions, targets);
     };
     let Ok(clone) = value.try_clone() else {
-        return Vec::new();
+        return (actions, targets);
     };
     let Ok(buttons) = Vec::<Dict>::try_from(clone) else {
-        return Vec::new();
+        return (actions, targets);
     };
-    let mut out = Vec::new();
     for button in &buttons {
-        if out.len() >= 16 {
+        if actions.len() >= 16 {
             break;
         }
         let (Some(action), Some(label)) = (dict_str(button, "action"), dict_str(button, "label"))
         else {
             continue;
         };
-        out.push((
-            clamp_text(action, 1024),
-            clamp_text(flatten_text(&label), 1024),
-        ));
+        let action = clamp_text(action, 1024);
+        if let Some(target) = button.get("target").and_then(|v| v.try_clone().ok()) {
+            targets.insert(action.clone(), target);
+        }
+        actions.push((action, clamp_text(flatten_text(&label), 1024)));
     }
-    out
+    (actions, targets)
 }
 
 #[interface(name = "org.gtk.Notifications")]
@@ -295,6 +353,24 @@ impl GtkNotifications {
             )));
         };
 
+        let app_id = clamp_text(app_id, 255);
+        let gtk_id = clamp_text(id, 255);
+        let default_action = dict_str(&notification, "default-action").map(|s| clamp_text(s, 1024));
+
+        // Split the buttons into plain (key, label) pairs for the model and
+        // their `av` targets, kept here. The default action's target is stored
+        // under the default-action key so a body click resolves the same way.
+        let (actions, mut targets) = parse_buttons(&notification);
+        if let (Some(key), Some(target)) = (
+            &default_action,
+            notification
+                .get("default-action-target")
+                .and_then(|v| v.try_clone().ok()),
+        ) {
+            targets.insert(key.clone(), target);
+        }
+        self.store_targets(app_id.clone(), gtk_id.clone(), targets);
+
         let req = GtkNotifyRequest {
             app_title: clamp_text(app.name.unwrap_or_else(|| app_id.clone()), 1024),
             app_icon: app.icon,
@@ -309,11 +385,11 @@ impl GtkNotifications {
                 8192,
             ),
             icon: notification.get("icon").and_then(deserialize_gicon),
-            actions: parse_buttons(&notification),
-            default_action: dict_str(&notification, "default-action").map(|s| clamp_text(s, 1024)),
+            actions,
+            default_action,
             urgency: parse_urgency(&notification),
-            app_id: clamp_text(app_id, 255),
-            gtk_id: clamp_text(id, 255),
+            app_id,
+            gtk_id,
         };
 
         self.to_niri
@@ -327,6 +403,10 @@ impl GtkNotifications {
 
     async fn remove_notification(&self, app_id: String, id: String) {
         let _guard = self.serial.lock().await;
+        self.targets
+            .lock()
+            .unwrap()
+            .remove(&(app_id.clone(), id.clone()));
         if self
             .to_niri
             .send(NotificationsToNiri::RemoveGtk { app_id, gtk_id: id })
@@ -336,9 +416,9 @@ impl GtkNotifications {
         }
     }
 
-    /// Emitted (broadcast) for non-`app.` actions; `app.` actions route to the
-    /// app instead (slice 2). Declared for introspection; emission is raw in
-    /// `start` (see the emitter task).
+    /// Emitted (broadcast) for non-`app.` actions; `app.` actions call the
+    /// app's `ActivateAction` instead. Declared for introspection; emission is
+    /// raw in `start` (see the emitter task).
     #[zbus(signal)]
     async fn action_invoked(
         emitter: &SignalEmitter<'_>,
@@ -350,9 +430,75 @@ impl GtkNotifications {
     ) -> zbus::Result<()>;
 }
 
+/// The `platform_data` map carrying the XDG activation token, as
+/// `GtkNotificationDaemonAppSource` builds it (`js/ui/notificationDaemon.js:510-534`).
+fn platform_data(token: String) -> HashMap<String, zvariant::Value<'static>> {
+    let mut map = HashMap::new();
+    if !token.is_empty() {
+        map.insert("activation-token".to_owned(), zvariant::Value::from(token));
+    }
+    map
+}
+
+/// The `av` action parameter: the single target value, or empty (glib's
+/// `ActivateAction` takes the first `av` element, `gapplicationimpl-dbus.c:290`).
+fn parameter_av(target: Option<zvariant::OwnedValue>) -> Vec<zvariant::Value<'static>> {
+    match target {
+        Some(target) => vec![zvariant::Value::from(target)],
+        None => Vec::new(),
+    }
+}
+
+/// `org.freedesktop.Application.ActivateAction` on the app's bus name, which
+/// D-Bus-activates it if stopped (gnome-shell's `this._app.activate_action`,
+/// `js/ui/notificationDaemon.js:510-517`). Failure is logged, not fatal (the
+/// app may simply not be D-Bus-activatable) — GNOME likewise `.catch`es it.
+async fn activate_app_action(
+    conn: &zbus::Connection,
+    app_id: &str,
+    action: &str,
+    target: Option<zvariant::OwnedValue>,
+    token: String,
+) {
+    let path = app_object_path(app_id);
+    let body = (action, parameter_av(target), platform_data(token));
+    if let Err(err) = conn
+        .call_method(
+            Some(app_id),
+            path.as_str(),
+            Some("org.freedesktop.Application"),
+            "ActivateAction",
+            &body,
+        )
+        .await
+    {
+        warn!("gtk-notifications: ActivateAction({action:?}) on {app_id} failed: {err:?}");
+    }
+}
+
+/// `org.freedesktop.Application.Activate` — a body click with no default action
+/// runs `source.open()` = `this._app.activate()` (`js/ui/notificationDaemon.js:539`).
+async fn activate_app(conn: &zbus::Connection, app_id: &str, token: String) {
+    let path = app_object_path(app_id);
+    let body = (platform_data(token),);
+    if let Err(err) = conn
+        .call_method(
+            Some(app_id),
+            path.as_str(),
+            Some("org.freedesktop.Application"),
+            "Activate",
+            &body,
+        )
+        .await
+    {
+        warn!("gtk-notifications: Activate on {app_id} failed: {err:?}");
+    }
+}
+
 impl Start for GtkNotifications {
     fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
         let from_niri = self.from_niri.clone();
+        let targets = self.targets.clone();
         let conn = zbus::blocking::Connection::session()?;
 
         conn.object_server().at(PATH, self)?;
@@ -369,8 +515,9 @@ impl Start for GtkNotifications {
             ),
         }
 
-        // Emitter task: broadcast `ActionInvoked` for non-`app.` actions. The
-        // main loop never touches this connection (the process-isolation seam).
+        // Emitter task: `app.` actions call the app's `ActivateAction`, others
+        // broadcast `ActionInvoked`. The main loop never touches this connection
+        // (the process-isolation seam).
         let emit_conn = conn.inner().clone();
         conn.inner()
             .executor()
@@ -384,44 +531,50 @@ impl Start for GtkNotifications {
                                 action,
                                 token,
                             } => {
-                                if action.starts_with("app.") {
-                                    // Routed to org.freedesktop.Application in slice 2.
-                                    debug!(
-                                        "gtk-notifications: app-action {action:?} routing \
-                                         deferred to slice 2"
-                                    );
-                                    continue;
-                                }
-                                // `emitActionInvoked` includes the activation
-                                // token in `platform_data`
-                                // (`js/ui/notificationDaemon.js:508-534`); the
-                                // target `av` is empty until slice 2.
-                                let mut platform_data = HashMap::new();
-                                platform_data.insert(
-                                    "activation-token".to_owned(),
-                                    zvariant::Value::from(token),
-                                );
-                                let body = (
-                                    app_id,
-                                    gtk_id,
-                                    action,
-                                    Vec::<zvariant::Value>::new(),
-                                    platform_data,
-                                );
-                                if let Err(err) = emit_conn
-                                    .emit_signal(
-                                        Option::<BusName>::None,
-                                        PATH,
-                                        BUS_NAME,
-                                        "ActionInvoked",
-                                        &body,
+                                // Pull this action's `av` target (dropped before
+                                // any await — the std guard is not Send).
+                                let target = targets
+                                    .lock()
+                                    .unwrap()
+                                    .get(&(app_id.clone(), gtk_id.clone()))
+                                    .and_then(|m| m.get(&action))
+                                    .and_then(|t| t.try_clone().ok());
+
+                                if let Some(app_action) = action.strip_prefix("app.") {
+                                    activate_app_action(
+                                        &emit_conn, &app_id, app_action, target, token,
                                     )
-                                    .await
-                                {
-                                    warn!(
-                                        "gtk-notifications: error emitting ActionInvoked: {err:?}"
+                                    .await;
+                                } else {
+                                    // `emitActionInvoked` carries the target `av`
+                                    // and the token in `platform_data`
+                                    // (`js/ui/notificationDaemon.js:519-534`).
+                                    let body = (
+                                        app_id,
+                                        gtk_id,
+                                        action,
+                                        parameter_av(target),
+                                        platform_data(token),
                                     );
+                                    if let Err(err) = emit_conn
+                                        .emit_signal(
+                                            Option::<BusName>::None,
+                                            PATH,
+                                            BUS_NAME,
+                                            "ActionInvoked",
+                                            &body,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            "gtk-notifications: error emitting \
+                                             ActionInvoked: {err:?}"
+                                        );
+                                    }
                                 }
+                            }
+                            GtkToNotifications::Activate { app_id, token } => {
+                                activate_app(&emit_conn, &app_id, token).await;
                             }
                         }
                     }
@@ -437,6 +590,19 @@ impl Start for GtkNotifications {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_path_mangles_dots_and_hyphens() {
+        // glib `application_path_from_appid`: '.'→'/', '-'→'_', leading '/'.
+        assert_eq!(
+            app_object_path("org.gnome.TextEditor"),
+            "/org/gnome/TextEditor"
+        );
+        assert_eq!(
+            app_object_path("ca.desrt.dconf-editor"),
+            "/ca/desrt/dconf_editor"
+        );
+    }
 
     #[test]
     fn app_id_validity_rejects_traversal_and_bare_names() {
@@ -519,10 +685,11 @@ mod tests {
             Value::from(vec!["icon-a".to_string(), "icon-b".to_string()]),
         ));
         map.insert("icon".into(), gicon);
-        // buttons: aa{sv}, each {label, action}.
+        // buttons: aa{sv}, each {label, action, target}.
         let mut button: HashMap<String, Value> = HashMap::new();
         button.insert("label".into(), Value::from("Reply"));
         button.insert("action".into(), Value::from("app.reply"));
+        button.insert("target".into(), Value::from("conversation-42"));
         map.insert("buttons".into(), Value::from(vec![button]));
 
         let dict = wire_dict(map);
@@ -538,9 +705,15 @@ mod tests {
             deserialize_gicon(dict.get("icon").unwrap()),
             Some(NotificationIcon::Themed("icon-a".to_owned()))
         );
+        let (actions, targets) = parse_buttons(&dict);
+        assert_eq!(actions, vec![("app.reply".to_owned(), "Reply".to_owned())]);
+        // The button's `target` is captured server-side, keyed by action.
         assert_eq!(
-            parse_buttons(&dict),
-            vec![("app.reply".to_owned(), "Reply".to_owned())]
+            targets
+                .get("app.reply")
+                .and_then(|t| String::try_from(t.try_clone().unwrap()).ok())
+                .as_deref(),
+            Some("conversation-42")
         );
     }
 

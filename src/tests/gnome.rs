@@ -3649,6 +3649,7 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
             assert_eq!(gtk_id, "msg-1");
             assert_eq!(action, "reply");
         }
+        _ => panic!("expected ActionInvoked"),
     }
     assert!(
         fdo_emitted.try_recv().is_err(),
@@ -3661,6 +3662,7 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
         .emit_notification_action(id, "default".to_owned());
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::ActionInvoked { action, .. } => assert_eq!(action, "app.open"),
+        _ => panic!("expected ActionInvoked"),
     }
 
     // Remove destroys it and emits no fdo NotificationClosed (no sender).
@@ -3675,6 +3677,42 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
         fdo_emitted.try_recv().is_err(),
         "removing a Gtk notification emits no NotificationClosed"
     );
+}
+
+/// A body click on a Gtk notification with NO default action runs `open()` =
+/// the app's `Activate` (`js/ui/notificationDaemon.js:539`).
+#[test]
+fn notifications_gtk_body_click_without_default_activates_app() {
+    use crate::notifications::{
+        GtkNotifyRequest, GtkToNotifications, NotificationsToNiri, Urgency,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::AddGtk {
+            req: GtkNotifyRequest {
+                app_id: "org.example.App".to_owned(),
+                gtk_id: "n1".to_owned(),
+                app_title: "App".to_owned(),
+                app_icon: None,
+                title: "t".to_owned(),
+                body: "b".to_owned(),
+                icon: None,
+                actions: Vec::new(),
+                default_action: None,
+                urgency: Urgency::Normal,
+            },
+        });
+    let id = f.niri().notifications.sources[0].notifications[0].id;
+
+    let (to_gtk, gtk_emitted) = async_channel::unbounded();
+    f.niri_state().niri.gtk_notifications_emit = Some(to_gtk);
+    f.niri_state().niri.open_notification_app(id);
+    match gtk_emitted.recv_blocking().unwrap() {
+        GtkToNotifications::Activate { app_id, .. } => assert_eq!(app_id, "org.example.App"),
+        _ => panic!("expected Activate"),
+    }
 }
 
 // ---- Notification banner (slice 2) ----
