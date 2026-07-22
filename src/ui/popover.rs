@@ -38,11 +38,18 @@ const POPOVER_MARGIN: f64 = 6.;
 
 /// `.popup-menu-content` `box-shadow: 0 2px 4px 0 $shadow_color` (`_popovers.scss:32`) — the drop
 /// shadow every panel popover (QS / date / input-source BoxPointer) casts; `$shadow_color` (dark)
-/// = `rgba(0,0,0,0.2)`. Spread 0.
+/// = `rgba(0,0,0,0.2)`.
+///
+/// The literal CSS spread is 0, but St's shadow rasterizer (`st-private.c` +
+/// `st-theme-node-drawing.c`) renders visibly denser than a naive "blur the silhouette, edge =
+/// 0.5-coverage" gaussian: measured against a real GNOME 50.1 popover over white, the shadow's
+/// core sits at ~full `$shadow_color` alpha right at the box edge and falls off outside — a
+/// profile a **spread of 2** reproduces almost exactly (the tail matches pixel-for-pixel). So we
+/// carry spread 2 to match GNOME's on-screen result (the true reference), not the literal 0.
 const POPOVER_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
     blur: 4.,
     offset: (0., 2.),
-    spread: 0.,
+    spread: 2.,
     color: [0., 0., 0., 0.2],
 };
 
