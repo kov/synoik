@@ -158,10 +158,13 @@ This lands **first**, wired to `input_source_menu`, as a permanent regression pi
 it fails on the pre-H2 path and passes after.
 
 ## 5. Rollout (tentative slices, each a commit, all gates green)
-- **A. H4 + H1.** Scale-sweep harness + `bake()` helper. Port `input_source_menu` (smallest,
-  already understood) onto both; its scale-2 test is the `3c7473be` pin. No visual change.
-- **B. H2.** `Painter` logical/pt verbs + `TextShaper`/`ShapedText` + `Align`/`place_ink`. Re-express
-  `input_source_menu`'s paint closure through it; the manual `× scale` disappears.
+- **A. H4 + H1.** ✅ DONE (`a6027351`). Scale-sweep harness + `bake()` helper. Ported
+  `input_source_menu` onto both; `popover_text_scales_with_output` is the `3c7473be` pin (verified
+  it fails on a reinjected logical-px bug). No visual change.
+- **B. H2.** ✅ DONE (`a17fd8f6`). `Painter` logical/pt verbs + `TextShaper`/`ShapedText` + `Align`.
+  `input_source_menu` now describes its chrome purely in logical units + points; the last manual
+  `× scale` is gone (pixel-identical by construction). `place_ink` is folded into `Painter::text`
+  via `Align`.
 - **C. H3.** Atoms + `style` module; delete the duplicated `icon_element`/`CHECK_ICONS`/color
   literals. Port a second component (quick-settings tiles or calendar discs) to exercise reuse.
 - **D+. Opportunistic ports.** calendar, quick_settings, mru, dialogs — one commit each, only when
