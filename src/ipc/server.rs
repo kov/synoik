@@ -587,7 +587,15 @@ impl State {
         let mut state = server.event_stream_state.borrow_mut();
         let state = &mut state.keyboard_layouts;
 
-        if state.keyboard_layouts.as_ref().unwrap().current_idx == idx {
+        // The full layout list hasn't been published yet — e.g. seeding the active group from
+        // `mru-sources` during `State::new`, before the initial `ipc_keyboard_layouts_changed`.
+        // That publish reads `current_idx` from live xkb, so it captures the seeded index; there
+        // is nothing to reconcile here yet. (Unwrapping here panicked at startup on a config whose
+        // `mru-sources[0]` is not the first source.)
+        let Some(layouts) = state.keyboard_layouts.as_ref() else {
+            return;
+        };
+        if layouts.current_idx == idx {
             return;
         }
 
