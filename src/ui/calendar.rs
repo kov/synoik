@@ -1,8 +1,9 @@
 //! The dateMenu calendar grid.
 //!
 //! A fork-owned port of gnome-shell's `js/ui/calendar.js` month view: a
-//! `‹ Month Year ›` header with prev/next-month pagers, a weekday-abbreviation
-//! row rotated by the locale/gsettings week-start, and a 6×7 day grid with the
+//! `‹ Month ›` header (month name alone in the current year, `‹ Month Year ›`
+//! otherwise) with prev/next-month pagers, a single-letter weekday-heading row
+//! rotated by the locale/gsettings week-start, and a 6×7 day grid with the
 //! current day highlighted and out-of-month days dimmed. An optional ISO
 //! week-number column shows when `org.gnome.desktop.calendar show-weekdate` is
 //! set. Date math is done with libc (no date crate); all text is drawn through
@@ -78,6 +79,10 @@ const TEXT: [f32; 4] = [1., 1., 1., 1.];
 const SELECTED_BG: [f32; 4] = [0.28, 0.28, 0.28, 1.];
 /// Out-of-month day numbers, dimmed.
 const DIM: [f32; 4] = [0.5, 0.5, 0.5, 1.];
+/// In-month weekend day number — gnome-shell's `.calendar-weekend { color: $insensitive_fg_color }`
+/// (`_calendar.scss:87`), `$insensitive_fg_color` (dark) = `mix($fg_color, $bg_color, 50%)` ≈
+/// `#9a9a9c`. Dimmer than a workday (white) so the work days pop.
+const WEEKEND_FG: [f32; 4] = [0.606, 0.606, 0.614, 1.];
 /// Weekday header + week numbers, muted.
 const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
 
@@ -396,14 +401,20 @@ impl Calendar {
 
         // Shape every run up front (needs `&mut renderer`, before the bake frame opens).
         // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the font sizes.
-        let title = strftime_ymd(
-            Ymd {
-                year: self.year,
-                month: self.month,
-                day: 1,
-            },
-            c"%B %Y",
-        );
+        // Month header: month name alone while viewing the current year, month + year otherwise —
+        // gnome-shell's `sameYear(selectedDate, now)` split between `%OB` and `%OB %Y`
+        // (`js/ui/calendar.js:755-757`). (`%OB`, the standalone month form, matters for declined-
+        // noun locales; for our en scope it is identical to `%B`.)
+        let first = Ymd {
+            year: self.year,
+            month: self.month,
+            day: 1,
+        };
+        let title = if self.year == self.today.year {
+            strftime_ymd(first, c"%B")
+        } else {
+            strftime_ymd(first, c"%B %Y")
+        };
         let day_label = strftime_ymd(self.today, c"%A");
         let date_label = strftime_ymd(self.today, c"%B %-d %Y");
         let grid = self.grid();
@@ -424,12 +435,23 @@ impl Calendar {
             let weekday_runs: Vec<ShapedText> = (0..GRID_COLS)
                 .map(|c| {
                     let w = (self.week_start as usize + c) % 7;
-                    shaper.shape(&weekday_abbrev(w as u32), TextStyle::new(WEEKDAY_PT))
+                    shaper.shape(&weekday_abbrev(w as u32), TextStyle::new(WEEKDAY_PT).bold())
                 })
                 .collect::<Result<_, _>>()?;
+            // Current-month days are bold (`.calendar-day font-weight:bold`), other-month days
+            // normal (`.calendar-other-month font-weight:normal`, `_calendar.scss:82,96`) — this is
+            // what makes the in-month days "pop".
             let day_runs: Vec<ShapedText> = grid
                 .iter()
-                .map(|d| shaper.shape(&d.day.to_string(), TextStyle::new(DAY_PT)))
+                .map(|d| {
+                    let style = TextStyle::new(DAY_PT);
+                    let style = if d.month == self.month {
+                        style.bold()
+                    } else {
+                        style
+                    };
+                    shaper.shape(&d.day.to_string(), style)
+                })
                 .collect::<Result<_, _>>()?;
             let week_runs: Vec<ShapedText> = if self.show_week_numbers {
                 (0..GRID_ROWS)
@@ -553,8 +575,21 @@ impl Calendar {
                         p.fill_rounded(disc, DISC_DIAM / 2., HOVER_WASH)?;
                     }
                 }
+                // Color (gnome-shell `_calendar.scss:73-99`): today draws white on its accent
+                // disc; other-month days are dimmed (`.calendar-other-month`); in-month WEEKEND
+                // days are the muted `$insensitive_fg_color` (`.calendar-weekend`) so the workdays
+                // (full white, bold) pop; in-month workdays are white.
                 let in_month = date.month == self.month;
-                let color = if is_today || in_month { TEXT } else { DIM };
+                let is_weekend = matches!(weekday(*date), 0 | 6);
+                let color = if is_today {
+                    TEXT
+                } else if !in_month {
+                    DIM
+                } else if is_weekend {
+                    WEEKEND_FG
+                } else {
+                    TEXT
+                };
                 p.text(&day_runs[i], c, Align::CENTER, color)?;
             }
 
@@ -2302,6 +2337,10 @@ fn strftime_ymd(date: Ymd, fmt: &CStr) -> String {
 }
 
 /// The locale's abbreviated name for weekday `w` (0=Sunday..6=Saturday).
+/// The single-letter grid abbreviation for weekday `w` (0 = Sunday). gnome-shell shows one letter
+/// per column ("S M T W T F S"), NOT the 3-char `%a` form (`_getCalendarDayAbbreviation`,
+/// `js/ui/calendar.js:53,538`). We take the first character of the localized abbreviated name,
+/// which for en yields exactly GNOME's S/M/T/W/T/F/S.
 fn weekday_abbrev(w: u32) -> String {
     // 2023-01-01 was a Sunday; add w days to land on the wanted weekday.
     let date = add_days(
@@ -2312,7 +2351,8 @@ fn weekday_abbrev(w: u32) -> String {
         },
         w as i64,
     );
-    strftime_ymd(date, c"%a")
+    let abbrev = strftime_ymd(date, c"%a");
+    abbrev.chars().next().map(String::from).unwrap_or(abbrev)
 }
 
 #[cfg(test)]
