@@ -8,20 +8,14 @@ use niri_config::{
     Action, Bind, Color, Config, CornerRadius, GradientInterpolation, Key, Modifiers, MruDirection,
     MruFilter, MruScope, Trigger,
 };
-use niri_vk::text::{SpanFamily, TextSpan};
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{
-    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
-};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -32,11 +26,11 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderCtx;
+use crate::ui::widget::{self, ParagraphSpan, TextShaper, TextStyle};
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
     with_toplevel_role,
@@ -71,8 +65,11 @@ const PANEL_BORDER: i32 = 4;
 /// Backdrop color behind the previews.
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
 
-/// Font size for the window titles and scope panel (body 11pt), logical px-per-em.
-const FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Font size for the window titles and scope panel (body 11pt), GNOME points;
+/// shaping routes it through [`TextShaper`]. `FONT_PX` is its logical px, used
+/// only for the scope-panel keycap-patch padding geometry.
+const FONT_PT: f64 = 11.;
+const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 /// Title text colour (opaque white); the offscreen is otherwise transparent so the gradient fade
 /// and the layout clip act on the text alone.
 const TITLE_COLOR: [f32; 4] = [1., 1., 1., 1.];
@@ -1701,8 +1698,11 @@ fn generate_title_texture(
 ) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::generate_title_texture");
 
-    let px = (FONT_PX * scale) as f32;
-    let run = renderer.build_glyph_run(title, px)?;
+    // `TextShaper` owns the pt → physical-px multiply — no `* scale` at this call site.
+    let run = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        shaper.shape(title, TextStyle::new(FONT_PT))?
+    };
     let (ix, iy, iw, ih) = run.ink_bounds();
     anyhow::ensure!(iw > 0 && ih > 0, "empty title");
 
@@ -1711,19 +1711,13 @@ fn generate_title_texture(
     let h = ih.min(16383);
     let origin = Point::<i32, Physical>::from((-ix, -iy));
     let size = Size::<i32, Physical>::from((w, h));
-    let full = Rectangle::from_size(size);
 
-    let mut target =
-        renderer.create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((w, h)))?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let full = Rectangle::from_size(size);
         frame.clear(Color32F::from([0., 0., 0., 0.]), &[full])?;
-        frame.render_glyphs(&run, origin, TITLE_COLOR, full, &[full])?;
-        let _sync = frame.finish()?;
-    }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        frame.render_glyphs(run.run(), origin, TITLE_COLOR, full, &[full])?;
+        Ok(())
+    })
 }
 
 impl ScopePanel {
@@ -1778,23 +1772,6 @@ fn render_panel(
     let padding = padding.max(0);
     let border: i32 = ((f64::from(PANEL_BORDER) / 2. * scale).round() as i32).max(1);
 
-    fn mono_bold(t: &str, px: f32) -> TextSpan<'_> {
-        TextSpan {
-            text: t,
-            family: SpanFamily::Mono,
-            bold: true,
-            px,
-        }
-    }
-    fn sans(t: &str, px: f32) -> TextSpan<'_> {
-        TextSpan {
-            text: t,
-            family: SpanFamily::Sans,
-            bold: false,
-            px,
-        }
-    }
-
     // First letter + remainder (+ inter-scope gap) for each scope, in cycle order.
     let last = SCOPE_CYCLE.len() - 1;
     let parts: Vec<(&str, String, MruScope)> = SCOPE_CYCLE
@@ -1811,13 +1788,16 @@ fn render_panel(
         })
         .collect();
 
-    let mut spans = vec![mono_bold("S", px), sans("cope:  ", px)];
+    let mut spans = vec![
+        ParagraphSpan::new("S", FONT_PT).mono().bold(),
+        ParagraphSpan::new("cope:  ", FONT_PT),
+    ];
     let mut colors = vec![PANEL_UNSELECTED, PANEL_UNSELECTED];
     let mut keycap_spans = Vec::new();
     for (first, rest, scope) in &parts {
         keycap_spans.push(spans.len() as u32);
-        spans.push(mono_bold(first, px));
-        spans.push(sans(rest, px));
+        spans.push(ParagraphSpan::new(first, FONT_PT).mono().bold());
+        spans.push(ParagraphSpan::new(rest, FONT_PT));
         let color = if *scope as usize == selected {
             PANEL_SELECTED
         } else {
@@ -1828,32 +1808,32 @@ fn render_panel(
     }
 
     // Large wrap so the single line never wraps; centering is moot for one line.
-    let run = renderer.build_glyph_paragraph(&spans, 100_000., px)?;
+    // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the shaping path.
+    let run = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        shaper.paragraph(&spans, 100_000., FONT_PT)?
+    };
     let (ix, iy, iw, ih) = run.ink_bounds();
     anyhow::ensure!(iw > 0 && ih > 0, "empty panel");
     let box_w = iw + padding * 2;
     let box_h = ih + padding * 2;
     let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
     let size = Size::<i32, Physical>::from((box_w, box_h));
-    let full = Rectangle::from_size(size);
     let inner = Rectangle::new(
         Point::from((border, border)),
         Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
     );
 
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((box_w, box_h)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    // Breathing room around the grey keycap patches.
+    let kpad_x = (px * 0.22).round() as i32;
+    let kpad_y = (px * 0.12).round() as i32;
+
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let full = Rectangle::from_size(size);
         frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
         frame.clear(Color32F::from(PANEL_BG), &[inner])?;
 
         // Grey keycap patches behind each bold-mono first letter.
-        let kpad_x = (px * 0.22).round() as i32;
-        let kpad_y = (px * 0.12).round() as i32;
         for &ks in &keycap_spans {
             let (kx, ky, kw, kh) = run.span_ink_bounds(ks);
             if kw > 0 && kh > 0 {
@@ -1866,11 +1846,9 @@ fn render_panel(
                 }
             }
         }
-        frame.render_glyphs_spans(&run, origin, &colors, full, &[full])?;
-        let _sync = frame.finish()?;
-    }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        frame.render_glyphs_spans(run.run(), origin, &colors, full, &[full])?;
+        Ok(())
+    })
 }
 
 /// Returns key bindings available when the MRU UI is open.
