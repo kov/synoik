@@ -14,7 +14,7 @@ use std::path::Path;
 
 use gio::glib;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
@@ -22,7 +22,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Padding around the dialog text block, logical px.
@@ -221,7 +221,7 @@ impl RunDialog {
                 scale,
                 self.revision,
                 |renderer| prepare_dialog(renderer, scale, entry, error),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -340,10 +340,11 @@ fn paint_dialog(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
     layout: &DialogLayout,
+    scale: f64,
 ) -> anyhow::Result<()> {
-    let full = Rectangle::from_size(phys);
-    frame.clear(Color32F::from(BOX_BG), &[full])?;
-    frame.render_glyphs(layout.run.run(), layout.origin, TEXT, full, &[full])?;
+    let mut p = Painter::new(frame, scale, phys);
+    p.clear(BOX_BG)?;
+    p.paragraph(&layout.run, layout.origin, TEXT)?;
     Ok(())
 }
 
@@ -488,7 +489,7 @@ mod tests {
                 scale,
                 0,
                 |r| prepare_dialog(r, scale, entry, error),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
             )
             .expect("dialog texture");
             let size = tex.size();
