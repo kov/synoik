@@ -17,16 +17,80 @@ use std::collections::HashMap;
 use anyhow::Context as _;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::renderer::OffscreenRenderer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
 use crate::utils::to_physical_precise_round;
 
 /// Straight-alpha RGBA, the color type every draw verb takes (glyph coverage /
 /// SDF alpha modulates it). Matches the `[f32; 4]` the frame primitives want.
 pub type Rgba = [f32; 4];
+
+/// Shared visual tokens, so the same color/icon-set is not re-declared per widget
+/// (they drifted before: `HOVER_WASH` in 3 files, `TEXT`/`CHECK_ICONS` in more).
+/// Only genuinely-shared, identically-valued tokens live here; widget-specific or
+/// divergent values (a menu bg vs a tile bg, the separator alphas) stay local until
+/// a port reconciles them against `docs/fork/gnome-style-reference.md`.
+pub mod style {
+    use super::Rgba;
+
+    /// Fully transparent — the clear color for a rounded (transparent-corner) surface.
+    pub const TRANSPARENT: Rgba = [0., 0., 0., 0.];
+    /// Primary foreground (opaque white); glyph coverage modulates the alpha.
+    pub const TEXT: Rgba = [1., 1., 1., 1.];
+    /// Dimmed foreground (secondary labels, e.g. a row's short code).
+    pub const MUTED: Rgba = [0.6, 0.6, 0.6, 1.];
+    /// The hover highlight wash over a row/tile (a subtle lighten). NOTE: the
+    /// lighten-vs-darken *direction* is per-widget (read from the SCSS cascade); this
+    /// is the standard lighten used by menu rows / QS tiles / calendar days.
+    pub const HOVER_WASH: Rgba = [1., 1., 1., 0.1];
+    /// Icon-name fallback chain for an "active/selected" check mark.
+    pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
+}
+
+/// Composite a symbolic icon — the first of `candidates` that resolves — centered
+/// at `center` (relative to the element `origin`), sized `logical_px`, tinted
+/// `color`. The single home for the icon-compositing helper that was copy-pasted
+/// across the popover/panel UIs (`icon_element` ×2 + 3 inline sequences). Returns
+/// `None` (logging on a GPU upload error) if no candidate resolves or the upload
+/// fails, so callers can `if let Some(el) = …` and simply skip a missing glyph.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_element<S: AsRef<str>>(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    candidates: &[S],
+    logical_px: f64,
+    scale: f64,
+    color: Rgba,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let buffer = candidates
+        .iter()
+        .find_map(|name| icons.buffer(name.as_ref(), logical_px, scale, color))?;
+    let tb = match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+        Ok(tb) => tb,
+        Err(err) => {
+            tracing::error!("error uploading widget icon: {err:#}");
+            return None;
+        }
+    };
+    let logical = tb.logical_size();
+    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+    Some(TextureRenderElement::from_texture_buffer(
+        tb,
+        loc,
+        1.,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
 
 /// A per-widget offscreen-texture cache for [`bake`], keyed by `(scale,
 /// physical_size, revision)`. One lives (behind a `RefCell`) on each baking

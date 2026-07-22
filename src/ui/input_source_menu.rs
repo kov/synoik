@@ -22,7 +22,9 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle};
+use crate::ui::widget::{
+    self, style, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
+};
 
 const PAD: f64 = 8.;
 const ROW_H: f64 = 32.;
@@ -42,19 +44,18 @@ const SEP_EXTRA: f64 = 9.;
 const RADIUS: f64 = 14.;
 const MIN_W: f64 = 200.;
 
+/// The menu background (a dark popover surface). Local: it differs from the
+/// quick-settings menu bg, so it is not a shared token yet.
 const BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
-const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
-const TEXT: [f32; 4] = [1., 1., 1., 1.];
-const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
+/// The row separator rule. Local: the separator alpha diverges across widgets
+/// (0.12 here vs 0.10/0.22 elsewhere) pending a reference reconciliation.
 const SEPARATOR: [f32; 4] = [1., 1., 1., 0.12];
-const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.10];
 
 /// Row text size (`%heading`, GNOME points). `TEXT_PX` is its logical px, used
 /// only for GPU-free width measurement in [`InputSourceMenu::logical_size`]; the
 /// bake shapes via [`widget::TextStyle`] so no draw site touches the px.
 const TEXT_PT: f64 = 11.;
 const TEXT_PX: f64 = crate::ui::pt_to_px(TEXT_PT);
-const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 
 /// One configured layout as shown in the menu (gnome-shell's `LayoutMenuItem`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +229,7 @@ impl InputSourceMenu {
         let size = self.logical_size();
         let mut p = Painter::new(frame, scale, phys);
 
-        p.clear(TRANSPARENT)?;
+        p.clear(style::TRANSPARENT)?;
         p.fill_rounded(Rectangle::from_size(size), RADIUS, BG)?;
 
         // The separator rule centered in the break above the trailing items.
@@ -242,7 +243,7 @@ impl InputSourceMenu {
         for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
             let rrect = self.row_rect(k, size.w);
             if self.hovered == Some(k) {
-                p.fill_rounded(rrect, 8., HOVER_WASH)?;
+                p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
             }
             // Layout rows reserve the ornament column; trailing items don't.
             let is_layout = matches!(self.row_kind(k), RowKind::Layout(_));
@@ -256,13 +257,18 @@ impl InputSourceMenu {
                 label_run,
                 Point::from((label_x, cy)),
                 Align::LEFT_MIDDLE,
-                TEXT,
+                style::TEXT,
             )?;
 
             // The short label, right-aligned and dimmed.
             if let Some(run) = short_run {
                 let right = size.w - TEXT_INSET;
-                p.text(run, Point::from((right, cy)), Align::RIGHT_MIDDLE, MUTED)?;
+                p.text(
+                    run,
+                    Point::from((right, cy)),
+                    Align::RIGHT_MIDDLE,
+                    style::MUTED,
+                )?;
             }
         }
         Ok(())
@@ -298,13 +304,13 @@ impl InputSourceMenu {
                 rrect.loc.x + TEXT_INSET + ORN_W / 2. - ROW_MARGIN,
                 rrect.loc.y + rrect.size.h / 2.,
             ));
-            if let Some(el) = icon_element(
+            if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
-                CHECK_ICONS,
+                style::CHECK_ICONS,
                 ICON,
                 scale,
-                TEXT,
+                style::TEXT,
                 origin,
                 center,
             ) {
@@ -334,35 +340,6 @@ impl InputSourceMenu {
         }
         elements
     }
-}
-
-/// Composite a symbolic icon (first of `candidates` that resolves) centered at
-/// `center`, tinted `color`. Mirrors the shared helper in `quick_settings`.
-#[allow(clippy::too_many_arguments)]
-fn icon_element(
-    renderer: &mut VulkanRenderer,
-    icons: &IconCache,
-    candidates: &[&str],
-    size: f64,
-    scale: f64,
-    color: [f32; 4],
-    origin: Point<f64, Logical>,
-    center: Point<f64, Logical>,
-) -> Option<TextureRenderElement<VkTexture>> {
-    let buffer = candidates
-        .iter()
-        .find_map(|name| icons.buffer(name, size, scale, color))?;
-    let tb = TextureBuffer::from_memory_buffer(renderer, &buffer).ok()?;
-    let logical = tb.logical_size();
-    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
-    Some(TextureRenderElement::from_texture_buffer(
-        tb,
-        loc,
-        1.,
-        None,
-        None,
-        Kind::Unspecified,
-    ))
 }
 
 #[cfg(test)]

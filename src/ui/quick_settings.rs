@@ -49,6 +49,7 @@ use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, NetworkStatus, PowerProfileStatus,
 };
 use crate::ui::popover::PopoverAction;
+use crate::ui::widget::{self, style};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass quick-settings proportions).
@@ -124,16 +125,7 @@ const SLIDER_TROUGH_BG: [f32; 4] = [1., 1., 1., 0.1];
 const MENU_RADIUS: f64 = 36.;
 
 const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
-/// Fully-transparent clear for the menu offscreen, so the rounded MENU_BG fill leaves
-/// the four outer corners transparent (they blend to whatever is beneath the popover).
-const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
-/// Hover highlight: an additive white wash painted over a control's existing
-/// background, behind its glyphs (GNOME raises a button's fg-wash by ~0.10 on
-/// `:hover`, `_message-list.scss:72-75`; quick toggles use `button(hover)`, a
-/// lightened bg). For flat detail rows with no base bg this is the whole
-/// indication. Subtle by design; tune live.
-const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.1];
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
 /// Text/icon on an active (accent) tile. GNOME's `-st-accent-fg-color` is hardcoded white
@@ -148,11 +140,6 @@ const SYS_FG: [f32; 4] = [0.9, 0.9, 0.9, 1.];
 const ARROW_W: f64 = 44.;
 const ARROW_ICON: f64 = 16.;
 const ARROW_ICONS: &[&str] = &["go-next-symbolic", "pan-end-symbolic"];
-/// The trailing check on the selected detail row (gnome-shell's `Ornament.CHECK`). Its native
-/// `ornament-check-symbolic` ships only in gnome-shell's gresource, invisible to our
-/// theme-directory icon cache — `object-select-symbolic` is the Adwaita equivalent that actually
-/// resolves.
-const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 /// The 1px divider between a menu tile's toggle-half and its arrow-half
 /// (`.quick-toggle-separator`); a faint line readable on both the off and accent backgrounds.
 const SEPARATOR_W: f64 = 1.;
@@ -1359,7 +1346,7 @@ impl QuickSettings {
                 rect.loc.y + rect.size.h / 2.,
             ));
             let candidates = item.icons(self.network, &self.power);
-            if let Some(el) = icon_element(
+            if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
                 &candidates,
@@ -1379,7 +1366,7 @@ impl QuickSettings {
                     arrow.loc.x + arrow.size.w / 2.,
                     arrow.loc.y + arrow.size.h / 2.,
                 ));
-                if let Some(el) = icon_element(
+                if let Some(el) = widget::icon_element(
                     renderer,
                     icons,
                     ARROW_ICONS,
@@ -1403,7 +1390,7 @@ impl QuickSettings {
                     card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON / 2.,
                     card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.,
                 ));
-                if let Some(el) = icon_element(
+                if let Some(el) = widget::icon_element(
                     renderer,
                     icons,
                     &cand,
@@ -1434,7 +1421,7 @@ impl QuickSettings {
                             rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON / 2.,
                             rrect.loc.y + rrect.size.h / 2.,
                         ));
-                        if let Some(el) = icon_element(
+                        if let Some(el) = widget::icon_element(
                             renderer, icons, &row.icons, TILE_ICON, scale, FG_OFF, origin, center,
                         ) {
                             elements.push(el);
@@ -1446,10 +1433,10 @@ impl QuickSettings {
                             rrect.loc.x + rrect.size.w - DETAIL_ROW_INSET - TILE_ICON / 2.,
                             rrect.loc.y + rrect.size.h / 2.,
                         ));
-                        if let Some(el) = icon_element(
+                        if let Some(el) = widget::icon_element(
                             renderer,
                             icons,
-                            CHECK_ICONS,
+                            style::CHECK_ICONS,
                             TILE_ICON,
                             scale,
                             FG_OFF,
@@ -1468,7 +1455,7 @@ impl QuickSettings {
             let rect = sys_rect(button, self.has_pill());
             let center =
                 Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
-            if let Some(el) = icon_element(
+            if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
                 button.icons(),
@@ -1489,7 +1476,7 @@ impl QuickSettings {
                 pill.loc.y + pill.size.h / 2.,
             ));
             let candidates = system_status::battery_icon(battery);
-            if let Some(el) = icon_element(
+            if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
                 &candidates,
@@ -1517,7 +1504,7 @@ impl QuickSettings {
                 Slider::Mic => crate::audio::mic_volume_icon(&self.mic),
             }
             .to_string();
-            if let Some(el) = icon_element(
+            if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
                 &[name],
@@ -1534,7 +1521,7 @@ impl QuickSettings {
                     arrow.loc.x + arrow.size.w / 2.,
                     arrow.loc.y + arrow.size.h / 2.,
                 ));
-                if let Some(el) = icon_element(
+                if let Some(el) = widget::icon_element(
                     renderer,
                     icons,
                     ARROW_ICONS,
@@ -1701,7 +1688,7 @@ impl QuickSettings {
             // Rounded panel: clear transparent, then fill the menu background as a rounded rect so
             // the outer corners stay transparent (the composited element's opacity hint below
             // excludes those corners). Content is drawn on top of the opaque interior.
-            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            frame.clear(Color32F::from(style::TRANSPARENT), &[full])?;
             frame.render_rounded_rect(MENU_BG, (MENU_RADIUS * scale) as f32, full, &[full])?;
 
             let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
@@ -1732,7 +1719,7 @@ impl QuickSettings {
                 )?;
                 if self.hovered == Some(QsHover::Tile(i)) {
                     frame.render_rounded_rect(
-                        HOVER_WASH,
+                        style::HOVER_WASH,
                         (rect.size.h / 2. * scale) as f32,
                         rect_px(rect),
                         &[full],
@@ -1799,7 +1786,7 @@ impl QuickSettings {
                 )?;
                 if self.hovered == Some(QsHover::Pill) {
                     frame.render_rounded_rect(
-                        HOVER_WASH,
+                        style::HOVER_WASH,
                         (pill.size.h / 2. * scale) as f32,
                         rect_px(pill),
                         &[full],
@@ -1836,7 +1823,7 @@ impl QuickSettings {
                 )?;
                 if self.hovered == Some(QsHover::Sys(button)) {
                     frame.render_rounded_rect(
-                        HOVER_WASH,
+                        style::HOVER_WASH,
                         (SYS_HIT / 2. * scale) as f32,
                         rect_px(disc),
                         &[full],
@@ -1867,7 +1854,7 @@ impl QuickSettings {
                 )?;
                 if self.hovered == Some(QsHover::SliderIcon(slider)) {
                     frame.render_rounded_rect(
-                        HOVER_WASH,
+                        style::HOVER_WASH,
                         (SLIDER_H / 2. * scale) as f32,
                         rect_px(disc),
                         &[full],
@@ -1941,7 +1928,7 @@ impl QuickSettings {
                     // bg) behind the label, matching GNOME's flat menu-item hover.
                     if self.hovered == Some(QsHover::DetailRow(k)) {
                         frame.render_rounded_rect(
-                            HOVER_WASH,
+                            style::HOVER_WASH,
                             (8. * scale) as f32,
                             rect_px(rrect),
                             &[full],
@@ -2210,42 +2197,6 @@ fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
         Point::from((center_x - SYS_HIT / 2., PAD)),
         Size::from((SYS_HIT, SYS_H)),
     )
-}
-
-/// Resolve the first of `candidates` that rasterizes and build a composited icon
-/// element centered at `origin + center` (both menu-local logical), tinted
-/// `color`. `None` when no candidate resolves.
-#[allow(clippy::too_many_arguments)]
-fn icon_element<S: AsRef<str>>(
-    renderer: &mut VulkanRenderer,
-    icons: &IconCache,
-    candidates: &[S],
-    logical_px: f64,
-    scale: f64,
-    color: [f32; 4],
-    origin: Point<f64, Logical>,
-    center: Point<f64, Logical>,
-) -> Option<TextureRenderElement<VkTexture>> {
-    let buffer = candidates
-        .iter()
-        .find_map(|name| icons.buffer(name.as_ref(), logical_px, scale, color))?;
-    let tb = match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-        Ok(tb) => tb,
-        Err(err) => {
-            tracing::error!("error uploading quick-settings icon: {err:#}");
-            return None;
-        }
-    };
-    let logical = tb.logical_size();
-    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
-    Some(TextureRenderElement::from_texture_buffer(
-        tb,
-        loc,
-        1.,
-        None,
-        None,
-        Kind::Unspecified,
-    ))
 }
 
 #[cfg(test)]
