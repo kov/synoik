@@ -1132,6 +1132,14 @@ impl CalendarMessageList {
         self.layout().1
     }
 
+    /// The list's full, un-scrolled height: top pad + group content + the
+    /// controls row. The popover grows to this (capped to the work area) so the
+    /// list scrolls only once it would exceed the screen, matching gnome-shell's
+    /// work-area `max-height` on the menu (`js/ui/panelMenu.js:177-185`).
+    fn natural_height(&self) -> f64 {
+        LIST_PAD + self.content_h() + self.controls_h()
+    }
+
     /// The Clear pill's popover-local rect (only meaningful when non-empty).
     fn clear_rect(&self, height: f64) -> Rectangle<f64, Logical> {
         let label_w = niri_vk::text::measure_line_width_weighted("Clear", CLEAR_PX as f32, true);
@@ -1864,6 +1872,11 @@ impl CalendarMessageList {
 pub struct DateMenu {
     pub calendar: Calendar,
     list: CalendarMessageList,
+    /// Max popover height (the work area minus margins, set by the popover from
+    /// the output). The content grows to its natural height up to this cap; past
+    /// it, the message list scrolls — gnome-shell's work-area `max-height`
+    /// (`js/ui/panelMenu.js:177-185`). `INFINITY` until set (tests, pre-layout).
+    available_h: f64,
     /// The popover background (rounded box + placeholder label / Clear pill),
     /// cached per scale; the stored revision is 0/1 for empty/non-empty.
     bg_cache: RefCell<TextureCache>,
@@ -1884,6 +1897,7 @@ impl DateMenu {
         Self {
             calendar: Calendar::new(week_start, show_week_numbers, accent),
             list: CalendarMessageList::new(groups),
+            available_h: f64::INFINITY,
             bg_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -1891,9 +1905,20 @@ impl DateMenu {
         }
     }
 
+    /// Set the popover's height budget (work area minus margins). The dateMenu
+    /// grows to fit its content up to this; beyond it, the message list scrolls.
+    pub fn set_available_height(&mut self, available_h: f64) {
+        self.available_h = available_h;
+    }
+
+    /// The popover grows to the taller column's natural height (the calendar is
+    /// fixed; the message list grows with its cards), capped at the available
+    /// work-area height — never below the calendar, so it stays fully visible.
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let cal = self.calendar.logical_size();
-        Size::from((calendar_col_x() + cal.w, cal.h))
+        let natural = cal.h.max(self.list.natural_height());
+        let h = natural.min(self.available_h.max(cal.h));
+        Size::from((calendar_col_x() + cal.w, h))
     }
 
     pub fn list(&self) -> &CalendarMessageList {
@@ -2924,6 +2949,50 @@ mod tests {
         assert!(list.scroll_by(-10_000., h));
         assert!(!list.scroll_by(-10_000., h), "clamped at the top");
         assert!(list.visible_interactive_cards(h).iter().any(|c| c.0 == 1));
+    }
+
+    /// The popover grows to fit its content, capped at the available work-area
+    /// height; past the cap the message list scrolls
+    /// (`js/ui/panelMenu.js:177-185`).
+    #[test]
+    fn date_menu_grows_to_fit_then_caps_at_available_height() {
+        let cal_h = Calendar::new(0, false, [0, 0, 0]).logical_size().h;
+        let groups: Vec<_> = (1..=10).map(|i| single_group(sample_card(i))).collect();
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], groups);
+
+        // Unbounded (the INFINITY default): grow past the calendar to fit the
+        // whole list, and at that natural height nothing overflows.
+        let grown = dm.logical_size().h;
+        assert!(
+            grown > cal_h,
+            "popover grows past the calendar to fit the list ({grown} vs {cal_h})"
+        );
+        assert!(
+            !dm.list().placed(grown).overflowing(),
+            "at its natural height the list fully fits (no scroll)"
+        );
+
+        // Capped to the calendar height: the popover clamps there and the list
+        // now overflows, so it scrolls.
+        dm.set_available_height(cal_h);
+        assert_eq!(
+            dm.logical_size().h,
+            cal_h,
+            "clamped to the available height"
+        );
+        assert!(
+            dm.list().placed(cal_h).overflowing(),
+            "past the cap the list scrolls"
+        );
+
+        // An empty popover never grows below/above the bare calendar.
+        let mut empty = DateMenu::new(0, false, [0, 0, 0], Vec::new());
+        empty.set_available_height(10_000.);
+        assert_eq!(
+            empty.logical_size().h,
+            cal_h,
+            "an empty popover is exactly the calendar height"
+        );
     }
 
     /// A scroll over the calendar column pages the month (up→prev, down→next,

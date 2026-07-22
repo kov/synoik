@@ -258,14 +258,17 @@ impl PanelPopover {
         }
         self.open = true;
         self.closing = false;
-        self.output = Some(output);
         self.anchor = anchor;
-        self.content = Some(PopoverContent::Calendar(DateMenu::new(
-            week_start,
-            show_week_numbers,
-            accent,
-            groups,
-        )));
+        let mut date_menu = DateMenu::new(week_start, show_week_numbers, accent, groups);
+        // Grow to fit the content but stay within the work area, leaving the
+        // same margin at the bottom as the top (`js/ui/panelMenu.js:177-185`,
+        // `js/ui/boxpointer.js:117-137`): output height minus the panel and both
+        // margins. Past this the message list scrolls.
+        let available_h =
+            (output_size(&output).h - PANEL_HEIGHT - 2. * POPOVER_MARGIN).max(POPOVER_MARGIN);
+        date_menu.set_available_height(available_h);
+        self.output = Some(output);
+        self.content = Some(PopoverContent::Calendar(date_menu));
         self.anim = Some(self.make_anim(0., 1.));
         true
     }
