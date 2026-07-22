@@ -13,29 +13,23 @@
 //! left) is passed in at render time so there is a single source of truth in the state machine.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 
 use niri_config::Config;
-use niri_vk::text::{SpanFamily, TextSpan};
-use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, Frame as _, Texture};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::end_session::EndSessionType;
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::ui::widget::{self, BakeCache, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 // Logical layout. Fixed so the pointer hit-test and the rendered geometry agree without threading a
@@ -48,9 +42,9 @@ const BUTTON_W: i32 = 120;
 const BUTTON_H: i32 = 40;
 const BUTTON_GAP: i32 = 12;
 /// Title font size (bold, GNOME `%title_3` = 15pt) and body/label font size (11pt),
-/// logical px-per-em.
-const TITLE_PX: f64 = crate::ui::pt_to_px(15.);
-const BODY_PX: f64 = crate::ui::pt_to_px(11.);
+/// GNOME points (shaping routes them through [`crate::ui::pt_to_px`]).
+const TITLE_PT: f64 = 15.;
+const BODY_PT: f64 = 11.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 /// Box background, grey border, and the two button fills (accent when focused), straight RGBA.
 const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
@@ -97,23 +91,12 @@ enum State {
     Hiding(Animation),
 }
 
-/// The rendered-content signature: re-render only when one of these changes (per output scale).
-type Sig = (u8, Option<u64>, Button);
-
-/// Per-scale texture cache: the signature it was rendered at, and the box texture. Tied to a
-/// renderer context (dropped when it changes).
-struct DialogCache {
-    context: Option<ContextId<VkTexture>>,
-    textures: HashMap<NotNan<f64>, (Sig, VkTexture)>,
-}
-
-impl DialogCache {
-    fn new() -> Self {
-        Self {
-            context: None,
-            textures: HashMap::new(),
-        }
-    }
+/// Pack the content signature (dialog type, countdown, focused button) into a [`widget::bake`]
+/// revision — the cache re-renders only when one of these changes (per output scale, which the
+/// bake key handles). Bit 0-1 kind, bit 2 focused-is-action, bits 3+ the countdown (0 = none).
+fn revision_for(kind: EndSessionType, seconds_left: Option<u64>, focused: Button) -> u64 {
+    let secs = seconds_left.map_or(0, |s| s + 1);
+    (kind as u64) | (((focused == Button::Action) as u64) << 2) | (secs << 3)
 }
 
 pub struct EndSessionDialog {
@@ -124,8 +107,8 @@ pub struct EndSessionDialog {
     /// through the close animation (when the state machine has already cleared) so the fade-out
     /// still has something to draw.
     content: Option<(EndSessionType, Option<u64>)>,
-    /// One cached texture per output scale, tagged with the content signature it was rendered at.
-    cache: RefCell<DialogCache>,
+    /// One cached texture per output scale, keyed by the content revision it was baked at.
+    cache: RefCell<BakeCache>,
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
@@ -148,7 +131,7 @@ impl EndSessionDialog {
             state: State::Hidden,
             focused: Button::Action,
             content: None,
-            cache: RefCell::new(DialogCache::new()),
+            cache: RefCell::new(BakeCache::new()),
             clock,
             config,
         }
@@ -346,34 +329,28 @@ impl EndSessionDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-        let Some(scale_key) = NotNan::new(scale).ok() else {
-            return;
-        };
-        let sig: Sig = (kind as u8, seconds_left, self.focused);
+        let revision = revision_for(kind, seconds_left, self.focused);
 
         let texture = {
             let mut cache = self.cache.borrow_mut();
-
-            // The cached textures belong to one renderer context; drop them all if it changed.
-            let context = renderer.context_id();
-            if cache.context.as_ref() != Some(&context) {
-                cache.textures.clear();
-                cache.context = Some(context);
-            }
-
-            let fresh = matches!(cache.textures.get(&scale_key), Some((s, _)) if *s == sig);
-            if !fresh {
-                match draw_dialog_texture(renderer, scale, kind, seconds_left, self.focused) {
-                    Ok(texture) => {
-                        cache.textures.insert(scale_key, (sig, texture));
-                    }
-                    Err(err) => {
-                        // Fail visible: fall through to always draw the backdrop (modal grab).
-                        warn!("error rendering the end-session dialog: {err:#}");
-                    }
+            // Fixed-size box → logical `WIDTH × HEIGHT`; the bake key handles scale + revision.
+            // Fail visible: on error fall through to always draw the backdrop (this dialog is a
+            // modal grab; never leave the seat with no overlay at all).
+            match widget::bake(
+                renderer,
+                &mut cache,
+                scale,
+                Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
+                revision,
+                |renderer| prepare_dialog(renderer, scale, kind, seconds_left, self.focused),
+                paint_dialog,
+            ) {
+                Ok(texture) => Some(texture),
+                Err(err) => {
+                    warn!("error rendering the end-session dialog: {err:#}");
+                    None
                 }
             }
-            cache.textures.get(&scale_key).map(|(_, t)| t.clone())
         };
 
         if let Some(texture) = texture {
@@ -448,19 +425,38 @@ fn content(
     (title, action, description)
 }
 
-/// Draw the fixed-size dialog into an offscreen [`VkTexture`] on the GPU: the dark box with a grey
-/// border, a centered white title, a centered grey (counting-down) description, and the two buttons
-/// (Cancel left, action right) — filled accent-blue when focused, else dark grey, with a centered
-/// white label. No cairo/pango. (The old pango path left-aligned the title/description and rounded
-/// the button corners; this centers them — matching gnome-shell — and squares the buttons.)
-fn draw_dialog_texture(
+/// The computed physical layout of the fixed-size dialog box, produced by [`prepare_dialog`] and
+/// drawn by [`paint_dialog`].
+struct DialogLayout {
+    title: ShapedParagraph,
+    desc: ShapedParagraph,
+    cancel: ShapedParagraph,
+    action: ShapedParagraph,
+    title_origin: Point<i32, Physical>,
+    desc_origin: Point<i32, Physical>,
+    cancel_origin: Point<i32, Physical>,
+    action_origin: Point<i32, Physical>,
+    inner: Rectangle<i32, Physical>,
+    cancel_rect: Rectangle<i32, Physical>,
+    action_rect: Rectangle<i32, Physical>,
+    /// Button fills: accent when focused, else the dark grey.
+    cancel_bg: [f32; 4],
+    action_bg: [f32; 4],
+}
+
+/// Shape the four text runs and compute the fixed-size box layout — the prepare phase for
+/// [`widget::bake`]. One centered run per text element; `render_glyphs` is one colour per call, and
+/// the title (white) and description (grey) differ, so they are separate runs. No cairo/pango.
+/// (The old pango path left-aligned the title/description and rounded the button corners; this
+/// centers them — matching gnome-shell — and squares the buttons.)
+fn prepare_dialog(
     renderer: &mut VulkanRenderer,
     scale: f64,
     kind: EndSessionType,
     seconds_left: Option<u64>,
     focused: Button,
-) -> anyhow::Result<VkTexture> {
-    let _span = tracy_client::span!("end_session_dialog::draw_dialog_texture");
+) -> anyhow::Result<DialogLayout> {
+    let _span = tracy_client::span!("end_session_dialog::prepare_dialog");
     let (title, action_label, description) = content(kind, seconds_left);
 
     let px = |logical: i32| to_physical_precise_round::<i32>(scale, logical);
@@ -468,48 +464,36 @@ fn draw_dialog_texture(
     let height = px(HEIGHT).max(1);
     let padding = px(PADDING).max(0);
     let border = px(BORDER).max(1);
-    let inner_wrap = (width - padding * 2).max(1);
-    let title_px = (TITLE_PX * scale) as f32;
-    let body_px = (BODY_PX * scale) as f32;
+    let inner_wrap = (WIDTH - PADDING * 2).max(1);
 
-    fn sans(text: &str, bold: bool, px: f32) -> TextSpan<'_> {
-        TextSpan {
-            text,
-            family: SpanFamily::Sans,
-            bold,
-            px,
-        }
-    }
-
-    // One centered run per text element; render_glyphs is one colour per call, and the title
-    // (white) and description (grey) differ, so they are separate runs.
-    let title_run = renderer.build_glyph_paragraph(
-        &[sans(title, true, title_px)],
-        inner_wrap as f32,
-        title_px,
+    let mut shaper = TextShaper::new(renderer, scale);
+    let title_run = shaper.paragraph(
+        &[ParagraphSpan::new(title, TITLE_PT).bold()],
+        f64::from(inner_wrap),
+        TITLE_PT,
     )?;
-    let desc_run = renderer.build_glyph_paragraph(
-        &[sans(&description, false, body_px)],
-        inner_wrap as f32,
-        body_px,
+    let desc_run = shaper.paragraph(
+        &[ParagraphSpan::new(&description, BODY_PT)],
+        f64::from(inner_wrap),
+        BODY_PT,
     )?;
-    let button_wrap = px(BUTTON_W).max(1) as f32;
-    let cancel_run =
-        renderer.build_glyph_paragraph(&[sans("Cancel", false, body_px)], button_wrap, body_px)?;
-    let action_run = renderer.build_glyph_paragraph(
-        &[sans(action_label, false, body_px)],
-        button_wrap,
-        body_px,
+    let cancel_run = shaper.paragraph(
+        &[ParagraphSpan::new("Cancel", BODY_PT)],
+        f64::from(BUTTON_W),
+        BODY_PT,
+    )?;
+    let action_run = shaper.paragraph(
+        &[ParagraphSpan::new(action_label, BODY_PT)],
+        f64::from(BUTTON_W),
+        BODY_PT,
     )?;
 
-    let size = Size::<i32, Physical>::from((width, height));
-    let full = Rectangle::from_size(size);
     let inner = Rectangle::new(
         Point::from((border, border)),
         Size::from(((width - border * 2).max(0), (height - border * 2).max(0))),
     );
 
-    // Stack the title then the description under it, each centered within the inner width.
+    // Stack the title then the description under it, each within the inner width.
     let (_, tiy, _, tih) = title_run.ink_bounds();
     let title_origin = Point::<i32, Physical>::from((padding, padding - tiy));
     let (_, diy, _, _) = desc_run.ink_bounds();
@@ -537,42 +521,81 @@ fn draw_dialog_texture(
         action_rect.loc.y + (action_rect.size.h - aih) / 2 - aiy,
     ));
 
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((width, height)),
+    let cancel_bg = if focused == Button::Cancel {
+        ACCENT
+    } else {
+        BUTTON_BG
+    };
+    let action_bg = if focused == Button::Action {
+        ACCENT
+    } else {
+        BUTTON_BG
+    };
+
+    Ok(DialogLayout {
+        title: title_run,
+        desc: desc_run,
+        cancel: cancel_run,
+        action: action_run,
+        title_origin,
+        desc_origin,
+        cancel_origin,
+        action_origin,
+        inner,
+        cancel_rect,
+        action_rect,
+        cancel_bg,
+        action_bg,
+    })
+}
+
+/// Draw the grey border, the dark box, the two button fills, and the four text runs — the paint
+/// phase for [`widget::bake`].
+fn paint_dialog(
+    frame: &mut VulkanFrame,
+    phys: Size<i32, Physical>,
+    layout: &DialogLayout,
+) -> anyhow::Result<()> {
+    let full = Rectangle::from_size(phys);
+
+    // Grey border = whole box grey, then the inner rect dark.
+    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
+    frame.clear(Color32F::from(BOX_BG), &[layout.inner])?;
+
+    // Button backgrounds (accent when focused).
+    frame.clear(Color32F::from(layout.cancel_bg), &[layout.cancel_rect])?;
+    frame.clear(Color32F::from(layout.action_bg), &[layout.action_rect])?;
+
+    // Text.
+    frame.render_glyphs(
+        layout.title.run(),
+        layout.title_origin,
+        TITLE_COLOR,
+        full,
+        &[full],
     )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
-
-        // Grey border = whole box grey, then the inner rect dark.
-        frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-        frame.clear(Color32F::from(BOX_BG), &[inner])?;
-
-        // Button backgrounds (accent when focused).
-        let cancel_bg = if focused == Button::Cancel {
-            ACCENT
-        } else {
-            BUTTON_BG
-        };
-        let action_bg = if focused == Button::Action {
-            ACCENT
-        } else {
-            BUTTON_BG
-        };
-        frame.clear(Color32F::from(cancel_bg), &[cancel_rect])?;
-        frame.clear(Color32F::from(action_bg), &[action_rect])?;
-
-        // Text.
-        frame.render_glyphs(&title_run, title_origin, TITLE_COLOR, full, &[full])?;
-        frame.render_glyphs(&desc_run, desc_origin, DESC_COLOR, full, &[full])?;
-        frame.render_glyphs(&cancel_run, cancel_origin, LABEL_COLOR, full, &[full])?;
-        frame.render_glyphs(&action_run, action_origin, LABEL_COLOR, full, &[full])?;
-        let _sync = frame.finish()?;
-    }
-
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+    frame.render_glyphs(
+        layout.desc.run(),
+        layout.desc_origin,
+        DESC_COLOR,
+        full,
+        &[full],
+    )?;
+    frame.render_glyphs(
+        layout.cancel.run(),
+        layout.cancel_origin,
+        LABEL_COLOR,
+        full,
+        &[full],
+    )?;
+    frame.render_glyphs(
+        layout.action.run(),
+        layout.action_origin,
+        LABEL_COLOR,
+        full,
+        &[full],
+    )?;
+    Ok(())
 }
 
 #[cfg(feature = "dbus")]
@@ -585,7 +608,9 @@ pub fn a11y_node() -> accesskit::Node {
 
 #[cfg(test)]
 mod tests {
-    use smithay::backend::renderer::ExportMem;
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem};
+    use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
 
@@ -609,8 +634,17 @@ mod tests {
         ] {
             for seconds in [Some(59), Some(0), None] {
                 for focused in [Button::Cancel, Button::Action] {
-                    let mut tex = draw_dialog_texture(&mut vk, 1., kind, seconds, focused)
-                        .expect("dialog texture");
+                    let mut cache = BakeCache::new();
+                    let mut tex = widget::bake(
+                        &mut vk,
+                        &mut cache,
+                        1.,
+                        Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
+                        revision_for(kind, seconds, focused),
+                        |r| prepare_dialog(r, 1., kind, seconds, focused),
+                        paint_dialog,
+                    )
+                    .expect("dialog texture");
                     let size = tex.size();
                     assert_eq!(
                         (size.w, size.h),
