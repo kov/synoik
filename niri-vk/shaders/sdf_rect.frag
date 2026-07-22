@@ -10,7 +10,9 @@ layout(push_constant) uniform Push {
     vec4 proj; // unused here; declared so the push-block offsets match the vertex stage
     vec2 target;
     float corner_radius;
-    float _pad0;
+    // > 0 draws an inset stroke (ring) of this physical-px width along the inside of the edge,
+    // instead of a solid fill. A focus ring, a 1px outline, etc.
+    float stroke_width;
     vec4 color;
 } pc;
 
@@ -28,6 +30,13 @@ void main() {
     vec2 half_size = pc.size * 0.5;
     float r = clamp(pc.corner_radius, 0.0, min(half_size.x, half_size.y));
     float d = sd_round_box(v_local - half_size, half_size, r);
+
+    // Stroke mode: keep only the inset band `-w <= d <= 0` — a ring hugging the inside of the edge,
+    // its inner corners concentric (the SDF offsets a rounded shape correctly). `max(d, -(d+w))` is
+    // that band's own SDF, so the same analytic AA applies. `stroke_width <= 0` → solid fill.
+    if (pc.stroke_width > 0.0) {
+        d = max(d, -(d + pc.stroke_width));
+    }
 
     float aa = max(fwidth(d), 1e-4);
     float coverage = 1.0 - smoothstep(-aa, aa, d);

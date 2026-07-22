@@ -509,8 +509,8 @@ impl ButtonStyle {
 }
 
 /// A clickable button: a rounded [`ButtonStyle`] fill with a centered bold-white
-/// label, the toolkit's standard hover wash, and an optional accent focus ring. The
-/// owner holds the logical `rect` (from its own layout) and the interaction flags;
+/// label, the toolkit's standard hover wash, and an optional inset accent focus ring.
+/// The owner holds the logical `rect` (from its own layout) and the interaction flags;
 /// [`Painter::button`] draws it so every button behaves identically wherever it
 /// appears. The single higher-level widget in the otherwise-primitive toolkit.
 #[derive(Debug, Clone, Copy)]
@@ -518,12 +518,8 @@ pub struct Button {
     pub rect: Rectangle<f64, Logical>,
     pub style: ButtonStyle,
     pub hovered: bool,
-    /// Keyboard-focused / default action — draws the accent focus ring.
+    /// Keyboard-focused / default action — draws the inset accent focus ring.
     pub focused: bool,
-    /// The surface color behind the button, used to mask the focus ring out of the
-    /// interior so a translucent fill still composites over the card. Defaults to the
-    /// dialog card bg; override with [`on_surface`](Self::on_surface) elsewhere.
-    pub surface: Rgba,
 }
 
 impl Button {
@@ -533,7 +529,6 @@ impl Button {
             style,
             hovered: false,
             focused: false,
-            surface: style::DIALOG_BG,
         }
     }
 
@@ -544,11 +539,6 @@ impl Button {
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
-        self
-    }
-
-    pub fn on_surface(mut self, surface: Rgba) -> Self {
-        self.surface = surface;
         self
     }
 
@@ -607,6 +597,23 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         let r = (radius * self.scale) as f32;
         self.frame
             .render_rounded_rect(color, r, self.full, &[self.full])?;
+        Ok(())
+    }
+
+    /// Stroke `rect` (logical) with `color`: an inset ring of `width` logical px along the inside
+    /// of the edge, corners cut by `radius` (logical; inner corners concentric). A focus ring or
+    /// outline — the stroke counterpart to [`fill_rounded`](Self::fill_rounded).
+    pub fn stroke_rounded(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        radius: f64,
+        width: f64,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        let r = (radius * self.scale) as f32;
+        let w = (width * self.scale) as f32;
+        self.frame
+            .stroke_rounded_rect(color, r, w, self.rect_px(rect), &[self.full])?;
         Ok(())
     }
 
@@ -749,25 +756,18 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// when focused, then the centered bold-white `label`. `accent` is the system
     /// accent — the focus-ring color, and the fill for [`ButtonStyle::Suggested`].
     ///
-    /// The focus ring is a 2px accent frame around the button. Because a
-    /// [`ButtonStyle::Dialog`] fill is translucent, the ring is painted as an outset
-    /// accent rect with the button's [`surface`](Button::surface) re-masked over the
-    /// interior, so the translucent fill still composites over the card, not the ring.
+    /// The focus ring is GNOME's inset 2px accent stroke ([`stroke_rounded`](Self::stroke_rounded))
+    /// on the button's own rect, drawn over the fill — faithful, and correct over a translucent
+    /// [`ButtonStyle::Dialog`] fill with no masking.
     pub fn button(&mut self, b: &Button, label: &ShapedText, accent: Rgba) -> anyhow::Result<()> {
         let radius = b.style.radius();
-        if b.focused {
-            const RING: f64 = 2.;
-            let ring = Rectangle::new(
-                Point::from((b.rect.loc.x - RING, b.rect.loc.y - RING)),
-                Size::from((b.rect.size.w + RING * 2., b.rect.size.h + RING * 2.)),
-            );
-            let ring_color = [accent[0], accent[1], accent[2], 0.8];
-            self.fill_rounded(ring, radius + RING, ring_color)?;
-            self.fill_rounded(b.rect, radius, b.surface)?;
-        }
         self.fill_rounded(b.rect, radius, b.style.bg(accent))?;
         if b.hovered {
             self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
+        }
+        if b.focused {
+            let ring_color = [accent[0], accent[1], accent[2], 0.8];
+            self.stroke_rounded(b.rect, radius, 2., ring_color)?;
         }
         let center = Point::from((
             b.rect.loc.x + b.rect.size.w / 2.,

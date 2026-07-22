@@ -41,7 +41,9 @@ pub struct QuadPush {
     pub proj: [f32; 4],
     pub target: [f32; 2],
     pub corner_radius: f32,
-    pub _pad0: f32,
+    /// For `sdf_rect.frag`: `> 0` draws an inset stroke (ring) of this physical-px width instead
+    /// of a solid fill. Padding (kept 0) for every other material sharing this block.
+    pub stroke_width: f32,
     pub color: [f32; 4],
     /// Texture sampling transform as 3 `vec4` columns (`.xyz` used): maps `v_uv` (0..1 across the
     /// quad) to normalized texture UV, folding the src crop, the buffer/`src_transform` rotation
@@ -264,7 +266,7 @@ impl Default for QuadPush {
             proj: IDENTITY_PROJ,
             target: [0.0, 0.0],
             corner_radius: 0.0,
-            _pad0: 0.0,
+            stroke_width: 0.0,
             color: [1.0, 1.0, 1.0, 1.0],
             tex_transform: IDENTITY_TEX_TRANSFORM,
             cutoff: [0.0, 0.0],

@@ -612,17 +612,17 @@ mod tests {
                         .expect("copy_framebuffer");
                     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-                    // The focused button carries a 2px accent ring just outside its rect (the
-                    // fill itself is the neutral translucent dialog-button color, matching GNOME
-                    // 50.1). Sample 1px above the top edge → the accent band (B clearly dominant).
+                    // The focused button carries a 2px accent ring inset along the inside of its
+                    // rect (the fill is the neutral translucent dialog-button color, matching GNOME
+                    // 50.1). Sample 1px below the top edge → the accent band (B clearly dominant).
                     let rect = EndSessionDialog::button_rect(focused);
                     let bx = (rect.loc.x + rect.size.w / 2.) as i32;
-                    let by = rect.loc.y as i32 - 1;
+                    let by = rect.loc.y as i32 + 1;
                     let i = ((by * size.w + bx) * 4) as usize;
                     let p = [pixels[i], pixels[i + 1], pixels[i + 2]];
                     assert!(
                         p[2] > 150 && p[2] > p[0] + 40,
-                        "focused button has no accent ring at its top edge: {p:?}"
+                        "focused button has no accent ring inside its top edge: {p:?}"
                     );
 
                     // Bright glyph ink (title / labels).

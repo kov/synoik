@@ -425,6 +425,31 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
+        self.render_rounded_rect_impl(color, corner_radius, 0.0, dst, damage)
+    }
+
+    /// Stroke a rounded rectangle: an inset ring of `stroke_width` physical px hugging the inside
+    /// of `dst`'s edge, corners cut by `corner_radius` (inner corners concentric). The stroke path
+    /// of the same SDF material as [`render_rounded_rect`] — a focus ring, a 1px outline.
+    pub(crate) fn stroke_rounded_rect(
+        &mut self,
+        color: [f32; 4],
+        corner_radius: f32,
+        stroke_width: f32,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        self.render_rounded_rect_impl(color, corner_radius, stroke_width.max(0.), dst, damage)
+    }
+
+    fn render_rounded_rect_impl(
+        &mut self,
+        color: [f32; 4],
+        corner_radius: f32,
+        stroke_width: f32,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
         let scissors = self.damage_scissors(dst, damage);
         if scissors.is_empty() {
             return Ok(());
@@ -435,6 +460,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             proj: self.proj,
             target: self.target_dims(),
             corner_radius,
+            stroke_width,
             color,
             ..Default::default()
         };
