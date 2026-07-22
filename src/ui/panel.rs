@@ -34,32 +34,30 @@ use std::time::Duration;
 
 use niri_config::Config;
 use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::system_status::{self, SystemStatus};
+use crate::ui::widget::{self, TextShaper, TextStyle};
 use crate::utils::{output_size, to_physical_precise_round};
 
 /// Logical height of the panel. GNOME's is `2.2em` at an `11pt` base font,
 /// i.e. ~32px at scale 1 (`gnome-shell-sass/widgets/_panel.scss`).
 pub const PANEL_HEIGHT: f64 = 32.;
 
-/// Panel font size in logical pixels-per-em. The clock draws at GNOME's `panel_button`
-/// base of 11pt (`_drawing.scss`), bold. Scaled by the output scale to the physical em
-/// the glyph rasterizer shapes at.
-const FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Panel font size. The clock draws at GNOME's `panel_button` base of 11pt
+/// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `FONT_PX`
+/// is its logical px, kept for the advance-width measure that centers the clock.
+const FONT_PT: f64 = 11.;
+const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 
 /// Base workspace-dot diameter, logical px. GNOME: `$scalable_icon_size (16) * 0.5`
 /// (`gnome-shell-sass/widgets/_panel.scss`), fully rounded (`$forced_circular_radius`).
@@ -1444,8 +1442,30 @@ fn draw_bar_texture(
     let height_px = height_px.max(1);
     let px = (FONT_PX * scale) as f32;
 
-    // The dateMenu clock draws bold, like GNOME's `panel_button` (font-weight: bold).
-    let clock_run = renderer.build_glyph_run_weighted(clock, px, true)?;
+    // Shape every run up front (needs `&mut renderer`, before the bake frame opens). `TextShaper`
+    // owns the pt → physical-px multiply; the clock draws bold, like GNOME's `panel_button`.
+    let bold = TextStyle::new(FONT_PT).bold();
+    let (clock_run, recording, keyboard) = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        let clock_run = shaper.shape(clock, bold)?;
+        // Bold, left-aligned at its button/pill padding, ink-centered vertically like the clock.
+        let shape_label = |shaper: &mut TextShaper, label: &str, lx: f64| -> anyhow::Result<_> {
+            let run = shaper.shape(label, bold)?;
+            let (_ix, iy, _iw, ih) = run.ink_bounds();
+            let origin = Point::<i32, Physical>::from((
+                to_physical_precise_round(scale, lx),
+                (height_px - ih) / 2 - iy,
+            ));
+            Ok((run, origin))
+        };
+        let recording = recording_label
+            .map(|(label, lx)| shape_label(&mut shaper, label, lx))
+            .transpose()?;
+        let keyboard = keyboard_label
+            .map(|(label, lx)| shape_label(&mut shaper, label, lx))
+            .transpose()?;
+        (clock_run, recording, keyboard)
+    };
 
     // Center the clock horizontally by its *advance* box, not its ink. gnome-shell's
     // WallClock uses tabular figures, so the advance width is constant as the seconds
@@ -1458,43 +1478,9 @@ fn draw_bar_texture(
     let c_origin =
         Point::<i32, Physical>::from(((width_px - advance_w) / 2, (height_px - c_ih) / 2 - c_iy));
 
-    // The recording label's bold glyph run, left-aligned at the pill padding and
-    // ink-centered vertically like the clock. Built before binding the target.
-    let recording = recording_label
-        .map(|(label, lx)| -> anyhow::Result<_> {
-            let run = renderer.build_glyph_run_weighted(label, px, true)?;
-            let (_ix, iy, _iw, ih) = run.ink_bounds();
-            let origin = Point::<i32, Physical>::from((
-                to_physical_precise_round(scale, lx),
-                (height_px - ih) / 2 - iy,
-            ));
-            Ok((run, origin))
-        })
-        .transpose()?;
-
-    // The keyboard input-source label, shaped like the recording label (bold, left-aligned at
-    // its button padding, ink-centered vertically).
-    let keyboard = keyboard_label
-        .map(|(label, lx)| -> anyhow::Result<_> {
-            let run = renderer.build_glyph_run_weighted(label, px, true)?;
-            let (_ix, iy, _iw, ih) = run.ink_bounds();
-            let origin = Point::<i32, Physical>::from((
-                to_physical_precise_round(scale, lx),
-                (height_px - ih) / 2 - iy,
-            ));
-            Ok((run, origin))
-        })
-        .transpose()?;
-
     let size = Size::<i32, Physical>::from((width_px, height_px));
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((width_px, height_px)),
-    )?;
 
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    widget::bake_uncached_sized(renderer, size, |frame| {
         let full = Rectangle::from_size(size);
 
         frame.clear(Color32F::from(BAR_BG), &[full])?;
@@ -1514,28 +1500,25 @@ fn draw_bar_texture(
             let radius = phys.size.h as f32 / 2.;
             frame.render_rounded_rect(*color, radius, phys, &[full])?;
         }
-        draw_workspace_dots(&mut frame, scale, count, position, full)?;
-        frame.render_glyphs(&clock_run, c_origin, TEXT, full, &[full])?;
+        draw_workspace_dots(frame, scale, count, position, full)?;
+        frame.render_glyphs(clock_run.run(), c_origin, TEXT, full, &[full])?;
         // The screen-recording pill's M:SS label, over its red container.
         if let Some((run, origin)) = &recording {
-            frame.render_glyphs(run, *origin, TEXT, full, &[full])?;
+            frame.render_glyphs(run.run(), *origin, TEXT, full, &[full])?;
         }
         // The keyboard input-source short label.
         if let Some((run, origin)) = &keyboard {
-            frame.render_glyphs(run, *origin, TEXT, full, &[full])?;
+            frame.render_glyphs(run.run(), *origin, TEXT, full, &[full])?;
         }
-        // finish() submits and fence-waits synchronously, so the sync point is already signaled.
-        let _sync = frame.finish()?;
-    }
-
-    // The bar is sampled by its own render element; transition it to shader-read.
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use smithay::backend::renderer::ExportMem;
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem};
+    use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
 
