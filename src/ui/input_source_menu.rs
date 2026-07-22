@@ -16,15 +16,13 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, BakeCache};
-use crate::utils::to_physical_precise_round;
+use crate::ui::widget::{self, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle};
 
 const PAD: f64 = 8.;
 const ROW_H: f64 = 32.;
@@ -51,7 +49,11 @@ const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
 const SEPARATOR: [f32; 4] = [1., 1., 1., 0.12];
 const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.10];
 
-const TEXT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Row text size (`%heading`, GNOME points). `TEXT_PX` is its logical px, used
+/// only for GPU-free width measurement in [`InputSourceMenu::logical_size`]; the
+/// bake shapes via [`widget::TextStyle`] so no draw site touches the px.
+const TEXT_PT: f64 = 11.;
+const TEXT_PX: f64 = crate::ui::pt_to_px(TEXT_PT);
 const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 
 /// One configured layout as shown in the menu (gnome-shell's `LayoutMenuItem`).
@@ -183,19 +185,18 @@ impl InputSourceMenu {
         }
     }
 
-    /// Shape every row's text at the physical (`× scale`) font size — the miss-only
-    /// prepare phase for [`widget::bake`]. Returns one `(label, optional short)` run
-    /// per row, in row order.
+    /// Shape every row's text — the miss-only prepare phase for [`widget::bake`].
+    /// The `TextShaper` performs the pt → logical → physical (`× scale`) sizing, so
+    /// there is no manual scale multiply here. Returns one `(label, optional short)`
+    /// run per row, in row order.
     #[allow(clippy::type_complexity)]
     fn shape_rows(
         &self,
         renderer: &mut VulkanRenderer,
         scale: f64,
-    ) -> anyhow::Result<Vec<(GlyphRun, Option<GlyphRun>)>> {
-        // The buffer is scale-sized, so the glyph run must be too (else the text
-        // renders at 1/scale — minuscule on HiDPI). This one `× scale` is the last
-        // manual one in this widget; H2's `Painter` removes it entirely.
-        let font_px = (TEXT_PX * scale) as f32;
+    ) -> anyhow::Result<Vec<(ShapedText, Option<ShapedText>)>> {
+        let mut shaper = TextShaper::new(renderer, scale);
+        let style = TextStyle::new(TEXT_PT);
         (0..self.row_count())
             .map(|k| {
                 let (label, short) = match self.row_kind(k) {
@@ -206,37 +207,29 @@ impl InputSourceMenu {
                     RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
                     RowKind::Settings => ("Keyboard Settings".to_owned(), None),
                 };
-                let label_run = renderer.build_glyph_run_weighted(&label, font_px, false)?;
-                let short_run = short
-                    .map(|s| renderer.build_glyph_run_weighted(&s, font_px, false))
-                    .transpose()?;
+                let label_run = shaper.shape(&label, style)?;
+                let short_run = short.map(|s| shaper.shape(&s, style)).transpose()?;
                 Ok((label_run, short_run))
             })
             .collect()
     }
 
-    /// Paint the card chrome (background, hover wash, separator, all row text) into
-    /// the bound frame — the paint phase for [`widget::bake`]. `phys` is the full
-    /// buffer size; `row_runs` are the runs shaped in [`Self::shape_rows`].
+    /// Paint the card chrome (background, hover wash, separator, all row text) via a
+    /// logical-unit [`Painter`] — the paint phase for [`widget::bake`]. `phys` is the
+    /// full buffer size; `row_runs` are the runs shaped in [`Self::shape_rows`]. No
+    /// scale multiply appears here: the `Painter` owns it.
     fn paint_bg(
         &self,
         frame: &mut VulkanFrame,
         phys: Size<i32, Physical>,
         scale: f64,
-        row_runs: &[(GlyphRun, Option<GlyphRun>)],
+        row_runs: &[(ShapedText, Option<ShapedText>)],
     ) -> anyhow::Result<()> {
         let size = self.logical_size();
-        let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-        let full = Rectangle::from_size(phys);
-        let rect_px = |r: Rectangle<f64, Logical>| {
-            Rectangle::new(
-                Point::<i32, Physical>::from((px(r.loc.x), px(r.loc.y))),
-                Size::<i32, Physical>::from((px(r.size.w), px(r.size.h))),
-            )
-        };
+        let mut p = Painter::new(frame, scale, phys);
 
-        frame.clear(Color32F::from(TRANSPARENT), &[full])?;
-        frame.render_rounded_rect(BG, (RADIUS * scale) as f32, full, &[full])?;
+        p.clear(TRANSPARENT)?;
+        p.fill_rounded(Rectangle::from_size(size), RADIUS, BG)?;
 
         // The separator rule centered in the break above the trailing items.
         let sep_y = self.row_top(self.items.len()) - SEP_EXTRA / 2.;
@@ -244,36 +237,32 @@ impl InputSourceMenu {
             Point::from((TEXT_INSET, sep_y)),
             Size::from((size.w - 2. * TEXT_INSET, 1.)),
         );
-        frame.render_rounded_rect(SEPARATOR, 0., rect_px(sep), &[full])?;
+        p.fill_rounded(sep, 0., SEPARATOR)?;
 
         for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
             let rrect = self.row_rect(k, size.w);
             if self.hovered == Some(k) {
-                frame.render_rounded_rect(
-                    HOVER_WASH,
-                    (8. * scale) as f32,
-                    rect_px(rrect),
-                    &[full],
-                )?;
+                p.fill_rounded(rrect, 8., HOVER_WASH)?;
             }
             // Layout rows reserve the ornament column; trailing items don't.
             let is_layout = matches!(self.row_kind(k), RowKind::Layout(_));
             let label_x = if is_layout {
-                px(TEXT_INSET + ORN_W)
+                TEXT_INSET + ORN_W
             } else {
-                px(TEXT_INSET)
+                TEXT_INSET
             };
-            let cy = px(rrect.loc.y + rrect.size.h / 2.);
-            let (lx, ly, _, lh) = label_run.ink_bounds();
-            let origin = Point::<i32, Physical>::from((label_x - lx, cy - lh / 2 - ly));
-            frame.render_glyphs(label_run, origin, TEXT, full, &[full])?;
+            let cy = rrect.loc.y + rrect.size.h / 2.;
+            p.text(
+                label_run,
+                Point::from((label_x, cy)),
+                Align::LEFT_MIDDLE,
+                TEXT,
+            )?;
 
             // The short label, right-aligned and dimmed.
             if let Some(run) = short_run {
-                let (sx, sy, sw, sh) = run.ink_bounds();
-                let right = px(size.w - TEXT_INSET);
-                let origin = Point::<i32, Physical>::from((right - sw - sx, cy - sh / 2 - sy));
-                frame.render_glyphs(run, origin, MUTED, full, &[full])?;
+                let right = size.w - TEXT_INSET;
+                p.text(run, Point::from((right, cy)), Align::RIGHT_MIDDLE, MUTED)?;
             }
         }
         Ok(())

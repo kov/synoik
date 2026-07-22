@@ -17,12 +17,16 @@ use std::collections::HashMap;
 use anyhow::Context as _;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::{Bind, ContextId, Frame as _, Offscreen, Renderer};
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Size, Transform};
+use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render_helpers::renderer::OffscreenRenderer;
-use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
 use crate::utils::to_physical_precise_round;
+
+/// Straight-alpha RGBA, the color type every draw verb takes (glyph coverage /
+/// SDF alpha modulates it). Matches the `[f32; 4]` the frame primitives want.
+pub type Rgba = [f32; 4];
 
 /// A per-widget offscreen-texture cache for [`bake`], keyed by `(scale,
 /// physical_size, revision)`. One lives (behind a `RefCell`) on each baking
@@ -115,6 +119,195 @@ pub fn bake_uncached(
     }
     renderer.make_offscreen_sampleable(&target)?;
     Ok(target)
+}
+
+// --- H2: logical/pt drawing --------------------------------------------------------------------
+//
+// A widget describes its chrome in LOGICAL units and GNOME points; `TextShaper`
+// and `Painter` perform the one and only `× scale` conversion internally. No
+// widget draw site multiplies by scale again — the multiply that got forgotten
+// (the minuscule-text bug `3c7473be`) no longer exists at any call site.
+
+/// A text style: a GNOME point size (routed through [`crate::ui::pt_to_px`]) and
+/// weight. Color is chosen at draw time (the same shaped run can be drawn in more
+/// than one color), so it is not part of the style.
+#[derive(Debug, Clone, Copy)]
+pub struct TextStyle {
+    /// GNOME point size (e.g. 11 for `%heading`). NOT pixels.
+    pub pt: f64,
+    pub bold: bool,
+}
+
+impl TextStyle {
+    pub fn new(pt: f64) -> Self {
+        Self { pt, bold: false }
+    }
+
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+}
+
+/// A shaped, rasterized run ready to draw — produced by [`TextShaper::shape`] at a
+/// specific scale, drawn by [`Painter::text`]. Opaque wrapper over the physical
+/// [`GlyphRun`] so callers never touch physical glyph metrics directly.
+pub struct ShapedText {
+    run: GlyphRun,
+}
+
+/// Shapes text at physical (`× scale`) pixels — the miss-only prepare phase (it
+/// needs `&mut VulkanRenderer`, which the live frame holds, so shaping must happen
+/// before the frame opens). Hand one to a widget's `prepare` closure.
+pub struct TextShaper<'a> {
+    renderer: &'a mut VulkanRenderer,
+    scale: f64,
+}
+
+impl<'a> TextShaper<'a> {
+    pub fn new(renderer: &'a mut VulkanRenderer, scale: f64) -> Self {
+        Self { renderer, scale }
+    }
+
+    /// Shape one line. `style.pt` → logical px (`pt_to_px`) → physical px
+    /// (`× scale`) — the single font-size conversion.
+    pub fn shape(&mut self, text: &str, style: TextStyle) -> anyhow::Result<ShapedText> {
+        let px = (crate::ui::pt_to_px(style.pt) * self.scale) as f32;
+        let run = self
+            .renderer
+            .build_glyph_run_weighted(text, px, style.bold)?;
+        Ok(ShapedText { run })
+    }
+}
+
+/// Horizontal placement of a run's ink relative to the anchor point.
+#[derive(Debug, Clone, Copy)]
+pub enum HAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Vertical placement of a run's ink relative to the anchor point.
+#[derive(Debug, Clone, Copy)]
+pub enum VAlign {
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// How [`Painter::text`] anchors a run's ink box to its `at` point.
+#[derive(Debug, Clone, Copy)]
+pub struct Align {
+    pub h: HAlign,
+    pub v: VAlign,
+}
+
+impl Align {
+    /// Left edge at `at.x`, vertically centered on `at.y` (a row label).
+    pub const LEFT_MIDDLE: Align = Align {
+        h: HAlign::Left,
+        v: VAlign::Middle,
+    };
+    /// Right edge at `at.x`, vertically centered on `at.y` (a right-aligned label).
+    pub const RIGHT_MIDDLE: Align = Align {
+        h: HAlign::Right,
+        v: VAlign::Middle,
+    };
+    /// Centered both ways on `at`.
+    pub const CENTER: Align = Align {
+        h: HAlign::Center,
+        v: VAlign::Middle,
+    };
+}
+
+/// A scale-correct drawing surface over a bound [`VulkanFrame`]. Every verb takes
+/// **logical** coordinates/sizes (and points, for text); the single `× scale`
+/// conversion lives here. Construct one inside a [`bake`] `paint` closure.
+pub struct Painter<'a, 'frame, 'buffer> {
+    frame: &'a mut VulkanFrame<'frame, 'buffer>,
+    scale: f64,
+    full: Rectangle<i32, Physical>,
+}
+
+impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
+    /// `phys` is the full baked-buffer size (as handed to the `paint` closure); it
+    /// scopes every draw's damage.
+    pub fn new(
+        frame: &'a mut VulkanFrame<'frame, 'buffer>,
+        scale: f64,
+        phys: Size<i32, Physical>,
+    ) -> Self {
+        Self {
+            frame,
+            scale,
+            full: Rectangle::from_size(phys),
+        }
+    }
+
+    fn px(&self, v: f64) -> i32 {
+        to_physical_precise_round::<i32>(self.scale, v)
+    }
+
+    fn rect_px(&self, r: Rectangle<f64, Logical>) -> Rectangle<i32, Physical> {
+        Rectangle::new(
+            Point::from((self.px(r.loc.x), self.px(r.loc.y))),
+            Size::from((self.px(r.size.w), self.px(r.size.h))),
+        )
+    }
+
+    /// Clear the whole buffer to `color` (a transparent clear for rounded popovers,
+    /// a border color for square dialogs).
+    pub fn clear(&mut self, color: Rgba) -> anyhow::Result<()> {
+        self.frame.clear(Color32F::from(color), &[self.full])?;
+        Ok(())
+    }
+
+    /// Fill `rect` (logical) with `color`, corners cut by `radius` (logical; 0 = a
+    /// plain rectangle, e.g. a separator rule).
+    pub fn fill_rounded(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        radius: f64,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        let r = (radius * self.scale) as f32;
+        self.frame
+            .render_rounded_rect(color, r, self.rect_px(rect), &[self.full])?;
+        Ok(())
+    }
+
+    /// Draw a shaped run, anchoring its ink box to `at` (logical) per `align`,
+    /// tinted `color`.
+    pub fn text(
+        &mut self,
+        shaped: &ShapedText,
+        at: Point<f64, Logical>,
+        align: Align,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        let (ix, iy, iw, ih) = shaped.run.ink_bounds();
+        let ax = self.px(at.x);
+        let ay = self.px(at.y);
+        let ox = match align.h {
+            HAlign::Left => ax - ix,
+            HAlign::Center => ax - ix - iw / 2,
+            HAlign::Right => ax - ix - iw,
+        };
+        let oy = match align.v {
+            VAlign::Top => ay - iy,
+            VAlign::Middle => ay - iy - ih / 2,
+            VAlign::Bottom => ay - iy - ih,
+        };
+        self.frame.render_glyphs(
+            &shaped.run,
+            Point::from((ox, oy)),
+            color,
+            self.full,
+            &[self.full],
+        )?;
+        Ok(())
+    }
 }
 
 /// Test-only scale-sweep harness (H4 in the design doc). Bakes a widget at scales
