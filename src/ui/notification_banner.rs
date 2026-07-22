@@ -37,14 +37,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use niri_config::Config;
+use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::texture::TextureRenderElement;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{card_elements, layout, CardCache, CardContent, CardLayout};
+use crate::ui::widget;
 use crate::utils::output_size;
 
 /// 1em at the 11pt base font.
@@ -53,6 +55,14 @@ const EM: f64 = crate::ui::pt_to_px(11.);
 const WIDTH: f64 = 34. * EM;
 /// `$modal_radius` (`_notifications.scss:11`).
 const RADIUS: f64 = 16.;
+/// GNOME `.notification-banner` `box-shadow: 0 2px 4px 2px $shadow_color`
+/// (`_notifications.scss:10`); `$shadow_color` (dark) = `rgba(0,0,0,0.2)`.
+const SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
+    blur: 4.,
+    offset: (0., 2.),
+    spread: 2.,
+    color: [0., 0., 0., 0.2],
+};
 /// `.notification-banner` margin (`_notifications.scss:12`).
 const MARGIN: f64 = 4.;
 
@@ -119,6 +129,8 @@ pub struct NotificationBanner {
     active_during_show: bool,
     revision: u64,
     cache: RefCell<CardCache>,
+    /// The drop shadow, baked into its own texture and cached alongside the card.
+    shadow_cache: RefCell<widget::BakeCache>,
     clock: Clock,
     config: Rc<RefCell<Config>>,
 }
@@ -137,6 +149,7 @@ impl NotificationBanner {
             active_during_show: false,
             revision: 0,
             cache: RefCell::new(CardCache::new()),
+            shadow_cache: RefCell::new(widget::BakeCache::new()),
             clock,
             config,
         }
@@ -544,24 +557,61 @@ impl NotificationBanner {
         let origin = Point::<f64, Logical>::from((x, y));
         let origin = origin.to_physical_precise_round(scale).to_logical(scale);
 
-        let mut cache = self.cache.borrow_mut();
-        cache.retain(|key| key == self.revision);
-        card_elements(
-            renderer,
-            icons,
-            &mut cache,
-            self.revision,
-            content,
-            &layout,
-            RADIUS,
-            origin,
-            alpha,
-            scale,
-            // The whole banner darkens while hovered (`%card:hover`); it tracks
-            // only whole-banner hover, so no per-button highlight (a minor gap
-            // vs the popover list, which does light individual buttons).
-            self.hovered,
-            None,
-        )
+        let mut elements = {
+            let mut cache = self.cache.borrow_mut();
+            cache.retain(|key| key == self.revision);
+            card_elements(
+                renderer,
+                icons,
+                &mut cache,
+                self.revision,
+                content,
+                &layout,
+                RADIUS,
+                origin,
+                alpha,
+                scale,
+                // The whole banner darkens while hovered (`%card:hover`); it tracks
+                // only whole-banner hover, so no per-button highlight (a minor gap
+                // vs the popover list, which does light individual buttons).
+                self.hovered,
+                None,
+            )
+        };
+
+        // The drop shadow goes *behind* the card, i.e. last in the FIRST=topmost Vec.
+        if !elements.is_empty() {
+            match widget::bake_card_shadow(
+                renderer,
+                &mut self.shadow_cache.borrow_mut(),
+                scale,
+                self.revision,
+                layout.size,
+                RADIUS,
+                SHADOW,
+            ) {
+                Ok((tex, off)) => {
+                    let loc = origin - off.to_f64().to_logical(scale);
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        tex,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::warn!("error baking notification-banner shadow: {err:?}"),
+            }
+        }
+
+        elements
     }
 }

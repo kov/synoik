@@ -181,6 +181,72 @@ pub fn bake<P>(
     Ok(cache.textures.get(&key).map(|(_, t)| t.clone()).unwrap())
 }
 
+/// A GNOME `box-shadow` for a card, in logical px: gaussian `blur` radius (σ = blur/2), `offset`
+/// `(dx, dy)`, `spread` (the shadow box grows by this before blurring, corners with it), and a
+/// straight-alpha `color`. Consumed by [`bake_card_shadow`].
+#[derive(Clone, Copy)]
+pub struct DropShadowSpec {
+    pub blur: f64,
+    pub offset: (f64, f64),
+    pub spread: f64,
+    pub color: Rgba,
+}
+
+/// Bake (cached by `(scale, size, revision)`) a card's drop shadow into its own transparent
+/// texture, and return it with the physical `(dx, dy)` to subtract from the card's on-screen
+/// location so the shadow sits behind it. `card_size`/`radius` describe the card; `spec` is the
+/// GNOME `box-shadow`. The buffer pads the card by the blur reach (~3σ) + `spread` all round (plus
+/// the downward `offset` at the bottom), so the fringe never clips. The reusable form of the
+/// screenshot-panel / notification-banner shadow — draws through [`Painter::drop_shadow`].
+pub fn bake_card_shadow(
+    renderer: &mut VulkanRenderer,
+    cache: &mut BakeCache,
+    scale: f64,
+    revision: u64,
+    card_size: Size<f64, Logical>,
+    radius: f64,
+    spec: DropShadowSpec,
+) -> anyhow::Result<(VkTexture, Point<i32, Physical>)> {
+    // Blur reach (~3σ) + a pixel of ceil headroom, plus the spread, is the pad on every side; the
+    // downward offset only extends the bottom (top pad already covers a small upward offset).
+    let reach = spec.blur * 1.5 + 1.;
+    let pad = reach + spec.spread;
+    let size = Size::<f64, Logical>::from((
+        card_size.w + pad * 2.,
+        card_size.h + pad * 2. + spec.offset.1.max(0.),
+    ));
+    // The (spread-inflated) shadow box, positioned so it has `reach` of blur room on top/left.
+    let box_rect = Rectangle::new(
+        Point::from((reach, reach)),
+        Size::from((
+            card_size.w + spec.spread * 2.,
+            card_size.h + spec.spread * 2.,
+        )),
+    );
+    let tex = bake(
+        renderer,
+        cache,
+        scale,
+        size,
+        revision,
+        |_| Ok(()),
+        |frame, phys, ()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(style::TRANSPARENT)?;
+            p.drop_shadow(
+                box_rect,
+                radius + spec.spread,
+                spec.blur,
+                spec.offset,
+                spec.color,
+            )?;
+            Ok(())
+        },
+    )?;
+    let off = to_physical_precise_round::<i32>(scale, pad);
+    Ok((tex, Point::from((off, off))))
+}
+
 /// A cache for [`bake_content`] — a content-sized bake whose physical size is not
 /// known until its text is shaped, so it is keyed by `(scale, revision)` alone
 /// (the revision determines the content, hence the size). Clears on context change.
