@@ -161,6 +161,78 @@ pub fn bake<P>(
     Ok(cache.textures.get(&key).map(|(_, t)| t.clone()).unwrap())
 }
 
+/// A cache for [`bake_content`] — a content-sized bake whose physical size is not
+/// known until its text is shaped, so it is keyed by `(scale, revision)` alone
+/// (the revision determines the content, hence the size). Clears on context change.
+#[derive(Default)]
+pub struct ContentCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
+}
+
+impl ContentCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Bake a **content-sized** widget (a dialog/notification box whose size is derived
+/// from its shaped text's ink, not known up front). Cached by `(scale, revision)`.
+///
+/// `prepare(renderer)` shapes the text and returns the physical buffer size plus a
+/// layout value `P`; `paint(frame, phys, prepared)` draws it. Both run only on a
+/// cache miss. The caller reads the returned texture's own size to place it (these
+/// widgets center themselves on screen from the baked size).
+pub fn bake_content<P>(
+    renderer: &mut VulkanRenderer,
+    cache: &mut ContentCache,
+    scale: f64,
+    revision: u64,
+    prepare: impl FnOnce(&mut VulkanRenderer) -> anyhow::Result<(Size<i32, Physical>, P)>,
+    paint: impl FnOnce(&mut VulkanFrame, Size<i32, Physical>, &P) -> anyhow::Result<()>,
+) -> anyhow::Result<VkTexture> {
+    let scale_key = NotNan::new(scale).context("non-finite scale")?;
+
+    let context = renderer.context_id();
+    if cache.context.as_ref() != Some(&context) {
+        cache.textures.clear();
+        cache.context = Some(context);
+    }
+
+    let fresh = matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == revision);
+    if !fresh {
+        let (phys, prepared) = prepare(renderer)?;
+        let tex = bake_uncached_sized(renderer, phys, |frame| paint(frame, phys, &prepared))?;
+        cache.textures.insert(scale_key, (revision, tex));
+    }
+
+    Ok(cache
+        .textures
+        .get(&scale_key)
+        .map(|(_, t)| t.clone())
+        .unwrap())
+}
+
+/// The offscreen dance for an already-known **physical** size (no logical→physical
+/// step). Shared by [`bake_content`] and [`bake_uncached`].
+fn bake_uncached_sized(
+    renderer: &mut VulkanRenderer,
+    phys: Size<i32, Physical>,
+    paint: impl FnOnce(&mut VulkanFrame) -> anyhow::Result<()>,
+) -> anyhow::Result<VkTexture> {
+    let (w, h) = (phys.w.max(1), phys.h.max(1));
+    let mut target =
+        renderer.create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((w, h)))?;
+    {
+        let mut fb = renderer.bind(&mut target)?;
+        let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        paint(&mut frame)?;
+        let _sync = frame.finish()?;
+    }
+    renderer.make_offscreen_sampleable(&target)?;
+    Ok(target)
+}
+
 /// Bake once with no caching — for widgets that re-draw every frame while
 /// animating and bypass their cache (the panel workspace-dot morph, the QS pill
 /// fill-fade). Same contract as [`bake`]'s `paint`.
@@ -171,18 +243,7 @@ pub fn bake_uncached(
     paint: impl FnOnce(&mut VulkanFrame, Size<i32, Physical>) -> anyhow::Result<()>,
 ) -> anyhow::Result<VkTexture> {
     let phys = physical_size(scale, logical_size);
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((phys.w, phys.h)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
-        paint(&mut frame, phys)?;
-        let _sync = frame.finish()?;
-    }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+    bake_uncached_sized(renderer, phys, |frame| paint(frame, phys))
 }
 
 // --- H2: logical/pt drawing --------------------------------------------------------------------
@@ -220,6 +281,65 @@ pub struct ShapedText {
     run: GlyphRun,
 }
 
+/// One span of a styled paragraph: its text, family, weight, and GNOME point size.
+/// The pt → physical conversion happens in [`TextShaper::paragraph`].
+#[derive(Debug, Clone, Copy)]
+pub struct ParagraphSpan<'a> {
+    pub text: &'a str,
+    pub mono: bool,
+    pub bold: bool,
+    /// GNOME point size for this span (spans may differ, e.g. a title vs body).
+    pub pt: f64,
+}
+
+impl<'a> ParagraphSpan<'a> {
+    /// A plain sans span at `pt`.
+    pub fn new(text: &'a str, pt: f64) -> Self {
+        Self {
+            text,
+            mono: false,
+            bold: false,
+            pt,
+        }
+    }
+
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    pub fn mono(mut self) -> Self {
+        self.mono = true;
+        self
+    }
+}
+
+/// A shaped, wrapped, multi-span paragraph — the dialog/notification text block.
+/// Its ink metrics are **physical** (content-sized widgets lay out in physical px
+/// directly); draw it with [`Painter::paragraph`].
+pub struct ShapedParagraph {
+    run: GlyphRun,
+}
+
+impl ShapedParagraph {
+    /// Ink bounding box of the whole block, physical px: `(x, y, w, h)`.
+    pub fn ink_bounds(&self) -> (i32, i32, i32, i32) {
+        self.run.ink_bounds()
+    }
+
+    /// Ink bounding box of span index `i` (physical px) — e.g. to draw a keycap
+    /// patch behind a monospace command span.
+    pub fn span_ink_bounds(&self, i: u32) -> (i32, i32, i32, i32) {
+        self.run.span_ink_bounds(i)
+    }
+
+    /// The shaped run, for drawing with [`Painter::paragraph`] or (content-sized
+    /// widgets laying out in physical px) `VulkanFrame::render_glyphs` directly.
+    pub(crate) fn run(&self) -> &GlyphRun {
+        &self.run
+    }
+}
+
 /// Shapes text at physical (`× scale`) pixels — the miss-only prepare phase (it
 /// needs `&mut VulkanRenderer`, which the live frame holds, so shaping must happen
 /// before the frame opens). Hand one to a widget's `prepare` closure.
@@ -241,6 +361,38 @@ impl<'a> TextShaper<'a> {
             .renderer
             .build_glyph_run_weighted(text, px, style.bold)?;
         Ok(ShapedText { run })
+    }
+
+    /// Shape a wrapped, center-aligned, multi-span paragraph. `wrap` is the wrap
+    /// width in **logical** px; `base_pt` is the line-height reference point size.
+    /// Every span's pt is converted the same way as [`Self::shape`] — no call site
+    /// touches a physical font size.
+    pub fn paragraph(
+        &mut self,
+        spans: &[ParagraphSpan],
+        wrap: f64,
+        base_pt: f64,
+    ) -> anyhow::Result<ShapedParagraph> {
+        use niri_vk::text::{SpanFamily, TextSpan};
+        let to_px = |pt: f64| (crate::ui::pt_to_px(pt) * self.scale) as f32;
+        let vk_spans: Vec<TextSpan> = spans
+            .iter()
+            .map(|s| TextSpan {
+                text: s.text,
+                family: if s.mono {
+                    SpanFamily::Mono
+                } else {
+                    SpanFamily::Sans
+                },
+                bold: s.bold,
+                px: to_px(s.pt),
+            })
+            .collect();
+        let wrap_px = (wrap * self.scale) as f32;
+        let run = self
+            .renderer
+            .build_glyph_paragraph(&vk_spans, wrap_px, to_px(base_pt))?;
+        Ok(ShapedParagraph { run })
     }
 }
 
