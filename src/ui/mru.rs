@@ -12,7 +12,7 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
+use smithay::backend::renderer::{Color32F, ContextId, Renderer, Texture};
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -30,7 +30,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderCtx;
-use crate::ui::widget::{self, ParagraphSpan, TextShaper, TextStyle};
+use crate::ui::widget::{self, Align, Painter, ParagraphSpan, TextShaper, TextStyle};
 use crate::utils::{
     baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
     with_toplevel_role,
@@ -1703,19 +1703,19 @@ fn generate_title_texture(
         let mut shaper = TextShaper::new(renderer, scale);
         shaper.shape(title, TextStyle::new(FONT_PT))?
     };
-    let (ix, iy, iw, ih) = run.ink_bounds();
+    let (_ix, _iy, iw, ih) = run.ink_bounds();
     anyhow::ensure!(iw > 0 && ih > 0, "empty title");
 
     // Guard against overly long titles; the fade + layout clip hide any overflow anyway.
     let w = iw.min(16383);
     let h = ih.min(16383);
-    let origin = Point::<i32, Physical>::from((-ix, -iy));
     let size = Size::<i32, Physical>::from((w, h));
 
     widget::bake_uncached_sized(renderer, size, |frame| {
-        let full = Rectangle::from_size(size);
-        frame.clear(Color32F::from([0., 0., 0., 0.]), &[full])?;
-        frame.render_glyphs(run.run(), origin, TITLE_COLOR, full, &[full])?;
+        let mut p = Painter::new(frame, scale, size);
+        p.clear([0., 0., 0., 0.])?;
+        // The buffer is exactly ink-sized, so the ink top-left sits at the origin.
+        p.text(&run, Point::from((0., 0.)), Align::TOP_LEFT, TITLE_COLOR)?;
         Ok(())
     })
 }
@@ -1829,9 +1829,9 @@ fn render_panel(
     let kpad_y = (px * 0.12).round() as i32;
 
     widget::bake_uncached_sized(renderer, size, |frame| {
-        let full = Rectangle::from_size(size);
-        frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
-        frame.clear(Color32F::from(PANEL_BG), &[inner])?;
+        let mut p = Painter::new(frame, scale, size);
+        p.clear(PANEL_BORDER_COLOR)?;
+        p.fill_rect_px(inner, PANEL_BG)?;
 
         // Grey keycap patches behind each bold-mono first letter.
         for &ks in &keycap_spans {
@@ -1842,11 +1842,11 @@ fn render_panel(
                     Size::from((kw + kpad_x * 2, kh + kpad_y * 2)),
                 );
                 if let Some(rect) = rect.intersection(inner) {
-                    frame.clear(Color32F::from(PANEL_KEYCAP_BG), &[rect])?;
+                    p.fill_rect_px(rect, PANEL_KEYCAP_BG)?;
                 }
             }
         }
-        frame.render_glyphs_spans(run.run(), origin, &colors, full, &[full])?;
+        p.paragraph_spans(&run, origin, &colors)?;
         Ok(())
     })
 }
