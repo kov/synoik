@@ -513,7 +513,10 @@ impl Calendar {
                 &date_label_run,
                 Point::from((label_x, PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.)),
                 Align::LEFT_MIDDLE,
-                TEXT,
+                // GNOME's `.date-label` and `.day-label` share `$fg_color` — no per-label
+                // override (`_calendar.scss:28,33`); measured equal (~#909091) in the 50.1
+                // reference. Match the weekday tone, not pure white.
+                MUTED,
             )?;
 
             // Header: ‹ arrows › and the centered "Month Year". A hovered arrow
