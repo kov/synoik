@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use niri_config::Config;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
@@ -29,7 +29,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, BakeCache, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{self, BakeCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 // Logical layout. Fixed so the pointer hit-test and the rendered geometry agree without threading a
@@ -343,7 +343,7 @@ impl EndSessionDialog {
                 Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
                 revision,
                 |renderer| prepare_dialog(renderer, scale, kind, seconds_left, self.focused),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -555,46 +555,23 @@ fn paint_dialog(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
     layout: &DialogLayout,
+    scale: f64,
 ) -> anyhow::Result<()> {
-    let full = Rectangle::from_size(phys);
+    let mut p = Painter::new(frame, scale, phys);
 
     // Grey border = whole box grey, then the inner rect dark.
-    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-    frame.clear(Color32F::from(BOX_BG), &[layout.inner])?;
+    p.clear(BORDER_COLOR)?;
+    p.fill_rect_px(layout.inner, BOX_BG)?;
 
     // Button backgrounds (accent when focused).
-    frame.clear(Color32F::from(layout.cancel_bg), &[layout.cancel_rect])?;
-    frame.clear(Color32F::from(layout.action_bg), &[layout.action_rect])?;
+    p.fill_rect_px(layout.cancel_rect, layout.cancel_bg)?;
+    p.fill_rect_px(layout.action_rect, layout.action_bg)?;
 
     // Text.
-    frame.render_glyphs(
-        layout.title.run(),
-        layout.title_origin,
-        TITLE_COLOR,
-        full,
-        &[full],
-    )?;
-    frame.render_glyphs(
-        layout.desc.run(),
-        layout.desc_origin,
-        DESC_COLOR,
-        full,
-        &[full],
-    )?;
-    frame.render_glyphs(
-        layout.cancel.run(),
-        layout.cancel_origin,
-        LABEL_COLOR,
-        full,
-        &[full],
-    )?;
-    frame.render_glyphs(
-        layout.action.run(),
-        layout.action_origin,
-        LABEL_COLOR,
-        full,
-        &[full],
-    )?;
+    p.paragraph(&layout.title, layout.title_origin, TITLE_COLOR)?;
+    p.paragraph(&layout.desc, layout.desc_origin, DESC_COLOR)?;
+    p.paragraph(&layout.cancel, layout.cancel_origin, LABEL_COLOR)?;
+    p.paragraph(&layout.action, layout.action_origin, LABEL_COLOR)?;
     Ok(())
 }
 
@@ -642,7 +619,7 @@ mod tests {
                         Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
                         revision_for(kind, seconds, focused),
                         |r| prepare_dialog(r, 1., kind, seconds, focused),
-                        paint_dialog,
+                        |frame, phys, layout| paint_dialog(frame, phys, layout, 1.),
                     )
                     .expect("dialog texture");
                     let size = tex.size();
