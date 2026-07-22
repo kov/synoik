@@ -3910,7 +3910,7 @@ fn notification_banner_close_click_dismisses() {
     // Banner geometry: 34em wide centered, y = panel(32) + margin(4); the close
     // circle (28px) sits PAD + its 3px margin from the right edge, centered in
     // the header row (`_message-list.scss:152-155`).
-    let em = 11. * 4. / 3.;
+    let em = crate::ui::pt_to_px(11.);
     let w = 34. * em;
     let x0 = (1920. - w) / 2.;
     let close_x = x0 + w - 6. - 3. - 14.;

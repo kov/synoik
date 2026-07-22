@@ -2652,10 +2652,11 @@ fn vulkan_renders_the_expanded_card_body() {
                 let i = ((py * w + px) * 4) as usize;
                 [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
             };
-            // Deep in the expanded body area — beyond the collapsed height.
+            // Deep in the expanded body area — beyond the collapsed height,
+            // anchored to the card bottom so it tracks the em-scaled height.
             let body_px = sample(
                 card_rect.loc.x + card_rect.size.w / 2.,
-                card_rect.loc.y + 110.,
+                card_rect.loc.y + card_rect.size.h - 15.,
             );
             // The (now collapse-)chevron glyph over the caret circle: a
             // chevron has no ink at its exact center, so take the brightest
