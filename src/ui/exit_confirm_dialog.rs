@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use niri_config::Config;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
@@ -14,7 +14,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
@@ -183,7 +183,7 @@ impl ExitConfirmDialog {
                 scale,
                 0,
                 |renderer| prepare_dialog(renderer, scale),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -323,15 +323,16 @@ fn paint_dialog(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
     layout: &DialogLayout,
+    scale: f64,
 ) -> anyhow::Result<()> {
-    let full = Rectangle::from_size(phys);
+    let mut p = Painter::new(frame, scale, phys);
     // Red border = whole box cleared red, then the inner rect cleared to the dark bg.
-    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-    frame.clear(Color32F::from(BOX_BG), &[layout.inner])?;
+    p.clear(BORDER_COLOR)?;
+    p.fill_rect_px(layout.inner, BOX_BG)?;
     if let Some(keycap) = layout.keycap {
-        frame.clear(Color32F::from(KEYCAP_BG), &[keycap])?;
+        p.fill_rect_px(keycap, KEYCAP_BG)?;
     }
-    frame.render_glyphs(layout.run.run(), layout.origin, TEXT, full, &[full])?;
+    p.paragraph(&layout.run, layout.origin, TEXT)?;
     Ok(())
 }
 
@@ -381,7 +382,7 @@ mod tests {
             1.,
             0,
             |r| prepare_dialog(r, 1.),
-            paint_dialog,
+            |frame, phys, layout| paint_dialog(frame, phys, layout, 1.),
         )
         .expect("dialog texture");
         let size = tex.size();
