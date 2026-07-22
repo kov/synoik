@@ -29,7 +29,10 @@ use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, BakeCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{
+    self, style, BakeCache, Painter, ParagraphSpan, Rgba, ShapedParagraph, ShapedText, TextShaper,
+    TextStyle,
+};
 use crate::utils::{output_size, to_physical_precise_round};
 
 // Logical layout. Fixed so the pointer hit-test and the rendered geometry agree without threading a
@@ -37,7 +40,6 @@ use crate::utils::{output_size, to_physical_precise_round};
 const WIDTH: i32 = 400;
 const HEIGHT: i32 = 190;
 const PADDING: i32 = 24;
-const BORDER: i32 = 2;
 const BUTTON_W: i32 = 120;
 const BUTTON_H: i32 = 40;
 const BUTTON_GAP: i32 = 12;
@@ -46,15 +48,11 @@ const BUTTON_GAP: i32 = 12;
 const TITLE_PT: f64 = 15.;
 const BODY_PT: f64 = 11.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-/// Box background, grey border, and the two button fills (accent when focused), straight RGBA.
-const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
-const BORDER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.];
-const BUTTON_BG: [f32; 4] = [0.22, 0.22, 0.22, 1.];
-const ACCENT: [f32; 4] = [0.20, 0.52, 0.89, 1.];
-/// Title (white), description (grey), and button-label (white) text colours.
+/// GNOME modal-dialog card: flat `$bg_color`, borderless, rounded to `$alert_radius`.
+const BOX_BG: [f32; 4] = style::DIALOG_BG;
+/// Title (white) and description (grey) text colours; button labels use `style::TEXT`.
 const TITLE_COLOR: [f32; 4] = [1., 1., 1., 1.];
 const DESC_COLOR: [f32; 4] = [0.8, 0.8, 0.8, 1.];
-const LABEL_COLOR: [f32; 4] = [1., 1., 1., 1.];
 
 /// Which button currently has focus (keyboard focus and pointer hover are unified — hovering a
 /// button focuses it, and Enter activates the focused one).
@@ -91,12 +89,19 @@ enum State {
     Hiding(Animation),
 }
 
-/// Pack the content signature (dialog type, countdown, focused button) into a [`widget::bake`]
-/// revision — the cache re-renders only when one of these changes (per output scale, which the
-/// bake key handles). Bit 0-1 kind, bit 2 focused-is-action, bits 3+ the countdown (0 = none).
-fn revision_for(kind: EndSessionType, seconds_left: Option<u64>, focused: Button) -> u64 {
+/// Pack the content signature (dialog type, countdown, focused button, accent) into a
+/// [`widget::bake`] revision — the cache re-renders only when one of these changes (per output
+/// scale, which the bake key handles). Bit 0-1 kind, bit 2 focused-is-action, bits 3-39 the
+/// countdown (0 = none), bits 40-63 the accent RGB (so a live accent change re-bakes).
+fn revision_for(
+    kind: EndSessionType,
+    seconds_left: Option<u64>,
+    focused: Button,
+    accent: [u8; 3],
+) -> u64 {
     let secs = seconds_left.map_or(0, |s| s + 1);
-    (kind as u64) | (((focused == Button::Action) as u64) << 2) | (secs << 3)
+    let accent = (accent[0] as u64) << 16 | (accent[1] as u64) << 8 | (accent[2] as u64);
+    (kind as u64) | (((focused == Button::Action) as u64) << 2) | (secs << 3) | (accent << 40)
 }
 
 pub struct EndSessionDialog {
@@ -314,6 +319,7 @@ impl EndSessionDialog {
         &self,
         renderer: &mut VulkanRenderer,
         output: &Output,
+        accent: [u8; 3],
         push: &mut dyn FnMut(EndSessionDialogRenderElement),
     ) {
         let (value, clamped_value) = match &self.state {
@@ -329,7 +335,13 @@ impl EndSessionDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-        let revision = revision_for(kind, seconds_left, self.focused);
+        let accent_rgba: Rgba = [
+            f32::from(accent[0]) / 255.,
+            f32::from(accent[1]) / 255.,
+            f32::from(accent[2]) / 255.,
+            1.,
+        ];
+        let revision = revision_for(kind, seconds_left, self.focused, accent);
 
         let texture = {
             let mut cache = self.cache.borrow_mut();
@@ -343,7 +355,7 @@ impl EndSessionDialog {
                 Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
                 revision,
                 |renderer| prepare_dialog(renderer, scale, kind, seconds_left, self.focused),
-                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale, accent_rgba),
             ) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
@@ -430,18 +442,16 @@ fn content(
 struct DialogLayout {
     title: ShapedParagraph,
     desc: ShapedParagraph,
-    cancel: ShapedParagraph,
-    action: ShapedParagraph,
+    /// Single-line button labels, centered by [`Painter::button`].
+    cancel: ShapedText,
+    action: ShapedText,
     title_origin: Point<i32, Physical>,
     desc_origin: Point<i32, Physical>,
-    cancel_origin: Point<i32, Physical>,
-    action_origin: Point<i32, Physical>,
-    inner: Rectangle<i32, Physical>,
-    cancel_rect: Rectangle<i32, Physical>,
-    action_rect: Rectangle<i32, Physical>,
-    /// Button fills: accent when focused, else the dark grey.
-    cancel_bg: [f32; 4],
-    action_bg: [f32; 4],
+    /// The two neutral dialog buttons (logical geometry + focus flag); the focused
+    /// one draws the accent ring. Both `ButtonStyle::Dialog` — GNOME's end-session
+    /// dialog uses no accent-fill / destructive button.
+    cancel_btn: widget::Button,
+    action_btn: widget::Button,
 }
 
 /// Shape the four text runs and compute the fixed-size box layout — the prepare phase for
@@ -460,10 +470,7 @@ fn prepare_dialog(
     let (title, action_label, description) = content(kind, seconds_left);
 
     let px = |logical: i32| to_physical_precise_round::<i32>(scale, logical);
-    let width = px(WIDTH).max(1);
-    let height = px(HEIGHT).max(1);
     let padding = px(PADDING).max(0);
-    let border = px(BORDER).max(1);
     let inner_wrap = (WIDTH - PADDING * 2).max(1);
 
     let mut shaper = TextShaper::new(renderer, scale);
@@ -477,21 +484,10 @@ fn prepare_dialog(
         f64::from(inner_wrap),
         BODY_PT,
     )?;
-    let cancel_run = shaper.paragraph(
-        &[ParagraphSpan::new("Cancel", BODY_PT)],
-        f64::from(BUTTON_W),
-        BODY_PT,
-    )?;
-    let action_run = shaper.paragraph(
-        &[ParagraphSpan::new(action_label, BODY_PT)],
-        f64::from(BUTTON_W),
-        BODY_PT,
-    )?;
-
-    let inner = Rectangle::new(
-        Point::from((border, border)),
-        Size::from(((width - border * 2).max(0), (height - border * 2).max(0))),
-    );
+    // Button labels are single-line, centered by `Painter::button` — plain runs, not
+    // wrapped paragraphs.
+    let cancel_run = shaper.shape("Cancel", TextStyle::new(BODY_PT).bold())?;
+    let action_run = shaper.shape(action_label, TextStyle::new(BODY_PT).bold())?;
 
     // Stack the title then the description under it, each within the inner width.
     let (_, tiy, _, tih) = title_run.ink_bounds();
@@ -499,38 +495,17 @@ fn prepare_dialog(
     let (_, diy, _, _) = desc_run.ink_bounds();
     let desc_origin = Point::<i32, Physical>::from((padding, padding + tih + px(12) - diy));
 
-    // Physical button rects (from the shared logical geometry) + centered label origins.
-    let button_phys = |b: Button| -> Rectangle<i32, Physical> {
-        let r = EndSessionDialog::button_rect(b);
-        Rectangle::new(
-            Point::from((px(r.loc.x as i32), px(r.loc.y as i32))),
-            Size::from((px(r.size.w as i32), px(r.size.h as i32))),
-        )
-    };
-    let cancel_rect = button_phys(Button::Cancel);
-    let action_rect = button_phys(Button::Action);
-
-    let (_, ciy, _, cih) = cancel_run.ink_bounds();
-    let cancel_origin = Point::<i32, Physical>::from((
-        cancel_rect.loc.x,
-        cancel_rect.loc.y + (cancel_rect.size.h - cih) / 2 - ciy,
-    ));
-    let (_, aiy, _, aih) = action_run.ink_bounds();
-    let action_origin = Point::<i32, Physical>::from((
-        action_rect.loc.x,
-        action_rect.loc.y + (action_rect.size.h - aih) / 2 - aiy,
-    ));
-
-    let cancel_bg = if focused == Button::Cancel {
-        ACCENT
-    } else {
-        BUTTON_BG
-    };
-    let action_bg = if focused == Button::Action {
-        ACCENT
-    } else {
-        BUTTON_BG
-    };
+    // The two neutral dialog buttons (logical geometry); the focused one draws the ring.
+    let cancel_btn = widget::Button::new(
+        EndSessionDialog::button_rect(Button::Cancel),
+        widget::ButtonStyle::Dialog,
+    )
+    .focused(focused == Button::Cancel);
+    let action_btn = widget::Button::new(
+        EndSessionDialog::button_rect(Button::Action),
+        widget::ButtonStyle::Dialog,
+    )
+    .focused(focused == Button::Action);
 
     Ok(DialogLayout {
         title: title_run,
@@ -539,13 +514,8 @@ fn prepare_dialog(
         action: action_run,
         title_origin,
         desc_origin,
-        cancel_origin,
-        action_origin,
-        inner,
-        cancel_rect,
-        action_rect,
-        cancel_bg,
-        action_bg,
+        cancel_btn,
+        action_btn,
     })
 }
 
@@ -556,22 +526,26 @@ fn paint_dialog(
     phys: Size<i32, Physical>,
     layout: &DialogLayout,
     scale: f64,
+    accent: Rgba,
 ) -> anyhow::Result<()> {
     let mut p = Painter::new(frame, scale, phys);
 
-    // Grey border = whole box grey, then the inner rect dark.
-    p.clear(BORDER_COLOR)?;
-    p.fill_rect_px(layout.inner, BOX_BG)?;
+    // GNOME modal card: transparent clear, then a flat rounded fill so the corners
+    // stay transparent (the composited element carries no opaque region). No border.
+    p.clear(style::TRANSPARENT)?;
+    p.fill_rounded(
+        Rectangle::from_size(Size::from((f64::from(WIDTH), f64::from(HEIGHT)))),
+        style::DIALOG_RADIUS,
+        BOX_BG,
+    )?;
 
-    // Button backgrounds (accent when focused).
-    p.fill_rect_px(layout.cancel_rect, layout.cancel_bg)?;
-    p.fill_rect_px(layout.action_rect, layout.action_bg)?;
-
-    // Text.
+    // Title + description.
     p.paragraph(&layout.title, layout.title_origin, TITLE_COLOR)?;
     p.paragraph(&layout.desc, layout.desc_origin, DESC_COLOR)?;
-    p.paragraph(&layout.cancel, layout.cancel_origin, LABEL_COLOR)?;
-    p.paragraph(&layout.action, layout.action_origin, LABEL_COLOR)?;
+
+    // The two neutral dialog buttons (accent focus ring on the focused one).
+    p.button(&layout.cancel_btn, &layout.cancel, accent)?;
+    p.button(&layout.action_btn, &layout.action, accent)?;
     Ok(())
 }
 
@@ -617,9 +591,11 @@ mod tests {
                         &mut cache,
                         1.,
                         Size::from((f64::from(WIDTH), f64::from(HEIGHT))),
-                        revision_for(kind, seconds, focused),
+                        revision_for(kind, seconds, focused, [0x35, 0x84, 0xe4]),
                         |r| prepare_dialog(r, 1., kind, seconds, focused),
-                        |frame, phys, layout| paint_dialog(frame, phys, layout, 1.),
+                        |frame, phys, layout| {
+                            paint_dialog(frame, phys, layout, 1., [0.2, 0.52, 0.89, 1.])
+                        },
                     )
                     .expect("dialog texture");
                     let size = tex.size();
@@ -636,16 +612,17 @@ mod tests {
                         .expect("copy_framebuffer");
                     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-                    // The focused button's top strip (above its vertically-centered label) is the
-                    // accent-blue fill (B clearly dominant).
+                    // The focused button carries a 2px accent ring just outside its rect (the
+                    // fill itself is the neutral translucent dialog-button color, matching GNOME
+                    // 50.1). Sample 1px above the top edge → the accent band (B clearly dominant).
                     let rect = EndSessionDialog::button_rect(focused);
                     let bx = (rect.loc.x + rect.size.w / 2.) as i32;
-                    let by = rect.loc.y as i32 + 4;
+                    let by = rect.loc.y as i32 - 1;
                     let i = ((by * size.w + bx) * 4) as usize;
                     let p = [pixels[i], pixels[i + 1], pixels[i + 2]];
                     assert!(
                         p[2] > 150 && p[2] > p[0] + 40,
-                        "focused button not accent-blue at its top: {p:?}"
+                        "focused button has no accent ring at its top edge: {p:?}"
                     );
 
                     // Bright glyph ink (title / labels).

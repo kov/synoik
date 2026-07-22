@@ -5227,8 +5227,12 @@ impl Niri {
             .render(ctx.renderer, output, &mut |elem| push(elem.into()));
 
         // Next, the end-session (logout/shutdown/restart) confirmation dialog.
-        self.end_session_dialog
-            .render(ctx.renderer, output, &mut |elem| push(elem.into()));
+        self.end_session_dialog.render(
+            ctx.renderer,
+            output,
+            self.gnome_settings.accent_color,
+            &mut |elem| push(elem.into()),
+        );
 
         // Next, the config error notification too.
         if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {

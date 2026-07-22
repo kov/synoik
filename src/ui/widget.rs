@@ -67,6 +67,10 @@ pub mod style {
     pub const DIALOG_BUTTON_BG: Rgba = [1., 1., 1., 0.1];
     /// `.destructive-action` fill — `$red_4 #c01c28` (`_default-colors.scss:11`).
     pub const DESTRUCTIVE_BG: Rgba = [0.753, 0.110, 0.157, 1.];
+
+    /// Modal-dialog corner radius, logical px — GNOME `$alert_radius` (`_common.scss:43`,
+    /// applied at `_dialogs.scss:6`). Note this is 18px, not `$modal_radius` (16px).
+    pub const DIALOG_RADIUS: f64 = 18.;
 }
 
 /// Composite a symbolic icon — the first of `candidates` that resolves — centered
