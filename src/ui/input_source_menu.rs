@@ -44,9 +44,6 @@ const SEP_EXTRA: f64 = 9.;
 const RADIUS: f64 = 14.;
 const MIN_W: f64 = 200.;
 
-/// The menu background (a dark popover surface). Local: it differs from the
-/// quick-settings menu bg, so it is not a shared token yet.
-const BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
 /// The row separator rule. Local: the separator alpha diverges across widgets
 /// (0.12 here vs 0.10/0.22 elsewhere) pending a reference reconciliation.
 const SEPARATOR: [f32; 4] = [1., 1., 1., 0.12];
@@ -234,8 +231,9 @@ impl InputSourceMenu {
         let size = self.logical_size();
         let mut p = Painter::new(frame, scale, phys);
 
+        // Transparent bg: the shared popover chrome (`PanelPopover::render`) draws the
+        // `.popup-menu-content` box fill behind this content.
         p.clear(style::TRANSPARENT)?;
-        p.fill_rounded(Rectangle::from_size(size), RADIUS, BG)?;
 
         // The separator rule centered in the break above the trailing items.
         let sep_y = self.row_top(self.items.len()) - SEP_EXTRA / 2.;

@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use niri_config::Config;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
@@ -204,6 +205,10 @@ pub struct PanelPopover {
     /// The `.popup-menu-content` 1px border, baked as a transparent ring texture and composited
     /// on top (a multi-texture popover would otherwise seam if bordered per-texture). Same keying.
     border_cache: RefCell<widget::BakeCache>,
+    /// The `.popup-menu-content` background fill (`$bg_color` #36363a), baked once and composited
+    /// BEHIND the content and above the shadow — the shared chrome's single bg, so the three
+    /// contents (bake with a transparent bg) can't drift the popover box color. Same keying.
+    fill_cache: RefCell<widget::BakeCache>,
 }
 
 impl PanelPopover {
@@ -219,6 +224,7 @@ impl PanelPopover {
             closing: false,
             shadow_cache: RefCell::new(widget::BakeCache::new()),
             border_cache: RefCell::new(widget::BakeCache::new()),
+            fill_cache: RefCell::new(widget::BakeCache::new()),
         }
     }
 
@@ -698,6 +704,49 @@ impl PanelPopover {
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             None => Vec::new(),
         };
+
+        // The `.popup-menu-content` background fill, drawn ONCE by the shared chrome behind the
+        // content (which bakes transparent) and above the drop shadow. This is the single home
+        // for the popover box bg (`$bg_color`): the three contents used to each fill their own
+        // box with a different, too-dark value. Pushed before the shadow so it lands above it.
+        if let Some(content) = self.content.as_ref() {
+            let card = content.logical_size();
+            let radius = content.corner_radius();
+            let mut cache = self.fill_cache.borrow_mut();
+            match widget::bake_card_fill(
+                renderer,
+                &mut cache,
+                scale,
+                radius as u64,
+                card,
+                radius,
+                widget::style::MENU_BG,
+            ) {
+                Ok(tex) => {
+                    // The fill is the popover's one opaque surface, so it carries the rounded
+                    // opaque region (two bands excluding the transparent corners). The content
+                    // textures above it are transparent-bg and report none.
+                    let opaque =
+                        widget::rounded_opaque_regions(tex.size(), (radius * scale).round() as i32);
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        tex,
+                        scale,
+                        Transform::Normal,
+                        opaque,
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        origin,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::warn!("error baking popover fill: {err:?}"),
+            }
+        }
 
         // The `.popup-menu-content` drop shadow, behind the content (appended last in the
         // FIRST=topmost Vec). Added before the fade+scale pass below so it animates with the

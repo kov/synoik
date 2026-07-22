@@ -29,9 +29,7 @@ use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
-use smithay::utils::{
-    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
-};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::notifications::SourceKey;
 use crate::render_helpers::icon::IconCache;
@@ -68,7 +66,6 @@ const ARROW_PT: f64 = 13.5; // pt_to_px(13.5) == 18 logical px
 /// $forced_circular_radius }`; today `%default_button`, selected `%flat_button`).
 const DISC_DIAM: f64 = 30.;
 
-const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
 /// Fully transparent — the buffer is cleared to this so the rounded outer corners stay see-through.
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 /// The popover's outer corner radius: gnome-shell's `.popup-menu-content` is
@@ -95,8 +92,10 @@ const TODAY_CARD_H: f64 = TODAY_PAD + DAY_ROW + DATE_ROW + TODAY_PAD; // 62
 /// Gap between the today card and the month-nav header below it.
 const TODAY_GAP: f64 = 6.;
 const TODAY_RADIUS: f64 = 12.;
-/// The card fill: BOX_BG lightened, matching GNOME's `#36363a`→`#47474c` button delta (~7%).
-const TODAY_CARD_BG: [f32; 4] = [0.17, 0.17, 0.17, 1.];
+/// The today card fill — GNOME's `$card_bg_color` = `lighten($bg_color, 7%)` ≈ `#47474c`, one
+/// step lighter than the `.popup-menu-content` box (`$bg_color` #36363a). Shared
+/// [`widget::style::CARD_BG`].
+const TODAY_CARD_BG: [f32; 4] = widget::style::CARD_BG;
 /// `.day-label` (weekday name) and `.date-label` (full date) point sizes. GNOME's date label is
 /// heavier (800) but the rasterizer tops out at bold (700); both draw bold here.
 const DAY_LABEL_PT: f64 = 11.;
@@ -459,12 +458,9 @@ impl Calendar {
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
             let mut p = Painter::new(frame, scale, phys);
-            // Rounded card: clear transparent, then fill the interior as a rounded rect so the four
-            // outer corners stay transparent (the composited element reports opacity excluding
-            // those corners — see `PanelPopover::render`). Matches the quick-settings
-            // menu's approach.
+            // Transparent bg: the shared popover chrome (`PanelPopover::render`) draws the
+            // `.popup-menu-content` box fill behind this column, so it need not fill its own box.
             p.clear(TRANSPARENT)?;
-            p.fill_rounded(Rectangle::from_size(size), BOX_RADIUS, BOX_BG)?;
 
             // Logical center of a rect (Painter places by logical coords + Align).
             let lc = |rect: Rectangle<f64, Logical>| {
@@ -2054,8 +2050,10 @@ impl DateMenu {
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
             let mut p = Painter::new(frame, scale, phys);
+            // Transparent bg: the shared popover chrome (`PanelPopover::render`) draws the
+            // `.popup-menu-content` box fill behind this texture; only the list-column chrome
+            // (separator / placeholder / Clear pill) lives here.
             p.clear(TRANSPARENT)?;
-            p.fill_rounded(Rectangle::from_size(size), BOX_RADIUS, BOX_BG)?;
 
             // The faint 1px separator on the list column's right edge
             // (`.message-list` border-right, `_message-list.scss:8,11`).
@@ -2102,8 +2100,6 @@ impl DateMenu {
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
-        use smithay::backend::renderer::Texture as _;
-
         let mut elements = Vec::new();
         let size = self.logical_size();
 
@@ -2159,34 +2155,18 @@ impl DateMenu {
             }
         }
 
-        // The background box, at the bottom of the stack, reporting opacity
-        // as the two bands that exclude the rounded corners — never claiming
-        // a cut-away corner pixel is opaque (which would let occlusion drop
-        // what shows through).
+        // The list-column chrome (separator / placeholder / Clear pill) on a transparent bg, at
+        // the bottom of the content stack. Reports NO opaque region: the `.popup-menu-content`
+        // box fill (and its rounded opaque region) is now drawn by the shared popover chrome
+        // behind this texture (`PanelPopover::render`).
         match self.bg_texture(renderer, scale) {
             Ok(texture) => {
-                let tex_size = texture.size();
-                let r = (BOX_RADIUS * scale).round() as i32;
-                let opaque = if r > 0 && tex_size.w > 2 * r && tex_size.h > 2 * r {
-                    vec![
-                        Rectangle::new(
-                            Point::<i32, BufferCoord>::from((0, r)),
-                            Size::from((tex_size.w, tex_size.h - 2 * r)),
-                        ),
-                        Rectangle::new(
-                            Point::<i32, BufferCoord>::from((r, 0)),
-                            Size::from((tex_size.w - 2 * r, tex_size.h)),
-                        ),
-                    ]
-                } else {
-                    vec![Rectangle::from_size(tex_size)]
-                };
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
                     scale,
                     Transform::Normal,
-                    opaque,
+                    Vec::new(),
                 );
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
@@ -2337,6 +2317,8 @@ fn weekday_abbrev(w: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use smithay::utils::Buffer as BufferCoord;
+
     use super::*;
 
     #[test]
@@ -2610,19 +2592,13 @@ mod tests {
             let i = ((y * size.w + x) * 4) as usize;
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
-        // The interior background is opaque dark (sample the left-edge padding, past the corner
-        // radius so it's inside the rounded rect).
+        // The calendar column bakes with a TRANSPARENT bg now — the shared popover chrome
+        // (`PanelPopover::render`) draws the `.popup-menu-content` box fill behind it. Sample the
+        // left-edge padding (empty, mid-height): fully transparent.
         let interior = px_at(3, size.h / 2);
         assert_eq!(
-            interior[3], 255,
-            "calendar interior must be opaque, got {interior:?}"
-        );
-        assert!(interior[0] < 60 && interior[1] < 60 && interior[2] < 60);
-        // The outer corners are rounded away — a pixel in the extreme corner is transparent.
-        let corner = px_at(size.w - 2, size.h - 2);
-        assert_eq!(
-            corner[3], 0,
-            "calendar outer corner must be transparent (rounded), got {corner:?}"
+            interior[3], 0,
+            "calendar column must be transparent (chrome draws the bg), got {interior:?}"
         );
 
         // Bright glyph ink (day numbers / header).

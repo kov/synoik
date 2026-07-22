@@ -59,6 +59,16 @@ pub mod style {
     /// Modal-dialog card background — GNOME `$bg_color` `#36363a` (`_dialogs.scss:4`,
     /// `_colors.scss:12`). Flat, borderless; corners rounded to `$alert_radius` (18px).
     pub const DIALOG_BG: Rgba = [0.212, 0.212, 0.227, 1.];
+    /// `.popup-menu-content` background — GNOME `$bg_color` `#36363a` (`_popovers.scss:31`,
+    /// `_colors.scss:12`). The single home for the panel-popover box fill (QS / date /
+    /// input-source), drawn once by the shared popover chrome so the three surfaces can't drift
+    /// (they each hand-rolled a *different, too-dark* value before). Same value as [`DIALOG_BG`]
+    /// today — both are `$bg_color` — but cited to the menu surface so they may diverge.
+    pub const MENU_BG: Rgba = [0.212, 0.212, 0.227, 1.];
+    /// `%card` / `.message` base surface — GNOME `$card_bg_color` = `lighten($bg_color, 7%)` ≈
+    /// `#47474c` (`_colors.scss:29`). The "one step lighter than the menu" fill used by the
+    /// date popover's today card and the QS detail card.
+    pub const CARD_BG: Rgba = [0.278, 0.278, 0.298, 1.];
     /// `.button` normal fill — the subtle raised gray `mix($fg, $bg, 9%)` over the
     /// dialog card (`_drawing.scss:171`, `$background_mix_factor` 9%).
     pub const BUTTON_BG: Rgba = [0.283, 0.283, 0.297, 1.];
@@ -275,6 +285,62 @@ pub fn bake_card_border(
             Ok(())
         },
     )
+}
+
+/// Bake (cached by `(scale, size, revision)`) a card's rounded `.popup-menu-content` background
+/// fill into its own texture — a `fill_rounded_full` at `radius`, `color`. Composited BEHIND the
+/// content and ABOVE the drop shadow, this is the single home for the panel-popover box bg so the
+/// three popovers (QS / date / input-source) can't drift: each content bakes with a transparent
+/// bg and the shared popover chrome draws this one cited fill. Counterpart to [`bake_card_border`]
+/// and [`bake_card_shadow`].
+pub fn bake_card_fill(
+    renderer: &mut VulkanRenderer,
+    cache: &mut BakeCache,
+    scale: f64,
+    revision: u64,
+    card_size: Size<f64, Logical>,
+    radius: f64,
+    color: Rgba,
+) -> anyhow::Result<VkTexture> {
+    bake(
+        renderer,
+        cache,
+        scale,
+        card_size,
+        revision,
+        |_| Ok(()),
+        |frame, phys, ()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(style::TRANSPARENT)?;
+            p.fill_rounded_full(radius, color)?;
+            Ok(())
+        },
+    )
+}
+
+/// The opaque sub-region of a rounded-rect texture of physical `size` with corner radius
+/// `radius_px` (physical px): two overlapping bands that exclude the four transparent corner
+/// squares, so occlusion never treats a cut-away corner as opaque (which would drop whatever shows
+/// through the rounding). Under-reporting the small arc slivers is harmless. The single home for
+/// this band math (the popover chrome fill and any rounded opaque surface share it).
+pub fn rounded_opaque_regions(
+    size: Size<i32, BufferCoord>,
+    radius_px: i32,
+) -> Vec<Rectangle<i32, BufferCoord>> {
+    if radius_px > 0 && size.w > 2 * radius_px && size.h > 2 * radius_px {
+        vec![
+            Rectangle::new(
+                Point::from((0, radius_px)),
+                Size::from((size.w, size.h - 2 * radius_px)),
+            ),
+            Rectangle::new(
+                Point::from((radius_px, 0)),
+                Size::from((size.w - 2 * radius_px, size.h)),
+            ),
+        ]
+    } else {
+        vec![Rectangle::from_size(size)]
+    }
 }
 
 /// A cache for [`bake_content`] — a content-sized bake whose physical size is not

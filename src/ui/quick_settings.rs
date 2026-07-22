@@ -33,8 +33,8 @@ use std::collections::HashMap;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer, Texture as _};
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::backend::renderer::{ContextId, Renderer};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
 use crate::gnome::QuickToggles;
@@ -120,8 +120,11 @@ const SLIDER_TROUGH_BG: [f32; 4] = [1., 1., 1., 0.1];
 /// inset by `PAD` and self-rounded, so this arc never clips a tile or the pill.
 const MENU_RADIUS: f64 = 36.;
 
-const MENU_BG: [f32; 4] = [0.12, 0.12, 0.12, 1.];
-const TILE_OFF: [f32; 4] = [0.24, 0.24, 0.24, 1.];
+/// Inactive quick-toggle / pill / slider-trough fill — GNOME's `.button` normal
+/// `mix($fg_color, $bg_color, 9%)` ≈ `#48484c` (the quick-toggle extends `.button`,
+/// `_quick-settings.scss:5,15`). Shared [`widget::style::BUTTON_BG`], the raised control on the
+/// menu bg. (The popup box bg itself is now drawn by the shared popover chrome.)
+const TILE_OFF: [f32; 4] = widget::style::BUTTON_BG;
 /// Text/icon on an inactive (dark) tile.
 const FG_OFF: [f32; 4] = [1., 1., 1., 1.];
 /// Text/icon on an active (accent) tile. GNOME's `-st-accent-fg-color` is hardcoded white
@@ -160,8 +163,9 @@ const DETAIL_ROW_INSET: f64 = 12.;
 /// Extra space above a row that follows a group separator (e.g. the machine-power vs session
 /// split in the shutdown menu). v1 renders the split as spacing rather than a drawn rule.
 const DETAIL_SEP_EXTRA: f64 = 8.;
-/// Detail-card surface (a touch lighter than `MENU_BG`, gnome-shell's `%card`).
-const CARD_BG: [f32; 4] = [0.18, 0.18, 0.18, 1.];
+/// Detail-card surface — gnome-shell's `%card` = `$card_bg_color` = `lighten($bg_color, 7%)`
+/// ≈ `#47474c`, one step lighter than the menu box. Shared [`widget::style::CARD_BG`].
+const CARD_BG: [f32; 4] = widget::style::CARD_BG;
 /// Header-title / row-label font size, GNOME points (shaped via [`TextShaper`]). Rows are
 /// regular weight (`.popup-menu-item`), the header title is bold (`%title_3`).
 const DETAIL_TITLE_PT: f64 = 11.;
@@ -1537,35 +1541,17 @@ impl QuickSettings {
             }
         }
 
-        // The chrome (menu + tile backgrounds + labels), beneath the icons.
+        // The chrome (tile backgrounds + labels) on a transparent bg, beneath the icons. Reports
+        // NO opaque region: the `.popup-menu-content` box fill (and its rounded opaque region) is
+        // now drawn by the shared popover chrome behind this texture (`PanelPopover::render`).
         match self.texture(renderer, scale) {
             Ok(texture) => {
-                // The menu's outer corners are rounded (transparent), so report opacity as the two
-                // bands that exclude the four `MENU_RADIUS` corner squares — never claiming a
-                // cut-away corner pixel is opaque (which would let occlusion drop what shows
-                // through). Under-reporting the small arc/square slivers is harmless.
-                let size = texture.size();
-                let r = (MENU_RADIUS * scale).round() as i32;
-                let opaque = if r > 0 && size.w > 2 * r && size.h > 2 * r {
-                    vec![
-                        Rectangle::new(
-                            Point::<i32, BufferCoord>::from((0, r)),
-                            Size::from((size.w, size.h - 2 * r)),
-                        ),
-                        Rectangle::new(
-                            Point::<i32, BufferCoord>::from((r, 0)),
-                            Size::from((size.w - 2 * r, size.h)),
-                        ),
-                    ]
-                } else {
-                    vec![Rectangle::from_size(size)]
-                };
                 let buffer = TextureBuffer::from_texture(
                     renderer,
                     texture,
                     scale,
                     Transform::Normal,
-                    opaque,
+                    Vec::new(),
                 );
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
@@ -1676,19 +1662,19 @@ impl QuickSettings {
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
             let mut p = Painter::new(frame, scale, phys);
-            // Rounded panel: clear transparent, then fill the menu background as a rounded rect so
-            // the outer corners stay transparent (the composited element's opacity hint below
-            // excludes those corners). Content is drawn on top of the opaque interior.
+            // Transparent bg: the shared popover chrome (`PanelPopover::render`) draws the
+            // `.popup-menu-content` box fill (`$bg_color`) behind this content. Tiles and cards
+            // are drawn on top; wherever this texture is transparent (outer corners, tile pill-
+            // corner gaps) the chrome bg shows through — the same `$bg_color` as before.
             p.clear(style::TRANSPARENT)?;
-            p.fill_rounded(Rectangle::from_size(size), MENU_RADIUS, MENU_BG)?;
 
             for (i, item) in self.grid().into_iter().enumerate() {
                 let rect = tile_rect(i, layout);
                 let on = item.is_on(self.toggles, self.network, self.airplane, &self.power);
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
-                // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
-                // MENU_BG, so the cut corners reveal the menu, keeping the texture opaque.
+                // half-height radius clamps to the pill in `sdf_rect.frag`. The cut corners fall
+                // back to the chrome's menu bg behind this texture.
                 p.fill_rounded(rect, rect.size.h / 2., bg)?;
                 if self.hovered == Some(QsHover::Tile(i)) {
                     p.fill_rounded(rect, rect.size.h / 2., style::HOVER_WASH)?;
@@ -2110,6 +2096,8 @@ fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
 
 #[cfg(test)]
 mod tests {
+    use smithay::utils::Buffer as BufferCoord;
+
     use super::*;
     use crate::system_status::KnownProfile;
 
@@ -2444,16 +2432,16 @@ mod tests {
             "the active Dark Style tile must be the accent color, got {px:?}"
         );
 
-        // The tile's corner is cut to the pill: a deep-corner pixel reveals the dark MENU_BG
-        // beneath, not the accent — proving `render_rounded_rect` rounded the tile in the
-        // offscreen.
+        // The tile's corner is cut to the pill: a deep-corner pixel is transparent (the shared
+        // popover chrome's menu bg shows through behind this content texture), not the accent —
+        // proving `render_rounded_rect` rounded the tile in the offscreen.
         let kx = (r0.loc.x + 2.) as i32;
         let ky = (r0.loc.y + 2.) as i32;
         let k = ((ky * size.w + kx) * 4) as usize;
-        let corner = [pixels[k], pixels[k + 1], pixels[k + 2]];
+        let corner = [pixels[k], pixels[k + 1], pixels[k + 2], pixels[k + 3]];
         assert!(
-            corner[0] < 70 && corner[1] < 70 && corner[2] < 70,
-            "the active tile's corner must be cut to MENU_BG, got {corner:?}"
+            corner[3] < 40,
+            "the active tile's corner must be cut to transparent (chrome shows through), got {corner:?}"
         );
 
         // The Night Light tile (grid cell 3, off) is the dim grey, not the accent.
