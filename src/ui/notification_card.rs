@@ -19,14 +19,14 @@ use std::time::Duration;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::notifications::{Notification, NotificationIcon, NotificationStore, Source, Urgency};
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::widget::{self, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 /// `.message` padding = `$base_padding` (`_message-list.scss:83`).
@@ -44,8 +44,12 @@ pub const BTN_H: f64 = 28.;
 const BTN_RADIUS: f64 = 8.;
 /// Gap between action buttons (`$base_margin`).
 const BTN_GAP: f64 = 4.;
-const TITLE_PX: f64 = crate::ui::pt_to_px(11.);
-const TIME_PX: f64 = crate::ui::pt_to_px(9.);
+/// Body/title/source/action font size (11pt) and the header time label (9pt),
+/// GNOME points; shaping routes them through [`TextShaper`]. `TITLE_PX` is the
+/// logical px, used by [`layout`] for wrap/measure (no scale — logical geometry).
+const TITLE_PT: f64 = 11.;
+const TIME_PT: f64 = 9.;
+const TITLE_PX: f64 = crate::ui::pt_to_px(TITLE_PT);
 /// An expanded body shows at most this many wrapped lines
 /// (`DEFAULT_EXPAND_LINES`, `js/ui/messageList.js:23`).
 pub const EXPAND_LINES: usize = 6;
@@ -411,33 +415,32 @@ pub fn draw_card(
         Point::<i32, Physical>::from((lx - ix, cy - ih / 2 - iy))
     };
 
-    let size = Size::<i32, Physical>::from((px(layout.size.w), px(layout.size.h)));
-    let full = Rectangle::from_size(size);
-    let title_px = (TITLE_PX * scale) as f32;
-    let time_px = (TIME_PX * scale) as f32;
+    // Shape every run up front (needs `&mut renderer`, which the frame holds, so
+    // it must precede the bake). `TextShaper` owns the single pt → physical-px
+    // multiply — no `* scale` at this call site.
+    let bold = TextStyle::new(TITLE_PT).bold();
+    let plain = TextStyle::new(TITLE_PT);
+    let (source_run, time_run, title_run, body_runs, action_runs) = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        let source_run = shaper.shape(&content.source_title, bold)?;
+        let time_run = shaper.shape(&content.time_text, TextStyle::new(TIME_PT))?;
+        let title_run = shaper.shape(&content.title, bold)?;
+        let body_runs: Vec<ShapedText> = layout
+            .body_lines
+            .iter()
+            .map(|line| shaper.shape(line, plain))
+            .collect::<Result<_, _>>()?;
+        let action_runs: Vec<ShapedText> = content
+            .actions
+            .iter()
+            .take(layout.actions.len())
+            .map(|(_, label)| shaper.shape(label, bold))
+            .collect::<Result<_, _>>()?;
+        (source_run, time_run, title_run, body_runs, action_runs)
+    };
 
-    let source_run = renderer.build_glyph_run_weighted(&content.source_title, title_px, true)?;
-    let time_run = renderer.build_glyph_run_weighted(&content.time_text, time_px, false)?;
-    let title_run = renderer.build_glyph_run_weighted(&content.title, title_px, true)?;
-    let body_runs: Vec<_> = layout
-        .body_lines
-        .iter()
-        .map(|line| renderer.build_glyph_run_weighted(line, title_px, false))
-        .collect::<Result<_, _>>()?;
-    let action_runs: Vec<_> = layout
-        .actions
-        .iter()
-        .zip(&content.actions)
-        .map(|(_, (_, label))| renderer.build_glyph_run_weighted(label, title_px, true))
-        .collect::<Result<_, _>>()?;
-
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((size.w.max(1), size.h.max(1))),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    widget::bake_uncached(renderer, scale, layout.size, |frame, size| {
+        let full = Rectangle::from_size(size);
 
         // Transparent beyond the rounded corners; the card is an SDF fill. A
         // hovered card body darkens (`%card:hover`).
@@ -479,21 +482,21 @@ pub fn draw_card(
         let header_cy = px(PAD + HEADER_H / 2.);
         let title_x = px(PAD * 2. + SMALL_ICON + PAD);
         let time_anchor = layout.expand.map_or(layout.close.loc.x, |e| e.loc.x);
-        let time_w = niri_vk::text::measure_line_width_weighted(&content.time_text, time_px, false);
-        let time_x = px(time_anchor - PAD) - time_w.round() as i32;
+        let time_w = time_run.ink_bounds().2;
+        let time_x = px(time_anchor - PAD) - time_w;
         let header_clip = Rectangle::new(
             Point::from((title_x, 0)),
             Size::from(((time_x - title_x).max(0), size.h)),
         );
         frame.render_glyphs(
-            &source_run,
+            source_run.run(),
             place_left(source_run.ink_bounds(), title_x, header_cy),
             HEADER_FG,
             header_clip,
             &[full],
         )?;
         frame.render_glyphs(
-            &time_run,
+            time_run.run(),
             place_left(time_run.ink_bounds(), time_x, header_cy),
             HEADER_FG,
             full,
@@ -515,7 +518,7 @@ pub fn draw_card(
         );
         if body_runs.is_empty() {
             frame.render_glyphs(
-                &title_run,
+                title_run.run(),
                 place_left(title_run.ink_bounds(), text_x, px(body_y + BODY_ICON / 2.)),
                 TEXT,
                 text_clip,
@@ -523,7 +526,7 @@ pub fn draw_card(
             )?;
         } else {
             frame.render_glyphs(
-                &title_run,
+                title_run.run(),
                 place_left(title_run.ink_bounds(), text_x, px(body_y + 14.)),
                 TEXT,
                 text_clip,
@@ -531,7 +534,7 @@ pub fn draw_card(
             )?;
             for (i, body_run) in body_runs.iter().enumerate() {
                 frame.render_glyphs(
-                    body_run,
+                    body_run.run(),
                     place_left(
                         body_run.ink_bounds(),
                         text_x,
@@ -554,14 +557,11 @@ pub fn draw_card(
                 r.loc.x + (r.size.w - iw) / 2 - ix,
                 r.loc.y + (r.size.h - ih) / 2 - iy,
             ));
-            frame.render_glyphs(run, origin, TEXT, r, &[full])?;
+            frame.render_glyphs(run.run(), origin, TEXT, r, &[full])?;
         }
 
-        let _sync = frame.finish()?;
-    }
-
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        Ok(())
+    })
 }
 
 /// Card textures cached per `(scale, key)` and uploaded pixel icons per `key`.
@@ -871,22 +871,12 @@ fn draw_solid_rounded(
     radius: f64,
     bg: [f32; 4],
 ) -> anyhow::Result<VkTexture> {
-    let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-    let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
-    let full = Rectangle::from_size(phys);
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((phys.w, phys.h)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+    widget::bake_uncached(renderer, scale, size, |frame, phys| {
+        let full = Rectangle::from_size(phys);
         frame.clear(Color32F::from(TRANSPARENT), &[full])?;
         frame.render_rounded_rect(bg, (radius * scale) as f32, full, &[full])?;
-        let _sync = frame.finish()?;
-    }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        Ok(())
+    })
 }
 
 #[cfg(test)]

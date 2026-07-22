@@ -276,9 +276,25 @@ impl TextStyle {
 
 /// A shaped, rasterized run ready to draw — produced by [`TextShaper::shape`] at a
 /// specific scale, drawn by [`Painter::text`]. Opaque wrapper over the physical
-/// [`GlyphRun`] so callers never touch physical glyph metrics directly.
+/// [`GlyphRun`]. [`Painter::text`] covers the common anchored+clipped-to-buffer
+/// case; widgets needing a custom clip rect (a header label clipped short of a
+/// right-aligned time) read [`ink_bounds`](Self::ink_bounds) and draw the
+/// [`run`](Self::run) with `VulkanFrame::render_glyphs` directly.
+#[derive(Clone)]
 pub struct ShapedText {
     run: GlyphRun,
+}
+
+impl ShapedText {
+    /// Ink bounding box, physical px: `(x, y, w, h)`.
+    pub fn ink_bounds(&self) -> (i32, i32, i32, i32) {
+        self.run.ink_bounds()
+    }
+
+    /// The shaped run, for a custom-clip `VulkanFrame::render_glyphs`.
+    pub(crate) fn run(&self) -> &GlyphRun {
+        &self.run
+    }
 }
 
 /// One span of a styled paragraph: its text, family, weight, and GNOME point size.
