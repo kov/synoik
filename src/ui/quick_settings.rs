@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture as _};
+use smithay::backend::renderer::{ContextId, Renderer, Texture as _};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
@@ -45,7 +45,7 @@ use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, NetworkStatus, PowerProfileStatus,
 };
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, style, ShapedText, TextShaper, TextStyle};
+use crate::ui::widget::{self, style, Align, Painter, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass quick-settings proportions).
@@ -1670,25 +1670,12 @@ impl QuickSettings {
         };
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
-            let full = Rectangle::from_size(phys);
+            let mut p = Painter::new(frame, scale, phys);
             // Rounded panel: clear transparent, then fill the menu background as a rounded rect so
             // the outer corners stay transparent (the composited element's opacity hint below
             // excludes those corners). Content is drawn on top of the opaque interior.
-            frame.clear(Color32F::from(style::TRANSPARENT), &[full])?;
-            frame.render_rounded_rect(MENU_BG, (MENU_RADIUS * scale) as f32, full, &[full])?;
-
-            let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-            let rect_px = |r: Rectangle<f64, Logical>| {
-                Rectangle::new(
-                    Point::<i32, Physical>::from((px(r.loc.x), px(r.loc.y))),
-                    Size::<i32, Physical>::from((px(r.size.w), px(r.size.h))),
-                )
-            };
-            // Left-align a shaped run's ink at a physical point, vertically centered.
-            let place_left = |ink: (i32, i32, i32, i32), lx: i32, cy: i32| {
-                let (ix, iy, _iw, ih) = ink;
-                Point::<i32, Physical>::from((lx - ix, cy - ih / 2 - iy))
-            };
+            p.clear(style::TRANSPARENT)?;
+            p.fill_rounded(Rectangle::from_size(size), MENU_RADIUS, MENU_BG)?;
 
             for (i, item) in self.grid().into_iter().enumerate() {
                 let rect = tile_rect(i, layout);
@@ -1697,19 +1684,9 @@ impl QuickSettings {
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
                 // half-height radius clamps to the pill in `sdf_rect.frag`. Drawn over the opaque
                 // MENU_BG, so the cut corners reveal the menu, keeping the texture opaque.
-                frame.render_rounded_rect(
-                    bg,
-                    (rect.size.h / 2. * scale) as f32,
-                    rect_px(rect),
-                    &[full],
-                )?;
+                p.fill_rounded(rect, rect.size.h / 2., bg)?;
                 if self.hovered == Some(QsHover::Tile(i)) {
-                    frame.render_rounded_rect(
-                        style::HOVER_WASH,
-                        (rect.size.h / 2. * scale) as f32,
-                        rect_px(rect),
-                        &[full],
-                    )?;
+                    p.fill_rounded(rect, rect.size.h / 2., style::HOVER_WASH)?;
                 }
 
                 // A menu tile's arrow-half is separated from the body by a 1px divider
@@ -1720,42 +1697,42 @@ impl QuickSettings {
                         Point::from((arrow.loc.x - SEPARATOR_W, arrow.loc.y + arrow.size.h * 0.2)),
                         Size::from((SEPARATOR_W, arrow.size.h * 0.6)),
                     );
-                    frame.render_rounded_rect(SEPARATOR_COLOR, 0., rect_px(sep), &[full])?;
+                    p.fill_rounded(sep, 0., SEPARATOR_COLOR)?;
                 }
 
                 let fg = if on { FG_ON } else { FG_OFF };
-                let label_x = px(rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.);
+                let label_x = rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.;
                 let center_y = rect.loc.y + rect.size.h / 2.;
                 let run = &label_runs[i];
                 // Clip the label to the toggle-body so a long name can't run under the arrow
                 // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
-                let clip = rect_px(tile_body_rect(i, item, layout));
+                let clip = tile_body_rect(i, item, layout);
                 match &subtitle_runs[i] {
                     // Two-line tile (Power Mode): title above center, subtitle below.
                     Some(sub) => {
-                        frame.render_glyphs(
-                            run.run(),
-                            place_left(run.ink_bounds(), label_x, px(center_y - SUBTITLE_GAP)),
+                        p.text_clipped(
+                            run,
+                            Point::from((label_x, center_y - SUBTITLE_GAP)),
+                            Align::LEFT_MIDDLE,
                             fg,
                             clip,
-                            &[full],
                         )?;
-                        frame.render_glyphs(
-                            sub.run(),
-                            place_left(sub.ink_bounds(), label_x, px(center_y + SUBTITLE_GAP)),
+                        p.text_clipped(
+                            sub,
+                            Point::from((label_x, center_y + SUBTITLE_GAP)),
+                            Align::LEFT_MIDDLE,
                             fg,
                             clip,
-                            &[full],
                         )?;
                     }
                     // Single-line tile: the title, vertically centered.
                     None => {
-                        frame.render_glyphs(
-                            run.run(),
-                            place_left(run.ink_bounds(), label_x, px(center_y)),
+                        p.text_clipped(
+                            run,
+                            Point::from((label_x, center_y)),
+                            Align::LEFT_MIDDLE,
                             fg,
                             clip,
-                            &[full],
                         )?;
                     }
                 }
@@ -1764,28 +1741,17 @@ impl QuickSettings {
             // The battery pill: a filled slab (its icon composites on top) with the
             // percentage after it.
             if let (Some(pill), Some(run)) = (pill_rect(self.has_pill()), &pill_run) {
-                frame.render_rounded_rect(
-                    TILE_OFF,
-                    (pill.size.h / 2. * scale) as f32,
-                    rect_px(pill),
-                    &[full],
-                )?;
+                p.fill_rounded(pill, pill.size.h / 2., TILE_OFF)?;
                 if self.hovered == Some(QsHover::Pill) {
-                    frame.render_rounded_rect(
-                        style::HOVER_WASH,
-                        (pill.size.h / 2. * scale) as f32,
-                        rect_px(pill),
-                        &[full],
-                    )?;
+                    p.fill_rounded(pill, pill.size.h / 2., style::HOVER_WASH)?;
                 }
-                let label_x = px(pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.);
-                let label_cy = px(pill.loc.y + pill.size.h / 2.);
-                frame.render_glyphs(
-                    run.run(),
-                    place_left(run.ink_bounds(), label_x, label_cy),
+                let label_x = pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.;
+                let label_cy = pill.loc.y + pill.size.h / 2.;
+                p.text(
+                    run,
+                    Point::from((label_x, label_cy)),
+                    Align::LEFT_MIDDLE,
                     FG_OFF,
-                    full,
-                    &[full],
                 )?;
             }
 
@@ -1801,19 +1767,9 @@ impl QuickSettings {
                     Point::from((hit.loc.x, hit.loc.y + (hit.size.h - SYS_HIT) / 2.)),
                     Size::from((SYS_HIT, SYS_HIT)),
                 );
-                frame.render_rounded_rect(
-                    TILE_OFF,
-                    (SYS_HIT / 2. * scale) as f32,
-                    rect_px(disc),
-                    &[full],
-                )?;
+                p.fill_rounded(disc, SYS_HIT / 2., TILE_OFF)?;
                 if self.hovered == Some(QsHover::Sys(button)) {
-                    frame.render_rounded_rect(
-                        style::HOVER_WASH,
-                        (SYS_HIT / 2. * scale) as f32,
-                        rect_px(disc),
-                        &[full],
-                    )?;
+                    p.fill_rounded(disc, SYS_HIT / 2., style::HOVER_WASH)?;
                 }
             }
 
@@ -1832,19 +1788,9 @@ impl QuickSettings {
                     Slider::Mic => (self.mic.volume, self.mic.muted),
                 };
                 let disc = slider_icon_rect(slider, layout);
-                frame.render_rounded_rect(
-                    TILE_OFF,
-                    (SLIDER_H / 2. * scale) as f32,
-                    rect_px(disc),
-                    &[full],
-                )?;
+                p.fill_rounded(disc, SLIDER_H / 2., TILE_OFF)?;
                 if self.hovered == Some(QsHover::SliderIcon(slider)) {
-                    frame.render_rounded_rect(
-                        style::HOVER_WASH,
-                        (SLIDER_H / 2. * scale) as f32,
-                        rect_px(disc),
-                        &[full],
-                    )?;
+                    p.fill_rounded(disc, SLIDER_H / 2., style::HOVER_WASH)?;
                 }
 
                 let track = slider_track_rect(slider, layout);
@@ -1853,12 +1799,7 @@ impl QuickSettings {
                     Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
                     Size::from((track.size.w, SLIDER_TROUGH)),
                 );
-                frame.render_rounded_rect(
-                    SLIDER_TROUGH_BG,
-                    (SLIDER_TROUGH / 2. * scale) as f32,
-                    rect_px(trough),
-                    &[full],
-                )?;
+                p.fill_rounded(trough, SLIDER_TROUGH / 2., SLIDER_TROUGH_BG)?;
 
                 let handle_cx = slider_handle_x(slider, volume, layout);
                 let fill_color = if muted { SLIDER_TROUGH_BG } else { self.accent };
@@ -1866,44 +1807,29 @@ impl QuickSettings {
                     trough.loc,
                     Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
                 );
-                frame.render_rounded_rect(
-                    fill_color,
-                    (SLIDER_TROUGH / 2. * scale) as f32,
-                    rect_px(fill),
-                    &[full],
-                )?;
+                p.fill_rounded(fill, SLIDER_TROUGH / 2., fill_color)?;
 
                 let handle = Rectangle::new(
                     Point::from((handle_cx - SLIDER_HANDLE / 2., cy - SLIDER_HANDLE / 2.)),
                     Size::from((SLIDER_HANDLE, SLIDER_HANDLE)),
                 );
-                frame.render_rounded_rect(
-                    FG_OFF,
-                    (SLIDER_HANDLE / 2. * scale) as f32,
-                    rect_px(handle),
-                    &[full],
-                )?;
+                p.fill_rounded(handle, SLIDER_HANDLE / 2., FG_OFF)?;
             }
 
             // The open detail view: the `%card` background, its header title (the header icon
             // composites on top in `render`), then the row labels. Row icons, if any, also
             // composite on top.
             if let (Some(card), Some((title_run, row_runs))) = (detail_rect(layout), &detail_runs) {
-                frame.render_rounded_rect(
-                    CARD_BG,
-                    (DETAIL_RADIUS * scale) as f32,
-                    rect_px(card),
-                    &[full],
-                )?;
+                p.fill_rounded(card, DETAIL_RADIUS, CARD_BG)?;
 
-                let title_x = px(card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON + 8.);
-                let title_cy = px(card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.);
-                frame.render_glyphs(
-                    title_run.run(),
-                    place_left(title_run.ink_bounds(), title_x, title_cy),
+                let title_x = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON + 8.;
+                let title_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
+                p.text_clipped(
+                    title_run,
+                    Point::from((title_x, title_cy)),
+                    Align::LEFT_MIDDLE,
                     FG_OFF,
-                    rect_px(card),
-                    &[full],
+                    card,
                 )?;
 
                 for (k, run) in row_runs.iter().enumerate() {
@@ -1913,12 +1839,7 @@ impl QuickSettings {
                     // A hovered picker row: a faint rounded fill (it has no base
                     // bg) behind the label, matching GNOME's flat menu-item hover.
                     if self.hovered == Some(QsHover::DetailRow(k)) {
-                        frame.render_rounded_rect(
-                            style::HOVER_WASH,
-                            (8. * scale) as f32,
-                            rect_px(rrect),
-                            &[full],
-                        )?;
+                        p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
                     }
                     let has_icon = self
                         .expanded
@@ -1933,23 +1854,23 @@ impl QuickSettings {
                         .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
                         .unwrap_or(false);
                     let label_x = if has_icon {
-                        px(rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.)
+                        rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
                     } else {
-                        px(rrect.loc.x + DETAIL_ROW_INSET)
+                        rrect.loc.x + DETAIL_ROW_INSET
                     };
-                    let label_cy = px(rrect.loc.y + rrect.size.h / 2.);
+                    let label_cy = rrect.loc.y + rrect.size.h / 2.;
                     // Reserve the trailing check zone (a check icon + its inset) on every row so a
                     // long label (e.g. a verbose HDMI sink description) is clipped before it, not
                     // drawn under the selected row's `object-select-symbolic`.
                     let mut label_clip = rrect;
                     label_clip.size.w =
                         (label_clip.size.w - (DETAIL_ROW_INSET + TILE_ICON)).max(0.);
-                    frame.render_glyphs(
-                        run.run(),
-                        place_left(run.ink_bounds(), label_x, label_cy),
+                    p.text_clipped(
+                        run,
+                        Point::from((label_x, label_cy)),
+                        Align::LEFT_MIDDLE,
                         FG_OFF,
-                        rect_px(label_clip),
-                        &[full],
+                        label_clip,
                     )?;
                 }
             }
