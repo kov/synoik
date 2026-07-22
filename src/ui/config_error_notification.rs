@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use niri_config::Config;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Color32F, Frame as _, Texture};
+use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
-use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
+use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
@@ -169,7 +169,7 @@ impl ConfigErrorNotification {
                 scale,
                 self.revision,
                 |renderer| prepare_dialog(renderer, scale, path),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, scale),
             ) {
                 Ok(texture) => texture,
                 Err(err) => {
@@ -306,14 +306,15 @@ fn paint_dialog(
     frame: &mut VulkanFrame,
     phys: Size<i32, Physical>,
     layout: &DialogLayout,
+    scale: f64,
 ) -> anyhow::Result<()> {
-    let full = Rectangle::from_size(phys);
-    frame.clear(Color32F::from(layout.border_color), &[full])?;
-    frame.clear(Color32F::from(BOX_BG), &[layout.inner])?;
+    let mut p = Painter::new(frame, scale, phys);
+    p.clear(layout.border_color)?;
+    p.fill_rect_px(layout.inner, BOX_BG)?;
     if let Some(keycap) = layout.keycap {
-        frame.clear(Color32F::from(KEYCAP_BG), &[keycap])?;
+        p.fill_rect_px(keycap, KEYCAP_BG)?;
     }
-    frame.render_glyphs(layout.run.run(), layout.origin, TEXT, full, &[full])?;
+    p.paragraph(&layout.run, layout.origin, TEXT)?;
     Ok(())
 }
 
@@ -354,7 +355,7 @@ mod tests {
                 1.,
                 0,
                 |r| prepare_dialog(r, 1., path),
-                paint_dialog,
+                |frame, phys, layout| paint_dialog(frame, phys, layout, 1.),
             )
             .expect("notification texture");
             let size = tex.size();
