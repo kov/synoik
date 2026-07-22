@@ -214,8 +214,10 @@ pub fn bake_content<P>(
 }
 
 /// The offscreen dance for an already-known **physical** size (no logical→physical
-/// step). Shared by [`bake_content`] and [`bake_uncached`].
-fn bake_uncached_sized(
+/// step). Shared by [`bake_content`] and [`bake_uncached`]; also for a
+/// content-sized widget with its own owner-driven cache that has already computed
+/// its physical size (the screenshot help panel).
+pub fn bake_uncached_sized(
     renderer: &mut VulkanRenderer,
     phys: Size<i32, Physical>,
     paint: impl FnOnce(&mut VulkanFrame) -> anyhow::Result<()>,

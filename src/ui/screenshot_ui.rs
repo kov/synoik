@@ -6,29 +6,24 @@ use std::rc::Rc;
 
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
-use niri_vk::text::{SpanFamily, TextSpan};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
-use smithay::utils::{
-    Buffer as BufferCoord, Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
-};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::memory::MemoryBuffer;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderTarget;
+use crate::ui::widget::{self, ParagraphSpan, TextShaper};
 use crate::utils::to_physical_precise_round;
 
 /// Per-element cache of a neutral CPU buffer uploaded once to a `VkTexture` (see
@@ -39,7 +34,10 @@ const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
-const FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Help-line font size, GNOME points; shaping routes it through [`ParagraphSpan`].
+/// `FONT_PX` is its logical px, used only for the keycap-patch padding geometry.
+const FONT_PT: f64 = 11.;
+const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 const BORDER: i32 = 4;
 
 /// Dark panel background, grey border, and the grey keycap patch (`#2C2C2C`).
@@ -1427,39 +1425,30 @@ fn generate_panel(
     let kpad_x = (px * 0.28).round() as i32;
     let kpad_y = (px * 0.12).round() as i32;
 
-    fn sans(text: &str, px: f32) -> TextSpan<'_> {
-        TextSpan {
-            text,
-            family: SpanFamily::Sans,
-            bold: false,
-            px,
-        }
-    }
-    fn mono(text: &str, px: f32) -> TextSpan<'_> {
-        TextSpan {
-            text,
-            family: SpanFamily::Mono,
-            bold: false,
-            px,
-        }
-    }
-
     // Each line is its own single-line run so the two share a left edge (the paragraph builder
     // center-aligns; we strip that per line via its ink-x). The keycap is span index 1.
+    // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the shaping path.
     let pointer_line = format!(" to {verb} the pointer.");
-    const WRAP: f32 = 100_000.;
+    const WRAP: f64 = 100_000.;
     let lines = [
         vec![
-            sans("Press ", px),
-            mono(" Space ", px),
-            sans(" to save the screenshot.", px),
+            ParagraphSpan::new("Press ", FONT_PT),
+            ParagraphSpan::new(" Space ", FONT_PT).mono(),
+            ParagraphSpan::new(" to save the screenshot.", FONT_PT),
         ],
-        vec![sans("Press ", px), mono(" P ", px), sans(&pointer_line, px)],
+        vec![
+            ParagraphSpan::new("Press ", FONT_PT),
+            ParagraphSpan::new(" P ", FONT_PT).mono(),
+            ParagraphSpan::new(&pointer_line, FONT_PT),
+        ],
     ];
-    let runs = lines
-        .iter()
-        .map(|spans| renderer.build_glyph_paragraph(spans, WRAP, px))
-        .collect::<Result<Vec<_>, _>>()?;
+    let runs = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        lines
+            .iter()
+            .map(|spans| shaper.paragraph(spans, WRAP, FONT_PT))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let ink: Vec<(i32, i32, i32, i32)> = runs.iter().map(|r| r.ink_bounds()).collect();
 
     let text_w = ink.iter().map(|b| b.2).max().unwrap_or(0);
@@ -1486,14 +1475,7 @@ fn generate_panel(
     // `OutputData::button_element`). Rounded chrome here (a rounded panel, an SDF shutter) can now
     // use `render_rounded_rect` — the offscreen "rounded misrenders" belief was a misdiagnosis
     // (see the quick-settings / calendar / panel-dot chrome) — but is left for a later pass.
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((width, height)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
-
+    widget::bake_uncached_sized(renderer, size, |frame| {
         // Grey border = whole box grey, then the inner rect dark.
         frame.clear(Color32F::from(PANEL_BORDER_COLOR), &[full])?;
         frame.clear(Color32F::from(PANEL_BG), &[inner])?;
@@ -1515,11 +1497,9 @@ fn generate_panel(
                     frame.clear(Color32F::from(KEYCAP_BG), &[patch])?;
                 }
             }
-            frame.render_glyphs(run, origin, TEXT_COLOR, full, &[full])?;
+            frame.render_glyphs(run.run(), origin, TEXT_COLOR, full, &[full])?;
         }
 
-        let _sync = frame.finish()?;
-    }
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+        Ok(())
+    })
 }
