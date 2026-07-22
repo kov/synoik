@@ -165,10 +165,16 @@ it fails on the pre-H2 path and passes after.
   `input_source_menu` now describes its chrome purely in logical units + points; the last manual
   `× scale` is gone (pixel-identical by construction). `place_ink` is folded into `Painter::text`
   via `Align`.
-- **C. H3.** Atoms + `style` module; delete the duplicated `icon_element`/`CHECK_ICONS`/color
-  literals. Port a second component (quick-settings tiles or calendar discs) to exercise reuse.
-- **D+. Opportunistic ports.** calendar, quick_settings, mru, dialogs — one commit each, only when
-  otherwise touched. Un-ported components keep working on their current path (no big-bang).
+- **C. H3.** ✅ DONE (`f2f20599`). `widget::icon_element` (one helper, replacing 2 fns + 3 inline
+  copies) + `widget::style` token module (`TRANSPARENT`/`TEXT`/`MUTED`/`HOVER_WASH`/`CHECK_ICONS`).
+  Ported **both** `input_source_menu` and `quick_settings` onto them (reuse exercised across two
+  call sites); only identically-valued tokens promoted, divergent ones (menu vs tile bg, separator
+  alphas) left local pending reference reconciliation. More atoms (`separator`, `checkmark`, `pill`,
+  a `hover_wash` helper carrying the per-widget lighten/darken direction) remain to extract as
+  further components are ported.
+- **D+. Opportunistic ports.** calendar, quick_settings (fully), mru, dialogs — one commit each,
+  only when otherwise touched. Un-ported components keep working on their current path (no
+  big-bang).
 
 ## 6. Testing / gates
 - Every ported component gets the H4 scale-sweep for free.
