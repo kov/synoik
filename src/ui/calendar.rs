@@ -28,7 +28,7 @@ use std::ptr::null_mut;
 use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer};
 use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
@@ -41,6 +41,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
+use crate::ui::widget::{self, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass `_calendar.scss` proportions).
@@ -53,12 +54,13 @@ const GRID_ROWS: usize = 6;
 const GRID_COLS: usize = 7;
 
 // Month label is GNOME's `.calendar-month-label` (%heading, 11pt); the weekday headings
-// and day-number cells are 9pt (`_calendar.scss`). The month-nav chevron is a drawn
-// glyph, not a GNOME point size, so it keeps its own logical-px size.
-const HEADER_PX: f64 = crate::ui::pt_to_px(11.);
-const WEEKDAY_PX: f64 = crate::ui::pt_to_px(9.);
-const DAY_PX: f64 = crate::ui::pt_to_px(9.);
-const ARROW_PX: f64 = 18.;
+// and day-number cells are 9pt (`_calendar.scss`); shaping routes these through [`TextShaper`].
+// The month-nav chevron is a drawn glyph sized in logical px, not a GNOME point size, so
+// `ARROW_PT` is the point size whose `pt_to_px` reproduces its historical 18 logical px.
+const HEADER_PT: f64 = 11.;
+const WEEKDAY_PT: f64 = 9.;
+const DAY_PT: f64 = 9.;
+const ARROW_PT: f64 = 13.5; // pt_to_px(13.5) == 18 logical px
 /// Diameter (logical px) of the today/selected highlight circle, drawn behind the
 /// day number with `render_rounded_rect` (a half-diameter radius clamps to a full
 /// circle in `sdf_rect.frag`). gnome-shell 50.1 makes both today and the selected
@@ -97,8 +99,8 @@ const TODAY_RADIUS: f64 = 12.;
 const TODAY_CARD_BG: [f32; 4] = [0.17, 0.17, 0.17, 1.];
 /// `.day-label` (weekday name) and `.date-label` (full date) point sizes. GNOME's date label is
 /// heavier (800) but the rasterizer tops out at bold (700); both draw bold here.
-const DAY_LABEL_PX: f64 = crate::ui::pt_to_px(11.);
-const DATE_LABEL_PX: f64 = crate::ui::pt_to_px(15.);
+const DAY_LABEL_PT: f64 = 11.;
+const DATE_LABEL_PT: f64 = 15.;
 
 /// Hover highlight: an additive fg-wash painted over an element's existing
 /// background (behind its glyphs), and a faint standalone fill for flat
@@ -393,12 +395,8 @@ impl Calendar {
         let phys = Size::<i32, Physical>::from((box_w, box_h));
         let layout = Layout::new(self.show_week_numbers);
 
-        // Shape every run up front (immutable borrows of the renderer's font system).
-        let header_px = (HEADER_PX * scale) as f32;
-        let weekday_px = (WEEKDAY_PX * scale) as f32;
-        let day_px = (DAY_PX * scale) as f32;
-        let arrow_px = (ARROW_PX * scale) as f32;
-
+        // Shape every run up front (needs `&mut renderer`, before the bake frame opens).
+        // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the font sizes.
         let title = strftime_ymd(
             Ymd {
                 year: self.year,
@@ -407,49 +405,59 @@ impl Calendar {
             },
             c"%B %Y",
         );
-        let title_run = renderer.build_glyph_run(&title, header_px)?;
-        let prev_run = renderer.build_glyph_run("\u{2039}", arrow_px)?; // ‹
-        let next_run = renderer.build_glyph_run("\u{203a}", arrow_px)?; // ›
-
-        let weekday_runs: Vec<_> = (0..GRID_COLS)
-            .map(|c| {
-                let w = (self.week_start as usize + c) % 7;
-                renderer.build_glyph_run(&weekday_abbrev(w as u32), weekday_px)
-            })
-            .collect::<Result<_, _>>()?;
-
-        let grid = self.grid();
-        let day_runs: Vec<_> = grid
-            .iter()
-            .map(|d| renderer.build_glyph_run(&d.day.to_string(), day_px))
-            .collect::<Result<_, _>>()?;
-
-        let week_runs: Vec<_> = if self.show_week_numbers {
-            (0..GRID_ROWS)
-                .map(|r| {
-                    let d = grid[r * GRID_COLS];
-                    renderer.build_glyph_run(&iso_week(d).to_string(), weekday_px)
-                })
-                .collect::<Result<_, _>>()?
-        } else {
-            Vec::new()
-        };
-
-        // Today card labels: weekday name over the full date, both bold (GNOME's TodayButton).
-        let day_label_px = (DAY_LABEL_PX * scale) as f32;
-        let date_label_px = (DATE_LABEL_PX * scale) as f32;
         let day_label = strftime_ymd(self.today, c"%A");
         let date_label = strftime_ymd(self.today, c"%B %-d %Y");
-        let day_label_run = renderer.build_glyph_run_weighted(&day_label, day_label_px, true)?;
-        let date_label_run = renderer.build_glyph_run_weighted(&date_label, date_label_px, true)?;
+        let grid = self.grid();
+        let (
+            title_run,
+            prev_run,
+            next_run,
+            weekday_runs,
+            day_runs,
+            week_runs,
+            day_label_run,
+            date_label_run,
+        ) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let title_run = shaper.shape(&title, TextStyle::new(HEADER_PT))?;
+            let prev_run = shaper.shape("\u{2039}", TextStyle::new(ARROW_PT))?; // ‹
+            let next_run = shaper.shape("\u{203a}", TextStyle::new(ARROW_PT))?; // ›
+            let weekday_runs: Vec<ShapedText> = (0..GRID_COLS)
+                .map(|c| {
+                    let w = (self.week_start as usize + c) % 7;
+                    shaper.shape(&weekday_abbrev(w as u32), TextStyle::new(WEEKDAY_PT))
+                })
+                .collect::<Result<_, _>>()?;
+            let day_runs: Vec<ShapedText> = grid
+                .iter()
+                .map(|d| shaper.shape(&d.day.to_string(), TextStyle::new(DAY_PT)))
+                .collect::<Result<_, _>>()?;
+            let week_runs: Vec<ShapedText> = if self.show_week_numbers {
+                (0..GRID_ROWS)
+                    .map(|r| {
+                        let d = grid[r * GRID_COLS];
+                        shaper.shape(&iso_week(d).to_string(), TextStyle::new(WEEKDAY_PT))
+                    })
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            };
+            // Today card labels: weekday name over the full date, both bold (GNOME's TodayButton).
+            let day_label_run = shaper.shape(&day_label, TextStyle::new(DAY_LABEL_PT).bold())?;
+            let date_label_run = shaper.shape(&date_label, TextStyle::new(DATE_LABEL_PT).bold())?;
+            (
+                title_run,
+                prev_run,
+                next_run,
+                weekday_runs,
+                day_runs,
+                week_runs,
+                day_label_run,
+                date_label_run,
+            )
+        };
 
-        let mut target = renderer.create_buffer(
-            Fourcc::Abgr8888,
-            Size::<i32, BufferCoord>::from((box_w, box_h)),
-        )?;
-        {
-            let mut fb = renderer.bind(&mut target)?;
-            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        widget::bake_uncached_sized(renderer, phys, |frame| {
             let full = Rectangle::from_size(phys);
             // Rounded card: clear transparent, then fill the interior as a rounded rect so the four
             // outer corners stay transparent (the composited element reports opacity excluding
@@ -500,7 +508,7 @@ impl Calendar {
             let label_x = px(PAD + TODAY_PAD);
             let day_cy = px(PAD + TODAY_PAD + DAY_ROW / 2.);
             frame.render_glyphs(
-                &day_label_run,
+                day_label_run.run(),
                 place_left(day_label_run.ink_bounds(), label_x, day_cy),
                 MUTED,
                 full,
@@ -508,7 +516,7 @@ impl Calendar {
             )?;
             let date_cy = px(PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.);
             frame.render_glyphs(
-                &date_label_run,
+                date_label_run.run(),
                 place_left(date_label_run.ink_bounds(), label_x, date_cy),
                 TEXT,
                 full,
@@ -528,7 +536,7 @@ impl Calendar {
                 frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
             }
             frame.render_glyphs(
-                &prev_run,
+                prev_run.run(),
                 place(prev_run.ink_bounds(), px_, py_),
                 MUTED,
                 full,
@@ -543,7 +551,7 @@ impl Calendar {
                 frame.render_rounded_rect(HOVER_WASH, (hover_disc / 2) as f32, disc, &[full])?;
             }
             frame.render_glyphs(
-                &next_run,
+                next_run.run(),
                 place(next_run.ink_bounds(), nx, ny),
                 MUTED,
                 full,
@@ -552,7 +560,7 @@ impl Calendar {
             let title_cx = box_w / 2;
             let title_cy = px(grid_top() + HEADER_H / 2.);
             frame.render_glyphs(
-                &title_run,
+                title_run.run(),
                 place(title_run.ink_bounds(), title_cx, title_cy),
                 TEXT,
                 full,
@@ -564,7 +572,7 @@ impl Calendar {
             for (c, run) in weekday_runs.iter().enumerate() {
                 let cx = px(grid_left(self.show_week_numbers) + (c as f64 + 0.5) * CELL);
                 frame.render_glyphs(
-                    run,
+                    run.run(),
                     place(run.ink_bounds(), cx, wd_cy),
                     MUTED,
                     full,
@@ -576,7 +584,13 @@ impl Calendar {
             for (r, run) in week_runs.iter().enumerate() {
                 let cx = px(PAD + WEEKCOL_W / 2.);
                 let cy = px(grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL);
-                frame.render_glyphs(run, place(run.ink_bounds(), cx, cy), MUTED, full, &[full])?;
+                frame.render_glyphs(
+                    run.run(),
+                    place(run.ink_bounds(), cx, cy),
+                    MUTED,
+                    full,
+                    &[full],
+                )?;
             }
 
             // Day grid.
@@ -608,14 +622,17 @@ impl Calendar {
                 let in_month = date.month == self.month;
                 let color = if is_today || in_month { TEXT } else { DIM };
                 let run = &day_runs[i];
-                frame.render_glyphs(run, place(run.ink_bounds(), cx, cy), color, full, &[full])?;
+                frame.render_glyphs(
+                    run.run(),
+                    place(run.ink_bounds(), cx, cy),
+                    color,
+                    full,
+                    &[full],
+                )?;
             }
 
-            let _sync = frame.finish()?;
-        }
-
-        renderer.make_offscreen_sampleable(&target)?;
-        Ok(target)
+            Ok(())
+        })
     }
 }
 
@@ -644,7 +661,7 @@ const CARD_RADIUS: f64 = 18.;
 const GROUP_HEADER_PAD: f64 = 6.;
 /// The group title `%title_2` (15pt/800; the rasterizer caps at bold, like the
 /// today date label) (`_common.scss:251-254`, `_message-list.scss:62-65`).
-const GROUP_TITLE_PX: f64 = crate::ui::pt_to_px(15.);
+const GROUP_TITLE_PT: f64 = 15.;
 /// `.message-group-title` side margin (`$base_margin`, `_message-list.scss:64`).
 const GROUP_TITLE_MARGIN: f64 = 4.;
 /// The header's collapse button (`.message-collapse-button`, `group-collapse-symbolic`):
@@ -661,14 +678,16 @@ const CONTROLS_PAD_B: f64 = 9.;
 /// radius): `%heading` 11pt/700 label.
 const CLEAR_H: f64 = 28.;
 const CLEAR_PAD_X: f64 = 14.;
-const CLEAR_PX: f64 = crate::ui::pt_to_px(11.);
+const CLEAR_PT: f64 = 11.;
+const CLEAR_PX: f64 = crate::ui::pt_to_px(CLEAR_PT);
 /// `.button` flat fill on the dark theme (matches the card action pills).
 const CLEAR_BG: [f32; 4] = [1., 1., 1., 0.1];
 /// `.message-list-placeholder` (`_message-list.scss:14-26`): 96px icon over a
 /// `%title_3` (15pt/700) label, both at 45% fg.
 const PLACEHOLDER_ICON: f64 = 96.;
 const PLACEHOLDER_GAP: f64 = 12.;
-const PLACEHOLDER_PX: f64 = crate::ui::pt_to_px(15.);
+const PLACEHOLDER_PT: f64 = 15.;
+const PLACEHOLDER_PX: f64 = crate::ui::pt_to_px(PLACEHOLDER_PT);
 const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
 /// Overlay scrollbar handle: `StScrollBar` min-width 8px with a 3px transparent
 /// border → a ~6px visible handle (`_scrollbars.scss:10-25`), a
@@ -1715,16 +1734,12 @@ impl CalendarMessageList {
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
         let phys = Size::<i32, Physical>::from((px(CARD_W).max(1), px(GROUP_HEADER_H).max(1)));
         let full = Rectangle::from_size(phys);
-        let title_run =
-            renderer.build_glyph_run_weighted(title, (GROUP_TITLE_PX * scale) as f32, true)?;
+        let title_run = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            shaper.shape(title, TextStyle::new(GROUP_TITLE_PT).bold())?
+        };
 
-        let mut target = renderer.create_buffer(
-            Fourcc::Abgr8888,
-            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
-        )?;
-        {
-            let mut fb = renderer.bind(&mut target)?;
-            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        widget::bake_uncached_sized(renderer, phys, |frame| {
             frame.clear(Color32F::from(TRANSPARENT), &[full])?;
 
             // The collapse button circle (header-local coordinates).
@@ -1756,17 +1771,15 @@ impl CalendarMessageList {
             let tx = px(GROUP_HEADER_PAD + GROUP_TITLE_MARGIN) - ix;
             let ty = (phys.h - ih) / 2 - iy;
             frame.render_glyphs(
-                &title_run,
+                title_run.run(),
                 Point::<i32, Physical>::from((tx, ty)),
                 TEXT,
                 full,
                 &[full],
             )?;
 
-            let _sync = frame.finish()?;
-        }
-        renderer.make_offscreen_sampleable(&target)?;
-        Ok(target)
+            Ok(())
+        })
     }
 
     /// The visible per-card interactions: single-card groups and every card of
@@ -2103,29 +2116,22 @@ impl DateMenu {
         let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
         let full = Rectangle::from_size(phys);
 
-        // Shape the text up front (immutable borrows of the font system).
-        let placeholder_run = self
-            .list
-            .is_empty()
-            .then(|| {
-                renderer.build_glyph_run_weighted(
-                    "No Notifications",
-                    (PLACEHOLDER_PX * scale) as f32,
-                    true,
-                )
-            })
-            .transpose()?;
-        let clear_run = (!self.list.is_empty())
-            .then(|| renderer.build_glyph_run_weighted("Clear", (CLEAR_PX * scale) as f32, true))
-            .transpose()?;
+        // Shape the text up front (needs `&mut renderer`, before the bake frame opens).
+        // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the font sizes.
+        let (placeholder_run, clear_run) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let placeholder_run = self
+                .list
+                .is_empty()
+                .then(|| shaper.shape("No Notifications", TextStyle::new(PLACEHOLDER_PT).bold()))
+                .transpose()?;
+            let clear_run = (!self.list.is_empty())
+                .then(|| shaper.shape("Clear", TextStyle::new(CLEAR_PT).bold()))
+                .transpose()?;
+            (placeholder_run, clear_run)
+        };
 
-        let mut target = renderer.create_buffer(
-            Fourcc::Abgr8888,
-            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
-        )?;
-        {
-            let mut fb = renderer.bind(&mut target)?;
-            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        widget::bake_uncached_sized(renderer, phys, |frame| {
             frame.clear(Color32F::from(TRANSPARENT), &[full])?;
             frame.render_rounded_rect(BOX_BG, (BOX_RADIUS * scale) as f32, full, &[full])?;
 
@@ -2144,7 +2150,7 @@ impl DateMenu {
                 let cx = px(LIST_PAD + LIST_W / 2.);
                 let (ix, iy, iw, ih) = run.ink_bounds();
                 let origin = Point::<i32, Physical>::from((cx - iw / 2 - ix, px(cy) - ih / 2 - iy));
-                frame.render_glyphs(run, origin, PLACEHOLDER_FG, full, &[full])?;
+                frame.render_glyphs(run.run(), origin, PLACEHOLDER_FG, full, &[full])?;
             }
 
             if let Some(run) = &clear_run {
@@ -2172,14 +2178,11 @@ impl DateMenu {
                     rect.loc.x + (rect.size.w - iw) / 2 - ix,
                     rect.loc.y + (rect.size.h - ih) / 2 - iy,
                 ));
-                frame.render_glyphs(run, origin, TEXT, rect, &[full])?;
+                frame.render_glyphs(run.run(), origin, TEXT, rect, &[full])?;
             }
 
-            let _sync = frame.finish()?;
-        }
-
-        renderer.make_offscreen_sampleable(&target)?;
-        Ok(target)
+            Ok(())
+        })
     }
 
     /// All the popover's render elements at `origin`, in output stacking
@@ -2673,7 +2676,7 @@ mod tests {
 
     #[test]
     fn draws_the_calendar_with_glyph_coverage() {
-        use smithay::backend::renderer::{ExportMem, Texture as _};
+        use smithay::backend::renderer::{Bind, ExportMem, Texture as _};
 
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
