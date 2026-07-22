@@ -170,14 +170,18 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
   `anchor_row_bottom`) + the backend to enumerate/act. Deferred v1 polish: slide-down grow animation,
   dim-the-rest, split-radius tile look.
 - **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
-- **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24`. A GNOME-faithful additive fg-wash
-  (`≈white@0.10`, `_message-list.scss:72-75` `:hover` step) behind every interactive popover control,
-  baked behind its glyphs; a `pointer_hover` route parallels `pointer_click`, and a hover change bumps
-  the widget's texture revision to re-bake. Covers QS tiles / pill / system buttons / slider mute
-  icons / detail rows, calendar day cells / month arrows / today card, and card close/action/caret /
-  group collapse / Clear. Cursor stays the arrow (GNOME uses none on shell widgets). Divergences:
-  QS tiles light whole (not per body/arrow half); the slider picker arrow and the card body are not
-  highlighted (the latter is faithful — `.message` has no `:hover`). Not live-validated yet
+- **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24` + notification fix `5642b2b9`. A
+  `pointer_hover` route parallels `pointer_click`, and a hover change bumps the widget's texture
+  revision to re-bake. Direction is cited per widget, NOT assumed: QS tiles / pill / system buttons /
+  slider mute icons / detail rows and calendar day cells / month arrows / today card **lighten**
+  (`button(hover)` = `st-lighten(…,4%)` on the dark theme, `_drawing.scss:193`), as an additive
+  `≈white@0.10` wash. Notification **cards darken** (`.message`=`%card`: `%card:hover` =
+  `lighten($card_bg,4%)` vs `.message`'s normal `+5%` override → ~1% darker), while the card **button**
+  under the pointer **lightens** on top (`%notification_button` white@.15→.30). Whole notification card
+  darkens on hover (banner + list), not just the buttons. Cursor stays the arrow (GNOME uses none on
+  shell widgets); a floating banner now also grabs the pointer so the window under it can't paint its
+  own cursor. Divergences: QS tiles light whole (not per body/arrow half); the slider picker arrow and
+  the banner's individual buttons aren't separately highlighted. Not live-validated yet
   (unit + Vulkan-differential only).
 
 ---
