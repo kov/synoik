@@ -4,7 +4,7 @@ use ash::vk;
 use glam::{Mat3, Vec2, Vec3};
 use niri_vk::render::{
     as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
-    TextPush,
+    TextPush, IDENTITY_PROJ,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
@@ -706,6 +706,56 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             Self::draw_quad(dev, self.cbuf, &scissors);
         }
         Ok(())
+    }
+
+    /// Toolkit convenience over [`Self::render_shadow`]: a simple rounded-rect drop shadow (no
+    /// window cutout). `box_dst` is the casting rect (with any shadow offset already applied); the
+    /// gaussian field is evaluated over `box_dst` outset by the blur bleed (~3·`sigma`), computed
+    /// here so the fringe always has room. `color` is straight-alpha (premultiplied here for the
+    /// premultiplied-over blend); `sigma` and radii are physical px. Used by
+    /// [`Painter::drop_shadow`](crate::ui::widget::Painter::drop_shadow) for GNOME `box-shadow`.
+    pub(crate) fn render_drop_shadow(
+        &mut self,
+        color: [f32; 4],
+        corner_radius: f32,
+        sigma: f32,
+        niri_scale: f32,
+        box_dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let margin = (sigma * 3.0).ceil() as i32;
+        let area = Rectangle::new(
+            Point::from((box_dst.loc.x - margin, box_dst.loc.y - margin)),
+            Size::from((box_dst.size.w + margin * 2, box_dst.size.h + margin * 2)),
+        );
+        let premul = [
+            color[0] * color[3],
+            color[1] * color[3],
+            color[2] * color[3],
+            color[3],
+        ];
+        let push = ShadowPush {
+            origin: [area.loc.x as f32, area.loc.y as f32],
+            size: [area.size.w as f32, area.size.h as f32],
+            proj: IDENTITY_PROJ,
+            target: [0.0, 0.0],
+            sigma,
+            niri_scale,
+            shadow_color: premul,
+            corner_radius: [corner_radius; 4],
+            window_corner_radius: [0.0; 4],
+            area_size: [area.size.w as f32, area.size.h as f32],
+            geo_loc: [
+                (box_dst.loc.x - area.loc.x) as f32,
+                (box_dst.loc.y - area.loc.y) as f32,
+            ],
+            geo_size: [box_dst.size.w as f32, box_dst.size.h as f32],
+            window_geo_loc: [0.0, 0.0],
+            window_geo_size: [0.0, 0.0],
+            niri_alpha: 1.0,
+            _pad0: 0.0,
+        };
+        self.render_shadow(push, area, damage)
     }
 
     /// Draw the postprocess-and-clip material: sample `texture` (from `src`) into `dst`, applying

@@ -631,6 +631,32 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Draw GNOME's `box-shadow`: a gaussian-blurred rounded rect behind a card.
+    /// `rect`/`radius` are the casting box (logical); `blur` is the CSS blur radius
+    /// (logical px; the gaussian σ = blur/2); `offset` shifts the shadow (logical —
+    /// GNOME's panel shadows are `0 <dy>`); `color` is straight-alpha (premultiplied
+    /// downstream). Draw this BEFORE the card fill so the card sits on top. The fringe
+    /// bleeds ~`blur`·1.5 (3σ) beyond `rect` + `offset`, so the bake buffer must carry
+    /// that much transparent padding around the card or the shadow clips at the edge
+    /// (the OSD-panel callers size the buffer for it).
+    pub fn drop_shadow(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        radius: f64,
+        blur: f64,
+        offset: (f64, f64),
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        let sigma = (blur * self.scale / 2.) as f32;
+        let mut box_dst = self.rect_px(rect);
+        box_dst.loc.x += self.px(offset.0);
+        box_dst.loc.y += self.px(offset.1);
+        let r = (radius * self.scale) as f32;
+        self.frame
+            .render_drop_shadow(color, r, sigma, self.scale as f32, box_dst, &[self.full])?;
+        Ok(())
+    }
+
     /// Draw a shaped run, anchoring its ink box to `at` (logical) per `align`,
     /// tinted `color`. Clipped to the whole buffer.
     pub fn text(
@@ -848,4 +874,72 @@ pub fn assert_scale_correct(
          (counts {ink:?}) — a ratio near 1 means text was shaped at logical px \
          instead of physical (the HiDPI bug class)",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem, Texture};
+    use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
+
+    use super::{bake_uncached_sized, Painter};
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    /// The gaussian drop-shadow verb: a black shadow over a white buffer must darken the
+    /// casting box to near-black, fade through mid-grey in the blur fringe just outside it,
+    /// and leave the far corner (beyond ~3σ) untouched white. Pins `Painter::drop_shadow`'s
+    /// SDF placement + blur falloff over the shared `render_shadow` material.
+    #[test]
+    fn drop_shadow_casts_a_fading_fringe() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(vk) => vk,
+            Err(e) => {
+                eprintln!("skipping drop_shadow_casts_a_fading_fringe: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        let scale = 1.0;
+        let size = Size::<i32, Physical>::from((100, 100));
+        // Box spans 30..70; blur 10 → σ=5, so the fringe reaches ~15px (15..85 shades) and
+        // the (95,95) corner stays white.
+        let mut tex = bake_uncached_sized(&mut vk, size, |frame| {
+            let mut p = Painter::new(frame, scale, size);
+            p.clear([1., 1., 1., 1.])?;
+            let box_rect =
+                Rectangle::<f64, Logical>::new(Point::from((30., 30.)), Size::from((40., 40.)));
+            p.drop_shadow(box_rect, 12., 10., (0., 0.), [0., 0., 0., 1.])?;
+            Ok(())
+        })
+        .expect("bake");
+
+        let tex_size = tex.size();
+        let fb = vk.bind(&mut tex).expect("bind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(tex_size);
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+        // Opaque white base + premultiplied-black shadow → each channel reads (1 − α)·255,
+        // so a plain channel average is the shadow strength (0 = full shadow, 255 = none).
+        let lum = |x: i32, y: i32| -> i32 {
+            let i = ((y * 100 + x) * 4) as usize;
+            (pixels[i] as i32 + pixels[i + 1] as i32 + pixels[i + 2] as i32) / 3
+        };
+        let center = lum(50, 50);
+        let fringe = lum(72, 50);
+        let corner = lum(95, 95);
+
+        assert!(
+            center < 60,
+            "box center should be near-black shadow, got {center}"
+        );
+        assert!(corner > 200, "far corner should stay white, got {corner}");
+        assert!(
+            fringe > center + 20 && fringe < corner - 20,
+            "fringe just outside the box should be mid-grey (blur falloff): \
+             center {center}, fringe {fringe}, corner {corner}",
+        );
+    }
 }
