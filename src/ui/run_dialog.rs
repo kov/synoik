@@ -16,7 +16,7 @@ use gio::glib;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Size, Transform};
 
 use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -34,8 +34,8 @@ const BASE_PT: f64 = 11.;
 /// Small (description/hint) font size, GNOME `%caption`, GNOME points.
 const SMALL_PT: f64 = 9.;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-/// Dialog box background (opaque dark grey), straight RGBA.
-const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// Dialog card background — GNOME modal `$bg_color`; rounded, borderless.
+const BOX_BG: [f32; 4] = widget::style::DIALOG_BG;
 /// Dialog text color (opaque white); the glyph coverage modulates the alpha.
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// gnome-shell's HistoryManager DEFAULT_LIMIT.
@@ -232,11 +232,16 @@ impl RunDialog {
         };
 
         if let Some(texture) = texture {
-            // The box is opaque, so let the compositor skip drawing behind it.
+            // Rounded corners → the card is not fully opaque; no opaque-region hint (its
+            // transparent corners must composite over the backdrop).
             let tex_size = texture.size();
-            let opaque = vec![Rectangle::from_size(tex_size)];
-            let buffer =
-                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
+            let buffer = TextureBuffer::from_texture(
+                renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                Vec::new(),
+            );
 
             let size = Size::<f64, Logical>::from((
                 f64::from(tex_size.w) / scale,
@@ -343,7 +348,10 @@ fn paint_dialog(
     scale: f64,
 ) -> anyhow::Result<()> {
     let mut p = Painter::new(frame, scale, phys);
-    p.clear(BOX_BG)?;
+    // Rounded borderless card: transparent clear so the corners composite away, then
+    // the flat fill over the whole content-sized buffer.
+    p.clear(widget::style::TRANSPARENT)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
     p.paragraph(&layout.run, layout.origin, TEXT)?;
     Ok(())
 }
@@ -502,15 +510,24 @@ mod tests {
                 .expect("copy_framebuffer");
             let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-            // A pixel near the bottom-right corner (past any text) is the opaque dark box.
-            let bx = size.w - 3;
+            // The bottom-edge center (past any text, off the rounded corners) is the opaque
+            // dark card bg.
+            let bx = size.w / 2;
             let by = size.h - 3;
             let i = ((by * size.w + bx) * 4) as usize;
             let bg = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
-            assert_eq!(bg[3], 255, "the box must be opaque, got {bg:?}");
+            assert_eq!(bg[3], 255, "the card must be opaque, got {bg:?}");
             assert!(
                 bg[0] < 60 && bg[1] < 60 && bg[2] < 60,
-                "box bg not dark: {bg:?}"
+                "card bg not dark: {bg:?}"
+            );
+
+            // The extreme corner is transparent — the card is rounded, not a square box.
+            let c = ((size.h - 1) * size.w + (size.w - 1)) as usize * 4;
+            assert_eq!(
+                pixels[c + 3],
+                0,
+                "card corner should be transparent (rounded)"
             );
 
             // Bright glyph ink somewhere (the title, at least).

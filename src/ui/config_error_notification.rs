@@ -24,12 +24,9 @@ const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 /// only needs to exceed the natural line width (a very long config path wraps rather than
 /// producing an ultra-wide banner).
 const WRAP_WIDTH: i32 = 1200;
-const BORDER: i32 = 4;
-/// Notification box background (opaque dark grey), straight RGBA.
-const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
-/// Border for the parse-error variant (red) and the created-config variant (green).
-const BORDER_ERROR: [f32; 4] = [1., 0.3, 0.3, 1.];
-const BORDER_CREATED: [f32; 4] = [0.5, 1., 0.5, 1.];
+/// Notification card background — GNOME modal `$bg_color`; rounded, borderless. The
+/// created-vs-error distinction is carried by the message text (no colored border).
+const BOX_BG: [f32; 4] = widget::style::DIALOG_BG;
 /// Keycap background behind the inline command/path (#000000, matching the old pango `bgcolor`).
 const KEYCAP_BG: [f32; 4] = [0., 0., 0., 1.];
 /// Text color (opaque white); the glyph coverage modulates the alpha.
@@ -218,12 +215,8 @@ struct DialogLayout {
     run: ShapedParagraph,
     /// Where the paragraph ink block is placed (top-left of the ink at `(pad, pad)`).
     origin: Point<i32, Physical>,
-    /// The dark box interior (inside the coloured border).
-    inner: Rectangle<i32, Physical>,
     /// The black keycap patch behind the mono command/path span, if present.
     keycap: Option<Rectangle<i32, Physical>>,
-    /// Border tint: red for a parse error, green for a created config.
-    border_color: [f32; 4],
 }
 
 /// Shape the message and compute the content-sized box layout — the prepare phase
@@ -236,28 +229,21 @@ fn prepare_dialog(
     let _span = tracy_client::span!("config_error_notification::prepare_dialog");
 
     let padding = to_physical_precise_round::<i32>(scale, f64::from(PADDING)).max(0);
-    let border = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
 
     let mut shaper = TextShaper::new(renderer, scale);
     let path_text;
-    let (spans, border_color): (Vec<ParagraphSpan>, [f32; 4]) = if let Some(path) = created_path {
+    let spans: Vec<ParagraphSpan> = if let Some(path) = created_path {
         path_text = format!("{path:?}");
-        (
-            vec![
-                ParagraphSpan::new("Created a default config file at ", FONT_PT),
-                ParagraphSpan::new(&path_text, FONT_PT).mono(),
-            ],
-            BORDER_CREATED,
-        )
+        vec![
+            ParagraphSpan::new("Created a default config file at ", FONT_PT),
+            ParagraphSpan::new(&path_text, FONT_PT).mono(),
+        ]
     } else {
-        (
-            vec![
-                ParagraphSpan::new("Failed to parse the config file. Please run ", FONT_PT),
-                ParagraphSpan::new("niri validate", FONT_PT).mono(),
-                ParagraphSpan::new(" to see the errors.", FONT_PT),
-            ],
-            BORDER_ERROR,
-        )
+        vec![
+            ParagraphSpan::new("Failed to parse the config file. Please run ", FONT_PT),
+            ParagraphSpan::new("niri validate", FONT_PT).mono(),
+            ParagraphSpan::new(" to see the errors.", FONT_PT),
+        ]
     };
 
     let run = shaper.paragraph(&spans, f64::from(WRAP_WIDTH), FONT_PT)?;
@@ -269,12 +255,8 @@ fn prepare_dialog(
     let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
 
     let size = Size::<i32, Physical>::from((box_w, box_h));
-    let inner = Rectangle::new(
-        Point::from((border, border)),
-        Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
-    );
 
-    // The keycap background: the command/path span's ink, padded and clamped inside the box.
+    // The keycap background: the command/path span's ink, padded and clamped inside the card.
     let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
     let keycap = (kw > 0 && kh > 0)
         .then(|| {
@@ -284,7 +266,7 @@ fn prepare_dialog(
                 Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
                 Size::from((kw + pad_x * 2, kh + pad_y * 2)),
             )
-            .intersection(inner)
+            .intersection(Rectangle::from_size(size))
         })
         .flatten();
 
@@ -293,9 +275,7 @@ fn prepare_dialog(
         DialogLayout {
             run,
             origin,
-            inner,
             keycap,
-            border_color,
         },
     ))
 }
@@ -309,8 +289,10 @@ fn paint_dialog(
     scale: f64,
 ) -> anyhow::Result<()> {
     let mut p = Painter::new(frame, scale, phys);
-    p.clear(layout.border_color)?;
-    p.fill_rect_px(layout.inner, BOX_BG)?;
+    // Rounded borderless card (GNOME modal): transparent clear, flat rounded fill,
+    // then the keycap patch + message.
+    p.clear(widget::style::TRANSPARENT)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
     if let Some(keycap) = layout.keycap {
         p.fill_rect_px(keycap, KEYCAP_BG)?;
     }
@@ -334,8 +316,9 @@ mod tests {
     use super::*;
     use crate::ui::widget::ContentCache;
 
-    /// Both variants draw: the parse-error box has a red border, the created-config box a green
-    /// one; both are opaque-dark with a black keycap patch and bright glyph ink. Skips with no GPU.
+    /// Both variants draw as the same borderless rounded GNOME modal card (the text differs, not
+    /// the chrome): flat `$bg_color`, transparent rounded corners, a black keycap patch, and bright
+    /// glyph ink. Skips with no GPU.
     #[test]
     fn draws_both_variants() {
         let mut vk = match VulkanRenderer::new() {
@@ -347,7 +330,7 @@ mod tests {
         };
 
         let created = Path::new("/home/user/.config/niri/config.kdl");
-        for (path, border_is_red) in [(None, true), (Some(created), false)] {
+        for path in [None, Some(created)] {
             let mut cache = ContentCache::new();
             let mut tex = widget::bake_content(
                 &mut vk,
@@ -372,22 +355,25 @@ mod tests {
                 [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
             };
 
-            // The top edge is the coloured border, opaque.
-            let border = px_at(size.w / 2, 1);
-            assert_eq!(border[3], 255, "border must be opaque, got {border:?}");
-            if border_is_red {
-                assert!(
-                    border[0] > 180 && border[1] < 120 && border[2] < 120,
-                    "error border not red: {border:?}"
-                );
-            } else {
-                assert!(
-                    border[1] > 180 && border[0] < 160 && border[2] < 160,
-                    "created border not green: {border:?}"
-                );
-            }
+            // Borderless GNOME modal card: the top edge center is the flat `$bg_color`
+            // (#36363a ≈ 54), opaque — both variants look identical (the text differs).
+            let top = px_at(size.w / 2, 1);
+            assert_eq!(top[3], 255, "card top edge must be opaque, got {top:?}");
+            assert!(
+                (48..=64).contains(&top[0])
+                    && (48..=64).contains(&top[1])
+                    && (48..=70).contains(&top[2]),
+                "top edge not the flat dialog card bg: {top:?}"
+            );
 
-            // A black keycap pixel exists (~0x00, darker than the 0x1A box).
+            // The extreme corner is transparent — the card is rounded, not a square box.
+            let corner = px_at(size.w - 1, size.h - 1);
+            assert_eq!(
+                corner[3], 0,
+                "card corner should be transparent (rounded), got {corner:?}"
+            );
+
+            // A black keycap pixel exists (~0x00, darker than the card bg).
             let keycap = pixels
                 .chunks_exact(4)
                 .any(|p| p[0] < 12 && p[1] < 12 && p[2] < 12 && p[3] == 255);

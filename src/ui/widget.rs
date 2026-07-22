@@ -600,6 +600,16 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Fill the whole buffer with `color`, corners cut by `radius` (logical). For a
+    /// card whose size is content-derived (a dialog/notification), where the entire
+    /// baked buffer *is* the rounded card.
+    pub fn fill_rounded_full(&mut self, radius: f64, color: Rgba) -> anyhow::Result<()> {
+        let r = (radius * self.scale) as f32;
+        self.frame
+            .render_rounded_rect(color, r, self.full, &[self.full])?;
+        Ok(())
+    }
+
     /// Fill `rect` (logical) with `color`, corners cut by `radius` (logical; 0 = a
     /// plain rectangle, e.g. a separator rule).
     pub fn fill_rounded(

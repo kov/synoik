@@ -26,12 +26,9 @@ const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 /// A generous non-wrapping layout width (logical px); the dialog is sized to its content, so this
 /// only needs to exceed the widest line.
 const WRAP_WIDTH: i32 = 1000;
-const BORDER: i32 = 8;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
-/// Dialog box background (opaque dark grey), straight RGBA.
-const BOX_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
-/// The red alert border.
-const BORDER_COLOR: [f32; 4] = [1., 0.3, 0.3, 1.];
+/// Dialog card background — GNOME modal `$bg_color`; rounded, borderless.
+const BOX_BG: [f32; 4] = widget::style::DIALOG_BG;
 /// The keycap background behind " Enter " (#2C2C2C, matching the old pango `bgcolor`).
 const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
 /// Dialog text color (opaque white); the glyph coverage modulates the alpha.
@@ -254,7 +251,6 @@ impl ExitConfirmDialog {
 struct DialogLayout {
     run: ShapedParagraph,
     origin: Point<i32, Physical>,
-    inner: Rectangle<i32, Physical>,
     keycap: Option<Rectangle<i32, Physical>>,
 }
 
@@ -267,8 +263,6 @@ fn prepare_dialog(
     let _span = tracy_client::span!("exit_confirm_dialog::prepare_dialog");
 
     let padding = to_physical_precise_round::<i32>(scale, f64::from(PADDING)).max(0);
-    // Even border thickness to avoid blurry edges, as the old cairo stroke did (~BORDER/2 visible).
-    let border = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
 
     // Span 1 is the keycap (mono " Enter "), matching KEYCAP_SPAN.
     let key = format!(" {KEY_NAME} ");
@@ -287,12 +281,8 @@ fn prepare_dialog(
     let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
 
     let size = Size::<i32, Physical>::from((box_w, box_h));
-    let inner = Rectangle::new(
-        Point::from((border, border)),
-        Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
-    );
 
-    // The keycap background: the " Enter " span's ink, padded to a keycap, clamped inside the box.
+    // The keycap background: the " Enter " span's ink, padded to a keycap, clamped inside the card.
     let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
     let keycap = (kw > 0 && kh > 0)
         .then(|| {
@@ -302,7 +292,7 @@ fn prepare_dialog(
                 Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
                 Size::from((kw + pad_x * 2, kh + pad_y * 2)),
             )
-            .intersection(inner)
+            .intersection(Rectangle::from_size(size))
         })
         .flatten();
 
@@ -311,7 +301,6 @@ fn prepare_dialog(
         DialogLayout {
             run,
             origin,
-            inner,
             keycap,
         },
     ))
@@ -326,9 +315,10 @@ fn paint_dialog(
     scale: f64,
 ) -> anyhow::Result<()> {
     let mut p = Painter::new(frame, scale, phys);
-    // Red border = whole box cleared red, then the inner rect cleared to the dark bg.
-    p.clear(BORDER_COLOR)?;
-    p.fill_rect_px(layout.inner, BOX_BG)?;
+    // Rounded borderless card (GNOME modal): transparent clear, flat rounded fill,
+    // then the keycap patch + message.
+    p.clear(widget::style::TRANSPARENT)?;
+    p.fill_rounded_full(widget::style::DIALOG_RADIUS, BOX_BG)?;
     if let Some(keycap) = layout.keycap {
         p.fill_rect_px(keycap, KEYCAP_BG)?;
     }
@@ -399,25 +389,35 @@ mod tests {
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
 
-        // The top edge is the red alert border (R high, G/B low), opaque.
-        let border = px_at(size.w / 2, 1);
-        assert_eq!(border[3], 255, "border must be opaque, got {border:?}");
+        // The top edge center is the flat GNOME modal card bg (#36363a ≈ 54), opaque —
+        // borderless now, not the old red alert border.
+        let top = px_at(size.w / 2, 1);
+        assert_eq!(top[3], 255, "card top edge must be opaque, got {top:?}");
         assert!(
-            border[0] > 180 && border[1] < 120 && border[2] < 120,
-            "top edge not red: {border:?}"
+            (48..=64).contains(&top[0])
+                && (48..=64).contains(&top[1])
+                && (48..=70).contains(&top[2]),
+            "top edge not the flat dialog card bg: {top:?}"
         );
 
-        // A pixel just inside a corner (past the border, away from text) is the dark box.
+        // A pixel inside a corner (away from text) is the card bg.
         let bg = px_at(size.w - 8, size.h - 8);
         assert!(
-            bg[0] < 45 && bg[1] < 45 && bg[2] < 45 && bg[3] == 255,
-            "inner box not dark/opaque: {bg:?}"
+            (48..=64).contains(&bg[0]) && bg[3] == 255,
+            "card interior not the dialog bg: {bg:?}"
         );
 
-        // Somewhere a grey keycap pixel (~0x2C) exists that is neither the 0x1A box nor white text.
-        let keycap = pixels.chunks_exact(4).any(|p| {
-            (38..=60).contains(&p[0]) && (38..=60).contains(&p[1]) && (38..=60).contains(&p[2])
-        });
+        // The extreme corner is transparent — the card is rounded, not a square box.
+        let corner = px_at(size.w - 1, size.h - 1);
+        assert_eq!(
+            corner[3], 0,
+            "card corner should be transparent (rounded), got {corner:?}"
+        );
+
+        // A grey keycap pixel (~0x2C = 44) exists, distinctly darker than the 54 card bg.
+        let keycap = pixels
+            .chunks_exact(4)
+            .any(|p| (40..=48).contains(&p[0]) && (40..=48).contains(&p[1]));
         assert!(keycap, "expected a grey keycap patch (~0x2C)");
 
         // Bright glyph ink.
