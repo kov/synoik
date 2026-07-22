@@ -38,13 +38,23 @@ const RADIUS: i32 = 16;
 /// `FONT_PX` is its logical px, used only for the keycap-patch padding geometry.
 const FONT_PT: f64 = 11.;
 const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
-const BORDER: i32 = 4;
+/// Panel corner radius, logical px — GNOME `.screenshot-ui-panel` `$modal_radius * 2`
+/// (`_screenshot.scss:9`). The whole panel is one rounded `%osd_panel` card.
+const PANEL_RADIUS: f64 = 32.;
 
-/// Dark panel background, grey border, and the grey keycap patch (`#2C2C2C`).
+/// Dark `%osd_panel` background and the grey keycap patch (`#2C2C2C`). `PANEL_BORDER_COLOR`
+/// is GNOME's `$osd_outer_borders_color` = white@2% (`_colors.scss:44`), a 1px inset stroke;
+/// the panel reads against the screenshot via its drop shadow, not a heavy border.
 const PANEL_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
-const PANEL_BORDER_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 1.];
+const PANEL_BORDER_COLOR: [f32; 4] = [1., 1., 1., 0.02];
 const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
 const TEXT_COLOR: [f32; 4] = [1., 1., 1., 1.];
+
+/// Drop shadow — GNOME `.screenshot-ui-panel` `box-shadow: 0 2px 4px 0 $shadow_color`
+/// (`_screenshot.scss:21`); `$shadow_color` (dark) is `rgba(0,0,0,0.2)`. Logical px.
+const SHADOW_COLOR: [f32; 4] = [0., 0., 0., 0.2];
+const SHADOW_BLUR: f64 = 4.;
+const SHADOW_OFFSET_Y: f64 = 2.;
 
 // Ideally the screenshot UI should support cross-output selections. However, that poses some
 // technical challenges when the outputs have different scales and such. So, this implementation
@@ -113,6 +123,9 @@ struct PanelCache {
     show: Option<VkTexture>,
     /// "…to hide the pointer." — shown while the pointer is visible.
     hide: Option<VkTexture>,
+    /// The panel's drop shadow, baked once into its own transparent texture and composited
+    /// *behind* the panel (both variants share the panel size, so one shadow serves both).
+    shadow: Option<VkTexture>,
     /// The CPU-composed capture-button bitmap (composited over the panel as a separate element),
     /// and its once-per-context Vulkan upload.
     button: Option<MemoryBuffer>,
@@ -728,6 +741,10 @@ impl ScreenshotUi {
             {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
+            // The drop shadow is pushed after the panel so it composites beneath it.
+            if let Some(elem) = output_data.shadow_element(renderer, alpha * progress) {
+                push(ScreenshotUiRenderElement::Screenshot(elem));
+            }
         }
 
         for (buffer, loc) in zip(&output_data.buffers, &output_data.locations) {
@@ -1132,11 +1149,22 @@ impl OutputData {
         let hide = generate_panel(renderer, scale, "hide")
             .map_err(|err| warn!("error rendering help panel: {err:?}"))
             .ok();
+        // The shadow only needs the panel footprint (both variants share it).
+        let shadow = show
+            .as_ref()
+            .or(hide.as_ref())
+            .map(|t| Size::<i32, Physical>::from((t.width() as i32, t.height() as i32)))
+            .and_then(|panel_size| {
+                generate_panel_shadow(renderer, scale, panel_size)
+                    .map_err(|err| warn!("error rendering help-panel shadow: {err:?}"))
+                    .ok()
+            });
         *self.panel.borrow_mut() = PanelCache {
             scale,
             context: Some(context),
             show,
             hide,
+            shadow,
             button: Some(button_bitmap(scale)),
             button_vk: RefCell::new(None),
         };
@@ -1167,6 +1195,37 @@ impl OutputData {
             TextureRenderElement::from_texture_buffer(
                 tb,
                 location,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ),
+        ))
+    }
+
+    /// The panel's drop-shadow element, placed so its baked panel-footprint aligns with the panel
+    /// on screen (the buffer pads the footprint by the blur bleed, so the element sits up-left of
+    /// the panel by that margin). Composited *behind* the panel. `None` until the shadow is baked.
+    fn shadow_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let scale = self.scale;
+        let (texture, panel_size) = {
+            let cache = self.panel.borrow();
+            (cache.shadow.clone()?, cache.size()?)
+        };
+        let (margin, _) = shadow_pad(scale);
+        let loc = (panel_location(self, panel_size) - Point::from((margin, margin)))
+            .to_f64()
+            .to_logical(scale);
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        Some(CapturedTextureRenderElement(
+            TextureRenderElement::from_texture_buffer(
+                buffer,
+                loc,
                 alpha,
                 None,
                 None,
@@ -1406,6 +1465,52 @@ fn button_bitmap(scale: f64) -> MemoryBuffer {
 /// Draw the screenshot help panel straight into a `VkTexture`: a dark box with a grey border, the
 /// concentric-circle capture button on the left, and two left-aligned help lines with `Space`/`P`
 /// keycaps on grey patches. `verb` is the pointer line's verb ("show" or "hide"). No cairo/pango.
+/// Physical `(margin, offset_y)` of the panel drop shadow at `scale`: the blur bleed (~3σ) and the
+/// downward offset. The shadow buffer pads the panel footprint by `margin` on top/left/right and
+/// `margin + offset_y` at the bottom, and the element is placed at `panel_location − (margin,
+/// margin)`.
+fn shadow_pad(scale: f64) -> (i32, i32) {
+    let sigma = SHADOW_BLUR * scale / 2.;
+    let margin = (sigma * 3.).ceil() as i32;
+    let offset_y = (SHADOW_OFFSET_Y * scale).round() as i32;
+    (margin, offset_y)
+}
+
+/// Bake the panel's drop shadow into its own transparent `VkTexture` via [`Painter::drop_shadow`],
+/// sized to hold the blur bleed + offset around a `panel_size` card. Composited behind the panel.
+fn generate_panel_shadow(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    panel_size: Size<i32, Physical>,
+) -> anyhow::Result<VkTexture> {
+    let (margin, offset_y) = shadow_pad(scale);
+    let size = Size::<i32, Physical>::from((
+        panel_size.w + margin * 2,
+        panel_size.h + margin * 2 + offset_y,
+    ));
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let mut p = Painter::new(frame, scale, size);
+        p.clear([0., 0., 0., 0.])?;
+        // The panel footprint sits at (margin, margin) in the buffer; `drop_shadow` shifts it down
+        // by the offset and blurs it. Logical coords (the verb re-multiplies by scale).
+        let box_logical = Rectangle::new(
+            Point::from((f64::from(margin) / scale, f64::from(margin) / scale)),
+            Size::from((
+                f64::from(panel_size.w) / scale,
+                f64::from(panel_size.h) / scale,
+            )),
+        );
+        p.drop_shadow(
+            box_logical,
+            PANEL_RADIUS,
+            SHADOW_BLUR,
+            (0., SHADOW_OFFSET_Y),
+            SHADOW_COLOR,
+        )?;
+        Ok(())
+    })
+}
+
 fn generate_panel(
     renderer: &mut VulkanRenderer,
     scale: f64,
@@ -1415,9 +1520,6 @@ fn generate_panel(
 
     let px = (FONT_PX * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
-    // Keep the border width even to avoid blurry edges.
-    let border_width = ((f64::from(BORDER) / 2. * scale).round() as i32 * 2).max(2);
-    let half_border_width = border_width / 2;
     let radius: i32 = to_physical_precise_round(scale, RADIUS);
     // 2 px between the two lines, matching the old cairo line spacing.
     let line_gap: i32 = to_physical_precise_round(scale, 2);
@@ -1456,29 +1558,22 @@ fn generate_panel(
     let row_advance = line_bottom + line_gap;
     let text_h = row_advance * (lines.len() as i32 - 1) + line_bottom;
 
-    let width = text_w + padding + radius * 2 + padding - half_border_width + padding;
+    let width = text_w + radius * 2 + padding * 3;
     let height = max(text_h, radius * 2) + padding * 2;
-    let text_x = padding + radius * 2 + padding - half_border_width;
+    let text_x = radius * 2 + padding * 2;
 
     let size = Size::<i32, Physical>::from((width, height));
-    let inner = Rectangle::new(
-        Point::from((half_border_width, half_border_width)),
-        Size::from((
-            (width - half_border_width * 2).max(0),
-            (height - half_border_width * 2).max(0),
-        )),
-    );
+    let full = Rectangle::from_size(size);
 
-    // This panel is a plain bordered rectangle, so `clear` + `render_glyphs` fully draw it; the
-    // capture button is still composited as a separate element over it (see
-    // `OutputData::button_element`). Rounded chrome here (a rounded panel, an SDF shutter) can now
-    // use `render_rounded_rect` — the offscreen "rounded misrenders" belief was a misdiagnosis
-    // (see the quick-settings / calendar / panel-dot chrome) — but is left for a later pass.
+    // A rounded `%osd_panel` card: transparent-cleared, filled to `PANEL_RADIUS`, then a 1px
+    // white@2% inset border stroke. The capture button and the drop shadow are composited as
+    // separate elements over/under it (see `OutputData::button_element` and the `Shadow` element
+    // in `render_output`), so the buffer stays exactly panel-sized.
     widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
-        // Grey border = whole box grey, then the inner rect dark.
-        p.clear(PANEL_BORDER_COLOR)?;
-        p.fill_rect_px(inner, PANEL_BG)?;
+        p.clear([0., 0., 0., 0.])?;
+        p.fill_rounded_full(PANEL_RADIUS, PANEL_BG)?;
+        p.stroke_rounded_full(PANEL_RADIUS, 1., PANEL_BORDER_COLOR)?;
 
         // Two help lines, left-aligned at `text_x`.
         for (i, run) in runs.iter().enumerate() {
@@ -1493,7 +1588,7 @@ fn generate_panel(
                     Point::from((origin.x + sx - kpad_x, origin.y + sy - kpad_y)),
                     Size::from((sw + kpad_x * 2, sh + kpad_y * 2)),
                 );
-                if let Some(patch) = patch.intersection(inner) {
+                if let Some(patch) = patch.intersection(full) {
                     p.fill_rect_px(patch, KEYCAP_BG)?;
                 }
             }

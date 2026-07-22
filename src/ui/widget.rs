@@ -600,6 +600,22 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Stroke the whole buffer's edge: an inset ring of `width` logical px, corners cut by
+    /// `radius` (logical). The stroke counterpart to [`fill_rounded_full`](Self::fill_rounded_full)
+    /// — a 1px border on a card whose buffer *is* the rounded surface (an OSD panel).
+    pub fn stroke_rounded_full(
+        &mut self,
+        radius: f64,
+        width: f64,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        let r = (radius * self.scale) as f32;
+        let w = (width * self.scale) as f32;
+        self.frame
+            .stroke_rounded_rect(color, r, w, self.full, &[self.full])?;
+        Ok(())
+    }
+
     /// Stroke `rect` (logical) with `color`: an inset ring of `width` logical px along the inside
     /// of the edge, corners cut by `radius` (logical; inner corners concentric). A focus ring or
     /// outline — the stroke counterpart to [`fill_rounded`](Self::fill_rounded).
