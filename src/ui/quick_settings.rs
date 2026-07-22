@@ -32,24 +32,20 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture as _,
-};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Renderer, Texture as _};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
 use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, NetworkStatus, PowerProfileStatus,
 };
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, style};
+use crate::ui::widget::{self, style, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass quick-settings proportions).
@@ -70,12 +66,12 @@ const TILE_ICON_INSET: f64 = 12.;
 /// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
 /// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
 /// light/small.
-const LABEL_PX: f64 = crate::ui::pt_to_px(11.);
+const LABEL_PT: f64 = 11.;
 
 /// A tile subtitle's font size — gnome-shell's `.quick-toggle-subtitle` is `%caption` (9pt),
 /// regular weight (`gnome-shell-sass/widgets/_quick-settings.scss`). Only Power Mode uses a
 /// subtitle so far.
-const SUBTITLE_PX: f64 = crate::ui::pt_to_px(9.);
+const SUBTITLE_PT: f64 = 9.;
 
 /// Half the vertical gap between a two-line tile's title and subtitle line centers (each is offset
 /// this far from the tile's vertical center). Keeps the 11pt title + 9pt subtitle from overlapping
@@ -166,10 +162,10 @@ const DETAIL_ROW_INSET: f64 = 12.;
 const DETAIL_SEP_EXTRA: f64 = 8.;
 /// Detail-card surface (a touch lighter than `MENU_BG`, gnome-shell's `%card`).
 const CARD_BG: [f32; 4] = [0.18, 0.18, 0.18, 1.];
-/// Header-title / row-label font size, logical px. Rows are regular weight (`.popup-menu-item`),
-/// the header title is bold (`%title_3`).
-const DETAIL_TITLE_PX: f64 = crate::ui::pt_to_px(11.);
-const DETAIL_ROW_PX: f64 = crate::ui::pt_to_px(11.);
+/// Header-title / row-label font size, GNOME points (shaped via [`TextShaper`]). Rows are
+/// regular weight (`.popup-menu-item`), the header title is bold (`%title_3`).
+const DETAIL_TITLE_PT: f64 = 11.;
+const DETAIL_ROW_PT: f64 = 11.;
 
 /// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
 /// opens a visual group break above the row (the shutdown menu's power/session split).
@@ -1611,79 +1607,69 @@ impl QuickSettings {
         let w_px = to_physical_precise_round::<i32>(scale, size.w).max(1);
         let h_px = to_physical_precise_round::<i32>(scale, size.h).max(1);
         let phys = Size::<i32, Physical>::from((w_px, h_px));
-        let label_px = (LABEL_PX * scale) as f32;
-
-        // Shape the tile labels + the battery pill's percentage up front (immutable
-        // borrows of the font system).
+        // Shape every run up front (needs `&mut renderer`, before the bake frame opens).
+        // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the font sizes.
+        // `.quick-toggle-title` / the power toggle's percentage are %heading = weight 700; the
+        // subtitle line is %caption, regular weight.
+        let label_style = TextStyle::new(LABEL_PT).bold();
+        let subtitle_style = TextStyle::new(SUBTITLE_PT);
         let labels: Vec<String> = self
             .grid()
             .iter()
             .map(|item| item.label(self.network))
             .collect();
-        // `.quick-toggle-title` / the power toggle's percentage are %heading = weight 700.
-        let label_runs: Vec<_> = labels
-            .iter()
-            .map(|l| renderer.build_glyph_run_weighted(l, label_px, true))
-            .collect::<Result<_, _>>()?;
-        // A parallel Option<run> for the (regular-weight) subtitle line — `Some` only for the tiles
-        // that carry one (Power Mode's active profile), `None` otherwise.
-        let subtitle_px = (SUBTITLE_PX * scale) as f32;
-        let subtitle_runs: Vec<Option<_>> = self
-            .grid()
-            .iter()
-            .map(|item| {
-                item.subtitle(&self.power)
-                    .map(|s| renderer.build_glyph_run_weighted(&s, subtitle_px, false))
-                    .transpose()
-            })
-            .collect::<Result<_, _>>()?;
-        let pill_run = self
-            .battery
-            .as_ref()
-            .map(|b| {
-                renderer.build_glyph_run_weighted(
-                    &format!("{}%", b.percentage.round() as i64),
-                    label_px,
-                    true,
-                )
-            })
-            .transpose()?;
-        // The open detail view's header title (bold, `%title_3`) and its regular-weight row labels.
-        let detail_title_px = (DETAIL_TITLE_PX * scale) as f32;
-        let detail_row_px = (DETAIL_ROW_PX * scale) as f32;
-        let detail_runs = self
-            .expanded
-            .map(|owner| -> anyhow::Result<_> {
-                let (_, title) = owner.header(self.network);
-                let title_run = renderer.build_glyph_run_weighted(&title, detail_title_px, true)?;
-                let rows = owner.rows(
-                    self.network,
-                    &self.sink_list,
-                    &self.source_list,
-                    &self.power,
-                );
-                // The card is sized from the pure `row_shape`; assert the live rows match it (count
-                // + separator positions) so the geometry can't drift from what's drawn here.
-                debug_assert_eq!(
-                    rows.iter().map(|r| r.separator_before).collect::<Vec<_>>(),
-                    owner.row_shape(self.layout().owner_device_count(owner)),
-                    "rows() must match row_shape() for correct card sizing"
-                );
-                let row_runs = rows
-                    .into_iter()
-                    .map(|r| renderer.build_glyph_run_weighted(&r.label, detail_row_px, false))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((title_run, row_runs))
-            })
-            .transpose()?;
+        let (label_runs, subtitle_runs, pill_run, detail_runs) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let label_runs: Vec<ShapedText> = labels
+                .iter()
+                .map(|l| shaper.shape(l, label_style))
+                .collect::<Result<_, _>>()?;
+            // A parallel Option<run> for the subtitle line — `Some` only for the tiles that carry
+            // one (Power Mode's active profile), `None` otherwise.
+            let subtitle_runs: Vec<Option<ShapedText>> = self
+                .grid()
+                .iter()
+                .map(|item| {
+                    item.subtitle(&self.power)
+                        .map(|s| shaper.shape(&s, subtitle_style))
+                        .transpose()
+                })
+                .collect::<Result<_, _>>()?;
+            let pill_run = self
+                .battery
+                .as_ref()
+                .map(|b| shaper.shape(&format!("{}%", b.percentage.round() as i64), label_style))
+                .transpose()?;
+            // The open detail view's header title (bold, `%title_3`) + its regular-weight rows.
+            let detail_runs = self
+                .expanded
+                .map(|owner| -> anyhow::Result<_> {
+                    let (_, title) = owner.header(self.network);
+                    let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
+                    let rows = owner.rows(
+                        self.network,
+                        &self.sink_list,
+                        &self.source_list,
+                        &self.power,
+                    );
+                    // The card is sized from the pure `row_shape`; assert the live rows match it
+                    // (count + separator positions) so the geometry can't drift from what's drawn.
+                    debug_assert_eq!(
+                        rows.iter().map(|r| r.separator_before).collect::<Vec<_>>(),
+                        owner.row_shape(self.layout().owner_device_count(owner)),
+                        "rows() must match row_shape() for correct card sizing"
+                    );
+                    let row_runs = rows
+                        .into_iter()
+                        .map(|r| shaper.shape(&r.label, TextStyle::new(DETAIL_ROW_PT)))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((title_run, row_runs))
+                })
+                .transpose()?;
+            (label_runs, subtitle_runs, pill_run, detail_runs)
+        };
 
-        let mut target = renderer.create_buffer(
-            Fourcc::Abgr8888,
-            Size::<i32, BufferCoord>::from((w_px, h_px)),
-        )?;
-        {
-            let mut fb = renderer.bind(&mut target)?;
-            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+        widget::bake_uncached_sized(renderer, phys, |frame| {
             let full = Rectangle::from_size(phys);
             // Rounded panel: clear transparent, then fill the menu background as a rounded rect so
             // the outer corners stay transparent (the composited element's opacity hint below
@@ -1748,14 +1734,14 @@ impl QuickSettings {
                     // Two-line tile (Power Mode): title above center, subtitle below.
                     Some(sub) => {
                         frame.render_glyphs(
-                            run,
+                            run.run(),
                             place_left(run.ink_bounds(), label_x, px(center_y - SUBTITLE_GAP)),
                             fg,
                             clip,
                             &[full],
                         )?;
                         frame.render_glyphs(
-                            sub,
+                            sub.run(),
                             place_left(sub.ink_bounds(), label_x, px(center_y + SUBTITLE_GAP)),
                             fg,
                             clip,
@@ -1765,7 +1751,7 @@ impl QuickSettings {
                     // Single-line tile: the title, vertically centered.
                     None => {
                         frame.render_glyphs(
-                            run,
+                            run.run(),
                             place_left(run.ink_bounds(), label_x, px(center_y)),
                             fg,
                             clip,
@@ -1795,7 +1781,7 @@ impl QuickSettings {
                 let label_x = px(pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.);
                 let label_cy = px(pill.loc.y + pill.size.h / 2.);
                 frame.render_glyphs(
-                    run,
+                    run.run(),
                     place_left(run.ink_bounds(), label_x, label_cy),
                     FG_OFF,
                     full,
@@ -1913,7 +1899,7 @@ impl QuickSettings {
                 let title_x = px(card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON + 8.);
                 let title_cy = px(card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.);
                 frame.render_glyphs(
-                    title_run,
+                    title_run.run(),
                     place_left(title_run.ink_bounds(), title_x, title_cy),
                     FG_OFF,
                     rect_px(card),
@@ -1959,7 +1945,7 @@ impl QuickSettings {
                     label_clip.size.w =
                         (label_clip.size.w - (DETAIL_ROW_INSET + TILE_ICON)).max(0.);
                     frame.render_glyphs(
-                        run,
+                        run.run(),
                         place_left(run.ink_bounds(), label_x, label_cy),
                         FG_OFF,
                         rect_px(label_clip),
@@ -1968,11 +1954,8 @@ impl QuickSettings {
                 }
             }
 
-            let _sync = frame.finish()?;
-        }
-
-        renderer.make_offscreen_sampleable(&target)?;
-        Ok(target)
+            Ok(())
+        })
     }
 }
 
@@ -2479,7 +2462,8 @@ mod tests {
     /// with the active tile painted the accent color and visible label ink.
     #[test]
     fn draws_the_menu_with_an_active_tile() {
-        use smithay::backend::renderer::{ExportMem, Texture as _};
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{Bind, ExportMem, Texture as _};
 
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
