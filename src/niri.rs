@@ -898,6 +898,11 @@ impl State {
             state.niri.gnome_settings = initial;
             state.niri.last_power_profile = state.niri.gnome_settings.last_power_profile.clone();
             state.niri.gnome_settings_writer = Some(writer);
+            // GNOME's input-sources own the keymap when present, overriding the
+            // niri-config keymap the seat keyboard was created with.
+            if state.niri.gnome_settings.input_sources.present {
+                state.apply_effective_xkb();
+            }
             state
                 .niri
                 .layout
@@ -951,7 +956,16 @@ impl State {
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
+                        let input_sources_changed =
+                            state.niri.gnome_settings.input_sources != settings.input_sources;
                         state.niri.gnome_settings = settings;
+                        // Re-derive the keymap from GNOME's input-sources when they
+                        // change (layout added/removed, options/model edited).
+                        if input_sources_changed && state.niri.gnome_settings.input_sources.present
+                        {
+                            state.apply_effective_xkb();
+                            state.ipc_keyboard_layouts_changed();
+                        }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
                         state.niri.queue_redraw_all();
@@ -1093,10 +1107,21 @@ impl State {
         }
     }
 
-    /// The keyboard `Xkb` config actually driving the keymap: the niri config's own, unless it is
-    /// left at default, in which case systemd-localed (`xkb_from_locale1`) supplies it. Mirrors the
-    /// fallback in the config-reload path so the panel label matches the live keymap.
+    /// The keyboard `Xkb` config actually driving the keymap. GNOME's
+    /// `org.gnome.desktop.input-sources` is the source of truth when its schema is
+    /// present (GNOME's way replaces niri's `input.keyboard.xkb` — CLAUDE.md tenet);
+    /// only where GNOME isn't installed do we fall back to niri's config, then to
+    /// systemd-localed (`xkb_from_locale1`). Mirrored across the apply paths so the
+    /// panel label matches the live keymap.
     fn effective_xkb(&self) -> Xkb {
+        let input_sources = &self.niri.gnome_settings.input_sources;
+        if input_sources.present {
+            return crate::keyboard_layout::xkb_from_input_sources(
+                &input_sources.sources,
+                &input_sources.xkb_options,
+                &input_sources.xkb_model,
+            );
+        }
         let config = self.niri.config.borrow();
         let xkb = config.input.keyboard.xkb.clone();
         drop(config);
@@ -1105,6 +1130,15 @@ impl State {
         } else {
             xkb
         }
+    }
+
+    /// (Re)apply the effective keymap to the seat keyboard — used at startup and
+    /// whenever GNOME's `input-sources` change. A no-op keymap swap is cheap and
+    /// resets the active group; MRU-based active-group seeding lands with the
+    /// popover slice.
+    pub fn apply_effective_xkb(&mut self) {
+        let xkb = self.effective_xkb();
+        self.set_xkb_config(xkb.to_xkb_config());
     }
 
     fn notify_blocker_cleared(&mut self) {
@@ -1898,8 +1932,12 @@ impl State {
         // Release the borrow.
         drop(old_config);
 
-        // Now with a &mut self we can reload the xkb config.
-        if let Some(mut xkb) = reload_xkb {
+        // Now with a &mut self we can reload the xkb config — unless GNOME's
+        // input-sources own the keymap, in which case niri-config xkb changes are
+        // ignored (GNOME's way replaces niri's).
+        if let Some(mut xkb) =
+            reload_xkb.filter(|_| !self.niri.gnome_settings.input_sources.present)
+        {
             let mut set_xkb_config = true;
 
             // It's fine to .take() the xkb file, as this is a
@@ -2500,6 +2538,14 @@ impl State {
 
         trace!("locale1 xkb settings changed: {xkb:?}");
         let xkb = self.niri.xkb_from_locale1.insert(xkb);
+
+        // GNOME's input-sources take priority over systemd-localed when present;
+        // keep the stored locale1 value (a capability for the no-GNOME fallback)
+        // but don't apply it here.
+        if self.niri.gnome_settings.input_sources.present {
+            trace!("ignoring locale1 xkb change because GNOME input-sources are present");
+            return;
+        }
 
         {
             let config = self.niri.config.borrow();

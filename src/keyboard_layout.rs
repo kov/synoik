@@ -8,6 +8,53 @@
 //! isn't code-derived (an `xkb.file` keymap, or a count mismatch), we fall back to abbreviating
 //! each layout's full xkb name. Either way, colliding labels are disambiguated (GNOME dedups too).
 
+use niri_config::Xkb;
+
+/// GNOME's fallback layout when `org.gnome.desktop.input-sources` is empty
+/// (`js/ui/status/keyboard.js` `KeyboardManager.DEFAULT_LAYOUT`).
+const DEFAULT_LAYOUT: &str = "us";
+
+/// Build the effective niri `Xkb` from GNOME's `org.gnome.desktop.input-sources`
+/// (its way replaces niri's `input.keyboard.xkb` — see the CLAUDE.md tenet).
+///
+/// - `sources`: the `sources` `a(ss)` array, `(type, id)` in order. Only `"xkb"`-type sources
+///   contribute layouts; `"ibus"` is unsupported here and skipped (a documented divergence — this
+///   fork has no IBus). An xkb `id` is `"layout"` or `"layout+variant"`.
+/// - `options`: `xkb-options` (joined with `,`).
+/// - `model`: `xkb-model` (empty → left unset, letting libxkbcommon default it).
+///
+/// An empty/all-ibus set yields the `"us"` default, matching gnome-shell's
+/// `_inputSourcesChanged` fallback. `layout`/`variant` stay index-aligned so the
+/// active group index maps straight through to a source.
+pub fn xkb_from_input_sources(
+    sources: &[(String, String)],
+    options: &[String],
+    model: &str,
+) -> Xkb {
+    let mut layouts = Vec::new();
+    let mut variants = Vec::new();
+    for (ty, id) in sources {
+        if ty != "xkb" {
+            continue;
+        }
+        let (layout, variant) = id.split_once('+').unwrap_or((id.as_str(), ""));
+        layouts.push(layout.to_owned());
+        variants.push(variant.to_owned());
+    }
+    if layouts.is_empty() {
+        layouts.push(DEFAULT_LAYOUT.to_owned());
+        variants.push(String::new());
+    }
+    Xkb {
+        rules: String::new(),
+        model: model.to_owned(),
+        layout: layouts.join(","),
+        variant: variants.join(","),
+        options: (!options.is_empty()).then(|| options.join(",")),
+        file: None,
+    }
+}
+
 /// The short label for the active layout in the panel input-source indicator, or `None` when fewer
 /// than two layouts are configured (GNOME hides the indicator with `<2` sources).
 ///
@@ -84,6 +131,53 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn srcs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(t, i)| (t.to_string(), i.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn input_sources_build_comma_aligned_layout_and_variant() {
+        let xkb = xkb_from_input_sources(
+            &srcs(&[("xkb", "us"), ("xkb", "de+nodeadkeys"), ("xkb", "br")]),
+            &v(&["grp:alt_shift_toggle", "caps:escape"]),
+            "pc105",
+        );
+        assert_eq!(xkb.layout, "us,de,br");
+        // Index-aligned: only `de` has a variant, so its slot is filled and the
+        // others are empty — libxkbcommon keeps the active group index mapping.
+        assert_eq!(xkb.variant, ",nodeadkeys,");
+        assert_eq!(
+            xkb.options.as_deref(),
+            Some("grp:alt_shift_toggle,caps:escape")
+        );
+        assert_eq!(xkb.model, "pc105");
+        assert_eq!(xkb.rules, "");
+        assert_eq!(xkb.file, None);
+    }
+
+    #[test]
+    fn input_sources_empty_falls_back_to_us() {
+        let xkb = xkb_from_input_sources(&[], &[], "");
+        assert_eq!(xkb.layout, "us");
+        assert_eq!(xkb.variant, "");
+        assert_eq!(xkb.options, None);
+    }
+
+    #[test]
+    fn input_sources_skip_ibus_but_keep_xkb() {
+        // IBus sources are unsupported here (divergence) — skipped, leaving the
+        // xkb layouts. An all-ibus set falls back to "us".
+        let xkb = xkb_from_input_sources(&srcs(&[("ibus", "libpinyin"), ("xkb", "us")]), &[], "");
+        assert_eq!(xkb.layout, "us");
+        assert_eq!(
+            xkb_from_input_sources(&srcs(&[("ibus", "anthy")]), &[], "").layout,
+            "us"
+        );
     }
 
     #[test]

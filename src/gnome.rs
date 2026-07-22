@@ -60,6 +60,33 @@ pub struct GnomeSettings {
     /// tile's body-click toggles back to (gnome-shell's `PowerProfilesToggle`). GNOME's schema
     /// default is `"power-saver"`.
     pub last_power_profile: String,
+    /// `org.gnome.desktop.input-sources`: the configured keyboard layouts (GNOME's
+    /// way replaces niri's `input.keyboard.xkb` — see the CLAUDE.md tenet). Drives
+    /// the seat keymap and the panel input-source indicator.
+    pub input_sources: InputSources,
+}
+
+/// The keyboard input-source configuration from `org.gnome.desktop.input-sources`
+/// (`js/ui/status/keyboard.js` `InputSourceSessionSettings`). We read the layout
+/// list, MRU ordering, options and model; the deprecated `current` key is ignored
+/// (GNOME 50.1 tracks the active source via `mru-sources`, not `current`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputSources {
+    /// Whether the schema is installed. When true its values — even empty ones —
+    /// are the source of truth (GNOME wins); when false we fall back to niri's
+    /// xkb config, then systemd-localed.
+    pub present: bool,
+    /// `sources` `a(ss)`: `(type, id)` in order. `type` is `"xkb"` or `"ibus"`;
+    /// an xkb `id` is `"layout"` or `"layout+variant"`.
+    pub sources: Vec<(String, String)>,
+    /// `mru-sources` `a(ss)`: most-recently-used ordering, same tuple format —
+    /// what GNOME writes on an interactive switch (the active source is
+    /// `mru-sources[0]`).
+    pub mru_sources: Vec<(String, String)>,
+    /// `xkb-options` `as`.
+    pub xkb_options: Vec<String>,
+    /// `xkb-model` `s`.
+    pub xkb_model: String,
 }
 
 /// The gsettings-backed quick-settings toggles (the "self-contained" ones that
@@ -91,6 +118,7 @@ impl Default for GnomeSettings {
             calendar: CalendarSettings::default(),
             quick_toggles: QuickToggles::default(),
             last_power_profile: "power-saver".to_string(),
+            input_sources: InputSources::default(),
         }
     }
 }
@@ -293,6 +321,28 @@ impl GnomeSettings {
         }
     }
 
+    fn load_input_sources(&mut self, s: &gio::Settings) {
+        // The schema being present makes it the source of truth (GNOME wins),
+        // even if the arrays are empty (→ the "us" fallback downstream).
+        self.input_sources.present = true;
+        if settings_has_key(s, "sources") {
+            self.input_sources.sources = read_source_tuples(&s.value("sources"));
+        }
+        if settings_has_key(s, "mru-sources") {
+            self.input_sources.mru_sources = read_source_tuples(&s.value("mru-sources"));
+        }
+        if settings_has_key(s, "xkb-options") {
+            self.input_sources.xkb_options = s
+                .strv("xkb-options")
+                .iter()
+                .map(|o| o.to_string())
+                .collect();
+        }
+        if settings_has_key(s, "xkb-model") {
+            self.input_sources.xkb_model = s.string("xkb-model").to_string();
+        }
+    }
+
     fn load_notifications(&mut self, notifications: &gio::Settings) {
         // gnome-shell's Do Not Disturb tile is the inverse of show-banners
         // (js/ui/status/system.js / calendar.js `_setDndState`).
@@ -389,6 +439,14 @@ fn settings_has_key(settings: &gio::Settings, key: &str) -> bool {
     settings
         .settings_schema()
         .is_some_and(|schema| schema.has_key(key))
+}
+
+/// Unpack an `a(ss)` variant (the `sources` / `mru-sources` keys) into `(type, id)`
+/// pairs. Children that don't decode as `(String, String)` are skipped.
+fn read_source_tuples(value: &glib::Variant) -> Vec<(String, String)> {
+    (0..value.n_children())
+        .filter_map(|i| value.child_value(i).get::<(String, String)>())
+        .collect()
 }
 
 /// One GNOME keybinding we honor: a semantic action and the accelerators
@@ -824,6 +882,7 @@ struct Stores {
     calendar: Option<gio::Settings>,
     notifications: Option<gio::Settings>,
     color: Option<gio::Settings>,
+    input_sources: Option<gio::Settings>,
 }
 
 impl Stores {
@@ -842,6 +901,7 @@ impl Stores {
             calendar: gsettings("org.gnome.desktop.calendar"),
             notifications: gsettings("org.gnome.desktop.notifications"),
             color: gsettings("org.gnome.settings-daemon.plugins.color"),
+            input_sources: gsettings("org.gnome.desktop.input-sources"),
         }
     }
 
@@ -856,6 +916,7 @@ impl Stores {
             "notifications" => self.notifications.as_ref(),
             "color" => self.color.as_ref(),
             "shell" => self.shell.as_ref(),
+            "input-sources" => self.input_sources.as_ref(),
             _ => None,
         }
     }
@@ -873,6 +934,7 @@ impl Stores {
             &self.calendar,
             &self.notifications,
             &self.color,
+            &self.input_sources,
         ]
         .into_iter()
         .flatten()
@@ -911,6 +973,9 @@ impl Stores {
         }
         if let Some(color) = &self.color {
             settings.load_color(color);
+        }
+        if let Some(input_sources) = &self.input_sources {
+            settings.load_input_sources(input_sources);
         }
         settings
     }
@@ -1163,6 +1228,30 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_source_tuples_unpacks_ass() {
+        use glib::prelude::ToVariant;
+
+        // `sources` / `mru-sources` are `a(ss)` = (type, id) pairs.
+        let variant = vec![
+            ("xkb".to_string(), "us".to_string()),
+            ("xkb".to_string(), "de+nodeadkeys".to_string()),
+            ("ibus".to_string(), "libpinyin".to_string()),
+        ]
+        .to_variant();
+        assert_eq!(variant.type_().as_str(), "a(ss)");
+        assert_eq!(
+            read_source_tuples(&variant),
+            vec![
+                ("xkb".to_string(), "us".to_string()),
+                ("xkb".to_string(), "de+nodeadkeys".to_string()),
+                ("ibus".to_string(), "libpinyin".to_string()),
+            ]
+        );
+        let empty = Vec::<(String, String)>::new().to_variant();
+        assert!(read_source_tuples(&empty).is_empty());
+    }
 
     #[test]
     fn accent_colors_follow_the_shell_palette() {
@@ -1424,6 +1513,7 @@ mod tests {
                 calendar: None,
                 notifications: None,
                 color: None,
+                input_sources: None,
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -1522,6 +1612,7 @@ mod tests {
                         calendar: None,
                         notifications: None,
                         color: None,
+                        input_sources: None,
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);
