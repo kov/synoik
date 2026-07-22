@@ -1074,6 +1074,7 @@ impl State {
                 let effects = self.niri.notifications.clear_all();
                 self.niri.apply_notification_effects(effects);
             }
+            PopoverAction::SetInputSource(idx) => self.set_input_source(idx),
         }
     }
 
@@ -3544,10 +3545,16 @@ impl State {
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_KEYBOARD) => {
-                                // GNOME opens the input-source menu here; the menu/popover is
-                                // deferred. Swallow the click so it doesn't fall through to
-                                // whatever sits under the panel strut.
+                                // Open the input-source (keyboard-layout) menu, anchored on the
+                                // indicator (gnome-shell's `InputSourceIndicator` popup).
+                                if let Some(anchor) = self.niri.panel.keyboard_rect(output_w) {
+                                    let (items, active) = self.input_source_menu_snapshot();
+                                    self.niri
+                                        .panel_popover
+                                        .toggle_input_sources(output, anchor, items, active);
+                                }
                                 self.niri.suppressed_buttons.insert(button_code);
+                                self.niri.queue_redraw_all();
                                 return;
                             }
                             _ => {}

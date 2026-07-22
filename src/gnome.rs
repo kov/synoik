@@ -794,6 +794,29 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Record the most-recently-used input sources: `org.gnome.desktop.input-sources
+    /// mru-sources` (`a(ss)`). gnome-shell writes only this on an interactive
+    /// layout switch (the deprecated `current` key is left untouched). Missing
+    /// store/key is a no-op.
+    pub fn set_mru_sources(&self, sources: Vec<(String, String)>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(input_sources) = &s.input_sources {
+                    if settings_has_key(input_sources, "mru-sources") {
+                        let variant = glib::prelude::ToVariant::to_variant(&sources);
+                        if let Err(err) = input_sources.set_value("mru-sources", &variant) {
+                            warn!(
+                                "error writing org.gnome.desktop.input-sources mru-sources: {err}"
+                            );
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {

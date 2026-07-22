@@ -956,15 +956,23 @@ impl State {
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
-                        let input_sources_changed =
-                            state.niri.gnome_settings.input_sources != settings.input_sources;
+                        // A keymap-affecting change (layout list / options / model)
+                        // rebuilds the keymap; an mru-only change (e.g. our own
+                        // switch write) just re-seeds the active group — no rebuild.
+                        let old_is = &state.niri.gnome_settings.input_sources;
+                        let new_is = &settings.input_sources;
+                        let keymap_changed = new_is.present
+                            && (old_is.sources != new_is.sources
+                                || old_is.xkb_options != new_is.xkb_options
+                                || old_is.xkb_model != new_is.xkb_model);
+                        let mru_changed =
+                            new_is.present && old_is.mru_sources != new_is.mru_sources;
                         state.niri.gnome_settings = settings;
-                        // Re-derive the keymap from GNOME's input-sources when they
-                        // change (layout added/removed, options/model edited).
-                        if input_sources_changed && state.niri.gnome_settings.input_sources.present
-                        {
+                        if keymap_changed {
                             state.apply_effective_xkb();
                             state.ipc_keyboard_layouts_changed();
+                        } else if mru_changed {
+                            state.seed_active_layout_from_mru();
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
@@ -1133,12 +1141,125 @@ impl State {
     }
 
     /// (Re)apply the effective keymap to the seat keyboard — used at startup and
-    /// whenever GNOME's `input-sources` change. A no-op keymap swap is cheap and
-    /// resets the active group; MRU-based active-group seeding lands with the
-    /// popover slice.
+    /// whenever GNOME's `input-sources` change — then seed the active group from
+    /// `mru-sources[0]` (gnome-shell activates the most-recently-used source
+    /// after (re)loading, `js/ui/status/keyboard.js` `_inputSourcesChanged`).
     pub fn apply_effective_xkb(&mut self) {
         let xkb = self.effective_xkb();
         self.set_xkb_config(xkb.to_xkb_config());
+        self.seed_active_layout_from_mru();
+    }
+
+    /// Set the active xkb group to `org.gnome.desktop.input-sources mru-sources[0]`
+    /// (the xkb group order is the `sources` order, ibus filtered out). A no-op
+    /// when GNOME isn't the source of truth or the MRU is empty/unmatched.
+    pub fn seed_active_layout_from_mru(&mut self) {
+        let sources = &self.niri.gnome_settings.input_sources;
+        if !sources.present {
+            return;
+        }
+        let Some(first) = sources.mru_sources.first().cloned() else {
+            return;
+        };
+        let idx = sources
+            .sources
+            .iter()
+            .filter(|(ty, _)| ty == "xkb")
+            .position(|s| *s == first);
+        let Some(idx) = idx.filter(|&i| i > 0) else {
+            return;
+        };
+        self.set_active_layout(idx);
+    }
+
+    /// Switch the active xkb group to `idx` (clamped to the compiled layout
+    /// count) and refresh the panel/IPC layout state.
+    fn set_active_layout(&mut self, idx: usize) {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        keyboard.with_xkb_state(self, |mut context| {
+            let num = context.xkb().lock().unwrap().layouts().count();
+            if idx < num {
+                context.set_layout(KeyboardLayout(idx as u32));
+            }
+        });
+        self.refresh_keyboard_layout_indicator();
+        self.ipc_refresh_keyboard_layout_index();
+    }
+
+    /// The input-source popover's items (a display name + short label per layout,
+    /// in xkb/source order) and the active index — read from the live xkb state
+    /// (which reflects GNOME's input-sources) so it matches the panel indicator.
+    pub fn input_source_menu_snapshot(
+        &mut self,
+    ) -> (Vec<crate::ui::input_source_menu::InputSourceItem>, usize) {
+        use crate::ui::input_source_menu::InputSourceItem;
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let (names, idx) = keyboard.with_xkb_state(self, |context| {
+            let xkb = context.xkb().lock().unwrap();
+            let names: Vec<String> = xkb
+                .layouts()
+                .map(|layout| xkb.layout_name(layout).to_owned())
+                .collect();
+            (names, xkb.active_layout().0 as usize)
+        });
+        let xkb = self.effective_xkb();
+        let codes: Vec<String> = if xkb.file.is_none() {
+            xkb.layout
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let shorts = crate::keyboard_layout::labels(&codes, &names);
+        let items = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, display)| InputSourceItem {
+                display,
+                short: shorts.get(i).cloned().unwrap_or_default(),
+            })
+            .collect();
+        (items, idx)
+    }
+
+    /// Switch to input source `idx` (a layout-menu row): set the active xkb group
+    /// and record it at the front of GNOME's `mru-sources`
+    /// (`js/ui/status/keyboard.js` `activateInputSource` → `_updateMruSettings`).
+    pub fn set_input_source(&mut self, idx: usize) {
+        self.set_active_layout(idx);
+
+        let sources = &self.niri.gnome_settings.input_sources;
+        if !sources.present {
+            return;
+        }
+        let xkb_sources: Vec<(String, String)> = sources
+            .sources
+            .iter()
+            .filter(|(ty, _)| ty == "xkb")
+            .cloned()
+            .collect();
+        let Some(picked) = xkb_sources.get(idx).cloned() else {
+            return;
+        };
+        // MRU = picked first, then the rest of the old MRU, then any sources not
+        // yet listed — deduplicated, preserving order.
+        let mut mru = vec![picked.clone()];
+        for s in sources
+            .mru_sources
+            .iter()
+            .chain(xkb_sources.iter())
+            .filter(|s| **s != picked)
+        {
+            if !mru.contains(s) {
+                mru.push(s.clone());
+            }
+        }
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.set_mru_sources(mru);
+        }
     }
 
     fn notify_blocker_cleared(&mut self) {

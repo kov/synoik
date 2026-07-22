@@ -36,6 +36,7 @@ const POPOVER_MARGIN: f64 = 6.;
 use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::calendar::DateMenu;
+use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::quick_settings::QuickSettings;
@@ -104,6 +105,10 @@ pub enum PopoverAction {
     InvokeNotificationAction { id: u32, key: String },
     /// The message list's Clear pill: close every notification.
     ClearNotifications,
+    /// Switch to this input source (a layout row in the keyboard menu): set the
+    /// active xkb group and record it in `mru-sources`. The menu closes, like
+    /// gnome-shell's popup menu closing on item activation.
+    SetInputSource(usize),
 }
 
 impl PopoverAction {
@@ -125,6 +130,8 @@ impl PopoverAction {
                 | PopoverAction::Spawn(_)
                 | PopoverAction::ActivateNotification { .. }
                 | PopoverAction::InvokeNotificationAction { .. }
+                // Picking a layout closes the popup, like gnome-shell's popup menu.
+                | PopoverAction::SetInputSource(_)
         )
     }
 }
@@ -133,6 +140,7 @@ impl PopoverAction {
 pub enum PopoverContent {
     Calendar(DateMenu),
     QuickSettings(QuickSettings),
+    InputSources(InputSourceMenu),
 }
 
 impl PopoverContent {
@@ -140,6 +148,7 @@ impl PopoverContent {
         match self {
             PopoverContent::Calendar(dm) => dm.logical_size(),
             PopoverContent::QuickSettings(qs) => qs.logical_size(),
+            PopoverContent::InputSources(m) => m.logical_size(),
         }
     }
 }
@@ -194,6 +203,7 @@ impl PanelPopover {
         match self.content.as_ref()? {
             PopoverContent::Calendar(_) => Some(crate::ui::panel::ROLE_DATE_MENU),
             PopoverContent::QuickSettings(_) => Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+            PopoverContent::InputSources(_) => Some(crate::ui::panel::ROLE_KEYBOARD),
         }
     }
 
@@ -292,6 +302,30 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) if self.open => Some(dm),
             _ => None,
         }
+    }
+
+    /// Toggle the input-source (keyboard-layout) menu, anchored at `anchor` on
+    /// `output`. `items` are the configured layouts (in source order) and
+    /// `active` the current one.
+    pub fn toggle_input_sources(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        items: Vec<InputSourceItem>,
+        active: usize,
+    ) {
+        if self.is_showing::<InputSourcesTag>() {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.content = Some(PopoverContent::InputSources(InputSourceMenu::new(
+            items, active,
+        )));
+        self.anim = Some(self.make_anim(0., 1.));
     }
 
     /// The popover's content origin on `output` (its resting top-left),
@@ -448,6 +482,7 @@ impl PanelPopover {
         match self.content.as_mut() {
             Some(PopoverContent::Calendar(dm)) => dm.pointer_hover(local),
             Some(PopoverContent::QuickSettings(qs)) => qs.pointer_hover(local),
+            Some(PopoverContent::InputSources(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -526,6 +561,7 @@ impl PanelPopover {
             let action = match self.content.as_mut() {
                 Some(PopoverContent::Calendar(dm)) => dm.pointer_click(local),
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
+                Some(PopoverContent::InputSources(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -624,6 +660,7 @@ impl PanelPopover {
         let mut elements = match self.content.as_ref() {
             Some(PopoverContent::Calendar(dm)) => dm.render(renderer, icons, scale, origin),
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
+            Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             None => Vec::new(),
         };
 
@@ -672,5 +709,11 @@ struct QuickSettingsTag;
 impl ContentTag for QuickSettingsTag {
     fn matches(content: &PopoverContent) -> bool {
         matches!(content, PopoverContent::QuickSettings(_))
+    }
+}
+struct InputSourcesTag;
+impl ContentTag for InputSourcesTag {
+    fn matches(content: &PopoverContent) -> bool {
+        matches!(content, PopoverContent::InputSources(_))
     }
 }

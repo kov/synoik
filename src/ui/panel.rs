@@ -881,6 +881,12 @@ impl Panel {
             .expect("quick settings is always present in the right box")
     }
 
+    /// The keyboard input-source indicator's rect, or `None` when it's hidden
+    /// (fewer than two layouts). Anchors the input-source popover.
+    pub fn keyboard_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        self.right_box_rect(ROLE_KEYBOARD, output_width)
+    }
+
     /// Logical width of the screen-recording indicator pill: padding + the `M:SS`
     /// label + gap + stop icon + padding. Zero when not recording.
     fn recording_width(&self) -> f64 {

@@ -1,0 +1,442 @@
+//! The panel input-source (keyboard-layout) popover menu — the fork's port of
+//! gnome-shell's `InputSourceIndicator` popup (`js/ui/status/keyboard.js`
+//! `InputSourceIndicator._init` / `_addSourceIndicators`).
+//!
+//! A simple vertical menu opened from the panel `keyboard` role: one row per
+//! configured layout (its display name, with the active one marked and its short
+//! label on the right), then a separator and the two fixed trailing items
+//! gnome-shell always appends — "Show Keyboard Layout" (activates GNOME Tecla)
+//! and "Keyboard Settings" (opens the control-center keyboard panel). Clicking a
+//! layout row switches the active group and records it in `mru-sources`.
+//!
+//! Divergences from gnome-shell: the active row is marked with a check
+//! (`object-select-symbolic`) rather than a radio `Ornament.DOT`; IBus property
+//! sub-menus are absent (no IBus in this fork).
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use ordered_float::NotNan;
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
+use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+
+use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::renderer::OffscreenRenderer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::popover::PopoverAction;
+use crate::utils::to_physical_precise_round;
+
+const PAD: f64 = 8.;
+const ROW_H: f64 = 32.;
+const ROW_GAP: f64 = 2.;
+/// Left/right margin of the hover band inside the card.
+const ROW_MARGIN: f64 = 6.;
+/// Text inset from the row's left edge (inside the ornament column for a layout row).
+const TEXT_INSET: f64 = 12.;
+/// The leading ornament column (the active row's check sits here); reserved on
+/// every layout row so the display name doesn't shift when the mark appears.
+const ORN_W: f64 = 22.;
+const ICON: f64 = 16.;
+/// Gap between the display name and the right-aligned short label.
+const LABEL_GAP: f64 = 16.;
+/// Extra space above the first trailing item (the separator break).
+const SEP_EXTRA: f64 = 9.;
+const RADIUS: f64 = 14.;
+const MIN_W: f64 = 200.;
+
+const BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
+const TEXT: [f32; 4] = [1., 1., 1., 1.];
+const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
+const SEPARATOR: [f32; 4] = [1., 1., 1., 0.12];
+const HOVER_WASH: [f32; 4] = [1., 1., 1., 0.10];
+
+const TEXT_PX: f64 = crate::ui::pt_to_px(11.);
+const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
+
+/// One configured layout as shown in the menu (gnome-shell's `LayoutMenuItem`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSourceItem {
+    /// The full display name (e.g. "English (US)"), from the live xkb layout name.
+    pub display: String,
+    /// The short label (e.g. "us"), matching the panel indicator.
+    pub short: String,
+}
+
+/// Which menu row an index maps to.
+enum RowKind {
+    /// A configured layout at this source index.
+    Layout(usize),
+    ShowLayout,
+    Settings,
+}
+
+struct TextureCache {
+    context: Option<ContextId<VkTexture>>,
+    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
+}
+
+/// The input-source popover menu content.
+pub struct InputSourceMenu {
+    items: Vec<InputSourceItem>,
+    active: usize,
+    hovered: Option<usize>,
+    revision: u64,
+    bg_cache: RefCell<TextureCache>,
+}
+
+impl InputSourceMenu {
+    pub fn new(items: Vec<InputSourceItem>, active: usize) -> Self {
+        Self {
+            items,
+            active,
+            hovered: None,
+            revision: 0,
+            bg_cache: RefCell::new(TextureCache {
+                context: None,
+                textures: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Total row count: one per layout, then the two fixed trailing items.
+    fn row_count(&self) -> usize {
+        self.items.len() + 2
+    }
+
+    fn row_kind(&self, k: usize) -> RowKind {
+        let n = self.items.len();
+        if k < n {
+            RowKind::Layout(k)
+        } else if k == n {
+            RowKind::ShowLayout
+        } else {
+            RowKind::Settings
+        }
+    }
+
+    /// The top y of row `k` (content space). The trailing items sit below a
+    /// `SEP_EXTRA` break after the last layout row.
+    fn row_top(&self, k: usize) -> f64 {
+        let sep = if k >= self.items.len() { SEP_EXTRA } else { 0. };
+        PAD + k as f64 * (ROW_H + ROW_GAP) + sep
+    }
+
+    /// Row `k`'s hover/click band (full width less the side margins).
+    fn row_rect(&self, k: usize, width: f64) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((ROW_MARGIN, self.row_top(k))),
+            Size::from((width - 2. * ROW_MARGIN, ROW_H)),
+        )
+    }
+
+    pub fn logical_size(&self) -> Size<f64, Logical> {
+        let measure =
+            |s: &str| niri_vk::text::measure_line_width_weighted(s, TEXT_PX as f32, false);
+        let w_display = self
+            .items
+            .iter()
+            .map(|i| measure(&i.display))
+            .fold(0., f64::max);
+        let w_short = self
+            .items
+            .iter()
+            .map(|i| measure(&i.short))
+            .fold(0., f64::max);
+        let w_action = measure("Show Keyboard Layout").max(measure("Keyboard Settings"));
+        let content = (ORN_W + w_display + LABEL_GAP + w_short).max(w_action);
+        let width = (TEXT_INSET + content + TEXT_INSET).max(MIN_W);
+
+        let total = self.row_count();
+        let height = 2. * PAD
+            + total as f64 * ROW_H
+            + (total.saturating_sub(1)) as f64 * ROW_GAP
+            + SEP_EXTRA;
+        Size::from((width, height))
+    }
+
+    /// Route a menu-local click to its action.
+    pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> PopoverAction {
+        let width = self.logical_size().w;
+        for k in 0..self.row_count() {
+            if self.row_rect(k, width).contains(pos) {
+                return match self.row_kind(k) {
+                    RowKind::Layout(i) => PopoverAction::SetInputSource(i),
+                    // gnome-shell activates `org.gnome.Tecla.desktop` (`_showLayout`).
+                    RowKind::ShowLayout => {
+                        PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.Tecla".into()])
+                    }
+                    // `addSettingsAction(_('Keyboard Settings'), 'gnome-keyboard-panel.desktop')`.
+                    RowKind::Settings => {
+                        PopoverAction::Spawn(vec!["gnome-control-center".into(), "keyboard".into()])
+                    }
+                };
+            }
+        }
+        PopoverAction::Consumed
+    }
+
+    /// Update the hovered row from a menu-local pointer position (`None` clears).
+    /// Returns whether it changed (so the caller can redraw).
+    pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
+        let width = self.logical_size().w;
+        let hovered =
+            pos.and_then(|p| (0..self.row_count()).find(|&k| self.row_rect(k, width).contains(p)));
+        if hovered != self.hovered {
+            self.hovered = hovered;
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bake the card chrome (background, hover wash, separator, and all text) into
+    /// one texture; the active row's check icon composites on top in `render`.
+    fn draw_bg(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let size = self.logical_size();
+        let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
+        let phys = Size::<i32, Physical>::from((px(size.w).max(1), px(size.h).max(1)));
+        let full = Rectangle::from_size(phys);
+        let rect_px = |r: Rectangle<f64, Logical>| {
+            Rectangle::new(
+                Point::<i32, Physical>::from((px(r.loc.x), px(r.loc.y))),
+                Size::<i32, Physical>::from((px(r.size.w), px(r.size.h))),
+            )
+        };
+
+        // Shape every row's text up front (immutable font-system borrows).
+        let mut row_runs = Vec::new();
+        for k in 0..self.row_count() {
+            let (label, short) = match self.row_kind(k) {
+                RowKind::Layout(i) => (
+                    self.items[i].display.clone(),
+                    Some(self.items[i].short.clone()),
+                ),
+                RowKind::ShowLayout => ("Show Keyboard Layout".to_owned(), None),
+                RowKind::Settings => ("Keyboard Settings".to_owned(), None),
+            };
+            let label_run = renderer.build_glyph_run_weighted(&label, TEXT_PX as f32, false)?;
+            let short_run = short
+                .map(|s| renderer.build_glyph_run_weighted(&s, TEXT_PX as f32, false))
+                .transpose()?;
+            row_runs.push((label_run, short_run));
+        }
+
+        let mut target = renderer.create_buffer(
+            Fourcc::Abgr8888,
+            Size::<i32, BufferCoord>::from((phys.w, phys.h)),
+        )?;
+        {
+            let mut fb = renderer.bind(&mut target)?;
+            let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
+            frame.clear(Color32F::from(TRANSPARENT), &[full])?;
+            frame.render_rounded_rect(BG, (RADIUS * scale) as f32, full, &[full])?;
+
+            // The separator rule centered in the break above the trailing items.
+            let sep_y = self.row_top(self.items.len()) - SEP_EXTRA / 2.;
+            let sep = Rectangle::new(
+                Point::from((TEXT_INSET, sep_y)),
+                Size::from((size.w - 2. * TEXT_INSET, 1.)),
+            );
+            frame.render_rounded_rect(SEPARATOR, 0., rect_px(sep), &[full])?;
+
+            for (k, (label_run, short_run)) in row_runs.iter().enumerate() {
+                let rrect = self.row_rect(k, size.w);
+                if self.hovered == Some(k) {
+                    frame.render_rounded_rect(
+                        HOVER_WASH,
+                        (8. * scale) as f32,
+                        rect_px(rrect),
+                        &[full],
+                    )?;
+                }
+                // Layout rows reserve the ornament column; trailing items don't.
+                let is_layout = matches!(self.row_kind(k), RowKind::Layout(_));
+                let label_x = if is_layout {
+                    px(TEXT_INSET + ORN_W)
+                } else {
+                    px(TEXT_INSET)
+                };
+                let cy = px(rrect.loc.y + rrect.size.h / 2.);
+                let (lx, ly, _, lh) = label_run.ink_bounds();
+                let origin = Point::<i32, Physical>::from((label_x - lx, cy - lh / 2 - ly));
+                frame.render_glyphs(label_run, origin, TEXT, full, &[full])?;
+
+                // The short label, right-aligned and dimmed.
+                if let Some(run) = short_run {
+                    let (sx, sy, sw, sh) = run.ink_bounds();
+                    let right = px(size.w - TEXT_INSET);
+                    let origin = Point::<i32, Physical>::from((right - sw - sx, cy - sh / 2 - sy));
+                    frame.render_glyphs(run, origin, MUTED, full, &[full])?;
+                }
+            }
+
+            let _sync = frame.finish()?;
+        }
+
+        renderer.make_offscreen_sampleable(&target)?;
+        Ok(target)
+    }
+
+    fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        let mut cache = self.bg_cache.borrow_mut();
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.textures.clear();
+            cache.context = Some(context);
+        }
+        let fresh =
+            matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == self.revision);
+        if !fresh {
+            let tex = self.draw_bg(renderer, scale)?;
+            cache.textures.insert(scale_key, (self.revision, tex));
+        }
+        Ok(cache
+            .textures
+            .get(&scale_key)
+            .map(|(_, t)| t.clone())
+            .unwrap())
+    }
+
+    /// The menu's render elements at `origin`, topmost first: the active row's
+    /// check icon, then the baked card chrome beneath it.
+    pub fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        scale: f64,
+        origin: Point<f64, Logical>,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let mut elements = Vec::new();
+
+        // The active layout's check, centered in its ornament column.
+        if self.active < self.items.len() {
+            let rrect = self.row_rect(self.active, self.logical_size().w);
+            let center = Point::from((
+                rrect.loc.x + TEXT_INSET + ORN_W / 2. - ROW_MARGIN,
+                rrect.loc.y + rrect.size.h / 2.,
+            ));
+            if let Some(el) = icon_element(
+                renderer,
+                icons,
+                CHECK_ICONS,
+                ICON,
+                scale,
+                TEXT,
+                origin,
+                center,
+            ) {
+                elements.push(el);
+            }
+        }
+
+        match self.bg_texture(renderer, scale) {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    origin,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => tracing::error!("error drawing the input-source menu: {err:#}"),
+        }
+        elements
+    }
+}
+
+/// Composite a symbolic icon (first of `candidates` that resolves) centered at
+/// `center`, tinted `color`. Mirrors the shared helper in `quick_settings`.
+#[allow(clippy::too_many_arguments)]
+fn icon_element(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    candidates: &[&str],
+    size: f64,
+    scale: f64,
+    color: [f32; 4],
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let buffer = candidates
+        .iter()
+        .find_map(|name| icons.buffer(name, size, scale, color))?;
+    let tb = TextureBuffer::from_memory_buffer(renderer, &buffer).ok()?;
+    let logical = tb.logical_size();
+    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+    Some(TextureRenderElement::from_texture_buffer(
+        tb,
+        loc,
+        1.,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn menu(n: usize, active: usize) -> InputSourceMenu {
+        let items = (0..n)
+            .map(|i| InputSourceItem {
+                display: format!("Layout {i}"),
+                short: format!("l{i}"),
+            })
+            .collect();
+        InputSourceMenu::new(items, active)
+    }
+
+    #[test]
+    fn rows_map_to_layout_then_fixed_items() {
+        let mut m = menu(2, 0);
+        let w = m.logical_size().w;
+        let hit = |m: &mut InputSourceMenu, k: usize| {
+            let r = m.row_rect(k, w);
+            m.pointer_click(r.loc + Point::from((r.size.w / 2., r.size.h / 2.)))
+        };
+        assert_eq!(hit(&mut m, 0), PopoverAction::SetInputSource(0));
+        assert_eq!(hit(&mut m, 1), PopoverAction::SetInputSource(1));
+        // Row 2 = "Show Keyboard Layout", row 3 = "Keyboard Settings".
+        assert!(matches!(hit(&mut m, 2), PopoverAction::Spawn(c) if c[0] == "gtk-launch"));
+        assert!(
+            matches!(hit(&mut m, 3), PopoverAction::Spawn(c) if c == ["gnome-control-center", "keyboard"])
+        );
+    }
+
+    #[test]
+    fn size_grows_with_layout_count() {
+        assert!(menu(4, 0).logical_size().h > menu(2, 0).logical_size().h);
+        // Always at least the two trailing rows.
+        assert!(menu(0, 0).logical_size().h > 0.);
+    }
+
+    #[test]
+    fn hover_tracks_rows_and_reports_change() {
+        let mut m = menu(2, 0);
+        let w = m.logical_size().w;
+        let r0 = m.row_rect(0, w);
+        assert!(m.pointer_hover(Some(r0.loc + Point::from((4., r0.size.h / 2.)))));
+        assert_eq!(m.hovered, Some(0));
+        // Same row again: no change.
+        assert!(!m.pointer_hover(Some(r0.loc + Point::from((6., r0.size.h / 2.)))));
+        // Leaving clears it.
+        assert!(m.pointer_hover(None));
+        assert_eq!(m.hovered, None);
+    }
+}

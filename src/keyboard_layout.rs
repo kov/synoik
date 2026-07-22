@@ -67,15 +67,22 @@ pub fn xkb_from_input_sources(
 /// from one that produced the live keymap, so a broken config with a coincidentally equal layout
 /// count can mislabel — a harmless wrong label, never a panic.
 pub fn short_label(codes: &[String], names: &[String], idx: usize) -> Option<String> {
-    let count = names.len();
-    if count < 2 {
+    if names.len() < 2 {
         return None;
     }
-    // Prefer the configured codes when they line up 1:1 with the compiled layouts (libxkbcommon
-    // keeps the comma order, so the index maps straight through). A `file` keymap yields empty
-    // `codes`, and a stale/mismatched `layout` string fails the length check — both fall through to
-    // abbreviating the full xkb names.
-    let labels = if codes.len() == count {
+    labels(codes, names).into_iter().nth(idx)
+}
+
+/// The short label for *every* configured layout, in xkb order (the panel
+/// indicator shows the active one; the input-source popover shows them all).
+///
+/// Prefers the configured codes when they line up 1:1 with the compiled layouts
+/// (libxkbcommon keeps the comma order, so the index maps straight through). A
+/// `file` keymap yields empty `codes`, and a stale/mismatched `layout` string
+/// fails the length check — both fall through to abbreviating the full xkb
+/// names. Colliding labels are disambiguated either way (GNOME dedups too).
+pub fn labels(codes: &[String], names: &[String]) -> Vec<String> {
+    if codes.len() == names.len() {
         dedup(codes.iter().map(|c| c.trim().to_lowercase()).collect())
     } else {
         dedup(
@@ -85,8 +92,7 @@ pub fn short_label(codes: &[String], names: &[String], idx: usize) -> Option<Str
                 .map(|(i, name)| abbreviate(name, i))
                 .collect(),
         )
-    };
-    labels.into_iter().nth(idx)
+    }
 }
 
 /// The first two alphabetic chars of a full xkb layout name, lowercased ("English (US)" → "en"),
