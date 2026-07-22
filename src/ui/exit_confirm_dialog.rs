@@ -1,32 +1,28 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 
 use niri_config::Config;
-use niri_vk::text::{SpanFamily, TextSpan};
-use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, Frame as _, Texture};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::ui::widget::{self, ContentCache, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
 const PADDING: i32 = 16;
-/// Dialog font size, GNOME message-dialog body 11pt, logical px-per-em.
-const FONT_PX: f64 = crate::ui::pt_to_px(11.);
+/// Dialog font size, GNOME message-dialog body, GNOME points. `FONT_PX` is its
+/// logical px, used only for keycap-padding geometry; shaping uses [`ParagraphSpan`].
+const FONT_PT: f64 = 11.;
+const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 /// A generous non-wrapping layout width (logical px); the dialog is sized to its content, so this
 /// only needs to exceed the widest line.
 const WRAP_WIDTH: i32 = 1000;
@@ -40,31 +36,17 @@ const BORDER_COLOR: [f32; 4] = [1., 0.3, 0.3, 1.];
 const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
 /// Dialog text color (opaque white); the glyph coverage modulates the alpha.
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
-/// Index of the keycap span in [`draw_dialog_texture`]'s span list.
+/// Index of the keycap span in [`prepare_dialog`]'s span list.
 const KEYCAP_SPAN: u32 = 1;
 
 pub struct ExitConfirmDialog {
     state: State,
-    /// Cached dialog box textures per output scale (the text is static). Tied to a renderer
-    /// context: dropped wholesale when the renderer changes.
-    cache: RefCell<DialogCache>,
+    /// Cached dialog box texture (content-sized; the text is static so the revision
+    /// is always 0). Tied to a renderer context: dropped wholesale when it changes.
+    cache: RefCell<ContentCache>,
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
-}
-
-struct DialogCache {
-    context: Option<ContextId<VkTexture>>,
-    textures: HashMap<NotNan<f64>, VkTexture>,
-}
-
-impl DialogCache {
-    fn new() -> Self {
-        Self {
-            context: None,
-            textures: HashMap::new(),
-        }
-    }
 }
 
 niri_render_elements! {
@@ -89,7 +71,7 @@ impl ExitConfirmDialog {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self {
             state: State::Hidden,
-            cache: RefCell::new(DialogCache::new()),
+            cache: RefCell::new(ContentCache::new()),
             clock,
             config,
         }
@@ -189,36 +171,26 @@ impl ExitConfirmDialog {
 
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
-        let Some(scale_key) = NotNan::new(scale).ok() else {
-            return;
-        };
 
         let texture = {
             let mut cache = self.cache.borrow_mut();
-
-            // The cached textures belong to one renderer context; drop them all if it changed.
-            let context = renderer.context_id();
-            if cache.context.as_ref() != Some(&context) {
-                cache.textures.clear();
-                cache.context = Some(context);
-            }
-
-            // Not the `entry` API: the build is fallible and borrows `renderer`, which the
-            // closure-based `or_insert_with` can't express.
-            #[allow(clippy::map_entry)]
-            if !cache.textures.contains_key(&scale_key) {
-                match draw_dialog_texture(renderer, scale) {
-                    Ok(texture) => {
-                        cache.textures.insert(scale_key, texture);
-                    }
-                    Err(err) => {
-                        // Fail visible: fall through to always draw the backdrop below (this dialog
-                        // is a modal grab; never leave the seat with no overlay at all).
-                        warn!("error rendering the exit confirm dialog: {err:#}");
-                    }
+            // Content-sized, static text → revision 0. Fail visible: on error fall
+            // through to always draw the backdrop below (this dialog is a modal
+            // grab; never leave the seat with no overlay at all).
+            match widget::bake_content(
+                renderer,
+                &mut cache,
+                scale,
+                0,
+                |renderer| prepare_dialog(renderer, scale),
+                paint_dialog,
+            ) {
+                Ok(texture) => Some(texture),
+                Err(err) => {
+                    warn!("error rendering the exit confirm dialog: {err:#}");
+                    None
                 }
             }
-            cache.textures.get(&scale_key).cloned()
         };
 
         if let Some(texture) = texture {
@@ -277,43 +249,36 @@ impl ExitConfirmDialog {
     }
 }
 
-/// Draw the dialog box into an offscreen [`VkTexture`] on the GPU: the opaque dark box, a red
-/// alert border, a grey keycap background behind " Enter ", and the centered two-line message.
-/// The box is content-sized (the text is static). No cairo/pango raster.
-fn draw_dialog_texture(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
-    let _span = tracy_client::span!("exit_confirm_dialog::draw_dialog_texture");
+/// The computed physical layout of the dialog box (content-sized, static text),
+/// produced by [`prepare_dialog`] and drawn by [`paint_dialog`].
+struct DialogLayout {
+    run: ShapedParagraph,
+    origin: Point<i32, Physical>,
+    inner: Rectangle<i32, Physical>,
+    keycap: Option<Rectangle<i32, Physical>>,
+}
 
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let padding = padding.max(0);
-    let wrap_px: i32 = to_physical_precise_round(scale, WRAP_WIDTH);
-    let wrap_px = wrap_px.max(1);
+/// Shape the message and compute the content-sized box layout — the prepare phase
+/// for [`widget::bake_content`]. Span 1 (mono " Enter ") is [`KEYCAP_SPAN`].
+fn prepare_dialog(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+) -> anyhow::Result<(Size<i32, Physical>, DialogLayout)> {
+    let _span = tracy_client::span!("exit_confirm_dialog::prepare_dialog");
+
+    let padding = to_physical_precise_round::<i32>(scale, f64::from(PADDING)).max(0);
     // Even border thickness to avoid blurry edges, as the old cairo stroke did (~BORDER/2 visible).
-    let border: i32 = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
-    let px = (FONT_PX * scale) as f32;
+    let border = ((f64::from(BORDER) / 2. * scale).round() as i32).max(1);
 
     // Span 1 is the keycap (mono " Enter "), matching KEYCAP_SPAN.
     let key = format!(" {KEY_NAME} ");
     let spans = [
-        TextSpan {
-            text: "Are you sure you want to exit niri?\n\nPress",
-            family: SpanFamily::Sans,
-            bold: false,
-            px,
-        },
-        TextSpan {
-            text: &key,
-            family: SpanFamily::Mono,
-            bold: false,
-            px,
-        },
-        TextSpan {
-            text: " to confirm.",
-            family: SpanFamily::Sans,
-            bold: false,
-            px,
-        },
+        ParagraphSpan::new("Are you sure you want to exit niri?\n\nPress", FONT_PT),
+        ParagraphSpan::new(&key, FONT_PT).mono(),
+        ParagraphSpan::new(" to confirm.", FONT_PT),
     ];
-    let run = renderer.build_glyph_paragraph(&spans, wrap_px as f32, px)?;
+    let mut shaper = TextShaper::new(renderer, scale);
+    let run = shaper.paragraph(&spans, f64::from(WRAP_WIDTH), FONT_PT)?;
 
     // The box is content-sized: place the whole ink block at (padding, padding).
     let (ix, iy, iw, ih) = run.ink_bounds();
@@ -322,7 +287,6 @@ fn draw_dialog_texture(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Res
     let origin = Point::<i32, Physical>::from((padding - ix, padding - iy));
 
     let size = Size::<i32, Physical>::from((box_w, box_h));
-    let full = Rectangle::from_size(size);
     let inner = Rectangle::new(
         Point::from((border, border)),
         Size::from(((box_w - border * 2).max(0), (box_h - border * 2).max(0))),
@@ -330,36 +294,45 @@ fn draw_dialog_texture(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Res
 
     // The keycap background: the " Enter " span's ink, padded to a keycap, clamped inside the box.
     let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
-    let keycap = (kw > 0 && kh > 0).then(|| {
-        let pad_x = (px * 0.3).round() as i32;
-        let pad_y = (px * 0.2).round() as i32;
-        let rect = Rectangle::new(
-            Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
-            Size::from((kw + pad_x * 2, kh + pad_y * 2)),
-        );
-        rect.intersection(inner)
-    });
+    let keycap = (kw > 0 && kh > 0)
+        .then(|| {
+            let pad_x = to_physical_precise_round::<i32>(scale, FONT_PX * 0.3);
+            let pad_y = to_physical_precise_round::<i32>(scale, FONT_PX * 0.2);
+            Rectangle::new(
+                Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
+                Size::from((kw + pad_x * 2, kh + pad_y * 2)),
+            )
+            .intersection(inner)
+        })
+        .flatten();
 
-    let mut target = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, BufferCoord>::from((box_w, box_h)),
-    )?;
-    {
-        let mut fb = renderer.bind(&mut target)?;
-        let mut frame = renderer.render(&mut fb, size, Transform::Normal)?;
+    Ok((
+        size,
+        DialogLayout {
+            run,
+            origin,
+            inner,
+            keycap,
+        },
+    ))
+}
 
-        // Red border = whole box cleared red, then the inner rect cleared to the dark bg.
-        frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
-        frame.clear(Color32F::from(BOX_BG), &[inner])?;
-        if let Some(Some(keycap)) = keycap {
-            frame.clear(Color32F::from(KEYCAP_BG), &[keycap])?;
-        }
-        frame.render_glyphs(&run, origin, TEXT, full, &[full])?;
-        let _sync = frame.finish()?;
+/// Draw the red border, the dark box, the keycap patch, and the message — the paint
+/// phase for [`widget::bake_content`].
+fn paint_dialog(
+    frame: &mut VulkanFrame,
+    phys: Size<i32, Physical>,
+    layout: &DialogLayout,
+) -> anyhow::Result<()> {
+    let full = Rectangle::from_size(phys);
+    // Red border = whole box cleared red, then the inner rect cleared to the dark bg.
+    frame.clear(Color32F::from(BORDER_COLOR), &[full])?;
+    frame.clear(Color32F::from(BOX_BG), &[layout.inner])?;
+    if let Some(keycap) = layout.keycap {
+        frame.clear(Color32F::from(KEYCAP_BG), &[keycap])?;
     }
-
-    renderer.make_offscreen_sampleable(&target)?;
-    Ok(target)
+    frame.render_glyphs(layout.run.run(), layout.origin, TEXT, full, &[full])?;
+    Ok(())
 }
 
 /// The dialog message as plain text (for accessibility).
@@ -381,7 +354,9 @@ pub fn a11y_node() -> accesskit::Node {
 
 #[cfg(test)]
 mod tests {
-    use smithay::backend::renderer::ExportMem;
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{Bind, ExportMem};
+    use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
 
@@ -399,7 +374,16 @@ mod tests {
             }
         };
 
-        let mut tex = draw_dialog_texture(&mut vk, 1.).expect("dialog texture");
+        let mut cache = ContentCache::new();
+        let mut tex = widget::bake_content(
+            &mut vk,
+            &mut cache,
+            1.,
+            0,
+            |r| prepare_dialog(r, 1.),
+            paint_dialog,
+        )
+        .expect("dialog texture");
         let size = tex.size();
         assert!(size.w > 0 && size.h > 0);
 
