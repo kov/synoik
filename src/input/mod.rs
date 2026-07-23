@@ -3450,6 +3450,7 @@ impl State {
                     // per-rebuild `requestRange` (`js/ui/calendar.js:748`).
                     self.niri.sync_calendar_range();
                     self.niri.refresh_popover_calendar_events();
+                    self.niri.refresh_popover_world_clocks();
                     self.niri.queue_redraw_all();
                     return;
                 }
@@ -3511,6 +3512,7 @@ impl State {
                                     // and populate the section from what's cached.
                                     self.niri.sync_calendar_range();
                                     self.niri.refresh_popover_calendar_events();
+                                    self.niri.refresh_popover_world_clocks();
                                 }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
@@ -3949,6 +3951,7 @@ impl State {
                         // reload events for the new grid (`js/ui/calendar.js:748`).
                         self.niri.sync_calendar_range();
                         self.niri.refresh_popover_calendar_events();
+                        self.niri.refresh_popover_world_clocks();
                         self.niri.queue_redraw_all();
                     }
                     return;

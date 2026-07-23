@@ -357,6 +357,17 @@ impl PanelPopover {
         }
     }
 
+    /// Push a freshly-formatted World Clocks section model into the open dateMenu.
+    /// Returns whether it changed anything.
+    pub fn set_world_clocks(&mut self, model: crate::world_clocks::WorldClocksModel) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
+                dm.set_world_clocks(model)
+            }
+            _ => false,
+        }
+    }
+
     /// Introspection/test hook: the open dateMenu content.
     pub fn date_menu(&self) -> Option<&DateMenu> {
         match &self.content {

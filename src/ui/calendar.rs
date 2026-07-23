@@ -25,9 +25,19 @@
 //! paging-keeps-selection divergence the grid already carries, so an event list
 //! can outlive a visible month change until a day in the new month is clicked.
 //!
-//! Deferred vs gnome-shell: world clocks, weather, calendar day-has-events dots,
-//! and keyboard grid navigation. Those hang off daemons/D-Bus (GNOME Clocks,
-//! GWeather) or are follow-ups; this is the self-contained core the popover opens on.
+//! The World Clocks section below the Events card IS ported (`set_world_clocks`,
+//! fed by `src/world_clocks.rs`): a `%card` with the same clip-not-scroll and
+//! clipped-bottom-corner divergences as the events card. Its own divergences (in
+//! `world_clocks.rs`): the timezone is resolved from the serialized coordinates
+//! (tzf-rs), not GWeather's DB; city labels are the English serialized name;
+//! clicking anywhere on the card launches GNOME Clocks via `gtk-launch` (GNOME
+//! activates the app object). Shown iff `org.gnome.clocks.desktop` is installed —
+//! sampled once at startup, so installing/removing Clocks mid-session needs a relog
+//! (GNOME re-syncs on `installed-changed`). Long city names hard-clip rather than
+//! ellipsize (GNOME's city label shows "…").
+//!
+//! Deferred vs gnome-shell: weather, calendar day-has-events dots, and keyboard
+//! grid navigation. Those hang off daemons/D-Bus (GWeather) or are follow-ups.
 //!
 //! The popover content itself is [`DateMenu`]: gnome-shell's dateMenu is a
 //! two-column hbox with the notification message list as the FIRST (left in
@@ -1966,6 +1976,23 @@ const EN_DASH: &str = "\u{2013}";
 /// row into a scrolling list; we render a clipped card, so a hard cap is safe.
 const MAX_EVENT_ROWS: usize = 128;
 
+// World Clocks section (`.world-clocks-button`/`.world-clocks-grid`,
+// `_calendar.scss:200-236`). The card shares the `%card` box with events
+// (`EVENTS_MARGIN`/`EVENTS_CARD_RADIUS`/`EVENTS_CARD_PAD`) and the
+// `datemenu-displays-box` gap (`EVENTS_GAP`).
+/// `.world-clocks-header` is `%heading` (11pt).
+const WC_HEADER_PT: f64 = 11.;
+/// `.world-clocks-city` inherits the base body size; `.world-clocks-time` is
+/// `%numeric` bold (same size).
+const WC_CITY_PT: f64 = 11.;
+const WC_TIME_PT: f64 = 11.;
+/// `.world-clocks-timezone` is `%numeric %caption` (9pt), muted.
+const WC_OFFSET_PT: f64 = 9.;
+/// `.world-clocks-grid spacing-rows: $base_padding`.
+const WC_ROW_GAP: f64 = 6.;
+/// `.world-clocks-grid spacing-columns: $base_padding * 2`.
+const WC_COL_GAP: f64 = 12.;
+
 /// A logical text line height (the file's `pt * 1.3` convention, see
 /// [`placeholder_centers`]).
 fn line_h(pt: f64) -> f64 {
@@ -2179,6 +2206,13 @@ pub struct DateMenu {
     events_rev: u64,
     /// The events-card texture, cached per scale.
     events_cache: RefCell<TextureCache>,
+    /// The World Clocks section model (header + rows), formatted by the compositor
+    /// at the current instant; empty/hidden until GNOME Clocks reports locations.
+    world_clocks: crate::world_clocks::WorldClocksModel,
+    /// Bumped whenever `world_clocks` changes, to key its texture cache.
+    world_clocks_rev: u64,
+    /// The world-clocks-card texture, cached per scale.
+    world_clocks_cache: RefCell<TextureCache>,
     /// The popover background (rounded box + placeholder label / Clear pill),
     /// cached per scale; the stored revision is 0/1 for empty/non-empty.
     bg_cache: RefCell<TextureCache>,
@@ -2203,6 +2237,12 @@ impl DateMenu {
             events: EventsSectionModel::default(),
             events_rev: 0,
             events_cache: RefCell::new(TextureCache {
+                context: None,
+                textures: HashMap::new(),
+            }),
+            world_clocks: crate::world_clocks::WorldClocksModel::default(),
+            world_clocks_rev: 0,
+            world_clocks_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
             }),
@@ -2275,6 +2315,81 @@ impl DateMenu {
         }
     }
 
+    /// Adopt a freshly-formatted World Clocks section model. Returns whether it changed.
+    pub fn set_world_clocks(&mut self, model: crate::world_clocks::WorldClocksModel) -> bool {
+        if self.world_clocks == model {
+            return false;
+        }
+        self.world_clocks = model;
+        self.world_clocks_rev += 1;
+        true
+    }
+
+    /// The World Clocks section model (for tests / introspection).
+    pub fn world_clocks(&self) -> &crate::world_clocks::WorldClocksModel {
+        &self.world_clocks
+    }
+
+    /// The world-clocks card's inner content height: the header, then (when there
+    /// are clocks) the row-gap and one line per clock, `WC_ROW_GAP` between.
+    fn world_clocks_content_h(&self) -> f64 {
+        let header = line_h(WC_HEADER_PT);
+        if self.world_clocks.rows.is_empty() {
+            header
+        } else {
+            let n = self.world_clocks.rows.len() as f64;
+            header + WC_ROW_GAP + n * line_h(WC_TIME_PT) + (n - 1.) * WC_ROW_GAP
+        }
+    }
+
+    /// The world-clocks card's outer height (content + padding).
+    fn world_clocks_card_h(&self) -> f64 {
+        self.world_clocks_content_h() + 2. * EVENTS_CARD_PAD
+    }
+
+    /// The section texture's natural height (card + margins), clamped to the room
+    /// left below the grid AND the events card. Overflow clips (ScrollView deferred).
+    fn world_clocks_alloc_h(&self) -> f64 {
+        if !self.world_clocks.visible {
+            return 0.;
+        }
+        let section = self.world_clocks_card_h() + 2. * EVENTS_MARGIN;
+        let cal_h = self.calendar.logical_size().h;
+        let room = (self.available_h - cal_h - self.events_height() - EVENTS_GAP).max(0.);
+        section.min(room)
+    }
+
+    /// The world-clocks section's contribution to the calendar column height (the
+    /// gap above it plus the section), 0 when hidden or with no room.
+    fn world_clocks_height(&self) -> f64 {
+        let alloc = self.world_clocks_alloc_h();
+        if alloc > 0. {
+            EVENTS_GAP + alloc
+        } else {
+            0.
+        }
+    }
+
+    /// The world-clocks card rect (popover-local), when the section is shown —
+    /// clicking anywhere on it launches GNOME Clocks (`vfunc_clicked`). This is the
+    /// card box (the `%card` margin ring lies outside the button, like GNOME's
+    /// `St.Button` hit area), inset from the section allocation by `EVENTS_MARGIN`.
+    fn world_clocks_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let alloc = self.world_clocks_alloc_h();
+        if alloc <= 0. {
+            return None;
+        }
+        let cal = self.calendar.logical_size();
+        let top = cal.h + self.events_height() + EVENTS_GAP + EVENTS_MARGIN;
+        Some(Rectangle::new(
+            Point::from((calendar_col_x() + EVENTS_MARGIN, top)),
+            Size::from((
+                (cal.w - 2. * EVENTS_MARGIN).max(0.),
+                (alloc - 2. * EVENTS_MARGIN).max(0.),
+            )),
+        ))
+    }
+
     /// Set the popover's height budget (work area minus margins). The dateMenu
     /// grows to fit its content up to this; beyond it, the message list scrolls.
     pub fn set_available_height(&mut self, available_h: f64) {
@@ -2286,8 +2401,9 @@ impl DateMenu {
     /// work-area height — never below the calendar, so it stays fully visible.
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let cal = self.calendar.logical_size();
-        // The calendar column is the grid plus the Events section below it.
-        let column_h = cal.h + self.events_height();
+        // The calendar column is the grid plus the Events and World Clocks sections
+        // stacked below it (`datemenu-displays-box`, `dateMenu.js:960-964`).
+        let column_h = cal.h + self.events_height() + self.world_clocks_height();
         let natural = column_h.max(self.list.natural_height());
         let h = natural.min(self.available_h.max(column_h));
         Size::from((calendar_col_x() + cal.w, h))
@@ -2339,6 +2455,14 @@ impl DateMenu {
                 Some(ListHit::Clear) => PopoverAction::ClearNotifications,
                 None => PopoverAction::Consumed,
             };
+        }
+        // A click anywhere on the World Clocks card launches GNOME Clocks and closes
+        // the popover (`WorldClocksSection.vfunc_clicked`, `dateMenu.js:376-382`).
+        if self.world_clocks_rect().is_some_and(|r| r.contains(pos)) {
+            return PopoverAction::Spawn(vec![
+                "gtk-launch".to_string(),
+                "org.gnome.clocks".to_string(),
+            ]);
         }
         self.calendar
             .pointer_click(pos - Point::from((calendar_col_x(), 0.)));
@@ -2660,6 +2784,154 @@ impl DateMenu {
         })
     }
 
+    /// The world-clocks card texture, cached per scale (keyed by `world_clocks_rev`
+    /// and the physical clip height, like the events card).
+    fn world_clocks_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<VkTexture> {
+        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        let height_key =
+            to_physical_precise_round::<i64>(scale, self.world_clocks_alloc_h()).max(0);
+        let revision = (self.world_clocks_rev & 0xFFFF_FFFF) | ((height_key as u64) << 32);
+        let mut cache = self.world_clocks_cache.borrow_mut();
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.textures.clear();
+            cache.context = Some(context);
+        }
+        let fresh = matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == revision);
+        if !fresh {
+            let tex = self.draw_world_clocks(renderer, scale)?;
+            cache.textures.insert(scale_key, (revision, tex));
+        }
+        Ok(cache
+            .textures
+            .get(&scale_key)
+            .map(|(_, t)| t.clone())
+            .unwrap())
+    }
+
+    fn draw_world_clocks(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<VkTexture> {
+        let cal_w = self.calendar.logical_size().w;
+        let alloc_h = self.world_clocks_alloc_h();
+        let phys = Size::<i32, Physical>::from((
+            to_physical_precise_round::<i32>(scale, cal_w).max(1),
+            to_physical_precise_round::<i32>(scale, alloc_h).max(1),
+        ));
+
+        // Shape header + the three cells per row before the bake frame opens.
+        let (header_run, row_runs) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let header_run = shaper.shape(
+                &self.world_clocks.header,
+                TextStyle::new(WC_HEADER_PT).bold(),
+            )?;
+            let mut row_runs = Vec::with_capacity(self.world_clocks.rows.len());
+            for row in &self.world_clocks.rows {
+                let city = shaper.shape(&row.city, TextStyle::new(WC_CITY_PT))?;
+                let time = shaper.shape(&row.time, TextStyle::new(WC_TIME_PT).bold())?;
+                let offset = shaper.shape(&row.tz_offset, TextStyle::new(WC_OFFSET_PT))?;
+                row_runs.push((city, time, offset));
+            }
+            (header_run, row_runs)
+        };
+
+        // Column widths: the time and offset columns are as wide as their widest
+        // cell; the city column expands into the rest (`world-clocks-grid`).
+        let ink_w = |run: &widget::ShapedText| run.ink_bounds().2 as f64 / scale;
+        let offset_col_w = row_runs
+            .iter()
+            .map(|(_, _, o)| ink_w(o))
+            .fold(0.0_f64, f64::max);
+        let time_col_w = row_runs
+            .iter()
+            .map(|(_, t, _)| ink_w(t))
+            .fold(0.0_f64, f64::max);
+
+        // The header is `$fg_color` (`.no-world-clocks`) when empty, else muted.
+        let header_color = if self.world_clocks.empty { TEXT } else { MUTED };
+        let card_h = self.world_clocks_card_h();
+        widget::bake_uncached_sized(renderer, phys, move |frame| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(TRANSPARENT)?;
+
+            let card = Rectangle::new(
+                Point::<f64, Logical>::from((EVENTS_MARGIN, EVENTS_MARGIN)),
+                Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
+            );
+            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+
+            let inner_left = card.loc.x + EVENTS_CARD_PAD;
+            let inner_right = card.loc.x + card.size.w - EVENTS_CARD_PAD;
+            let mut y = card.loc.y + EVENTS_CARD_PAD;
+
+            // All cells are centered by their font line box (not ink), so the
+            // three side-by-side columns share a baseline regardless of descenders.
+            let card_clip = Rectangle::new(card.loc, card.size);
+
+            // Header (`.world-clocks-header`), spanning the city/time columns.
+            p.text_band(
+                &header_run,
+                inner_left,
+                widget::HAlign::Left,
+                y,
+                line_h(WC_HEADER_PT),
+                header_color,
+                card_clip,
+            )?;
+            y += line_h(WC_HEADER_PT);
+
+            // The right edges of the offset and time columns.
+            let offset_x = inner_right;
+            let time_x = inner_right - offset_col_w - WC_COL_GAP;
+            let city_clip_right = time_x - time_col_w - WC_COL_GAP;
+            let band = line_h(WC_TIME_PT);
+            for (city, time, offset) in &row_runs {
+                y += WC_ROW_GAP;
+                // City (start-aligned, full fg), clipped short of the time column.
+                p.text_band(
+                    city,
+                    inner_left,
+                    widget::HAlign::Left,
+                    y,
+                    band,
+                    TEXT,
+                    Rectangle::new(
+                        Point::from((inner_left, y)),
+                        Size::from(((city_clip_right - inner_left).max(0.), band)),
+                    ),
+                )?;
+                // Time (bold, right-aligned) then the muted offset at the far right.
+                p.text_band(
+                    time,
+                    time_x,
+                    widget::HAlign::Right,
+                    y,
+                    band,
+                    TEXT,
+                    card_clip,
+                )?;
+                p.text_band(
+                    offset,
+                    offset_x,
+                    widget::HAlign::Right,
+                    y,
+                    band,
+                    MUTED,
+                    card_clip,
+                )?;
+                y += band;
+            }
+            Ok(())
+        })
+    }
+
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -2746,6 +3018,35 @@ impl DateMenu {
                 }
                 Err(err) => {
                     tracing::error!("error drawing the events section: {err:#}");
+                }
+            }
+        }
+
+        // The World Clocks section card, below the Events card in the calendar
+        // column (`datemenu-displays-box`, `js/ui/dateMenu.js:963`).
+        if self.world_clocks_height() > 0. {
+            let cal_h = self.calendar.logical_size().h;
+            let top = cal_h + self.events_height() + EVENTS_GAP;
+            match self.world_clocks_texture(renderer, scale) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        origin + Point::from((calendar_col_x(), top)),
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => {
+                    tracing::error!("error drawing the world clocks section: {err:#}");
                 }
             }
         }
@@ -4062,5 +4363,77 @@ mod tests {
             rows: vec![],
         });
         assert!(dm.events_texture(&mut vk, 2.0).is_ok());
+    }
+
+    fn wc_model(visible: bool, rows: usize) -> crate::world_clocks::WorldClocksModel {
+        use crate::world_clocks::{ClockRow, WorldClocksModel};
+        WorldClocksModel {
+            visible,
+            header: if rows == 0 {
+                "Add World Clocks…"
+            } else {
+                "World Clocks"
+            }
+            .into(),
+            empty: rows == 0,
+            rows: (0..rows)
+                .map(|i| ClockRow {
+                    city: format!("City {i}"),
+                    time: "12:00".into(),
+                    tz_offset: "+1".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn world_clocks_section_grows_the_calendar_column() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        let base = dm.logical_size().h;
+        // Hidden (Clocks not installed) adds no height.
+        assert!(dm.set_world_clocks(wc_model(false, 2)));
+        assert_eq!(dm.logical_size().h, base, "hidden section adds no height");
+        // A visible section grows the column.
+        assert!(dm.set_world_clocks(wc_model(true, 2)));
+        assert!(
+            dm.logical_size().h > base,
+            "a visible world-clocks section grows the calendar column"
+        );
+    }
+
+    #[test]
+    fn world_clocks_click_launches_clocks() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_world_clocks(wc_model(true, 1));
+        let rect = dm.world_clocks_rect().expect("visible section has a rect");
+        let center = rect.loc + Point::from((rect.size.w / 2., rect.size.h / 2.));
+        assert_eq!(
+            dm.pointer_click(center),
+            PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.clocks".into()]),
+            "clicking the card launches GNOME Clocks"
+        );
+    }
+
+    #[test]
+    fn world_clocks_card_bakes_at_multiple_scales() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping world_clocks_card_bakes_at_multiple_scales: no Vulkan ({e})");
+                return;
+            }
+        };
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_world_clocks(wc_model(true, 2));
+        for scale in [1.0, 1.5, 2.0] {
+            let tex = dm
+                .world_clocks_texture(&mut vk, scale)
+                .expect("world clocks texture bakes");
+            let size = smithay::backend::renderer::Texture::size(&tex);
+            assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
+        }
+        // Empty (Add World Clocks…) also bakes.
+        dm.set_world_clocks(wc_model(true, 0));
+        assert!(dm.world_clocks_texture(&mut vk, 2.0).is_ok());
     }
 }

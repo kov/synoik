@@ -915,6 +915,42 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Draw `shaped` horizontally per `halign` at logical `x`, vertically centered by
+    /// its font **line box** within the band `[band_top, band_top + band_h]` (logical),
+    /// clipped to `clip` (logical). Unlike [`text`](Self::text)'s ink-box centering,
+    /// line-box centering keeps baselines aligned across side-by-side cells regardless
+    /// of which strings carry descenders (the grid-row idiom, as the panel does for its
+    /// clock/labels) — see [`ShapedText::line_box_centered_y`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_band(
+        &mut self,
+        shaped: &ShapedText,
+        x: f64,
+        halign: HAlign,
+        band_top: f64,
+        band_h: f64,
+        color: Rgba,
+        clip: Rectangle<f64, Logical>,
+    ) -> anyhow::Result<()> {
+        let (ix, _iy, iw, _ih) = shaped.run.ink_bounds();
+        let ax = self.px(x);
+        let ox = match halign {
+            HAlign::Left => ax - ix,
+            HAlign::Center => ax - ix - iw / 2,
+            HAlign::Right => ax - ix - iw,
+        };
+        let oy = self.px(band_top) + shaped.line_box_centered_y(self.px(band_h));
+        let clip = self.rect_px(clip);
+        self.frame.render_glyphs(
+            &shaped.run,
+            Point::from((ox, oy)),
+            color,
+            clip,
+            &[self.full],
+        )?;
+        Ok(())
+    }
+
     /// Draw a shaped run at a precomputed **physical** glyph-layout `origin`, tinted
     /// `color`, clipped to the whole buffer. The physical-coordinate counterpart to
     /// [`text`](Self::text) for a run whose placement isn't a simple ink-box anchor —

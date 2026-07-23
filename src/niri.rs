@@ -982,6 +982,9 @@ impl State {
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
+                        // A world-clocks change (e.g. the Clocks mirror wrote new
+                        // locations) refreshes the open section.
+                        state.niri.refresh_popover_world_clocks();
                         state.niri.queue_redraw_all();
                     }
                 })
@@ -3323,6 +3326,9 @@ impl Niri {
                     if state.niri.panel.update_clock() {
                         state.niri.queue_redraw_all();
                     }
+                    // Refresh the open World Clocks section's live times/offsets on
+                    // the same tick (gnome-shell's `WallClock notify::clock`).
+                    state.niri.refresh_popover_world_clocks();
                     // Re-arm for the next second (when showing seconds) or the next
                     // minute boundary, per the current clock format.
                     TimeoutAction::ToDuration(state.niri.panel.clock_tick_interval())
@@ -7929,6 +7935,28 @@ impl Niri {
             is_24h,
         );
         if self.panel_popover.set_calendar_events(model) {
+            self.queue_redraw_all();
+        }
+    }
+
+    /// Rebuild the open World Clocks section at the current instant and push it,
+    /// on popover open, a settings change, or the panel's per-minute clock tick
+    /// (gnome-shell refreshes the labels on `WallClock notify::clock`,
+    /// `js/ui/dateMenu.js:508-521`). Gated on the dateMenu popover being open.
+    pub fn refresh_popover_world_clocks(&mut self) {
+        if self.panel_popover.date_menu().is_none() {
+            return;
+        }
+        // SAFETY: `time(NULL)` reads the wall clock (world clocks show live times).
+        let now_secs = unsafe { libc::time(std::ptr::null_mut()) } as i64;
+        let is_24h = self.gnome_settings.clock.hour24;
+        let model = crate::world_clocks::world_clocks_model(
+            &self.gnome_settings.world_clocks.locations,
+            self.gnome_settings.world_clocks.clocks_installed,
+            now_secs,
+            is_24h,
+        );
+        if self.panel_popover.set_world_clocks(model) {
             self.queue_redraw_all();
         }
     }
