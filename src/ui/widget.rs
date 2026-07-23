@@ -53,6 +53,27 @@ pub mod style {
     /// lighten-vs-darken *direction* is per-widget (read from the SCSS cascade); this
     /// is the standard lighten used by menu rows / QS tiles / calendar days.
     pub const HOVER_WASH: Rgba = [1., 1., 1., 0.1];
+    /// `$borders_color` = `transparentize($fg_color, 0.9)` (white @ 10%, dark theme) — the 1px
+    /// rule color for the calendar column separator (`.message-list` border-right,
+    /// `_message-list.scss:8`) and the QS group separators
+    /// (`.popup-separator-menu-item-separator`, `_popovers.scss:117`). The single source of truth
+    /// so the two can't drift; draw both via [`Painter::hairline`](super::Painter::hairline).
+    pub const BORDERS: Rgba = [1., 1., 1., 0.1];
+
+    /// Source-over composite of `fg` (possibly translucent) onto the **opaque** `bg`, returning an
+    /// opaque color — the color a translucent overlay *would* produce over `bg`. Use it to lay a
+    /// translucent [`BORDERS`] hairline onto an opaque surface via the crisp (replacing) clear that
+    /// [`Painter::hairline`](super::Painter::hairline) uses, so the line reads the same as it would
+    /// blended (a raw translucent clear would instead punch a hole to whatever is behind).
+    pub fn over(bg: Rgba, fg: Rgba) -> Rgba {
+        let a = fg[3];
+        [
+            bg[0] * (1. - a) + fg[0] * a,
+            bg[1] * (1. - a) + fg[1] * a,
+            bg[2] * (1. - a) + fg[2] * a,
+            1.,
+        ]
+    }
     /// Icon-name fallback chain for an "active/selected" check mark.
     pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 
@@ -1026,6 +1047,22 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     ) -> anyhow::Result<()> {
         self.frame.clear(Color32F::from(color), &[rect])?;
         Ok(())
+    }
+
+    /// A crisp separator hairline filling the logical `rect` (one dimension is its 1px thickness).
+    /// Snapped to device pixels and painted with [`fill_rect_px`](Self::fill_rect_px) — a *clear*,
+    /// so a hairline keeps full coverage where an SDF `fill_rounded` would anti-alias both edges
+    /// and halve a 1px line (`_message-list.scss` / `_popovers.scss` `$borders_color` all but
+    /// vanished as a rounded fill). Because it clears (replaces, not blends), pass an **opaque**
+    /// color when drawing over opaque content — use [`style::over`] to pre-blend
+    /// [`style::BORDERS`] onto the surface; over a transparent bake layer the translucent
+    /// `BORDERS` itself is correct (it blends when the layer composites). The single home for both
+    /// the calendar column separator and the QS group separators.
+    pub fn hairline(&mut self, rect: Rectangle<f64, Logical>, color: Rgba) -> anyhow::Result<()> {
+        let mut px = self.rect_px(rect);
+        px.size.w = px.size.w.max(1);
+        px.size.h = px.size.h.max(1);
+        self.fill_rect_px(px, color)
     }
 
     /// Draw a shaped paragraph block with its layout frame's top-left at `origin`

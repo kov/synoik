@@ -782,10 +782,6 @@ const SCROLLBAR_W: f64 = 6.;
 const SCROLLBAR_MIN_H: f64 = 24.;
 const SCROLLBAR_EDGE_GAP: f64 = 4.;
 const SCROLLBAR_THUMB: [f32; 4] = [0.45, 0.45, 0.47, 1.];
-/// The 1px column separator: `.message-list`'s `border-right` in
-/// `$borders_color` = fg at 10% on the dark theme (`_message-list.scss:8,11`,
-/// `_colors.scss:39`).
-const SEPARATOR: [f32; 4] = [1., 1., 1., 0.1];
 
 /// A visible card's `(id, card rect, close-button rect)`, popover-local
 /// (introspection/test hook).
@@ -2679,18 +2675,16 @@ impl DateMenu {
             p.clear(TRANSPARENT)?;
 
             // The 1px separator on the list column's right edge (`.message-list` border-right,
-            // `_message-list.scss:8,11`). Drawn with the crisp device-pixel fill, NOT
-            // `fill_rounded` — an SDF rect anti-aliases both edges of a hairline,
-            // halving its coverage so a white@10% line all but vanished; `fill_rect_px`
-            // paints full-alpha device pixels, so it reads at the intended
-            // $borders_color like GNOME's.
-            let sep_x = to_physical_precise_round::<i32>(scale, LIST_PAD + LIST_W);
-            let sep_w = to_physical_precise_round::<i32>(scale, 1.).max(1);
-            let sep = Rectangle::<i32, Physical>::new(
-                Point::from((sep_x, 0)),
-                Size::from((sep_w, phys.h)),
-            );
-            p.fill_rect_px(sep, SEPARATOR)?;
+            // `_message-list.scss:8,11`). This layer bakes transparent and composites over the
+            // popover box, so the translucent `$borders_color` blends correctly at composite —
+            // `Painter::hairline` keeps it crisp (an SDF fill would AA-dim a 1px line away).
+            p.hairline(
+                Rectangle::new(
+                    Point::from((LIST_PAD + LIST_W, 0.)),
+                    Size::from((1., size.h)),
+                ),
+                widget::style::BORDERS,
+            )?;
 
             if let Some(run) = &placeholder_run {
                 // Centered under the (separately composited) 96px icon.

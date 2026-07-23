@@ -172,12 +172,9 @@ const DETAIL_ROW_H: f64 = 36.;
 const DETAIL_ROW_GAP: f64 = 2.;
 const DETAIL_ROW_INSET: f64 = 12.;
 /// Extra space above a row that follows a group separator (e.g. the machine-power vs session
-/// split in the shutdown menu) — the `.popup-separator-menu-item`'s slot, with a 1px rule
-/// (`DETAIL_SEP_COLOR`) drawn centered in it.
+/// split in the shutdown menu) — the `.popup-separator-menu-item`'s slot, with a 1px
+/// `$borders_color` rule (shared [`widget::style::BORDERS`]) drawn centered in it.
 const DETAIL_SEP_EXTRA: f64 = 8.;
-/// The group-separator rule — `.popup-separator-menu-item-separator` = `$borders_color` =
-/// `transparentize($fg_color, 0.9)` (white @ 10%).
-const DETAIL_SEP_COLOR: [f32; 4] = [1., 1., 1., 0.1];
 /// Detail-card surface — gnome-shell's `%card` = `$card_bg_color` = `lighten($bg_color, 7%)`
 /// ≈ `#47474c`, one step lighter than the menu box. Shared [`widget::style::CARD_BG`].
 const CARD_BG: [f32; 4] = widget::style::CARD_BG;
@@ -1863,23 +1860,20 @@ impl QuickSettings {
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
-                    // A rule centered in the extra gap above a group-opening row. Drawn as crisp
-                    // device pixels (`fill_rect_px`) — a 1px SDF fill would AA-dim white@10% away.
+                    // The group-separator rule, centered in the extra gap above a group-opening
+                    // row. The same `$borders_color` + crisp `Painter::hairline` as the calendar
+                    // column separator — but this bakes onto the *opaque* card, where the clear
+                    // would punch a translucent hole, so pre-blend the border over the card
+                    // (`style::over`) to lay the identical line as an opaque color.
                     if k > 0 && sep_shape.get(k).copied().unwrap_or(false) {
                         let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
-                        let x0 = to_physical_precise_round::<i32>(scale, card.loc.x + DETAIL_PAD);
-                        let x1 = to_physical_precise_round::<i32>(
-                            scale,
-                            card.loc.x + card.size.w - DETAIL_PAD,
-                        );
-                        let sep = Rectangle::<i32, Physical>::new(
-                            Point::from((x0, to_physical_precise_round::<i32>(scale, line_cy))),
-                            Size::from((
-                                (x1 - x0).max(1),
-                                to_physical_precise_round::<i32>(scale, 1.).max(1),
-                            )),
-                        );
-                        p.fill_rect_px(sep, DETAIL_SEP_COLOR)?;
+                        p.hairline(
+                            Rectangle::new(
+                                Point::from((card.loc.x + DETAIL_PAD, line_cy)),
+                                Size::from((card.size.w - 2. * DETAIL_PAD, 1.)),
+                            ),
+                            style::over(CARD_BG, style::BORDERS),
+                        )?;
                     }
                     // A hovered picker row: a faint rounded fill (it has no base
                     // bg) behind the label, matching GNOME's flat menu-item hover.
