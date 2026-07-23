@@ -139,7 +139,7 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 
 | # | Indicator | Panel icon | QS menu UI | Reference | Dep | Status |
 |---|---|---|---|---|---|---|
-| Q1 | **system** | battery/power icon + optional % (`system-shutdown-symbolic` w/o battery) | `SystemItem` row: PowerToggle (battery→power settings), Screenshot, Settings, Lock, **Shutdown w/ submenu** (Suspend/Restart/Power Off/Log Out) | `js/ui/status/system.js:308`; icon `:319-360`; row `:263-306`; PowerToggle `:32`; Screenshot `:110`; Settings `:133`; Lock `:240`; Shutdown+submenu `:167` | `[self]`/`[dbus:login1]` | ✅ screenshot/settings/lock + battery pill; **power button now opens the session submenu** (Suspend/Restart…/Power Off…/Log Out…) on the QuickMenuToggle framework, no longer power-offs directly. Switch User deferred (greeter jump). **No user avatar upstream** — don't add one. |
+| Q1 | **system** | battery/power icon + optional % (`system-shutdown-symbolic` w/o battery) | `SystemItem` row: PowerToggle (battery→power settings), Screenshot, Settings, Lock, **Shutdown w/ submenu** (Suspend/Restart/Power Off/Log Out) | `js/ui/status/system.js:308`; icon `:319-360`; row `:263-306`; PowerToggle `:32`; Screenshot `:110`; Settings `:133`; Lock `:240`; Shutdown+submenu `:167` | `[self]`/`[dbus:login1]` | ✅ screenshot/settings/lock + battery pill; **power button now opens the session submenu** (Suspend/Restart…/Power Off…/Log Out…) on the QuickMenuToggle framework, no longer power-offs directly. Switch User deferred — needs a lock screen + GDM greeter handoff (see backlog item 16). **No user avatar upstream** — don't add one. |
 | Q2 | **volume output** | speaker icon | `OutputStreamSlider` + output-device submenu | `OutputIndicator` `js/ui/status/volume.js:468`; icon `:439,487`; slider `:293,491`; device section `:77` | `[pw]` | 🟡 slider ✅ + **device picker ✅** (slider `go-next` arrow when >1 sink → in-menu list of sinks, current default checked, click sets it default via a `default.configured.audio.sink` metadata write). Divergences: sink-level not gvc port-level; no per-row device icon; list capped not scrolled |
 | Q3 | **volume input (mic)** | mic privacy icon while recording | `InputStreamSlider` + input-device submenu | `InputIndicator` `volume.js:508`; icon `:544-549`; slider `:367,535` | `[pw]` | ✅ privacy icon (orange while a non-skipped, non-monitor `Stream/Input/Audio` runs; white when source muted; leftmost in cluster); **mic slider + input-device picker ✅** (`7730c6ad`): a second QS slider below the output slider, shown only while recording with a bound source (`stream != null && recording`, `volume.js:429`); icon toggles source mute, track sets source level (sensitivity-graded icon), `go-next` arrow when >1 source → "Sound Input" card listing sources w/ default checked → row sets it default via `default.configured.audio.source`. Divergences (like Q2): source-level not gvc port-level; no slider→0-mute coupling; no unmute-at-25% |
 | Q4 | **brightness** | none | `BrightnessItem` slider; multi-monitor submenu | `js/ui/status/brightness.js:94`; slider `:38,99`; submenu `:12` | `[dbus:gsd/logind]` backlight | ⬜ |
@@ -350,3 +350,25 @@ carved these out as separate work — none block R1 for daily use:
     rich `<b>/<i>` spans) remain per the plan.
 14. ~~C6 events~~ ✅ (6a `a68a2a49` + 6b `ec70a4db`) / ~~C7 world clocks~~ ✅ (7a `8270ada8` + 7b `f3c1acfa` + 7c `02a46bde`) / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
+16. **Lock screen + Switch User** (Q1 shutdown submenu's missing `Switch User…` row). Investigated
+    2026-07-23 — this is a Phase-2 subsystem (see STRATEGY §6), not a one-line add. GNOME's
+    `SystemActions.activateSwitchUser` (`js/misc/systemActions.js:470`) does two things and gates on a
+    third, none of which the fork has yet:
+    - **Lock the current session first** — `Main.screenShield.lock(false)`. We have **no screen
+      shield / lock screen** at all. This is the load-bearing prerequisite *and* a hard security
+      requirement: without it, switching users leaves this session unlocked and visible on its VT.
+      The lock screen is its own subsystem (lock UI + PAM/logind unlock auth + sessionMode `isLocked`
+      plumbing that also gates the notification list, banners, etc.). Building it unblocks Switch User
+      almost for free.
+    - **Hand off to a greeter** — `Gdm.goto_login_session_sync(null)` spawns/activates a fresh GDM
+      greeter on another VT. That's a libgdm (GObject) call; to stay GObject-free (fork tenet) drive
+      GDM's D-Bus (`org.gnome.DisplayManager`) and/or logind (`org.freedesktop.login1`) directly.
+    - **Visibility gate** — GNOME shows the row iff `userManager.can_switch() && has_multiple_users`
+      (AccountsService, `org.freedesktop.Accounts`) and `!lockdown disable-user-switching`
+      (`org.gnome.desktop.lockdown`); hidden entirely on a single-user machine. So we also need an
+      AccountsService query to decide whether to render it.
+
+    Plan: do a **lock-screen slice** first (Phase 2), then add Switch User (the GDM handoff) + the
+    faithful multi-user/lockdown gate on top. Until then the shutdown submenu's session group is just
+    `Log Out…` (the group separator above it is already faithful). `Log Out`/`Restart`/`Power Off`
+    already work via our gnome-session `EndSessionDialog` handshake; only Switch User needs this.

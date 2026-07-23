@@ -484,7 +484,9 @@ EndSessionDialog; Night Light. The control-plane state/event model lands here.
 ### Phase 2: The overview & core shell UI (gated on Experiment 1)
 In-compositor overview (live thumbnails, workspace strip, dash, app-grid view, search via
 `SearchProvider2`), alt-tab switchers, OSDs, lock screen. Toolkit per Experiment 3:
-`st-toolkit` if it earns it, else libcosmic/iced.
+`st-toolkit` if it earns it, else libcosmic/iced. The **lock screen** is a prerequisite for
+**Switch User** (and gates sessionMode `isLocked`); requirements investigated in
+`docs/fork/panel-status-port.md` backlog item 16.
 
 ### Phase 3: Platform completeness
 ScreenCast (PipeWire producer) → RemoteDesktop/InputCapture → Screenshot/portal backend →
