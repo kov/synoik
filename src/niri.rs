@@ -178,6 +178,7 @@ use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElem
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
+use crate::ui::overview_search::{OverviewSearch, SearchResultEntry};
 use crate::ui::panel::Panel;
 use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
@@ -522,6 +523,12 @@ pub struct Niri {
     pub panel_popover: PanelPopover,
     /// The overview dash (favorites bar).
     pub dash: Dash,
+    /// The overview search (entry + app results).
+    pub overview_search: OverviewSearch,
+    /// Tracks the overview-UI visibility rising edge (closed→open, unlock/screenshot
+    /// close while open) so the search resets on a fresh open, matching GNOME's
+    /// reset-on-enter — see [`Niri::refresh_overview_search_state`].
+    overview_search_was_visible: bool,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
     /// Full-color application-icon loader for the dash / app grid / search.
@@ -951,9 +958,16 @@ impl State {
                         // now resolve.
                         state.niri.app_icon_cache.clear();
                         state.niri.dash.clear_icon_uploads();
-                        if state.niri.sync_dash_favorites() {
-                            state.niri.queue_redraw_all();
-                        }
+                        state.niri.overview_search.clear_icon_uploads();
+                        // A refreshed catalog may change what the current query
+                        // resolves to.
+                        state.niri.sync_overview_search();
+                        state.niri.sync_dash_favorites();
+                        // Unconditional: dropping the icon uploads and reshuffling
+                        // search results both invalidate what is on screen, and an
+                        // idle overview produces no frames on its own — a stale frame
+                        // would let a click land on a tile that has since changed app.
+                        state.niri.queue_redraw_all();
                     }
                 })
                 .unwrap();
@@ -1036,6 +1050,7 @@ impl State {
                             state.niri.icon_cache = IconCache::new(theme.as_str());
                             state.niri.app_icon_cache.set_theme(&theme);
                             state.niri.dash.clear_icon_uploads();
+                            state.niri.overview_search.clear_icon_uploads();
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
@@ -1108,6 +1123,7 @@ impl State {
         self.niri.popups.cleanup();
         self.refresh_popup_grab();
         self.update_keyboard_focus();
+        self.niri.refresh_overview_search_state();
 
         // Should be called before refresh_layout() because that one will refresh other window
         // states and then send a pending configure.
@@ -3547,6 +3563,8 @@ impl Niri {
             panel,
             panel_popover,
             dash: Dash::new(),
+            overview_search: OverviewSearch::new(),
+            overview_search_was_visible: false,
             icon_cache: IconCache::new("Adwaita"),
             app_icon_cache: AppIconCache::new("Adwaita"),
 
@@ -5476,6 +5494,17 @@ impl Niri {
                 .and_then(|mon| mon.expose_progress())
             {
                 for element in self.dash.render(
+                    ctx.renderer,
+                    &self.app_icon_cache,
+                    &self.icon_cache,
+                    output,
+                    progress,
+                ) {
+                    push(element.into());
+                }
+                // The overview search entry (top) + results grid, faded with the
+                // overview like the dash.
+                for element in self.overview_search.render(
                     ctx.renderer,
                     &self.app_icon_cache,
                     &self.icon_cache,
@@ -7991,6 +8020,69 @@ impl Niri {
             })
             .collect();
         self.dash.set_favorites(favorites)
+    }
+
+    /// Whether the overview chrome (dash, search) is actually on screen: the GNOME
+    /// overview open, not hidden behind a lock or screenshot surface. The single gate
+    /// for every overview-UI pointer/hover intercept — an intercept firing while the
+    /// UI is invisible would eat clicks (and the dash one could launch into a locked
+    /// session; the S3 blocker). `is_overview_open` alone is also true in niri's own
+    /// scrolling-mode overview, where the GNOME chrome never draws — hence `is_gnome_mode`.
+    pub fn overview_ui_visible(&self) -> bool {
+        self.layout.is_gnome_mode()
+            && self.layout.is_overview_open()
+            && !self.is_locked()
+            && !self.screenshot_ui.is_open()
+    }
+
+    /// Reset the overview search on a fresh overview *enter* (GNOME resets search on
+    /// overview enter/unmap). Keyed on the rising edge of "the GNOME overview is open"
+    /// — deliberately NOT on [`overview_ui_visible`](Self::overview_ui_visible), which
+    /// also dips when a screenshot/lock surface covers a still-open overview: GNOME
+    /// keeps the query across such an independent modal, so keying on visibility would
+    /// wipe an in-progress search on a Print-screen round-trip. (Clearing is not
+    /// load-bearing for the lock bypass — `overview_ui_visible` gates the intercepts.)
+    /// Nothing clears on close, so the query stays visible through the close fade, as
+    /// GNOME's does. Called each cycle from `State::refresh`.
+    pub fn refresh_overview_search_state(&mut self) {
+        let open = self.layout.is_gnome_mode() && self.layout.is_overview_open();
+        if open && !self.overview_search_was_visible {
+            self.overview_search.clear();
+        }
+        self.overview_search_was_visible = open;
+    }
+
+    /// Run the app search for the current query and feed the results into the overview
+    /// search model — GNOME's `SearchResultsView.setTerms` → `_doSearch` → the built-in
+    /// `AppSearchProvider` (`appDisplay.js:1801-1831`): `AppSystem.search(terms.join(' '))`
+    /// → relevance-tier groups → filter `should_show` → concat → cap at
+    /// [`MAX_RESULTS`](crate::ui::overview_search::MAX_RESULTS). (No `Shell.AppUsage`
+    /// within-tier sort yet — S9+.)
+    pub fn sync_overview_search(&mut self) {
+        let terms = crate::ui::overview_search::tokenize(self.overview_search.query());
+        if terms.is_empty() {
+            self.overview_search.set_results(Vec::new());
+            return;
+        }
+        let query = terms.join(" ");
+        let mut results = Vec::new();
+        'outer: for group in self.app_system.search(&query) {
+            for id in group {
+                if let Some(entry) = self.app_system.lookup(&id) {
+                    if entry.should_show {
+                        results.push(SearchResultEntry {
+                            id: entry.id,
+                            name: entry.name,
+                            icon: entry.icon,
+                        });
+                        if results.len() >= crate::ui::overview_search::MAX_RESULTS {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        self.overview_search.set_results(results);
     }
 
     /// Push a fresh store snapshot into an open calendar popover's message

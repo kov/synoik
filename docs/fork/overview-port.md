@@ -249,10 +249,28 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   touch falls through. Pins: 8 conformance tests (`overview_dash_*`) + 3 `dash.rs` unit tests + a Vulkan
   render test pinning the hover-lightens sign. **Not yet live-validated** (fade smoothness / real icons /
   hover feel — see `pending-live-validation`).
-- **S4 — Overview search entry + `AppSearchProvider` + launch.** `widget::Entry` at overview top;
-  typing routes through `KeyboardFocus::Overview` → terms → `AppSystem.search` → grid results;
-  Enter/click → `launch` + close overview. Local app provider only. Pins: conformance test
-  terms→results ordering and activate→launch; render test for the results grid.
+- **S4 — Overview search entry + `AppSearchProvider` + launch. ✅ DONE.** `src/ui/overview_search.rs`:
+  the `OverviewSearch` model (query, result snapshot, keyboard selection, mouse hover) + a new
+  `widget::Entry` toolkit primitive (pill chrome + placeholder/text + caret + find/clear glyph
+  geometry & hit-testing). Typing while `KeyboardFocus::Overview` engages the entry — the key block
+  sits inside the `should_intercept_key` Forward branch, **press-only** on the shared
+  `suppressed_keys` (releases are owned globally; a local release arm would leak), with an `Ignored`
+  outcome so unhandled and modifier-decorated keys fall through unconsumed. `Niri::sync_overview_search`
+  runs the app provider (`AppSystem::search(terms.join(' '))` → tiers → `should_show` → cap 6) and
+  feeds results back. Enter activates the selection, a click activates its tile, the clear glyph
+  clears; all launch + close the overview. Escape clears while active, else falls through to the
+  hardcoded bind that closes. Search resets on overview *enter* (visibility rising edge in
+  `State::refresh`) — deliberately not on close (query stays through the fade) nor on a
+  screenshot/lock round-trip (GNOME keeps it). Pointer/hover gated by the new shared
+  `Niri::overview_ui_visible()` (also fixed the dash click gate's missing `is_gnome_mode`).
+  **The active entry body consumes clicks** (it is an opaque control drawn over the thumbnail strip
+  pre-S5); the inactive entry is fully click-through so it can't eat thumbnail clicks. Divergences
+  in the module doc: no 150ms debounce, no `AppUsage` ordering, no `SystemActions`, caret-at-end
+  only (Left/Up = selection-prev), modified keys refused, no compose/autorepeat, results drawn over
+  the picker, per-output draw with one shared selection, no `reset-search` outside-click gesture.
+  Pins: 12 conformance tests (`overview_search_*`) + 12 `overview_search.rs` unit tests + a Vulkan
+  render test (entry pill fill = `ENTRY_BG`, selected tile lighter than unselected). **Not yet
+  live-validated.**
 - **S5 — Overview chrome layout (`ControlsManager` port).** Formalize placement: search-entry-top,
   dash-bottom, results-replace-picker, driven by an `OverviewAdjustment` analogue; wire
   `search-active` visibility. (S3/S4 may hardcode positions; S5 makes the layout faithful and is the

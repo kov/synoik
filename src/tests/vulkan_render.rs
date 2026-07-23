@@ -6210,3 +6210,125 @@ fn vulkan_dash_hover_lightens_the_tile() {
         );
     }
 }
+
+/// The overview search bakes through the owned renderer: the entry pill composites an
+/// opaque dark fill, and (with a query + results) the results card draws with the
+/// selected tile washed *lighter* than an unselected one — the `.overview-tile`
+/// selection highlight. Pinned as a one-frame differential.
+#[test]
+fn vulkan_overview_search_draws_entry_and_selection() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::overview_search::SearchResultEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!(
+            "skipping vulkan_overview_search_draws_entry_and_selection: no Vulkan device ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Drive the model directly into an active state with two results, tile 0 selected.
+    {
+        let s = &mut f.niri().overview_search;
+        s.handle_key(None, Some('a'), true);
+        s.set_results(vec![
+            SearchResultEntry {
+                id: "a.desktop".into(),
+                name: "A".into(),
+                icon: AppIconRef::Fallback,
+            },
+            SearchResultEntry {
+                id: "b.desktop".into(),
+                name: "B".into(),
+                icon: AppIconRef::Fallback,
+            },
+        ]);
+    }
+
+    let size = smithay::utils::Size::<f64, Logical>::from((1920., 1080.));
+    let pill = f.niri().overview_search.entry_pill(size);
+    let c0 = f
+        .niri()
+        .overview_search
+        .result_center(0, size)
+        .expect("tile 0");
+    let c1 = f
+        .niri()
+        .overview_search
+        .result_center(1, size)
+        .expect("tile 1");
+
+    let state = f.niri_state();
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            let elements = niri.overview_search.render(
+                vk,
+                &niri.app_icon_cache,
+                &niri.icon_cache,
+                &output,
+                1.0,
+            );
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let pixels = render_to_vec(
+                vk,
+                phys,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((pixels, phys.w, phys.h))
+        },
+    );
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_overview_search_draws_entry_and_selection: no Vulkan device");
+        return;
+    };
+    let (pixels, w, _h) = result.expect("compositing the search through Vulkan must not error");
+
+    // The entry pill fill, sampled low in the pill (below the text line, left of the
+    // trailing clear glyph): opaque and dark (`ENTRY_BG`).
+    let ex = (pill.loc.x + pill.size.w * 0.5) as i32;
+    let ey = (pill.loc.y + pill.size.h - 5.) as i32;
+    let entry = px(&pixels, w, ex, ey);
+    eprintln!("vulkan_overview_search: entry={entry:?}");
+    assert_eq!(
+        entry[3], 255,
+        "the entry pill must composite opaquely: {entry:?}"
+    );
+    assert!(
+        entry[0] < 90 && entry[1] < 90 && entry[2] < 90,
+        "the entry pill fill must be dark (ENTRY_BG): {entry:?}"
+    );
+
+    // Left border of each result tile (in the tile, left of the 64px icon): the
+    // selected tile 0 carries the wash, tile 1 the plain card bg.
+    let sample = |c: Point<f64, Logical>| px(&pixels, w, (c.x - 42.) as i32, c.y as i32);
+    let selected = sample(c0);
+    let plain = sample(c1);
+    eprintln!("vulkan_overview_search: selected={selected:?} plain={plain:?}");
+    assert_eq!(
+        plain[3], 255,
+        "the results card must composite opaquely: {plain:?}"
+    );
+    for ch in 0..3 {
+        assert!(
+            selected[ch] > plain[ch],
+            "the selected result tile must be lighter than an unselected one on \
+             channel {ch}: selected={selected:?} plain={plain:?}"
+        );
+    }
+}

@@ -8,6 +8,7 @@ pub mod input_source_menu;
 pub mod mru;
 pub mod notification_banner;
 pub mod notification_card;
+pub mod overview_search;
 pub mod panel;
 pub mod popover;
 pub mod quick_settings;

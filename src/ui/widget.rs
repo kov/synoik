@@ -104,6 +104,16 @@ pub mod style {
     pub const DIALOG_BUTTON_BG: Rgba = [1., 1., 1., 0.1];
     /// `.destructive-action` fill — `$red_4 #c01c28` (`_default-colors.scss:11`).
     pub const DESTRUCTIVE_BG: Rgba = [0.753, 0.110, 0.157, 1.];
+    /// `%system_entry` normal background — `mix($system_fg_color, $system_bg_color, 9%)`
+    /// (`_drawing.scss` `entry()` mixin, `$background_mix_factor` 9%), with
+    /// `$system_fg_color`=#fafafb and `$system_bg_color`=lighten(#222226, 5%). The
+    /// overview `search-entry` pill fill; always-dark. (`_colors.scss:20-21,47`.)
+    pub const ENTRY_BG: Rgba = [0.252, 0.252, 0.267, 1.];
+    /// `$system_overlay_bg_color` = `mix($system_base_color, $system_fg_color, 90%)`
+    /// ≈ `#38383b` (`_colors.scss:50`) — the non-transparent overlay surface used by
+    /// the dash and the `.search-section-content` results card. Same value the dash
+    /// bakes as its pill (kept in sync via this one constant).
+    pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
 
     /// Modal-dialog corner radius, logical px — GNOME `$alert_radius` (`_common.scss:43`,
     /// applied at `_dialogs.scss:6`). Note this is 18px, not `$modal_radius` (16px).
@@ -225,6 +235,136 @@ impl AppIcon {
             self.rect.loc.x + self.rect.size.w / 2.,
             self.rect.loc.y + self.rect.size.h / 2.,
         ))
+    }
+}
+
+/// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
+/// overview `search-entry` (`_search-entry.scss`, `overviewControls.js:325`). A
+/// **view + geometry** primitive: the caller owns the editable string (like
+/// [`crate::ui::run_dialog`] does) and feeds it in. [`Entry::bake`] draws the pill
+/// background plus the placeholder/typed text and a trailing caret; the primary
+/// (find) and optional secondary (clear) symbolic glyphs ride on top as
+/// [`icon_element`]s the caller composites (so they fade with the overview, like the
+/// dash's show-apps glyph). run_dialog keeps its own bespoke centered mono field for
+/// now — adopting this here is a follow-up.
+pub struct Entry;
+
+/// Where an [`Entry`]'s parts sit (all logical, absolute output coords).
+#[derive(Debug, Clone, Copy)]
+pub struct EntryLayout {
+    /// The rounded pill box.
+    pub pill: Rectangle<f64, Logical>,
+    /// Center of the primary (`edit-find-symbolic`) glyph.
+    pub primary_icon: Point<f64, Logical>,
+    /// Center of the trailing (`edit-clear-symbolic`) glyph.
+    pub secondary_icon: Point<f64, Logical>,
+    /// Left x where the text/placeholder begins.
+    pub text_x: f64,
+}
+
+/// What a point over an [`Entry`] hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryHit {
+    /// The trailing clear (`edit-clear-symbolic`) glyph.
+    Clear,
+    /// Anywhere else in the pill.
+    Field,
+}
+
+impl Entry {
+    /// Pill height, logical: `%entry_common` 9px padding around a ~15px line, rounded
+    /// up to a comfortable pill (`.search-entry` is `$forced_circular_radius`, so the
+    /// radius is `height/2`). S5-tunable.
+    pub const HEIGHT: f64 = 40.;
+    /// The find/clear symbolic glyph side (`.search-entry-icon` `$scalable_icon_size`
+    /// = 16px, `_search-entry.scss:10`).
+    pub const ICON_PX: f64 = 16.;
+    /// Icon center inset from the pill's near edge (icon half + `padding 0 $base_margin`).
+    const ICON_INSET: f64 = 16.;
+    /// Entry font (`%system_entry` inherits the 11pt base).
+    const TEXT_PT: f64 = 11.;
+
+    /// Lay out a pill of `width` centered horizontally on `center_x`, top edge `top_y`.
+    pub fn layout(center_x: f64, top_y: f64, width: f64) -> EntryLayout {
+        let x = (center_x - width / 2.).round();
+        let pill = Rectangle::new(
+            Point::from((x, top_y.round())),
+            Size::from((width, Self::HEIGHT)),
+        );
+        let cy = pill.loc.y + Self::HEIGHT / 2.;
+        EntryLayout {
+            pill,
+            primary_icon: Point::from((pill.loc.x + Self::ICON_INSET, cy)),
+            secondary_icon: Point::from((pill.loc.x + width - Self::ICON_INSET, cy)),
+            text_x: pill.loc.x + Self::ICON_INSET * 2.,
+        }
+    }
+
+    /// Hit-test a point: the trailing clear disc (only when `has_clear`), else the
+    /// field body, else `None`.
+    pub fn hit(
+        layout: &EntryLayout,
+        pos: Point<f64, Logical>,
+        has_clear: bool,
+    ) -> Option<EntryHit> {
+        if !layout.pill.contains(pos) {
+            return None;
+        }
+        if has_clear {
+            let d = pos - layout.secondary_icon;
+            if d.x * d.x + d.y * d.y <= Self::ICON_PX * Self::ICON_PX {
+                return Some(EntryHit::Clear);
+            }
+        }
+        Some(EntryHit::Field)
+    }
+
+    /// Bake the pill + text/placeholder + trailing caret into a pill-sized texture
+    /// (composited by the caller at `layout.pill.loc`, the two glyphs on top). When
+    /// `text` is empty the `placeholder` shows muted with no caret (an unfocused hint);
+    /// once typing starts the text shows in full white with a caret bar. Long text is
+    /// clipped at the trailing-icon inset (no horizontal scroll yet — MVP).
+    pub fn bake(
+        renderer: &mut VulkanRenderer,
+        cache: &mut BakeCache,
+        scale: f64,
+        width: f64,
+        text: &str,
+        placeholder: &str,
+        revision: u64,
+    ) -> anyhow::Result<VkTexture> {
+        let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
+        let empty = text.is_empty();
+        // The caret bar (U+258F), like run_dialog, only while typing.
+        let display = if empty {
+            placeholder.to_owned()
+        } else {
+            format!("{text}\u{258f}")
+        };
+        let text_x = Self::ICON_INSET * 2.;
+        let clip = Rectangle::<f64, Logical>::new(
+            Point::from((text_x, 0.)),
+            Size::from((width - text_x - Self::ICON_INSET * 2., Self::HEIGHT)),
+        );
+        bake(
+            renderer,
+            cache,
+            scale,
+            size,
+            revision,
+            |r| {
+                let mut shaper = TextShaper::new(r, scale);
+                shaper.shape(&display, TextStyle::new(Self::TEXT_PT))
+            },
+            move |frame, phys, shaped| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(Self::HEIGHT / 2., style::ENTRY_BG)?;
+                let color = if empty { style::MUTED } else { style::TEXT };
+                p.text_band(shaped, text_x, HAlign::Left, 0., Self::HEIGHT, color, clip)?;
+                Ok(())
+            },
+        )
     }
 }
 

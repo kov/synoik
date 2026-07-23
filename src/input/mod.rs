@@ -707,6 +707,62 @@ impl State {
                 };
 
                 if matches!(res, FilterResult::Forward) {
+                    if this.niri.keyboard_focus.is_overview() && pressed {
+                        // Overview search: typing engages the search entry (GNOME's
+                        // `_onStageKeyPress`/`_shouldTriggerSearch`, searchController.js:145-236).
+                        // Press-only + shared `suppressed_keys`: `should_intercept_key` above
+                        // already owns key releases globally (a suppressed release returns
+                        // Intercept there and never reaches here), so a copied run_dialog-style
+                        // release arm would leak/double-forward — do NOT add one. The Enter →
+                        // launch → close release is leak-free by construction (the release is
+                        // suppressed and swallowed before the new window sees it).
+                        //
+                        // `keyboard_focus == Overview` is only reached when nothing above
+                        // (lock/screenshot/dialogs/popover) claimed focus (niri.rs
+                        // update_keyboard_focus), so the search can't engage while invisible.
+                        let text = modified
+                            .key_char()
+                            .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        let active = this.niri.overview_search.is_active();
+                        // A non-whitespace printable starts a search; once active, every key
+                        // routes to the entry (Backspace/nav/Escape). Modifiers/Tab/arrows while
+                        // inactive fall through to the overview binds below.
+                        let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control());
+                        if active || starts {
+                            use crate::ui::overview_search::SearchOutcome;
+                            let plain = !mods.ctrl && !mods.alt && !mods.logo;
+                            let outcome = this.niri.overview_search.handle_key(raw, text, plain);
+                            // Ignored = a key the search doesn't handle (bare modifier, F-key);
+                            // let it fall through to the hardcoded overview binds, unconsumed.
+                            if !matches!(outcome, SearchOutcome::Ignored) {
+                                match outcome {
+                                    SearchOutcome::Handled | SearchOutcome::Ignored => {}
+                                    SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
+                                        this.niri.sync_overview_search();
+                                    }
+                                    SearchOutcome::Activate(id) => {
+                                        if let Err(err) = this
+                                            .niri
+                                            .app_system
+                                            .launch(&id, crate::app_system::LaunchMode::Activate)
+                                        {
+                                            tracing::warn!("search launch of {id} failed: {err:?}");
+                                        }
+                                        this.niri.overview_search.clear();
+                                        this.niri.layout.close_overview();
+                                    }
+                                    SearchOutcome::Close => {
+                                        this.niri.overview_search.clear();
+                                        this.niri.layout.close_overview();
+                                    }
+                                }
+                                this.niri.queue_redraw_all();
+                                this.niri.suppressed_keys.insert(key_code);
+                                return FilterResult::Intercept(None);
+                            }
+                        }
+                    }
+
                     // If we didn't find any bind, try other hardcoded keys.
                     if this.niri.keyboard_focus.is_overview() && pressed {
                         if let Some(bind) = raw.and_then(|raw| hardcoded_overview_bind(raw, *mods))
@@ -2937,24 +2993,29 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
-        // The overview dash tracks the hovered tile (favorite / show-apps) so it can
-        // paint the tile's hover fill (`_dash.scss` `.overview-icon:hover`). Only when
-        // the dash is actually on screen — the GNOME overview (`is_gnome_mode`), open,
-        // and not hidden behind a lock/screenshot surface — matching the render gate;
-        // otherwise this is churn (redraws) over a dash nobody sees. `is_overview_open`
-        // is also true in niri's own scrolling-mode overview, where the dash never draws.
-        let dash_visible = self.niri.layout.is_gnome_mode()
-            && self.niri.layout.is_overview_open()
-            && !self.niri.is_locked()
-            && !self.niri.screenshot_ui.is_open();
-        let dash_hit = if dash_visible {
-            self.niri
-                .output_under(pos)
-                .and_then(|(output, p)| self.niri.dash.hit_test(p, output_size(output)))
+        // The overview dash + search track their hovered element so they can paint its
+        // hover fill (`.overview-icon:hover` / `.overview-tile:hover`). Only when the
+        // overview UI is actually on screen — see `Niri::overview_ui_visible` (matches
+        // the render gate); otherwise this is churn (redraws) over UI nobody sees.
+        let overview_visible = self.niri.overview_ui_visible();
+        let (dash_hit, search_hit) = if overview_visible {
+            match self.niri.output_under(pos) {
+                Some((output, p)) => {
+                    let size = output_size(output);
+                    (
+                        self.niri.dash.hit_test(p, size),
+                        self.niri.overview_search.hit_test(p, size),
+                    )
+                }
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         if self.niri.dash.set_hovered(dash_hit) {
+            self.niri.queue_redraw_all();
+        }
+        if self.niri.overview_search.set_hovered(search_hit) {
             self.niri.queue_redraw_all();
         }
 
@@ -3504,19 +3565,17 @@ impl State {
                 // hit so a right/middle press over the dash can't fall through to the
                 // overview's right-drag / workspace grabs beneath it.
                 //
-                // Only when the dash is actually visible: a lock surface or the screenshot
-                // UI can be raised over a still-open overview (neither closes it), and the
-                // render path hides the dash behind them — so without these guards the dash
-                // would be an invisible click-eater (and, unlike the panel intercepts which
-                // route through the lock-filtered `do_action`, this launches apps directly —
-                // a lock-screen bypass). GNOME sidesteps this by dropping the overview from
-                // the lock/unlock session modes (`sessionMode.js`).
-                if self.niri.layout.is_overview_open()
-                    && !self.niri.is_locked()
-                    && !self.niri.screenshot_ui.is_open()
-                {
+                // Only when the overview UI is actually visible (`overview_ui_visible`): a lock
+                // surface or the screenshot UI can be raised over a still-open overview (neither
+                // closes it) and the render path hides the dash/search behind them — so without
+                // the guard they'd be invisible click-eaters (and, unlike the panel intercepts
+                // which route through the lock-filtered `do_action`, these launch apps directly —
+                // a lock-screen bypass). GNOME sidesteps this by dropping the overview from the
+                // lock/unlock session modes (`sessionMode.js`).
+                if self.niri.overview_ui_visible() {
                     if let Some((output, pos)) = &under {
-                        if let Some(hit) = self.niri.dash.hit_test(*pos, output_size(output)) {
+                        let size = output_size(output);
+                        if let Some(hit) = self.niri.dash.hit_test(*pos, size) {
                             self.niri.suppressed_buttons.insert(button_code);
                             if let DashHit::Favorite(i) = hit {
                                 if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
@@ -3531,6 +3590,42 @@ impl State {
                                         self.niri.layout.close_overview();
                                     }
                                 }
+                            }
+                            self.niri.queue_redraw_all();
+                            return;
+                        }
+
+                        // The overview search: a click on a result tile launches it and closes
+                        // the overview; the clear glyph clears the query; the entry / card
+                        // background are consumed inertly. Every button consumed on a hit (same
+                        // fall-through reasoning as the dash).
+                        if let Some(hit) = self.niri.overview_search.hit_test(*pos, size) {
+                            use crate::ui::overview_search::SearchHit;
+                            self.niri.suppressed_buttons.insert(button_code);
+                            match hit {
+                                SearchHit::Result(i)
+                                    if matches!(
+                                        button,
+                                        Some(MouseButton::Left | MouseButton::Middle)
+                                    ) =>
+                                {
+                                    if let Some(id) =
+                                        self.niri.overview_search.result_id(i).map(str::to_owned)
+                                    {
+                                        if let Err(err) =
+                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
+                                        {
+                                            tracing::warn!("search launch of {id} failed: {err:?}");
+                                        }
+                                        self.niri.overview_search.clear();
+                                        self.niri.layout.close_overview();
+                                    }
+                                }
+                                SearchHit::Clear if button == Some(MouseButton::Left) => {
+                                    self.niri.overview_search.clear();
+                                    self.niri.sync_overview_search();
+                                }
+                                _ => {}
                             }
                             self.niri.queue_redraw_all();
                             return;

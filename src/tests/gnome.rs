@@ -37,8 +37,11 @@ const KEY_R: u32 = 19;
 const KEY_T: u32 = 20;
 const KEY_U: u32 = 22;
 const KEY_ENTER: u32 = 28;
+const KEY_BACKSPACE: u32 = 14;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_A: u32 = 30;
+const KEY_SPACE: u32 = 57;
+const KEY_RIGHT: u32 = 106;
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_Z: u32 = 44;
 const KEY_LEFTALT: u32 = 56;
@@ -5054,5 +5057,302 @@ fn overview_dash_hover_tracks_tile() {
         f.niri().dash.hovered_for_test(),
         None,
         "leaving the dash clears the hover"
+    );
+}
+
+// ---- S4: overview search ----
+
+/// A fixture with a 1920×1080 output, an injected fake `AppSystem` whose catalog
+/// resolves each id in `groups` and returns `groups` from `search` (the fake ignores
+/// the query — seed exactly the relevance tiers you want), the overview open, and the
+/// keyboard focused on it (so typing engages the search). Returns the launch recorder.
+fn search_overview(groups: &[&[&str]]) -> (Fixture, crate::app_system::RecordingLauncher) {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let recorder = RecordingLauncher::default();
+    let ids: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+    let apps = ids
+        .iter()
+        .map(|id| AppEntry::fake(id, id))
+        .collect::<Vec<_>>();
+    let catalog = FakeCatalog::new(apps);
+    *catalog.search_result.borrow_mut() = groups
+        .iter()
+        .map(|g| g.iter().map(|s| s.to_string()).collect())
+        .collect();
+    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    assert!(
+        f.niri().keyboard_focus.is_overview(),
+        "the overview must hold keyboard focus so typing engages search"
+    );
+    (f, recorder)
+}
+
+/// Typing a printable engages search and lists the provider's results (in group
+/// order); the entry becomes active.
+#[test]
+fn overview_search_types_query_and_lists_results() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop", "b.desktop"]]);
+
+    assert!(!f.niri().overview_search.is_active());
+    tap(&mut f, KEY_A);
+    assert!(
+        f.niri().overview_search.is_active(),
+        "a printable key must start a search"
+    );
+    assert_eq!(f.niri().overview_search.result_id(0), Some("a.desktop"));
+    assert_eq!(f.niri().overview_search.result_id(1), Some("b.desktop"));
+    assert_eq!(f.niri().overview_search.result_id(2), None);
+}
+
+/// Results are filtered to `should_show` apps and capped at `MAX_RESULTS`.
+#[test]
+fn overview_search_filters_hidden_and_caps_results() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // 8 shown + 1 hidden; expect the hidden one filtered and the rest capped at 6.
+    let mut apps: Vec<AppEntry> = (0..8)
+        .map(|i| AppEntry::fake(&format!("app{i}.desktop"), &format!("App {i}")))
+        .collect();
+    apps.push(AppEntry {
+        should_show: false,
+        ..AppEntry::fake("hidden.desktop", "Hidden")
+    });
+    let mut group: Vec<String> = vec!["hidden.desktop".to_owned()];
+    group.extend((0..8).map(|i| format!("app{i}.desktop")));
+    let catalog = FakeCatalog::new(apps);
+    *catalog.search_result.borrow_mut() = vec![group];
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+
+    tap(&mut f, KEY_A);
+    // hidden.desktop filtered → first result is app0; capped at 6.
+    assert_eq!(f.niri().overview_search.result_id(0), Some("app0.desktop"));
+    assert_eq!(
+        f.niri().overview_search.result_id(6),
+        None,
+        "results are capped at MAX_RESULTS (6)"
+    );
+    assert_eq!(f.niri().overview_search.result_id(5), Some("app5.desktop"));
+}
+
+/// Enter launches the default (first) result and closes the overview, clearing search.
+#[test]
+fn overview_search_enter_launches_selected_and_closes() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_ENTER);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.id, "a.desktop",
+        "Enter launches the first result"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "launching from search closes the overview"
+    );
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "the search is cleared on activate"
+    );
+}
+
+/// The Right arrow moves the selection; Enter then launches that result.
+#[test]
+fn overview_search_arrow_then_enter_launches_second() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_ENTER);
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.id, "b.desktop",
+        "selection moved to the second result"
+    );
+}
+
+/// A click on a result tile launches it and closes the overview.
+#[test]
+fn overview_search_click_result_launches() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
+    tap(&mut f, KEY_A);
+
+    let size = smithay::utils::Size::from((1920., 1080.));
+    let center = f
+        .niri()
+        .overview_search
+        .result_center(1, size)
+        .expect("result tile 1");
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.id, "b.desktop",
+        "clicking a tile launches that app"
+    );
+    assert!(!f.niri().layout.is_overview_open());
+}
+
+/// Enter with an active query but zero results is consumed — it must NOT fall through
+/// to the hardcoded Return→ToggleOverview bind and close the overview.
+#[test]
+fn overview_search_enter_with_no_results_keeps_overview_open() {
+    let (mut f, recorder) = search_overview(&[]); // no groups → no results
+
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+    assert_eq!(f.niri().overview_search.result_id(0), None);
+    tap(&mut f, KEY_ENTER);
+
+    assert!(recorder.calls.borrow().is_empty(), "nothing to launch");
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "Enter with no results must not close the overview"
+    );
+}
+
+/// Escape while active clears the search (overview stays open); a second Escape (now
+/// inactive) falls through to the hardcoded bind and closes the overview.
+#[test]
+fn overview_search_escape_clears_then_closes() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+
+    tap(&mut f, KEY_ESC);
+    assert!(!f.niri().overview_search.is_active(), "first Escape clears");
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "clearing the search leaves the overview open"
+    );
+
+    tap(&mut f, KEY_ESC);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a second Escape (inactive) closes the overview via the hardcoded bind"
+    );
+}
+
+/// Backspacing the query to empty deactivates the search (results cleared).
+#[test]
+fn overview_search_backspace_empties_deactivates() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+    tap(&mut f, KEY_BACKSPACE);
+    assert!(!f.niri().overview_search.is_active());
+    assert_eq!(f.niri().overview_search.result_id(0), None);
+}
+
+/// A space as the first key does not engage search (the query tokenizes to empty),
+/// mirroring GNOME's `_shouldTriggerSearch`.
+#[test]
+fn overview_search_space_first_stays_inactive() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    tap(&mut f, KEY_SPACE);
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "a leading space must not start a search"
+    );
+}
+
+/// While a search is active the entry pill is an opaque drawn control, so a click on
+/// its body must be CONSUMED — never fall through to whatever it overlaps (pre-S5 the
+/// hardcoded entry position sits over the workspace thumbnail strip, where a
+/// fall-through would switch workspace or close the overview, discarding the search).
+#[test]
+fn overview_search_active_entry_body_consumes_clicks() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop"]]);
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+
+    let size = smithay::utils::Size::from((1920., 1080.));
+    let pill = f.niri().overview_search.entry_pill(size);
+    let center = (pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.);
+
+    f.pointer_motion(center.0, center.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a click on the active entry must not fall through and close the overview"
+    );
+    assert!(
+        f.niri().overview_search.is_active(),
+        "the query must survive a click on the entry"
+    );
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "the entry body launches nothing"
+    );
+}
+
+/// Typing when the overview is closed does not engage search (keyboard focus isn't
+/// Overview) — the search is inert outside the overview.
+#[test]
+fn overview_search_inert_when_overview_closed() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")]);
+    *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_owned()]];
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+    f.niri_state().update_keyboard_focus();
+    assert!(!f.niri().keyboard_focus.is_overview());
+
+    tap(&mut f, KEY_A);
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "typing outside the overview must not start a search"
+    );
+}
+
+/// Re-opening the overview starts search fresh: a query left from a previous session
+/// is cleared on the visibility rising edge (`refresh_overview_search_state`).
+#[test]
+fn overview_search_resets_on_reopen() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+
+    // Prime the edge detector for the open state, then close and re-open.
+    f.niri().refresh_overview_search_state();
+    f.niri_state().do_action(Action::CloseOverview, false);
+    f.niri_complete_animations();
+    f.niri().refresh_overview_search_state(); // falling edge
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri().refresh_overview_search_state(); // rising edge → clear
+
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "a re-opened overview starts with an empty search"
     );
 }
