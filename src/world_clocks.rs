@@ -114,8 +114,10 @@ fn parse_location(element: &glib::Variant) -> Option<WorldLocation> {
 /// Resolve each location's coordinates to an IANA timezone id.
 ///
 /// Builds a `tzf-rs` finder transiently (see the module Memory note) and drops it on return.
-/// Meant to run off the frame loop (a worker thread) because the finder's construction is
-/// expensive. Returns an entry per input location, in input order.
+/// Its only caller is `GnomeSettings::load_world_clocks`, which runs on the dedicated
+/// `gsettings-watch` thread (not the compositor's frame loop), and only when the locations
+/// blob actually changes (blob-keyed cache) — so the finder's ~40-65 ms + 58 MiB construction
+/// is off the render path and rare. Returns an entry per input location, in input order.
 pub fn resolve_timezones(locations: &[WorldLocation]) -> Vec<ResolvedLocation> {
     if locations.is_empty() {
         return Vec::new();

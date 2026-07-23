@@ -724,7 +724,10 @@ impl Calendar {
 const LIST_EM: f64 = crate::ui::pt_to_px(11.);
 /// `.message-list` width (`_message-list.scss:3`).
 const LIST_W: f64 = 29. * LIST_EM;
-/// `.popup-menu-content` padding (`_popovers.scss:28`).
+/// `.popup-menu-content` padding (`_popovers.scss:28`) — the uniform inset between
+/// the popover box and its content. Applied on the left (before the list column),
+/// the right (after the calendar column), and the bottom (below the calendar
+/// column) in [`DateMenu::logical_size`]; the top comes from the grid's own inset.
 const LIST_PAD: f64 = 6.;
 /// `.message-list:ltr` margin-right, separating the two columns
 /// (`_message-list.scss:11`).
@@ -2211,6 +2214,9 @@ pub struct DateMenu {
     world_clocks: crate::world_clocks::WorldClocksModel,
     /// Bumped whenever `world_clocks` changes, to key its texture cache.
     world_clocks_rev: u64,
+    /// Whether the pointer is over the world-clocks card (`%card:hover`, a lighten
+    /// wash) — the card is an `St.Button` that launches GNOME Clocks.
+    world_clocks_hovered: bool,
     /// The world-clocks-card texture, cached per scale.
     world_clocks_cache: RefCell<TextureCache>,
     /// The popover background (rounded box + placeholder label / Clear pill),
@@ -2242,6 +2248,7 @@ impl DateMenu {
             }),
             world_clocks: crate::world_clocks::WorldClocksModel::default(),
             world_clocks_rev: 0,
+            world_clocks_hovered: false,
             world_clocks_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -2355,7 +2362,9 @@ impl DateMenu {
         }
         let section = self.world_clocks_card_h() + 2. * EVENTS_MARGIN;
         let cal_h = self.calendar.logical_size().h;
-        let room = (self.available_h - cal_h - self.events_height() - EVENTS_GAP).max(0.);
+        // Leave the `.popup-menu-content` bottom padding (`LIST_PAD`) below the card.
+        let room =
+            (self.available_h - cal_h - self.events_height() - EVENTS_GAP - LIST_PAD).max(0.);
         section.min(room)
     }
 
@@ -2402,11 +2411,13 @@ impl DateMenu {
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let cal = self.calendar.logical_size();
         // The calendar column is the grid plus the Events and World Clocks sections
-        // stacked below it (`datemenu-displays-box`, `dateMenu.js:960-964`).
-        let column_h = cal.h + self.events_height() + self.world_clocks_height();
+        // stacked below it (`datemenu-displays-box`, `dateMenu.js:960-964`), then the
+        // `.popup-menu-content` bottom padding so the last card isn't flush with the
+        // box edge (the left/right get the same `LIST_PAD` inset, below).
+        let column_h = cal.h + self.events_height() + self.world_clocks_height() + LIST_PAD;
         let natural = column_h.max(self.list.natural_height());
         let h = natural.min(self.available_h.max(column_h));
-        Size::from((calendar_col_x() + cal.w, h))
+        Size::from((calendar_col_x() + cal.w + LIST_PAD, h))
     }
 
     /// The popover box corner radius — for the drop shadow behind it.
@@ -2475,13 +2486,21 @@ impl DateMenu {
     /// anything changed (so the caller can redraw).
     pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
         let size = self.logical_size();
+        // The world-clocks card is a hoverable button; while the pointer is on it,
+        // the calendar column gets no hover.
+        let over_wc = pos.is_some_and(|p| self.world_clocks_rect().is_some_and(|r| r.contains(p)));
         let (list_pos, cal_pos) = match pos {
             Some(p) if p.x < calendar_col_x() => (Some(p), None),
+            Some(_) if over_wc => (None, None),
             Some(p) => (None, Some(p - Point::from((calendar_col_x(), 0.)))),
             None => (None, None),
         };
         let mut changed = self.list.hover(list_pos, size.h);
         changed |= self.calendar.hover(cal_pos);
+        if self.world_clocks_hovered != over_wc {
+            self.world_clocks_hovered = over_wc;
+            changed = true;
+        }
         changed
     }
 
@@ -2794,7 +2813,11 @@ impl DateMenu {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let height_key =
             to_physical_precise_round::<i64>(scale, self.world_clocks_alloc_h()).max(0);
-        let revision = (self.world_clocks_rev & 0xFFFF_FFFF) | ((height_key as u64) << 32);
+        // rev in the low 31 bits, the hover state in bit 31, the clip height above —
+        // a hover toggle re-bakes with/without the wash, like `bg_texture`.
+        let revision = (self.world_clocks_rev & 0x7FFF_FFFF)
+            | ((self.world_clocks_hovered as u64) << 31)
+            | ((height_key as u64) << 32);
         let mut cache = self.world_clocks_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
@@ -2857,6 +2880,7 @@ impl DateMenu {
         // The header is `$fg_color` (`.no-world-clocks`) when empty, else muted.
         let header_color = if self.world_clocks.empty { TEXT } else { MUTED };
         let card_h = self.world_clocks_card_h();
+        let hovered = self.world_clocks_hovered;
         widget::bake_uncached_sized(renderer, phys, move |frame| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(TRANSPARENT)?;
@@ -2866,6 +2890,10 @@ impl DateMenu {
                 Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
             );
             p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+            // `%card:hover` — a lighten wash over the whole card (the button state).
+            if hovered {
+                p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::HOVER_WASH)?;
+            }
 
             let inner_left = card.loc.x + EVENTS_CARD_PAD;
             let inner_right = card.loc.x + card.size.w - EVENTS_CARD_PAD;
@@ -3600,8 +3628,10 @@ mod tests {
         let dm = DateMenu::new(0, false, [0, 0, 0], vec![single_group(sample_card(1))]);
         let cal = dm.calendar.logical_size();
         let size = dm.logical_size();
-        assert_eq!(size.w, calendar_col_x() + cal.w);
-        assert_eq!(size.h, cal.h);
+        // Width/height include the `.popup-menu-content` padding on the right/bottom
+        // (`LIST_PAD`); the single-card list is shorter than the calendar column.
+        assert_eq!(size.w, calendar_col_x() + cal.w + LIST_PAD);
+        assert_eq!(size.h, cal.h + LIST_PAD);
         assert!(
             calendar_col_x() > 29. * LIST_EM,
             "the list column is 29em wide plus its margins"
@@ -3765,16 +3795,14 @@ mod tests {
             "at its natural height the list fully fits (no scroll)"
         );
 
-        // Capped to the calendar height: the popover clamps there and the list
-        // now overflows, so it scrolls.
-        dm.set_available_height(cal_h);
-        assert_eq!(
-            dm.logical_size().h,
-            cal_h,
-            "clamped to the available height"
-        );
+        // Capped to the calendar column: the popover clamps at the calendar grid
+        // plus the `.popup-menu-content` bottom pad (its floor — the grid can't be
+        // clipped) and the list now overflows, so it scrolls.
+        let cap = cal_h + LIST_PAD;
+        dm.set_available_height(cap);
+        assert_eq!(dm.logical_size().h, cap, "clamped to the available height");
         assert!(
-            dm.list().placed(cal_h).overflowing(),
+            dm.list().placed(cap).overflowing(),
             "past the cap the list scrolls"
         );
 
@@ -3783,8 +3811,8 @@ mod tests {
         empty.set_available_height(10_000.);
         assert_eq!(
             empty.logical_size().h,
-            cal_h,
-            "an empty popover is exactly the calendar height"
+            cal_h + LIST_PAD,
+            "an empty popover is the calendar height plus the content-box bottom pad"
         );
     }
 
@@ -4412,6 +4440,22 @@ mod tests {
             PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.clocks".into()]),
             "clicking the card launches GNOME Clocks"
         );
+    }
+
+    #[test]
+    fn world_clocks_hover_lights_up_the_card() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_world_clocks(wc_model(true, 1));
+        let rect = dm.world_clocks_rect().expect("visible section has a rect");
+        let center = rect.loc + Point::from((rect.size.w / 2., rect.size.h / 2.));
+        // Moving onto the card sets the hover wash and reports a redraw.
+        assert!(dm.pointer_hover(Some(center)), "entering the card redraws");
+        assert!(dm.world_clocks_hovered, "pointer over the card is hovered");
+        // Idempotent while still inside.
+        assert!(!dm.pointer_hover(Some(center)), "staying inside is a no-op");
+        // Leaving clears it.
+        assert!(dm.pointer_hover(None), "leaving the card redraws");
+        assert!(!dm.world_clocks_hovered, "pointer gone is not hovered");
     }
 
     #[test]
