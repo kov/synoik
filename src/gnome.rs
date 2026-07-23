@@ -63,6 +63,10 @@ pub struct GnomeSettings {
     /// gnome-shell's palette (st-theme-context.c). Drives accent-colored
     /// chrome like the overview thumbnail indicator.
     pub accent_color: [u8; 3],
+    /// `org.gnome.desktop.interface icon-theme`: the icon theme both the symbolic
+    /// icon cache and the app-icon loader resolve against. GNOME's default is
+    /// `"Adwaita"`.
+    pub icon_theme: String,
     /// `org.gnome.desktop.interface clock-*`: how the panel clock label reads.
     pub clock: ClockFormat,
     /// `org.gnome.desktop.calendar`: week start + week-number column.
@@ -143,6 +147,7 @@ impl Default for GnomeSettings {
             edge_tiling: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
+            icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
             quick_toggles: QuickToggles::default(),
@@ -346,6 +351,12 @@ impl GnomeSettings {
             match parse_accent_color(value.as_str()) {
                 Some(rgb) => self.accent_color = rgb,
                 None => warn!("ignoring unrecognized accent-color {value:?}"),
+            }
+        }
+        if settings_has_key(interface, "icon-theme") {
+            let value = interface.string("icon-theme");
+            if !value.is_empty() {
+                self.icon_theme = value.to_string();
             }
         }
         if settings_has_key(interface, "clock-format") {

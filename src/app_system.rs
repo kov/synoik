@@ -33,10 +33,23 @@ use gio::glib;
 use gio_unix::prelude::*;
 use gio_unix::DesktopAppInfo;
 
+/// A plain-data snapshot of an app's icon (`g_app_info_get_icon()`), resolved to
+/// pixels by [`crate::render_helpers::icon::AppIconCache`]. Mirrors the `GIcon`
+/// cases St's `st_icon_theme_lookup_by_gicon_for_scale` handles for `.desktop`
+/// apps; loadable/bytes/pixbuf gicons map to [`Fallback`](Self::Fallback) for now.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AppIconRef {
+    /// `GThemedIcon`: icon names in priority order (`g_themed_icon_get_names`).
+    Themed(Vec<String>),
+    /// `GFileIcon`: an absolute file path.
+    File(PathBuf),
+    /// No icon, a pathless (URI-backed) file, or an unsupported `GIcon` type; the
+    /// loader substitutes `application-x-executable` (GNOME's fallback).
+    Fallback,
+}
+
 /// One installed application — a plain-data snapshot of a `GDesktopAppInfo`,
-/// inspectable and cheap to clone. The full-color icon is deliberately absent;
-/// it is the next slice (S2, the themed icon loader), added as a resolved gicon
-/// there rather than here.
+/// inspectable and cheap to clone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppEntry {
     /// `g_app_info_get_id()`, e.g. `"org.gnome.Nautilus.desktop"`. Entries whose
@@ -59,6 +72,9 @@ pub struct AppEntry {
     /// `g_app_info_should_show()`. Consumers filter on this; the catalog keeps
     /// everything so favorites/launch can still resolve `NoDisplay` apps.
     pub should_show: bool,
+    /// The app's icon descriptor (`g_app_info_get_icon()`), resolved to pixels by
+    /// the [`AppIconCache`](crate::render_helpers::icon::AppIconCache).
+    pub icon: AppIconRef,
 }
 
 /// How a launch was requested — the two verbs of `AppIcon.activate`
@@ -366,6 +382,7 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         .downcast_ref::<DesktopAppInfo>()
         .map(|d| d.list_actions().iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
+    let icon = icon_ref(info.icon(), &id);
     Some(AppEntry {
         id,
         name: info.name().to_string(),
@@ -373,7 +390,30 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         commandline: info.commandline(),
         actions,
         should_show: info.should_show(),
+        icon,
     })
+}
+
+/// Extract the plain-data icon descriptor from a `g_app_info_get_icon()` result —
+/// the `GThemedIcon`/`GFileIcon` cases St resolves for `.desktop` apps
+/// (`st-icon-theme.c` `st_icon_theme_lookup_by_gicon_for_scale`); everything else
+/// (loadable/bytes/pixbuf, pathless URI files) maps to
+/// [`AppIconRef::Fallback`].
+fn icon_ref(icon: Option<gio::Icon>, id: &str) -> AppIconRef {
+    let Some(icon) = icon else {
+        return AppIconRef::Fallback;
+    };
+    if let Some(themed) = icon.downcast_ref::<gio::ThemedIcon>() {
+        return AppIconRef::Themed(themed.names().iter().map(|s| s.to_string()).collect());
+    }
+    if let Some(file) = icon.downcast_ref::<gio::FileIcon>() {
+        return match file.file().path() {
+            Some(path) => AppIconRef::File(path),
+            None => AppIconRef::Fallback,
+        };
+    }
+    tracing::debug!("unsupported GIcon type for {id:?}; using the fallback icon");
+    AppIconRef::Fallback
 }
 
 /// The production catalog: thin, stateless wrappers over GIO.
@@ -496,6 +536,13 @@ impl AppLauncher for RecordingLauncher {
     }
 }
 
+/// The real GIO-enumerated apps — a test helper so other modules (the icon
+/// loader) can exercise real `AppEntry` icon descriptors without a live `Niri`.
+#[cfg(test)]
+pub fn gio_installed_for_test() -> Vec<AppEntry> {
+    GioCatalog.enumerate()
+}
+
 #[cfg(test)]
 impl AppEntry {
     /// A minimal shown entry for tests.
@@ -507,6 +554,7 @@ impl AppEntry {
             commandline: Some(PathBuf::from(format!("{} %U", name.to_lowercase()))),
             actions: Vec::new(),
             should_show: true,
+            icon: AppIconRef::Fallback,
         }
     }
 }
@@ -533,6 +581,8 @@ mod tests {
                 "unexpected app id {:?}",
                 entry.id
             );
+            // Icon extraction never panics on real catalog data.
+            let _ = &entry.icon;
         }
         let first = &all[0];
         let looked_up = catalog
@@ -552,6 +602,29 @@ mod tests {
                 .any(|id| id == &app.id)
         });
         assert!(found, "search did not surface any of the first few apps");
+    }
+
+    /// The icon descriptor maps the two `GIcon` cases that matter for `.desktop`
+    /// apps; a missing icon and unsupported kinds map to `Fallback`.
+    #[test]
+    fn icon_ref_extracts_themed_and_file() {
+        let themed = gio::ThemedIcon::new("firefox").upcast::<gio::Icon>();
+        match icon_ref(Some(themed), "x") {
+            AppIconRef::Themed(names) => assert!(
+                names.iter().any(|n| n == "firefox"),
+                "themed names missing the base name: {names:?}"
+            ),
+            other => panic!("expected Themed, got {other:?}"),
+        }
+
+        let file =
+            gio::FileIcon::new(&gio::File::for_path("/nonexistent/x.png")).upcast::<gio::Icon>();
+        assert_eq!(
+            icon_ref(Some(file), "x"),
+            AppIconRef::File(PathBuf::from("/nonexistent/x.png"))
+        );
+
+        assert_eq!(icon_ref(None, "x"), AppIconRef::Fallback);
     }
 
     // The favorites + launch semantics below pin `AppFavorites`/`shell_app`

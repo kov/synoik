@@ -158,7 +158,7 @@ use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
-use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -521,6 +521,8 @@ pub struct Niri {
     pub panel_popover: PanelPopover,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
+    /// Full-color application-icon loader for the dash / app grid / search.
+    pub app_icon_cache: AppIconCache,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -908,6 +910,11 @@ impl State {
             state.niri.gnome_settings = initial;
             state.niri.last_power_profile = state.niri.gnome_settings.last_power_profile.clone();
             state.niri.gnome_settings_writer = Some(writer);
+            // Seed both icon caches from the configured icon theme (they default
+            // to Adwaita pre-settings).
+            let icon_theme = state.niri.gnome_settings.icon_theme.clone();
+            state.niri.icon_cache = IconCache::new(icon_theme.as_str());
+            state.niri.app_icon_cache.set_theme(&icon_theme);
             // GNOME's input-sources own the keymap when present, overriding the
             // niri-config keymap the seat keyboard was created with.
             if state.niri.gnome_settings.input_sources.present {
@@ -936,6 +943,9 @@ impl State {
                 .insert_source(app_db_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(()) = event {
                         state.niri.app_system.refresh();
+                        // A newly installed app's icon (or a cached negative) may
+                        // now resolve.
+                        state.niri.app_icon_cache.clear();
                         // Later slices redraw the dash/app grid here.
                     }
                 })
@@ -1001,12 +1011,20 @@ impl State {
                                 || old_is.xkb_model != new_is.xkb_model);
                         let mru_changed =
                             new_is.present && old_is.mru_sources != new_is.mru_sources;
+                        let icon_theme_changed =
+                            state.niri.gnome_settings.icon_theme != settings.icon_theme;
                         state.niri.gnome_settings = settings;
                         if keymap_changed {
                             state.apply_effective_xkb();
                             state.ipc_keyboard_layouts_changed();
                         } else if mru_changed {
                             state.seed_active_layout_from_mru();
+                        }
+                        // An icon-theme change re-themes both icon caches.
+                        if icon_theme_changed {
+                            let theme = state.niri.gnome_settings.icon_theme.clone();
+                            state.niri.icon_cache = IconCache::new(theme.as_str());
+                            state.niri.app_icon_cache.set_theme(&theme);
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
@@ -3518,6 +3536,7 @@ impl Niri {
             panel,
             panel_popover,
             icon_cache: IconCache::new("Adwaita"),
+            app_icon_cache: AppIconCache::new("Adwaita"),
 
             window_mru_ui,
             pending_mru_commit: None,
