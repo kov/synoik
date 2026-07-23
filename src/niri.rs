@@ -2162,14 +2162,22 @@ impl State {
         let mut resized_outputs = vec![];
         let mut recolored_outputs = vec![];
 
+        // GNOME's display-config store (`~/.config/monitors.xml`) is the authoritative source of
+        // per-monitor scale/transform — it is what the user set in Settings / quick-settings and
+        // what mutter restores every login. Per the fork tenet it wins over niri's KDL `output {}`
+        // config (advanced escape hatch) and over the DPI guess. Loaded fresh each reload (cheap,
+        // and picks up Settings changes without a file watcher).
+        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+
         for output in self.niri.global_space.outputs() {
             let name = output.user_data().get::<OutputName>().unwrap();
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
+            let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
 
-            let scale = config
-                .and_then(|c| c.scale)
-                .map(|s| s.0)
+            let scale = saved
+                .map(|s| s.scale)
+                .or_else(|| config.and_then(|c| c.scale).map(|s| s.0))
                 .unwrap_or_else(|| {
                     let size_mm = output.physical_properties().size;
                     let resolution = output.current_mode().unwrap().size;
@@ -2177,10 +2185,12 @@ impl State {
                 });
             let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-            let transform = panel_orientation(output)
-                + config
+            let base_transform = saved.map(|s| s.transform).unwrap_or_else(|| {
+                config
                     .map(|c| ipc_transform_to_smithay(c.transform))
-                    .unwrap_or(Transform::Normal);
+                    .unwrap_or(Transform::Normal)
+            });
+            let transform = panel_orientation(output) + base_transform;
 
             if output.current_scale().fractional_scale() != scale
                 || output.current_transform() != transform
@@ -3640,16 +3650,26 @@ impl Niri {
 
         let config = self.config.borrow();
         let c = config.outputs.find(name);
-        let scale = c.and_then(|c| c.scale).map(|s| s.0).unwrap_or_else(|| {
-            let size_mm = output.physical_properties().size;
-            let resolution = output.current_mode().unwrap().size;
-            guess_monitor_scale(size_mm, resolution)
-        });
+        // GNOME's `monitors.xml` store is authoritative for scale/transform (see
+        // `reload_output_config` for the precedence rationale); consult it before the KDL config
+        // and the DPI guess so a saved scale is honored from the first frame, not just on reload.
+        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+        let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
+        let scale = saved
+            .map(|s| s.scale)
+            .or_else(|| c.and_then(|c| c.scale).map(|s| s.0))
+            .unwrap_or_else(|| {
+                let size_mm = output.physical_properties().size;
+                let resolution = output.current_mode().unwrap().size;
+                guess_monitor_scale(size_mm, resolution)
+            });
         let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-        let transform = panel_orientation(&output)
-            + c.map(|c| ipc_transform_to_smithay(c.transform))
-                .unwrap_or(Transform::Normal);
+        let base_transform = saved.map(|s| s.transform).unwrap_or_else(|| {
+            c.map(|c| ipc_transform_to_smithay(c.transform))
+                .unwrap_or(Transform::Normal)
+        });
+        let transform = panel_orientation(&output) + base_transform;
 
         let mut backdrop_color = c
             .and_then(|c| c.backdrop_color)

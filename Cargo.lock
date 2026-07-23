@@ -2213,6 +2213,7 @@ dependencies = [
  "proptest-derive",
  "rayon",
  "resvg",
+ "roxmltree 0.21.1",
  "sd-notify",
  "serde",
  "serde_json",
