@@ -1437,13 +1437,13 @@ fn draw_bar_texture(
     let (clock_run, recording, keyboard) = {
         let mut shaper = TextShaper::new(renderer, scale);
         let clock_run = shaper.shape(clock, bold)?;
-        // Bold, left-aligned at its button/pill padding, ink-centered vertically like the clock.
+        // Bold, left-aligned at its button/pill padding, line-box-centered vertically like the
+        // clock.
         let shape_label = |shaper: &mut TextShaper, label: &str, lx: f64| -> anyhow::Result<_> {
             let run = shaper.shape(label, bold)?;
-            let (_ix, iy, _iw, ih) = run.ink_bounds();
             let origin = Point::<i32, Physical>::from((
                 to_physical_precise_round(scale, lx),
-                (height_px - ih) / 2 - iy,
+                run.line_box_centered_y(height_px),
             ));
             Ok((run, origin))
         };
@@ -1460,12 +1460,15 @@ fn draw_bar_texture(
     // WallClock uses tabular figures, so the advance width is constant as the seconds
     // tick and the label never shifts; centering on the ink (whose left edge/width
     // wobble per digit) makes the whole run jitter left/right each second. Our
-    // SansSerif digits are tabular too, so an advance-centered origin is rock-steady.
-    // Vertical stays ink-centered (the ink height is stable across digits).
+    // Cantarell digits are tabular too, so an advance-centered origin is rock-steady.
+    // Vertical centers on the font line-box (ascent+descent about the baseline), as
+    // St/Pango do — reserving descent space so the caps sit a hair higher than ink
+    // centering would put them (GNOME's clock reads visually higher in the bar).
     let advance_w = niri_vk::text::measure_line_width_weighted(clock, px, true).round() as i32;
-    let (_c_ix, c_iy, _c_iw, c_ih) = clock_run.ink_bounds();
-    let c_origin =
-        Point::<i32, Physical>::from(((width_px - advance_w) / 2, (height_px - c_ih) / 2 - c_iy));
+    let c_origin = Point::<i32, Physical>::from((
+        (width_px - advance_w) / 2,
+        clock_run.line_box_centered_y(height_px),
+    ));
 
     let size = Size::<i32, Physical>::from((width_px, height_px));
 
@@ -2193,6 +2196,56 @@ mod tests {
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 40, "expected visible glyph ink, got {bright}");
+    }
+
+    /// The clock is vertically centered on its font *line-box* (the constant ascent+descent about
+    /// the baseline), like St/Pango — not on its *ink*. The observable consequence, and the reason
+    /// GNOME does it: the vertical position is baseline-stable — it does not depend on which glyphs
+    /// happen to carry a descender. A clock reading "12:34 pm" (the `p` dips below the baseline)
+    /// must sit at exactly the same `y` as "12:34"; ink centering would nudge the whole label up as
+    /// the descender appears, jittering it vertically the way proportional digits jitter it
+    /// horizontally. Skips with no device.
+    #[test]
+    fn clock_vertical_centering_is_baseline_stable() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping clock_vertical_centering_is_baseline_stable: no device ({e})");
+                return;
+            }
+        };
+
+        let scale = 2.;
+        let height_px = to_physical_precise_round(scale, PANEL_HEIGHT);
+        let bold = TextStyle::new(FONT_PT).bold();
+
+        let (plain, descend, ink_plain, ink_descend) = {
+            let mut shaper = TextShaper::new(&mut vk, scale);
+            let a = shaper.shape("12:34", bold).expect("shape");
+            let b = shaper.shape("12:34 pm", bold).expect("shape");
+            (
+                a.line_box_centered_y(height_px),
+                b.line_box_centered_y(height_px),
+                a.ink_bounds(),
+                b.ink_bounds(),
+            )
+        };
+
+        assert_eq!(
+            plain, descend,
+            "line-box centering must place both labels at the same y ({plain} vs {descend})"
+        );
+
+        // Guard against a false pass: the two labels really do differ in ink (the `p`'s descender
+        // grows the ink box), so an ink-centered origin *would* differ — the property is
+        // non-trivial.
+        let ink_y = |(_, iy, _, ih): (i32, i32, i32, i32)| (height_px - ih) / 2 - iy;
+        assert_ne!(
+            ink_y(ink_plain),
+            ink_y(ink_descend),
+            "test is only meaningful if ink centering would differ; ink boxes \
+             {ink_plain:?} vs {ink_descend:?}"
+        );
     }
 
     /// `format_recording` matches GNOME's `'%d:%02d'`: zero-padded seconds, unbounded minutes.

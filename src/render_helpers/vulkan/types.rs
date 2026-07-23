@@ -313,6 +313,11 @@ pub(crate) struct GlyphRun {
     /// Source-span index of each glyph, parallel to `glyphs` (see [`niri_vk::text::GlyphAtlas`]).
     spans: std::sync::Arc<[u32]>,
     side: u32,
+    /// First-line line-box metrics (run-local px): baseline y, and the font's ascent/descent about
+    /// it. See [`Self::line_box`].
+    baseline: i32,
+    ascent: f32,
+    descent: f32,
 }
 
 impl GlyphRun {
@@ -321,13 +326,27 @@ impl GlyphRun {
         glyphs: Vec<niri_vk::text::PlacedGlyph>,
         spans: Vec<u32>,
         side: u32,
+        line_box: (i32, f32, f32),
     ) -> Self {
+        let (baseline, ascent, descent) = line_box;
         GlyphRun {
             atlas,
             glyphs: glyphs.into(),
             spans: spans.into(),
             side,
+            baseline,
+            ascent,
+            descent,
         }
+    }
+
+    /// Line-box metrics of the run's first line, run-local px: `(baseline_y, ascent, descent)`.
+    /// `baseline_y` is measured from the same run-local origin as the glyph placements. Centering a
+    /// single-line label on `[baseline_y - ascent, baseline_y + descent]` reproduces GNOME/Pango's
+    /// vertical centering (which reserves descent space) instead of ink centering. Zeros for a
+    /// glyph-less run.
+    pub(crate) fn line_box(&self) -> (i32, f32, f32) {
+        (self.baseline, self.ascent, self.descent)
     }
 
     pub(crate) fn atlas(&self) -> &VkTexture {

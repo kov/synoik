@@ -474,6 +474,23 @@ impl ShapedText {
     pub fn ink_bounds(&self) -> (i32, i32, i32, i32) {
         self.run.ink_bounds()
     }
+
+    /// Physical-px top y at which to draw this run so its font line-box (ascent+descent about the
+    /// baseline) is vertically centered in a band of `height_px` — GNOME/Pango's centering, which
+    /// reserves descent space so caps sit a hair higher than ink centering. Pair with an x from
+    /// [`ink_bounds`](Self::ink_bounds) or an advance width. Falls back to ink centering for a
+    /// glyph-less run (no line-box metrics).
+    pub fn line_box_centered_y(&self, height_px: i32) -> i32 {
+        let (baseline, ascent, descent) = self.run.line_box();
+        if ascent + descent <= 0. {
+            let (_ix, iy, _iw, ih) = self.run.ink_bounds();
+            return (height_px - ih) / 2 - iy;
+        }
+        // Center [baseline - ascent, baseline + descent] in the band, then offset so the run-local
+        // baseline lands there: top = band_center - box_height/2 - (baseline - ascent).
+        let box_top = (height_px as f32 - (ascent + descent)) / 2.;
+        (box_top - (baseline as f32 - ascent)).round() as i32
+    }
 }
 
 /// One span of a styled paragraph: its text, family, weight, and GNOME point size.

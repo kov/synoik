@@ -602,6 +602,7 @@ impl VulkanRenderer {
             .build_atlas_weighted(&gpu, pool, text, px, bold)?;
 
         let side = atlas.side;
+        let line_box = (atlas.baseline, atlas.ascent, atlas.descent);
         let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
         // The atlas is R8 coverage, only ever sampled (never scanned out or read back), so the
         // fourcc is informational; R8 names the byte layout honestly.
@@ -615,7 +616,13 @@ impl VulkanRenderer {
             Fourcc::R8,
             false,
         );
-        Ok(GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side))
+        Ok(GlyphRun::new(
+            vk_tex,
+            atlas.glyphs,
+            atlas.spans,
+            side,
+            line_box,
+        ))
     }
 
     /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)
@@ -638,6 +645,7 @@ impl VulkanRenderer {
             .build_paragraph(&gpu, pool, spans, wrap_px, base_px)?;
 
         let side = atlas.side;
+        let line_box = (atlas.baseline, atlas.ascent, atlas.descent);
         let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
         let vk_tex = VkTexture::new(
             gpu,
@@ -649,7 +657,13 @@ impl VulkanRenderer {
             Fourcc::R8,
             false,
         );
-        Ok(GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side))
+        Ok(GlyphRun::new(
+            vk_tex,
+            atlas.glyphs,
+            atlas.spans,
+            side,
+            line_box,
+        ))
     }
 
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The

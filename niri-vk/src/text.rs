@@ -50,6 +50,15 @@ pub struct GlyphAtlas {
     /// ink rectangle to paint an inline background (e.g. a keycap).
     pub spans: Vec<u32>,
     pub side: u32,
+    /// Line-box metrics of the run's first line, in physical px, for baseline (line-box) vertical
+    /// centering — what GNOME/Pango do (center the font's ascent+descent extents, reserving
+    /// descent space) rather than ink centering. `baseline` is the run-local y of the first
+    /// line's baseline (the same origin the glyph placements are measured from);
+    /// `ascent`/`descent` are the font's extents above/below it. All zero for an empty
+    /// (whitespace-only) run.
+    pub baseline: i32,
+    pub ascent: f32,
+    pub descent: f32,
 }
 
 /// Atlas slot (top-left in atlas px) for each distinct glyph, keyed by its shaping cache key.
@@ -294,6 +303,27 @@ impl TextContext {
         // Per-instance placement (one entry per on-screen glyph): key, x, y, source-span index.
         let mut instances: Vec<(CacheKey, i32, i32, u32)> = Vec::new();
 
+        // Line-box metrics for baseline centering: the font's ascent/descent (px) at this size,
+        // taken from the first line's first glyph, plus that line's baseline. Pango/St center a
+        // single-line label on this box (ascent+descent) — reserving descent space — not on the
+        // ink, so caps sit a hair higher than ink centering. Zero for a glyph-less run.
+        let ppem = buffer.metrics().font_size;
+        let mut baseline = 0i32;
+        let mut ascent = 0.0f32;
+        let mut descent = 0.0f32;
+        'metrics: for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
+                if let Some(font) = fonts.get_font(key.font_id, key.font_weight) {
+                    let m = font.as_swash().metrics(&[]).scale(ppem);
+                    baseline = run.line_y.round() as i32;
+                    ascent = m.ascent;
+                    descent = m.descent;
+                    break 'metrics;
+                }
+            }
+        }
+
         for run in buffer.layout_runs() {
             let baseline = run.line_y.round() as i32;
             for glyph in run.glyphs {
@@ -427,6 +457,9 @@ impl TextContext {
             glyphs,
             spans,
             side,
+            baseline,
+            ascent,
+            descent,
         })
     }
 }
