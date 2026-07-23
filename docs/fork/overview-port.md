@@ -225,9 +225,16 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   (nullable-binding panic on link/DBus-activated apps); `commandline` covers it. 8 headless tests
   (model + real-gio smoke) + a corpus wiring test; Fable-reviewed (favorites resolved-space fix
   landed from the review).
-- **S2 — Full-color app-icon loader.** §3.2. Headless test: a known installed app's icon resolves +
-  decodes to visible non-monochrome coverage across scales (skips cleanly if theme absent, like the
-  existing icon tests).
+- **S2 — Full-color app-icon loader. ✅ DONE (`b43d85b9`).** `render_helpers::icon::AppIconCache`
+  (sibling of the symbolic `IconCache`, sharing the factored `render_svg_pixmap`): `AppIconRef`
+  descriptor (themed/file/fallback) extracted from `GIcon` in the catalog; `freedesktop-icons`
+  resolution (inheritance + size dirs); full-color decode keeping the icon's own colors (raster via
+  `image` — premultiply-before-resize to avoid fringing — SVG via `resvg`); `application-x-executable`
+  fallback; premultiplied `Abgr8888` scale-tagged output. `org.gnome.desktop.interface icon-theme`
+  plumbed to both caches (re-theme on change, clear on installed-changed). 6 headless tests
+  (colors-kept, premultiply, real-app decode, scale-tag, fallback, descriptor); Fable-reviewed
+  (channel order confirmed correct from tiny-skia/DRM sources; premultiply-order + lazy-fallback fixes
+  landed).
 - **S3 — Dash chrome (favorites) + `widget::AppIcon` + click-to-launch.** Render the dash at the
   overview bottom (background + favorites app-well + show-apps button), hit-test, click→`launch`. Start
   **favorites-only** (defer running apps to S6). Pins: render test for the dash bake; conformance test
