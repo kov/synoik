@@ -117,7 +117,7 @@ All five are unbuilt in the fork. Order per `sessionMode.js:96-100`.
 | R2 | **screenSharing** | `screen-shared-symbolic` + stop icon during remote sharing; click stops | none | `ScreenSharingIndicator` `remoteAccess.js:133`; icons `:146-153` | `[self]`/portal state | ⬜ |
 | R3 | **dwellClick** | dwell-click mode icon, only when the a11y feature is on | mode choices | `DwellClickIndicator` `js/ui/status/dwellClick.js:35`; icon `:42`; per-mode `:76-82` | `[self]` a11y gsettings | ⬜ |
 | R4 | **a11y** (`ATIndicator`) | `accessibility-menu-symbolic` | toggles: High Contrast, Zoom, Large Text, Screen Reader, Screen Keyboard, Visual Alerts, Sticky/Slow/Bounce Keys | `js/ui/status/accessibility.js:32`; icon `:39`; items `:45-75+` | `[self]` a11y gsettings | ⬜ |
-| R5 | **keyboard** (`InputSourceIndicator`) | current input-source short-name/flag label, only when >1 source | source list to switch; modifier-key popup (`InputSourcePopup` `keyboard.js:78`) | `js/ui/status/keyboard.js:874`; container `:834,884-885`; label `:986` | `[self]` xkb + input-source gsettings | 🟡 label done (`33c25f94`), live-validated. **Deferred (later keyboard pass):** (a) clicking it opens no menu — needs the source-switch list + "Show Keyboard Layout" + "Keyboard Settings" items; (b) reads niri's xkb config, not GNOME's `org.gnome.desktop.input-sources` |
+| R5 | **keyboard** (`InputSourceIndicator`) | current input-source short-name/flag label, only when >1 source | source list to switch; modifier-key popup (`InputSourcePopup` `keyboard.js:78`) | `js/ui/status/keyboard.js:874`; container `:834,884-885`; label `:986` | `[self]` xkb + input-source gsettings | ✅ label (`33c25f94`) + **keymap driven by GNOME's `org.gnome.desktop.input-sources`** (`b396e063`; GNOME wins when the schema is present, niri xkb + systemd-localed fallback-only) + **layout popover** (`7c4f1e88`: row/layout w/ active checked + short label, separator, "Show Keyboard Layout"→Tecla, "Keyboard Settings"→control-center; picking switches the xkb group + writes `mru-sources`) + HiDPI glyph fix (`3c7473be`) + startup-seed panic fix (`79e14af5`) + **shares the panel-button hover/checked pill** (`48418eaf`). Live-validated 2026-07-23. Divergences: active row uses a check not a radio dot; IBus unsupported; per-window layout not honored (global); modifier-key `InputSourcePopup` not built. **Cleanup TODO:** the now fallback-only niri `input.keyboard.xkb` knob could be dropped ([[gnome-way-replaces-niri]]) |
 
 ---
 
@@ -221,7 +221,8 @@ carved these out as separate work — none block R1 for daily use:
 **Tier 1 — self-contained, no new daemon, real daily-driver gaps:**
 1. ✅ C4 TodayButton header (calendar) — done `e5b3ac6c`.
 2. ✅ R1 screen-recording indicator — done (native recorder track).
-3. ✅ R5 input-source (keyboard) indicator — done `33c25f94` (xkb layout label; menu deferred).
+3. ✅ R5 input-source (keyboard) indicator — **fully done**: label `33c25f94` + GNOME `input-sources`
+   keymap `b396e063` + layout popover/switching `7c4f1e88` + shared pill `48418eaf`. Live-validated.
 4. Q18 unsafe-mode indicator + toggle — deferred: no unsafe-mode state exists in the fork yet
    (nothing sets/reads it), so the indicator would be inert chrome. Revisit once a privileged
    surface actually gates on it.
