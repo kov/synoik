@@ -182,9 +182,19 @@ const RIGHT_BOX_ORDER: &[&str] = &[
     ROLE_QUICK_SETTINGS,
 ];
 
-/// Right-box status-indicator icon size and inter-icon gap, logical px.
+/// Right-box status-indicator icon size, logical px (`$scalable_icon_size`).
 const QS_ICON: f64 = 16.;
-const QS_ICON_GAP: f64 = 4.;
+/// `.panel-status-indicators-box` inter-child spacing, logical px
+/// (`_panel.scss:40` `spacing: $base_margin` = 4px).
+const QS_BOX_SPACING: f64 = 4.;
+/// Each `.system-status-icon`'s per-side horizontal margin inside the box, logical px
+/// (`_panel.scss:35` `margin: 0 $base_margin` = 4px). The box rule overrides only
+/// `padding: 0` (`_panel.scss:42-44`), so this margin still applies to every icon —
+/// St stacks it on top of the box spacing.
+const QS_ICON_MARGIN: f64 = 4.;
+/// Effective gap between adjacent status icons: box spacing plus each icon's facing
+/// margin (4 + 4 + 4 = 12px), matching GNOME's rendered aggregate cluster.
+const QS_ICON_GAP: f64 = QS_BOX_SPACING + 2. * QS_ICON_MARGIN;
 
 /// The screen-recording indicator's stop glyph and its filled-pill color
 /// (`$recording_indicator_color` = `$red_4` = `#c01c28`, `_panel.scss:5`).
@@ -325,7 +335,9 @@ fn qs_indicator_width(
     mic: MicStatus,
 ) -> f64 {
     let n = qs_indicator_icons(toggles, status, audio, mic).len() as f64;
-    2. * INDICATOR_H_PADDING + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+    // The box's outer icons keep their facing margin too, so the cluster carries
+    // one `QS_ICON_MARGIN` of breathing room at each end inside the button padding.
+    2. * INDICATOR_H_PADDING + 2. * QS_ICON_MARGIN + n * QS_ICON + (n - 1.) * QS_ICON_GAP
 }
 
 /// A live screen recording as the panel sees it: when it started (monotonic, for the
@@ -1238,7 +1250,8 @@ impl Panel {
         icons: &IconCache,
     ) {
         let rect = self.quick_settings_rect(output_width);
-        let mut x = rect.loc.x + INDICATOR_H_PADDING;
+        // The first icon carries the box's leading `.system-status-icon` left margin.
+        let mut x = rect.loc.x + INDICATOR_H_PADDING + QS_ICON_MARGIN;
         for (candidates, color) in
             qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
         {
