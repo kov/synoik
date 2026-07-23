@@ -47,8 +47,12 @@ use crate::utils::to_physical_precise_round;
 const PAD: f64 = 8.;
 const HEADER_H: f64 = 36.;
 const WEEKDAY_H: f64 = 22.;
-const CELL: f64 = 34.;
-const WEEKCOL_W: f64 = 26.;
+/// Day-cell pitch. GNOME's `.calendar-day` is `3em` (`_calendar.scss:75-76`), which renders as
+/// ~44px at the 11pt base em — measured 43px logical against a real 50.1 popover (ours was a
+/// cramped 34). `em(3.0)` tracks the base font so the grid can't drift from it.
+const CELL: f64 = crate::ui::em(3.0);
+/// Week-number column width, scaled with the cell (only shown when week numbers are enabled).
+const WEEKCOL_W: f64 = 34.;
 const GRID_ROWS: usize = 6;
 const GRID_COLS: usize = 7;
 
@@ -65,7 +69,8 @@ const ARROW_PT: f64 = 13.5; // pt_to_px(13.5) == 18 logical px
 /// circle in `sdf_rect.frag`). gnome-shell 50.1 makes both today and the selected
 /// day circular filled buttons (`.calendar-day { border-radius:
 /// $forced_circular_radius }`; today `%default_button`, selected `%flat_button`).
-const DISC_DIAM: f64 = 30.;
+/// Measured 39px logical against a real 50.1 popover (≈0.89 of the `3em` cell); ours was 30.
+const DISC_DIAM: f64 = 39.;
 
 /// Fully transparent — the buffer is cleared to this so the rounded outer corners stay see-through.
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
