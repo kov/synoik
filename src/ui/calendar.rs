@@ -9,9 +9,25 @@
 //! set. Date math is done with libc (no date crate); all text is drawn through
 //! the owned Vulkan glyph atlas, like the rest of the panel.
 //!
-//! Deferred vs gnome-shell: the events list, world clocks, weather, and keyboard
-//! grid navigation. Those hang off daemons/D-Bus (CalendarServer, GWeather) or
-//! are follow-ups; this is the self-contained core the popover opens on.
+//! The Events section below the grid IS ported (`EventsSectionModel` +
+//! [`DateMenu::set_events`], fed by `src/dbus/calendar_server.rs`). Divergences
+//! recorded there: the `datemenu-displays-section` ScrollView is deferred — when
+//! the column would overflow the popover the bottom event rows clip instead of
+//! scrolling (trigger to un-defer: when WorldClocks/Weather land), and because the
+//! clip is a hard cut against `events_alloc_h`, an overflowing card loses its
+//! rounded bottom corners until the ScrollView lands; the section is
+//! non-reactive (GNOME's `calendarApp === null` state — we don't resolve the
+//! `text/calendar` default app yet, so clicking launches nothing); the "No
+//! Events" placeholder is upright, not italic (no italic face in the shaper);
+//! `_formatEventTime`'s RTL swaps are the repo-wide deferred-RTL divergence; and
+//! the title/events follow the *selected* day, so paging the month keeps the old
+//! selection (and its title) rather than jumping to the new month — the same
+//! paging-keeps-selection divergence the grid already carries, so an event list
+//! can outlive a visible month change until a day in the new month is clicked.
+//!
+//! Deferred vs gnome-shell: world clocks, weather, calendar day-has-events dots,
+//! and keyboard grid navigation. Those hang off daemons/D-Bus (GNOME Clocks,
+//! GWeather) or are follow-ups; this is the self-contained core the popover opens on.
 //!
 //! The popover content itself is [`DateMenu`]: gnome-shell's dateMenu is a
 //! two-column hbox with the notification message list as the FIRST (left in
@@ -32,6 +48,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
+use crate::calendar_events::CalendarEventStore;
 use crate::notifications::SourceKey;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::render_to_texture;
@@ -1921,6 +1938,230 @@ impl CalendarMessageList {
     }
 }
 
+// ---- Events section (`js/ui/dateMenu.js:111`, `_calendar.scss:153-195`) ----
+
+/// Column/`datemenu-displays-box` spacing above the section (`$base_padding`).
+const EVENTS_GAP: f64 = 6.;
+/// `%card` margin (`$base_margin`, `_common.scss:141`).
+const EVENTS_MARGIN: f64 = 4.;
+/// `%card` radius (`$base_border_radius * 1.5`).
+const EVENTS_CARD_RADIUS: f64 = 12.;
+/// `%card` padding (`$scaled_padding * 2`).
+const EVENTS_CARD_PAD: f64 = 12.;
+/// `.events-title` is `%heading` (11pt); `.event-summary` too; `.event-time` is
+/// `%caption` (9pt) (`_calendar.scss:161-184`, `_common.scss:266,280`).
+const EVENTS_TITLE_PT: f64 = 11.;
+const EVENT_SUMMARY_PT: f64 = 11.;
+const EVENT_TIME_PT: f64 = 9.;
+/// `.events-title` padding-bottom, `.event-box` spacing, `.events-list` spacing —
+/// all `$base_padding` (`_calendar.scss:166,172,177`).
+const EVENTS_TITLE_PB: f64 = 6.;
+const EVENT_BOX_GAP: f64 = 6.;
+const EVENTS_LIST_GAP: f64 = 6.;
+/// EN DASH between the parts of an event's time range (`EN_CHAR`, `dateMenu.js`).
+const EN_DASH: &str = "\u{2013}";
+/// Cap on rows built (and thus shaped) per day. The card clips to the popover, so
+/// far more than this can never be seen; a pathological day (thousands of events)
+/// must not shape thousands of paragraphs per bake. Divergence: GNOME builds every
+/// row into a scrolling list; we render a clipped card, so a hard cap is safe.
+const MAX_EVENT_ROWS: usize = 128;
+
+/// A logical text line height (the file's `pt * 1.3` convention, see
+/// [`placeholder_centers`]).
+fn line_h(pt: f64) -> f64 {
+    crate::ui::pt_to_px(pt) * 1.3
+}
+
+/// One formatted event row: the summary over its time string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRow {
+    pub summary: String,
+    pub time: String,
+}
+
+/// The Events section as the compositor formats it for a given day — all
+/// clock-dependent formatting happens here (before the widget), so the renderer
+/// is a pure function of this model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventsSectionModel {
+    /// `has-calendars` gates visibility (`_sync`, `js/ui/dateMenu.js:326`).
+    pub visible: bool,
+    /// "Today" / "Yesterday" / "Tomorrow" / a date (`_updateTitle`, `dateMenu.js:172-190`).
+    pub title: String,
+    /// The day's events, newest sort order; empty → "No Events" placeholder.
+    pub rows: Vec<EventRow>,
+}
+
+/// Build the section model for `selected` day from the store (`getEvents` +
+/// `_updateTitle` + `_formatEventTime`, `js/ui/dateMenu.js`).
+pub fn events_section_model(
+    store: &CalendarEventStore,
+    selected: Ymd,
+    now_secs: i64,
+    is_24h: bool,
+) -> EventsSectionModel {
+    let (day_start, day_end) = local_day_bounds(selected);
+    let rows = store
+        .events_for(day_start, day_end)
+        .iter()
+        .take(MAX_EVENT_ROWS)
+        .map(|e| EventRow {
+            summary: e.summary.clone(),
+            time: format_event_time(e.start, e.end, day_start, day_end, now_secs, is_24h),
+        })
+        .collect();
+    EventsSectionModel {
+        visible: store.has_calendars(),
+        title: events_title(selected, now_secs),
+        rows,
+    }
+}
+
+/// The section title (`_updateTitle`, `js/ui/dateMenu.js:172-190`). English only,
+/// like the rest of our string scope.
+fn events_title(selected: Ymd, now_secs: i64) -> String {
+    const DAY: i64 = 86_400;
+    let (start, end) = local_day_bounds(selected);
+    if start <= now_secs && now_secs < end {
+        "Today".to_string()
+    } else if end <= now_secs && now_secs - end < DAY {
+        "Yesterday".to_string()
+    } else if start > now_secs && start - now_secs <= DAY {
+        "Tomorrow".to_string()
+    } else if selected.year == year_of_secs(now_secs) {
+        strftime_ymd(selected, c"%B %-d")
+    } else {
+        strftime_ymd(selected, c"%B %-d %Y")
+    }
+}
+
+/// An event's time string for a given day (`_formatEventTime`,
+/// `js/ui/dateMenu.js:196-257`). LTR only — the RTL swaps are the repo-wide
+/// deferred-RTL divergence.
+fn format_event_time(
+    start: i64,
+    end: i64,
+    day_start: i64,
+    day_end: i64,
+    now_secs: i64,
+    is_24h: bool,
+) -> String {
+    if start == day_start && end == day_end {
+        return "All Day".to_string();
+    }
+    let starts_before = start < day_start;
+    let ends_after = end > day_end;
+    if starts_before || ends_after {
+        // Multi-day: date (+ time unless at midnight) on each side.
+        let this_year = year_of_secs(now_secs);
+        let starts_mid = is_midnight_secs(start);
+        let ends_mid = is_midnight_secs(end);
+        // A midnight end displays as the previous *calendar* day — GNOME steps
+        // `eventEnd.setDate(getDate() - 1)` (`dateMenu.js:227-231`), a local-date
+        // step (DST-safe), NOT a fixed 86400s subtraction.
+        let disp_end = if ends_mid {
+            add_days(ymd_of_secs(end), -1)
+        } else {
+            ymd_of_secs(end)
+        };
+        let use_md = year_of_secs(start) == this_year && this_year == disp_end.year;
+        let fmt: &CStr = if use_md { c"%m/%d" } else { c"%x" };
+        let start_date = strftime_secs(start, fmt);
+        let end_date = strftime_ymd(disp_end, fmt);
+        if starts_mid && ends_mid {
+            format!("{start_date} {EN_DASH} {end_date}")
+        } else {
+            // Times come from the *unadjusted* end (`dateMenu.js:208`).
+            let start_time = format_time(start, is_24h);
+            let end_time = format_time(end, is_24h);
+            format!("{start_date} {start_time} {EN_DASH} {end_date} {end_time}")
+        }
+    } else if start == end {
+        // GNOME's `eventStart === eventEnd` compares object identity (always
+        // false) — dead code; we compare timestamps, showing just the start.
+        format_time(start, is_24h)
+    } else {
+        format!(
+            "{} {EN_DASH} {}",
+            format_time(start, is_24h),
+            format_time(end, is_24h)
+        )
+    }
+}
+
+/// Locale time-of-day: 24h `%H:%M`, else 12h `%-I:%M %p` (`formatTime`).
+fn format_time(secs: i64, is_24h: bool) -> String {
+    strftime_secs(secs, if is_24h { c"%H:%M" } else { c"%-I:%M %p" })
+}
+
+/// `strftime` of a Unix timestamp in local time.
+fn strftime_secs(secs: i64, fmt: &CStr) -> String {
+    // SAFETY: localtime returns a pointer into a static buffer; read immediately.
+    unsafe {
+        let t = secs as libc::time_t;
+        let tm = libc::localtime(&t);
+        if tm.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u8; 64];
+        let n = libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr(),
+            tm,
+        );
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+}
+
+fn year_of_secs(secs: i64) -> i32 {
+    // SAFETY: as above.
+    unsafe {
+        let t = secs as libc::time_t;
+        let tm = libc::localtime(&t);
+        if tm.is_null() {
+            return 1970;
+        }
+        (*tm).tm_year + 1900
+    }
+}
+
+fn is_midnight_secs(secs: i64) -> bool {
+    // SAFETY: as above.
+    unsafe {
+        let t = secs as libc::time_t;
+        let tm = libc::localtime(&t);
+        if tm.is_null() {
+            return false;
+        }
+        let tm = &*tm;
+        tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec == 0
+    }
+}
+
+/// The local calendar date (Y/M/D) a timestamp falls on. Paired with [`add_days`]
+/// this gives a DST-safe calendar-day step, matching JS `Date.setDate()`.
+fn ymd_of_secs(secs: i64) -> Ymd {
+    // SAFETY: localtime returns a pointer into a static buffer; read immediately.
+    unsafe {
+        let t = secs as libc::time_t;
+        let tm = libc::localtime(&t);
+        if tm.is_null() {
+            return Ymd {
+                year: 1970,
+                month: 1,
+                day: 1,
+            };
+        }
+        let tm = &*tm;
+        Ymd {
+            year: tm.tm_year + 1900,
+            month: (tm.tm_mon + 1) as u32,
+            day: tm.tm_mday as u32,
+        }
+    }
+}
+
 /// The dateMenu popover content: the message-list column (left) beside the
 /// calendar column (`js/ui/dateMenu.js:917-940`).
 pub struct DateMenu {
@@ -1931,6 +2172,13 @@ pub struct DateMenu {
     /// it, the message list scrolls — gnome-shell's work-area `max-height`
     /// (`js/ui/panelMenu.js:177-185`). `INFINITY` until set (tests, pre-layout).
     available_h: f64,
+    /// The Events section model (title + rows), formatted by the compositor for
+    /// the calendar's selected day; empty/hidden until the CalendarServer reports.
+    events: EventsSectionModel,
+    /// Bumped whenever `events` changes, to key its texture cache.
+    events_rev: u64,
+    /// The events-card texture, cached per scale.
+    events_cache: RefCell<TextureCache>,
     /// The popover background (rounded box + placeholder label / Clear pill),
     /// cached per scale; the stored revision is 0/1 for empty/non-empty.
     bg_cache: RefCell<TextureCache>,
@@ -1952,10 +2200,78 @@ impl DateMenu {
             calendar: Calendar::new(week_start, show_week_numbers, accent),
             list: CalendarMessageList::new(groups),
             available_h: f64::INFINITY,
+            events: EventsSectionModel::default(),
+            events_rev: 0,
+            events_cache: RefCell::new(TextureCache {
+                context: None,
+                textures: HashMap::new(),
+            }),
             bg_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
             }),
+        }
+    }
+
+    /// Adopt a freshly-formatted Events section model. Returns whether it changed.
+    pub fn set_events(&mut self, model: EventsSectionModel) -> bool {
+        if self.events == model {
+            return false;
+        }
+        self.events = model;
+        self.events_rev += 1;
+        true
+    }
+
+    /// The Events section model (for tests / introspection).
+    pub fn events(&self) -> &EventsSectionModel {
+        &self.events
+    }
+
+    /// Height of one `.event-box` (summary over time, `EVENT_BOX_GAP` between).
+    fn event_box_h() -> f64 {
+        line_h(EVENT_SUMMARY_PT) + EVENT_BOX_GAP + line_h(EVENT_TIME_PT)
+    }
+
+    /// The events card's inner content height (title + its padding-bottom + the
+    /// rows, or one placeholder line when empty).
+    fn events_content_h(&self) -> f64 {
+        let rows_h = if self.events.rows.is_empty() {
+            line_h(EVENTS_TITLE_PT) // "No Events" placeholder line
+        } else {
+            let n = self.events.rows.len() as f64;
+            n * Self::event_box_h() + (n - 1.) * EVENTS_LIST_GAP
+        };
+        line_h(EVENTS_TITLE_PT) + EVENTS_TITLE_PB + rows_h
+    }
+
+    /// The events card's outer height (content + padding).
+    fn events_card_h(&self) -> f64 {
+        self.events_content_h() + 2. * EVENTS_CARD_PAD
+    }
+
+    /// The section texture's natural height (card + its margins), clamped to the
+    /// space left below the grid. When the column would overflow the popover the
+    /// bottom rows clip — the displays-section ScrollView is deferred (see the
+    /// module docs).
+    fn events_alloc_h(&self) -> f64 {
+        if !self.events.visible {
+            return 0.;
+        }
+        let section = self.events_card_h() + 2. * EVENTS_MARGIN;
+        let cal_h = self.calendar.logical_size().h;
+        let room = (self.available_h - cal_h - EVENTS_GAP).max(0.);
+        section.min(room)
+    }
+
+    /// The events section's total contribution to the calendar column height
+    /// (the gap above it plus the section), 0 when hidden or with no room.
+    fn events_height(&self) -> f64 {
+        let alloc = self.events_alloc_h();
+        if alloc > 0. {
+            EVENTS_GAP + alloc
+        } else {
+            0.
         }
     }
 
@@ -1970,8 +2286,10 @@ impl DateMenu {
     /// work-area height — never below the calendar, so it stays fully visible.
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let cal = self.calendar.logical_size();
-        let natural = cal.h.max(self.list.natural_height());
-        let h = natural.min(self.available_h.max(cal.h));
+        // The calendar column is the grid plus the Events section below it.
+        let column_h = cal.h + self.events_height();
+        let natural = column_h.max(self.list.natural_height());
+        let h = natural.min(self.available_h.max(column_h));
         Size::from((calendar_col_x() + cal.w, h))
     }
 
@@ -2227,6 +2545,121 @@ impl DateMenu {
     /// order (FIRST = topmost): message-list cards / placeholder icon, then
     /// the calendar column, then the background box (carrying the
     /// rounded-corner-aware opaque region) at the bottom.
+    /// Draw the Events section into an offscreen texture, cached per (scale,
+    /// `events_rev`).
+    fn events_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<VkTexture> {
+        let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
+        // The card is clipped to `events_alloc_h()`, which follows the popover cap
+        // (`available_h`) — a value that changes on output resize WITHOUT touching
+        // `events_rev`. Fold its physical height in so a re-cap re-bakes rather than
+        // clipping against a stale height (mirrors `bg_texture`'s `height_key`).
+        let height_key = to_physical_precise_round::<i64>(scale, self.events_alloc_h()).max(0);
+        let revision = (self.events_rev & 0xFFFF_FFFF) | ((height_key as u64) << 32);
+        let mut cache = self.events_cache.borrow_mut();
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.textures.clear();
+            cache.context = Some(context);
+        }
+        let fresh = matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == revision);
+        if !fresh {
+            let tex = self.draw_events(renderer, scale)?;
+            cache.textures.insert(scale_key, (revision, tex));
+        }
+        Ok(cache
+            .textures
+            .get(&scale_key)
+            .map(|(_, t)| t.clone())
+            .unwrap())
+    }
+
+    fn draw_events(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let cal_w = self.calendar.logical_size().w;
+        let alloc_h = self.events_alloc_h();
+        let phys = Size::<i32, Physical>::from((
+            to_physical_precise_round::<i32>(scale, cal_w).max(1),
+            to_physical_precise_round::<i32>(scale, alloc_h).max(1),
+        ));
+
+        // Shape every run before the bake frame opens (needs `&mut renderer`).
+        let (title_run, row_runs, placeholder_run) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let title_run =
+                shaper.shape(&self.events.title, TextStyle::new(EVENTS_TITLE_PT).bold())?;
+            let placeholder_run = shaper.shape("No Events", TextStyle::new(EVENTS_TITLE_PT))?;
+            let mut row_runs = Vec::with_capacity(self.events.rows.len());
+            for row in &self.events.rows {
+                let summary =
+                    shaper.shape(&row.summary, TextStyle::new(EVENT_SUMMARY_PT).bold())?;
+                let time = shaper.shape(&row.time, TextStyle::new(EVENT_TIME_PT))?;
+                row_runs.push((summary, time));
+            }
+            (title_run, row_runs, placeholder_run)
+        };
+
+        let card_h = self.events_card_h();
+        widget::bake_uncached_sized(renderer, phys, move |frame| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(TRANSPARENT)?;
+
+            // The `%card` (bg #47474c, radius 12, padding 12), inset by its margin.
+            let card = Rectangle::new(
+                Point::<f64, Logical>::from((EVENTS_MARGIN, EVENTS_MARGIN)),
+                Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
+            );
+            p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+
+            let cx = card.loc.x + EVENTS_CARD_PAD;
+            let mut y = card.loc.y + EVENTS_CARD_PAD;
+
+            // Title (`.events-title`, muted heading), then its padding-bottom.
+            p.text(
+                &title_run,
+                Point::from((cx, y + line_h(EVENTS_TITLE_PT) / 2.)),
+                Align::LEFT_MIDDLE,
+                MUTED,
+            )?;
+            y += line_h(EVENTS_TITLE_PT) + EVENTS_TITLE_PB;
+
+            if row_runs.is_empty() {
+                // `.event-placeholder` — muted (italic deferred: no italic face).
+                p.text(
+                    &placeholder_run,
+                    Point::from((cx, y + line_h(EVENTS_TITLE_PT) / 2.)),
+                    Align::LEFT_MIDDLE,
+                    MUTED,
+                )?;
+            } else {
+                for (i, (summary, time)) in row_runs.iter().enumerate() {
+                    if i > 0 {
+                        y += EVENTS_LIST_GAP;
+                    }
+                    // `.event-summary` (heading, full fg) over `.event-time`
+                    // (caption, muted).
+                    p.text(
+                        summary,
+                        Point::from((cx, y + line_h(EVENT_SUMMARY_PT) / 2.)),
+                        Align::LEFT_MIDDLE,
+                        TEXT,
+                    )?;
+                    y += line_h(EVENT_SUMMARY_PT) + EVENT_BOX_GAP;
+                    p.text(
+                        time,
+                        Point::from((cx, y + line_h(EVENT_TIME_PT) / 2.)),
+                        Align::LEFT_MIDDLE,
+                        MUTED,
+                    )?;
+                    y += line_h(EVENT_TIME_PT);
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -2286,6 +2719,34 @@ impl DateMenu {
             }
             Err(err) => {
                 tracing::error!("error drawing the calendar popover: {err:#}");
+            }
+        }
+
+        // The Events section card, below the grid in the calendar column
+        // (`datemenu-displays-box`, `js/ui/dateMenu.js:960`).
+        if self.events_height() > 0. {
+            let cal_h = self.calendar.logical_size().h;
+            match self.events_texture(renderer, scale) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        origin + Point::from((calendar_col_x(), cal_h + EVENTS_GAP)),
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => {
+                    tracing::error!("error drawing the events section: {err:#}");
+                }
             }
         }
 
@@ -3443,5 +3904,163 @@ mod tests {
         assert!(cal.scroll(1.0), "a nonzero scroll pages the month");
         let r1 = cal.grid_range();
         assert_ne!(r0, r1, "the next month's grid range differs");
+    }
+
+    #[test]
+    fn events_title_relative_buckets() {
+        // Relative to today() + now, the buckets are TZ-consistent (both sides
+        // use the same local zone), so this is host-robust.
+        let now = unsafe { libc::time(null_mut()) } as i64;
+        let today = today();
+        assert_eq!(events_title(today, now), "Today");
+        assert_eq!(events_title(add_days(today, -1), now), "Yesterday");
+        assert_eq!(events_title(add_days(today, 1), now), "Tomorrow");
+        // A day well away from now is a formatted date, not a bucket.
+        let far = events_title(add_days(today, 40), now);
+        assert!(!["Today", "Yesterday", "Tomorrow"].contains(&far.as_str()) && !far.is_empty());
+    }
+
+    #[test]
+    fn format_event_time_structure() {
+        let day_start = 1_600_000_000i64; // arbitrary; only relative structure matters
+        let day_end = day_start + 86_400;
+        let now = day_start;
+        assert_eq!(
+            format_event_time(day_start, day_end, day_start, day_end, now, true),
+            "All Day"
+        );
+        // In-day range → EN DASH between two times.
+        let r = format_event_time(
+            day_start + 3600,
+            day_start + 7200,
+            day_start,
+            day_end,
+            now,
+            true,
+        );
+        assert!(r.contains(EN_DASH), "range uses en dash: {r}");
+        // Zero-length in-day → a single time, no dash.
+        let z = format_event_time(
+            day_start + 3600,
+            day_start + 3600,
+            day_start,
+            day_end,
+            now,
+            true,
+        );
+        assert!(
+            !z.contains(EN_DASH) && !z.is_empty(),
+            "zero-length shows one time: {z}"
+        );
+        // Ends after today → multi-day, still a dash-joined range.
+        let m = format_event_time(
+            day_start + 3600,
+            day_end + 7200,
+            day_start,
+            day_end,
+            now,
+            true,
+        );
+        assert!(m.contains(EN_DASH), "multi-day uses en dash: {m}");
+    }
+
+    #[test]
+    fn midnight_end_shows_the_previous_calendar_day() {
+        // A multi-day event ending exactly at midnight displays its end as the
+        // previous *calendar* day (`dateMenu.js:227-231` steps `setDate(-1)`). We
+        // build the bounds through the same libc path the code uses, so the
+        // assertion is timezone-agnostic; DST-boundary correctness rides on the
+        // calendar-day `add_days` step (not a fixed 86400s), which is what makes
+        // this a day-step and not a seconds-step — verified by construction.
+        let d = Ymd {
+            year: 2026,
+            month: 6,
+            day: 15,
+        };
+        let (day_start, day_end) = local_day_bounds(d);
+        let end_midnight = local_day_bounds(add_days(d, 2)).0; // 00:00 of D+2
+        let now = day_start;
+        let s = format_event_time(
+            day_start - 3600,
+            end_midnight,
+            day_start,
+            day_end,
+            now,
+            true,
+        );
+        // Same year → %m/%d; the shown end date is D+1, never D+2.
+        let want = strftime_ymd(add_days(d, 1), c"%m/%d");
+        let never = strftime_ymd(add_days(d, 2), c"%m/%d");
+        assert!(s.contains(&want), "midnight end shows {want}: {s}");
+        assert!(
+            !s.contains(&never),
+            "midnight end must not show {never}: {s}"
+        );
+    }
+
+    #[test]
+    fn events_section_grows_the_calendar_column() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        let base = dm.logical_size().h;
+        // A hidden section (no calendars) adds no height.
+        assert!(dm.set_events(EventsSectionModel {
+            visible: false,
+            title: "Today".into(),
+            rows: vec![],
+        }));
+        assert_eq!(dm.logical_size().h, base, "hidden section adds no height");
+        // A visible section with rows grows the column.
+        assert!(dm.set_events(EventsSectionModel {
+            visible: true,
+            title: "Today".into(),
+            rows: vec![
+                EventRow {
+                    summary: "Standup".into(),
+                    time: "09:00".into(),
+                },
+                EventRow {
+                    summary: "Lunch".into(),
+                    time: "12:00".into(),
+                },
+            ],
+        }));
+        assert!(
+            dm.logical_size().h > base,
+            "a visible events section grows the calendar column"
+        );
+    }
+
+    #[test]
+    fn events_card_bakes_at_multiple_scales() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping events_card_bakes_at_multiple_scales: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_events(EventsSectionModel {
+            visible: true,
+            title: "Today".into(),
+            rows: vec![EventRow {
+                summary: "Standup".into(),
+                time: "09:00 \u{2013} 09:30".into(),
+            }],
+        });
+        for scale in [1.0, 1.5, 2.0] {
+            let tex = dm
+                .events_texture(&mut vk, scale)
+                .expect("events texture bakes");
+            let size = smithay::backend::renderer::Texture::size(&tex);
+            assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
+        }
+        // Empty (placeholder) also bakes.
+        dm.set_events(EventsSectionModel {
+            visible: true,
+            title: "Today".into(),
+            rows: vec![],
+        });
+        assert!(dm.events_texture(&mut vk, 2.0).is_ok());
     }
 }

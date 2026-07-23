@@ -163,8 +163,10 @@ impl PopoverAction {
 
 /// The content a popover hosts.
 pub enum PopoverContent {
-    Calendar(DateMenu),
-    QuickSettings(QuickSettings),
+    // Boxed: `DateMenu` and `QuickSettings` carry several caches each, so they
+    // dominate the enum size (`clippy::large_enum_variant`).
+    Calendar(Box<DateMenu>),
+    QuickSettings(Box<QuickSettings>),
     InputSources(InputSourceMenu),
 }
 
@@ -326,7 +328,7 @@ impl PanelPopover {
             (output_size(&output).h - PANEL_HEIGHT - 2. * POPOVER_MARGIN).max(POPOVER_MARGIN);
         date_menu.set_available_height(available_h);
         self.output = Some(output);
-        self.content = Some(PopoverContent::Calendar(date_menu));
+        self.content = Some(PopoverContent::Calendar(Box::new(date_menu)));
         self.anim = Some(self.make_anim(0., 1.));
         true
     }
@@ -344,10 +346,22 @@ impl PanelPopover {
         }
     }
 
+    /// Push a freshly-formatted Events section model into the open dateMenu.
+    /// Returns whether it changed anything.
+    pub fn set_calendar_events(&mut self, model: crate::ui::calendar::EventsSectionModel) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
+                dm.set_events(model)
+            }
+            _ => false,
+        }
+    }
+
     /// Introspection/test hook: the open dateMenu content.
     pub fn date_menu(&self) -> Option<&DateMenu> {
         match &self.content {
             Some(PopoverContent::Calendar(dm)) if self.open => Some(dm),
+            // (dm is &Box<DateMenu>; auto-derefs to &DateMenu at the return.)
             _ => None,
         }
     }
@@ -408,7 +422,7 @@ impl PanelPopover {
         self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
-        self.content = Some(PopoverContent::QuickSettings(QuickSettings::new(
+        self.content = Some(PopoverContent::QuickSettings(Box::new(QuickSettings::new(
             toggles,
             network,
             airplane,
@@ -419,7 +433,7 @@ impl PanelPopover {
             mic,
             source_list,
             accent,
-        )));
+        ))));
         self.anim = Some(self.make_anim(0., 1.));
     }
 

@@ -7909,13 +7909,28 @@ impl Niri {
         let _ = tx.send_blocking(crate::calendar_events::NiriToCalendar::SetRange { since, until });
     }
 
-    /// Refresh the open Events section after a store change (6b pushes the fresh
-    /// section model here). Gated on the dateMenu popover being open.
+    /// Rebuild the open Events section for the calendar's selected day and push
+    /// it, after a store change, popover open, or month/day navigation
+    /// (`EventsSection.setDate` on `selected-date-changed` / open,
+    /// `js/ui/dateMenu.js:900-915`). Gated on the dateMenu popover being open.
     pub fn refresh_popover_calendar_events(&mut self) {
-        if self.panel_popover.open_role() != Some(crate::ui::panel::ROLE_DATE_MENU) {
+        let Some(dm) = self.panel_popover.date_menu() else {
             return;
+        };
+        let selected = dm.calendar.selected();
+        // SAFETY: `time(NULL)` reads the wall clock (the events section shows
+        // real dates, like the calendar grid's own `today()`).
+        let now_secs = unsafe { libc::time(std::ptr::null_mut()) } as i64;
+        let is_24h = self.gnome_settings.clock.hour24;
+        let model = crate::ui::calendar::events_section_model(
+            &self.calendar_events,
+            selected,
+            now_secs,
+            is_24h,
+        );
+        if self.panel_popover.set_calendar_events(model) {
+            self.queue_redraw_all();
         }
-        self.queue_redraw_all();
     }
 
     fn user_is_idle(&mut self) -> bool {

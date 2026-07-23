@@ -3507,8 +3507,10 @@ impl State {
                                     let effects = self.niri.notifications.acknowledge_all();
                                     self.niri.apply_notification_effects(effects);
                                     // Load events for the now-open calendar's grid
-                                    // (`open-state-changed` → today, `js/ui/dateMenu.js:907-915`).
+                                    // (`open-state-changed` → today, `js/ui/dateMenu.js:907-915`)
+                                    // and populate the section from what's cached.
                                     self.niri.sync_calendar_range();
+                                    self.niri.refresh_popover_calendar_events();
                                 }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
