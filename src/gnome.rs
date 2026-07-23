@@ -6,12 +6,20 @@
 //! state flows through here as one inspectable struct rather than being scattered
 //! across the input/render code.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use gio::glib;
-use gio::prelude::{SettingsExt, SettingsExtManual};
+use gio::glib::prelude::ObjectExt;
+use gio::prelude::{DBusProxyExt, SettingsExt, SettingsExtManual};
 use smithay::input::keyboard::{xkb, Keysym};
+
+use crate::world_clocks::{ResolvedLocation, WorldLocation};
+
+/// The cached coordinate→timezone resolution: the parsed locations that produced
+/// it, paired with the resolved output (see [`Stores::world_clocks_cache`]).
+type WorldClocksCache = Option<(Vec<WorldLocation>, Vec<ResolvedLocation>)>;
 
 /// GNOME desktop settings the compositor honors, mirroring the relevant
 /// `org.gnome.*` GSettings keys.
@@ -64,6 +72,21 @@ pub struct GnomeSettings {
     /// way replaces niri's `input.keyboard.xkb` — see the CLAUDE.md tenet). Drives
     /// the seat keymap and the panel input-source indicator.
     pub input_sources: InputSources,
+    /// `org.gnome.shell.world-clocks locations` resolved to timezones, plus whether
+    /// GNOME Clocks is installed — drives the dateMenu World Clocks section.
+    pub world_clocks: WorldClocks,
+}
+
+/// The dateMenu World Clocks section's data (`js/ui/dateMenu.js` `WorldClocksSection`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorldClocks {
+    /// Whether `org.gnome.clocks.desktop` is installed — the whole section shows
+    /// iff true (`_sync`, `dateMenu.js:384-387`). Sampled once at startup (a
+    /// divergence from GNOME's live `installed-changed`; needs a relog to update).
+    pub clocks_installed: bool,
+    /// The configured clocks with their coordinate-resolved IANA timezones, in
+    /// settings order (the UI sorts by current offset at render time).
+    pub locations: Vec<crate::world_clocks::ResolvedLocation>,
 }
 
 /// The keyboard input-source configuration from `org.gnome.desktop.input-sources`
@@ -119,6 +142,7 @@ impl Default for GnomeSettings {
             quick_toggles: QuickToggles::default(),
             last_power_profile: "power-saver".to_string(),
             input_sources: InputSources::default(),
+            world_clocks: WorldClocks::default(),
         }
     }
 }
@@ -349,6 +373,30 @@ impl GnomeSettings {
         if settings_has_key(s, "xkb-model") {
             self.input_sources.xkb_model = s.string("xkb-model").to_string();
         }
+    }
+
+    /// Read `org.gnome.shell.world-clocks locations` and resolve each location's
+    /// coordinates to a timezone (`WorldClocksSection._clocksChanged`,
+    /// `dateMenu.js:389-408`). The `tzf-rs` finder is expensive, so its output is
+    /// cached against the parsed locations: only a genuine change to the blob pays
+    /// the resolution cost, not every unrelated settings re-read.
+    fn load_world_clocks(&mut self, s: &gio::Settings, cache: &RefCell<WorldClocksCache>) {
+        if !settings_has_key(s, "locations") {
+            return;
+        }
+        let locations = crate::world_clocks::parse_locations(&s.value("locations"));
+        let mut cache = cache.borrow_mut();
+        let resolved = match &*cache {
+            Some((cached_locs, cached_resolved)) if *cached_locs == locations => {
+                cached_resolved.clone()
+            }
+            _ => {
+                let resolved = crate::world_clocks::resolve_timezones(&locations);
+                *cache = Some((locations, resolved.clone()));
+                resolved
+            }
+        };
+        self.world_clocks.locations = resolved;
     }
 
     fn load_notifications(&mut self, notifications: &gio::Settings) {
@@ -724,6 +772,9 @@ pub fn load_and_watch_gsettings() -> (
                 stores.subscribe(move |settings| {
                     let _ = tx.send(settings);
                 });
+                // Mirror GNOME Clocks' locations into the shell gsettings before the
+                // initial read, so a running Clocks is reflected in the first model.
+                stores.setup_clocks_mirror();
                 let _ = init_tx.send(stores.read());
 
                 if stores.any() {
@@ -914,6 +965,16 @@ struct Stores {
     notifications: Option<gio::Settings>,
     color: Option<gio::Settings>,
     input_sources: Option<gio::Settings>,
+    world_clocks: Option<gio::Settings>,
+    /// Whether `org.gnome.clocks.desktop` is installed, sampled once at open.
+    clocks_installed: bool,
+    /// Cache for the expensive coordinate→timezone resolution, keyed by the parsed
+    /// locations: only rebuild the `tzf-rs` finder when the blob actually changes,
+    /// not on every unrelated settings change that re-reads the model.
+    world_clocks_cache: RefCell<WorldClocksCache>,
+    /// The GNOME Clocks D-Bus proxy driving the `locations`-mirror; held alive for
+    /// the watcher thread's lifetime once set up.
+    clocks_proxy: RefCell<Option<gio::DBusProxy>>,
 }
 
 impl Stores {
@@ -933,6 +994,10 @@ impl Stores {
             notifications: gsettings("org.gnome.desktop.notifications"),
             color: gsettings("org.gnome.settings-daemon.plugins.color"),
             input_sources: gsettings("org.gnome.desktop.input-sources"),
+            world_clocks: gsettings("org.gnome.shell.world-clocks"),
+            clocks_installed: desktop_app_installed("org.gnome.clocks.desktop"),
+            world_clocks_cache: RefCell::new(None),
+            clocks_proxy: RefCell::new(None),
         }
     }
 
@@ -966,6 +1031,7 @@ impl Stores {
             &self.notifications,
             &self.color,
             &self.input_sources,
+            &self.world_clocks,
         ]
         .into_iter()
         .flatten()
@@ -1008,6 +1074,10 @@ impl Stores {
         if let Some(input_sources) = &self.input_sources {
             settings.load_input_sources(input_sources);
         }
+        settings.world_clocks.clocks_installed = self.clocks_installed;
+        if let Some(world_clocks) = &self.world_clocks {
+            settings.load_world_clocks(world_clocks, &self.world_clocks_cache);
+        }
         settings
     }
 
@@ -1023,6 +1093,68 @@ impl Stores {
             });
         }
     }
+
+    /// Mirror GNOME Clocks' saved locations into `org.gnome.shell.world-clocks`,
+    /// gnome-shell's `WorldClocksSection._onClocksPropertiesChanged`
+    /// (`dateMenu.js:523-540`). Clocks exports its world clocks as the
+    /// `Locations` (`av`) property of `org.gnome.Shell.ClocksIntegration`; the
+    /// shell is the only writer of the gsettings key, so without this the section
+    /// never populates on a system that never ran stock gnome-shell.
+    ///
+    /// The write re-enters this store's `changed` subscription, so the model is
+    /// refreshed like any external change. Runs on the watcher thread's glib main
+    /// context (like GNOME's `Gio.DBusProxy`); the proxy is kept alive in `self`.
+    fn setup_clocks_mirror(self: &Rc<Self>) {
+        let Some(world_clocks) = self.world_clocks.clone() else {
+            return;
+        };
+        // DO_NOT_AUTO_START: an absent Clocks just leaves the last-mirrored value.
+        let proxy = match gio::DBusProxy::for_bus_sync(
+            gio::BusType::Session,
+            gio::DBusProxyFlags::DO_NOT_AUTO_START
+                | gio::DBusProxyFlags::GET_INVALIDATED_PROPERTIES,
+            None,
+            "org.gnome.clocks",
+            "/org/gnome/clocks",
+            "org.gnome.Shell.ClocksIntegration",
+            gio::Cancellable::NONE,
+        ) {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                warn!("could not create GNOME Clocks proxy for the world-clocks mirror: {err}");
+                return;
+            }
+        };
+
+        let mirror = Rc::new(move |proxy: &gio::DBusProxy| {
+            // Only mirror while Clocks actually owns the name — copying an empty
+            // `Locations` from a nascent/absent proxy would wipe the saved clocks
+            // (`dateMenu.js:534-536`).
+            if proxy.name_owner().is_none() {
+                return;
+            }
+            if let Some(locations) = proxy.cached_property("Locations") {
+                if let Err(err) = world_clocks.set_value("locations", &locations) {
+                    warn!("error mirroring GNOME Clocks locations: {err}");
+                }
+            }
+        });
+
+        let on_change = mirror.clone();
+        // `connect_local` (not the `Send + Sync` `connect_g_properties_changed`): the
+        // proxy and its callback live only on this glib thread.
+        proxy.connect_local("g-properties-changed", false, move |values| {
+            if let Ok(proxy) = values[0].get::<gio::DBusProxy>() {
+                on_change(&proxy);
+            }
+            None
+        });
+        // The sync constructor loads properties immediately: mirror once now (covers
+        // a Clocks already running at startup); later changes/owner transitions
+        // re-emit `g-properties-changed`.
+        mirror(&proxy);
+        self.clocks_proxy.replace(Some(proxy));
+    }
 }
 
 /// Open a [`gio::Settings`] for `schema_id`, or `None` if the schema isn't
@@ -1032,6 +1164,24 @@ fn gsettings(schema_id: &str) -> Option<gio::Settings> {
     let source = gio::SettingsSchemaSource::default()?;
     source.lookup(schema_id, true)?;
     Some(gio::Settings::new(schema_id))
+}
+
+/// Whether an application `${id}.desktop` is installed, gnome-shell's
+/// `Shell.AppSystem.lookup_app` as used by `WorldClocksSection._sync`. Scans the
+/// XDG `applications` dirs for a flat `<id>` file (nested / vendor-prefixed
+/// desktop-id resolution is a recorded divergence — fine for `org.gnome.clocks`).
+fn desktop_app_installed(desktop_id: &str) -> bool {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(data_home));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/share"));
+    }
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
+    dirs.extend(std::env::split_paths(&data_dirs));
+    dirs.iter()
+        .any(|dir| dir.join("applications").join(desktop_id).exists())
 }
 
 bitflags::bitflags! {
@@ -1567,6 +1717,10 @@ mod tests {
                 notifications: None,
                 color: None,
                 input_sources: None,
+                world_clocks: None,
+                clocks_installed: false,
+                world_clocks_cache: RefCell::new(None),
+                clocks_proxy: RefCell::new(None),
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -1666,6 +1820,10 @@ mod tests {
                         notifications: None,
                         color: None,
                         input_sources: None,
+                        world_clocks: None,
+                        clocks_installed: false,
+                        world_clocks_cache: RefCell::new(None),
+                        clocks_proxy: RefCell::new(None),
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);
