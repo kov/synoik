@@ -153,22 +153,37 @@ const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.22];
 const DETAIL_MARGIN: f64 = 12.; // `.quick-toggle-menu { margin: $base_padding*2 0 0 }`
 const DETAIL_RADIUS: f64 = 24.; // `%card` → `$base_border_radius * 3`
 const DETAIL_PAD: f64 = 10.;
-const DETAIL_HEADER_H: f64 = 32.;
 const DETAIL_HEADER_ICON: f64 = 24.; // `$medium_scalable_icon_size`
+/// The `.header .icon` circular pill: the 24px icon plus `padding: 1.5 * $base_padding` (9px) a
+/// side → a 42px disc, `border-radius: $forced_circular_radius`, filling the header row's height.
+const DETAIL_HEADER_ICON_PAD: f64 = 9.;
+const DETAIL_HEADER_PILL: f64 = DETAIL_HEADER_ICON + 2. * DETAIL_HEADER_ICON_PAD;
+/// The `.header .icon` background — `transparentize($fg_color, 0.8)` (white @ 20%), the
+/// highlighted pill behind the header icon; the accent `.active` variant only applies to a
+/// checked toggle's menu, never the shutdown menu.
+const DETAIL_HEADER_PILL_BG: [f32; 4] = [1., 1., 1., 0.2];
+/// The header row is as tall as its icon pill (`$medium_scalable_icon_size` + padding).
+const DETAIL_HEADER_H: f64 = DETAIL_HEADER_PILL;
 const DETAIL_HEADER_INSET: f64 = 10.;
-const DETAIL_HEADER_GAP: f64 = 8.;
+/// `.header` `padding-bottom` / `spacing-columns` = `$base_padding * 2` (12px): the gap below the
+/// header before the rows, and between the icon pill and the title.
+const DETAIL_HEADER_GAP: f64 = 12.;
 const DETAIL_ROW_H: f64 = 36.;
 const DETAIL_ROW_GAP: f64 = 2.;
 const DETAIL_ROW_INSET: f64 = 12.;
 /// Extra space above a row that follows a group separator (e.g. the machine-power vs session
-/// split in the shutdown menu). v1 renders the split as spacing rather than a drawn rule.
+/// split in the shutdown menu) — the `.popup-separator-menu-item`'s slot, with a 1px rule
+/// (`DETAIL_SEP_COLOR`) drawn centered in it.
 const DETAIL_SEP_EXTRA: f64 = 8.;
+/// The group-separator rule — `.popup-separator-menu-item-separator` = `$borders_color` =
+/// `transparentize($fg_color, 0.9)` (white @ 10%).
+const DETAIL_SEP_COLOR: [f32; 4] = [1., 1., 1., 0.1];
 /// Detail-card surface — gnome-shell's `%card` = `$card_bg_color` = `lighten($bg_color, 7%)`
 /// ≈ `#47474c`, one step lighter than the menu box. Shared [`widget::style::CARD_BG`].
 const CARD_BG: [f32; 4] = widget::style::CARD_BG;
-/// Header-title / row-label font size, GNOME points (shaped via [`TextShaper`]). Rows are
-/// regular weight (`.popup-menu-item`), the header title is bold (`%title_3`).
-const DETAIL_TITLE_PT: f64 = 11.;
+/// Header-title font size, GNOME points (shaped via [`TextShaper`]). The header title is
+/// `%title_3` (15pt/700); rows are regular-weight `.popup-menu-item` at `DETAIL_ROW_PT`.
+const DETAIL_TITLE_PT: f64 = 15.;
 const DETAIL_ROW_PT: f64 = 11.;
 
 /// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
@@ -1391,8 +1406,9 @@ impl QuickSettings {
         if let Some(owner) = self.expanded {
             if let Some(card) = detail_rect(layout) {
                 let (cand, _title) = owner.header(self.network);
+                // Centered on the icon pill (the pill itself is chrome, drawn in `draw`).
                 let center = Point::from((
-                    card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON / 2.,
+                    card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL / 2.,
                     card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.,
                 ));
                 if let Some(el) = widget::icon_element(
@@ -1813,7 +1829,21 @@ impl QuickSettings {
             if let (Some(card), Some((title_run, row_runs))) = (detail_rect(layout), &detail_runs) {
                 p.fill_rounded(card, DETAIL_RADIUS, CARD_BG)?;
 
-                let title_x = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_ICON + 8.;
+                // The `.header .icon` highlighted circular pill, behind the (separately
+                // composited) header icon glyph.
+                let pill_cx = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL / 2.;
+                let pill_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
+                let pill = Rectangle::new(
+                    Point::from((
+                        pill_cx - DETAIL_HEADER_PILL / 2.,
+                        pill_cy - DETAIL_HEADER_PILL / 2.,
+                    )),
+                    Size::from((DETAIL_HEADER_PILL, DETAIL_HEADER_PILL)),
+                );
+                p.fill_rounded(pill, DETAIL_HEADER_PILL / 2., DETAIL_HEADER_PILL_BG)?;
+
+                let title_x =
+                    card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL + DETAIL_HEADER_GAP;
                 let title_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
                 p.text_clipped(
                     title_run,
@@ -1823,10 +1853,34 @@ impl QuickSettings {
                     card,
                 )?;
 
+                // The group-separator rules (`.popup-separator-menu-item`): one 1px rule per row
+                // that opens a new group (the shutdown menu's machine-power vs session split).
+                let sep_shape = self
+                    .expanded
+                    .map(|o| o.row_shape(layout.owner_device_count(o)))
+                    .unwrap_or_default();
                 for (k, run) in row_runs.iter().enumerate() {
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
+                    // A rule centered in the extra gap above a group-opening row. Drawn as crisp
+                    // device pixels (`fill_rect_px`) — a 1px SDF fill would AA-dim white@10% away.
+                    if k > 0 && sep_shape.get(k).copied().unwrap_or(false) {
+                        let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
+                        let x0 = to_physical_precise_round::<i32>(scale, card.loc.x + DETAIL_PAD);
+                        let x1 = to_physical_precise_round::<i32>(
+                            scale,
+                            card.loc.x + card.size.w - DETAIL_PAD,
+                        );
+                        let sep = Rectangle::<i32, Physical>::new(
+                            Point::from((x0, to_physical_precise_round::<i32>(scale, line_cy))),
+                            Size::from((
+                                (x1 - x0).max(1),
+                                to_physical_precise_round::<i32>(scale, 1.).max(1),
+                            )),
+                        );
+                        p.fill_rect_px(sep, DETAIL_SEP_COLOR)?;
+                    }
                     // A hovered picker row: a faint rounded fill (it has no base
                     // bg) behind the label, matching GNOME's flat menu-item hover.
                     if self.hovered == Some(QsHover::DetailRow(k)) {
@@ -3167,6 +3221,30 @@ mod tests {
         match qs.pointer_click(center(row)) {
             PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-session-quit", "--power-off"]),
             other => panic!("expected the power-off spawn, got {other:?}"),
+        }
+    }
+
+    /// Baking the open shutdown submenu exercises the new header icon pill and the group-separator
+    /// rule; a no-Vulkan environment skips. Under `NIRI_VK_VALIDATION` this checks those draw
+    /// calls against the spec (a bare geometry test can't see the pill/rule at all).
+    #[test]
+    fn shutdown_submenu_bakes_with_pill_and_separator() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "skipping shutdown_submenu_bakes_with_pill_and_separator: no Vulkan ({e})"
+                );
+                return;
+            }
+        };
+        let mut qs = qs(NetworkStatus::Wired, None);
+        qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        assert_eq!(qs.expanded, Some(DetailOwner::Power));
+        for scale in [1.0, 2.0] {
+            let tex = qs.draw(&mut vk, scale).expect("shutdown submenu bakes");
+            let size = smithay::backend::renderer::Texture::size(&tex);
+            assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
         }
     }
 
