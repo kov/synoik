@@ -98,7 +98,7 @@ dot; popover = **two columns** (`calendarArea` hbox, `dateMenu.js:893-897`).
 | C3 | **Message-list column** (`CalendarMessageList`) | notifications + media controls + **Clear** button + "No Notifications" placeholder | `js/ui/calendar.js:794`; placeholder `:775,804`; view `:814-821`; clear button `:823-837`; added `dateMenu.js:918-919` | `[subsystem]` `org.freedesktop.Notifications` server (we own it) | ✅ slices 3a/3b (see item 13); media controls deferred |
 | C4 | **TodayButton header** | day-of-week + full date above the grid | `TodayButton` `dateMenu.js:52,70-77`; added `:942` | `[self]` | ✅ `e5b3ac6c` (header card in `calendar.rs`; click snaps to today; one-surface divergence) |
 | C5 | Calendar month grid | 6×7 day grid | `Calendar.Calendar()` `dateMenu.js:899,943` | `[self]` | ✅ (`calendar.rs`) |
-| C6 | **Events section** | today's calendar events / "No Events" | `EventsSection` `dateMenu.js:111`; added `:960-961`; placeholder `:289-293` | `[dbus:evolution-data-server]` (CalendarServer) | ⬜ (noted deferred `calendar.rs:11`) |
+| C6 | **Events section** | today's calendar events / "No Events" | `EventsSection` `dateMenu.js:111`; added `:960-961`; placeholder `:289-293` | `[dbus:evolution-data-server]` (CalendarServer) | ✅ 6a `a68a2a49` (data plane: `org.gnome.Shell.CalendarServer` client + store) + 6b `ec70a4db` (UI). ScrollView/reactivity deferred (`calendar.rs:12`); needs live validation with a configured calendar |
 | C7 | **World clocks section** | clocks from GNOME Clocks | `WorldClocksSection` `dateMenu.js:331`; added `:963-964` | `[dbus]` GNOME Clocks + gsettings | ⬜ |
 | C8 | **Weather section** | forecast | `WeatherSection` `dateMenu.js:543`; added `:966-967` | `[subsystem]` GWeather / GNOME Weather | ⬜ |
 
@@ -348,5 +348,5 @@ carved these out as separate work — none block R1 for daily use:
     through the approved plan (slices 1/2/3a/3b/4 + message expansion + scrolling); deferred items
     (MPRIS media, GtkNotifications, per-app policies, sounds, live time refresh,
     rich `<b>/<i>` spans) remain per the plan.
-14. C6 events / C7 world clocks / C8 weather.
+14. ~~C6 events~~ ✅ (6a `a68a2a49` + 6b `ec70a4db`) / C7 world clocks / C8 weather.
 15. Q12 location, Q14 thunderbolt, Q17 auto-rotate, Q16 camera, Q19 background apps (as hardware/need arises).
