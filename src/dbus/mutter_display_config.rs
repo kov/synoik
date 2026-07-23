@@ -55,7 +55,7 @@ pub struct LogicalMonitorConfiguration {
     y: i32,
     scale: f64,
     transform: u32,
-    _is_primary: bool,
+    is_primary: bool,
     monitors: Vec<(String, String, HashMap<String, OwnedValue>)>,
 }
 
@@ -180,18 +180,35 @@ impl DisplayConfig {
     ) -> fdo::Result<()> {
         let current_conf = self.ipc_outputs.lock().unwrap();
         let mut new_conf = HashMap::new();
+        // Collected in parallel for persistence (method == PERSISTENT): the full monitorspec + mode
+        // per logical monitor, so we can write `monitors.xml` the way mutter does.
+        let mut write_lms: Vec<crate::monitors_xml::WriteLogicalMonitor> = Vec::new();
         for requested_config in logical_monitor_configs {
             if requested_config.monitors.len() > 1 {
                 return Err(zbus::fdo::Error::Failed(
                     "Mirroring is not yet supported".to_owned(),
                 ));
             }
+            let mut write_monitors = Vec::new();
             for (connector, mode, _props) in requested_config.monitors {
-                if !current_conf.values().any(|o| o.name == connector) {
+                let Some(output) = current_conf.values().find(|o| o.name == connector) else {
                     return Err(zbus::fdo::Error::Failed(format!(
                         "Connector '{connector}' not found",
                     )));
-                }
+                };
+                // Resolve the monitorspec + chosen mode dims for persistence. `<vendor>` should be
+                // the EDID PNP id, which we don't carry; the decoded make is a faithful-enough
+                // stand-in (our reader matches on connector + product/serial, not vendor).
+                let (mw, mh, mr) = parse_mode_id(&mode);
+                write_monitors.push(crate::monitors_xml::WriteMonitor {
+                    connector: connector.clone(),
+                    vendor: output.make.clone(),
+                    product: output.model.clone(),
+                    serial: output.serial.clone().unwrap_or_else(|| connector.clone()),
+                    width: mw,
+                    height: mh,
+                    rate: mr,
+                });
                 new_conf.insert(
                     connector.clone(),
                     Some(niri_config::Output {
@@ -230,6 +247,14 @@ impl DisplayConfig {
                     }),
                 );
             }
+            write_lms.push(crate::monitors_xml::WriteLogicalMonitor {
+                x: requested_config.x,
+                y: requested_config.y,
+                scale: requested_config.scale,
+                primary: requested_config.is_primary,
+                transform: requested_config.transform,
+                monitors: write_monitors,
+            });
         }
         if new_conf.is_empty() {
             return Err(zbus::fdo::Error::Failed(
@@ -248,6 +273,15 @@ impl DisplayConfig {
         if let Err(err) = self.to_niri.send(new_conf) {
             warn!("error sending message to niri: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+        // PERSISTENT (2): write GNOME's monitors.xml so the choice survives logout, the way mutter
+        // does. TEMPORARY (1) applies for the session only. `reload_output_config` then re-reads
+        // the file, so the in-memory KDL config (set above) and the store stay consistent.
+        if method == 2 {
+            match crate::monitors_xml::write(&write_lms) {
+                Ok(path) => tracing::info!("persisted display config to {}", path.display()),
+                Err(err) => warn!("could not persist monitors.xml: {err}"),
+            }
         }
         Ok(())
     }
@@ -326,6 +360,18 @@ fn make_display_name(output: &niri_ipc::Output, is_laptop_panel: bool) -> String
     } else {
         make.clone()
     }
+}
+
+/// Parse a mode id as minted by `get_current_state` — `"{width}x{height}@{rate:.3}"` — back into
+/// `(width, height, rate)` for persistence. Falls back to `(0, 0, 60.0)` on a malformed id (the
+/// ids we hand out always parse; the fallback just keeps a rogue client from writing garbage).
+fn parse_mode_id(mode: &str) -> (i32, i32, f64) {
+    (|| {
+        let (dims, rate) = mode.split_once('@')?;
+        let (w, h) = dims.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?, rate.parse().ok()?))
+    })()
+    .unwrap_or((0, 0, 60.0))
 }
 
 fn format_diagonal(diagonal_inches: f64) -> String {
