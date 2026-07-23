@@ -6,6 +6,7 @@ pub mod a11y;
 pub mod animation;
 pub mod audio;
 pub mod backend;
+pub mod calendar_events;
 pub mod cli;
 pub mod cursor;
 #[cfg(feature = "dbus")]

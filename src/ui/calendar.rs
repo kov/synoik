@@ -311,19 +311,81 @@ impl Calendar {
     /// The 42 dates filling the 6×7 grid, row-major from the week-start column of
     /// the row containing the 1st.
     fn grid(&self) -> [Ymd; GRID_ROWS * GRID_COLS] {
-        let first = Ymd {
-            year: self.year,
-            month: self.month,
-            day: 1,
-        };
-        let col_of_first = (7 + weekday(first) as i32 - self.week_start as i32) % 7;
-        let start = add_days(first, -(col_of_first as i64));
-        let mut out = [first; GRID_ROWS * GRID_COLS];
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = add_days(start, i as i64);
-        }
-        out
+        month_grid(self.year, self.month, self.week_start)
     }
+
+    /// The Unix-second `[since, until)` range covering the whole 42-cell grid —
+    /// what the CalendarServer is asked to load (`js/ui/calendar.js:748`).
+    /// `getEvents` then filters per selected day client-side.
+    pub fn grid_range(&self) -> (i64, i64) {
+        grid_range_of(self.year, self.month, self.week_start)
+    }
+
+    /// Local-midnight `[since, until)` bounds of the currently-selected day.
+    pub fn selected_day_bounds(&self) -> (i64, i64) {
+        local_day_bounds(self.selected)
+    }
+}
+
+/// The 42 dates of a month's 6×7 grid, row-major from the week-start column of
+/// the row containing the 1st. Free function so range math can reuse it without
+/// a live [`Calendar`].
+///
+/// Divergence from gnome-shell: when the 1st falls exactly on the week-start
+/// column, GNOME still pads a full leading week from the previous month to keep
+/// the month in weeks 2–6 (`_rebuildCalendar`'s always-6-weeks policy,
+/// `js/ui/calendar.js:645-666`); we start at the 1st and spill further into the
+/// next month instead. Pre-existing (this only moved the logic); affects the
+/// top/bottom row and the C6 grid-range edges — revisit as its own grid fix.
+fn month_grid(year: i32, month: u32, week_start: u8) -> [Ymd; GRID_ROWS * GRID_COLS] {
+    let first = Ymd {
+        year,
+        month,
+        day: 1,
+    };
+    let col_of_first = (7 + weekday(first) as i32 - week_start as i32) % 7;
+    let start = add_days(first, -(col_of_first as i64));
+    let mut out = [first; GRID_ROWS * GRID_COLS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = add_days(start, i as i64);
+    }
+    out
+}
+
+/// The Unix-second `[since, until)` grid range of an arbitrary month (used at
+/// startup / while the popover is closed, when there is no live [`Calendar`]).
+pub fn grid_range_of(year: i32, month: u32, week_start: u8) -> (i64, i64) {
+    let cells = month_grid(year, month, week_start);
+    let first = cells[0];
+    let last = cells[GRID_ROWS * GRID_COLS - 1];
+    (local_midnight(first), local_midnight(add_days(last, 1)))
+}
+
+/// Today's month, for priming the range before the popover first opens.
+pub fn today_grid_range(week_start: u8) -> (i64, i64) {
+    let t = today();
+    grid_range_of(t.year, t.month, week_start)
+}
+
+/// Local-midnight `[00:00 today, 00:00 tomorrow)` of a date, Unix seconds — the
+/// per-day interval `getEvents`/`EventsSection.setDate` filters on
+/// (`js/ui/dateMenu.js:150-154`).
+pub fn local_day_bounds(date: Ymd) -> (i64, i64) {
+    (local_midnight(date), local_midnight(add_days(date, 1)))
+}
+
+/// A date's local midnight as Unix seconds. `mktime` interprets the broken-down
+/// time in the local zone (DST-normalized via `tm_isdst = -1`), matching JS
+/// `new Date(y, m, d)`.
+fn local_midnight(date: Ymd) -> i64 {
+    // SAFETY: a zeroed `tm` is valid; we set the fields mktime needs.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = date.year - 1900;
+    tm.tm_mon = date.month as i32 - 1;
+    tm.tm_mday = date.day as i32;
+    tm.tm_isdst = -1;
+    // SAFETY: tm is populated; mktime normalizes and returns the epoch time.
+    unsafe { libc::mktime(&mut tm) as i64 }
 }
 
 /// Logical layout of the calendar's hit/draw regions, relative to its top-left.
@@ -3334,5 +3396,52 @@ mod tests {
             list.revision, rev0,
             "a Clear-pill hover must not bump the card revision"
         );
+    }
+
+    #[test]
+    fn day_bounds_span_one_local_day() {
+        // The start is strictly before the end in every zone; the span is 24h ±
+        // an hour on a DST-transition day (tolerated so the test is TZ-robust).
+        let (since, until) = local_day_bounds(Ymd {
+            year: 2026,
+            month: 3,
+            day: 10,
+        });
+        assert!(since < until);
+        assert!(
+            (82_800..=90_000).contains(&(until - since)),
+            "a local day is ~24h (±DST), got {}",
+            until - since
+        );
+    }
+
+    #[test]
+    fn grid_range_covers_the_whole_month_grid() {
+        // The 42-cell grid spans six weeks (~42 days, ± an hour at a DST edge)
+        // and contains today's own day interval.
+        let (since, until) = grid_range_of(2026, 7, 0);
+        let span_days = (until - since) / 86_400;
+        assert!(
+            (41..=43).contains(&span_days),
+            "grid spans ~42 days, got {span_days}"
+        );
+        // July 15 sits inside July's grid.
+        let (day_since, day_until) = local_day_bounds(Ymd {
+            year: 2026,
+            month: 7,
+            day: 15,
+        });
+        assert!(since <= day_since && day_until <= until);
+    }
+
+    #[test]
+    fn grid_range_tracks_the_displayed_month() {
+        // Paging the month shifts the range the CalendarServer is asked to load
+        // (`js/ui/calendar.js:748` re-requests on every rebuild).
+        let mut cal = Calendar::new(0, false, [0, 0, 0]);
+        let r0 = cal.grid_range();
+        assert!(cal.scroll(1.0), "a nonzero scroll pages the month");
+        let r1 = cal.grid_range();
+        assert_ne!(r0, r1, "the next month's grid range differs");
     }
 }

@@ -3445,6 +3445,11 @@ impl State {
                         }
                         None => self.niri.panel_popover.close(),
                     }
+                    // A click may have paged the calendar month (nav arrows) —
+                    // reload the events for the now-shown grid, like GNOME's
+                    // per-rebuild `requestRange` (`js/ui/calendar.js:748`).
+                    self.niri.sync_calendar_range();
+                    self.niri.refresh_popover_calendar_events();
                     self.niri.queue_redraw_all();
                     return;
                 }
@@ -3501,6 +3506,9 @@ impl State {
                                 if opened {
                                     let effects = self.niri.notifications.acknowledge_all();
                                     self.niri.apply_notification_effects(effects);
+                                    // Load events for the now-open calendar's grid
+                                    // (`open-state-changed` → today, `js/ui/dateMenu.js:907-915`).
+                                    self.niri.sync_calendar_range();
                                 }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();
@@ -3935,6 +3943,10 @@ impl State {
                         .or_else(|| event.amount(Axis::Vertical))
                         .unwrap_or(0.);
                     if self.niri.panel_popover.pointer_scroll(&output, pos, step) {
+                        // A scroll over the calendar column pages the month —
+                        // reload events for the new grid (`js/ui/calendar.js:748`).
+                        self.niri.sync_calendar_range();
+                        self.niri.refresh_popover_calendar_events();
                         self.niri.queue_redraw_all();
                     }
                     return;

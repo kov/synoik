@@ -395,6 +395,12 @@ pub struct Niri {
     /// differs in shape and is broadcast); `None` when the server isn't running.
     pub gtk_notifications_emit:
         Option<async_channel::Sender<crate::notifications::GtkToNotifications>>,
+    /// The dateMenu Events source (org.gnome.Shell.CalendarServer), empty until
+    /// the watcher reports; see [`crate::calendar_events`].
+    pub calendar_events: crate::calendar_events::CalendarEventStore,
+    /// Range-request channel to the calendar-server watcher task, which owns the
+    /// bus connection; `None` when the watcher isn't running.
+    pub calendar_range_emit: Option<async_channel::Sender<crate::calendar_events::NiriToCalendar>>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
@@ -2910,6 +2916,42 @@ impl State {
         }
     }
 
+    /// A calendar update from the `org.gnome.Shell.CalendarServer` watcher (see
+    /// `dbus::calendar_server`): mutate the store and refresh the open Events
+    /// section. Ports `DBusEventSource`'s signal handlers (`js/ui/calendar.js`).
+    pub fn on_calendar_events_msg(&mut self, msg: crate::calendar_events::CalendarToNiri) {
+        use crate::calendar_events::CalendarToNiri;
+        let changed = match msg {
+            CalendarToNiri::EventsAddedOrUpdated(batch) => {
+                self.niri.calendar_events.add_or_update(batch)
+            }
+            CalendarToNiri::EventsRemoved(ids) => self.niri.calendar_events.remove(&ids),
+            CalendarToNiri::ClientDisappeared(uid) => {
+                self.niri.calendar_events.client_disappeared(&uid)
+            }
+            CalendarToNiri::CacheReset => {
+                // A range change wipes the cache before the new range loads,
+                // like GNOME's forced `_loadEvents` (`js/ui/calendar.js:356-360`).
+                self.niri.calendar_events.reset();
+                true
+            }
+            CalendarToNiri::HasCalendars(has) => self.niri.calendar_events.set_has_calendars(has),
+            CalendarToNiri::OwnerAppeared => {
+                // Reset cache; the watcher re-requests the range forcefully.
+                self.niri.calendar_events.reset();
+                true
+            }
+            CalendarToNiri::OwnerVanished => {
+                self.niri.calendar_events.reset();
+                self.niri.calendar_events.set_has_calendars(false);
+                true
+            }
+        };
+        if changed {
+            self.niri.refresh_popover_calendar_events();
+        }
+    }
+
     /// See [`Niri::apply_notification_effects`].
     pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
         self.niri.apply_notification_effects(effects);
@@ -3375,6 +3417,8 @@ impl Niri {
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,
             gtk_notifications_emit: None,
+            calendar_events: crate::calendar_events::CalendarEventStore::default(),
+            calendar_range_emit: None,
             notification_banner,
             notification_banner_timer: None,
             last_power_profile: "power-saver".to_string(),
@@ -7848,6 +7892,30 @@ impl Niri {
         if self.panel_popover.set_notifications(cards) {
             self.queue_redraw_all();
         }
+    }
+
+    /// Ask the CalendarServer watcher to load the day range the calendar shows —
+    /// the open popover's grid, or (closed) today's month, matching gnome-shell's
+    /// per-rebuild `requestRange` (`js/ui/calendar.js:748`). The watcher dedups,
+    /// so calling this liberally (startup, open, month paging) is free.
+    pub fn sync_calendar_range(&self) {
+        let Some(tx) = &self.calendar_range_emit else {
+            return;
+        };
+        let (since, until) = match self.panel_popover.date_menu() {
+            Some(dm) => dm.calendar.grid_range(),
+            None => crate::ui::calendar::today_grid_range(self.gnome_settings.calendar.week_start),
+        };
+        let _ = tx.send_blocking(crate::calendar_events::NiriToCalendar::SetRange { since, until });
+    }
+
+    /// Refresh the open Events section after a store change (6b pushes the fresh
+    /// section model here). Gated on the dateMenu popover being open.
+    pub fn refresh_popover_calendar_events(&mut self) {
+        if self.panel_popover.open_role() != Some(crate::ui::panel::ROLE_DATE_MENU) {
+            return;
+        }
+        self.queue_redraw_all();
     }
 
     fn user_is_idle(&mut self) -> bool {

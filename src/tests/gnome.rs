@@ -4078,6 +4078,90 @@ fn open_calendar(f: &mut Fixture) {
     assert!(f.niri().panel_popover.is_open());
 }
 
+/// Calendar events flow into the store through `on_calendar_events_msg`, the way
+/// the `org.gnome.Shell.CalendarServer` watcher would deliver them, and
+/// `has_calendars` gates section visibility (DBusEventSource / `_sync`,
+/// `js/ui/calendar.js`, `js/ui/dateMenu.js`).
+#[test]
+fn calendar_events_flow_into_the_store() {
+    use crate::calendar_events::{CalendarEvent, CalendarToNiri};
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let ev = |id: &str, start: i64, end: i64| CalendarEvent {
+        id: id.into(),
+        summary: "Meeting".into(),
+        start,
+        end,
+    };
+
+    // No calendars yet → section hidden.
+    assert!(!f.niri().calendar_events.has_calendars());
+    f.niri_state()
+        .on_calendar_events_msg(CalendarToNiri::HasCalendars(true));
+    assert!(f.niri().calendar_events.has_calendars());
+
+    // A batch lands in the store.
+    f.niri_state()
+        .on_calendar_events_msg(CalendarToNiri::EventsAddedOrUpdated(vec![
+            ev("uid\n1", 100, 200),
+            ev("uid\n2", 300, 400),
+        ]));
+    assert_eq!(f.niri().calendar_events.events_for(0, 1000).len(), 2);
+
+    // A removal is a prefix delete.
+    f.niri_state()
+        .on_calendar_events_msg(CalendarToNiri::EventsRemoved(vec!["uid\n1".into()]));
+    assert_eq!(f.niri().calendar_events.events_for(0, 1000).len(), 1);
+
+    // A range change wipes the cache (the watcher sends this before the new
+    // range loads) but keeps `has_calendars`.
+    f.niri_state()
+        .on_calendar_events_msg(CalendarToNiri::CacheReset);
+    assert!(f.niri().calendar_events.events_for(0, 1000).is_empty());
+    assert!(f.niri().calendar_events.has_calendars());
+
+    // The server vanishing clears the store and hides the section.
+    f.niri_state()
+        .on_calendar_events_msg(CalendarToNiri::OwnerVanished);
+    assert!(!f.niri().calendar_events.has_calendars());
+    assert!(f.niri().calendar_events.events_for(0, 1000).is_empty());
+}
+
+/// Opening the calendar asks the CalendarServer watcher to load exactly the
+/// shown month's 42-cell grid range (`js/ui/calendar.js:748` — the per-rebuild
+/// `requestRange`; paging re-runs the same `sync_calendar_range`).
+#[test]
+fn opening_the_calendar_requests_its_grid_range() {
+    use crate::calendar_events::NiriToCalendar;
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let (tx, rx) = async_channel::unbounded();
+    f.niri_state().niri.calendar_range_emit = Some(tx);
+
+    open_calendar(&mut f);
+
+    let expected = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .calendar
+        .grid_range();
+    // The open path issued a range request for the shown grid.
+    let mut last = None;
+    while let Ok(NiriToCalendar::SetRange { since, until }) = rx.try_recv() {
+        last = Some((since, until));
+    }
+    assert_eq!(
+        last,
+        Some(expected),
+        "opening requests the shown month's grid range"
+    );
+}
+
 /// Opening the calendar message list acknowledges the whole store exactly
 /// once (`js/ui/messageList.js:1193-1199`) and drops queued banners
 /// (`js/ui/messageTray.js:1070-1078`); notifications arriving while it is

@@ -3,6 +3,7 @@ use zbus::object_server::Interface;
 
 use crate::niri::State;
 
+pub mod calendar_server;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
@@ -65,6 +66,8 @@ pub struct DBusServers {
     /// write the `AirplaneMode` property when the QS toggle is clicked
     /// ([`rfkill::set_airplane_mode`]).
     pub conn_rfkill: Option<Connection>,
+    /// org.gnome.Shell.CalendarServer (session bus) — the dateMenu Events source.
+    pub conn_calendar_server: Option<Connection>,
 }
 
 impl DBusServers {
@@ -306,6 +309,29 @@ impl DBusServers {
             }
             Err(err) => {
                 warn!("error starting rfkill watcher: {err:?}");
+            }
+        }
+
+        // Calendar events (org.gnome.Shell.CalendarServer): bidirectional — we
+        // push the visible day range out and receive event signals back.
+        let (to_niri, from_calendar) = calloop::channel::channel();
+        let (to_calendar, calendar_from_niri) = async_channel::unbounded();
+        niri.event_loop
+            .insert_source(from_calendar, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_calendar_events_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match calendar_server::start(to_niri, calendar_from_niri) {
+            Ok(conn) => {
+                dbus.conn_calendar_server = Some(conn);
+                niri.calendar_range_emit = Some(to_calendar);
+                // Request today's month grid so the service activates and events
+                // are ready before the popover first opens.
+                niri.sync_calendar_range();
+            }
+            Err(err) => {
+                warn!("error starting calendar-server watcher: {err:?}");
             }
         }
 
