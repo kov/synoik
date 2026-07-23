@@ -235,10 +235,20 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   (colors-kept, premultiply, real-app decode, scale-tag, fallback, descriptor); Fable-reviewed
   (channel order confirmed correct from tiny-skia/DRM sources; premultiply-order + lazy-fallback fixes
   landed).
-- **S3 — Dash chrome (favorites) + `widget::AppIcon` + click-to-launch.** Render the dash at the
-  overview bottom (background + favorites app-well + show-apps button), hit-test, click→`launch`. Start
-  **favorites-only** (defer running apps to S6). Pins: render test for the dash bake; conformance test
-  that a click on a favorite's rect calls `launch` with the right entry.
+- **S3 — Dash chrome (favorites) + `widget::AppIcon` + click-to-launch. ✅ DONE.** `src/ui/dash.rs`:
+  the `Dash` widget (rounded `dash-background` pill bottom-center, favorites app-well of `widget::AppIcon`
+  tiles, trailing show-apps button), `layout`/`hit_test` sharing one `DashLayout`, `render` baking the
+  pill (hover fill) with full-color icons on top, faded by `expose_progress`. Click intercept in
+  `on_pointer_button` (inside the gnome-mode block): a favorite launches (`LaunchMode::Activate` — all
+  apps are stopped in S3) + closes the overview; show-apps/background consumed inertly; every button
+  consumed on a hit so nothing falls through to the overview pan grabs. Gated to when the dash is
+  actually visible (`is_overview_open && !locked && !screenshot-ui`) so an invisible dash can't eat
+  clicks / launch into a locked session. Favorites snapshot via `sync_dash_favorites`; icon uploads
+  dropped on installed-changed and icon-theme change. **Favorites-only** (running apps → S6). Divergences
+  recorded in the module doc: launch-on-press (vs GNOME's release), right-click AppMenu consumed inertly,
+  touch falls through. Pins: 8 conformance tests (`overview_dash_*`) + 3 `dash.rs` unit tests + a Vulkan
+  render test pinning the hover-lightens sign. **Not yet live-validated** (fade smoothness / real icons /
+  hover feel — see `pending-live-validation`).
 - **S4 — Overview search entry + `AppSearchProvider` + launch.** `widget::Entry` at overview top;
   typing routes through `KeyboardFocus::Overview` → terms → `AppSystem.search` → grid results;
   Enter/click → `launch` + close overview. Local app provider only. Pins: conformance test

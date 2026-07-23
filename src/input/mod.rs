@@ -45,6 +45,7 @@ use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
 use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
+use crate::app_system::LaunchMode;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
@@ -53,6 +54,7 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::run_dialog::{self, KeyOutcome};
@@ -2935,6 +2937,27 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
+        // The overview dash tracks the hovered tile (favorite / show-apps) so it can
+        // paint the tile's hover fill (`_dash.scss` `.overview-icon:hover`). Only when
+        // the dash is actually on screen — the GNOME overview (`is_gnome_mode`), open,
+        // and not hidden behind a lock/screenshot surface — matching the render gate;
+        // otherwise this is churn (redraws) over a dash nobody sees. `is_overview_open`
+        // is also true in niri's own scrolling-mode overview, where the dash never draws.
+        let dash_visible = self.niri.layout.is_gnome_mode()
+            && self.niri.layout.is_overview_open()
+            && !self.niri.is_locked()
+            && !self.niri.screenshot_ui.is_open();
+        let dash_hit = if dash_visible {
+            self.niri
+                .output_under(pos)
+                .and_then(|(output, p)| self.niri.dash.hit_test(p, output_size(output)))
+        } else {
+            None
+        };
+        if self.niri.dash.set_hovered(dash_hit) {
+            self.niri.queue_redraw_all();
+        }
+
         // Hovering the notification banner holds its expiry and expands the
         // banner; leaving restarts the countdown
         // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
@@ -3466,6 +3489,49 @@ impl State {
                         if let Some(hit) = self.niri.notification_banner.hit_test(output, *pos) {
                             self.niri.suppressed_buttons.insert(button_code);
                             self.on_banner_hit(hit);
+                            self.niri.queue_redraw_all();
+                            return;
+                        }
+                    }
+                }
+
+                // The overview dash (favorites bar) intercepts clicks while the overview is
+                // open: a click on a favorite launches it and closes the overview (all our
+                // apps are stopped in S3, so this is a plain `Activate` launch — GNOME's
+                // dash icon does `open_new_window` only for a *running* app,
+                // `appDisplay.js:3060`). The show-apps button and the pill background are
+                // consumed inertly (S8 wires the app grid). *Every* button is consumed on a
+                // hit so a right/middle press over the dash can't fall through to the
+                // overview's right-drag / workspace grabs beneath it.
+                //
+                // Only when the dash is actually visible: a lock surface or the screenshot
+                // UI can be raised over a still-open overview (neither closes it), and the
+                // render path hides the dash behind them — so without these guards the dash
+                // would be an invisible click-eater (and, unlike the panel intercepts which
+                // route through the lock-filtered `do_action`, this launches apps directly —
+                // a lock-screen bypass). GNOME sidesteps this by dropping the overview from
+                // the lock/unlock session modes (`sessionMode.js`).
+                if self.niri.layout.is_overview_open()
+                    && !self.niri.is_locked()
+                    && !self.niri.screenshot_ui.is_open()
+                {
+                    if let Some((output, pos)) = &under {
+                        if let Some(hit) = self.niri.dash.hit_test(*pos, output_size(output)) {
+                            self.niri.suppressed_buttons.insert(button_code);
+                            if let DashHit::Favorite(i) = hit {
+                                if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
+                                    if let Some(id) =
+                                        self.niri.dash.favorite_id(i).map(str::to_owned)
+                                    {
+                                        if let Err(err) =
+                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
+                                        {
+                                            tracing::warn!("dash launch of {id} failed: {err:?}");
+                                        }
+                                        self.niri.layout.close_overview();
+                                    }
+                                }
+                            }
                             self.niri.queue_redraw_all();
                             return;
                         }

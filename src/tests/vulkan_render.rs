@@ -6118,3 +6118,95 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
         );
     }
 }
+
+/// The overview dash bakes through the owned renderer, and its hover fill *lightens*
+/// the hovered tile — the per-widget hover direction (`TILE_HOVER` =
+/// `st-lighten($dash_background_color, 7%)`, `_dash.scss`). Pinned as a differential
+/// in one frame: with favorite 0 hovered, sample tile 0's top border (hover fill,
+/// above the icon) against tile 1's (plain pill background); tile 0 must be brighter
+/// on every color channel. A sign flip (a theme reading it as a darken) fails here.
+#[test]
+fn vulkan_dash_hover_lightens_the_tile() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+    use crate::ui::dash::DashHit;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_dash_hover_lightens_the_tile: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let apps = vec![
+        AppEntry::fake("a.desktop", "a.desktop"),
+        AppEntry::fake("b.desktop", "b.desktop"),
+    ];
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(apps)),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri()
+        .app_system
+        .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
+    f.niri().sync_dash_favorites();
+    f.niri().dash.set_hovered(Some(DashHit::Favorite(0)));
+
+    let size = smithay::utils::Size::<f64, Logical>::from((1920., 1080.));
+    let c0 = f.niri().dash.tile_center(0, size).expect("tile 0");
+    let c1 = f.niri().dash.tile_center(1, size).expect("tile 1");
+
+    let state = f.niri_state();
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            // Render the dash directly at full opacity — this pins the bake, not the
+            // overview open animation (whose progress is subject to the headless clock).
+            let elements =
+                niri.dash
+                    .render(vk, &niri.app_icon_cache, &niri.icon_cache, &output, 1.0);
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            // First element is topmost, so composite back-to-front (pill under icons).
+            let pixels = render_to_vec(
+                vk,
+                phys,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((pixels, phys.w, phys.h))
+        },
+    );
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_dash_hover_lightens_the_tile: no Vulkan device");
+        return;
+    };
+    let (pixels, w, _h) = result.expect("compositing the dash through Vulkan must not error");
+
+    // Top border of each tile: inside the 76px tile but above the 64px icon (≈35px up
+    // from center), so we sample the tile fill, never an icon glyph.
+    let sample = |c: Point<f64, Logical>| px(&pixels, w, c.x as i32, (c.y - 35.) as i32);
+    let hovered = sample(c0);
+    let plain = sample(c1);
+    eprintln!("vulkan_dash_hover_lightens_the_tile: hovered={hovered:?} plain={plain:?}");
+
+    // The plain tile is the opaque pill background — proves the dash actually baked.
+    assert_eq!(plain[3], 255, "the dash pill must composite opaquely");
+    for ch in 0..3 {
+        assert!(
+            hovered[ch] > plain[ch],
+            "the hovered tile must be lighter than the plain one on channel {ch} \
+             (hover lightens): hovered={hovered:?} plain={plain:?}"
+        );
+    }
+}

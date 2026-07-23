@@ -51,6 +51,8 @@ const KEY_PAGEDOWN: u32 = 109;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 /// Tap a key: press and release.
 fn tap(f: &mut Fixture, key: u32) {
@@ -4832,4 +4834,225 @@ fn app_system_is_disconnected_and_injectable_headless() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0.id, "org.example.App.desktop");
     assert_eq!(calls[0].1, ResolvedLaunch::Default);
+}
+
+/// S3 dash: a fixture with a 1920×1080 output, an injected fake `AppSystem` whose
+/// catalog holds one entry per `favorites` id, those ids synced into the dash, and
+/// the overview open. Returns the launch recorder so a test can assert what a dash
+/// click launched. This is the injection idiom of `app_system_is_disconnected_…`
+/// wired through to the dash (`sync_dash_favorites`).
+fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLauncher) {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let recorder = RecordingLauncher::default();
+    let apps = favorites
+        .iter()
+        .map(|id| AppEntry::fake(id, id))
+        .collect::<Vec<_>>();
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
+    f.niri()
+        .app_system
+        .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
+    f.niri().sync_dash_favorites();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    assert!(f.niri().layout.is_overview_open(), "overview must open");
+
+    (f, recorder)
+}
+
+/// The center of dash tile `i` in the 1920×1080 output's logical coords.
+fn dash_tile_center(
+    f: &mut Fixture,
+    i: usize,
+) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    let size = smithay::utils::Size::from((1920., 1080.));
+    f.niri()
+        .dash
+        .tile_center(i, size)
+        .expect("tile index in range")
+}
+
+/// A left-click on a dash favorite launches it (plain `Activate` — all our apps
+/// are stopped in S3, `appDisplay.js:3060`) and closes the overview, GNOME's
+/// dash-icon behavior (`dash.js`/`appDisplay.js` `activate` → `_animateOverview`).
+#[test]
+fn overview_dash_favorite_click_launches_and_closes() {
+    use crate::app_system::ResolvedLaunch;
+
+    let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+    let center = dash_tile_center(&mut f, 1);
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one favorite launched");
+    assert_eq!(calls[0].0.id, "b.desktop", "the clicked favorite launched");
+    assert_eq!(calls[0].1, ResolvedLaunch::Default);
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "launching a favorite closes the overview"
+    );
+}
+
+/// A middle-click on a favorite also launches it (still `Activate`: `open_new_window`
+/// is reserved for a *running* app, which S3 never tracks) and closes the overview.
+#[test]
+fn overview_dash_favorite_middle_click_launches() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    let center = dash_tile_center(&mut f, 0);
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    f.niri_complete_animations();
+
+    assert_eq!(recorder.calls.borrow().len(), 1, "middle-click launches");
+    assert!(!f.niri().layout.is_overview_open());
+}
+
+/// A right-click on a favorite is *consumed* — no launch, and critically it must
+/// not fall through to the overview's right-drag workspace grab (that pan starts
+/// on a right-press over empty overview space, `input/mod.rs`). The overview stays
+/// open and no pointer grab begins.
+#[test]
+fn overview_dash_favorite_right_click_consumed() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    let center = dash_tile_center(&mut f, 0);
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "right-click must not launch"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "right-click on the dash leaves the overview open"
+    );
+    assert!(
+        !f.niri().seat.get_pointer().unwrap().is_grabbed(),
+        "a right-click on the dash must not begin the overview pan grab"
+    );
+}
+
+/// The trailing show-apps button consumes its click inertly in S3 (the app grid is
+/// S8): no launch, and the overview stays open.
+#[test]
+fn overview_dash_show_apps_click_is_inert() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    let i = f.niri().dash.show_apps_index();
+    let center = dash_tile_center(&mut f, i);
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.niri_complete_animations();
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "show-apps must not launch an app"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "show-apps is inert in S3 — the overview stays open"
+    );
+}
+
+/// The dash is only live while the overview is open: a click at a favorite's
+/// position with the overview closed passes through to the windows/workspace, never
+/// launching the app.
+#[test]
+fn overview_dash_ignored_when_overview_closed() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    let center = dash_tile_center(&mut f, 0);
+
+    f.niri_state().do_action(Action::CloseOverview, false);
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a closed overview has no dash to click"
+    );
+}
+
+/// The dash intercept fires only while the dash is actually *visible*. A surface
+/// that renders over a still-open overview without closing it (the screenshot UI
+/// here; a lock surface shares the identical guard) hides the dash — so a click at a
+/// favorite's position must NOT launch it, or the invisible dash would eat clicks
+/// (and, for the lock case, launch apps into a locked session). GNOME avoids the
+/// state entirely by dropping the overview from those session modes.
+#[test]
+fn overview_dash_inert_behind_screenshot_ui() {
+    // The screenshot UI captures the screen through the renderer, so this one needs a
+    // Vulkan device; skip cleanly without one (like the `vulkan_*` render tests).
+    if crate::render_helpers::vulkan::VulkanRenderer::new().is_err() {
+        eprintln!("skipping overview_dash_inert_behind_screenshot_ui: no Vulkan device");
+        return;
+    }
+
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    let center = dash_tile_center(&mut f, 0);
+
+    // Give the cursor an output (screenshot capture is per-output-under-cursor), clear
+    // of the dash so no hover is set yet.
+    f.pointer_motion(960., 540.);
+    // Raise the screenshot UI over the open overview (it doesn't close the overview).
+    f.niri_state().open_screenshot_ui(false, None);
+    assert!(f.niri().screenshot_ui.is_open(), "screenshot UI must open");
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the overview stays open behind the screenshot UI"
+    );
+
+    // Now move onto the (hidden) dash favorite and click.
+    f.pointer_motion(center.x - 960., center.y - 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "the dash is hidden behind the screenshot UI — its click must not launch an app"
+    );
+    // And the hover tracker leaves the tile unhovered while the dash is hidden.
+    assert_eq!(f.niri().dash.hovered_for_test(), None);
+}
+
+/// Pointer motion over the dash tracks the hovered tile (the `.overview-icon:hover`
+/// fill target); leaving the dash clears it. Only while the overview is open.
+#[test]
+fn overview_dash_hover_tracks_tile() {
+    use crate::ui::dash::DashHit;
+
+    let (mut f, _recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+    let center = dash_tile_center(&mut f, 0);
+
+    f.pointer_motion(center.x, center.y);
+    assert_eq!(
+        f.niri().dash.hovered_for_test(),
+        Some(DashHit::Favorite(0)),
+        "hovering a favorite marks it hovered"
+    );
+
+    // Move well clear of the dash (top-left corner): hover clears.
+    f.pointer_motion(-center.x + 5., -center.y + 5.);
+    assert_eq!(
+        f.niri().dash.hovered_for_test(),
+        None,
+        "leaving the dash clears the hover"
+    );
 }

@@ -25,11 +25,17 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
-use crate::render_helpers::icon::IconCache;
+use crate::app_system::AppIconRef;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
 use crate::utils::to_physical_precise_round;
+
+/// The upload cache for full-color app icons, keyed by
+/// `(scale, descriptor, logical size)`. Lives on a baking widget (the dash, later
+/// the grid/search) so a hover re-bake doesn't re-upload the icon textures.
+pub type AppIconUploads = HashMap<(NotNan<f64>, AppIconRef, u16), TextureBuffer<VkTexture>>;
 
 /// Straight-alpha RGBA, the color type every draw verb takes (glyph coverage /
 /// SDF alpha modulates it). Matches the `[f32; 4]` the frame primitives want.
@@ -141,6 +147,85 @@ pub fn icon_element<S: AsRef<str>>(
         None,
         Kind::Unspecified,
     ))
+}
+
+/// Composite a **full-color application icon** ([`AppIconRef`]), resolved +
+/// decoded by the [`AppIconCache`], centered at `center` (relative to the element
+/// `origin`), sized `logical_px`. The full-color sibling of [`icon_element`]: no
+/// tint (the icon keeps its own colors), and uploads are cached in the caller's
+/// [`AppIconUploads`] map (keyed by scale + descriptor + size) so a hover re-bake
+/// reuses them. `alpha` multiplies the element (the overview fade). `None` if even
+/// the fallback icon fails to resolve/upload.
+#[allow(clippy::too_many_arguments)]
+pub fn app_icon_element(
+    renderer: &mut VulkanRenderer,
+    uploads: &mut AppIconUploads,
+    icons: &AppIconCache,
+    icon: &AppIconRef,
+    logical_px: f64,
+    scale: f64,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let scale_key = NotNan::new(scale).ok()?;
+    let key = (scale_key, icon.clone(), (logical_px.round() as u16).max(1));
+    #[allow(clippy::map_entry)]
+    if !uploads.contains_key(&key) {
+        let buffer = icons.buffer(icon, logical_px, scale)?;
+        match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+            Ok(tb) => {
+                uploads.insert(key.clone(), tb);
+            }
+            Err(err) => {
+                tracing::error!("error uploading app icon: {err:#}");
+                return None;
+            }
+        }
+    }
+    let tb = uploads.get(&key)?;
+    let logical = tb.logical_size();
+    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+    Some(TextureRenderElement::from_texture_buffer(
+        tb.clone(),
+        loc,
+        alpha,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
+
+/// GNOME's `.overview-icon` tile (`%tile`, `_common.scss:84-90`): a rounded square
+/// holding an icon, with a hover state. The reusable geometry + state shared by the
+/// dash (S3) and, later, the app grid and grid search results — GNOME shares it the
+/// same way (`DashIcon`/`GridSearchResult` extend `AppIcon`). The icon pixels ride
+/// on top as an [`app_icon_element`]; this type owns the tile box, the hover fill,
+/// and hit-testing.
+#[derive(Debug, Clone, Copy)]
+pub struct AppIcon {
+    /// The tile box (logical), laid out by the owner.
+    pub rect: Rectangle<f64, Logical>,
+    pub hovered: bool,
+}
+
+impl AppIcon {
+    /// `%tile` padding around the icon (`_common.scss:86`).
+    pub const PADDING: f64 = 6.;
+    /// `%tile` corner radius (`_common.scss:85`).
+    pub const RADIUS: f64 = 16.;
+
+    /// The tile side for a given icon size (icon + padding both sides).
+    pub fn size(icon_px: f64) -> f64 {
+        icon_px + 2. * Self::PADDING
+    }
+
+    pub fn icon_center(&self) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + self.rect.size.w / 2.,
+            self.rect.loc.y + self.rect.size.h / 2.,
+        ))
+    }
 }
 
 /// A per-widget offscreen-texture cache for [`bake`], keyed by `(scale,
@@ -892,6 +977,19 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         let r = (radius * self.scale) as f32;
         self.frame
             .render_rounded_rect(color, r, self.rect_px(rect), &[self.full])?;
+        Ok(())
+    }
+
+    /// Draw an [`AppIcon`] tile's **state** layer (not the icon pixels — those ride
+    /// on top as an [`app_icon_element`]). Normal is a no-op: a flat `.overview-icon`
+    /// tile shares its parent's background (`_drawing.scss:175-177`), so nothing is
+    /// drawn. Hovered fills the tile with `hover_bg`, the surface-specific hover color
+    /// (GNOME's flat+`always_dark` `st-lighten`, `_drawing.scss:186-189,270-274` — the
+    /// lighten *direction* is the caller's, read from the SCSS).
+    pub fn app_tile(&mut self, tile: &AppIcon, hover_bg: Rgba) -> anyhow::Result<()> {
+        if tile.hovered {
+            self.fill_rounded(tile.rect, AppIcon::RADIUS, hover_bg)?;
+        }
         Ok(())
     }
 

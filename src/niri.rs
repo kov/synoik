@@ -173,6 +173,7 @@ use crate::render_helpers::{
 use crate::screencasting::Screencasting;
 use crate::system_status::SystemStatus;
 use crate::ui::config_error_notification::ConfigErrorNotification;
+use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -519,6 +520,8 @@ pub struct Niri {
     pub end_session_dialog: EndSessionDialog,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
+    /// The overview dash (favorites bar).
+    pub dash: Dash,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
     /// Full-color application-icon loader for the dash / app grid / search.
@@ -937,6 +940,7 @@ impl State {
                 .niri
                 .app_system
                 .set_favorites(state.niri.gnome_settings.favorite_apps.clone());
+            state.niri.sync_dash_favorites();
             state
                 .niri
                 .event_loop
@@ -946,7 +950,10 @@ impl State {
                         // A newly installed app's icon (or a cached negative) may
                         // now resolve.
                         state.niri.app_icon_cache.clear();
-                        // Later slices redraw the dash/app grid here.
+                        state.niri.dash.clear_icon_uploads();
+                        if state.niri.sync_dash_favorites() {
+                            state.niri.queue_redraw_all();
+                        }
                     }
                 })
                 .unwrap();
@@ -1000,6 +1007,7 @@ impl State {
                             .niri
                             .app_system
                             .set_favorites(settings.favorite_apps.clone());
+                        state.niri.sync_dash_favorites();
                         // A keymap-affecting change (layout list / options / model)
                         // rebuilds the keymap; an mru-only change (e.g. our own
                         // switch write) just re-seeds the active group — no rebuild.
@@ -1020,11 +1028,14 @@ impl State {
                         } else if mru_changed {
                             state.seed_active_layout_from_mru();
                         }
-                        // An icon-theme change re-themes both icon caches.
+                        // An icon-theme change re-themes both icon caches, so the
+                        // dash's uploaded textures (keyed only by icon+size+scale, not
+                        // theme) must be dropped or they keep serving old-theme pixels.
                         if icon_theme_changed {
                             let theme = state.niri.gnome_settings.icon_theme.clone();
                             state.niri.icon_cache = IconCache::new(theme.as_str());
                             state.niri.app_icon_cache.set_theme(&theme);
+                            state.niri.dash.clear_icon_uploads();
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
@@ -3535,6 +3546,7 @@ impl Niri {
             end_session_dialog,
             panel,
             panel_popover,
+            dash: Dash::new(),
             icon_cache: IconCache::new("Adwaita"),
             app_icon_cache: AppIconCache::new("Adwaita"),
 
@@ -4355,6 +4367,18 @@ impl Niri {
         if self
             .notification_banner
             .pointer_inside(output, pos_within_output)
+        {
+            return rv;
+        }
+
+        // While the overview is open, the dash sits above the zoomed workspaces and
+        // takes the pointer — suppress the window beneath it (same reason as the
+        // banner). Its own clicks/hover are handled in the input path.
+        if self.layout.is_overview_open()
+            && self
+                .dash
+                .hit_test(pos_within_output, output_size(output))
+                .is_some()
         {
             return rv;
         }
@@ -5443,6 +5467,23 @@ impl Niri {
                 .render(ctx.renderer, &self.icon_cache, output)
             {
                 push(element.into());
+            }
+            // The overview dash (favorites) fades in with the overview — above the
+            // zoomed workspaces (pushed later, below), below the panel/popover/banner.
+            if let Some(progress) = self
+                .layout
+                .monitor_for_output(output)
+                .and_then(|mon| mon.expose_progress())
+            {
+                for element in self.dash.render(
+                    ctx.renderer,
+                    &self.app_icon_cache,
+                    &self.icon_cache,
+                    output,
+                    progress,
+                ) {
+                    push(element.into());
+                }
             }
         }
 
@@ -7933,6 +7974,23 @@ impl Niri {
         if self.panel.set_messages_indicator(visible) {
             self.queue_redraw_all();
         }
+    }
+
+    /// Snapshot the app catalog's favorites into the dash (GNOME's dash
+    /// `_queueRedisplay` on `AppFavorites`/`installed-changed`). Returns whether the
+    /// dash changed.
+    pub fn sync_dash_favorites(&mut self) -> bool {
+        let favorites = self
+            .app_system
+            .favorites()
+            .into_iter()
+            .map(|e| DashEntry {
+                id: e.id,
+                name: e.name,
+                icon: e.icon,
+            })
+            .collect();
+        self.dash.set_favorites(favorites)
     }
 
     /// Push a fresh store snapshot into an open calendar popover's message
