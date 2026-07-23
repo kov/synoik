@@ -75,10 +75,10 @@ GNOME sizes text through a handful of placeholder classes, not per-widget px. Ea
 | body (default) | 11 | 400 | 14.7 | panel labels, menu items |
 | `%numeric` | — | — | — | `font-feature-settings: "tnum"` (tabular figures; the clock) |
 
-¹ **pt→px is not fixed in our renderer.** GNOME/St converts `pt` at the stage's font DPI (nominally
-96 DPI → `1pt = 4/3 px`, so the "96-DPI px" column). We do **not** use a single factor — each ported
-UI picked a px by eye, and they disagree (see §1.3). Treat the pt column as canonical intent and the
-px as a per-site choice to converge.
+¹ **pt→px is a single factor now** — `PX_PER_PT = 4/3` via `ui::pt_to_px` (see §1.3). GNOME/St
+converts the base `pt` at the stage's font DPI (nominally 96 DPI → `1pt = 4/3 px`, the "96-DPI px"
+column); the theme's `fontsize` mixin `1.091` is only an internal em-ratio, not the realized factor.
+Validated against a real Cantarell 50.1 panel at matched scale: every text element within ~10%.
 
 ### 1.3 pt→px — one helper (`ui::pt_to_px`)
 
@@ -99,6 +99,35 @@ pt in §1.2 and call `pt_to_px`.
 
 One knob: if live output reads uniformly too large/small, adjust `PX_PER_PT` and every UI tracks it.
 Not yet live-validated on the seat.
+
+### 1.3.1 Font family — Cantarell everywhere
+
+GNOME renders **all** shell UI in one family, from `org.gnome.desktop.interface font-name`
+(default **"Cantarell 11"**), set on the Clutter `stage` and inherited by every actor
+(`_common.scss:68` `stage { … color: $fg_color }` + St's default font). There is no per-widget
+family in the theme — panel, popovers, dialogs, notifications, calendar, quick-settings, OSD, MRU
+all inherit Cantarell. So matching GNOME's look is not per-widget: **the family is a single global
+choice, and it must be Cantarell.** (Monospace spans — dialog command echoes, keycaps — use
+`monospace-font-name`, default "Source Code Pro 10"; we map those to the generic monospace.)
+
+**Our implementation** (`niri-vk/src/text.rs`):
+- `pub const SANS_FAMILY = Family::Name("Cantarell")` — every sans shape/measure names it. Do **not**
+  use `Family::SansSerif`: fontconfig resolves the generic to whatever `fc-match sans` returns (Noto
+  Sans on this VM), a different typeface whose glyph shapes (the "J"/"l") and metrics differ from
+  GNOME. cosmic-text falls back to the fontdb default if Cantarell is absent (GNOME systems always
+  ship it).
+- **Tabular figures.** Cantarell's default digits are *proportional* (`1` narrower than `8`), which
+  jitters the advance-centered clock every second. GNOME fixes this with `%numeric` =
+  `font-feature-settings: "tnum"` on the panel + calendar (§1.2). We match it in `sans_label_attrs`:
+  the single-line **label** shape+measure path enables `tnum` (cosmic-text 0.19
+  `Attrs::font_features` + `FeatureTag::new(b"tnum")`); **body paragraphs stay proportional** (they
+  don't set it), mirroring GNOME's scoping. Pinned by `panel::tests::clock_advance_width_is_stable_across_seconds`.
+- **Weight.** Our rasterizer tops out at bold (700); GNOME's `%title_1`/`%title_2` are 800 → drawn
+  bold. `%heading`/`%title_3`/`%title_4` are 700 (exact).
+
+**TODO (fork tenet "GNOME's way"):** read `font-name` / `monospace-font-name` from
+`org.gnome.desktop.interface` at runtime instead of hardcoding Cantarell, so a user's font choice is
+honored (family + the base pt that feeds §1.3). Hardcoding Cantarell is the faithful *default* only.
 
 ### 1.4 Colors
 
