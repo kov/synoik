@@ -91,11 +91,18 @@ const WEEKEND_FG: [f32; 4] = [0.606, 0.606, 0.614, 1.];
 /// Weekday header + week numbers, muted.
 const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
 /// Week-number pill (`.calendar-week-number`, `_calendar.scss:139-149`): a rounded box behind the
-/// number, `border-radius: $base_border_radius * 0.5` = 4px, background
-/// `transparentize($insensitive_fg_color, .8)` = `$insensitive_fg_color` (#9a9a9c) at 20% alpha,
-/// horizontal padding `$base_padding` = 6px. The number itself is drawn in [`MUTED`].
+/// number, `border-radius: $base_border_radius * 0.5` = 4px, horizontal padding `$base_padding` =
+/// 6px. GNOME's `background-color: transparentize($insensitive_fg_color, .8)` (#9a9a9c @ 20%)
+/// composited over the popover bg resolves to ≈ the message-list card surface (`lighten($card_bg,
+/// 5%)` ≈ #51515a); on-screen GNOME renders the bubble at that card tone, so we fill it opaquely
+/// with the same card color rather than relying on the alpha coincidence. The number is [`MUTED`].
 const WEEK_BOX_RADIUS: f64 = 4.;
-const WEEK_BOX_BG: [f32; 4] = [0.606, 0.606, 0.614, 0.2];
+const WEEK_BOX_BG: [f32; 4] = [
+    0x51 as f32 / 255.,
+    0x51 as f32 / 255.,
+    0x5a as f32 / 255.,
+    1.,
+];
 const WEEK_BOX_PAD_X: f64 = 6.;
 const WEEK_BOX_PAD_Y: f64 = 3.;
 
