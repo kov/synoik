@@ -101,6 +101,8 @@ wayland-scanner = "0.31.10"
 wayland-server = "0.31.13"
 xcursor = "0.3.10"
 zbus = { version = "5.13.2", optional = true }
+jiff = "0.2"
+tzf-rs = "1.3"
 
 [dependencies.smithay]
 workspace = true

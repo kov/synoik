@@ -37,6 +37,7 @@ pub mod ui;
 pub mod utils;
 pub mod wallpaper;
 pub mod window;
+pub mod world_clocks;
 
 #[cfg(test)]
 mod tests;
