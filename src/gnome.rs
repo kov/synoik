@@ -43,6 +43,11 @@ pub struct GnomeSettings {
     /// `org.gnome.shell command-history`: the run dialog's persisted history,
     /// oldest first. gnome-shell caps it at 512 entries.
     pub command_history: Vec<String>,
+    /// `org.gnome.shell favorite-apps`: the dash's pinned apps, in order
+    /// (`js/ui/appFavorites.js`). Raw stored ids; the [`AppSystem`] resolves them.
+    ///
+    /// [`AppSystem`]: crate::app_system::AppSystem
+    pub favorite_apps: Vec<String>,
     /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
     /// dialog refuses to open (gnome-shell's `RunDialog.open`).
     pub disable_command_line: bool,
@@ -132,6 +137,7 @@ impl Default for GnomeSettings {
             overlay_keys: vec![Keysym::Super_L, Keysym::Super_R],
             keybindings: default_keybindings(),
             command_history: Vec::new(),
+            favorite_apps: Vec::new(),
             disable_command_line: false,
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
@@ -289,6 +295,13 @@ impl GnomeSettings {
         }
         if settings_has_key(shell, "last-selected-power-profile") {
             self.last_power_profile = shell.string("last-selected-power-profile").to_string();
+        }
+        if settings_has_key(shell, "favorite-apps") {
+            self.favorite_apps = shell
+                .strv("favorite-apps")
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         }
     }
 
@@ -822,6 +835,27 @@ impl GnomeSettingsWriter {
                         let history: Vec<&str> = history.iter().map(String::as_str).collect();
                         if let Err(err) = shell.set_strv("command-history", history) {
                             warn!("error writing org.gnome.shell command-history: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Persist the dash's pinned apps to `org.gnome.shell favorite-apps`
+    /// (`js/ui/appFavorites.js` `_updateFavorites`). Missing store/key is a no-op,
+    /// so the authoritative copy lives in the `AppSystem` and this is best-effort
+    /// persistence (like [`set_command_history`](Self::set_command_history)).
+    pub fn set_favorite_apps(&self, favorites: Vec<String>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(shell) = &s.shell {
+                    if settings_has_key(shell, "favorite-apps") {
+                        let favorites: Vec<&str> = favorites.iter().map(String::as_str).collect();
+                        if let Err(err) = shell.set_strv("favorite-apps", favorites) {
+                            warn!("error writing org.gnome.shell favorite-apps: {err}");
                         }
                     }
                 }
@@ -1858,6 +1892,92 @@ mod tests {
         assert_eq!(
             read_rx.recv().unwrap(),
             vec!["echo hi".to_owned()],
+            "the write must land in the store via the watcher thread"
+        );
+
+        main_loop.quit();
+        watcher.join().unwrap();
+    }
+
+    #[test]
+    fn writer_persists_favorite_apps() {
+        // The schema comes from the host system; skip where not installed.
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let Some(shell_schema) = source.lookup("org.gnome.shell", true) else {
+            return;
+        };
+        if !shell_schema.has_key("favorite-apps") {
+            return;
+        }
+
+        let ctx = glib::MainContext::new();
+        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
+
+        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn({
+            let ctx = ctx.clone();
+            move || {
+                ctx.with_thread_default(|| {
+                    // SettingsSchema is not Send; look it up again here.
+                    let shell_schema = gio::SettingsSchemaSource::default()
+                        .unwrap()
+                        .lookup("org.gnome.shell", true)
+                        .unwrap();
+                    let backend = gio::memory_settings_backend_new();
+                    let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
+                    STORES.set(Some(Rc::new(Stores {
+                        mutter: None,
+                        mutter_keybindings: None,
+                        wm_keybindings: None,
+                        wm_preferences: None,
+                        shell: Some(shell),
+                        lockdown: None,
+                        background: None,
+                        interface: None,
+                        calendar: None,
+                        notifications: None,
+                        color: None,
+                        input_sources: None,
+                        world_clocks: None,
+                        clocks_installed: false,
+                        world_clocks_cache: RefCell::new(None),
+                        clocks_proxy: RefCell::new(None),
+                    })));
+
+                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
+                    loop_tx.send(main_loop.clone()).unwrap();
+                    main_loop.run();
+                })
+                .unwrap();
+            }
+        });
+        let main_loop = loop_rx.recv().unwrap();
+
+        writer.set_favorite_apps(vec!["org.gnome.Nautilus.desktop".to_owned()]);
+
+        // Invokes run in order, so this reads back after the write landed.
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        ctx.invoke(move || {
+            STORES.with(|stores| {
+                let s = stores.take().unwrap();
+                let favorites: Vec<String> = s
+                    .shell
+                    .as_ref()
+                    .unwrap()
+                    .strv("favorite-apps")
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                read_tx.send(favorites).unwrap();
+                stores.set(Some(s));
+            });
+        });
+
+        assert_eq!(
+            read_rx.recv().unwrap(),
+            vec!["org.gnome.Nautilus.desktop".to_owned()],
             "the write must land in the store via the watcher thread"
         );
 

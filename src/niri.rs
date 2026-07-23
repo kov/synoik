@@ -372,6 +372,10 @@ pub struct Niri {
     pub gnome_settings: GnomeSettings,
     /// Writes settings back to the GSettings store; `None` when headless.
     pub gnome_settings_writer: Option<GnomeSettingsWriter>,
+    /// The application catalog (installed apps, favorites, search, launch) the
+    /// dash and overview search resolve through. `disconnected` (empty) when
+    /// headless; tests inject fakes.
+    pub app_system: crate::app_system::AppSystem,
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
@@ -917,6 +921,25 @@ impl State {
                 .niri
                 .layout
                 .set_gnome_accent_color(state.niri.gnome_settings.accent_color);
+            // The application catalog (dash favorites, overview search, launch),
+            // seeded from the current `favorite-apps` and refreshed on
+            // `installed-changed`.
+            let (app_system, app_db_rx) = crate::app_system::AppSystem::new_gio();
+            state.niri.app_system = app_system;
+            state
+                .niri
+                .app_system
+                .set_favorites(state.niri.gnome_settings.favorite_apps.clone());
+            state
+                .niri
+                .event_loop
+                .insert_source(app_db_rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(()) = event {
+                        state.niri.app_system.refresh();
+                        // Later slices redraw the dash/app grid here.
+                    }
+                })
+                .unwrap();
             // Decode wallpapers on a worker thread (a 4K JPEG-XL decode would
             // otherwise stall the main loop, e.g. on a color-scheme flip), and
             // route finished decodes back here to swap in + redraw.
@@ -962,6 +985,11 @@ impl State {
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
+                        // A `favorite-apps` change re-seeds the dash favorites.
+                        state
+                            .niri
+                            .app_system
+                            .set_favorites(settings.favorite_apps.clone());
                         // A keymap-affecting change (layout list / options / model)
                         // rebuilds the keymap; an mru-only change (e.g. our own
                         // switch write) just re-seeds the active group — no rebuild.
@@ -3413,6 +3441,7 @@ impl Niri {
             popup_grab: None,
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
+            app_system: crate::app_system::AppSystem::disconnected(),
             audio: None,
             mic: crate::audio::MicStatus::default(),
             sink_list: crate::audio::SinkList::default(),

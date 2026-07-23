@@ -4,6 +4,7 @@ extern crate tracing;
 #[cfg(feature = "dbus")]
 pub mod a11y;
 pub mod animation;
+pub mod app_system;
 pub mod audio;
 pub mod backend;
 pub mod calendar_events;

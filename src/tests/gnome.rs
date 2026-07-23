@@ -4799,3 +4799,37 @@ fn notification_banner_critical_auto_expands() {
         Some(crate::ui::notification_banner::BannerHit::Action(0))
     );
 }
+
+/// The overview app catalog is wired but inert in headless mode: a fresh `Fixture`
+/// has a *disconnected* `AppSystem` (nothing installed — the corpus never touches
+/// the host app database), and fakes are injectable via `with_parts` with a launch
+/// reaching the recorder. This pins the wiring and documents the injection idiom
+/// the S3 (dash) and S4 (overview search) tests will use.
+#[test]
+fn app_system_is_disconnected_and_injectable_headless() {
+    use crate::app_system::{
+        AppEntry, AppSystem, FakeCatalog, LaunchMode, RecordingLauncher, ResolvedLaunch,
+    };
+
+    let mut f = Fixture::new();
+    assert_eq!(
+        f.niri().app_system.installed().count(),
+        0,
+        "headless AppSystem must be inert"
+    );
+    assert!(f.niri().app_system.favorites().is_empty());
+
+    let recorder = RecordingLauncher::default();
+    let catalog = FakeCatalog::new(vec![AppEntry::fake("org.example.App.desktop", "App")]);
+    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
+
+    f.niri()
+        .app_system
+        .launch("org.example.App.desktop", LaunchMode::Activate)
+        .expect("launch reaches the recorder");
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.id, "org.example.App.desktop");
+    assert_eq!(calls[0].1, ResolvedLaunch::Default);
+}

@@ -71,6 +71,12 @@ drm-ffi = "0.9.1"
 fastrand = "2.4.1"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
 gio = "0.22.8"
+# The Unix-only Gio bindings (GDesktopAppInfo lives here since gtk-rs-core 0.22,
+# not in `gio`); backs the app catalog/search in `app_system`. `v2_58` is required
+# because the binding for `DesktopAppInfo::search` (the relevance-grouped app
+# search GNOME uses) lives in a module gated behind that feature (gio-unix
+# `lib.rs`), even though the underlying `g_desktop_app_info_search` symbol is older.
+gio-unix = { version = "0.22.8", features = ["v2_58"] }
 git-version = "0.3.9"
 glam = "0.32.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
