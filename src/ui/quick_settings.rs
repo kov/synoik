@@ -1867,10 +1867,15 @@ impl QuickSettings {
                     // (`style::over`) to lay the identical line as an opaque color.
                     if k > 0 && sep_shape.get(k).copied().unwrap_or(false) {
                         let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
+                        // The separator is itself a `.popup-separator-menu-item`, so its rule is
+                        // inset by the `%menuitem` horizontal padding (`$base_padding*2`, our
+                        // `DETAIL_ROW_INSET`) on top of the card pad — i.e. its ends align with the
+                        // row labels, not the card edge (`_common.scss:135`, `_popovers.scss:113`).
+                        let inset = DETAIL_PAD + DETAIL_ROW_INSET;
                         p.hairline(
                             Rectangle::new(
-                                Point::from((card.loc.x + DETAIL_PAD, line_cy)),
-                                Size::from((card.size.w - 2. * DETAIL_PAD, 1.)),
+                                Point::from((card.loc.x + inset, line_cy)),
+                                Size::from((card.size.w - 2. * inset, 1.)),
                             ),
                             style::over(CARD_BG, style::BORDERS),
                         )?;
