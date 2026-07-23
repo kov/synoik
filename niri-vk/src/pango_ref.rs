@@ -27,7 +27,7 @@ pub fn render(
 
         let layout = pangocairo::functions::create_layout(&cr);
         let mut font = pango::FontDescription::new();
-        font.set_family("Sans");
+        font.set_family("Cantarell");
         font.set_absolute_size(px * pango::SCALE as f64);
         layout.set_font_description(Some(&font));
         layout.set_text(text);

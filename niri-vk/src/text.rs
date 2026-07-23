@@ -17,7 +17,8 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{bail, Context, Result};
 use ash::vk;
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, Family, FontSystem, Hinting, Metrics, Shaping, Weight,
+    Align, Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Hinting, Metrics,
+    Shaping, Weight,
 };
 use etagere::{size2, AtlasAllocator};
 use swash::scale::image::Content;
@@ -80,10 +81,7 @@ pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
     {
         let mut b = buffer.borrow_with(&mut fonts);
         b.set_size(None, None);
-        let mut attrs = Attrs::new().family(Family::SansSerif);
-        if bold {
-            attrs = attrs.weight(Weight::BOLD);
-        }
+        let attrs = sans_label_attrs(bold);
         b.set_text(text, &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(false);
     }
@@ -107,7 +105,7 @@ fn shape_line_ranges(
     {
         let mut b = buffer.borrow_with(fonts);
         b.set_size(Some(wrap_px), None);
-        let mut attrs = Attrs::new().family(Family::SansSerif);
+        let mut attrs = Attrs::new().family(SANS_FAMILY);
         if bold {
             attrs = attrs.weight(Weight::BOLD);
         }
@@ -225,10 +223,7 @@ impl TextContext {
         {
             let mut b = buffer.borrow_with(&mut self.fonts);
             b.set_size(None, None);
-            let mut attrs = Attrs::new().family(Family::SansSerif);
-            if bold {
-                attrs = attrs.weight(Weight::BOLD);
-            }
+            let attrs = sans_label_attrs(bold);
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
@@ -257,7 +252,7 @@ impl TextContext {
         {
             let mut b = buffer.borrow_with(&mut self.fonts);
             b.set_size(Some(wrap_px), None);
-            let default_attrs = Attrs::new().family(Family::SansSerif);
+            let default_attrs = Attrs::new().family(SANS_FAMILY);
             // Tag each span with its index (cosmic-text carries it to every laid-out glyph as
             // `metadata`), so `rasterize` can record which span each glyph came from and a caller
             // can recover a span's ink rectangle (e.g. to paint an inline keycap background).
@@ -446,6 +441,29 @@ pub struct TextSpan<'a> {
     pub px: f32,
 }
 
+/// GNOME's default UI font is Cantarell (`org.gnome.desktop.interface font-name` = "Cantarell 11").
+/// The generic `Family::SansSerif` resolves through fontconfig to whatever `sans` maps to (Noto
+/// Sans on this system), whose glyph shapes and metrics differ from GNOME's — so name Cantarell.
+/// If it is missing, cosmic-text falls back to the fontdb default. TODO: read the `font-name`
+/// gsetting instead of hardcoding, per the fork's "GNOME's way" tenet.
+pub const SANS_FAMILY: Family<'static> = Family::Name("Cantarell");
+
+/// Sans attrs for a single-line LABEL: Cantarell, optional bold, and **tabular figures** (`tnum`).
+/// GNOME applies `%numeric` (`tnum`) to the panel clock and calendar numbers so a digit run keeps a
+/// constant advance — Cantarell's default figures are proportional (`1` is narrower than `8`),
+/// which would jitter the advance-centered clock every second. Labels are exactly GNOME's numeric
+/// surfaces (clock, dates, counts); body paragraphs keep proportional figures (they don't set
+/// this).
+fn sans_label_attrs(bold: bool) -> Attrs<'static> {
+    let mut features = FontFeatures::new();
+    features.enable(FeatureTag::new(b"tnum"));
+    let mut attrs = Attrs::new().family(SANS_FAMILY).font_features(features);
+    if bold {
+        attrs = attrs.weight(Weight::BOLD);
+    }
+    attrs
+}
+
 /// The font family of a [`TextSpan`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SpanFamily {
@@ -456,7 +474,7 @@ pub enum SpanFamily {
 impl TextSpan<'_> {
     fn attrs(&self) -> Attrs<'static> {
         let family = match self.family {
-            SpanFamily::Sans => Family::SansSerif,
+            SpanFamily::Sans => SANS_FAMILY,
             SpanFamily::Mono => Family::Monospace,
         };
         let weight = if self.bold {
