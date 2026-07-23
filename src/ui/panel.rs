@@ -49,9 +49,11 @@ use crate::system_status::{self, SystemStatus};
 use crate::ui::widget::{self, Painter, TextShaper, TextStyle};
 use crate::utils::{output_size, to_physical_precise_round};
 
-/// Logical height of the panel. GNOME's is `2.2em` at an `11pt` base font,
-/// i.e. ~32px at scale 1 (`gnome-shell-sass/widgets/_panel.scss`).
-pub const PANEL_HEIGHT: f64 = 32.;
+/// Logical height of the panel. GNOME's `#panel` is `2.2em` (`_panel.scss:10,16`); measured 35px
+/// logical against a real 50.1 panel (ours was a slightly short 32). GNOME's structural height ems
+/// resolve against the mixin's 16px reference base (`2.2 × 16 = 35.2`), NOT the ~14.67 font em —
+/// hence the measured value rather than `em(2.2)`.
+pub const PANEL_HEIGHT: f64 = 35.;
 
 /// Panel font size. The clock draws at GNOME's `panel_button` base of 11pt
 /// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `FONT_PX`

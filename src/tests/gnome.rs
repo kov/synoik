@@ -1091,8 +1091,8 @@ fn placement_first_fit_prefers_below() {
 
     // place.c center_tile_rect_in_area: the leftover space of a hypothetical
     // grid of same-size windows, halved horizontally, third-ed vertically —
-    // within the work area, which the top panel insets to (0, 32, 1920, 1048).
-    let slot = ((1920. % 101.) / 2., 32. + (1048. % 101.) / 3.);
+    // within the work area, which the top panel insets to (0, 35, 1920, 1045).
+    let slot = ((1920. % 101.) / 2., 35. + (1045. % 101.) / 3.);
 
     let _w1 = map_window_sized(&mut f, id, (100, 100), None);
     let w1_pos = focused_window_pos(&mut f);
@@ -1149,28 +1149,28 @@ fn placement_cascades_when_nothing_fits() {
     let id = f.add_client();
 
     // 1000×600 windows: after the first takes the centered-tile slot,
-    // below/right candidates all overflow the 1920×1048 work area (the top
+    // below/right candidates all overflow the 1920×1045 work area (the top
     // panel insets it), so first-fit fails and every subsequent window cascades.
     let _w1 = map_window_sized(&mut f, id, (1000, 600), None);
 
     let _w2 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 32.),
+        (0., 35.),
         "the first cascaded window must sit at the work-area origin",
     );
 
     let _w3 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (50., 82.),
+        (50., 85.),
         "the next cascade slot is one 50px diagonal step down",
     );
 
     let _w4 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (100., 132.),
+        (100., 135.),
         "each occupied slot steps the cascade another 50px",
     );
 }
@@ -1324,18 +1324,18 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 960 × 1048, bounds: 1920 × 1048, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
+        @"size: 960 × 1045, bounds: 1920 × 1045, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
     );
 
     // The client commits the tiled size; the tile sits at the left edge.
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1048);
+    window.set_size(960, 1045);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 32.),
+        (0., 35.),
         "a left-tiled window must sit at the work-area origin",
     );
 
@@ -1347,7 +1347,7 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 800 × 600, bounds: 1920 × 1048, states: [Activated]"
+        @"size: 800 × 600, bounds: 1920 × 1045, states: [Activated]"
     );
 
     let window = f.client(id).window(&surface);
@@ -1457,10 +1457,10 @@ fn oversized_window_auto_maximizes_with_clamped_restore() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
 
-    // Clamped to the work area (top panel insets it to 1920×1048):
-    // scale = min(1920·√0.8/1800, 1048·√0.8/1000) ≈ 0.937 → 1687×937.
+    // Clamped to the work area (top panel insets it to 1920×1045):
+    // scale = min(1920·√0.8/1800, 1045·√0.8/1000) ≈ 0.937 → 1687×937.
     let factor = 0.8f64.sqrt();
-    let scale = f64::min(1920. * factor / 1800., 1048. * factor / 1000.);
+    let scale = f64::min(1920. * factor / 1800., 1045. * factor / 1000.);
     let expected = format!(
         "size: {} × {}",
         (1800. * scale).round() as i32,
@@ -1582,18 +1582,18 @@ fn drag_to_left_edge_tiles() {
 
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
-        configures.contains("TiledLeft") && configures.contains("size: 960 × 1048"),
+        configures.contains("TiledLeft") && configures.contains("size: 960 × 1045"),
         "dropping in the left edge band must tile left, got: {configures}"
     );
 
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1048);
+    window.set_size(960, 1045);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 32.),
+        (0., 35.),
         "the tiled window must sit at the left work-area edge",
     );
     let _ = f.client(id).window(&surface).recent_configures();
@@ -1834,8 +1834,8 @@ fn overview_workspace_is_centered_at_gnome_scale() {
     f.niri_complete_animations();
 
     // Workspace-local slot (see expose::tests): 760 × 570 centered in the
-    // work area — the top panel insets it to 1920×1048, so the slot sits at
-    // (580, 32 + (1048-570)/2) = (580, 271) — then through zoom 0.8 with the
+    // work area — the top panel insets it to 1920×1045, so the slot sits at
+    // (580, 35 + (1045-570)/2) = (580, 272) — then through zoom 0.8 with the
     // workspace miniature centered at (192, 108) (that uses the full view size,
     // so it is unshifted).
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
@@ -2312,7 +2312,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.set_size(1920, 1048);
+    window.set_size(1920, 1045);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
@@ -2345,7 +2345,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     for configure in f.client(id).window(&surface).recent_configures() {
         assert_eq!(
             configure.size,
-            (1920, 1048),
+            (1920, 1045),
             "an overview drag must never resize the maximized window, got: {configure}"
         );
         assert!(
@@ -2531,18 +2531,18 @@ fn panel_reserves_top_strut() {
 
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
-        configures.contains("size: 1920 × 1048"),
+        configures.contains("size: 1920 × 1045"),
         "a maximized window must fill the work area below the panel, got: {configures}"
     );
 
     let window = f.client(id).window(&surface);
-    window.set_size(1920, 1048);
+    window.set_size(1920, 1045);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 32.),
+        (0., 35.),
         "the maximized window must start below the panel strut",
     );
 }
@@ -2754,7 +2754,7 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     // + TILE_GAP + (TILE_H + TILE_GAP) [second row] + TILE_H/2. Plus the popover
     // origin (menu y = PANEL_HEIGHT + margin).
     let tile_x = origin_x + 12. + 75.;
-    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    let tile_y = (35. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
     pointer_motion_to(&mut f, tile_x, tile_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -2813,7 +2813,7 @@ fn messages_indicator_toggles_with_dnd_tile() {
     let center_x = anchor.loc.x + anchor.size.w / 2.;
     let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
     let tile_x = origin_x + 12. + 75.;
-    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    let tile_y = (35. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
     let open_qs = |f: &mut Fixture| {
         pointer_motion_to(f, 1906., 10.);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
