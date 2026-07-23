@@ -205,24 +205,32 @@ impl Default for CalendarSettings {
     }
 }
 
-/// The locale's first day of the week, 0=Sunday..6=Saturday, via glibc's
-/// `nl_langinfo(_NL_TIME_FIRST_WEEKDAY)` (1=Sunday..7=Saturday), like
-/// gnome-shell's `Shell.util_get_week_start`.
+/// The locale's first day of the week, 0=Sunday..6=Saturday. Faithful port of
+/// gnome-shell's `shell_util_get_week_start` (itself copied from `gtkcalendar.c`):
+/// combine `_NL_TIME_FIRST_WEEKDAY` (a byte, 1=Sunday..7=Saturday, giving the
+/// offset from the week-origin date) with `_NL_TIME_WEEK_1STDAY` (a *packed date*
+/// read as the pointer's integer value, not a string — 19971130=Sunday origin,
+/// 19971201=Monday origin), as `(week_1stday + first_weekday - 1) % 7`.
 fn locale_week_start() -> u8 {
-    // _NL_TIME_FIRST_WEEKDAY is a glibc extension; its value is 0x2000e.
-    const _NL_TIME_FIRST_WEEKDAY: libc::nl_item = 0x20000 + 14;
-    // SAFETY: nl_langinfo returns a pointer to a static, NUL-terminated string
-    // whose first byte encodes the weekday (1=Sunday). Read that one byte.
-    let first = unsafe {
-        let p = libc::nl_langinfo(_NL_TIME_FIRST_WEEKDAY);
-        if p.is_null() {
-            1
-        } else {
-            *p as u8
-        }
-    };
-    // 1..=7 (1=Sunday) → 0..=6 (0=Sunday); default to Sunday on anything odd.
-    first.checked_sub(1).map(|w| w % 7).unwrap_or(0)
+    // glibc `_NL_ITEM(LC_TIME=2, index)` = `(2 << 16) | index`. The correct indices are
+    // 0x68 / 0x66 — NOT 14, which is `ABMON_1` ("Jan"), whose 'J' byte silently yielded
+    // Wednesday. Verified against the system langinfo.h.
+    const _NL_TIME_FIRST_WEEKDAY: libc::nl_item = 0x20068;
+    const _NL_TIME_WEEK_1STDAY: libc::nl_item = 0x20066;
+    // SAFETY: nl_langinfo returns a pointer into static locale data. FIRST_WEEKDAY points at a
+    // string whose first byte is the weekday; WEEK_1STDAY is the glibc quirk where the *pointer
+    // value itself* is the packed date integer (per gtkcalendar.c's `union { uint; char*; }`).
+    unsafe {
+        let fw = libc::nl_langinfo(_NL_TIME_FIRST_WEEKDAY);
+        let first_weekday = if fw.is_null() { 1i32 } else { *fw as i32 };
+        let week_origin = libc::nl_langinfo(_NL_TIME_WEEK_1STDAY) as usize as u32;
+        let week_1stday = match week_origin {
+            19971130 => 0, // Sunday origin
+            19971201 => 1, // Monday origin
+            _ => 0,        // unknown → assume Sunday (GNOME warns; we default quietly)
+        };
+        (((week_1stday + first_weekday - 1) % 7 + 7) % 7) as u8
+    }
 }
 
 /// `org.gnome.desktop.wm.preferences focus-new-windows`.
@@ -1251,6 +1259,28 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `locale_week_start` must read the weekday item, not a month name. The historic
+    /// bug used item `0x2000e` (`ABMON_1`, "Jan"…), whose first byte is a letter (≥ 'A' = 65), so
+    /// `(byte-1)%7` silently yielded Wednesday for every locale. The correct
+    /// `_NL_TIME_FIRST_WEEKDAY` (`0x20068`) returns a small weekday code 1..=7. Assert the
+    /// constant reads a sane code, and the derived week start is a valid 0..=6.
+    #[test]
+    fn week_start_reads_weekday_not_month_name() {
+        const _NL_TIME_FIRST_WEEKDAY: libc::nl_item = 0x20068;
+        // SAFETY: nl_langinfo returns a static, NUL-terminated string; read its first byte.
+        let byte = unsafe {
+            let p = libc::nl_langinfo(_NL_TIME_FIRST_WEEKDAY);
+            assert!(!p.is_null(), "nl_langinfo returned null");
+            *p as u8
+        };
+        assert!(
+            (1..=7).contains(&byte),
+            "first-weekday byte {byte} is not a weekday code 1..=7 — wrong langinfo item \
+             (a month-name byte, the old ABMON_1 bug, would be a letter ≥ 65)"
+        );
+        assert!(locale_week_start() <= 6);
+    }
 
     #[test]
     fn read_source_tuples_unpacks_ass() {

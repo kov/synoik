@@ -90,6 +90,14 @@ const DIM: [f32; 4] = [0.5, 0.5, 0.5, 1.];
 const WEEKEND_FG: [f32; 4] = [0.606, 0.606, 0.614, 1.];
 /// Weekday header + week numbers, muted.
 const MUTED: [f32; 4] = [0.6, 0.6, 0.6, 1.];
+/// Week-number pill (`.calendar-week-number`, `_calendar.scss:139-149`): a rounded box behind the
+/// number, `border-radius: $base_border_radius * 0.5` = 4px, background
+/// `transparentize($insensitive_fg_color, .8)` = `$insensitive_fg_color` (#9a9a9c) at 20% alpha,
+/// horizontal padding `$base_padding` = 6px. The number itself is drawn in [`MUTED`].
+const WEEK_BOX_RADIUS: f64 = 4.;
+const WEEK_BOX_BG: [f32; 4] = [0.606, 0.606, 0.614, 0.2];
+const WEEK_BOX_PAD_X: f64 = 6.;
+const WEEK_BOX_PAD_Y: f64 = 3.;
 
 // The "today" header card above the grid — gnome-shell's `TodayButton` (`js/ui/calendar.js`):
 // a button showing the weekday name over the full date, tapping it snaps the selection back to
@@ -551,10 +559,21 @@ impl Calendar {
                 p.text(run, Point::from((cx, wd_cy)), Align::CENTER, MUTED)?;
             }
 
-            // Week-number column.
+            // Week-number column: a rounded `.calendar-week-number` pill behind each number.
             for (r, run) in week_runs.iter().enumerate() {
                 let cx = PAD + WEEKCOL_W / 2.;
                 let cy = grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL;
+                // `ink_bounds` is physical px; back to logical for the Painter (× scale
+                // internally).
+                let (_ix, _iy, iw, ih) = run.ink_bounds();
+                let (iw, ih) = (iw as f64 / scale, ih as f64 / scale);
+                let box_w = iw + 2. * WEEK_BOX_PAD_X;
+                let box_h = ih + 2. * WEEK_BOX_PAD_Y;
+                let pill = Rectangle::new(
+                    Point::<f64, Logical>::from((cx - box_w / 2., cy - box_h / 2.)),
+                    Size::<f64, Logical>::from((box_w, box_h)),
+                );
+                p.fill_rounded(pill, WEEK_BOX_RADIUS, WEEK_BOX_BG)?;
                 p.text(run, Point::from((cx, cy)), Align::CENTER, MUTED)?;
             }
 
@@ -2095,13 +2114,19 @@ impl DateMenu {
             // (separator / placeholder / Clear pill) lives here.
             p.clear(TRANSPARENT)?;
 
-            // The faint 1px separator on the list column's right edge
-            // (`.message-list` border-right, `_message-list.scss:8,11`).
-            let sep = Rectangle::new(
-                Point::<f64, Logical>::from((LIST_PAD + LIST_W, 0.)),
-                Size::<f64, Logical>::from((1., size.h)),
+            // The 1px separator on the list column's right edge (`.message-list` border-right,
+            // `_message-list.scss:8,11`). Drawn with the crisp device-pixel fill, NOT
+            // `fill_rounded` — an SDF rect anti-aliases both edges of a hairline,
+            // halving its coverage so a white@10% line all but vanished; `fill_rect_px`
+            // paints full-alpha device pixels, so it reads at the intended
+            // $borders_color like GNOME's.
+            let sep_x = to_physical_precise_round::<i32>(scale, LIST_PAD + LIST_W);
+            let sep_w = to_physical_precise_round::<i32>(scale, 1.).max(1);
+            let sep = Rectangle::<i32, Physical>::new(
+                Point::from((sep_x, 0)),
+                Size::from((sep_w, phys.h)),
             );
-            p.fill_rounded(sep, 0., SEPARATOR)?;
+            p.fill_rect_px(sep, SEPARATOR)?;
 
             if let Some(run) = &placeholder_run {
                 // Centered under the (separately composited) 96px icon.
