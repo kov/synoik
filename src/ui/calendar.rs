@@ -2207,6 +2207,9 @@ pub struct DateMenu {
     events: EventsSectionModel,
     /// Bumped whenever `events` changes, to key its texture cache.
     events_rev: u64,
+    /// The events card is an `St.Button` (`%card:hover` + click launches the
+    /// calendar app); tracks its hover wash and revision bit.
+    events_button: widget::CardButton,
     /// The events-card texture, cached per scale.
     events_cache: RefCell<TextureCache>,
     /// The World Clocks section model (header + rows), formatted by the compositor
@@ -2214,9 +2217,9 @@ pub struct DateMenu {
     world_clocks: crate::world_clocks::WorldClocksModel,
     /// Bumped whenever `world_clocks` changes, to key its texture cache.
     world_clocks_rev: u64,
-    /// Whether the pointer is over the world-clocks card (`%card:hover`, a lighten
-    /// wash) — the card is an `St.Button` that launches GNOME Clocks.
-    world_clocks_hovered: bool,
+    /// The world-clocks card is an `St.Button` (`%card:hover` + click launches
+    /// GNOME Clocks); tracks its hover wash and revision bit.
+    world_clocks_button: widget::CardButton,
     /// The world-clocks-card texture, cached per scale.
     world_clocks_cache: RefCell<TextureCache>,
     /// The popover background (rounded box + placeholder label / Clear pill),
@@ -2242,13 +2245,14 @@ impl DateMenu {
             available_h: f64::INFINITY,
             events: EventsSectionModel::default(),
             events_rev: 0,
+            events_button: widget::CardButton::default(),
             events_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
             }),
             world_clocks: crate::world_clocks::WorldClocksModel::default(),
             world_clocks_rev: 0,
-            world_clocks_hovered: false,
+            world_clocks_button: widget::CardButton::default(),
             world_clocks_cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -2379,6 +2383,26 @@ impl DateMenu {
         }
     }
 
+    /// The events card rect (popover-local), when the section is shown — clicking
+    /// anywhere on it launches the calendar app (`EventsSection.vfunc_clicked`,
+    /// `dateMenu.js:300-310`). The card box (inset from the section allocation by
+    /// `EVENTS_MARGIN`), sitting one `EVENTS_GAP` below the grid.
+    fn events_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let alloc = self.events_alloc_h();
+        if alloc <= 0. {
+            return None;
+        }
+        let cal = self.calendar.logical_size();
+        let top = cal.h + EVENTS_GAP + EVENTS_MARGIN;
+        Some(Rectangle::new(
+            Point::from((calendar_col_x() + EVENTS_MARGIN, top)),
+            Size::from((
+                (cal.w - 2. * EVENTS_MARGIN).max(0.),
+                (alloc - 2. * EVENTS_MARGIN).max(0.),
+            )),
+        ))
+    }
+
     /// The world-clocks card rect (popover-local), when the section is shown —
     /// clicking anywhere on it launches GNOME Clocks (`vfunc_clicked`). This is the
     /// card box (the `%card` margin ring lies outside the button, like GNOME's
@@ -2467,6 +2491,17 @@ impl DateMenu {
                 None => PopoverAction::Consumed,
             };
         }
+        // A click anywhere on the Events card launches the calendar app and closes
+        // the popover (`EventsSection.vfunc_clicked`, `dateMenu.js:300-310`).
+        // Divergence: GNOME launches the default `text/calendar` handler resolved
+        // via the app system; lacking one, we launch GNOME Calendar (as world-clocks
+        // launches GNOME Clocks) and treat "has calendars" as implying it exists.
+        if self.events_rect().is_some_and(|r| r.contains(pos)) {
+            return PopoverAction::Spawn(vec![
+                "gtk-launch".to_string(),
+                "org.gnome.Calendar".to_string(),
+            ]);
+        }
         // A click anywhere on the World Clocks card launches GNOME Clocks and closes
         // the popover (`WorldClocksSection.vfunc_clicked`, `dateMenu.js:376-382`).
         if self.world_clocks_rect().is_some_and(|r| r.contains(pos)) {
@@ -2486,21 +2521,20 @@ impl DateMenu {
     /// anything changed (so the caller can redraw).
     pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
         let size = self.logical_size();
-        // The world-clocks card is a hoverable button; while the pointer is on it,
-        // the calendar column gets no hover.
+        // The events and world-clocks cards are hoverable buttons below the grid;
+        // while the pointer is on either, the calendar column gets no hover.
+        let over_events = pos.is_some_and(|p| self.events_rect().is_some_and(|r| r.contains(p)));
         let over_wc = pos.is_some_and(|p| self.world_clocks_rect().is_some_and(|r| r.contains(p)));
         let (list_pos, cal_pos) = match pos {
             Some(p) if p.x < calendar_col_x() => (Some(p), None),
-            Some(_) if over_wc => (None, None),
+            Some(_) if over_events || over_wc => (None, None),
             Some(p) => (None, Some(p - Point::from((calendar_col_x(), 0.)))),
             None => (None, None),
         };
         let mut changed = self.list.hover(list_pos, size.h);
         changed |= self.calendar.hover(cal_pos);
-        if self.world_clocks_hovered != over_wc {
-            self.world_clocks_hovered = over_wc;
-            changed = true;
-        }
+        changed |= self.events_button.set_hovered(over_events);
+        changed |= self.world_clocks_button.set_hovered(over_wc);
         changed
     }
 
@@ -2701,7 +2735,9 @@ impl DateMenu {
         // `events_rev`. Fold its physical height in so a re-cap re-bakes rather than
         // clipping against a stale height (mirrors `bg_texture`'s `height_key`).
         let height_key = to_physical_precise_round::<i64>(scale, self.events_alloc_h()).max(0);
-        let revision = (self.events_rev & 0xFFFF_FFFF) | ((height_key as u64) << 32);
+        let revision = self
+            .events_button
+            .revision(self.events_rev, height_key as u64);
         let mut cache = self.events_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
@@ -2745,6 +2781,7 @@ impl DateMenu {
         };
 
         let card_h = self.events_card_h();
+        let hovered = self.events_button.hovered();
         widget::bake_uncached_sized(renderer, phys, move |frame| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(TRANSPARENT)?;
@@ -2755,6 +2792,8 @@ impl DateMenu {
                 Size::<f64, Logical>::from((cal_w - 2. * EVENTS_MARGIN, card_h)),
             );
             p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
+            // `%card:hover` — a lighten wash over the whole card (the button state).
+            widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
 
             let cx = card.loc.x + EVENTS_CARD_PAD;
             let mut y = card.loc.y + EVENTS_CARD_PAD;
@@ -2813,11 +2852,9 @@ impl DateMenu {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let height_key =
             to_physical_precise_round::<i64>(scale, self.world_clocks_alloc_h()).max(0);
-        // rev in the low 31 bits, the hover state in bit 31, the clip height above —
-        // a hover toggle re-bakes with/without the wash, like `bg_texture`.
-        let revision = (self.world_clocks_rev & 0x7FFF_FFFF)
-            | ((self.world_clocks_hovered as u64) << 31)
-            | ((height_key as u64) << 32);
+        let revision = self
+            .world_clocks_button
+            .revision(self.world_clocks_rev, height_key as u64);
         let mut cache = self.world_clocks_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
@@ -2880,7 +2917,7 @@ impl DateMenu {
         // The header is `$fg_color` (`.no-world-clocks`) when empty, else muted.
         let header_color = if self.world_clocks.empty { TEXT } else { MUTED };
         let card_h = self.world_clocks_card_h();
-        let hovered = self.world_clocks_hovered;
+        let hovered = self.world_clocks_button.hovered();
         widget::bake_uncached_sized(renderer, phys, move |frame| {
             let mut p = Painter::new(frame, scale, phys);
             p.clear(TRANSPARENT)?;
@@ -2891,9 +2928,7 @@ impl DateMenu {
             );
             p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::CARD_BG)?;
             // `%card:hover` — a lighten wash over the whole card (the button state).
-            if hovered {
-                p.fill_rounded(card, EVENTS_CARD_RADIUS, widget::style::HOVER_WASH)?;
-            }
+            widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
 
             let inner_left = card.loc.x + EVENTS_CARD_PAD;
             let inner_right = card.loc.x + card.size.w - EVENTS_CARD_PAD;
@@ -4359,6 +4394,49 @@ mod tests {
         );
     }
 
+    fn visible_events() -> EventsSectionModel {
+        EventsSectionModel {
+            visible: true,
+            title: "Today".into(),
+            rows: vec![EventRow {
+                summary: "Standup".into(),
+                time: "09:00".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn events_click_launches_calendar() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_events(visible_events());
+        let rect = dm.events_rect().expect("visible section has a rect");
+        let center = rect.loc + Point::from((rect.size.w / 2., rect.size.h / 2.));
+        assert_eq!(
+            dm.pointer_click(center),
+            PopoverAction::Spawn(vec!["gtk-launch".into(), "org.gnome.Calendar".into()]),
+            "clicking the card launches the calendar app"
+        );
+    }
+
+    #[test]
+    fn events_hover_lights_up_the_card() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+        dm.set_events(visible_events());
+        let rect = dm.events_rect().expect("visible section has a rect");
+        let center = rect.loc + Point::from((rect.size.w / 2., rect.size.h / 2.));
+        // Moving onto the card sets the hover wash and reports a redraw.
+        assert!(dm.pointer_hover(Some(center)), "entering the card redraws");
+        assert!(
+            dm.events_button.hovered(),
+            "pointer over the card is hovered"
+        );
+        // Idempotent while still inside.
+        assert!(!dm.pointer_hover(Some(center)), "staying inside is a no-op");
+        // Leaving clears it.
+        assert!(dm.pointer_hover(None), "leaving the card redraws");
+        assert!(!dm.events_button.hovered(), "pointer gone is not hovered");
+    }
+
     #[test]
     fn events_card_bakes_at_multiple_scales() {
         let mut vk = match VulkanRenderer::new() {
@@ -4450,12 +4528,18 @@ mod tests {
         let center = rect.loc + Point::from((rect.size.w / 2., rect.size.h / 2.));
         // Moving onto the card sets the hover wash and reports a redraw.
         assert!(dm.pointer_hover(Some(center)), "entering the card redraws");
-        assert!(dm.world_clocks_hovered, "pointer over the card is hovered");
+        assert!(
+            dm.world_clocks_button.hovered(),
+            "pointer over the card is hovered"
+        );
         // Idempotent while still inside.
         assert!(!dm.pointer_hover(Some(center)), "staying inside is a no-op");
         // Leaving clears it.
         assert!(dm.pointer_hover(None), "leaving the card redraws");
-        assert!(!dm.world_clocks_hovered, "pointer gone is not hovered");
+        assert!(
+            !dm.world_clocks_button.hovered(),
+            "pointer gone is not hovered"
+        );
     }
 
     #[test]

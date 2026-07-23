@@ -727,6 +727,54 @@ impl Button {
     }
 }
 
+/// A `%card`-styled `St.Button` — the dateMenu's launcher cards
+/// (`.events-button` / `.world-clocks-button` / `.weather-button`, all
+/// `@extend %card`, `_calendar.scss:153-157`): a rounded [`style::CARD_BG`] card
+/// that lightens on hover (`%card:hover`, [`style::HOVER_WASH`]) and launches an
+/// app on click. This owns only the hover state plus the two easy-to-get-wrong
+/// shared bits — the texture-cache revision packing and the hover-wash paint — so
+/// each section keeps its own content bake and geometry.
+#[derive(Default)]
+pub struct CardButton {
+    hovered: bool,
+}
+
+impl CardButton {
+    pub fn hovered(&self) -> bool {
+        self.hovered
+    }
+
+    /// Set the hover state from whether the pointer is over the card; returns
+    /// whether it changed (so the caller can request a redraw / re-bake).
+    pub fn set_hovered(&mut self, over: bool) -> bool {
+        let changed = self.hovered != over;
+        self.hovered = over;
+        changed
+    }
+
+    /// Pack a texture-cache revision: the content revision in the low 31 bits, the
+    /// hover bit at bit 31, and a physical clip-height key in the high 32 — so a
+    /// re-cap OR a hover toggle re-bakes with/without the wash (mirrors `bg_texture`).
+    pub fn revision(&self, content_rev: u64, height_key: u64) -> u64 {
+        (content_rev & 0x7FFF_FFFF) | ((self.hovered as u64) << 31) | (height_key << 32)
+    }
+
+    /// Paint the `%card:hover` lighten wash over the card when `hovered` — call
+    /// right after filling the card background. Takes the bool explicitly (not
+    /// `&self`) because the caller captures it into the `move` bake closure.
+    pub fn paint_hover(
+        painter: &mut Painter,
+        hovered: bool,
+        card: Rectangle<f64, Logical>,
+        radius: f64,
+    ) -> anyhow::Result<()> {
+        if hovered {
+            painter.fill_rounded(card, radius, style::HOVER_WASH)?;
+        }
+        Ok(())
+    }
+}
+
 /// A scale-correct drawing surface over a bound [`VulkanFrame`]. Every verb takes
 /// **logical** coordinates/sizes (and points, for text); the single `× scale`
 /// conversion lives here. Construct one inside a [`bake`] `paint` closure.
