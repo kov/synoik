@@ -117,7 +117,20 @@ const BTN_ACTIVE_A: f32 = 0.28;
 const BTN_ACTIVE_HOVER_A: f32 = 0.32;
 
 /// The three panel-button roles whose containers fade between states.
-const BTN_ROLES: [&str; 3] = [ROLE_ACTIVITIES, ROLE_DATE_MENU, ROLE_QUICK_SETTINGS];
+/// Every panel button that wears the shared hover/checked "pill" — the fully-rounded
+/// `panel-button` state-layer wash that fades in on hover and stays lit while the
+/// button's menu is up. GNOME gives every `.panel-button` this background
+/// (`_panel.scss:112-113`), and each of these roles is a real `PanelMenu.Button`
+/// (Activities, `dateMenu`, `quickSettings`, and the `InputSourceIndicator` keyboard
+/// menu — `js/ui/status/keyboard.js:875`). The one place a role opts into the pill:
+/// add it here and give [`Panel::pill_rect`] its geometry. `screenRecording` is
+/// excluded — it carries its own always-on red fill rather than the state layer.
+const PILL_ROLES: [&str; 4] = [
+    ROLE_ACTIVITIES,
+    ROLE_DATE_MENU,
+    ROLE_QUICK_SETTINGS,
+    ROLE_KEYBOARD,
+];
 
 /// A button container's fill-alpha fade (gnome-shell `panel_button`'s 150ms
 /// `transition-duration`). `target` is the alpha the fill is heading to; `anim`
@@ -505,7 +518,7 @@ pub struct Panel {
 impl Panel {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         let clock_format = ClockFormat::default();
-        let fills = BTN_ROLES
+        let fills = PILL_ROLES
             .iter()
             .map(|&role| {
                 (
@@ -751,7 +764,7 @@ impl Panel {
     fn retarget_fills(&mut self) {
         let config = self.config.borrow().animations.panel_popover_open_close.0;
         let mut changed = false;
-        for role in BTN_ROLES {
+        for role in PILL_ROLES {
             let target = self.target_alpha(role);
             let fade = self.fills.get_mut(role).expect("every role has a fade");
             if (fade.target - target).abs() < f32::EPSILON {
@@ -789,23 +802,43 @@ impl Panel {
         self.fills.values().any(FillFade::is_animating)
     }
 
+    /// A pill-capable button's hit rect for this frame, or `None` when the role is
+    /// currently absent (e.g. the keyboard indicator with a single layout). The one
+    /// place the shared pill maps a [`PILL_ROLES`] entry to its geometry, so hover /
+    /// checked highlighting and hit-testing stay in lock-step for every button.
+    fn pill_rect(
+        &self,
+        role: &str,
+        output_width: f64,
+        ws: WorkspaceState,
+    ) -> Option<Rectangle<f64, Logical>> {
+        match role {
+            ROLE_ACTIVITIES => Some(self.activities_rect(ws)),
+            ROLE_DATE_MENU => Some(self.date_menu_rect(output_width)),
+            // quickSettings (always present) and keyboard (present with >1 layout) both
+            // live in the right box, so their geometry comes from the same folder.
+            _ => self.right_box_rect(role, output_width),
+        }
+    }
+
     /// The rounded containers to paint behind the buttons this frame, each a
     /// (pill rect, fill color) — only for buttons with a non-zero (animated) fill.
-    /// The same building block (`render_rounded_rect`) for all three, so they're
-    /// consistent. `output_width` places the centered/right-anchored buttons.
+    /// The same building block (`render_rounded_rect`) for every [`PILL_ROLES`] entry,
+    /// so they're consistent. `output_width` places the centered/right-anchored buttons.
     fn button_containers(
         &self,
         output_width: f64,
         ws: WorkspaceState,
     ) -> Vec<(Rectangle<f64, Logical>, [f32; 4])> {
         let mut v = Vec::new();
-        for (role, rect) in [
-            (ROLE_ACTIVITIES, self.activities_rect(ws)),
-            (ROLE_DATE_MENU, self.date_menu_rect(output_width)),
-            (ROLE_QUICK_SETTINGS, self.quick_settings_rect(output_width)),
-        ] {
+        for &role in &PILL_ROLES {
             let alpha = self.fills.get(role).map_or(0., FillFade::value);
-            if alpha > 0.001 {
+            if alpha <= 0.001 {
+                continue;
+            }
+            // A role can be mid-fade the frame its indicator disappears (keyboard drops
+            // to one layout); with no rect there is nothing to light, so skip it.
+            if let Some(rect) = self.pill_rect(role, output_width, ws) {
                 v.push((container_rect(rect), [1., 1., 1., alpha]));
             }
         }
@@ -1156,9 +1189,10 @@ impl Panel {
             containers.push((container_rect(r1), R1_BG));
             (rec.label.clone(), r1.loc.x + INDICATOR_H_PADDING)
         });
-        // The keyboard input-source label — a plain (transparent) panel button, no fill
-        // container this slice (hover/checked is deferred with its source menu). Left-aligned
-        // at the button padding, like the recording pill's label.
+        // The keyboard input-source label. Its hover/checked pill is a shared
+        // `PILL_ROLES` container drawn by `button_containers` above (the `InputSourceIndicator`
+        // is a `PanelMenu.Button` like the clock); here we only place the label, left-aligned
+        // at the button padding like the recording pill's label.
         let keyboard_label = self
             .keyboard_layout
             .as_ref()
@@ -2387,6 +2421,56 @@ mod tests {
         // Clearing the label hides it again.
         assert!(panel.set_keyboard_layout(None));
         assert!(panel.items(ow, ws).iter().all(|i| i.role != ROLE_KEYBOARD));
+    }
+
+    /// The keyboard input-source indicator shares the panel-button pill: it lights on
+    /// hover and stays lit while its menu is up, just like the clock and quick-settings
+    /// (`InputSourceIndicator extends PanelMenu.Button`, `js/ui/status/keyboard.js:875`).
+    #[test]
+    fn keyboard_indicator_wears_the_shared_pill() {
+        let mut clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
+        let ws = WorkspaceState {
+            count: 1,
+            active: 0,
+        };
+        let ow = 1920.;
+        assert!(panel.set_keyboard_layout(Some("us".into())));
+
+        let kb = panel.keyboard_rect(ow).expect("keyboard indicator present");
+        // Its pill is the same inset container the other buttons get.
+        let pill = container_rect(kb);
+        let has_kb_pill = |panel: &Panel| {
+            panel
+                .button_containers(ow, ws)
+                .iter()
+                .any(|(rect, _)| (rect.loc.x - pill.loc.x).abs() < 1e-6)
+        };
+
+        // Idle: no pill.
+        assert!(!has_kb_pill(&panel), "idle keyboard button has no pill");
+
+        // Hover lights it (settle past the 150ms fade).
+        assert!(panel.set_hovered_role(Some(ROLE_KEYBOARD)));
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
+        assert!(
+            has_kb_pill(&panel),
+            "hovered keyboard button lights its pill"
+        );
+
+        // Opening its menu keeps it lit even without hover (checked state).
+        assert!(panel.set_hovered_role(None));
+        assert!(panel.set_open_menu(Some(ROLE_KEYBOARD)));
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
+        assert!(
+            has_kb_pill(&panel),
+            "keyboard button stays lit while its menu is open",
+        );
+
+        // Closing the menu drops the pill again.
+        assert!(panel.set_open_menu(None));
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
+        assert!(!has_kb_pill(&panel), "closed menu clears the pill");
     }
 
     /// The recording pill draws red (`#c01c28`) with its white `M:SS` label on top.
