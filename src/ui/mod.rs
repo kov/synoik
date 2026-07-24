@@ -16,6 +16,7 @@ pub mod quick_settings;
 pub mod run_dialog;
 pub mod screen_transition;
 pub mod screenshot_ui;
+pub mod theme_node;
 pub mod widget;
 
 /// GNOME authors font sizes in points; we size glyphs in logical pixels-per-em, so route every
