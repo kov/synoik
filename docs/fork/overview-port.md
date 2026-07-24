@@ -543,8 +543,12 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     the workspace; favorites reordering inside the dash still unported.
   - Also in the batch, outside the overview: the niri focus ring / border are off in GNOME mode
     (`f524a7dc`) and the startup hotkey overlay is gone (`f1221928`).
-  - **Not yet live-validated** — geometry and colors are pinned headless (plus one Vulkan frame for
-    the close button), but the *feel* (hover timing, drag readability) needs a real seat.
+  - **Live-checked on a headless seat (2026-07-24):** the hover growth (preview's top/left edges move
+    ~4-5px out, centered), the close button on the preview's corner, double-Super landing in the app
+    grid, and the app-icon drag actor tracking the pointer. The last of those was a real bug the
+    headless tests could not see — the drag offset was taken against the pointer at drag *start*
+    instead of the icon, so the icon stayed at the press point (`3b3ff265`). Still un-checked on a
+    real seat: the *feel* (the 200ms ease timings; the harness runs with animations off).
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
