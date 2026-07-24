@@ -23,10 +23,12 @@
 //! rescans live.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use anyhow::Context as _;
+use calloop::channel::Sender as CalloopSender;
 use smithay::backend::allocator::Fourcc;
 use smithay::utils::{Scale, Size, Transform};
 
@@ -284,14 +286,55 @@ fn render_svg_pixmap(
     Ok(pixmap)
 }
 
-/// Resolves + decodes **full-color application icons** on demand, caching the
-/// decoded buffers (positives *and* negatives, so a missing icon isn't re-probed
-/// every frame). Resolution goes through the `freedesktop-icons` crate (real
-/// theme inheritance + size directories); decode keeps the icon's own colors.
+/// The cache key for a decoded app icon: descriptor + logical + physical size.
+type IconKey = (AppIconRef, u16, u32);
+
+/// A decode request handed to the worker thread — all fields are `Send`.
+pub struct IconRequest {
+    key: IconKey,
+    icon: AppIconRef,
+    logical_px: f64,
+    scale: f64,
+    theme: String,
+    generation: u64,
+}
+
+/// A finished decode delivered from the worker back to the main loop, routed to
+/// [`AppIconCache::apply_decoded`]. `None` is a resolve/decode failure — cached as a
+/// negative so a broken icon isn't re-requested every frame.
+pub struct IconDecoded {
+    key: IconKey,
+    buffer: Option<MemoryBuffer>,
+    generation: u64,
+}
+
+/// Resolves + decodes **full-color application icons**, caching the decoded buffers
+/// (positives *and* negatives, so a missing icon isn't re-probed every frame).
+/// Resolution goes through the `freedesktop-icons` crate (real theme inheritance +
+/// size directories); decode keeps the icon's own colors.
+///
+/// The decode (SVG render / raster decode at the target size) is the expensive part
+/// and is offloaded to a worker thread ([`spawn_worker`](Self::spawn_worker)): a miss
+/// enqueues a request and returns `None` (the caller draws no icon this frame), and
+/// the finished buffer lands via [`apply_decoded`](Self::apply_decoded) on the main
+/// loop, which queues a redraw. Without a worker (headless tests) the decode is
+/// synchronous. A `generation` counter, bumped on every cache-invalidating change,
+/// drops results that a theme swap / `clear` outran.
 pub struct AppIconCache {
     /// The current icon theme (`org.gnome.desktop.interface icon-theme`).
     theme: String,
-    buffers: RefCell<HashMap<(AppIconRef, u16, u32), Option<MemoryBuffer>>>,
+    buffers: RefCell<HashMap<IconKey, Option<MemoryBuffer>>>,
+    /// Bumped on every cache-invalidating change (theme swap / `clear`); stamped on
+    /// each request so a result that lands after an invalidation is dropped.
+    generation: u64,
+    /// Requests currently on the worker, so a miss isn't re-queued every frame.
+    /// Cleared on invalidation (else a key stuck here would never re-resolve).
+    in_flight: RefCell<HashSet<IconKey>>,
+    /// Request sink to the decode worker; `None` before [`spawn_worker`] (headless
+    /// tests), where decoding falls back to synchronous.
+    ///
+    /// [`spawn_worker`]: Self::spawn_worker
+    decode_tx: Option<mpsc::Sender<IconRequest>>,
 }
 
 impl AppIconCache {
@@ -299,30 +342,95 @@ impl AppIconCache {
         Self {
             theme: theme.into(),
             buffers: RefCell::new(HashMap::new()),
+            generation: 0,
+            in_flight: RefCell::new(HashSet::new()),
+            decode_tx: None,
         }
+    }
+
+    /// Start the decode worker; give it the sink that delivers finished decodes back
+    /// to the main loop (register `result_tx`'s receiver as a calloop source calling
+    /// [`apply_decoded`](Self::apply_decoded)). Until this is called, [`buffer`] decodes
+    /// synchronously.
+    ///
+    /// [`buffer`]: Self::buffer
+    pub fn spawn_worker(&mut self, result_tx: CalloopSender<IconDecoded>) {
+        let (req_tx, req_rx) = mpsc::channel::<IconRequest>();
+        self.decode_tx = Some(req_tx);
+        if let Err(err) = std::thread::Builder::new()
+            .name("app-icon-decode".to_owned())
+            .spawn(move || {
+                // Ends when the request sender (held by `AppIconCache`) is dropped.
+                for req in req_rx {
+                    // Icons are semi-untrusted app content; a malformed SVG that
+                    // panics the rasterizer must not take down the worker (it becomes
+                    // a negative result instead).
+                    let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        render_icon(&req.theme, &req.icon, req.logical_px, req.scale, req.key.2)
+                    }))
+                    .unwrap_or(None);
+                    let decoded = IconDecoded {
+                        key: req.key,
+                        buffer,
+                        generation: req.generation,
+                    };
+                    if result_tx.send(decoded).is_err() {
+                        break;
+                    }
+                }
+            })
+        {
+            tracing::warn!(
+                "could not spawn the app-icon decode thread: {err}; decoding synchronously"
+            );
+            self.decode_tx = None;
+        }
+    }
+
+    /// Insert a finished decode. Returns whether the cache changed (→ redraw). A
+    /// result whose generation the cache has moved past (a theme swap / `clear` fired
+    /// while it was in flight) is dropped, but its in-flight slot is always freed so
+    /// the icon re-resolves.
+    pub fn apply_decoded(&mut self, decoded: IconDecoded) -> bool {
+        self.in_flight.get_mut().remove(&decoded.key);
+        if decoded.generation != self.generation {
+            return false;
+        }
+        self.buffers.get_mut().insert(decoded.key, decoded.buffer);
+        true
+    }
+
+    /// Bump the generation and drop everything in-flight — every cache-invalidating
+    /// change routes through here, so a decode started before it lands stale.
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.buffers.get_mut().clear();
+        self.in_flight.get_mut().clear();
     }
 
     /// Swap the icon theme, clearing the cache if it actually changed.
     pub fn set_theme(&mut self, theme: &str) {
         if self.theme != theme {
             self.theme = theme.to_string();
-            self.buffers.get_mut().clear();
+            self.invalidate();
         }
     }
 
     /// Drop all cached buffers — e.g. on `installed-changed`, since a newly
     /// installed app's icon (or its previously-cached negative) may now resolve.
     pub fn clear(&mut self) {
-        self.buffers.get_mut().clear();
+        self.invalidate();
     }
 
-    /// A full-color icon buffer for `icon` at `logical_px` (square), rendered at
-    /// the output `scale` and tinted with the icon's own colors. Falls back to
-    /// `application-x-executable`; `None` only if even that is unresolvable.
-    /// Cached by (descriptor, logical size, physical size).
+    /// A full-color icon buffer for `icon` at `logical_px` (square), rendered at the
+    /// output `scale` with the icon's own colors, falling back to
+    /// `application-x-executable`. Cached by (descriptor, logical size, physical size).
     ///
-    /// Interior-mutable like [`IconCache::buffer`] so both the render path and UI
-    /// can rasterize from a shared `&` without a `&mut` borrow.
+    /// With a worker wired, a miss is decoded off-thread: this returns `None` (the
+    /// caller draws no icon this frame) and the buffer lands later via
+    /// [`apply_decoded`](Self::apply_decoded). Without a worker it decodes inline.
+    /// Interior-mutable like [`IconCache::buffer`] so the render path and UI can
+    /// rasterize from a shared `&`.
     pub fn buffer(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
         // Keying on both logical and physical size avoids two different logical
         // sizes at different scales colliding on the same physical px and picking
@@ -334,73 +442,109 @@ impl AppIconCache {
         if let Some(cached) = self.buffers.borrow().get(&key) {
             return cached.clone();
         }
-        let result = self.render(icon, logical_px, scale, px);
-        self.buffers.borrow_mut().insert(key, result.clone());
-        result
-    }
-
-    /// Resolve + decode on a cache miss: try the icon's own file first, and only
-    /// on a resolve/decode failure fall back to `application-x-executable` (so a
-    /// resolvable icon never pays for the fallback's multi-theme sweep).
-    fn render(
-        &self,
-        icon: &AppIconRef,
-        logical_px: f64,
-        scale: f64,
-        px: u32,
-    ) -> Option<MemoryBuffer> {
-        if let Some(path) = self.resolve(icon, logical_px, scale) {
-            match decode_icon(&path, px, scale) {
-                Ok(buf) => return Some(buf),
-                Err(err) => tracing::warn!("failed to decode app icon {}: {err:#}", path.display()),
-            }
-        }
-        let fallback = self.resolve_named("application-x-executable", logical_px, scale)?;
-        match decode_icon(&fallback, px, scale) {
-            Ok(buf) => Some(buf),
-            Err(err) => {
-                tracing::warn!(
-                    "failed to decode fallback icon {}: {err:#}",
-                    fallback.display()
-                );
+        match &self.decode_tx {
+            // Async: hand the decode to the worker (once — dedup on the in-flight
+            // set), draw nothing until it lands.
+            Some(tx) => {
+                if self.in_flight.borrow_mut().insert(key.clone()) {
+                    let req = IconRequest {
+                        key: key.clone(),
+                        icon: icon.clone(),
+                        logical_px,
+                        scale,
+                        theme: self.theme.clone(),
+                        generation: self.generation,
+                    };
+                    if tx.send(req).is_err() {
+                        // Worker gone: decode this one synchronously and cache it.
+                        self.in_flight.borrow_mut().remove(&key);
+                        let result = render_icon(&self.theme, icon, logical_px, scale, px);
+                        self.buffers.borrow_mut().insert(key, result.clone());
+                        return result;
+                    }
+                }
                 None
             }
+            // No worker (tests): decode inline, caching the result (incl. negatives).
+            None => {
+                let result = render_icon(&self.theme, icon, logical_px, scale, px);
+                self.buffers.borrow_mut().insert(key, result.clone());
+                result
+            }
         }
-    }
-
-    /// The file for an icon descriptor, or `None` (the caller then tries the
-    /// fallback). A themed icon tries each name in priority order; a file icon
-    /// resolves directly if it exists.
-    fn resolve(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<PathBuf> {
-        match icon {
-            AppIconRef::Themed(names) => names
-                .iter()
-                .find_map(|name| self.resolve_named(name, logical_px, scale)),
-            AppIconRef::File(path) => path.is_file().then(|| path.clone()),
-            AppIconRef::Fallback => None,
-        }
-    }
-
-    /// Resolve a themed icon name to a file via the freedesktop-icons crate
-    /// (inheritance + size dirs + hicolor fallback). We do **not** use the crate's
-    /// own cache — it caches negatives process-globally with no invalidation, so a
-    /// freshly installed app's icon would stay missing until restart; our buffer
-    /// cache subsumes the win and we control its lifetime.
-    fn resolve_named(&self, name: &str, logical_px: f64, scale: f64) -> Option<PathBuf> {
-        // GNOME passes an *integer* scale to its lookup and paints fractionally;
-        // `ceil` errs toward a larger source asset (we always resample to exact
-        // physical px afterward, so this only affects source quality).
-        freedesktop_icons::lookup(name)
-            .with_size((logical_px.round() as u16).max(1))
-            .with_scale((scale.ceil() as u16).max(1))
-            .with_theme(&self.theme)
-            .find()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.buffers.borrow().len()
     }
+
+    /// Wire the async path to a plain channel (no worker thread) so a test can inspect
+    /// the requests and hand back decoded results via [`apply_decoded`](Self::apply_decoded).
+    #[cfg(test)]
+    fn wire_test_channel(&mut self) -> mpsc::Receiver<IconRequest> {
+        let (tx, rx) = mpsc::channel();
+        self.decode_tx = Some(tx);
+        rx
+    }
+}
+
+/// Resolve + decode an icon in `theme` (a free function so it runs on the decode
+/// worker as well as inline): try the icon's own file first, and only on a
+/// resolve/decode failure fall back to `application-x-executable` (so a resolvable
+/// icon never pays for the fallback's multi-theme sweep).
+fn render_icon(
+    theme: &str,
+    icon: &AppIconRef,
+    logical_px: f64,
+    scale: f64,
+    px: u32,
+) -> Option<MemoryBuffer> {
+    if let Some(path) = resolve_icon(theme, icon, logical_px, scale) {
+        match decode_icon(&path, px, scale) {
+            Ok(buf) => return Some(buf),
+            Err(err) => tracing::warn!("failed to decode app icon {}: {err:#}", path.display()),
+        }
+    }
+    let fallback = resolve_named_in_theme(theme, "application-x-executable", logical_px, scale)?;
+    match decode_icon(&fallback, px, scale) {
+        Ok(buf) => Some(buf),
+        Err(err) => {
+            tracing::warn!(
+                "failed to decode fallback icon {}: {err:#}",
+                fallback.display()
+            );
+            None
+        }
+    }
+}
+
+/// The file for an icon descriptor, or `None` (the caller then tries the fallback).
+/// A themed icon tries each name in priority order; a file icon resolves directly.
+fn resolve_icon(theme: &str, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<PathBuf> {
+    match icon {
+        AppIconRef::Themed(names) => names
+            .iter()
+            .find_map(|name| resolve_named_in_theme(theme, name, logical_px, scale)),
+        AppIconRef::File(path) => path.is_file().then(|| path.clone()),
+        AppIconRef::Fallback => None,
+    }
+}
+
+/// Resolve a themed icon name to a file via the freedesktop-icons crate (theme
+/// inheritance, size dirs, hicolor fallback). We do **not** use the crate's own cache
+/// — it caches negatives process-globally with no invalidation, so a freshly
+/// installed app's icon would stay missing until restart; our buffer cache subsumes
+/// the win and we control its lifetime.
+fn resolve_named_in_theme(theme: &str, name: &str, logical_px: f64, scale: f64) -> Option<PathBuf> {
+    // GNOME passes an *integer* scale to its lookup and paints fractionally; `ceil`
+    // errs toward a larger source asset (we always resample to exact physical px
+    // afterward, so this only affects source quality).
+    freedesktop_icons::lookup(name)
+        .with_size((logical_px.round() as u16).max(1))
+        .with_scale((scale.ceil() as u16).max(1))
+        .with_theme(theme)
+        .find()
 }
 
 /// Decode an icon file to a premultiplied `Abgr8888` [`MemoryBuffer`] of `px`×`px`
@@ -682,6 +826,90 @@ mod tests {
             &AppIconRef::File(PathBuf::from("/nonexistent/x.png")),
             32.,
             1.0,
+        );
+    }
+
+    fn dummy_buffer() -> MemoryBuffer {
+        MemoryBuffer::new(
+            vec![255u8; 4],
+            Fourcc::Abgr8888,
+            Size::from((1, 1)),
+            Scale::from(1.0),
+            Transform::Normal,
+        )
+    }
+
+    /// With a worker wired, a miss enqueues one request and returns `None`; a repeat
+    /// doesn't re-enqueue; applying the decoded buffer makes it warm.
+    #[test]
+    fn async_miss_requests_once_then_applies() {
+        let mut cache = AppIconCache::new("hicolor");
+        let rx = cache.wire_test_channel();
+        let icon = AppIconRef::Themed(vec!["some-app".into()]);
+
+        assert!(
+            cache.buffer(&icon, 96., 1.0).is_none(),
+            "miss draws nothing"
+        );
+        let req = rx.try_recv().expect("a decode was requested");
+        assert!(
+            cache.buffer(&icon, 96., 1.0).is_none(),
+            "still pending, no icon yet"
+        );
+        assert!(rx.try_recv().is_err(), "not re-queued while in flight");
+
+        assert!(cache.apply_decoded(IconDecoded {
+            key: req.key,
+            buffer: Some(dummy_buffer()),
+            generation: req.generation,
+        }));
+        assert!(cache.buffer(&icon, 96., 1.0).is_some(), "now warm");
+    }
+
+    /// A result that lands after a `clear` (installed-changed) is dropped, and the
+    /// icon re-requests rather than being stuck in flight.
+    #[test]
+    fn stale_result_after_clear_is_dropped_and_re_requested() {
+        let mut cache = AppIconCache::new("hicolor");
+        let rx = cache.wire_test_channel();
+        let icon = AppIconRef::Themed(vec!["some-app".into()]);
+
+        cache.buffer(&icon, 96., 1.0);
+        let stale = rx.try_recv().unwrap();
+        cache.clear(); // bumps the generation + clears in-flight
+
+        assert!(
+            !cache.apply_decoded(IconDecoded {
+                key: stale.key,
+                buffer: Some(dummy_buffer()),
+                generation: stale.generation,
+            }),
+            "a pre-clear result is stale"
+        );
+        assert!(cache.buffer(&icon, 96., 1.0).is_none());
+        assert!(rx.try_recv().is_ok(), "re-requested after the stale drop");
+    }
+
+    /// A negative result (resolve/decode failure) is cached, so a broken icon isn't
+    /// re-requested every frame.
+    #[test]
+    fn async_negative_result_is_cached() {
+        let mut cache = AppIconCache::new("hicolor");
+        let rx = cache.wire_test_channel();
+        let icon = AppIconRef::Themed(vec!["nope".into()]);
+
+        cache.buffer(&icon, 96., 1.0);
+        let req = rx.try_recv().unwrap();
+        cache.apply_decoded(IconDecoded {
+            key: req.key,
+            buffer: None,
+            generation: req.generation,
+        });
+
+        assert!(cache.buffer(&icon, 96., 1.0).is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "a cached negative is not re-requested"
         );
     }
 }

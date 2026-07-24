@@ -991,6 +991,23 @@ impl State {
                     }
                 })
                 .unwrap();
+            // Decode app icons on a worker thread — the overview app grid shows ~24
+            // at once, and rasterizing them inline on the first frame stutters the
+            // open animation. Finished decodes land back here and queue a redraw.
+            let (icon_tx, icon_rx) = calloop::channel::channel();
+            state.niri.app_icon_cache.spawn_worker(icon_tx);
+            state
+                .niri
+                .event_loop
+                .insert_source(icon_rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(decoded) = event {
+                        if state.niri.app_icon_cache.apply_decoded(decoded) {
+                            state.niri.queue_redraw_all();
+                        }
+                    }
+                })
+                .unwrap();
+
             // Decode wallpapers on a worker thread (a 4K JPEG-XL decode would
             // otherwise stall the main loop, e.g. on a color-scheme flip), and
             // route finished decodes back here to swap in + redraw.
