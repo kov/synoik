@@ -151,6 +151,11 @@ pub enum SearchOutcome {
 struct SearchCache {
     context: Option<ContextId<VkTexture>>,
     entry_bake: widget::BakeCache,
+    /// The card background + selection/hover wash + "No results" status (below the
+    /// labels). Re-bakes on a highlight change, but only rounded fills — no re-shape.
+    bg_bake: widget::BakeCache,
+    /// The tile labels (above the wash) — hover/selection-independent so a highlight
+    /// change never re-shapes them.
     results_bake: widget::BakeCache,
     /// Full-color result-icon uploads (shared key space with the dash's).
     icons: AppIconUploads,
@@ -303,10 +308,9 @@ impl OverviewSearch {
     }
 
     fn set_selected(&mut self, i: usize) {
-        if i != self.selected {
-            self.selected = i;
-            self.content_rev = self.content_rev.wrapping_add(1);
-        }
+        // No `content_rev` bump: the selection wash is a separate element (the caller
+        // always redraws on a handled key), so moving it never re-shapes the labels.
+        self.selected = i;
     }
 
     /// Replace the result snapshot (from `sync_overview_search`), clamping the
@@ -332,13 +336,14 @@ impl OverviewSearch {
         self.content_rev = self.content_rev.wrapping_add(1);
     }
 
-    /// Set the mouse-hovered element; returns whether it changed (→ redraw).
+    /// Set the mouse-hovered element; returns whether it changed (→ redraw). Does not
+    /// bump `content_rev`: the hover wash is a separate element, so a hover change (every
+    /// mouse move) repositions it without re-shaping the result labels.
     pub fn set_hovered(&mut self, hovered: Option<SearchHit>) -> bool {
         if self.hovered == hovered {
             return false;
         }
         self.hovered = hovered;
-        self.content_rev = self.content_rev.wrapping_add(1);
         true
     }
 
@@ -436,6 +441,14 @@ impl OverviewSearch {
     #[cfg(test)]
     pub fn entry_pill(&self, area: SearchArea) -> Rectangle<f64, Logical> {
         self.layout(area).entry.pill
+    }
+
+    /// The label-bake revision — a test probe for the invariant that a highlight change
+    /// (hover / keyboard selection) does not invalidate it (which would re-shape the
+    /// result labels every mouse move / arrow key).
+    #[cfg(test)]
+    pub fn content_rev(&self) -> u64 {
+        self.content_rev
     }
 
     /// The logical center of result tile `i` — a geometry probe for the
@@ -594,23 +607,46 @@ impl OverviewSearch {
             Err(err) => tracing::error!("error baking the search entry: {err:#}"),
         }
 
-        // --- The results card chrome (labels + selection/hover wash, or "No results"). ---
+        // --- The results card in two z-layers so a highlight change (every mouse move /
+        //     arrow key) never re-shapes the labels. The labels bake is keyed on
+        //     `content_rev` alone (results, never the highlight); the card bake — background
+        //     + selection/hover wash + "No results" status — re-bakes when the highlight
+        //     moves, but that is only rounded fills (no label shaping), so it is cheap. The
+        //     wash is blended over the OPAQUE card background here, which composites as a
+        //     correct lighten (a separate partial-alpha element would darken instead — the
+        //     bakes store premultiplied alpha but the compositor blends straight, harmless
+        //     only for opaque/black content). The result icons were pushed above both. ---
         if active {
             if let Some(card) = layout.card {
                 let origin = card.loc;
-                let selected = self.selected;
-                let hovered = self.hovered;
                 let card_size = card.size;
-                // Tile boxes relative to the card origin (for paint) and label strings
-                // (for the shaping prepare) — kept in separate vecs so the two bake
-                // closures don't both borrow one.
+                let empty = self.results.is_empty();
+                let mut push_card_layer = |renderer: &VulkanRenderer, texture| {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        card.loc,
+                        results_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                };
+
+                // (1) Labels — highlight-independent, so hover/selection never re-shape them.
                 let rel_rects: Vec<Rectangle<f64, Logical>> = layout
                     .tiles
                     .iter()
                     .map(|t| Rectangle::new(t.loc - origin, t.size))
                     .collect();
                 let names: Vec<String> = self.results.iter().map(|e| e.name.clone()).collect();
-                let empty = self.results.is_empty();
+                let label_rects = rel_rects.clone();
                 match widget::bake(
                     renderer,
                     &mut cache.results_bake,
@@ -619,25 +655,73 @@ impl OverviewSearch {
                     self.content_rev,
                     move |r| {
                         let mut shaper = widget::TextShaper::new(r, scale);
-                        let labels = names
+                        names
                             .iter()
                             .map(|name| shaper.shape(name, widget::TextStyle::new(LABEL_PT)))
-                            .collect::<anyhow::Result<Vec<_>>>()?;
-                        let status =
-                            if empty {
-                                Some(shaper.shape(
-                                    "No results",
-                                    widget::TextStyle::new(STATUS_PT).bold(),
-                                )?)
-                            } else {
-                                None
-                            };
-                        Ok((labels, status))
+                            .collect::<anyhow::Result<Vec<_>>>()
                     },
-                    move |frame, phys, (labels, status)| {
+                    move |frame, phys, labels| {
+                        let mut p = Painter::new(frame, scale, phys);
+                        p.clear(style::TRANSPARENT)?;
+                        for (rel, label) in label_rects.iter().zip(labels.iter()) {
+                            p.labelled_tile(
+                                *rel,
+                                label,
+                                &widget::TileMetrics::OVERVIEW,
+                                false,
+                                style::TEXT,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                ) {
+                    Ok(texture) => push_card_layer(renderer, texture),
+                    Err(err) => tracing::error!("error baking the search labels: {err:#}"),
+                }
+
+                // (2) Card background + selection/hover wash + "No results" status (bottom).
+                //     Re-bakes on a highlight change, but only rounded fills — no re-shape.
+                let selected = self.selected;
+                let hovered = self.hovered;
+                // Highlight packed into the bake revision so a move re-bakes the wash.
+                let hover_idx = match hovered {
+                    Some(SearchHit::Result(i)) => i as u64 + 1,
+                    _ => 0,
+                };
+                let card_rev = (self.content_rev << 40)
+                    | ((selected as u64 & 0xF_FFFF) << 20)
+                    | (hover_idx & 0xF_FFFF);
+                match widget::bake(
+                    renderer,
+                    &mut cache.bg_bake,
+                    scale,
+                    card_size,
+                    card_rev,
+                    move |r| {
+                        if empty {
+                            let mut shaper = widget::TextShaper::new(r, scale);
+                            Ok(Some(shaper.shape(
+                                "No results",
+                                widget::TextStyle::new(STATUS_PT).bold(),
+                            )?))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    move |frame, phys, status| {
                         let mut p = Painter::new(frame, scale, phys);
                         p.clear(style::TRANSPARENT)?;
                         p.fill_rounded_full(CARD_RADIUS, widget::style::OVERLAY_BG)?;
+                        // Selection always washes; a hovered result adds/overlaps one.
+                        for (i, rel) in rel_rects.iter().enumerate() {
+                            if i == selected || hovered == Some(SearchHit::Result(i)) {
+                                p.fill_rounded(
+                                    *rel,
+                                    widget::TileMetrics::OVERVIEW.radius,
+                                    style::HOVER_WASH,
+                                )?;
+                            }
+                        }
                         if let Some(status) = status {
                             // Centered "No results" (`.search-statustext`).
                             p.text_band(
@@ -650,37 +734,11 @@ impl OverviewSearch {
                                 Rectangle::from_size(card_size),
                             )?;
                         }
-                        for (i, (rel, label)) in rel_rects.iter().zip(labels.iter()).enumerate() {
-                            let active = i == selected || hovered == Some(SearchHit::Result(i));
-                            p.labelled_tile(
-                                *rel,
-                                label,
-                                &widget::TileMetrics::OVERVIEW,
-                                active,
-                                style::TEXT,
-                            )?;
-                        }
                         Ok(())
                     },
                 ) {
-                    Ok(texture) => {
-                        let buffer = TextureBuffer::from_texture(
-                            renderer,
-                            texture,
-                            scale,
-                            Transform::Normal,
-                            vec![],
-                        );
-                        elements.push(TextureRenderElement::from_texture_buffer(
-                            buffer,
-                            card.loc,
-                            results_alpha,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ));
-                    }
-                    Err(err) => tracing::error!("error baking the search results: {err:#}"),
+                    Ok(texture) => push_card_layer(renderer, texture),
+                    Err(err) => tracing::error!("error baking the search card: {err:#}"),
                 }
             }
         }
@@ -747,6 +805,31 @@ mod tests {
         assert_eq!(tokenize("web browser"), vec!["web", "browser"]);
         assert!(tokenize("   ").is_empty());
         assert!(tokenize("").is_empty());
+    }
+
+    #[test]
+    fn highlight_change_does_not_bump_the_label_bake_revision() {
+        // The label bake is keyed on `content_rev`; hover + keyboard selection must not
+        // touch it, or every mouse move / arrow key re-shapes the result labels (the
+        // stutter that bites once providers make the result set large). Query/result
+        // changes, which DO change the labels, still bump it.
+        let mut s = OverviewSearch::new();
+        s.handle_key(None, Some('a'), true);
+        s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
+        let rev = s.content_rev();
+        assert!(
+            s.set_hovered(Some(SearchHit::Result(1))),
+            "a new hover reports a change"
+        );
+        s.handle_key(Some(Keysym::Down), None, true); // move the keyboard selection
+        assert_eq!(
+            s.content_rev(),
+            rev,
+            "hover + selection must not invalidate the label bake"
+        );
+        // A query change re-shapes (the labels differ).
+        s.handle_key(None, Some('b'), true);
+        assert_ne!(s.content_rev(), rev, "a query change re-bakes");
     }
 
     #[test]
