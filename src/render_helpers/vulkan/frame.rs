@@ -304,9 +304,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             target: self.target_dims(),
             corner_radius: 0.0,
             _pad0: 0.0,
-            // clipped_texture.frag multiplies the sample by this, so white-with-alpha modulates
-            // alpha (and, being straight-alpha, fades the AA edge to the destination).
-            color: [1.0, 1.0, 1.0, alpha],
+            // clipped_texture.frag multiplies the premultiplied sample by this premultiplied tint,
+            // so a uniform `alpha` scales color and coverage together.
+            color: [alpha, alpha, alpha, alpha],
             tex_transform: build_tex_transform(src, texture, src_transform),
             geo_size: clip.geo_size,
             _pad1: [0.0, 0.0],
@@ -373,9 +373,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             proj: self.proj,
             target: self.target_dims(),
             corner_radius,
-            // rounded_texture.frag multiplies the sample by this, so white-with-alpha modulates
-            // alpha; the SDF coverage then cuts the corners.
-            color: [1.0, 1.0, 1.0, alpha],
+            // rounded_texture.frag multiplies the premultiplied sample by this premultiplied tint;
+            // the SDF coverage then cuts the corners.
+            color: [alpha, alpha, alpha, alpha],
             tex_transform: build_tex_transform(src, texture, src_transform),
             ..Default::default()
         };
@@ -461,7 +461,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             target: self.target_dims(),
             corner_radius,
             stroke_width,
-            color,
+            // The toolkit states colors straight-alpha (as the SCSS does); the renderer is
+            // premultiplied. This is that boundary.
+            color: premultiply(color),
             ..Default::default()
         };
         let dev = &self.renderer.gpu.device;
@@ -505,7 +507,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             size: [dst.size.w as f32, dst.size.h as f32],
             proj: self.proj,
             target: self.target_dims(),
-            color: [1.0, 1.0, 1.0, alpha],
+            // Premultiplied tint (see `render_texture_from_to`).
+            color: [alpha, alpha, alpha, alpha],
             tex_transform: build_tex_transform(src, texture, src_transform),
             cutoff: [cutoff.0, cutoff.1],
             ..Default::default()
@@ -624,7 +627,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     uv_origin: [g.atlas_x as f32 / side, g.atlas_y as f32 / side],
                     uv_size: [g.w as f32 / side, g.h as f32 / side],
                     _pad: [0.0, 0.0],
-                    color: color_for(i),
+                    // Toolkit colors are straight-alpha; the glyph material is premultiplied.
+                    color: premultiply(color_for(i)),
                 };
                 dev.cmd_push_constants(
                     self.cbuf,
@@ -1615,8 +1619,11 @@ impl Frame for VulkanFrame<'_, '_> {
             size: [dst.size.w as f32, dst.size.h as f32],
             proj: self.proj,
             target: self.target_dims(),
-            // texture.frag multiplies the sample by this, so white-with-alpha modulates alpha.
-            color: [1.0, 1.0, 1.0, alpha],
+            // texture.frag multiplies the sample by this. Both are premultiplied, so a uniform
+            // `alpha` tint scales color and coverage together — matching the GLES oracle's
+            // `color = texture2D(tex, uv) * alpha`. A `[1, 1, 1, alpha]` straight tint here would
+            // leave rgb unattenuated and wash out every fade.
+            color: [alpha, alpha, alpha, alpha],
             tex_transform: build_tex_transform(src, texture, src_transform),
             ..Default::default()
         };
@@ -1682,6 +1689,19 @@ fn ndc_transform(transform: Transform) -> [f32; 4] {
     // m00 = m.x.x, m10 = m.x.y, m01 = m.y.x, m11 = m.y.y. Negate the off-diagonals (m10, m01).
     let m = transform.matrix();
     [m.x.x, -m.x.y, -m.y.x, m.y.y]
+}
+
+/// Premultiply a straight-alpha RGBA into the renderer's premultiplied convention.
+///
+/// The renderer is premultiplied end to end (see `build_pipeline`'s alpha convention), but the
+/// toolkit above it keeps straight-alpha colors because that is how the GNOME SCSS states them
+/// (`style::HOVER_WASH` is literally white at 10%). This is the boundary where the two meet: every
+/// frame method taking a toolkit `Rgba` premultiplies through here before it reaches a push
+/// constant. A no-op for opaque and fully transparent colors, which is precisely why feeding a
+/// straight color to a premultiplied blend stayed invisible for so long.
+pub(crate) fn premultiply(color: [f32; 4]) -> [f32; 4] {
+    let a = color[3];
+    [color[0] * a, color[1] * a, color[2] * a, a]
 }
 
 /// Pack a `glam::Mat3` into 3 `vec4` columns (`.xyz` used, `w = 0`) for a `mat3` push field.

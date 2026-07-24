@@ -40,5 +40,7 @@ void main() {
 
     float aa = max(fwidth(d), 1e-4);
     float coverage = 1.0 - smoothstep(-aa, aa, d);
-    o = vec4(pc.color.rgb, pc.color.a * coverage);
+    // `pc.color` is premultiplied (the frame method premultiplies the toolkit's straight Rgba) and
+    // the pipeline blends premultiplied-over, so coverage scales rgb and alpha together.
+    o = pc.color * coverage;
 }

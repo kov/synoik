@@ -583,9 +583,11 @@ impl TextRenderer {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // Premultiplied-over, like every other material: `text.frag` scales the premultiplied tint
+        // by the atlas coverage.
         let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -629,7 +631,8 @@ impl TextRenderer {
         })
     }
 
-    /// Draw every glyph in `atlas`, offset to `(ox, oy)` in a `target`-sized image, in `color`.
+    /// Draw every glyph in `atlas`, offset to `(ox, oy)` in a `target`-sized image, in `color`
+    /// (**premultiplied** — the glyph material blends premultiplied-over like every other).
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,

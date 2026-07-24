@@ -1,9 +1,10 @@
 #version 450
 
 // Glyph material: the atlas holds grayscale coverage in its red channel (swash Format::Alpha).
-// Output the text color modulated by coverage — straight-alpha, so it composites over whatever
-// is behind via the standard blend. Hinting/AA quality lives entirely in the atlas bitmap; this
-// stage just places and tints it.
+// Output the text color modulated by coverage. `pc.color` is premultiplied (the frame method
+// premultiplies the toolkit's straight Rgba) and the pipeline blends premultiplied-over, so
+// coverage scales rgb and alpha together. Hinting/AA quality lives entirely in the atlas bitmap;
+// this stage just places and tints it.
 
 layout(set = 0, binding = 0) uniform sampler2D atlas;
 
@@ -22,5 +23,5 @@ layout(location = 0) out vec4 o;
 
 void main() {
     float coverage = texture(atlas, v_uv).r;
-    o = vec4(pc.color.rgb, pc.color.a * coverage);
+    o = pc.color * coverage;
 }

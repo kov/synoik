@@ -13,7 +13,7 @@ layout(push_constant) uniform Push {
     vec2 target;
     float corner_radius;
     float _pad0;
-    vec4 color;          // straight-alpha tint, [1,1,1,alpha]
+    vec4 color;          // premultiplied tint, [alpha,alpha,alpha,alpha]
     vec4 st0;            // tex_transform columns (xyz used): v_uv -> normalized UV
     vec4 st1;
     vec4 st2;
@@ -33,7 +33,7 @@ void main() {
         fade = clamp((pc.cutoff.y - uv.x) / (pc.cutoff.y - pc.cutoff.x), 0.0, 1.0);
     }
 
-    // Straight-alpha blend: attenuate alpha only (the GLES shader premultiplies by fade, which is
-    // equivalent once the hardware multiplies rgb by src alpha at blend time).
-    o = vec4(c.rgb, c.a * fade);
+    // Premultiplied-over blend (ONE / ONE_MINUS_SRC_ALPHA) and `c` is premultiplied, so the fade
+    // scales rgb and alpha together — exactly what the GLES shader does.
+    o = c * fade;
 }

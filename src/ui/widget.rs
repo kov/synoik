@@ -29,7 +29,9 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{GlyphRun, VkTexture, VulkanFrame, VulkanRenderer};
+use crate::render_helpers::vulkan::{
+    premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer,
+};
 use crate::utils::to_physical_precise_round;
 
 /// The upload cache for full-color app icons, keyed by
@@ -1127,7 +1129,12 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// Clear the whole buffer to `color` (a transparent clear for rounded popovers,
     /// a border color for square dialogs).
     pub fn clear(&mut self, color: Rgba) -> anyhow::Result<()> {
-        self.frame.clear(Color32F::from(color), &[self.full])?;
+        // A clear writes its value into the buffer verbatim — no blend — so it has to arrive in the
+        // buffer's own (premultiplied) convention, not the toolkit's straight one. Every clear
+        // color in the tree today is opaque or fully transparent, where the two agree; this keeps a
+        // future translucent clear from silently storing straight alpha.
+        self.frame
+            .clear(Color32F::from(premultiply(color)), &[self.full])?;
         Ok(())
     }
 
@@ -1389,7 +1396,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         rect: Rectangle<i32, Physical>,
         color: Rgba,
     ) -> anyhow::Result<()> {
-        self.frame.clear(Color32F::from(color), &[rect])?;
+        // Premultiplied for the same reason as [`clear`](Self::clear) — this is a clear too.
+        self.frame
+            .clear(Color32F::from(premultiply(color)), &[rect])?;
         Ok(())
     }
 

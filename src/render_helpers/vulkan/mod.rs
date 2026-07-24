@@ -29,7 +29,7 @@ pub(crate) use custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomSha
 pub(crate) use effect_blur::EffectBlur;
 pub use error::VulkanError;
 pub use frame::VulkanFrame;
-pub(crate) use frame::{pack_mat3, ClipParams};
+pub(crate) use frame::{pack_mat3, premultiply, ClipParams};
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;
 pub use types::{VkMapping, VkTexture};

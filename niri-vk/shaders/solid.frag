@@ -1,6 +1,8 @@
 #version 450
 
-// Solid-fill material: the simplest quad, straight through to the push-constant color.
+// Solid-fill material: the simplest quad, straight through to the push-constant color. That color
+// is premultiplied (smithay's `Color32F` is a premultiplied RGBA by contract) and the pipeline
+// blends premultiplied-over, so it needs no adjustment here.
 
 layout(push_constant) uniform Push {
     vec2 origin;

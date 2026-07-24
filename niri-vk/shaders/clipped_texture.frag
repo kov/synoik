@@ -6,11 +6,10 @@
 // the owned-renderer port of niri's ClippedSurfaceRenderElement — the window rounded-corner /
 // clip-to-geometry path.
 //
-// It differs from postprocess.frag in two ways that matter for a *client* surface: (1) sampling
-// goes through the folded tex_transform (so a y-flipped or buffer-transformed client buffer samples
-// correctly — postprocess only ever samples renderer-internal captures via src_rect); (2) the
-// pipeline blends straight-alpha and attenuates only the alpha (like texture.frag/rounded_texture.
-// frag), so the antialiased corner edge fades to the destination without double-darkening.
+// It differs from postprocess.frag in one way that matters for a *client* surface: sampling goes
+// through the folded tex_transform (so a y-flipped or buffer-transformed client buffer samples
+// correctly — postprocess only ever samples renderer-internal captures via src_rect). Both output
+// premultiplied color for the premultiplied-over blend.
 //
 // input_to_geo maps v_uv (0..1 across the quad, i.e. the surface's on-screen placement) directly to
 // [0,1] geometry space — a pure dst->geo affine built CPU-side. Because it acts on v_uv (not the
@@ -26,7 +25,7 @@ layout(push_constant) uniform Push {
     vec2 target;
     float corner_radius; // unused SDF scalar; declared for offset agreement with the vertex stage
     float _pad0;
-    vec4 color;              // straight-alpha tint, [1,1,1,alpha]
+    vec4 color;              // premultiplied tint, [alpha,alpha,alpha,alpha]
     vec4 st0;                // tex_transform columns (xyz used): v_uv -> normalized UV
     vec4 st1;
     vec4 st2;
@@ -85,7 +84,7 @@ void main() {
         mask = niri_rounding_alpha(coords_geo * pc.geo_size, pc.geo_size, pc.clip_corner_radius);
     }
 
-    // The pipeline blends straight-alpha (SRC_ALPHA / ONE_MINUS_SRC_ALPHA), so attenuate only the
-    // alpha (mirrors rounded_texture.frag): the hardware multiplies rgb by src alpha at blend time.
-    o = vec4(c.rgb, c.a * mask);
+    // The pipeline blends premultiplied-over (ONE / ONE_MINUS_SRC_ALPHA) and `c` is premultiplied
+    // (mirrors rounded_texture.frag), so the mask scales rgb and alpha together.
+    o = c * mask;
 }

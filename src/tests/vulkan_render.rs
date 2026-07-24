@@ -4188,6 +4188,115 @@ fn vulkan_imports_a_client_dmabuf() {
     eprintln!("vulkan_imports_a_client_dmabuf: quadrants TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?}");
 }
 
+/// **The alpha convention.** Every texture the renderer samples holds *premultiplied* alpha
+/// (Wayland client buffers, the icon decoder, every `widget::bake`), so compositing one must be
+/// `src + dst·(1−α)`. Blending it as straight-alpha instead — `src·α + dst·(1−α)` — multiplies by
+/// α a second time.
+///
+/// That second multiply is exactly zero for α=1 and for black (rgb=0), which is why every other
+/// test in this file stayed green while the renderer was doing it: opaque windows and black
+/// scrims are the entire corpus. It only shows on *partial-alpha colored* content, where it turns
+/// a lightening wash into a darkening one — a white 50% wash over a dark backdrop came out
+/// **below** the backdrop it was meant to lighten.
+///
+/// Two textures (not a solid + a texture) so `render_to_vec`'s element type stays homogeneous.
+/// Note the ordering: `render_helpers::render_to_vec` draws in iterator order, so the **last**
+/// element is the topmost — the opposite of the `Niri::render_to_vec` element list, where the
+/// first is. Putting the wash first here paints it *under* the opaque backdrop and the readback is
+/// a flat 51, which is a passing-looking way to test nothing.
+#[test]
+fn vulkan_blends_partial_alpha_textures_premultiplied() {
+    use smithay::backend::renderer::element::Kind;
+    use smithay::backend::renderer::ImportMem;
+
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_blends_partial_alpha_textures_premultiplied: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    const S: i32 = 32;
+    let fill = |rgba: [u8; 4]| -> Vec<u8> {
+        std::iter::repeat_n(rgba, (S * S) as usize)
+            .flatten()
+            .collect()
+    };
+    let import = |vk: &mut VulkanRenderer, bytes: &[u8]| {
+        vk.import_memory(bytes, Fourcc::Abgr8888, Size::from((S, S)), false)
+            .expect("import memory")
+    };
+
+    // Backdrop: opaque dark grey (51 ≈ 0.2). Wash: white at 50% *premultiplied*, i.e. straight
+    // white (1,1,1) times α=0.5 → 128 in every channel including alpha.
+    let backdrop_tex = import(&mut vk, &fill([51, 51, 51, 255]));
+    let wash_tex = import(&mut vk, &fill([128, 128, 128, 128]));
+
+    let element =
+        |vk: &VulkanRenderer, tex: &crate::render_helpers::vulkan::VkTexture, alpha: f32| {
+            let buffer =
+                TextureBuffer::from_texture(vk, tex.clone(), 1.0, Transform::Normal, Vec::new());
+            TextureRenderElement::from_texture_buffer(
+                buffer,
+                Point::from((0.0, 0.0)),
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+        };
+
+    let composite = |vk: &mut VulkanRenderer, wash_alpha: f32| -> [u8; 4] {
+        let elements = vec![
+            element(vk, &backdrop_tex, 1.0),
+            element(vk, &wash_tex, wash_alpha),
+        ];
+        let pixels = render_to_vec(
+            vk,
+            Size::from((S, S)),
+            Scale::from(1.0),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements.into_iter(),
+        )
+        .expect("composite the wash over the backdrop");
+        px(&pixels, S, S / 2, S / 2)
+    };
+
+    // Premultiplied-over at full element alpha: 128 + 51·(1−0.5) = 153.5.
+    // Straight-of-premultiplied (the bug) would give 128·0.5 + 25.5 = 89.5 — *darker* than the
+    // 51 backdrop is light, i.e. the wash would dim instead of brighten.
+    let full = composite(&mut vk, 1.0);
+    assert!(
+        (i16::from(full[0]) - 153).abs() <= 3,
+        "premultiplied white 50% over a 51 backdrop must read ~153, got {full:?} \
+         (~89 means the blend multiplied by alpha twice)",
+    );
+    assert!(
+        full[0] > 51,
+        "a white wash must LIGHTEN the backdrop it covers, got {full:?} over 51",
+    );
+
+    // The element-alpha tint travels the same way: the push tint is premultiplied, so α=0.5 scales
+    // the already-premultiplied sample to 64, over 51·(1−0.25) = 38.25 → ~102. A straight
+    // `[1, 1, 1, α]` tint would leave rgb unattenuated and land near 70 instead.
+    let half = composite(&mut vk, 0.5);
+    assert!(
+        (i16::from(half[0]) - 102).abs() <= 3,
+        "the same wash at element alpha 0.5 must read ~102, got {half:?}",
+    );
+
+    eprintln!(
+        "vulkan_blends_partial_alpha_textures_premultiplied: full={full:?} half={half:?} \
+         (backdrop 51)"
+    );
+}
+
 /// Directly exercise the mid-frame render-pass split behind the backdrop-blur port
 /// (`VulkanFrame::capture_region`): clear the target red, capture it, then overwrite with green on
 /// the continuation pass. The **capture** must read back red (the scene as it was when captured)
@@ -6571,6 +6680,17 @@ fn vulkan_app_grid_draws_hovered_tile() {
     assert!(
         hovered[3] > 0,
         "the hovered tile must carry a wash (non-transparent): {hovered:?}"
+    );
+    // The wash is `style::HOVER_WASH`, straight white at 10%; a bake stores premultiplied alpha,
+    // so it must land as rgb == a (~26), NOT rgb 255 with a 26. Pins the straight→premultiplied
+    // conversion at the toolkit boundary — without it this element composites at full-strength
+    // white, and with a straight *blend* underneath it darkens instead of lightens.
+    assert!(
+        hovered[..3]
+            .iter()
+            .all(|&c| i16::from(c) - i16::from(hovered[3]) <= 2
+                && i16::from(hovered[3]) - i16::from(c) <= 2),
+        "the hover wash must be stored premultiplied (rgb == a): {hovered:?}"
     );
     assert_eq!(
         plain[3], 0,

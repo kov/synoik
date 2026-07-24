@@ -3,6 +3,12 @@
 // Textured material: sample a bound texture at the quad UV, tinted by the push-constant color
 // (white = pass-through). This is the window/icon/glyph-atlas path — everything that samples
 // pixels rather than generating them.
+//
+// Alpha convention: the sampled texture is PREMULTIPLIED (Wayland client buffers, our icon decoder
+// and every `widget::bake` all are), `pc.color` is a premultiplied tint, and the pipeline blends
+// premultiplied-over (ONE / ONE_MINUS_SRC_ALPHA) — so a premultiplied sample times a premultiplied
+// tint is already the right source color. Mirrors smithay's GLES `texture.frag`
+// (`color = texture2D(tex, uv) * alpha`, blended with ONE).
 
 layout(set = 0, binding = 0) uniform sampler2D tex;
 

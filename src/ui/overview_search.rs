@@ -612,10 +612,9 @@ impl OverviewSearch {
         //     `content_rev` alone (results, never the highlight); the card bake — background
         //     + selection/hover wash + "No results" status — re-bakes when the highlight
         //     moves, but that is only rounded fills (no label shaping), so it is cheap. The
-        //     wash is blended over the OPAQUE card background here, which composites as a
-        //     correct lighten (a separate partial-alpha element would darken instead — the
-        //     bakes store premultiplied alpha but the compositor blends straight, harmless
-        //     only for opaque/black content). The result icons were pushed above both. ---
+        //     wash rides along in the card bake (rather than as its own element) simply because
+        //     it re-bakes on the same key as the background it sits on — one bake, not two.
+        //     The result icons were pushed above both. ---
         if active {
             if let Some(card) = layout.card {
                 let origin = card.loc;

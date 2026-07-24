@@ -264,37 +264,16 @@ impl VulkanRenderer {
         }
         let quad_push = std::mem::size_of::<QuadPush>() as u32;
         let sampler = std::slice::from_ref(&sampler_set_layout);
-        // Straight-alpha materials (output non-premultiplied color).
-        let solid_pipeline = build_pipeline(
-            &gpu,
-            render_pass,
-            QUAD_VERT,
-            SOLID_FRAG,
-            &[],
-            quad_push,
-            false,
-        )?;
-        // Rounded solid-color fill: the `sdf_rect.frag` box-SDF material, samples nothing (no set),
-        // shares `QuadPush` (uses only origin/size/corner_radius/color) and blends straight-alpha
-        // like `solid` — the toolkit's rounded-rect primitive (tile/pill/menu backgrounds).
-        let sdf_rect_pipeline = build_pipeline(
-            &gpu,
-            render_pass,
-            QUAD_VERT,
-            SDF_FRAG,
-            &[],
-            quad_push,
-            false,
-        )?;
-        let texture_pipeline = build_pipeline(
-            &gpu,
-            render_pass,
-            QUAD_VERT,
-            TEX_FRAG,
-            sampler,
-            quad_push,
-            false,
-        )?;
+        // Every material below blends premultiplied-over; see `build_pipeline`'s alpha convention.
+        let solid_pipeline =
+            build_pipeline(&gpu, render_pass, QUAD_VERT, SOLID_FRAG, &[], quad_push)?;
+        // Rounded solid-color fill: the `sdf_rect.frag` box-SDF material, samples nothing (no set)
+        // and shares `QuadPush` (uses only origin/size/corner_radius/color) — the toolkit's
+        // rounded-rect primitive (tile/pill/menu backgrounds).
+        let sdf_rect_pipeline =
+            build_pipeline(&gpu, render_pass, QUAD_VERT, SDF_FRAG, &[], quad_push)?;
+        let texture_pipeline =
+            build_pipeline(&gpu, render_pass, QUAD_VERT, TEX_FRAG, sampler, quad_push)?;
         let rounded_texture_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -302,10 +281,8 @@ impl VulkanRenderer {
             ROUNDED_TEX_FRAG,
             sampler,
             quad_push,
-            false,
         )?;
-        // Clipped-surface: samples a texture (set 0) and clips it to a rounded geometry. Like the
-        // texture material it blends straight-alpha (attenuates only the alpha for the AA edge).
+        // Clipped-surface: samples a texture (set 0) and clips it to a rounded geometry.
         let clipped_texture_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -313,7 +290,6 @@ impl VulkanRenderer {
             CLIPPED_TEX_FRAG,
             sampler,
             std::mem::size_of::<ClippedTexturePush>() as u32,
-            false,
         )?;
         let gradient_fade_pipeline = build_pipeline(
             &gpu,
@@ -322,9 +298,8 @@ impl VulkanRenderer {
             GRADIENT_FADE_FRAG,
             sampler,
             quad_push,
-            false,
         )?;
-        // The border/shadow materials output premultiplied color and sample nothing (no set).
+        // The border/shadow materials sample nothing (no set).
         let border_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -332,7 +307,6 @@ impl VulkanRenderer {
             BORDER_FRAG,
             &[],
             std::mem::size_of::<BorderPush>() as u32,
-            true,
         )?;
         let shadow_pipeline = build_pipeline(
             &gpu,
@@ -341,9 +315,8 @@ impl VulkanRenderer {
             SHADOW_FRAG,
             &[],
             std::mem::size_of::<ShadowPush>() as u32,
-            true,
         )?;
-        // Postprocess-and-clip samples a texture (set 0) and outputs premultiplied color.
+        // Postprocess-and-clip samples a texture (set 0).
         let postprocess_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -351,9 +324,8 @@ impl VulkanRenderer {
             POSTPROCESS_FRAG,
             sampler,
             std::mem::size_of::<PostprocessPush>() as u32,
-            true,
         )?;
-        // Resize cross-fade samples two textures (set 0 = prev, set 1 = next), premultiplied out.
+        // Resize cross-fade samples two textures (set 0 = prev, set 1 = next).
         let resize_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -361,10 +333,8 @@ impl VulkanRenderer {
             RESIZE_FRAG,
             &[sampler_set_layout, sampler_set_layout],
             std::mem::size_of::<ResizePush>() as u32,
-            true,
         )?;
-        // The glyph material samples the R8 coverage atlas (set 0) and outputs straight-alpha
-        // (coverage modulates the text color's alpha), like the plain texture material.
+        // The glyph material samples the R8 coverage atlas (set 0), coverage-modulating the tint.
         let text_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -372,7 +342,6 @@ impl VulkanRenderer {
             TEXT_FRAG,
             sampler,
             std::mem::size_of::<niri_vk::render::TextPush>() as u32,
-            false,
         )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
@@ -475,7 +444,6 @@ impl VulkanRenderer {
                     &compiled.frag_spv,
                     &set_layouts,
                     compiled.push_size,
-                    true,
                 )?;
                 Some(pipeline)
             }
@@ -1979,9 +1947,21 @@ fn create_continuation_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, 
 }
 
 /// Build a `vert_spv` + `frag_spv` pipeline with dynamic viewport/scissor against `render_pass`.
-/// `push_size` is the pipeline's push-constant range size; `premultiplied` selects the source
-/// color blend factor (`ONE` for shaders that output premultiplied color like the border/shadow
-/// materials, `SRC_ALPHA` for straight-alpha materials like solid/texture).
+/// `push_size` is the pipeline's push-constant range size.
+///
+/// # Alpha convention
+///
+/// The renderer is **premultiplied end to end**: every framebuffer (output and offscreen bake)
+/// holds premultiplied alpha, every sampled texture is premultiplied (Wayland client buffers, the
+/// icon decoder, every `widget::bake`), every push-constant color is premultiplied, every fragment
+/// stage outputs premultiplied color, and so every pipeline blends premultiplied-over. There is
+/// deliberately no per-material knob: a material that blended `SRC_ALPHA` against an already-
+/// premultiplied source would multiply by alpha twice, which is invisible for opaque or black
+/// content and darkens everything else (it is exactly the bug this convention replaced).
+///
+/// Straight-alpha colors still exist *above* this layer — the toolkit's `style::Rgba` mirrors the
+/// GNOME SCSS and is straight — but they are premultiplied at the frame-method boundary
+/// (`render_rounded_rect_impl`, `render_glyphs_with`, `Painter::clear`), never here.
 fn build_pipeline(
     gpu: &Gpu,
     render_pass: vk::RenderPass,
@@ -1989,7 +1969,6 @@ fn build_pipeline(
     frag_spv: &[u8],
     set_layouts: &[vk::DescriptorSetLayout],
     push_size: u32,
-    premultiplied: bool,
 ) -> Result<Pipeline, VulkanError> {
     let dev = &gpu.device;
     // vk handles have no RAII: each fallible step past `vert` must destroy what precedes it before
@@ -2037,14 +2016,12 @@ fn build_pipeline(
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-    let src_color_factor = if premultiplied {
-        vk::BlendFactor::ONE
-    } else {
-        vk::BlendFactor::SRC_ALPHA
-    };
+    // Premultiplied-over compositing, for every material without exception — see the alpha
+    // convention on `build_pipeline`. This matches the GLES oracle, which set
+    // `BlendFunc(ONE, ONE_MINUS_SRC_ALPHA)` for every draw.
     let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
-        .src_color_blend_factor(src_color_factor)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
         .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .color_blend_op(vk::BlendOp::ADD)
         .src_alpha_blend_factor(vk::BlendFactor::ONE)

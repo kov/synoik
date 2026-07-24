@@ -13,7 +13,7 @@ layout(push_constant) uniform Push {
     vec2 target;
     float corner_radius; // physical pixels
     float _pad0;
-    vec4 color;          // straight-alpha tint, [1,1,1,alpha]
+    vec4 color;          // premultiplied tint, [alpha,alpha,alpha,alpha]
     vec4 st0;            // tex_transform columns (xyz used): v_uv -> normalized UV
     vec4 st1;
     vec4 st2;
@@ -40,8 +40,8 @@ void main() {
     float aa = max(fwidth(d), 1e-4);
     float coverage = 1.0 - smoothstep(-aa, aa, d);
 
-    // The pipeline blends straight-alpha (SRC_ALPHA / ONE_MINUS_SRC_ALPHA), so attenuate only the
-    // alpha: the hardware multiplies rgb by src alpha at blend time, fading the cut corners to the
-    // destination. (Multiplying rgb here as well would double-darken the antialiased edge.)
-    o = vec4(c.rgb, c.a * coverage);
+    // The pipeline blends premultiplied-over (ONE / ONE_MINUS_SRC_ALPHA) and `c` is already
+    // premultiplied (premultiplied sample × premultiplied tint), so coverage scales rgb *and*
+    // alpha together — that is what fades the cut corners to the destination.
+    o = c * coverage;
 }
