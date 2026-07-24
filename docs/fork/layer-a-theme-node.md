@@ -100,9 +100,14 @@ parser without a stable node target fixes nothing. Nesting: Layer B is additive 
 `ThemeNode` is *sourced*, never how widgets consume it, so no widget re-touch.
 
 ## Rollout (slices, each a commit, all gates green)
-- **A1.** `ThemeNode` + `Edges` + `content_box`/`allocation_for`/`paint` + the cross-axis helper, with
-  `st/test-theme.c`-derived unit pins. No widget wired yet. No visual change.
-- **A2.** Migrate the dash onto it (pixel-identical; existing tests green + new box-model pins).
+- **A1.** ✅ DONE (`b12037d7`). `ThemeNode` + `Edges` + `content_box`/`allocation_for`/`paint` +
+  `allocate_1d`/`allocate_align`, unit-pinned against the St formulas (`src/ui/theme_node.rs`). No
+  widget wired; no visual change.
+- **A2.** ✅ DONE (`d78086cc`). Dash pill modelled as a `DASH_BACKGROUND` `ThemeNode`: pill size from
+  `allocation_for`, run origin from `content_box`, dot + divider from `allocate_1d`, pill background
+  through `ThemeNode::paint`. Pixel-identical — existing dash unit + `vulkan_dash_*` render tests are
+  the guardrail (pass unchanged) + a node⇄const pin. The icon tile stays `widget::AppIcon` (already the
+  `.overview-icon` primitive); only the pill was unmodelled.
 - **A3+.** Opportunistic: next widget touched (QS tile / panel button) adopts `ThemeNode`, stabilizing
   the bag shape for Layer B.
 - **B1.** Parser+cascade feeding `ThemeNode` from `gnome-shell.css`; delete constants incrementally.
