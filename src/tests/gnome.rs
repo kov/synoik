@@ -1868,6 +1868,51 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     );
 }
 
+/// In the overview a workspace's background rounds to gnome-shell's
+/// `.workspace-background` `border-radius: 30px`, and its `box-shadow` sits on
+/// that same rounded box (`_window-picker.scss:56-60`,
+/// `WorkspaceBackground._updateBorderRadius`). The wallpaper and the shadow
+/// derived the radius separately and the shadow's stayed square, so bare backdrop
+/// poked out of every rounded corner as a pointy dark tab.
+///
+/// Pins the sharing — one accessor, growing with the overview and zero on the
+/// desktop — since that is exactly what drifted. (Pixel-sampling the corner can't
+/// pin it headless: with no wallpaper the workspace falls back to its opaque solid
+/// background, which covers the corner.)
+#[test]
+fn overview_workspace_shadow_shares_the_background_radius() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = map_window_sized(&mut f, id, (800, 600), None);
+
+    let radius = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .workspace_background_radius()
+    };
+
+    assert_eq!(
+        radius(&mut f),
+        0.,
+        "on the desktop the workspace fills the screen with square corners"
+    );
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    // 30 pre-zoom units divided by the zoom, so it lands at 30 on screen.
+    let zoom = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap().overview_zoom()
+    };
+    let open = radius(&mut f);
+    assert!(
+        (open - 30. / zoom).abs() < 1e-6,
+        "the overview radius must be gnome-shell's 30px on screen, got {open} at zoom {zoom}"
+    );
+}
+
 /// GNOME draws no compositor-side chrome around a window — mutter has no
 /// border or focus-ring concept, and focus is communicated by raising the window
 /// and by its own CSD. niri's border and focus ring are its own idiom, so GNOME

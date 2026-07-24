@@ -393,7 +393,13 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.are_transitions_ongoing() || self.floating.are_transitions_ongoing()
     }
 
-    pub fn update_render_elements(&mut self, is_active: bool) {
+    /// `background_radius` is the corner radius the workspace background is
+    /// rounded to (see `Monitor::workspace_background_radius`). The shadow has to
+    /// use the *same* one: gnome-shell's `.workspace-background` carries its
+    /// `box-shadow` on the same rounded box (`_window-picker.scss:56-60`), and a
+    /// square-cornered shadow around a rounded background leaves the backdrop
+    /// showing through each corner as a pointy tab.
+    pub fn update_render_elements(&mut self, is_active: bool, background_radius: f64) {
         self.scrolling
             .update_render_elements(is_active && !self.floating_is_active.get());
 
@@ -404,7 +410,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.shadow.update_render_elements(
             self.view_size,
             true,
-            CornerRadius::default(),
+            CornerRadius::from(background_radius as f32),
             self.scale.fractional_scale(),
             1.,
         );

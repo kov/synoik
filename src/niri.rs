@@ -5766,11 +5766,10 @@ impl Niri {
 
         // In GNOME windowing mode the org.gnome.desktop.background wallpaper
         // backs every workspace. In the overview its corners round like
-        // gnome-shell's (BACKGROUND_CORNER_RADIUS_PIXELS = 30, growing with
-        // the transition); the radius is in pre-zoom workspace units, so
-        // divide out the zoom to land at 30 on screen.
+        // gnome-shell's `.workspace-background`; the workspace shadow rounds on
+        // the same radius, so both take it from the one accessor.
         let gnome_mode = self.config.borrow().layout.windowing_mode == WindowingMode::Floating;
-        let wallpaper_radius = mon.expose_progress().map_or(0., |p| 30. * p) / zoom;
+        let wallpaper_radius = mon.workspace_background_radius();
 
         // Get layer-shell elements.
         let layer_map = layer_map_for_output(output);

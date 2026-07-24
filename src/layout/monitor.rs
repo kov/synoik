@@ -64,6 +64,10 @@ const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 const WORKSPACE_MIN_SPACING: f64 = 24.;
 const WORKSPACE_MAX_SPACING: f64 = 80.;
 
+/// gnome-shell's `BACKGROUND_CORNER_RADIUS_PIXELS` (`workspace.js:30`), kept in
+/// sync with `.workspace-background`'s `border-radius` (`_window-picker.scss:58`).
+const WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 30.;
+
 /// gnome-shell's `WORKSPACE_INACTIVE_SCALE` (`workspacesView.js:25`): how far a
 /// workspace shrinks once the row has scrolled off it.
 pub const WORKSPACE_INACTIVE_SCALE: f64 = 0.94;
@@ -1184,6 +1188,23 @@ impl<W: LayoutElement> Monitor<W> {
                 .any(|ws| ws.are_transitions_ongoing())
     }
 
+    /// The corner radius the workspace background is rounded to in the overview,
+    /// in **pre-zoom workspace units** — the row is scaled by the zoom afterwards,
+    /// so dividing it out here is what lands the radius at 30 physical px.
+    ///
+    /// gnome-shell's `.workspace-background` is `border-radius: 30px` with a
+    /// matching `box-shadow` on the same box (`_window-picker.scss:56-60`), lerped
+    /// 0 → 30 on the workspace's state adjustment
+    /// (`WorkspaceBackground._updateBorderRadius`, `workspace.js:1002-1009`).
+    ///
+    /// One accessor because the wallpaper and the shadow both need it and must
+    /// agree: they were derived separately, the shadow's stayed square, and the
+    /// backdrop showed through each rounded corner as a pointy dark tab.
+    pub fn workspace_background_radius(&self) -> f64 {
+        let progress = self.expose_progress().unwrap_or(0.);
+        WORKSPACE_BACKGROUND_CORNER_RADIUS * progress / self.overview_zoom()
+    }
+
     pub fn update_render_elements(&mut self, is_active: bool) {
         if let Some(strip) = self.thumbnail_strip() {
             let rect = self.thumbnail_indicator_rect(&strip);
@@ -1221,8 +1242,9 @@ impl<W: LayoutElement> Monitor<W> {
             .as_ref()
             .and_then(|hint| hint.workspace.existing_id());
 
+        let background_radius = self.workspace_background_radius();
         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
-            ws.update_render_elements(is_active);
+            ws.update_render_elements(is_active, background_radius);
 
             if Some(ws.id()) == insert_hint_ws_id {
                 insert_hint_ws_geo = Some(geo);
