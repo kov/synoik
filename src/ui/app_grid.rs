@@ -508,6 +508,18 @@ impl AppGrid {
         self.layout(area).tiles.len()
     }
 
+    /// The logical center of the current page's tile `k`'s **icon** (not the whole tile —
+    /// the icon sits above the label) — a render-test probe for sampling the drawn glyph.
+    #[cfg(test)]
+    pub fn icon_center(
+        &self,
+        k: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let layout = self.layout(area);
+        layout.tiles.get(k).map(|t| layout.metrics.icon_center(*t))
+    }
+
     /// The center of a navigation arrow's disc — a geometry probe for the conformance
     /// corpus (which clicks real pixels routed through [`arrow_hit`](Self::arrow_hit)).
     #[cfg(test)]
@@ -561,6 +573,48 @@ impl AppGrid {
         }
 
         let mut elements = Vec::new();
+
+        // --- Batch-upload any page icons whose decode is ready but not yet on the GPU, so the
+        //     first open pays ONE submit+fence for the whole page instead of ~24 (a real Venus
+        //     stutter). `app_icon_element` below then finds them cached; an icon still decoding
+        //     stays a miss and is simply drawn on a later frame, exactly as before. Only worth a
+        //     batch for 2+ pending uploads — a lone miss uploads fine on its own. ---
+        if let Ok(scale_key) = NotNan::new(scale) {
+            let logical = (metrics.icon_px.round() as u16).max(1);
+            let mut keys: Vec<(NotNan<f64>, AppIconRef, u16)> = Vec::new();
+            let mut buffers = Vec::new();
+            for entry in page_entries {
+                let key = (scale_key, entry.icon.clone(), logical);
+                if cache.icons.contains_key(&key) || keys.contains(&key) {
+                    continue;
+                }
+                if let Some(buf) = app_icons.buffer(&entry.icon, metrics.icon_px, scale) {
+                    keys.push(key);
+                    buffers.push(buf);
+                }
+            }
+            if buffers.len() > 1 {
+                let items: Vec<_> = buffers
+                    .iter()
+                    .map(|b| (b.data(), b.format(), b.size(), false))
+                    .collect();
+                match renderer.import_memory_batch(&items) {
+                    Ok(textures) => {
+                        for ((key, buf), texture) in keys.into_iter().zip(&buffers).zip(textures) {
+                            let tb = TextureBuffer::from_texture(
+                                renderer,
+                                texture,
+                                buf.scale(),
+                                buf.transform(),
+                                Vec::new(),
+                            );
+                            cache.icons.insert(key, tb);
+                        }
+                    }
+                    Err(err) => tracing::error!("error batch-uploading app icons: {err:#}"),
+                }
+            }
+        }
 
         // --- App icons (topmost, over their tiles). ---
         for (k, entry) in page_entries.iter().enumerate() {

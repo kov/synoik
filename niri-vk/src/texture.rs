@@ -136,6 +136,122 @@ impl Drop for TextureGuard<'_> {
     }
 }
 
+/// A texture built up to the point of its GPU copy: the device-local [`Texture`] plus the host
+/// staging buffer holding its pixels, with the staging→image copy not yet recorded. Produced by
+/// [`Texture::build_pending`] and consumed once the copy has been submitted (the caller frees the
+/// staging then). Lets the single and batched upload paths share resource creation.
+struct PendingUpload {
+    staging: vk::Buffer,
+    smem: vk::DeviceMemory,
+    texture: Texture,
+}
+
+/// Uploads many textures with a single submit + fence-wait instead of one per texture — the
+/// overview app grid decodes ~24 icons and would otherwise pay ~24 serialized queue round-trips on
+/// first open (a real stutter on virtualized/Venus queues). Usage: [`TextureBatch::new`], then
+/// [`upload`](Self::upload) per texture (creates its resources, no submit), then
+/// [`finish`](Self::finish) once (records every copy into one command buffer, submits, waits, and
+/// returns the textures). Dropping a batch without `finish` (an error/panic mid-build) frees every
+/// resource staged so far.
+pub struct TextureBatch<'a> {
+    gpu: &'a Gpu,
+    pool: vk::CommandPool,
+    pending: Vec<PendingUpload>,
+}
+
+impl<'a> TextureBatch<'a> {
+    pub fn new(gpu: &'a Gpu, pool: vk::CommandPool) -> Self {
+        Self {
+            gpu,
+            pool,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Stage one texture: create its staging buffer + image/view/sampler and copy the pixels into
+    /// the staging, but record no commands and submit nothing (that happens in `finish`). The data
+    /// must be tight `width*height*bpp` bytes, matching [`Texture::upload`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        format: vk::Format,
+        bpp: vk::DeviceSize,
+        components: vk::ComponentMapping,
+        filter: vk::Filter,
+    ) -> Result<()> {
+        let pending = Texture::build_pending(
+            self.gpu, width, height, data, format, bpp, components, filter,
+        )?;
+        self.pending.push(pending);
+        Ok(())
+    }
+
+    /// Record every staged copy into one command buffer, submit once, wait once, then free the
+    /// staging buffers and return the finished textures (in `upload` order). On a submit/wait
+    /// failure every staged texture is destroyed and the error is returned.
+    pub fn finish(mut self) -> Result<Vec<Texture>> {
+        let device = &self.gpu.device;
+        // Drain so this batch's `Drop` (which runs when `self` falls out of scope below) sees an
+        // empty list and frees nothing a second time. (A panic between here and the frees below
+        // would leak the drained resources — the ash calls all return `Result`, so the only real
+        // candidate is an allocation abort, which tears the process down anyway.)
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let result = self.gpu.run_commands(self.pool, |cbuf| unsafe {
+            for p in &pending {
+                record_upload_copy(
+                    device,
+                    cbuf,
+                    p.texture.image,
+                    p.staging,
+                    p.texture.width,
+                    p.texture.height,
+                );
+            }
+        });
+
+        // The staging buffers have served their purpose (or the submit failed — `run_commands`
+        // already drained the device on a wait error, so this can't race an in-flight copy).
+        for p in &pending {
+            unsafe {
+                device.destroy_buffer(p.staging, None);
+                device.free_memory(p.smem, None);
+            }
+        }
+
+        match result {
+            Ok(()) => Ok(pending.into_iter().map(|p| p.texture).collect()),
+            Err(err) => {
+                for p in &pending {
+                    p.texture.destroy(self.gpu);
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for TextureBatch<'_> {
+    fn drop(&mut self) {
+        // Non-empty only when the batch was abandoned before `finish` (an early `?` or a panic);
+        // free every resource staged so far. Nothing was submitted, so no copy is in flight.
+        let device = &self.gpu.device;
+        for p in self.pending.drain(..) {
+            unsafe {
+                device.destroy_buffer(p.staging, None);
+                device.free_memory(p.smem, None);
+            }
+            p.texture.destroy(self.gpu);
+        }
+    }
+}
+
 impl Texture {
     /// Upload tight `width*height` RGBA8 pixels into a shader-readable texture.
     pub fn from_rgba(
@@ -749,6 +865,9 @@ impl Texture {
     }
 
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
+    /// One image, one submit, one fence-wait. For uploading many textures at once (the overview
+    /// app grid's ~24 icons on first open), [`TextureBatch`] shares the resource creation but
+    /// records every copy into a single submit — see the module's batch section.
     #[allow(clippy::too_many_arguments)]
     fn upload(
         gpu: &Gpu,
@@ -761,6 +880,47 @@ impl Texture {
         components: vk::ComponentMapping,
         filter: vk::Filter,
     ) -> Result<Self> {
+        let PendingUpload {
+            staging,
+            smem,
+            texture,
+        } = Self::build_pending(gpu, width, height, data, format, bpp, components, filter)?;
+        let device = &gpu.device;
+        let result = gpu.run_commands(pool, |cbuf| unsafe {
+            record_upload_copy(device, cbuf, texture.image, staging, width, height);
+        });
+        // The staging buffer has served its purpose either way; on a submit/wait error also
+        // free the half-built texture (its copy never ran). `run_commands` already drains the
+        // device on a wait error, so freeing here can't race an in-flight submission.
+        unsafe {
+            device.destroy_buffer(staging, None);
+            device.free_memory(smem, None);
+        }
+        match result {
+            Ok(()) => Ok(texture),
+            Err(err) => {
+                texture.destroy(gpu);
+                Err(err)
+            }
+        }
+    }
+
+    /// Build everything `upload` needs before the GPU copy — the host staging buffer (already
+    /// holding the pixels) and the device-local `Texture` (image/view/sampler), with the copy
+    /// still un-recorded. Shared by the single [`upload`](Self::upload) and the batched
+    /// [`TextureBatch`] so their resource creation stays identical; the caller records the copy
+    /// (via [`record_upload_copy`]) and frees the staging once it has been submitted.
+    #[allow(clippy::too_many_arguments)]
+    fn build_pending(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        format: vk::Format,
+        bpp: vk::DeviceSize,
+        components: vk::ComponentMapping,
+        filter: vk::Filter,
+    ) -> Result<PendingUpload> {
         let device = &gpu.device;
         let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * bpp;
         assert_eq!(
@@ -770,8 +930,8 @@ impl Texture {
         );
 
         // Frees any handle created below if a later `?` fails partway (so a failed allocate/bind/
-        // create doesn't orphan a resource); on success the image/memory/view/sampler are nulled
-        // out of it before they move into the returned `Texture`, leaving it only the staging.
+        // create doesn't orphan a resource); on success all six handles are nulled out of it
+        // before they move into the returned `PendingUpload`.
         let mut guard = UploadGuard::new(device);
 
         // --- staging buffer with the pixel data ---
@@ -820,52 +980,8 @@ impl Texture {
         guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0)? };
 
-        gpu.run_commands(pool, |cbuf| unsafe {
-            transition(
-                device,
-                cbuf,
-                image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-            );
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-            device.cmd_copy_buffer_to_image(
-                cbuf,
-                staging,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-            transition(
-                device,
-                cbuf,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            );
-        })?;
-        // `staging`/`smem` are no longer referenced; the guard frees them on return (both here and
-        // on any error below), replacing the old manual free.
-
+        // The view/sampler only reference the image handle, so they are valid before the copy
+        // runs (nothing samples the texture until its batch is submitted).
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -884,19 +1000,24 @@ impl Texture {
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
         guard.sampler = sampler;
 
-        // Success: hand the image/memory/view/sampler to the `Texture` and disarm the guard for
-        // them (it still frees the staging buffer + memory on drop).
+        // Success: the handles now belong to `PendingUpload`; disarm the guard for all of them.
+        guard.staging = vk::Buffer::null();
+        guard.smem = vk::DeviceMemory::null();
         guard.image = vk::Image::null();
         guard.memory = vk::DeviceMemory::null();
         guard.view = vk::ImageView::null();
         guard.sampler = vk::Sampler::null();
-        Ok(Texture {
-            image,
-            view,
-            sampler,
-            memory,
-            width,
-            height,
+        Ok(PendingUpload {
+            staging,
+            smem,
+            texture: Texture {
+                image,
+                view,
+                sampler,
+                memory,
+                width,
+                height,
+            },
         })
     }
 
@@ -1114,6 +1235,61 @@ impl Default for Staging {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Record a freshly-created (`UNDEFINED`) image's staging→image upload into `cbuf`: barrier to
+/// `TRANSFER_DST`, copy the full `width*height` buffer, barrier to `SHADER_READ_ONLY`. Shared by
+/// [`Texture::upload`] (one image, one submit) and [`TextureBatch`] (N images, one submit) so the
+/// barrier/copy stay byte-identical between the single and batched paths.
+unsafe fn record_upload_copy(
+    device: &ash::Device,
+    cbuf: vk::CommandBuffer,
+    image: vk::Image,
+    staging: vk::Buffer,
+    width: u32,
+    height: u32,
+) {
+    transition(
+        device,
+        cbuf,
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    let region = vk::BufferImageCopy::default()
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+    device.cmd_copy_buffer_to_image(
+        cbuf,
+        staging,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &[region],
+    );
+    transition(
+        device,
+        cbuf,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

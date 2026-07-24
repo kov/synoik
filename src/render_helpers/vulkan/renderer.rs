@@ -14,7 +14,7 @@ use niri_vk::shaders::{
     POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG, SHADOW_FRAG,
     SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
-use niri_vk::texture::Texture as NiriTexture;
+use niri_vk::texture::{Texture as NiriTexture, TextureBatch};
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
@@ -32,6 +32,10 @@ use super::types::{
     import_format, is_rgba8888, GlyphRun, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
 };
 use crate::render_helpers::blur::BlurOptions;
+
+/// One host-memory buffer to import in a batch ([`VulkanRenderer::import_memory_batch`]): tight
+/// `w*h*4` bytes, its DRM `Fourcc`, the buffer size, and whether it is y-flipped.
+pub type MemImportItem<'a> = (&'a [u8], Fourcc, Size<i32, BufferCoord>, bool);
 
 /// One `quad.vert` + material-fragment graphics pipeline with dynamic viewport/scissor (so it is
 /// reused across differently-sized targets).
@@ -555,13 +559,21 @@ impl VulkanRenderer {
             )
         }?;
         let layouts = [self.sampler_set_layout];
-        let set = unsafe {
+        // Free the pool if set allocation fails (e.g. host-OOM under Venus pressure) — a bare `?`
+        // here would orphan it, and the batch path calls this once per icon.
+        let set = match unsafe {
             dev.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
                     .set_layouts(&layouts),
             )
-        }?[0];
+        } {
+            Ok(sets) => sets[0],
+            Err(err) => {
+                unsafe { dev.destroy_descriptor_pool(pool, None) };
+                return Err(err.into());
+            }
+        };
         let image_info = [vk::DescriptorImageInfo::default()
             .sampler(tex.sampler)
             .image_view(tex.view)
@@ -573,6 +585,87 @@ impl VulkanRenderer {
             .image_info(&image_info);
         unsafe { dev.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         Ok((pool, set))
+    }
+
+    /// Import many host-memory buffers as textures with a **single** GPU submit + fence-wait
+    /// instead of one per texture (see [`TextureBatch`]). Each item is `(tight w*h*4 bytes, its
+    /// `Fourcc`, size, flipped)`; the returned textures are in the same order. The overview app
+    /// grid uses it to upload its ~24 icons on first open in one round-trip. On any per-item error
+    /// the whole batch fails and every already-built resource is freed.
+    pub fn import_memory_batch(
+        &mut self,
+        items: &[MemImportItem],
+    ) -> Result<Vec<VkTexture>, VulkanError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = match self.upscale_filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
+        let mut batch = TextureBatch::new(&self.gpu, self.command_pool);
+        for (data, format, size, _flipped) in items {
+            let Some((vk_format, alpha_one)) = import_format(*format) else {
+                return Err(VulkanError::UnsupportedFormat(*format));
+            };
+            let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+            // A zero extent would build an invalid (0-size) buffer/image; reject it up front
+            // rather than trip a validation error deep in `build_pending`.
+            if w == 0 || h == 0 {
+                return Err(VulkanError::Other(format!(
+                    "import_memory_batch: zero extent {w}x{h}"
+                )));
+            }
+            // `ImportMem`'s tight `w*h*4` contract (matches `import_memory`).
+            let expected = (w as usize) * (h as usize) * 4;
+            if data.len() < expected {
+                return Err(VulkanError::Other(format!(
+                    "import_memory_batch: {} bytes for {w}x{h}, need {expected}",
+                    data.len()
+                )));
+            }
+            let components = if alpha_one {
+                vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
+            } else {
+                vk::ComponentMapping::default()
+            };
+            batch
+                .upload(w, h, &data[..expected], vk_format, 4, components, filter)
+                .map_err(|e| VulkanError::Other(format!("batch upload: {e:#}")))?;
+        }
+        let textures = batch
+            .finish()
+            .map_err(|e| VulkanError::Other(format!("batch finish: {e:#}")))?;
+
+        // Wrap each texture with its descriptor set. If that fails partway, destroy the current
+        // texture and every not-yet-wrapped one; the already-wrapped ones in `out` free via
+        // `VkTexture`'s Drop as it unwinds.
+        let mut out = Vec::with_capacity(textures.len());
+        let mut textures = textures.into_iter();
+        for (_, format, size, flipped) in items {
+            let Some(tex) = textures.next() else { break };
+            let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+            match self.make_texture_set(&tex) {
+                Ok((desc_pool, set)) => out.push(VkTexture::new(
+                    self.gpu.clone(),
+                    tex,
+                    desc_pool,
+                    set,
+                    w,
+                    h,
+                    *format,
+                    *flipped,
+                )),
+                Err(err) => {
+                    tex.destroy(&self.gpu);
+                    for leftover in textures {
+                        leftover.destroy(&self.gpu);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Shape and rasterize `text` at `px` pixels-per-em into a [`GlyphRun`] — an R8 coverage atlas
@@ -1683,7 +1776,15 @@ impl ImportMem for VulkanRenderer {
             alpha_one,
             filter,
         )?;
-        let (desc_pool, set) = self.make_texture_set(&tex)?;
+        // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches the batch
+        // path's cleanup on the same failure).
+        let (desc_pool, set) = match self.make_texture_set(&tex) {
+            Ok(v) => v,
+            Err(err) => {
+                tex.destroy(&self.gpu);
+                return Err(err);
+            }
+        };
         Ok(VkTexture::new(
             self.gpu.clone(),
             tex,

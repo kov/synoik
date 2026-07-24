@@ -6578,6 +6578,113 @@ fn vulkan_app_grid_draws_hovered_tile() {
     );
 }
 
+/// The grid's batch icon upload path: two distinct icons (so the page has >1 pending upload,
+/// tripping `import_memory_batch`) must both draw, each with its own colors — proving the single
+/// submit uploaded every texture correctly, not a swapped/blank one.
+#[test]
+fn vulkan_app_grid_batch_uploads_page_icons() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_batch_uploads_page_icons: no Vulkan device ({e})");
+        return;
+    }
+
+    // Two solid-color source icons on disk (distinct paths → distinct cache keys → two pending
+    // uploads on the page). The harness has no decode worker, so `buffer()` resolves inline and
+    // both are ready when the grid renders → the batch path runs.
+    let dir = std::env::temp_dir();
+    let red_path = dir.join(format!("niri-batch-red-{}.png", std::process::id()));
+    let blue_path = dir.join(format!("niri-batch-blue-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([220, 20, 20, 255]))
+        .save(&red_path)
+        .expect("write red icon");
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([20, 20, 220, 255]))
+        .save(&blue_path)
+        .expect("write blue icon");
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    {
+        let g = &mut f.niri().app_grid;
+        g.set_entries(vec![
+            AppGridEntry {
+                id: "red.desktop".into(),
+                name: "Red".into(),
+                icon: AppIconRef::File(red_path.clone()),
+            },
+            AppGridEntry {
+                id: "blue.desktop".into(),
+                name: "Blue".into(),
+                icon: AppIconRef::File(blue_path.clone()),
+            },
+        ]);
+    }
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let c0 = f.niri().app_grid.icon_center(0, area).expect("icon 0");
+    let c1 = f.niri().app_grid.icon_center(1, area).expect("icon 1");
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let elements = niri.app_grid.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    area,
+                    1.0,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+
+    let _ = std::fs::remove_file(&red_path);
+    let _ = std::fs::remove_file(&blue_path);
+
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_app_grid_batch_uploads_page_icons: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the batched grid through Vulkan must not error");
+
+    let p0 = px(&pixels, w, c0.x as i32, c0.y as i32);
+    let p1 = px(&pixels, w, c1.x as i32, c1.y as i32);
+    eprintln!("vulkan_app_grid_batch: icon0={p0:?} icon1={p1:?}");
+    assert!(
+        p0[3] > 0 && p0[0] > 200 && p0[2] < 60,
+        "tile 0 drew its red icon through the batch: {p0:?}"
+    );
+    assert!(
+        p1[3] > 0 && p1[2] > 200 && p1[0] < 60,
+        "tile 1 drew its blue icon through the batch: {p1:?}"
+    );
+}
+
 /// With more apps than one page holds, the app grid bakes its page-indicator dots:
 /// the active page's dot is a full-opacity white circle, an inactive one is dimmer,
 /// and the gap between dots is transparent.
