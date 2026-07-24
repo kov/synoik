@@ -1868,6 +1868,62 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     );
 }
 
+/// GNOME draws no compositor-side chrome around a window — mutter has no
+/// border or focus-ring concept, and focus is communicated by raising the window
+/// and by its own CSD. niri's border and focus ring are its own idiom, so GNOME
+/// windowing mode forces both off, **window rules included**: a rule that turns
+/// one back on would paint an outline GNOME never draws.
+///
+/// The geometry follows: with no border the window keeps the whole tile.
+#[test]
+fn gnome_mode_draws_no_border_or_focus_ring() {
+    let mut config = Config::default();
+    // Everything a user could turn them on with, at once.
+    config.layout.border = niri_config::Border {
+        off: false,
+        width: 8.,
+        ..Default::default()
+    };
+    config.layout.focus_ring = niri_config::FocusRing {
+        off: false,
+        width: 8.,
+        ..Default::default()
+    };
+    // A rule that explicitly turns the border back on: the case that must still
+    // lose to GNOME mode.
+    config.window_rules.push(niri_config::WindowRule {
+        border: niri_config::BorderRule {
+            on: true,
+            width: Some(niri_config::FloatOrInt(6.)),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = map_window_sized(&mut f, id, (800, 600), None);
+
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let tile = mon
+        .expect("workspaces must be on a monitor")
+        .active_workspace_ref()
+        .tiles()
+        .next()
+        .expect("a mapped window must have a tile");
+
+    assert!(
+        tile.border().is_off() && tile.focus_ring().is_off(),
+        "GNOME mode must force both off whatever the config and rules say"
+    );
+    assert_eq!(
+        tile.tile_size(),
+        tile.window_size(),
+        "with no border the window keeps the whole tile"
+    );
+}
+
 /// The workspace row lands on its picker box only when the overview is fully
 /// open; closed it covers the output exactly (a pointer against the screen edge
 /// at y = 0 must still hit it), and it travels between the two continuously.

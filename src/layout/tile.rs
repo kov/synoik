@@ -2,7 +2,7 @@ use core::f64;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
-use niri_config::{Color, CornerRadius, GradientInterpolation};
+use niri_config::{Color, CornerRadius, GradientInterpolation, WindowingMode};
 use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
@@ -35,6 +35,7 @@ use crate::utils::transaction::Transaction;
 use crate::utils::{
     baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
 };
+use crate::window::ResolvedWindowRules;
 
 /// Toplevel window with decorations.
 #[derive(Debug)]
@@ -196,6 +197,40 @@ pub(super) struct AlphaAnimation {
     offscreen_vk: OffscreenBuffer,
 }
 
+/// The `border` config a window actually gets.
+///
+/// **GNOME draws no compositor-side window chrome.** A window is a window: focus
+/// is communicated by raising it and by the client's own CSD headerbar, never by
+/// an outline the shell paints around it — mutter has no border/focus-ring
+/// concept at all, and gnome-shell's `.window-clone-border` exists only inside
+/// the overview. niri's border and focus ring are its own idiom, so in GNOME
+/// windowing mode they are forced off, config *and* window rules alike: leaving
+/// the rules live would let a single rule paint an outline GNOME never draws.
+///
+/// This zeroes their geometry too — `visual_border_width` returns `None` once the
+/// border is off, so the window keeps the whole tile.
+fn border_config(options: &Options, rules: &ResolvedWindowRules) -> niri_config::Border {
+    if options.layout.windowing_mode == WindowingMode::Floating {
+        return niri_config::Border {
+            off: true,
+            ..options.layout.border
+        };
+    }
+    options.layout.border.merged_with(&rules.border)
+}
+
+/// The `focus-ring` config a window actually gets — off in GNOME mode, for the
+/// reasons on [`border_config`].
+fn focus_ring_config(options: &Options, rules: &ResolvedWindowRules) -> niri_config::FocusRing {
+    if options.layout.windowing_mode == WindowingMode::Floating {
+        return niri_config::FocusRing {
+            off: true,
+            ..options.layout.focus_ring
+        };
+    }
+    options.layout.focus_ring.merged_with(&rules.focus_ring)
+}
+
 impl<W: LayoutElement> Tile<W> {
     pub fn new(
         window: W,
@@ -205,8 +240,8 @@ impl<W: LayoutElement> Tile<W> {
         options: Rc<Options>,
     ) -> Self {
         let rules = window.rules();
-        let border_config = options.layout.border.merged_with(&rules.border);
-        let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
+        let border_config = border_config(&options, rules);
+        let focus_ring_config = focus_ring_config(&options, rules);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
 
@@ -261,15 +296,11 @@ impl<W: LayoutElement> Tile<W> {
 
         let rules = self.window.rules();
 
-        let mut border_config = self.options.layout.border.merged_with(&rules.border);
+        let mut border_config = border_config(&self.options, rules);
         border_config.width = round_max1(border_config.width);
         self.border.update_config(border_config.into());
 
-        let mut focus_ring_config = self
-            .options
-            .layout
-            .focus_ring
-            .merged_with(&rules.focus_ring);
+        let mut focus_ring_config = focus_ring_config(&self.options, rules);
         focus_ring_config.width = round_max1(focus_ring_config.width);
         self.focus_ring.update_config(focus_ring_config);
 
@@ -402,15 +433,11 @@ impl<W: LayoutElement> Tile<W> {
         let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
 
         let rules = self.window.rules();
-        let mut border_config = self.options.layout.border.merged_with(&rules.border);
+        let mut border_config = border_config(&self.options, rules);
         border_config.width = round_max1(border_config.width);
         self.border.update_config(border_config.into());
 
-        let mut focus_ring_config = self
-            .options
-            .layout
-            .focus_ring
-            .merged_with(&rules.focus_ring);
+        let mut focus_ring_config = focus_ring_config(&self.options, rules);
         focus_ring_config.width = round_max1(focus_ring_config.width);
         self.focus_ring.update_config(focus_ring_config);
 

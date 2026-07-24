@@ -3343,8 +3343,11 @@ fn preset_column_width_fixed_correct_with_border() {
         Op::SwitchPresetColumnWidth,
     ];
 
+    // Borders are niri's; GNOME mode forces them off, so this pins the scrolling
+    // layer's border arithmetic in the mode that still has one.
     let options = Options {
         layout: niri_config::Layout {
+            windowing_mode: WindowingMode::Scrolling,
             preset_column_widths: vec![PresetSize::Fixed(500)],
             ..Default::default()
         },
@@ -3358,6 +3361,7 @@ fn preset_column_width_fixed_correct_with_border() {
     // Add border.
     let options = Options {
         layout: niri_config::Layout {
+            windowing_mode: WindowingMode::Scrolling,
             preset_column_widths: vec![PresetSize::Fixed(500)],
             border: niri_config::Border {
                 off: false,

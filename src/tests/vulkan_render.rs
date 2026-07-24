@@ -5518,7 +5518,12 @@ fn vulkan_draws_a_rounded_focus_ring() {
         return;
     }
 
-    let mut config = Config::default();
+    // GNOME windowing mode draws no border and no focus ring around a window
+    // (`layout::tile::focus_ring_config`), so the rounded-ring *rendering* is
+    // exercised through niri's scrolling mode. The shader path this pins is still
+    // live in GNOME mode — `ui::mru` and the workspace-thumbnail indicator both
+    // draw through `FocusRing`.
+    let mut config = crate::tests::scrolling(Config::default());
     config.layout.border.off = true; // isolate the focus ring
     config.layout.focus_ring.off = false;
     config.layout.focus_ring.width = 12.;
