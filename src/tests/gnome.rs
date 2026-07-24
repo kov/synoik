@@ -1919,6 +1919,166 @@ fn overview_spreads_windows_into_picker_slots() {
     );
 }
 
+/// Every workspace's render rect on output 1 — the geometry the overview's row
+/// tests measure, settled.
+fn workspace_geo(f: &mut Fixture) -> Vec<smithay::utils::Rectangle<f64, smithay::utils::Logical>> {
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    mon.expect("workspaces must be on a monitor")
+        .workspaces_render_geo()
+        .collect()
+}
+
+/// Two workspace-row snapshots agree to within a physical pixel (the row's
+/// coordinates are rounded to the pixel grid, so exactness is not the contract).
+#[track_caller]
+fn assert_geo_eq(
+    a: &[smithay::utils::Rectangle<f64, smithay::utils::Logical>],
+    b: &[smithay::utils::Rectangle<f64, smithay::utils::Logical>],
+    what: &str,
+) {
+    assert_eq!(a.len(), b.len(), "{what}: workspace count changed");
+    for (i, (a, b)) in a.iter().zip(b).enumerate() {
+        assert!(
+            (a.loc.x - b.loc.x).abs() <= 1.
+                && (a.loc.y - b.loc.y).abs() <= 1.
+                && (a.size.w - b.size.w).abs() <= 1.
+                && (a.size.h - b.size.h).abs() <= 1.,
+            "{what}: workspace {i} differs: {a:?} vs {b:?}"
+        );
+    }
+}
+
+/// Every workspace moves toward its final position and never away from it, and
+/// no single frame carries an implausible share of the travel.
+///
+/// Monotonicity is the load-bearing half, and it is structural rather than tuned:
+/// the row is a lerp between two *fixed* layouts on a monotone ease, so position
+/// is monotone by construction — give or take the pixel rounding the row is
+/// snapped to, hence the 1px slack. The per-step ceiling is only a smoke check for
+/// gross discontinuity (a third of the whole trip in one frame); the *small* snap
+/// that ends a mis-terminated animation is caught by comparing the last sample
+/// with the settled state, not by this.
+#[track_caller]
+fn assert_row_travels_monotonically(
+    samples: &[Vec<smithay::utils::Rectangle<f64, smithay::utils::Logical>>],
+    what: &str,
+) {
+    let n = samples.len();
+    assert!(n >= 4, "{what}: too few samples");
+    let count = samples[0].len();
+
+    for i in 0..count {
+        let xs: Vec<f64> = samples.iter().map(|s| s[i].loc.x).collect();
+        let travel = xs[n - 1] - xs[0];
+        let sign = if travel >= 0. { 1. } else { -1. };
+
+        for w in xs.windows(2) {
+            let step = (w[1] - w[0]) * sign;
+            assert!(
+                step >= -1.,
+                "{what}: workspace {i} moved backwards ({:.1} -> {:.1}) in {xs:?}",
+                w[0],
+                w[1]
+            );
+            assert!(
+                step <= f64::max(travel.abs() / 3., 8.),
+                "{what}: workspace {i} jumped {step:.1}px in one frame, out of \
+                 {:.1}px of travel over {n} samples: {xs:?}",
+                travel.abs()
+            );
+        }
+    }
+}
+
+/// The workspace row must travel *monotonically* between the window picker and
+/// the app grid. gnome-shell interpolates between two frozen endpoint layouts —
+/// `_getInitialBoxes` (`workspacesView.js:281-324`) takes the workspaces box of
+/// the initial state and of the final state, not the live one — so every
+/// coordinate is affine in the eased parameter and the row cannot overshoot.
+/// Evaluating both ends at the current (moving) zoom instead made the row swing
+/// ~85px past its landing spot and come back, which is only visible mid-flight:
+/// both settled ends were correct the whole time.
+#[test]
+fn overview_grid_transition_moves_the_row_monotonically() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    let picker = workspace_geo(&mut f);
+
+    // Into the app grid.
+    f.niri().layout.toggle_app_grid();
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(400), 32);
+    assert_geo_eq(
+        &samples[0],
+        &picker,
+        "the transition starts where the picker was",
+    );
+    assert_row_travels_monotonically(&samples, "picker -> app grid");
+    f.settle_animations();
+    let grid = workspace_geo(&mut f);
+    assert_geo_eq(
+        samples.last().unwrap(),
+        &grid,
+        "the transition ends where the settled app grid is",
+    );
+
+    // And back out of it.
+    f.niri().layout.toggle_app_grid();
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(400), 32);
+    assert_geo_eq(&samples[0], &grid, "the way back starts where the grid was");
+    assert_row_travels_monotonically(&samples, "app grid -> picker");
+    f.settle_animations();
+    assert_geo_eq(
+        samples.last().unwrap(),
+        &workspace_geo(&mut f),
+        "the way back ends where the settled picker is",
+    );
+}
+
+/// Closing the overview *from the app grid* has to land on the desktop, not
+/// beside it. gnome-shell's one adjustment travels 2 -> 0 through WINDOW_PICKER,
+/// so the fit mode is back to SINGLE by the time it is hidden
+/// (`overviewControls.js:278-308,593-606`); we freeze the show-apps scalar across
+/// a close, so it is gated on the overview progress to reach zero with it.
+/// Without that the row ended the animation offset by the fit-all spacing and
+/// snapped into place afterwards — a jump with no animation at all behind it.
+#[test]
+fn overview_close_from_the_app_grid_lands_on_the_desktop() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    let desktop = workspace_geo(&mut f);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+
+    f.niri_state().do_action(Action::CloseOverview, false);
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 48);
+    assert_row_travels_monotonically(&samples, "app grid -> desktop");
+    assert_geo_eq(
+        samples.last().unwrap(),
+        &desktop,
+        "the close must end on the desktop layout, with nothing left to snap",
+    );
+
+    // ...and the snap that used to follow is gone: settling changes nothing.
+    let last = samples.last().unwrap().clone();
+    f.settle_animations();
+    assert_geo_eq(
+        &workspace_geo(&mut f),
+        &last,
+        "settling after the close must not move the row",
+    );
+}
+
 /// Hovering a window preview grows it: gnome-shell's `showOverlay` eases the
 /// preview's container up by `WINDOW_ACTIVE_SIZE_INC` (5px) in each direction
 /// about its center (`windowPreview.js:340-352`), so the slot's center stays put

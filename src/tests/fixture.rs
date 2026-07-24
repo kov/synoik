@@ -8,6 +8,7 @@ use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
 use smithay::backend::input::{ButtonState, InputEvent, KeyState, Keycode};
 use smithay::output::Output;
+use smithay::utils::{Logical, Rectangle};
 
 use super::client::{Client, ClientId};
 use super::server::Server;
@@ -109,6 +110,58 @@ impl Fixture {
         let now = niri.clock.now_unadjusted();
         niri.clock.set_unadjusted(now + Duration::from_millis(1000));
         niri.advance_animations();
+    }
+
+    /// Sample `f` at `n + 1` evenly spaced instants across the next `duration`,
+    /// advancing animations at each pinned instant — the animated analogue of
+    /// [`settle_animations`](Self::settle_animations), for asserting what a UI
+    /// looks like *during* a transition rather than at its ends.
+    ///
+    /// Trigger the transition **before** calling, and do not dispatch or round-trip
+    /// clients inside `f`: a roundtrip clears the lazy clock and re-times every
+    /// running animation (the headless-animation-clock trap). The clock only ever
+    /// moves here, by exact fractions of `duration`, so a sample is a pure function
+    /// of pinned time and the series is reproducible.
+    ///
+    /// For a spring (whose duration isn't a constant), pass a generous span and let
+    /// the tail samples be settled — every invariant worth asserting holds trivially
+    /// over a settled tail.
+    pub fn sample_animation<T>(
+        &mut self,
+        duration: Duration,
+        n: u32,
+        mut f: impl FnMut(&mut Self) -> T,
+    ) -> Vec<T> {
+        let start = self.niri().clock.now_unadjusted();
+        (0..=n)
+            .map(|i| {
+                let at = start + duration.mul_f64(f64::from(i) / f64::from(n));
+                let niri = self.niri();
+                niri.clock.set_unadjusted(at);
+                niri.advance_animations();
+                f(self)
+            })
+            .collect()
+    }
+
+    /// [`sample_animation`](Self::sample_animation) of the one geometry the
+    /// overview's workspace row is: every workspace's render rect on output `n`,
+    /// which is what rendering, hit-testing and drop targets all consume.
+    pub fn sample_workspace_geo(
+        &mut self,
+        output_n: u8,
+        duration: Duration,
+        n: u32,
+    ) -> Vec<Vec<Rectangle<f64, Logical>>> {
+        let output = self.niri_output(output_n);
+        self.sample_animation(duration, n, |f| {
+            f.niri()
+                .layout
+                .monitor_for_output(&output)
+                .unwrap()
+                .workspaces_render_geo()
+                .collect()
+        })
     }
 
     /// Inject a key press through the real input pipeline (`process_input_event`).

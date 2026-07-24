@@ -1606,7 +1606,29 @@ impl<W: LayoutElement> Monitor<W> {
         if !self.workspaces_horizontal() {
             return 0.;
         }
-        self.app_grid_fraction()
+        self.app_grid_state_fraction()
+    }
+
+    /// The show-apps fraction as the *state axis* sees it: the raw fraction gated
+    /// on how far the overview itself is open.
+    ///
+    /// gnome-shell has a single adjustment over `HIDDEN..APP_GRID`, so hiding from
+    /// the app grid travels 2 → 0 *through* `WINDOW_PICKER` and every blend keyed
+    /// off the state — the fit mode, the workspaces box, the app-display box —
+    /// unwinds with it (`getStateTransitionParams` + `_update`,
+    /// `overviewControls.js:278-308,593-606`). We carry two scalars instead, and
+    /// deliberately freeze the show-apps one across a close so the zoom-out starts
+    /// from the app-grid box; gating it on the open progress gives back the
+    /// guarantee that matters — the grid end of every blend reaches zero exactly
+    /// when the overview is hidden, instead of the row landing offset by the
+    /// fit-all spacing and snapping into place afterwards.
+    fn app_grid_state_fraction(&self) -> f64 {
+        let progress = self
+            .overview_progress
+            .as_ref()
+            .map_or(0., |p| p.clamped_value())
+            .clamp(0., 1.);
+        self.app_grid_fraction() * progress
     }
 
     /// Where the row currently sits on the workspace axis — gnome-shell's
@@ -1646,62 +1668,72 @@ impl<W: LayoutElement> Monitor<W> {
     /// Where workspace 0 starts on the strip axis, and how far apart consecutive
     /// workspaces sit — both relative to the centered slot
     /// [`Self::workspaces_static_offset`] places, and both blended between
-    /// gnome-shell's fit-single and fit-all boxes on [`Self::fit_mode_fraction`].
+    /// gnome-shell's fit-single and fit-all rows on [`Self::fit_mode_fraction`].
     ///
-    /// `WorkspacesView.vfunc_allocate` (`workspacesView.js:330-420`) walks a
-    /// fit-single box and a fit-all box in lockstep — each advancing by its own
+    /// `WorkspacesView.vfunc_allocate` (`workspacesView.js:330-388`) walks a
+    /// fit-single row and a fit-all row in lockstep — each advancing by its own
     /// width plus its own spacing — and gives each workspace
     /// `fitSingleBox.interpolate(fitAllBox, fitMode)`. For a uniform row that is
-    /// exactly a lerp of the origin and of the advance, which is what this
-    /// returns.
+    /// exactly a lerp of the origin and of the advance, which is what this returns.
     ///
-    /// The two modes differ in *where the row is anchored*. Fit-single slides the
-    /// whole row so the active workspace lands on the centered slot
-    /// (`_getFirstFitSingleWorkspaceBox`, `:172-204`) — its neighbors then hang
-    /// off the screen edges. Fit-all instead lays every workspace out inside the
-    /// allocation and centers the run as a whole
-    /// (`_getFirstFitAllWorkspaceBox`, `:128-170`), so which workspace is active
-    /// no longer moves anything.
+    /// The two rows differ in *where the row is anchored*. Fit-single slides the
+    /// whole row so the active workspace lands on the centered slot; fit-all lays
+    /// every workspace out inside the allocation and centers the run as a whole, so
+    /// which workspace is active no longer moves anything.
     ///
-    /// **Divergence.** When the row is wide enough that the *width* binds rather
-    /// than the height (roughly seven or more workspaces at 16:9), gnome-shell
-    /// narrows each fit-all box to `availableWidth / n`, squashing the workspaces
-    /// out of aspect. We keep one zoom per monitor, so our workspaces stay
-    /// aspect-locked and the packed row simply overflows the edges as it does in
-    /// fit-single. Everything up to that count matches.
+    /// **Each row is built at its own endpoint state's zoom, not at the current
+    /// one.** That is `_getInitialBoxes` (`workspacesView.js:281-324`): when a
+    /// transition's two ends disagree on the fit mode — window picker <-> app grid,
+    /// and a close *from* the grid — gnome-shell takes the workspaces box of the
+    /// initial state and of the final state and interpolates between those two
+    /// *frozen* rectangles, falling back to the live allocation only when both ends
+    /// share a fit mode (the plain overview open/close). Evaluating both ends at the
+    /// current, moving zoom instead makes each end of the lerp a function of the very
+    /// parameter driving the lerp, and the row's path bends: it used to overshoot
+    /// ~85px past its landing spot and come back. Here the picker end is the picker
+    /// box at the current *open* progress (so a close still unwinds it to the full
+    /// screen) and the grid end is the app-grid box; at `fit == 0` this reduces
+    /// exactly to the fit-single row at the current zoom.
     fn workspaces_strip_axis(&self, zoom: f64) -> (f64, f64) {
-        let extent_single = self.workspace_extent_with_gap(zoom);
-        let origin_single = -self.workspace_render_idx() * extent_single;
+        let render_idx = self.workspace_render_idx();
+
+        // niri's vertical strip has no fit-all mode at all.
+        if !self.workspaces_horizontal() {
+            let extent = self.workspace_extent_with_gap(zoom);
+            return (-render_idx * extent, extent);
+        }
+
+        let view_w = self.view_size.w;
+        // Both rows are expressed against the slot the drawn (blended) size is
+        // centered on, so the lerp between them is a lerp of like for like.
+        let slot = (view_w - self.workspace_size(zoom).w) / 2.;
+
+        let zoom_single = self.zoom_for_state(overview_layout::state::WINDOW_PICKER);
+        let ws_w_single = self.workspace_size(zoom_single).w;
+        let (x_single, extent_single) = fit_single_row(
+            view_w,
+            ws_w_single,
+            self.workspace_gap(zoom_single, FitMode::Single),
+            render_idx,
+        );
 
         let fit = self.fit_mode_fraction();
         if fit <= 0. {
-            return (origin_single, extent_single);
+            return (x_single - slot, extent_single);
         }
 
-        let ws_w = self.workspace_size(zoom).w;
-        let n = self.workspaces.len() as f64;
-        let spacing = self.workspace_gap(zoom, FitMode::All);
-
-        // Spacing here is not only the space between workspaces, but also the
-        // space before the first and after the last, so the row never touches
-        // the edges of the allocation (`workspacesView.js:136-138`).
-        let available = self.view_size.w - spacing * (n + 1.);
-        let x1 = if available / n >= ws_w {
-            // The height binds, so the boxes keep their aspect-locked width and
-            // the leftover space centers the run.
-            spacing + f64::max((available - ws_w * n) / 2., 0.)
-        } else {
-            spacing
-        };
-
-        // Both modes are expressed against the slot `workspaces_static_offset`
-        // centers, so the fit-all anchor is the offset from there.
-        let origin_all = x1 - (self.view_size.w - ws_w) / 2.;
-        let extent_all = ws_w + spacing;
+        let zoom_all = self.zoom_for_state(overview_layout::state::APP_GRID);
+        let ws_w_all = self.workspace_size(zoom_all).w;
+        let (x_all, extent_all) = fit_all_row(
+            view_w,
+            ws_w_all,
+            self.workspace_gap(zoom_all, FitMode::All),
+            self.workspaces.len() as f64,
+        );
 
         let lerp = |a: f64, b: f64| a + (b - a) * fit;
         (
-            lerp(origin_single, origin_all),
+            lerp(x_single, x_all) - slot,
             lerp(extent_single, extent_all),
         )
     }
@@ -1711,6 +1743,16 @@ impl<W: LayoutElement> Monitor<W> {
     /// search entry, thumbnails, dash and window picker go; everything else
     /// consumes these boxes.
     pub fn controls_layout(&self) -> ControlsLayout {
+        // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps state eases in.
+        self.controls_layout_at(
+            overview_layout::state::WINDOW_PICKER + self.app_grid_state_fraction(),
+        )
+    }
+
+    /// The same chrome layout at an arbitrary point on gnome-shell's state axis
+    /// — how the geometry of an *endpoint* state is asked for while a transition
+    /// is in flight (`getWorkspacesBoxForState`, `overviewControls.js:196-215`).
+    fn controls_layout_at(&self, state: f64) -> ControlsLayout {
         overview_layout::layout(
             self.view_size,
             self.working_area.loc.y,
@@ -1718,9 +1760,19 @@ impl<W: LayoutElement> Monitor<W> {
             crate::ui::dash::PREFERRED_HEIGHT,
             thumbnails::preferred_height(self.view_size, self.workspaces.len()),
             self.thumbnails_expand_fraction(),
-            // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps state eases in.
-            overview_layout::state::WINDOW_PICKER + self.app_grid_fraction(),
+            state,
         )
+    }
+
+    /// The workspace zoom one state on that axis implies, at the current overview
+    /// *open* progress: the state fixes the box, the progress blends it toward the
+    /// full-screen desktop the same way [`Self::overview_zoom`] does.
+    fn zoom_for_state(&self, state: f64) -> f64 {
+        if self.options.layout.windowing_mode != WindowingMode::Floating {
+            return self.overview_zoom();
+        }
+        let zoom = self.controls_layout_at(state).workspaces.size.h / self.view_size.h;
+        compute_overview_zoom(zoom, self.overview_progress.as_ref().map(|p| p.value()))
     }
 
     /// Whether the strip *wants* to be shown: gnome-shell's
@@ -3121,6 +3173,40 @@ fn workspace_render_scale(scroll_position: f64, idx: usize, ramp: f64) -> f64 {
     1. - (1. - WORKSPACE_INACTIVE_SCALE) * distance * ramp
 }
 
+/// The fit-single row: the active workspace centered in the view, its neighbours
+/// hanging off the edges (`_getFirstFitSingleWorkspaceBox`,
+/// `workspacesView.js:171-204`). Returns the first workspace's absolute
+/// strip-axis position and the row's pitch.
+///
+/// Pure algebra, so the row's shape is pinned without a clock (the animated
+/// geometry that goes through it is sampled separately).
+fn fit_single_row(view_w: f64, ws_w: f64, gap: f64, render_idx: f64) -> (f64, f64) {
+    let extent = ws_w + gap;
+    ((view_w - ws_w) / 2. - render_idx * extent, extent)
+}
+
+/// The fit-all row: every workspace laid out inside the allocation with the run
+/// centered (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`). The gap
+/// is also the space before the first and after the last workspace, so the row
+/// never touches the edges (`:135-137`).
+///
+/// **Divergence.** When the row is wide enough that the *width* binds rather than
+/// the height (roughly seven or more workspaces at 16:9), gnome-shell narrows each
+/// box to `availableWidth / n`, squashing the workspaces out of aspect. We keep one
+/// zoom per monitor, so ours stay aspect-locked and the packed row simply overflows
+/// the edges as it does in fit-single. Everything up to that count matches.
+fn fit_all_row(view_w: f64, ws_w: f64, gap: f64, n: f64) -> (f64, f64) {
+    let available = view_w - gap * (n + 1.);
+    let x1 = if available / n >= ws_w {
+        // The height binds, so the boxes keep their aspect-locked width and the
+        // leftover space centers the run.
+        gap + f64::max((available - ws_w * n) / 2., 0.)
+    } else {
+        gap
+    };
+    (x1, ws_w + gap)
+}
+
 /// The strip's drop placeholder: a translucent pill marking where the new
 /// workspace goes (gnome-shell's workspace-placeholder asset).
 fn thumbnail_placeholder_config() -> niri_config::FocusRing {
@@ -3150,5 +3236,136 @@ fn thumbnail_indicator_config(accent: [u8; 3]) -> niri_config::FocusRing {
         active_gradient: None,
         inactive_gradient: None,
         urgent_gradient: None,
+    }
+}
+
+/// Clock-free sweeps over the two row layouts. The animated geometry that lerps
+/// between them is pinned separately, by sampling the real transition
+/// (`overview_grid_transition_moves_the_row_monotonically` in the conformance
+/// corpus); here we pin the endpoints themselves, as plain algebra, so a
+/// regression in either row is attributable without an animation in the picture.
+#[cfg(test)]
+mod row_tests {
+    use super::{fit_all_row, fit_single_row};
+
+    /// The view, a 16:9 workspace zoomed to fit, and a gap — one plausible set of
+    /// inputs to sweep the interesting parameters around.
+    const VIEW: f64 = 1920.;
+
+    fn single_positions(ws_w: f64, gap: f64, render_idx: f64, n: usize) -> Vec<f64> {
+        let (x1, pitch) = fit_single_row(VIEW, ws_w, gap, render_idx);
+        (0..n).map(|i| x1 + i as f64 * pitch).collect()
+    }
+
+    fn all_positions(ws_w: f64, gap: f64, n: usize) -> Vec<f64> {
+        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64);
+        (0..n).map(|i| x1 + i as f64 * pitch).collect()
+    }
+
+    /// The whole point of fit-single: whichever workspace is active is the one
+    /// centered in the view, at every integer index and for every row length.
+    #[test]
+    fn fit_single_centers_the_active_workspace() {
+        for ws_w in [1920., 1400., 960.] {
+            for gap in [0., 32., 100.] {
+                for n in 1..8usize {
+                    for active in 0..n {
+                        // The row scrolled to `active` must put *that* workspace's
+                        // center on the view's center.
+                        let xs = single_positions(ws_w, gap, active as f64, n);
+                        let center = xs[active] + ws_w / 2.;
+                        assert!(
+                            (center - VIEW / 2.).abs() < 1e-9,
+                            "ws {active} of {n} off center at {center} \
+                             (ws_w={ws_w}, gap={gap})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fractional `render_idx` — mid workspace-switch — slides the row by that
+    /// fraction of the pitch and nothing else. The pitch is index-independent, so
+    /// the row is rigid: it translates, it never stretches.
+    #[test]
+    fn fit_single_is_a_rigid_translation() {
+        let (ws_w, gap) = (1400., 32.);
+        let (base, pitch) = fit_single_row(VIEW, ws_w, gap, 0.);
+        for step in 0..=20 {
+            let idx = f64::from(step) / 10.;
+            let (x1, p) = fit_single_row(VIEW, ws_w, gap, idx);
+            assert!((p - pitch).abs() < 1e-9, "pitch moved at render_idx={idx}");
+            assert!(
+                (x1 - (base - idx * pitch)).abs() < 1e-9,
+                "row not rigid at render_idx={idx}"
+            );
+        }
+    }
+
+    /// Fit-all is what the app grid shows: the run of workspaces centered in the
+    /// view as a whole, independent of which one is active.
+    #[test]
+    fn fit_all_centers_the_run() {
+        for gap in [0., 32., 100.] {
+            for n in 1..7usize {
+                // A zoom small enough that n workspaces fit — the height-binds
+                // case, which is the one the app grid is in for realistic counts.
+                let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64 * 0.8;
+                let xs = all_positions(ws_w, gap, n);
+                let first = xs[0];
+                let last = xs[n - 1] + ws_w;
+                assert!(
+                    ((first + last) / 2. - VIEW / 2.).abs() < 1e-9,
+                    "run of {n} not centered (gap={gap})"
+                );
+                assert!(first >= gap - 1e-9, "run of {n} touches the left edge");
+                assert!(
+                    last <= VIEW - gap + 1e-9,
+                    "run of {n} touches the right edge"
+                );
+            }
+        }
+    }
+
+    /// The gap is also the margin before the first and after the last workspace
+    /// (`workspacesView.js:135-137`), so a row that exactly fills the allocation
+    /// still leaves one gap on each side.
+    #[test]
+    fn fit_all_keeps_a_gap_at_both_ends() {
+        let (gap, n) = (32., 4usize);
+        let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64;
+        let xs = all_positions(ws_w, gap, n);
+        assert!((xs[0] - gap).abs() < 1e-9);
+        assert!((xs[n - 1] + ws_w - (VIEW - gap)).abs() < 1e-9);
+    }
+
+    /// When the width binds instead of the height (many workspaces), we keep the
+    /// aspect-locked width and let the row overflow rather than squashing the
+    /// boxes — the recorded divergence. It still starts at the left gap.
+    #[test]
+    fn fit_all_overflows_rather_than_squashing() {
+        let (ws_w, gap, n) = (1400., 32., 8usize);
+        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64);
+        assert!((x1 - gap).abs() < 1e-9);
+        assert!((pitch - (ws_w + gap)).abs() < 1e-9);
+        assert!(x1 + (n - 1) as f64 * pitch + ws_w > VIEW);
+    }
+
+    /// Both rows advance by width + gap, so a lerp between them is a lerp of two
+    /// uniform rows — the property `workspaces_strip_axis` relies on to blend a
+    /// whole row with two scalars.
+    #[test]
+    fn both_rows_are_uniform() {
+        let (ws_w, gap) = (1400., 32.);
+        for (x1, pitch) in [
+            fit_single_row(VIEW, ws_w, gap, 2.),
+            fit_all_row(VIEW, ws_w, gap, 4.),
+        ] {
+            let xs: Vec<f64> = (0..4).map(|i| x1 + f64::from(i) * pitch).collect();
+            for w in xs.windows(2) {
+                assert!((w[1] - w[0] - pitch).abs() < 1e-9);
+            }
+        }
     }
 }
