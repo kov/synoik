@@ -386,11 +386,24 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     (HIDDEN/WINDOW_PICKER/APP_GRID): per-state workspaces + a new `app_display` box, interpolated like
     `ControlsManagerLayout`. Pure geometry; callers pass `WINDOW_PICKER` so behaviour is unchanged.
     Pins cover the app-grid boxes + midpoint interpolation.
-  - **Next (S8a remaining):** (1) a state adjustment/animation so the overview drives `state` 1↔2,
-    (2) wire the show-apps button (`DashHit::ShowApps`, inert today) + Escape to toggle it, (3) the
-    app-grid **view** — installed-minus-favorites as labelled `.overview-tile` tiles (96px icon +
-    label, `AppIcon` + `ThemeNode`; the tile matches the S4 search-result tile) filling `app_display`,
-    with hit-test + click/Enter → launch + close.
+  - **S8a-state ✅ DONE (`3860eb95`).** Per-monitor eased `app_grid_fraction` drives WINDOW_PICKER↔
+    APP_GRID (`overview_layout::state`); the show-apps button (`DashHit::ShowApps`) toggles it,
+    Escape / a search close returns to the picker, and closing the overview from the grid resets the
+    state. `controls_layout()` passes `WINDOW_PICKER + fraction`.
+  - **S8a-view ✅ DONE (`560b3f1c` shared tile primitive + `87d30d6b` grid).** The labelled
+    `.overview-tile` render (hover/selection wash + caption) was factored into `widget::TileMetrics`
+    + `Painter::labelled_tile`, shared by the search results and the grid (pixel-identical). New
+    `src/ui/app_grid.rs`: installed-minus-favorites, name-sorted, fill-by-width tiles into
+    `app_display`; click/middle-click → launch + close; own hover for the wash. Rendered below the
+    dash+search at overview-fade × (1 − search-fade) — the grid **slides, it does not fade** with the
+    state axis (`overviewControls.js:582-627`; the box motion is the animation). Gated reactivity on
+    `is_app_grid_open() && !search.is_active()`.
+  - **S8a divergences / follow-ups (deferred, all documented in-module):** thumbnails do NOT yet fade/
+    scale out with the grid fraction (`_getThumbnailsBoxParams` state-axis params) — they may sit
+    opaque above the shrunk picker; **single page only** (apps past the band are dropped, reachable via
+    search — no pagination/PageIndicators/folders/`app-picker-layout`/DnD reorder); **no in-grid
+    keynav** (arrows/Enter); sort is `to_lowercase` not locale collation. Floor/ceil vs transition-
+    bracket interpolation noted in `overview_layout.rs` (`b6b3d86b`).
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
