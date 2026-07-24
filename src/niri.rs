@@ -8113,10 +8113,10 @@ impl Niri {
     /// Composite `elements` as one group at `alpha`, or push them straight through
     /// at full opacity.
     ///
-    /// NOTE: the partial-alpha branch has **no automated render coverage** — every
-    /// headless test settles the fade to one end, where this is a pass-through.
-    /// It is a thin, fail-open wrapper over the same `OffscreenBuffer` path
-    /// `Tile`'s alpha animation uses, but the blend itself is live-validated only.
+    /// The partial-alpha branch is pinned by
+    /// `vulkan_search_fade_blends_the_picker_at_partial_alpha`, which measures the
+    /// blend against both settled ends; every other test settles the fade, where
+    /// this is a pass-through.
     ///
     /// The group composite is what makes the search cross-fade correct: applying a
     /// per-element alpha would double-darken wherever two window previews overlap.

@@ -6224,6 +6224,106 @@ fn vulkan_dash_hover_lightens_the_tile() {
 /// opaque dark fill, and (with a query + results) the results card draws with the
 /// selected tile washed *lighter* than an unselected one — the `.overview-tile`
 /// selection highlight. Pinned as a one-frame differential.
+/// The overview search cross-fade actually *blends* the window picker: a mid-fade
+/// frame must read `S·α + B·(1−α)` at the preview center — not `S` (the group
+/// pushed straight through) and not `B` (the group dropped). This pins the
+/// partial-alpha offscreen-composite branch of `Niri::push_group_at_alpha`, which
+/// every other test skips by settling the fade to one end.
+///
+/// Two traps make the naive version of this test lie:
+/// - The startup "Important Hotkeys" overlay (`Niri::new`) sits over the picker and is dismissed by
+///   the *first key press* — so engaging the search would otherwise change the frame by a whole
+///   panel, not just the picker's alpha.
+/// - `green > 200` matches **white**, not green: the panel clock, the entry caret and the card text
+///   all clear it. The reference has to come from the preview's own rect, and the assertion from
+///   the measured ends rather than a filter.
+#[test]
+fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
+    use crate::app_system::{AppSystem, FakeCatalog, RecordingLauncher};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // An empty catalog: on a machine with real desktop entries "a" would match
+    // apps and draw their icons over the frame.
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![])),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri().hotkey_overlay.hide();
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+
+    // The preview's own rect, from the layout — no pixel hunting. Its center
+    // holds picker content only (the results card sits well above it).
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let (cx, cy) = (
+        (rect.loc.x + rect.size.w / 2.) as i32,
+        (rect.loc.y + rect.size.h / 2.) as i32,
+    );
+
+    // S — fade 0, the pass-through end.
+    assert_eq!(f.niri().overview_search_fade(), 0.);
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let s = px(&pixels, w, cx, cy);
+    assert!(
+        s[1] > 200 && s[0] < 60,
+        "the preview center must be the green window, got {s:?}"
+    );
+
+    // Engage the search and pin the clock part-way through the 250ms ease.
+    f.key_press(30); // KEY_A
+    f.key_release(30);
+    f.niri().advance_animations();
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(100));
+        niri.advance_animations();
+    }
+    let fade = f.niri().overview_search_fade();
+    assert!(
+        fade > 0.1 && fade < 0.9,
+        "the fade must be partial, got {fade}"
+    );
+    let (pixels, ..) = render_output_vulkan(&mut f, &output);
+    let m = px(&pixels, w, cx, cy);
+
+    // B — fade 1, where the group is dropped entirely.
+    f.settle_animations();
+    assert_eq!(f.niri().overview_search_fade(), 1.);
+    let (pixels, ..) = render_output_vulkan(&mut f, &output);
+    let b = px(&pixels, w, cx, cy);
+    assert!(
+        b[1] < 100,
+        "the covered picker must leave plain background, got {b:?}"
+    );
+
+    eprintln!("vulkan_search_fade: S={s:?} M={m:?} B={b:?} fade={fade}");
+
+    // Both ends are measured, so this stays honest if the theme changes.
+    let alpha = 1. - fade;
+    for c in 0..3 {
+        let expected = s[c] as f64 * alpha + b[c] as f64 * fade;
+        assert!(
+            (m[c] as f64 - expected).abs() <= 4.,
+            "channel {c}: got {}, want the blend {expected:.1} (S={} B={} \
+             alpha={alpha:.3}); pushing the group straight through would give {}, \
+             dropping it {}",
+            m[c],
+            s[c],
+            b[c],
+            s[c],
+            b[c],
+        );
+    }
+}
+
 #[test]
 fn vulkan_overview_search_draws_entry_and_selection() {
     use smithay::utils::Logical;

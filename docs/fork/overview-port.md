@@ -322,11 +322,16 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   boolean rather than at the ease's end (gnome-shell flips in `onComplete`, so its previews stay
   clickable for 250ms after a search starts); the results card disappears on deactivate instead of
   fading out (the picker still fades back in under it).
-  **Test-coverage gap, deliberate and recorded:** the partial-alpha branch of the group composite has
-  no render test. Every headless test settles the fade to an end, where it is a pass-through, and three
-  attempts at a mid-fade pixel differential were each either vacuous or measuring the results card
-  rather than the picker. The blend is live-validation-only for now; the model (eases, mid value,
-  reactivity, click-consumption) is pinned by 2 conformance tests.
+  Pins: 2 conformance tests (fade eases, mid value, reactivity, click-consumption) + a Vulkan render
+  test that measures the blend itself — it samples the preview center at fade 0, mid-fade and fade 1
+  and asserts the mid frame is `S·α + B·(1−α)` from the two *measured* ends, so it fails both if the
+  group is pushed straight through and if it is dropped (mutation-verified both ways).
+  **Two traps that made three earlier attempts at this test lie**, worth knowing before writing any
+  full-frame render test here: the startup "Important Hotkeys" overlay (`Niri::new`) covers the picker
+  and is dismissed by the *first key press*, so engaging the search changes the frame by a whole panel
+  unless you `hotkey_overlay.hide()` first; and a `green > 200` filter matches **white** — the panel
+  clock, the entry caret and the card text all clear it — so the reference must come from the
+  preview's own `expose_target_rect`, not from a colour filter.
 - **S6 — Running apps + running dots.** window `app_id`/WM_CLASS → `.desktop` matching (StartupWMClass
   rules); `get_running()` feeds dash trailing icons + the `AppIcon` running dot; `dash-separator`
   between favorites and running. Conformance test the matching table.
