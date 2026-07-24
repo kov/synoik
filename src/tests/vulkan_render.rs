@@ -6272,15 +6272,15 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         .expect("output 1 has a monitor");
     let area: crate::ui::overview_search::SearchArea = controls.into();
     let pill = f.niri().overview_search.entry_pill(area);
-    let c0 = f
+    let t0 = f
         .niri()
         .overview_search
-        .result_center(0, area)
+        .result_tile(0, area)
         .expect("tile 0");
-    let c1 = f
+    let t1 = f
         .niri()
         .overview_search
-        .result_center(1, area)
+        .result_tile(1, area)
         .expect("tile 1");
 
     let state = f.niri_state();
@@ -6329,11 +6329,18 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         "the entry pill fill must be dark (ENTRY_BG): {entry:?}"
     );
 
-    // Left border of each result tile (in the tile, left of the 64px icon): the
-    // selected tile 0 carries the wash, tile 1 the plain card bg.
-    let sample = |c: Point<f64, Logical>| px(&pixels, w, (c.x - 42.) as i32, c.y as i32);
-    let selected = sample(c0);
-    let plain = sample(c1);
+    // Inside each tile's left padding band, clear of the icon: the selected tile 0
+    // carries the wash, tile 1 the plain card bg.
+    let edge = |t: Rectangle<f64, Logical>| {
+        px(
+            &pixels,
+            w,
+            (t.loc.x + 4.) as i32,
+            (t.loc.y + t.size.h / 2.) as i32,
+        )
+    };
+    let selected = edge(t0);
+    let plain = edge(t1);
     eprintln!("vulkan_overview_search: selected={selected:?} plain={plain:?}");
     assert_eq!(
         plain[3], 255,
@@ -6346,4 +6353,23 @@ fn vulkan_overview_search_draws_entry_and_selection() {
              channel {ch}: selected={selected:?} plain={plain:?}"
         );
     }
+
+    // The selection fill is `.overview-tile`'s radius (24), not `%tile`'s (16).
+    // A point 6px diagonally inside the corner is outside a 24-radius round
+    // (it needs 0.293·r ≈ 7.0) but inside a 16-radius one (needs ≈ 4.7), so this
+    // discriminates the two rules rather than merely re-measuring the fill.
+    let corner = px(&pixels, w, (t0.loc.x + 6.) as i32, (t0.loc.y + 6.) as i32);
+    eprintln!("vulkan_overview_search: corner={corner:?}");
+    let d_plain: i32 = (0..3)
+        .map(|c| (corner[c] as i32 - plain[c] as i32).abs())
+        .sum();
+    let d_selected: i32 = (0..3)
+        .map(|c| (corner[c] as i32 - selected[c] as i32).abs())
+        .sum();
+    assert!(
+        d_plain < d_selected,
+        "the tile corner must be cut by the `.overview-tile` radius (24) — at \
+         `%tile`'s 16 it would still be washed: corner={corner:?} \
+         plain={plain:?} selected={selected:?}"
+    );
 }

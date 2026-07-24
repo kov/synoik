@@ -390,6 +390,10 @@ impl Dash {
                         &AppIcon {
                             rect: rel,
                             hovered: true,
+                            // The dash styles the inner `.overview-icon` as a
+                            // plain `%tile` (`_dash.scss:60-63`), not the outer
+                            // `.overview-tile` the app grid uses.
+                            radius: AppIcon::RADIUS,
                         },
                         TILE_HOVER,
                     )?;

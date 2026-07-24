@@ -75,17 +75,21 @@ const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 /// preferred height (`overviewControls.js:165`).
 pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + Entry::HEIGHT + ENTRY_MARGIN_BOTTOM;
 
-/// Full-color app-icon side in a result tile, logical. S5-tunable (GNOME's app-grid
-/// `IconGrid` sizes this dynamically); 64 matches the dash.
-const RESULT_ICON_PX: f64 = 64.;
+/// Full-color app-icon side in a result tile, logical: `GridSearchResult` builds a
+/// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
+/// (`iconGrid.js:11,83`) — bigger than the dash's 64.
+const RESULT_ICON_PX: f64 = 96.;
 /// Result-tile label point size (`%caption`-ish app name under the icon).
 const LABEL_PT: f64 = 10.;
-/// `.overview-tile` padding (`$base_padding*2`=12).
-const TILE_PAD: f64 = 12.;
-/// Result-tile fixed width, logical (icon + room for a clipped label + padding).
-const TILE_W: f64 = 96.;
-/// Result-tile height: padding + icon + gap + one label line + padding.
-const TILE_H: f64 = TILE_PAD + RESULT_ICON_PX + 6. + 18. + TILE_PAD; // 112
+/// `.overview-tile` padding — the selection fill sits on the outer tile here, not
+/// on the inner icon the way the dash does. See [`AppIcon::OVERVIEW_TILE_PADDING`].
+const TILE_PAD: f64 = AppIcon::OVERVIEW_TILE_PADDING;
+/// Result-tile width: padding + icon + padding. A longer label is clipped rather
+/// than widening the tile (gnome-shell lets the label drive the natural width).
+const TILE_W: f64 = TILE_PAD + RESULT_ICON_PX + TILE_PAD; // 120
+/// Result-tile height: padding + icon + `.overview-icon-with-label` spacing
+/// (`$base_padding`, `_app-grid.scss:31-35`) + one label line + padding.
+const TILE_H: f64 = TILE_PAD + RESULT_ICON_PX + 6. + 18. + TILE_PAD; // 144
 /// Gap between grid tiles (`.grid-search-results` `spacing: $base_padding*5`=30).
 const GRID_SPACING: f64 = 30.;
 /// `.search-section-content` padding (`$base_padding*2`=12).
@@ -425,6 +429,13 @@ impl OverviewSearch {
     /// The logical center of result tile `i` — a geometry probe for the
     /// conformance corpus (which clicks real pixels routed through
     /// [`hit_test`](Self::hit_test)). `None` if out of range.
+    /// Result tile `i`'s box — a geometry probe for the render test, which needs
+    /// the tile edges (not just its center) to sample the selection fill.
+    #[cfg(test)]
+    pub fn result_tile(&self, i: usize, area: SearchArea) -> Option<Rectangle<f64, Logical>> {
+        self.layout(area).tiles.get(i).copied()
+    }
+
     #[cfg(test)]
     pub fn result_center(&self, i: usize, area: SearchArea) -> Option<Point<f64, Logical>> {
         let layout = self.layout(area);
@@ -629,6 +640,7 @@ impl OverviewSearch {
                                     &AppIcon {
                                         rect: *rel,
                                         hovered: true,
+                                        radius: AppIcon::OVERVIEW_TILE_RADIUS,
                                     },
                                     widget::style::HOVER_WASH,
                                 )?;
@@ -917,6 +929,44 @@ mod tests {
         assert!(s.is_active());
         assert_eq!(s.query(), "a");
         assert_eq!(s.selected_id(), Some("a.desktop"));
+    }
+
+    /// The result tile follows `.overview-tile`, not `%tile`: gnome-shell puts the
+    /// button (and so the selection fill) on the outer tile, which overrides both
+    /// the padding and the radius and wraps the label as well as the icon
+    /// (`_app-grid.scss:21-37`, `search.js:142` extending it via
+    /// `_search-results.scss:58-60`). The dash is the other case and keeps `%tile`.
+    #[test]
+    fn result_tile_follows_the_overview_tile_rule() {
+        // BaseIcon's default `ICON_SIZE` (`iconGrid.js:11,83`), not the dash's 64.
+        assert_eq!(RESULT_ICON_PX, 96.);
+        // padding 12 + icon 96 + padding 12
+        assert_eq!(TILE_W, 120.);
+        // + `.overview-icon-with-label` spacing 6 + one label line 18
+        assert_eq!(TILE_H, 144.);
+        assert_eq!(TILE_PAD, AppIcon::OVERVIEW_TILE_PADDING);
+        assert_ne!(
+            AppIcon::OVERVIEW_TILE_RADIUS,
+            AppIcon::RADIUS,
+            "the two tile rules must stay distinct — collapsing them is the bug \
+             this pins (the dash keeps %tile, the app grid and search do not)"
+        );
+
+        // The card grows with the bigger tiles, and still centers them.
+        let mut s = OverviewSearch::new();
+        s.handle_key(None, Some('a'), true);
+        s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
+        let l = s.layout(area_1080());
+        let card = l.card.expect("an active search has a card");
+        assert_eq!(
+            card.size,
+            Size::from((
+                2. * TILE_W + GRID_SPACING + 2. * CARD_PAD,
+                TILE_H + 2. * CARD_PAD
+            ))
+        );
+        assert_eq!(l.tiles[0].size, Size::from((TILE_W, TILE_H)));
+        assert_eq!(l.tiles[0].loc.x, card.loc.x + CARD_PAD);
     }
 
     /// The empty-state ("No results") card is sized for its own status string, not for

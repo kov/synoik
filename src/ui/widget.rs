@@ -217,6 +217,9 @@ pub struct AppIcon {
     /// The tile box (logical), laid out by the owner.
     pub rect: Rectangle<f64, Logical>,
     pub hovered: bool,
+    /// Corner radius of the hover/selection fill. Which one depends on where the
+    /// tile lives — see [`AppIcon::RADIUS`] vs [`AppIcon::OVERVIEW_TILE_RADIUS`].
+    pub radius: f64,
 }
 
 impl AppIcon {
@@ -224,6 +227,21 @@ impl AppIcon {
     pub const PADDING: f64 = 6.;
     /// `%tile` corner radius (`_common.scss:85`).
     pub const RADIUS: f64 = 16.;
+
+    /// `.overview-tile` padding (`$base_padding * 2`, `_app-grid.scss:26`).
+    ///
+    /// The app grid and the search results put the button — and so the
+    /// hover/selection fill — on the *outer* `.overview-tile`, which overrides
+    /// `%tile`'s padding and radius (`_app-grid.scss:24-26`) and wraps the label
+    /// as well as the icon. The dash is the other case: it resets
+    /// `.overview-tile` and styles the inner `.overview-icon` as a plain `%tile`
+    /// instead (`_dash.scss:49-63`), so it keeps [`PADDING`]/[`RADIUS`].
+    ///
+    /// [`PADDING`]: Self::PADDING
+    /// [`RADIUS`]: Self::RADIUS
+    pub const OVERVIEW_TILE_PADDING: f64 = 12.;
+    /// `.overview-tile` corner radius (`$base_border_radius * 3`, `_app-grid.scss:25`).
+    pub const OVERVIEW_TILE_RADIUS: f64 = 24.;
 
     /// The tile side for a given icon size (icon + padding both sides).
     pub fn size(icon_px: f64) -> f64 {
@@ -1128,7 +1146,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// lighten *direction* is the caller's, read from the SCSS).
     pub fn app_tile(&mut self, tile: &AppIcon, hover_bg: Rgba) -> anyhow::Result<()> {
         if tile.hovered {
-            self.fill_rounded(tile.rect, AppIcon::RADIUS, hover_bg)?;
+            self.fill_rounded(tile.rect, tile.radius, hover_bg)?;
         }
         Ok(())
     }
