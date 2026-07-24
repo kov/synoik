@@ -200,6 +200,14 @@ impl Fixture {
         self.niri_state().process_input_event(event);
     }
 
+    /// Skip the synthetic input clock forward, so the next injected event carries
+    /// a timestamp `ms` milliseconds later than it otherwise would. Input events
+    /// are normally stamped 1 ms apart; this is how a test drives a behavior that
+    /// keys off the *gap* between two events (e.g. a double-tap window).
+    pub fn advance_input_time(&mut self, ms: u32) {
+        self.next_input_time += ms;
+    }
+
     fn next_input_micros(&mut self) -> u64 {
         let time = self.next_input_time;
         self.next_input_time += 1;

@@ -350,6 +350,10 @@ impl OverviewProgress {
             OverviewProgress::Value(v) => *v,
         }
     }
+
+    fn is_animation(&self) -> bool {
+        matches!(self, OverviewProgress::Animation(_))
+    }
 }
 
 impl From<&super::OverviewProgress> for OverviewProgress {
@@ -1875,6 +1879,20 @@ impl<W: LayoutElement> Monitor<W> {
         Point::from((x, y))
             .to_physical_precise_round(scale)
             .to_logical(scale)
+    }
+
+    /// Whether the overview is still *animating open* on this monitor.
+    ///
+    /// gnome-shell's overlay-key handler asks the same question of its state
+    /// adjustment — `transitioning && finalState > initialState`
+    /// (`overviewControls.js:426-433`) — to tell a second Super tap that lands
+    /// mid-open (shift a state up, into the app grid) from one that lands after it
+    /// settled (toggle the overview back shut).
+    pub fn is_overview_opening(&self) -> bool {
+        let Some(progress) = &self.overview_progress else {
+            return false;
+        };
+        progress.is_animation() && self.overview_open && progress.clamped_value() < 1.
     }
 
     /// In GNOME windowing mode, the overview spreads each workspace's windows

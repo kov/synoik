@@ -4943,6 +4943,17 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
+    /// Shift a state *up*: window picker → app grid (`overviewControls.js:669-676`,
+    /// which clamps the target at `APP_GRID`, so this only ever opens). Returns
+    /// whether the state changed.
+    pub fn open_app_grid(&mut self) -> bool {
+        if !self.overview_open || self.app_grid_open {
+            return false;
+        }
+        self.set_app_grid(true);
+        true
+    }
+
     /// Ease the app grid back to the window picker if it is open — the grid tier of
     /// the overview's Escape (`searchController.js:153-159`: search → grid → hide).
     /// Returns whether it was open, so Escape can fall through to closing the
@@ -5369,6 +5380,14 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn is_overview_open(&self) -> bool {
         self.overview_open
+    }
+
+    /// Whether the overview is still animating open — see
+    /// [`Monitor::is_overview_opening`]. Asked of the active monitor, the one the
+    /// overlay key is about to act on.
+    pub fn is_overview_opening(&self) -> bool {
+        self.active_monitor_ref()
+            .is_some_and(Monitor::is_overview_opening)
     }
 
     /// Whether the session is in GNOME (floating) windowing mode, where the top

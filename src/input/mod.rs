@@ -79,6 +79,12 @@ use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 
+/// How soon a second overlay-key tap escalates into the app grid rather than
+/// closing the overview, when animations are off and there is no open
+/// transition to test against: `Overview.ANIMATION_TIME` (`overview.js:12`),
+/// the same constant gnome-shell compares to (`overviewControls.js:433`).
+const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
     pub aspect_ratio: f64,
@@ -543,7 +549,33 @@ impl State {
                         && !mods.iso_level5_shift;
                     this.niri.overlay_key_armed = is_overlay_key.then_some(key_code);
                 } else if this.niri.overlay_key_armed.take() == Some(key_code) {
-                    this.do_action(Action::ToggleOverview, false);
+                    // A second tap that comes quickly enough shifts a state *up* —
+                    // window picker → app grid — instead of toggling the overview
+                    // back shut (`overviewControls.js:419-438`).
+                    //
+                    // With animations on, "quickly enough" is not a timer at all:
+                    // gnome-shell asks whether its state adjustment is mid-transition
+                    // upward, so the escalation window is exactly the open animation.
+                    // With animations off there is no transition to catch, so it falls
+                    // back to "the overview is up and the previous overlay-key fired
+                    // less than ANIMATION_TIME ago" (`overview.js:12`, 250 ms). Miss
+                    // the window either way and Super closes the overview as always.
+                    let now = Duration::from_millis(u64::from(time));
+                    let prev = this.niri.overlay_key_last_fired.replace(now);
+                    let should_shift = if this.niri.config.borrow().animations.off {
+                        this.niri.layout.is_overview_open()
+                            && prev.is_some_and(|prev| {
+                                now.saturating_sub(prev) < OVERLAY_KEY_SHIFT_WINDOW
+                            })
+                    } else {
+                        this.niri.layout.is_overview_opening()
+                    };
+
+                    if should_shift {
+                        this.niri.layout.open_app_grid();
+                    } else {
+                        this.do_action(Action::ToggleOverview, false);
+                    }
                     return FilterResult::Intercept(None);
                 }
 

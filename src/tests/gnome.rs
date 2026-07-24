@@ -169,6 +169,102 @@ fn super_tap_toggles_overview() {
     );
 }
 
+/// Two quick Super taps land in the app grid: the second tap "shifts a state up"
+/// (window picker → app grid) instead of toggling the overview back shut
+/// (`overviewControls.js:419-438`). With animations on, "quick" is not a timer —
+/// gnome-shell asks whether its state adjustment is still transitioning upward,
+/// so the escalation window is exactly the open animation.
+#[test]
+fn double_super_tap_opens_the_app_grid() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Deliberately do NOT settle: the overview must still be animating open.
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the first tap opens the overview"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a second tap during the open animation must not close the overview"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "it must shift a state up, into the app grid"
+    );
+
+    // A third tap, now that nothing is transitioning, toggles as always — the
+    // shift is clamped at APP_GRID, so it never toggles the grid back down.
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a tap after the animation settles closes the overview"
+    );
+}
+
+/// The other half of the same branch: a second tap that arrives after the open
+/// animation has settled is a plain toggle, and must leave the app grid alone.
+#[test]
+fn slow_second_super_tap_closes_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a second tap after the open animation closes the overview"
+    );
+    assert!(
+        !f.niri().layout.is_app_grid_open(),
+        "and must not have shifted into the app grid"
+    );
+}
+
+/// With animations off there is no transition to catch, so gnome-shell falls back
+/// to a real timer: the overview is up and the previous overlay-key tap fired less
+/// than `Overview.ANIMATION_TIME` (250 ms) ago (`overviewControls.js:431-433`).
+#[test]
+fn double_super_tap_opens_the_app_grid_without_animations() {
+    let mut config = Config::default();
+    config.animations.off = true;
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "two taps within 250 ms must reach the app grid with animations off"
+    );
+
+    // Past the window, the same tap is a plain toggle again.
+    f.advance_input_time(300);
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a tap more than 250 ms later closes the overview"
+    );
+}
+
 /// GNOME's default overlay-key is `"Super"`, meaning *either* Super. So a lone
 /// right-Super tap opens the overview too, with no setting change.
 #[test]

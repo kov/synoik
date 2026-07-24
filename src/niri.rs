@@ -454,6 +454,11 @@ pub struct Niri {
     /// intervening input toggles the overview; any other key (or pointer
     /// activity) clears it. Mirrors mutter's `overlay_key_only_pressed`.
     pub overlay_key_armed: Option<Keycode>,
+    /// Event time of the last overlay-key tap that actually fired, i.e.
+    /// gnome-shell's `_lastOverlayKeyTime` (`overviewControls.js:419`). Only
+    /// read when animations are off, where the double-tap escalation into the
+    /// app grid falls back to a time comparison.
+    pub overlay_key_last_fired: Option<Duration>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
@@ -3669,6 +3674,7 @@ impl Niri {
             last_user_action_time: None,
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
+            overlay_key_last_fired: None,
             suppressed_buttons: HashSet::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
