@@ -1680,6 +1680,7 @@ impl Tty {
         };
 
         // Mark the last frame as submitted.
+        let mut missed_deadline = None;
         match surface.compositor.frame_submitted() {
             Ok(Some((mut feedback, target_presentation_time))) => {
                 let refresh = match refresh_interval {
@@ -1712,6 +1713,10 @@ impl Tty {
                         misprediction_s * 1000.,
                     );
                 }
+
+                // How late this frame landed against the deadline it was built
+                // for — the frame log's stutter signal.
+                missed_deadline = Some((target_presentation_time, presentation_time));
             }
             Ok(None) => (),
             Err(err) => {
@@ -1733,11 +1738,10 @@ impl Tty {
         // can be reached below.
         let unfinished_animations_remain = output_state.unfinished_animations_remain;
 
-        // A gap in the vblank sequence is frames the display never got — the
-        // thing a user actually perceives as a stutter, and independent of
-        // whether any individual frame looked slow to build.
-        niri.frame_log
-            .presented(&output.name(), meta.sequence, refresh_interval);
+        if let Some((target, actual)) = missed_deadline {
+            niri.frame_log
+                .presented(&output.name(), target, actual, refresh_interval);
+        }
 
         if redraw_needed || unfinished_animations_remain {
             let vblank_frame = tracy_client::Client::running()

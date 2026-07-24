@@ -38,9 +38,11 @@
 //!   phase *includes* GPU execution: the Vulkan renderer submits and fence-waits synchronously, so
 //!   `finish` does not return until the GPU is done. A slow `submit` is therefore ambiguous between
 //!   CPU and GPU until the `gpu` option splits it out.
-//! - **Presented frames**, from the DRM vblank sequence. A gap in the sequence is a frame the user
-//!   did not get, which is the thing actually perceived as a stutter — and it can happen with every
-//!   frame cost looking healthy (a late commit, a missed deadline elsewhere, the scanout engine).
+//! - **Missed deadlines**, from comparing when a frame actually reached the screen against the
+//!   presentation time it was built for. That is what a user perceives as a stutter, and it can
+//!   happen with every frame cost looking healthy. Deliberately *not* the gap in the DRM vblank
+//!   sequence — see [`FrameLog::presented`] for why that measures idleness on a damage-driven
+//!   compositor.
 //!
 //! Neither is much use without knowing what the frame was *doing*, so a logged
 //! frame carries its [`FrameContext`]: element count, whether the damage was
@@ -51,8 +53,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-use crate::utils::get_monotonic_time;
 
 /// Number of widget bakes that have run since the process started. A bake is an
 /// uncached rasterization into its own GPU texture — a render pass, a submit and
@@ -218,14 +218,6 @@ impl Stats {
     }
 }
 
-/// Per-output presentation tracking, for spotting frames that never reached the
-/// display.
-#[derive(Debug, Default)]
-struct Presentation {
-    last_sequence: Option<u32>,
-    last_time: Option<Duration>,
-}
-
 /// The frame being timed right now.
 #[derive(Debug)]
 struct InFlight {
@@ -245,7 +237,6 @@ pub struct FrameLog {
     settings: Option<Settings>,
     in_flight: Option<InFlight>,
     stats: HashMap<String, Stats>,
-    presentation: HashMap<String, Presentation>,
     last_summary: Instant,
 }
 
@@ -282,7 +273,6 @@ impl FrameLog {
             settings,
             in_flight: None,
             stats: HashMap::new(),
-            presentation: HashMap::new(),
             last_summary: Instant::now(),
         }
     }
@@ -461,42 +451,66 @@ impl FrameLog {
         line
     }
 
-    /// Record a presented frame from the DRM vblank. A jump in `sequence` means
-    /// the display went through vblanks we never filled — the frames a user
-    /// actually sees as a stutter.
-    pub fn presented(&mut self, output: &str, sequence: u32, refresh: Option<Duration>) {
+    /// Record a presented frame: how late it landed against the presentation time
+    /// the compositor aimed for when it built it.
+    ///
+    /// **Not** the gap in the DRM vblank sequence, which is the obvious thing to
+    /// measure and is wrong here. The hardware vblank counter advances every
+    /// refresh cycle whether or not we flipped, and a damage-driven compositor
+    /// deliberately does not flip when nothing changed — so on an idle desktop
+    /// the sequence gap measures *idleness*. The first run of this logger
+    /// reported "dropped 59 frames" once a second on a static screen, which was
+    /// the clock ticking, not a stutter.
+    ///
+    /// What a user perceives as a stutter is a frame that was meant for a
+    /// particular vblank and arrived at a later one. `target` is the deadline the
+    /// frame was built against (`FrameClock::next_presentation_time`), `actual` is
+    /// when it reached the screen; a difference of a whole refresh cycle or more
+    /// is a missed deadline, whatever the compositor was doing before it.
+    pub fn presented(
+        &mut self,
+        output: &str,
+        target: Duration,
+        actual: Duration,
+        refresh: Option<Duration>,
+    ) {
         if self.settings.is_none() {
             return;
         }
 
-        let now = get_monotonic_time();
-        let entry = self.presentation.entry(output.to_owned()).or_default();
-        let previous_time = entry.last_time.replace(now);
-        let previous = entry.last_sequence.replace(sequence);
+        // No hardware clock (`DrmEventTime::Realtime`, or the debug knob that
+        // emulates a zero presentation time): nothing to compare against.
+        if actual.is_zero() || target.is_zero() {
+            return;
+        }
 
-        let Some(previous) = previous else {
+        // Without a refresh interval there is no cycle to be late by.
+        let Some(refresh) = refresh.filter(|r| !r.is_zero()) else {
             return;
         };
 
-        // Sequence wrap and backwards jumps (a mode set, a VT switch) are not
-        // drops; `wrapping_sub` handles the wrap, and anything absurd is treated
-        // as a discontinuity rather than thousands of dropped frames.
-        let missed = sequence.wrapping_sub(previous).saturating_sub(1);
-        if missed == 0 || missed > 60 {
+        let Some(late) = actual.checked_sub(target) else {
+            // Presented early. That is the frame clock mispredicting downward,
+            // not a drop.
+            return;
+        };
+
+        // Round to whole cycles: landing a hair after the target is the normal
+        // scheduling jitter of hitting the same vblank, not a miss.
+        let missed = (late.as_secs_f64() / refresh.as_secs_f64()).round() as u64;
+        if missed == 0 {
             return;
         }
 
-        self.stats.entry(output.to_owned()).or_default().dropped += u64::from(missed);
+        self.stats.entry(output.to_owned()).or_default().dropped += missed;
 
-        let gap = previous_time.map(|previous| now.saturating_sub(previous));
-        match (gap, refresh) {
-            (Some(gap), Some(refresh)) => tracing::warn!(
-                "dropped {missed} frame(s) on {output}: {} between presentations, refresh {}",
-                ms(gap),
-                ms(refresh),
-            ),
-            _ => tracing::warn!("dropped {missed} frame(s) on {output}"),
-        }
+        tracing::warn!(
+            "missed {missed} vblank(s) on {output}: presented {} after the {} target, \
+             refresh {}",
+            ms(late),
+            ms(target),
+            ms(refresh),
+        );
     }
 
     fn maybe_summarize(&mut self, now: Instant) {
@@ -608,7 +622,6 @@ mod tests {
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
-            presentation: HashMap::new(),
             last_summary: Instant::now(),
         };
 
@@ -625,35 +638,66 @@ mod tests {
         assert_eq!(stats.frames, 1);
     }
 
-    /// A gap in the vblank sequence is dropped frames; a wrap is not, and neither
-    /// is the first frame seen.
+    /// A frame is missed when it lands a whole refresh cycle or more after the
+    /// deadline it was built for — and, crucially, **not** merely because time
+    /// passed since the previous frame.
     #[test]
-    fn sequence_gaps_count_as_dropped_frames() {
+    fn only_a_late_presentation_counts_as_missed() {
+        let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
-            presentation: HashMap::new(),
             last_summary: Instant::now(),
         };
-        let refresh = Some(Duration::from_micros(16667));
+        let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
 
-        log.presented("out", 10, refresh);
-        assert!(
-            !log.stats.contains_key("out"),
-            "the first frame is a baseline"
+        // On time: presented essentially at the target.
+        let target = Duration::from_secs(100);
+        log.presented(
+            "out",
+            target,
+            target + Duration::from_micros(200),
+            Some(refresh),
         );
+        assert_eq!(dropped(&log), 0, "hitting the target is not a miss");
 
-        log.presented("out", 11, refresh);
-        assert_eq!(log.stats.get("out").map_or(0, |s| s.dropped), 0);
+        // One cycle late.
+        log.presented("out", target, target + refresh, Some(refresh));
+        assert_eq!(dropped(&log), 1);
 
-        log.presented("out", 14, refresh);
-        assert_eq!(log.stats["out"].dropped, 2);
+        // Three cycles late.
+        log.presented("out", target, target + refresh * 3, Some(refresh));
+        assert_eq!(dropped(&log), 4);
 
-        // Wrapping the counter is not a drop storm.
-        log.presented("out", u32::MAX, refresh);
-        let after_jump = log.stats["out"].dropped;
-        log.presented("out", 0, refresh);
-        assert_eq!(log.stats["out"].dropped, after_jump);
+        // Early — the frame clock mispredicting downward, not a drop.
+        log.presented(
+            "out",
+            target,
+            target - Duration::from_millis(5),
+            Some(refresh),
+        );
+        assert_eq!(dropped(&log), 4);
+
+        // THE case that made the first version useless: an idle desktop redrawing
+        // once a second, each frame hitting its own target exactly. A metric based
+        // on the gap between presentations would call this 59 dropped frames every
+        // second; it is a compositor with nothing to draw.
+        let mut log = FrameLog {
+            settings: Some(Settings::default()),
+            in_flight: None,
+            stats: HashMap::new(),
+            last_summary: Instant::now(),
+        };
+        for i in 0..5 {
+            let target = Duration::from_secs(200) + Duration::from_secs(i);
+            log.presented("out", target, target, Some(refresh));
+        }
+        assert_eq!(dropped(&log), 0, "idle redraws are not dropped frames");
+
+        // No hardware clock, or no refresh interval: nothing to compare against.
+        log.presented("out", target, Duration::ZERO, Some(refresh));
+        log.presented("out", target, target + refresh * 5, None);
+        assert_eq!(dropped(&log), 0);
     }
 }
