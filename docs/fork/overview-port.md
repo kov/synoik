@@ -409,8 +409,8 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     (active full / inactive 2/3-scale+half-alpha), navigable by a **wheel notch** (150ms debounce), a
     **dot click**, or **reset to page 0** on a fresh overview open. Render pins the dots.
   - **S8 divergences / follow-ups (deferred, documented in `app_grid.rs`):** no touchpad **swipe**
-    (continuous scroll over the grid is consumed but inert), no page-slide animation (snap), no side
-    **nav-arrows**, no keyboard paging (`Page_Up/Down`) or in-grid arrow/Enter keynav, no
+    (continuous scroll over the grid is consumed but inert), no page-slide animation (snap),
+    no keyboard paging (`Page_Up/Down`) or in-grid arrow/Enter keynav, no
     `indicatorsPadding` (differs only at narrow widths), no folders/`app-picker-layout`/DnD reorder;
     sort is `to_lowercase` not locale collation. The thumbnails' transient scale/translation shrink
     and the faded-strip non-reactivity (S8a) also remain. Floor/ceil vs transition-bracket
@@ -420,12 +420,17 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     open animation now run on a worker thread (like the wallpaper decoder): miss → enqueue + draw
     nothing that frame; result lands via a calloop source → redraw, so icons pop in during the slide.
     Generation counter + in-flight dedup + negative cache + `catch_unwind`; headless keeps the sync path.
+  - **Nav arrows ✅ DONE (`bb835487`).** The `.page-navigation-arrow` flat circular buttons in the side
+    gutters (`carousel-arrow-{previous,next}-symbolic` chevron, 60px disc, flat at rest / `HOVER_WASH` on
+    hover), shown only when a previous/next page exists, stepping the page ∓1 on click. Chevrons bundled
+    into `resources/icons/` + `embedded_icon()` (gresource icons, not on-disk). Divergence: absent
+    `indicatorsPadding`, they ride the centering gutter, not a fixed 10% band. Render pins the chevron +
+    hover wash.
   - **Next (deferred, pending live measurement):** (1) **batch the GPU uploads** if the residual
     submit+fence-wait-per-texture still hitches on Venus (or cap N-per-frame); (2) **prewarm** dash
     favorites at startup + adjacent grid pages on page-land (kills first-open pop-in + makes paging
-    pop-free); (3) the **left/right page-navigation arrows** (`.page-navigation-arrow`, flanking the
-    grid, wired to `set_page`) — the one visible nav gap Gustavo noted; (4) touchpad **swipe**,
-    page-slide animation, keyboard paging (from S8b's deferred list).
+    pop-free); (3) touchpad **swipe**, page-slide animation, keyboard paging (from S8b's deferred list);
+    (4) `indicatorsPadding` reserve so the arrows sit in a fixed side band rather than the gutter.
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
