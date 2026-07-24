@@ -5522,6 +5522,7 @@ fn overview_dash_favorite_click_launches_and_closes() {
 
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
 
     let calls = recorder.calls.borrow();
@@ -5534,6 +5535,63 @@ fn overview_dash_favorite_click_launches_and_closes() {
     );
 }
 
+/// The overview's icons are St.Buttons, so the launch happens on the *release*,
+/// not the press: `ClutterClickGesture` only completes when the button is lifted
+/// (`clutter-click-gesture.c:68-81`; StButton leaves `recognize-on-press` off,
+/// `st-button.c:429-435`). The press alone must do nothing — that is what leaves
+/// room for a press to start a drag instead.
+#[test]
+fn overview_dash_favorite_launches_on_release_not_press() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    let center = dash_tile_center(&mut f, 0);
+
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.niri_complete_animations();
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "the press alone must not launch"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "and must not close the overview"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        recorder.calls.borrow().len(),
+        1,
+        "the release completes the click"
+    );
+    assert!(!f.niri().layout.is_overview_open());
+}
+
+/// ...and the release only counts if it lands on the same widget: lift the button
+/// somewhere else and the click is cancelled (`clutter-click-gesture.c:74-79`,
+/// which cancels when the press gesture is no longer pressed on the actor).
+#[test]
+fn overview_dash_release_off_the_icon_does_not_launch() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+    let pressed = dash_tile_center(&mut f, 0);
+    let other = dash_tile_center(&mut f, 1);
+
+    pointer_motion_to(&mut f, pressed.x, pressed.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, other.x, other.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "releasing over a different icon launches nothing"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "and leaves the overview open"
+    );
+}
+
 /// A middle-click on a favorite also launches it (still `Activate`: `open_new_window`
 /// is reserved for a *running* app, which S3 never tracks) and closes the overview.
 #[test]
@@ -5543,6 +5601,7 @@ fn overview_dash_favorite_middle_click_launches() {
 
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
     f.niri_complete_animations();
 
     assert_eq!(recorder.calls.borrow().len(), 1, "middle-click launches");
@@ -6073,6 +6132,7 @@ fn overview_search_click_result_launches() {
         .expect("result tile 1");
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
 
     let calls = recorder.calls.borrow();
@@ -6521,6 +6581,7 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     pointer_motion_to(&mut f, run.x, run.y);
     assert_eq!(f.niri().dash.hovered_for_test(), Some(DashHit::App(1)));
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
         recorder
             .calls

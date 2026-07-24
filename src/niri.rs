@@ -137,7 +137,7 @@ use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData,
+    mods_with_tablet_stylus_binds, mods_with_wheel_binds, OverviewHit, TabletData,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -461,6 +461,11 @@ pub struct Niri {
     pub overlay_key_last_fired: Option<Duration>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
+    /// Which of the overview's widgets a pointer press landed on, with the button
+    /// code that pressed it. The overview's controls are St.Buttons, which act on
+    /// the release and only if it lands on the same widget, so the press records
+    /// the target here and the release consumes it.
+    pub overview_pressed: Option<(u32, OverviewHit)>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -3676,6 +3681,7 @@ impl Niri {
             overlay_key_armed: None,
             overlay_key_last_fired: None,
             suppressed_buttons: HashSet::new(),
+            overview_pressed: None,
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,

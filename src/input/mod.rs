@@ -54,9 +54,11 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::ui::app_grid::PageArrow;
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
+use crate::ui::overview_search::SearchHit;
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -84,6 +86,23 @@ pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 /// transition to test against: `Overview.ANIMATION_TIME` (`overview.js:12`),
 /// the same constant gnome-shell compares to (`overviewControls.js:433`).
 const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
+
+/// A widget of the overview's chrome under the pointer. The overview's controls
+/// are St.Buttons, which act on release rather than press, so a click needs a
+/// press-time target to compare the release against — this is that target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewHit {
+    /// The dash (favorites bar).
+    Dash(DashHit),
+    /// The search entry / results card.
+    Search(SearchHit),
+    /// An app grid tile at index `.0`.
+    GridApp(usize),
+    /// A page-indicator dot for page `.0`.
+    GridPage(usize),
+    /// A page navigation arrow.
+    GridArrow(PageArrow),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
@@ -3494,6 +3513,114 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Which of the overview's widgets is at `pos` on `output`, if the overview
+    /// chrome is on screen and reactive there. Hit order follows the paint order:
+    /// dash, then the search card, then the app grid (reactive only while open and
+    /// not covered by a search — the same gate the hover tracking uses).
+    fn overview_hit(&self, output: &Output, pos: Point<f64, Logical>) -> Option<OverviewHit> {
+        if !self.niri.overview_ui_visible() {
+            return None;
+        }
+
+        let controls = self.niri.layout.controls_layout_for_output(output)?;
+
+        if let Some(hit) = self.niri.dash.hit_test(pos, controls.dash) {
+            return Some(OverviewHit::Dash(hit));
+        }
+        if let Some(hit) = self.niri.overview_search.hit_test(pos, controls.into()) {
+            return Some(OverviewHit::Search(hit));
+        }
+        if self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active() {
+            let area = controls.app_display;
+            if let Some(i) = self.niri.app_grid.hit_test(pos, area) {
+                return Some(OverviewHit::GridApp(i));
+            }
+            if let Some(page) = self.niri.app_grid.indicator_hit(pos, area) {
+                return Some(OverviewHit::GridPage(page));
+            }
+            if let Some(arrow) = self.niri.app_grid.arrow_hit(pos, area) {
+                return Some(OverviewHit::GridArrow(arrow));
+            }
+        }
+
+        None
+    }
+
+    /// Activate an overview widget: the release half of a click on the chrome.
+    /// `button` is the button that was lifted; the backgrounds (dash pill, search
+    /// card, entry body) are hit-tested so they consume the click, but do nothing.
+    fn activate_overview_hit(
+        &mut self,
+        output: &Output,
+        hit: OverviewHit,
+        button: Option<MouseButton>,
+    ) {
+        let primary = button == Some(MouseButton::Left);
+        // GNOME's app icons take primary and middle (`button_mask`,
+        // `appDisplay.js:1854`); middle is "open a new window", which for a stopped
+        // app is the same launch.
+        let launches = matches!(button, Some(MouseButton::Left | MouseButton::Middle));
+
+        match hit {
+            // A favorite launches and closes the overview. All our apps are stopped,
+            // so this is a plain `Activate` — GNOME's dash icon does `open_new_window`
+            // only for a *running* app (`appDisplay.js:3060`).
+            OverviewHit::Dash(DashHit::App(i)) if launches => {
+                if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
+                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
+                        tracing::warn!("dash launch of {id} failed: {err:?}");
+                    }
+                    self.niri.layout.close_overview();
+                }
+            }
+            // The show-apps button toggles the app grid (`ShowAppsIcon`,
+            // `dash.js:189-213`).
+            OverviewHit::Dash(DashHit::ShowApps) if primary => {
+                self.niri.layout.toggle_app_grid();
+            }
+            OverviewHit::Search(SearchHit::Result(i)) if launches => {
+                if let Some(id) = self.niri.overview_search.result_id(i).map(str::to_owned) {
+                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
+                        tracing::warn!("search launch of {id} failed: {err:?}");
+                    }
+                    self.niri.overview_search.clear();
+                    self.niri.layout.close_overview();
+                }
+            }
+            OverviewHit::Search(SearchHit::Clear) if primary => {
+                self.niri.overview_search.clear();
+                self.niri.sync_overview_search();
+            }
+            // An app grid tile launches the app and closes the overview
+            // (`AppIcon.activate`, `appDisplay.js:3060,3077`).
+            OverviewHit::GridApp(i) if launches => {
+                if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {
+                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
+                        tracing::warn!("app grid launch of {id} failed: {err:?}");
+                    }
+                    self.niri.layout.close_overview();
+                }
+            }
+            // A page-indicator dot jumps to that page; a navigation arrow steps one.
+            OverviewHit::GridPage(page) if primary => {
+                if let Some(controls) = self.niri.layout.controls_layout_for_output(output) {
+                    self.niri.app_grid.set_page(page, controls.app_display);
+                }
+            }
+            OverviewHit::GridArrow(arrow) if primary => {
+                if let Some(controls) = self.niri.layout.controls_layout_for_output(output) {
+                    let cur = self.niri.app_grid.current_page();
+                    let target = match arrow {
+                        PageArrow::Prev => cur.saturating_sub(1),
+                        PageArrow::Next => cur + 1,
+                    };
+                    self.niri.app_grid.set_page(target, controls.app_display);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -3511,6 +3638,35 @@ impl State {
         // started it is suppressed below, so handle it before that early return).
         if button_state == ButtonState::Released && self.niri.panel_popover.end_drag() {
             self.niri.queue_redraw_all();
+        }
+
+        // The release half of a click on the overview's chrome. St.Button's click
+        // gesture completes on the *release*, and only if the pointer is still on
+        // the widget it was pressed on (`clutter-click-gesture.c:68-81`) — lift off
+        // it (or drag away) and nothing is activated. Runs before the suppression
+        // check below, which is what keeps the release from reaching clients.
+        if button_state == ButtonState::Released {
+            if let Some((code, hit)) = self.niri.overview_pressed.take() {
+                if code == button_code {
+                    self.niri.suppressed_buttons.remove(&button_code);
+
+                    let location = pointer.current_location();
+                    let under = self
+                        .niri
+                        .output_under(location)
+                        .map(|(o, p)| (o.clone(), p));
+                    if let Some((output, pos)) = under {
+                        if self.overview_hit(&output, pos) == Some(hit) {
+                            self.activate_overview_hit(&output, hit, button);
+                        }
+                    }
+
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+
+                self.niri.overview_pressed = Some((code, hit));
+            }
         }
 
         // Ignore release events for mouse clicks that triggered a bind.
@@ -3618,14 +3774,18 @@ impl State {
                     }
                 }
 
-                // The overview dash (favorites bar) intercepts clicks while the overview is
-                // open: a click on a favorite launches it and closes the overview (all our
-                // apps are stopped in S3, so this is a plain `Activate` launch — GNOME's
-                // dash icon does `open_new_window` only for a *running* app,
-                // `appDisplay.js:3060`). The show-apps button and the pill background are
-                // consumed inertly (S8 wires the app grid). *Every* button is consumed on a
-                // hit so a right/middle press over the dash can't fall through to the
-                // overview's right-drag / workspace grabs beneath it.
+                // The overview's own widgets are St.Buttons — dash icons, the show-apps
+                // button, app-grid tiles and page controls, search results — and an
+                // St.Button acts on *release*: its click gesture completes only when the
+                // button is lifted while the pointer is still on the widget
+                // (`clutter-click-gesture.c:68-81` via `st-button.c:429-435`, which does
+                // not set `recognize-on-press`). So the press only *records* the target;
+                // the release path above re-tests the hit and activates. A press is also
+                // what a drag starts from, which is the other reason GNOME can't act here.
+                //
+                // *Every* button is consumed on a hit so a right/middle press over the
+                // dash can't fall through to the overview's right-drag / workspace grabs
+                // beneath it.
                 //
                 // Only when the overview UI is actually visible (`overview_ui_visible`): a lock
                 // surface or the screenshot UI can be raised over a still-open overview (neither
@@ -3634,138 +3794,14 @@ impl State {
                 // which route through the lock-filtered `do_action`, these launch apps directly —
                 // a lock-screen bypass). GNOME sidesteps this by dropping the overview from the
                 // lock/unlock session modes (`sessionMode.js`).
-                if self.niri.overview_ui_visible() {
-                    if let Some((controls, pos)) = under.as_ref().and_then(|(output, pos)| {
-                        Some((self.niri.layout.controls_layout_for_output(output)?, pos))
-                    }) {
-                        if let Some(hit) = self.niri.dash.hit_test(*pos, controls.dash) {
-                            self.niri.suppressed_buttons.insert(button_code);
-                            match hit {
-                                DashHit::App(i) => {
-                                    if matches!(
-                                        button,
-                                        Some(MouseButton::Left | MouseButton::Middle)
-                                    ) {
-                                        if let Some(id) =
-                                            self.niri.dash.item_id(i).map(str::to_owned)
-                                        {
-                                            if let Err(err) = self
-                                                .niri
-                                                .app_system
-                                                .launch(&id, LaunchMode::Activate)
-                                            {
-                                                tracing::warn!(
-                                                    "dash launch of {id} failed: {err:?}"
-                                                );
-                                            }
-                                            self.niri.layout.close_overview();
-                                        }
-                                    }
-                                }
-                                // The show-apps button toggles the app grid
-                                // (`ShowAppsIcon`, `dash.js:189-213`).
-                                DashHit::ShowApps => {
-                                    if matches!(button, Some(MouseButton::Left)) {
-                                        self.niri.layout.toggle_app_grid();
-                                    }
-                                }
-                                DashHit::Background => {}
-                            }
-                            self.niri.queue_redraw_all();
-                            return;
-                        }
-
-                        // The overview search: a click on a result tile launches it and closes
-                        // the overview; the clear glyph clears the query; the entry / card
-                        // background are consumed inertly. Every button consumed on a hit (same
-                        // fall-through reasoning as the dash).
-                        if let Some(hit) = self.niri.overview_search.hit_test(*pos, controls.into())
-                        {
-                            use crate::ui::overview_search::SearchHit;
-                            self.niri.suppressed_buttons.insert(button_code);
-                            match hit {
-                                SearchHit::Result(i)
-                                    if matches!(
-                                        button,
-                                        Some(MouseButton::Left | MouseButton::Middle)
-                                    ) =>
-                                {
-                                    if let Some(id) =
-                                        self.niri.overview_search.result_id(i).map(str::to_owned)
-                                    {
-                                        if let Err(err) =
-                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
-                                        {
-                                            tracing::warn!("search launch of {id} failed: {err:?}");
-                                        }
-                                        self.niri.overview_search.clear();
-                                        self.niri.layout.close_overview();
-                                    }
-                                }
-                                SearchHit::Clear if button == Some(MouseButton::Left) => {
-                                    self.niri.overview_search.clear();
-                                    self.niri.sync_overview_search();
-                                }
-                                _ => {}
-                            }
-                            self.niri.queue_redraw_all();
-                            return;
-                        }
-
-                        // The app grid (when open and not covered by a search): a
-                        // click on a tile launches the app and closes the overview
-                        // (`AppIcon.activate`, `appDisplay.js:3060,3077`). Reactive
-                        // only while open + search-inactive, matching the hover gate.
-                        if self.niri.layout.is_app_grid_open()
-                            && !self.niri.overview_search.is_active()
-                        {
-                            let area = controls.app_display;
-                            if let Some(i) = self.niri.app_grid.hit_test(*pos, area) {
-                                self.niri.suppressed_buttons.insert(button_code);
-                                if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
-                                    if let Some(id) =
-                                        self.niri.app_grid.entry_id(i).map(str::to_owned)
-                                    {
-                                        if let Err(err) =
-                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
-                                        {
-                                            tracing::warn!(
-                                                "app grid launch of {id} failed: {err:?}"
-                                            );
-                                        }
-                                        self.niri.layout.close_overview();
-                                    }
-                                }
-                                self.niri.queue_redraw_all();
-                                return;
-                            }
-                            // A click on a page-indicator dot jumps to that page.
-                            if let Some(page) = self.niri.app_grid.indicator_hit(*pos, area) {
-                                self.niri.suppressed_buttons.insert(button_code);
-                                if button == Some(MouseButton::Left) {
-                                    self.niri.app_grid.set_page(page, area);
-                                }
-                                self.niri.queue_redraw_all();
-                                return;
-                            }
-                            // A click on a navigation arrow steps one page.
-                            if let Some(arrow) = self.niri.app_grid.arrow_hit(*pos, area) {
-                                self.niri.suppressed_buttons.insert(button_code);
-                                if button == Some(MouseButton::Left) {
-                                    let cur = self.niri.app_grid.current_page();
-                                    let target = match arrow {
-                                        crate::ui::app_grid::PageArrow::Prev => {
-                                            cur.saturating_sub(1)
-                                        }
-                                        crate::ui::app_grid::PageArrow::Next => cur + 1,
-                                    };
-                                    self.niri.app_grid.set_page(target, area);
-                                }
-                                self.niri.queue_redraw_all();
-                                return;
-                            }
-                        }
-                    }
+                if let Some(hit) = under
+                    .as_ref()
+                    .and_then(|(output, pos)| self.overview_hit(output, *pos))
+                {
+                    self.niri.suppressed_buttons.insert(button_code);
+                    self.niri.overview_pressed = Some((button_code, hit));
+                    self.niri.queue_redraw_all();
+                    return;
                 }
 
                 // A left-click on a panel button: the workspace indicator toggles the overview
