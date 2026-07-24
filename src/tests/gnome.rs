@@ -5371,6 +5371,46 @@ fn overview_app_grid_paginates_and_navigates() {
     );
 }
 
+/// The startup icon prewarm enqueues the dash + grid icon decodes off-thread (so the
+/// first overview open doesn't rasterize them on the opening frame), gated on the
+/// worker being wired, and dedups repeat requests.
+#[test]
+fn overview_prewarm_requests_dash_and_grid_icon_decodes() {
+    let (mut f, _r) = app_grid_fixture(&["fav.desktop"], &["a.desktop", "b.desktop"]);
+
+    // Without a worker wired, prewarm must be a no-op (else it would decode inline on
+    // the main thread — the stall it exists to avoid).
+    assert!(!f.niri().app_icon_cache.has_worker());
+    f.niri().prewarm_app_icons(); // no panic, nothing to observe
+
+    // Wire the async path to a test channel and prewarm: every fake app icon is
+    // `Fallback`, so the requests dedup to one per surface size — the dash's 64px and
+    // the grid's 96px.
+    let rx = f.niri().app_icon_cache.wire_test_channel();
+    assert!(f.niri().app_icon_cache.has_worker());
+    f.niri().prewarm_app_icons();
+
+    let mut sizes: Vec<u32> = rx
+        .try_iter()
+        .map(|req| req.logical_px().round() as u32)
+        .collect();
+    sizes.sort_unstable();
+    assert_eq!(
+        sizes,
+        vec![64, 96],
+        "prewarm requests the dash (64) and grid (96) icon decodes"
+    );
+
+    // A second prewarm enqueues nothing new — the keys are in flight (nothing was
+    // applied to resolve them).
+    f.niri().prewarm_app_icons();
+    assert_eq!(
+        rx.try_iter().count(),
+        0,
+        "in-flight keys are not re-requested"
+    );
+}
+
 /// The dash is only live while the overview is open: a click at a favorite's
 /// position with the overview closed passes through to the windows/workspace, never
 /// launching the app.

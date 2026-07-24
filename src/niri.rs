@@ -1004,6 +1004,9 @@ impl State {
                         state.niri.sync_overview_search();
                         state.niri.sync_dash_favorites();
                         state.niri.sync_app_grid();
+                        // The catalog (and its icons) just changed and the caches were
+                        // cleared above — re-warm the decodes off-thread for the next open.
+                        state.niri.prewarm_app_icons();
                         // Unconditional: dropping the icon uploads and reshuffling
                         // search results both invalidate what is on screen, and an
                         // idle overview produces no frames on its own — a stale frame
@@ -1082,6 +1085,9 @@ impl State {
                             .set_favorites(settings.favorite_apps.clone());
                         state.niri.sync_dash_favorites();
                         state.niri.sync_app_grid();
+                        // Pinning/unpinning moves an app between the dash and the grid;
+                        // warm any icon that just entered a surface (idempotent).
+                        state.niri.prewarm_app_icons();
                         // A keymap-affecting change (layout list / options / model)
                         // rebuilds the keymap; an mru-only change (e.g. our own
                         // switch write) just re-seeds the active group — no rebuild.
@@ -1111,6 +1117,10 @@ impl State {
                             state.niri.app_icon_cache.set_theme(&theme);
                             state.niri.dash.clear_icon_uploads();
                             state.niri.overview_search.clear_icon_uploads();
+                            state.niri.app_grid.clear_icon_uploads();
+                            // `set_theme` invalidated the decode cache — re-warm it in
+                            // the new theme off-thread for the next open.
+                            state.niri.prewarm_app_icons();
                         }
                         // A DND (`show-banners`) flip toggles the dateMenu dot.
                         state.niri.update_messages_indicator();
@@ -4015,6 +4025,11 @@ impl Niri {
 
         // Must be last since it will call queue_redraw(output) which needs things to be filled-in.
         self.reposition_outputs(Some(&output));
+
+        // Now that an output (hence a scale) exists and the worker is up, warm the
+        // dash/grid icon decodes so the first overview open doesn't rasterize them on
+        // the opening frame. Idempotent — safe to repeat as more outputs appear.
+        self.prewarm_app_icons();
     }
 
     pub fn output_exists(&self, output: &Output) -> bool {
@@ -8312,6 +8327,46 @@ impl Niri {
                 .then_with(|| a.name.cmp(&b.name))
         });
         self.app_grid.set_entries(entries)
+    }
+
+    /// Warm the app-icon decode cache for the always-visible launch surfaces (the
+    /// dash + the app grid) at each connected output's scale, so the first overview
+    /// open finds the icons already decoded instead of rasterizing ~24 of them on the
+    /// opening frame. This mirrors GNOME, which keeps its `AppDisplay` resident and
+    /// populates it off the idle deferred-work queue at startup (`appDisplay.js:1339`)
+    /// into a shell-wide cache held `POLICY_FOREVER` (`st-texture-cache.c:998`).
+    ///
+    /// The decode runs on the worker thread and [`AppIconCache::buffer`] dedups keys
+    /// that are already cached or in flight, so this is idempotent and cheap to call
+    /// again whenever the scale set or the app content changes.
+    pub fn prewarm_app_icons(&self) {
+        // Before the worker is wired, `buffer()` would decode inline on the main
+        // thread — the exact startup stall this exists to avoid.
+        if !self.app_icon_cache.has_worker() {
+            return;
+        }
+        // The distinct output scales the surfaces will draw at (each is its own cache
+        // key). A handful of outputs at most, so a linear dedup is fine.
+        let mut scales: Vec<f64> = Vec::new();
+        for output in self.global_space.outputs() {
+            let scale = output.current_scale().fractional_scale();
+            if !scales.contains(&scale) {
+                scales.push(scale);
+            }
+        }
+        // The dash renders its icons at `dash::ICON_PX`; the grid (and search) at the
+        // `.overview-tile` BaseIcon size. Warm each at the sizes it can appear.
+        let grid_px = crate::ui::widget::TileMetrics::OVERVIEW.icon_px;
+        for scale in scales {
+            for icon in self.dash.icon_refs() {
+                let _ = self
+                    .app_icon_cache
+                    .buffer(icon, crate::ui::dash::ICON_PX, scale);
+            }
+            for icon in self.app_grid.icon_refs() {
+                let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
+            }
+        }
     }
 
     /// Snapshot every mapped window into the app model's running-app tracker —

@@ -235,6 +235,11 @@ impl AppGrid {
         self.entries.get(i).map(|e| e.id.as_str())
     }
 
+    /// Every entry's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
+    pub fn icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
+        self.entries.iter().map(|e| &e.icon)
+    }
+
     /// Set the mouse-hovered tile (an absolute entry index); returns whether it
     /// changed (→ redraw).
     pub fn set_hovered(&mut self, hovered: Option<usize>) -> bool {

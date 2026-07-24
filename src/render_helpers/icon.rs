@@ -428,6 +428,13 @@ impl AppIconCache {
         self.invalidate();
     }
 
+    /// Whether the decode worker is wired ([`spawn_worker`](Self::spawn_worker) ran).
+    /// A prewarm pass gates on this: before the worker exists, [`buffer`](Self::buffer)
+    /// would decode inline on the main thread — the very stall prewarming avoids.
+    pub fn has_worker(&self) -> bool {
+        self.decode_tx.is_some()
+    }
+
     /// A full-color icon buffer for `icon` at `logical_px` (square), rendered at the
     /// output `scale` with the icon's own colors, falling back to
     /// `application-x-executable`. Cached by (descriptor, logical size, physical size).
@@ -488,10 +495,19 @@ impl AppIconCache {
     /// Wire the async path to a plain channel (no worker thread) so a test can inspect
     /// the requests and hand back decoded results via [`apply_decoded`](Self::apply_decoded).
     #[cfg(test)]
-    fn wire_test_channel(&mut self) -> mpsc::Receiver<IconRequest> {
+    pub(crate) fn wire_test_channel(&mut self) -> mpsc::Receiver<IconRequest> {
         let (tx, rx) = mpsc::channel();
         self.decode_tx = Some(tx);
         rx
+    }
+}
+
+#[cfg(test)]
+impl IconRequest {
+    /// The logical (pre-scale) icon size requested — lets a test tell the dash's 64px
+    /// warm apart from the grid's 96px.
+    pub(crate) fn logical_px(&self) -> f64 {
+        self.logical_px
     }
 }
 

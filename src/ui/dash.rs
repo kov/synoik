@@ -57,7 +57,7 @@ use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
 use crate::ui::widget::{self, AppIcon, AppIconUploads, Painter};
 
 /// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`).
-const ICON_PX: f64 = 64.;
+pub(crate) const ICON_PX: f64 = 64.;
 /// The `.overview-icon` tile side (icon + `%tile` padding, `_common.scss:86`).
 const TILE: f64 = ICON_PX + 2. * AppIcon::PADDING; // 76
 /// Per-item advance: tile + `0 2px` item margin (`$dash_spacing`, `_dash.scss:54`).
@@ -239,6 +239,11 @@ impl Dash {
     /// The desktop id of app `i`, if present.
     pub fn item_id(&self, i: usize) -> Option<&str> {
         self.items.get(i).map(|e| e.id.as_str())
+    }
+
+    /// Every item's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
+    pub fn icon_refs(&self) -> impl Iterator<Item = &crate::app_system::AppIconRef> {
+        self.items.iter().map(|e| &e.icon)
     }
 
     /// Set the hovered element; returns whether it changed (→ redraw + re-bake).
