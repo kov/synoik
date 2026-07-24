@@ -7283,6 +7283,22 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     assert_row_travels_monotonically(&samples, "picker -> app grid (middle active)");
 
     f.settle_animations();
+    let grid = workspace_geo(&mut f);
+
+    // ...and back down the same leg, which is the direction that used to swing
+    // left before settling right.
+    f.niri().layout.toggle_app_grid();
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
+    assert_row_travels_monotonically(&samples, "app grid -> picker (middle active)");
+    f.settle_animations();
+    let picker = workspace_geo(&mut f);
+    assert!(
+        picker[0].size.w > grid[0].size.w,
+        "the picker row must be the larger of the two"
+    );
+
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
     f.niri_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "app grid -> desktop (middle active)");
