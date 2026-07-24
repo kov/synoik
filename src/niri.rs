@@ -3474,10 +3474,11 @@ impl Niri {
             config.clone(),
         );
 
-        let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
-        if !config_.hotkey_overlay.skip_at_startup {
-            hotkey_overlay.show();
-        }
+        // No "Important Hotkeys" card on login: GNOME shows nothing over a fresh
+        // session, and a modal cheat-sheet in front of the desktop is niri's
+        // welcome, not GNOME's. The overlay itself stays available on demand
+        // (`Action::ShowHotkeyOverlay`).
+        let hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());

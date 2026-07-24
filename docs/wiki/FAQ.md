@@ -30,16 +30,6 @@ window-rule {
 
 For more information, check the [`geometry-corner-radius` window rule](./Configuration:-Window-Rules.md#geometry-corner-radius).
 
-### How to hide the "Important Hotkeys" pop-up at the start?
-
-Put this into your config:
-
-```kdl
-hotkey-overlay {
-    skip-at-startup
-}
-```
-
 ### How to fix lag on external monitors connected to a hybrid GPU laptop?
 
 Hybrid GPU laptops (which have both an integrated and a discrete GPU) generally connect the external monitor port to the discrete GPU.

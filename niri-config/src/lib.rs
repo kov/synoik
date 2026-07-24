@@ -839,10 +839,6 @@ mod tests {
                 disable-primary
             }
 
-            hotkey-overlay {
-                skip-at-startup
-            }
-
             animations {
                 slowdown 2.0
 
@@ -1501,7 +1497,6 @@ mod tests {
                 disable_primary: true,
             },
             hotkey_overlay: HotkeyOverlay {
-                skip_at_startup: true,
                 hide_not_bound: false,
             },
             config_notification: ConfigNotification {

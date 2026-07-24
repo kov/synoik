@@ -66,21 +66,18 @@ impl Default for ScreenshotPath {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyOverlay {
-    pub skip_at_startup: bool,
     pub hide_not_bound: bool,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyOverlayPart {
     #[knuffel(child)]
-    pub skip_at_startup: Option<Flag>,
-    #[knuffel(child)]
     pub hide_not_bound: Option<Flag>,
 }
 
 impl MergeWith<HotkeyOverlayPart> for HotkeyOverlay {
     fn merge_with(&mut self, part: &HotkeyOverlayPart) {
-        merge!((self, part), skip_at_startup, hide_not_bound);
+        merge!((self, part), hide_not_bound);
     }
 }
 

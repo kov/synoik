@@ -47,7 +47,6 @@ clipboard {
 }
 
 hotkey-overlay {
-    skip-at-startup
     hide-not-bound
 }
 
@@ -289,15 +288,8 @@ clipboard {
 
 Settings for the "Important Hotkeys" overlay.
 
-#### `skip-at-startup`
-
-Set the `skip-at-startup` flag if you don't want to see the hotkey help at niri startup.
-
-```kdl
-hotkey-overlay {
-    skip-at-startup
-}
-```
+The overlay is never shown at startup — GNOME puts nothing over a fresh session —
+so it appears only when you ask for it, via the `show-hotkey-overlay` action.
 
 #### `hide-not-bound`
 
