@@ -116,6 +116,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::{Animation, Clock};
+use crate::app_system::AppIconRef;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
@@ -188,6 +189,7 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
     OutputScreenshot, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
+use crate::ui::widget::AppIconUploads;
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -218,6 +220,50 @@ const ALL_RENDER_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+/// How long an [app-launch workspace intent](Niri::expect_launch_on_workspace)
+/// stays claimable — mutter's `STARTUP_TIMEOUT_MS`
+/// (`src/core/startup-notification.c:38`), the same 15s a startup sequence lives.
+const PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Size of the icon carried by an app drag, logical px. gnome-shell drags the
+/// icon actor itself, which in the dash is 64px (`dash.js:321`) — the app grid's
+/// 96px icon shrinks to the same 64 through `dragActorMaxSize` there
+/// (`appDisplay.js:1096`), so one size covers both sources.
+const APP_DRAG_ICON_PX: f64 = 64.;
+
+/// An app icon being dragged out of the dash or the app grid toward a workspace.
+///
+/// gnome-shell makes every `AppIcon` a DND source (`AppViewItem`'s draggable) and
+/// lets a `Workspace` take the drop: `source.app.open_new_window(workspaceIndex)`
+/// (`workspace.js:1429-1434`). The drag actor is the icon itself, carried at the
+/// grab point.
+#[derive(Debug)]
+pub struct AppDrag {
+    /// The desktop id being dragged.
+    pub id: String,
+    /// Its icon — the drag actor.
+    pub icon: AppIconRef,
+    /// Output the pointer is on.
+    pub output: Output,
+    /// Pointer position within that output.
+    pub pos: Point<f64, Logical>,
+    /// Where the pointer sat inside the icon when the drag began, so it doesn't
+    /// jump to the center as it is picked up.
+    pub grab_offset: Point<f64, Logical>,
+}
+
+/// An app launched onto a particular workspace, waiting for its window. See
+/// [`Niri::expect_launch_on_workspace`].
+#[derive(Debug)]
+pub struct PendingLaunch {
+    /// The desktop id that was launched.
+    pub app_id: String,
+    /// Where its first window should open.
+    pub workspace: WorkspaceId,
+    /// When this intent stops being claimable.
+    pub expires: Duration,
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -466,7 +512,7 @@ pub struct Niri {
     /// code that pressed it. The overview's controls are St.Buttons, which act on
     /// the release and only if it lands on the same widget, so the press records
     /// the target here and the release consumes it.
-    pub overview_pressed: Option<(u32, OverviewHit)>,
+    pub overview_pressed: Option<(u32, OverviewHit, Point<f64, Logical>)>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -548,6 +594,12 @@ pub struct Niri {
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
     pub preview_close_hovered: Option<Window>,
+    /// Workspaces claimed by apps launched onto them — see [`PendingLaunch`].
+    pub pending_launches: Vec<PendingLaunch>,
+    /// An app icon being dragged onto a workspace — see [`AppDrag`].
+    pub app_drag: Option<AppDrag>,
+    /// GPU uploads for the dragged icon.
+    pub app_drag_uploads: RefCell<AppIconUploads>,
     /// When the app grid last flipped a page on a wheel notch, to debounce a fast
     /// spin (`SCROLL_TIMEOUT_TIME`=150ms, `appDisplay.js:696-701`).
     pub app_grid_last_page_flip: Option<Duration>,
@@ -3745,6 +3797,9 @@ impl Niri {
             app_grid: AppGrid::new(),
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
+            pending_launches: Vec::new(),
+            app_drag: None,
+            app_drag_uploads: RefCell::new(AppIconUploads::default()),
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
@@ -5660,6 +5715,27 @@ impl Niri {
             push(backdrop);
 
             return;
+        }
+
+        // An app icon being dragged onto a workspace rides above everything, like
+        // gnome-shell's DND actor in `Main.uiGroup` (`dnd.js:213-216`).
+        if let Some(drag) = &self.app_drag {
+            if drag.output == *output {
+                let center = drag.pos + drag.grab_offset;
+                if let Some(element) = crate::ui::widget::app_icon_element(
+                    ctx.renderer,
+                    &mut self.app_drag_uploads.borrow_mut(),
+                    &self.app_icon_cache,
+                    &drag.icon,
+                    APP_DRAG_ICON_PX,
+                    output.current_scale().fractional_scale(),
+                    Point::from((0., 0.)),
+                    center,
+                    1.,
+                ) {
+                    push(element.into());
+                }
+            }
         }
 
         // Draw the hotkey overlay on top.
@@ -8459,6 +8535,53 @@ impl Niri {
                 let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
             }
         }
+    }
+
+    /// Remember that the next window of `app_id` (a desktop id) should open on
+    /// `workspace` — what gnome-shell expresses as `app.open_new_window(index)`
+    /// when an app icon is dropped on a workspace (`workspace.js:1429-1434`).
+    ///
+    /// mutter carries that through a startup-notification sequence bound to the
+    /// launch context; we have no launch context, so the intent is parked here and
+    /// claimed by the first window that resolves to the app. It expires on the same
+    /// clock a startup sequence does (`STARTUP_TIMEOUT_MS`,
+    /// `mutter/src/core/startup-notification.c:38`), so a launch that never
+    /// produces a window can't misplace an unrelated one later.
+    pub fn expect_launch_on_workspace(&mut self, app_id: String, workspace: WorkspaceId) {
+        let expires = get_monotonic_time() + PENDING_LAUNCH_TIMEOUT;
+        self.pending_launches.retain(|p| p.app_id != app_id);
+        self.pending_launches.push(PendingLaunch {
+            app_id,
+            workspace,
+            expires,
+        });
+    }
+
+    /// Claim the workspace a mapping window was launched onto, if any: the
+    /// window's `app_id` is resolved to a desktop id the same way the running-app
+    /// tracker resolves it, and a matching (unexpired) intent is consumed.
+    pub fn claim_pending_launch(&mut self, app_id: Option<&str>) -> Option<WorkspaceId> {
+        let now = get_monotonic_time();
+        self.pending_launches.retain(|p| p.expires > now);
+
+        let app_id = app_id?;
+        let desktop_id = self
+            .app_system
+            .app_for_window(app_id)
+            .map(|entry| entry.id)
+            .unwrap_or_else(|| app_id.to_owned());
+
+        let idx = self
+            .pending_launches
+            .iter()
+            .position(|p| p.app_id == desktop_id)?;
+        let pending = self.pending_launches.remove(idx);
+
+        // The workspace may be gone by the time the app got around to mapping.
+        self.layout
+            .workspaces()
+            .any(|(_, _, ws)| ws.id() == pending.workspace)
+            .then_some(pending.workspace)
     }
 
     /// Snapshot every mapped window into the app model's running-app tracker —

@@ -240,6 +240,11 @@ impl Dash {
         self.items.get(i).map(|e| e.id.as_str())
     }
 
+    /// The icon of app `i`, if present (what a drag of that tile carries).
+    pub fn item_icon(&self, i: usize) -> Option<&crate::app_system::AppIconRef> {
+        self.items.get(i).map(|e| &e.icon)
+    }
+
     /// Every item's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
     pub fn icon_refs(&self) -> impl Iterator<Item = &crate::app_system::AppIconRef> {
         self.items.iter().map(|e| &e.icon)

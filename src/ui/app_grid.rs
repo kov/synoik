@@ -238,6 +238,11 @@ impl AppGrid {
         self.entries.get(i).map(|e| e.id.as_str())
     }
 
+    /// The icon of tile `i`, if present (what a drag of that tile carries).
+    pub fn entry_icon(&self, i: usize) -> Option<&AppIconRef> {
+        self.entries.get(i).map(|e| &e.icon)
+    }
+
     /// Every entry's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
     pub fn icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
         self.entries.iter().map(|e| &e.icon)

@@ -26,7 +26,7 @@ use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
 use crate::niri::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
-use crate::utils::{get_monotonic_time, is_mapped, send_scale_transform};
+use crate::utils::{get_monotonic_time, is_mapped, send_scale_transform, with_toplevel_role};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
 
 impl CompositorHandler for State {
@@ -92,6 +92,7 @@ impl CompositorHandler for State {
                     window.on_commit();
 
                     let toplevel = window.toplevel().expect("no X11 support");
+                    let app_id = with_toplevel_role(toplevel, |role| role.app_id.clone());
 
                     let (
                         rules,
@@ -278,6 +279,14 @@ impl CompositorHandler for State {
                         Mapped::new(window, rules, hook, &config)
                     };
                     let window = mapped.window.clone();
+
+                    // A window launched onto a workspace (an app icon dropped on
+                    // it in the overview) opens there, unless a window rule already
+                    // pinned one. gnome-shell's `open_new_window(workspaceIndex)`
+                    // routes through the startup-notification launch context;
+                    // `claim_pending_launch` is our stand-in.
+                    let workspace_id =
+                        workspace_id.or_else(|| self.niri.claim_pending_launch(app_id.as_deref()));
 
                     let target = if let Some(p) = &parent {
                         // Open dialogs next to their parent window.

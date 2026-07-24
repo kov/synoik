@@ -5774,6 +5774,149 @@ fn overview_dash_release_off_the_icon_does_not_launch() {
     );
 }
 
+/// Dragging a dash icon onto a workspace launches the app *there*: gnome-shell's
+/// `Workspace.acceptDrop` calls `source.app.open_new_window(workspaceIndex)`
+/// (`workspace.js:1429-1434`). The drag starts once the pointer leaves the
+/// `drag-threshold` box (`st-dnd-start-gesture.c:73-90`), which also cancels the
+/// click the press would otherwise have completed.
+#[test]
+fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
+    use crate::app_system::ResolvedLaunch;
+
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+    f.settle_animations();
+    let center = dash_tile_center(&mut f, 0);
+
+    // Pick the icon up and drag it onto the workspace above the dash.
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, center.x, center.y - 40.);
+    assert!(
+        f.niri().app_drag.is_some(),
+        "leaving the press box must start the drag"
+    );
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "dragging must not launch on the way"
+    );
+
+    let ws = f.niri().layout.active_workspace().unwrap().id();
+    pointer_motion_to(&mut f, 960., 400.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(f.niri().app_drag.is_none(), "the drop ends the drag");
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "the drop launches the app");
+    assert_eq!(calls[0].0.id, "a.desktop");
+    assert_eq!(
+        calls[0].1,
+        ResolvedLaunch::Default,
+        "a drop asks for a new window; our fake app has no new-window action, \
+         so it resolves to a plain launch"
+    );
+    drop(calls);
+
+    // And the app's first window opens on the workspace it was dropped on.
+    assert_eq!(
+        f.niri().claim_pending_launch(Some("a")),
+        Some(ws),
+        "the launch must claim the workspace it was dropped on"
+    );
+}
+
+/// The other half of the drop: the app's first window really does open on the
+/// workspace it was dropped on. gnome-shell hands the workspace index to
+/// `open_new_window`, which carries it through the startup-notification launch
+/// context; we park the intent and the mapping window claims it.
+#[test]
+fn overview_launch_on_workspace_places_the_first_window() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    // A second workspace, and the target is *not* the active one.
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first_win = f.niri().layout.focus().unwrap().window.clone();
+    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    f.niri_complete_animations();
+    let target = f.niri().layout.active_workspace().unwrap().id();
+    f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+    f.niri_complete_animations();
+    assert_ne!(
+        f.niri().layout.active_workspace().unwrap().id(),
+        target,
+        "the target workspace must not be the active one"
+    );
+
+    f.niri()
+        .expect_launch_on_workspace("a.desktop".to_owned(), target);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("a");
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    let win = f
+        .niri()
+        .layout
+        .windows()
+        .map(|(_, m)| m.window.clone())
+        .find(|w| *w != first_win)
+        .expect("the second window must be mapped");
+    let landed = f
+        .niri()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .map(|(_, _, ws)| ws.id())
+        .expect("the window must be on a workspace");
+    assert_eq!(
+        landed, target,
+        "the launched window must open on the workspace it was dropped on"
+    );
+
+    // The intent is one-shot: a second window of the same app opens wherever it
+    // would have anyway.
+    assert_eq!(f.niri().claim_pending_launch(Some("a")), None);
+}
+
+/// A drag that ends over the overview's own chrome drops nothing: gnome-shell's
+/// dash and app display are drop targets in their own right (favorites
+/// reordering), not workspaces.
+#[test]
+fn overview_dropping_an_icon_on_the_dash_launches_nothing() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+    f.settle_animations();
+    let from = dash_tile_center(&mut f, 0);
+    let onto = dash_tile_center(&mut f, 1);
+
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, onto.x, onto.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a drop on the dash itself launches nothing"
+    );
+    assert!(f.niri().layout.is_overview_open());
+}
+
 /// A middle-click on a favorite also launches it (still `Activate`: `open_new_window`
 /// is reserved for a *running* app, which S3 never tracks) and closes the overview.
 #[test]

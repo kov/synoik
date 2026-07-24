@@ -5446,6 +5446,24 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
+    /// The workspace a drop at `pos` on `output` would land on, if it is an
+    /// existing one: the workspace under the pointer in the picker, or the
+    /// thumbnail under it in the strip (gnome-shell's `Workspace.acceptDrop` /
+    /// `WorkspaceThumbnail.acceptDrop`). A drop into a gap between thumbnails —
+    /// which for a *window* drag inserts a new workspace — has no workspace to
+    /// name, so it answers `None`.
+    pub fn drop_workspace_at(
+        &self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Option<WorkspaceId> {
+        let mon = self.monitor_for_output(output)?;
+        match mon.insert_position(pos).0 {
+            InsertWorkspace::Existing(id) => Some(id),
+            InsertWorkspace::NewAt(_) => None,
+        }
+    }
+
     /// Point the overview's window picker at the preview under the pointer, or at
     /// nothing. Hovering a preview grows it and raises it above its neighbours
     /// (gnome-shell's `showOverlay`, `windowPreview.js:310`). Returns whether

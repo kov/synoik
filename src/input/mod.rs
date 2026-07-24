@@ -53,7 +53,7 @@ use crate::gnome::{
 };
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement};
-use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::PageArrow;
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
@@ -81,6 +81,14 @@ pub mod touch_resize_grab;
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+
+/// How far the pointer must leave a press before it becomes a drag —
+/// `org.gnome.desktop.peripherals.mouse drag-threshold` (default 8), compared
+/// per axis (`st-dnd-start-gesture.c:73-90`).
+///
+/// DIVERGENCE: read from the setting in GNOME (`St.Settings`); we hardcode the
+/// default until the mouse schema joins the inspectable gsettings model.
+const DRAG_THRESHOLD: f64 = 8.;
 
 /// How soon a second overlay-key tap escalates into the app grid rather than
 /// closing the overview, when animations are off and there is no open
@@ -3345,6 +3353,7 @@ impl State {
         }
 
         self.update_panel_hover(new_pos);
+        self.update_app_drag(new_pos);
 
         let under = self.niri.contents_under(new_pos);
 
@@ -3491,6 +3500,7 @@ impl State {
         }
 
         self.update_panel_hover(pos);
+        self.update_app_drag(pos);
 
         let under = self.niri.contents_under(pos);
 
@@ -3544,6 +3554,97 @@ impl State {
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
+        self.niri.queue_redraw_all();
+    }
+
+    /// Drive an app-icon drag: start one when a press on a dash or app-grid icon
+    /// has been dragged past the threshold, and follow the pointer once it has.
+    ///
+    /// gnome-shell makes every app icon a DND source; `St.DndStartGesture` begins
+    /// the drag once the pointer leaves a `drag-threshold` box around the press
+    /// (`st-dnd-start-gesture.c:73-90`), which cancels the click — that is why the
+    /// icon's own activation is on the release.
+    fn update_app_drag(&mut self, pos: Point<f64, Logical>) {
+        let Some((output, pos_within_output)) = self
+            .niri
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p))
+        else {
+            return;
+        };
+
+        if let Some(drag) = &mut self.niri.app_drag {
+            drag.output = output;
+            drag.pos = pos_within_output;
+            self.niri.queue_redraw_all();
+            return;
+        }
+
+        let Some((_, hit, origin)) = &self.niri.overview_pressed else {
+            return;
+        };
+        if (pos_within_output.x - origin.x).abs() <= DRAG_THRESHOLD
+            && (pos_within_output.y - origin.y).abs() <= DRAG_THRESHOLD
+        {
+            return;
+        }
+
+        // Only the app icons are drag sources; the show-apps button, the page
+        // controls and the search card are not.
+        let (id, icon) = match hit {
+            OverviewHit::Dash(DashHit::App(i)) => (
+                self.niri.dash.item_id(*i).map(str::to_owned),
+                self.niri.dash.item_icon(*i).cloned(),
+            ),
+            OverviewHit::GridApp(i) => (
+                self.niri.app_grid.entry_id(*i).map(str::to_owned),
+                self.niri.app_grid.entry_icon(*i).cloned(),
+            ),
+            _ => return,
+        };
+        let (Some(id), Some(icon)) = (id, icon) else {
+            return;
+        };
+
+        // The icon is carried at the point it was grabbed by, like the drag actor
+        // gnome-shell hands to `_dragActor.set_position` (`dnd.js:257-259`).
+        let grab_offset = *origin - pos_within_output;
+        self.niri.overview_pressed = None;
+        self.niri.app_drag = Some(AppDrag {
+            id,
+            icon,
+            output,
+            pos: pos_within_output,
+            grab_offset,
+        });
+        self.niri.queue_redraw_all();
+    }
+
+    /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
+    /// thumbnail — opens the app there (`Workspace.acceptDrop`,
+    /// `workspace.js:1429-1434`); anywhere else it is simply dropped.
+    fn end_app_drag(&mut self) {
+        let Some(drag) = self.niri.app_drag.take() else {
+            return;
+        };
+
+        // The overview's own chrome is not a workspace: gnome-shell's dash and app
+        // display take their own drops (favorites reordering, folders), so a drop
+        // that never left them just goes back where it came from.
+        let over_chrome = self.overview_hit(&drag.output, drag.pos).is_some();
+        let target = (!over_chrome)
+            .then(|| self.niri.layout.drop_workspace_at(&drag.output, drag.pos))
+            .flatten();
+
+        if let Some(workspace) = target {
+            // `open_new_window`, not `activate`: a drop always asks for a window
+            // *here*, even for an app that is already running elsewhere.
+            match self.niri.app_system.launch(&drag.id, LaunchMode::NewWindow) {
+                Ok(()) => self.niri.expect_launch_on_workspace(drag.id, workspace),
+                Err(err) => tracing::warn!("drag launch of {} failed: {err:?}", drag.id),
+            }
+        }
+
         self.niri.queue_redraw_all();
     }
 
@@ -3708,13 +3809,21 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
+        // A drag beats a click: once an icon has left the press box, the release
+        // drops it rather than activating anything.
+        if button_state == ButtonState::Released && self.niri.app_drag.is_some() {
+            self.niri.suppressed_buttons.remove(&button_code);
+            self.end_app_drag();
+            return;
+        }
+
         // The release half of a click on the overview's chrome. St.Button's click
         // gesture completes on the *release*, and only if the pointer is still on
         // the widget it was pressed on (`clutter-click-gesture.c:68-81`) — lift off
         // it (or drag away) and nothing is activated. Runs before the suppression
         // check below, which is what keeps the release from reaching clients.
         if button_state == ButtonState::Released {
-            if let Some((code, hit)) = self.niri.overview_pressed.take() {
+            if let Some((code, hit, origin)) = self.niri.overview_pressed.take() {
                 if code == button_code {
                     self.niri.suppressed_buttons.remove(&button_code);
 
@@ -3733,7 +3842,7 @@ impl State {
                     return;
                 }
 
-                self.niri.overview_pressed = Some((code, hit));
+                self.niri.overview_pressed = Some((code, hit, origin));
             }
         }
 
@@ -3867,7 +3976,8 @@ impl State {
                     .and_then(|(output, pos)| self.overview_hit(output, *pos))
                 {
                     self.niri.suppressed_buttons.insert(button_code);
-                    self.niri.overview_pressed = Some((button_code, hit));
+                    let origin = under.as_ref().map(|(_, pos)| *pos).unwrap_or_default();
+                    self.niri.overview_pressed = Some((button_code, hit, origin));
                     self.niri.queue_redraw_all();
                     return;
                 }
