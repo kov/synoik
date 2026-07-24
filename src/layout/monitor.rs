@@ -1606,29 +1606,48 @@ impl<W: LayoutElement> Monitor<W> {
         if !self.workspaces_horizontal() {
             return 0.;
         }
-        self.app_grid_state_fraction()
+        self.fit_mode_fraction_raw()
     }
 
-    /// The show-apps fraction as the *state axis* sees it: the raw fraction gated
-    /// on how far the overview itself is open.
+    /// Where we sit on gnome-shell's state axis: 0 `HIDDEN`, 1 `WINDOW_PICKER`,
+    /// 2 `APP_GRID` (`_stateAdjustment`, `overviewControls.js:278-308`).
     ///
-    /// gnome-shell has a single adjustment over `HIDDEN..APP_GRID`, so hiding from
-    /// the app grid travels 2 → 0 *through* `WINDOW_PICKER` and every blend keyed
-    /// off the state — the fit mode, the workspaces box, the app-display box —
-    /// unwinds with it (`getStateTransitionParams` + `_update`,
-    /// `overviewControls.js:278-308,593-606`). We carry two scalars instead, and
-    /// deliberately freeze the show-apps one across a close so the zoom-out starts
-    /// from the app-grid box; gating it on the open progress gives back the
-    /// guarantee that matters — the grid end of every blend reaches zero exactly
-    /// when the overview is hidden, instead of the row landing offset by the
-    /// fit-all spacing and snapping into place afterwards.
-    fn app_grid_state_fraction(&self) -> f64 {
+    /// gnome-shell carries exactly one adjustment over that range and derives the
+    /// fit mode, the workspaces box and the app-display box from it, so hiding
+    /// from the app grid travels 2 → 0 *through* `WINDOW_PICKER` and every blend
+    /// unwinds in order. We carry two scalars — how far the overview is open and
+    /// how far the app grid is in — and reconstruct the axis here: the show-apps
+    /// fraction is a *second unit* on top of the first, so it is scaled by the
+    /// open progress. A close from the grid freezes the show-apps scalar and runs
+    /// the open one down, which lands here as the 2 → 0 sweep.
+    ///
+    /// Every state-dependent blend must go through this rather than through the
+    /// raw open progress, or the two scalars can describe a state the reference
+    /// never passes through — e.g. an app-grid row at a near-desktop zoom.
+    fn overview_state(&self) -> f64 {
         let progress = self
             .overview_progress
             .as_ref()
             .map_or(0., |p| p.clamped_value())
             .clamp(0., 1.);
-        self.app_grid_fraction() * progress
+        progress * (1. + self.app_grid_fraction())
+    }
+
+    /// How far the overview is open, as the *zoom* blend wants it: the `HIDDEN` →
+    /// `WINDOW_PICKER` leg alone, saturating at 1 for the whole app-grid leg. That
+    /// saturation is what parks the workspace zoom at its fully-open value while
+    /// the row re-fits, so a close from the grid re-fits first and zooms after.
+    ///
+    /// With no app grid in play this is the raw progress, overshoot included: the
+    /// open is a spring, and clamping it here would quietly flatten the bounce.
+    /// [`Self::overview_state`] must stay clamped instead — an overshoot past 1
+    /// there would read as "starting to show the apps".
+    fn open_fraction(&self) -> f64 {
+        if self.app_grid_fraction() > 0. {
+            self.overview_state().min(1.)
+        } else {
+            self.overview_progress.as_ref().map_or(0., |p| p.value())
+        }
     }
 
     /// Where the row currently sits on the workspace axis — gnome-shell's
@@ -1708,19 +1727,26 @@ impl<W: LayoutElement> Monitor<W> {
         // centered on, so the lerp between them is a lerp of like for like.
         let slot = (view_w - self.workspace_size(zoom).w) / 2.;
 
-        let zoom_single = self.zoom_for_state(overview_layout::state::WINDOW_PICKER);
-        let ws_w_single = self.workspace_size(zoom_single).w;
-        let (x_single, extent_single) = fit_single_row(
-            view_w,
-            ws_w_single,
-            self.workspace_gap(zoom_single, FitMode::Single),
-            render_idx,
-        );
+        let single_row = |zoom: f64| {
+            fit_single_row(
+                view_w,
+                self.workspace_size(zoom).w,
+                self.workspace_gap(zoom, FitMode::Single),
+                render_idx,
+            )
+        };
 
         let fit = self.fit_mode_fraction();
         if fit <= 0. {
+            // Both ends of this leg are fit-single, so there is nothing to freeze:
+            // the row is laid out in the live allocation, which is the fallback
+            // `_getInitialBoxes` takes when the fit modes agree.
+            let (x_single, extent_single) = single_row(zoom);
             return (x_single - slot, extent_single);
         }
+
+        let (x_single, extent_single) =
+            single_row(self.zoom_for_state(overview_layout::state::WINDOW_PICKER));
 
         let zoom_all = self.zoom_for_state(overview_layout::state::APP_GRID);
         let ws_w_all = self.workspace_size(zoom_all).w;
@@ -1743,10 +1769,20 @@ impl<W: LayoutElement> Monitor<W> {
     /// search entry, thumbnails, dash and window picker go; everything else
     /// consumes these boxes.
     pub fn controls_layout(&self) -> ControlsLayout {
-        // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps state eases in.
+        // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps leg eases in. Below
+        // the picker the chrome keeps its picker layout and the *zoom* blends it
+        // toward the desktop, which is how gnome-shell's HIDDEN box relates to the
+        // WINDOW_PICKER one (`overviewControls.js:207-216`).
         self.controls_layout_at(
-            overview_layout::state::WINDOW_PICKER + self.app_grid_state_fraction(),
+            overview_layout::state::WINDOW_PICKER + self.fit_mode_fraction_raw(),
         )
+    }
+
+    /// [`Self::fit_mode_fraction`] without the vertical-strip special case: how far
+    /// along the `WINDOW_PICKER` → `APP_GRID` leg we are, which is what the *chrome*
+    /// follows in either windowing mode.
+    fn fit_mode_fraction_raw(&self) -> f64 {
+        (self.overview_state() - overview_layout::state::WINDOW_PICKER).clamp(0., 1.)
     }
 
     /// The same chrome layout at an arbitrary point on gnome-shell's state axis
@@ -1764,15 +1800,19 @@ impl<W: LayoutElement> Monitor<W> {
         )
     }
 
-    /// The workspace zoom one state on that axis implies, at the current overview
-    /// *open* progress: the state fixes the box, the progress blends it toward the
-    /// full-screen desktop the same way [`Self::overview_zoom`] does.
+    /// The workspace zoom one state on that axis implies, *fully open*: the box
+    /// that state allocates, fitted by height, with no blend toward the desktop.
+    ///
+    /// This is `getWorkspacesBoxForState` (`overviewControls.js:256-258`), which
+    /// reads a per-state cache — a rectangle that does not move while a transition
+    /// runs. Only the two ends of the `WINDOW_PICKER` → `APP_GRID` leg are ever
+    /// asked for, and that whole leg sits at [`Self::open_fraction`] 1, so leaving
+    /// the open blend out is not an approximation: it is the same number.
     fn zoom_for_state(&self, state: f64) -> f64 {
         if self.options.layout.windowing_mode != WindowingMode::Floating {
             return self.overview_zoom();
         }
-        let zoom = self.controls_layout_at(state).workspaces.size.h / self.view_size.h;
-        compute_overview_zoom(zoom, self.overview_progress.as_ref().map(|p| p.value()))
+        self.controls_layout_at(state).workspaces.size.h / self.view_size.h
     }
 
     /// Whether the strip *wants* to be shown: gnome-shell's
@@ -1903,6 +1943,12 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn overview_zoom(&self) -> f64 {
+        if self.options.layout.windowing_mode == WindowingMode::Floating {
+            // The open leg of the state axis, so that closing from the app grid
+            // re-fits the row first and zooms up after, rather than doing both at
+            // once through states the reference never visits.
+            return self.zoom_at(Some(self.open_fraction()));
+        }
         let progress = self.overview_progress.as_ref().map(|p| p.value());
         self.zoom_at(progress)
     }
@@ -1921,8 +1967,9 @@ impl<W: LayoutElement> Monitor<W> {
         let x = (self.view_size.w - ws_size.w) / 2.;
 
         let y = if self.options.layout.windowing_mode == WindowingMode::Floating {
-            let progress = self.overview_progress.as_ref().map_or(0., |p| p.value());
-            self.controls_layout().workspaces.loc.y * progress
+            // The same open leg the zoom rides, so the row's box and its size stay
+            // consistent all the way down a close from the app grid.
+            self.controls_layout().workspaces.loc.y * self.open_fraction()
         } else {
             (self.view_size.h - ws_size.h) / 2.
         };

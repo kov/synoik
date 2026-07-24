@@ -7246,3 +7246,102 @@ fn ipc_scale_beats_store_and_automatic_returns_to_it() {
         "automatic falls back to the store, not the guess"
     );
 }
+
+/// The same two transitions with the active workspace in the *middle* of a longer
+/// row — the shape that exposed the second half of this bug.
+///
+/// With two workspaces the active one is an end of the run, so the fit-all row and
+/// the fit-single row want it in nearly the same place and a bad blend barely
+/// moves it. Put it in the middle and the two rows disagree about every
+/// workspace's position, so any endpoint that is itself a function of the running
+/// progress bends the path: the row used to swing right and come back.
+#[test]
+fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_middle() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Two populated workspaces plus the trailing empty one, focused on the
+    // middle: `[win] [win, active] [empty]`.
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    f.settle_animations();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+    f.settle_animations();
+
+    let desktop = workspace_geo(&mut f);
+    assert!(
+        desktop.len() >= 3,
+        "need a row long enough to have a middle"
+    );
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    f.niri().layout.toggle_app_grid();
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
+    assert_row_travels_monotonically(&samples, "picker -> app grid (middle active)");
+
+    f.settle_animations();
+    f.niri_state().do_action(Action::CloseOverview, false);
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
+    assert_row_travels_monotonically(&samples, "app grid -> desktop (middle active)");
+    assert_geo_eq(
+        samples.last().unwrap(),
+        &desktop,
+        "the close must land back on the desktop layout it started from",
+    );
+}
+
+/// The app-grid leg happens at a fully-open overview, so the workspace zoom must
+/// be parked there for its whole length: closing from the grid re-fits the row
+/// first and zooms up after, rather than doing both at once.
+///
+/// That ordering is not cosmetic. A fit-all row at a near-desktop zoom is
+/// degenerate — the workspaces overflow the view, so the run pins to the left gap
+/// instead of centering — and blending toward it is what threw the row sideways.
+/// gnome-shell cannot reach that state: its single 0..2 adjustment passes through
+/// `WINDOW_PICKER`, which unwinds the fit *before* the zoom starts
+/// (`getStateTransitionParams`, `overviewControls.js:278-308`).
+#[test]
+fn overview_close_from_the_app_grid_refits_before_it_zooms() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    let grid = workspace_geo(&mut f);
+
+    f.niri_state().do_action(Action::CloseOverview, false);
+    let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
+
+    // The active workspace never overlaps its neighbour: the row's pitch stays at
+    // least its width, which is exactly what a degenerate fit-all blend breaks.
+    for (i, row) in samples.iter().enumerate() {
+        for pair in row.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            assert!(
+                right.loc.x + 1. >= left.loc.x + left.size.w,
+                "sample {i}: workspaces overlap ({left:?} then {right:?})",
+            );
+        }
+    }
+
+    // And the fit is fully unwound before the zoom finishes: by the time the
+    // active workspace is back to full width, the row is the desktop row.
+    let full = samples
+        .iter()
+        .position(|row| row[0].size.w >= 1919.)
+        .expect("the close must reach full width");
+    let pitch = samples[full][1].loc.x - samples[full][0].loc.x;
+    assert!(
+        pitch >= 1919.,
+        "at full width the row must already be unfitted, got pitch {pitch} \
+         (grid pitch was {})",
+        grid[1].loc.x - grid[0].loc.x,
+    );
+}
