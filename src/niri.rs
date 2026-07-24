@@ -5843,7 +5843,7 @@ impl Niri {
 
             {
                 let mut group = Vec::new();
-                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem));
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem.into()));
                 Self::push_group_at_alpha(
                     ctx.renderer,
                     &self.picker_offscreen,
@@ -5878,6 +5878,10 @@ impl Niri {
                 }
                 push(ws.render_background().into());
             }
+
+            // No cross-fade group on this path: it renders a single fullscreen
+            // workspace above the top layer, not the overview row.
+            mon.render_workspace_shadows(&mut |elem| push(elem.into()));
         } else {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
@@ -5897,7 +5901,9 @@ impl Niri {
             {
                 let thumbnails_alpha = picker_alpha * (1. - mon.app_grid_fraction() as f32);
                 let mut group = Vec::new();
-                mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| group.push(elem));
+                mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| {
+                    group.push(elem.into())
+                });
                 Self::push_group_at_alpha(
                     ctx.renderer,
                     &self.thumbnails_offscreen,
@@ -5908,7 +5914,23 @@ impl Niri {
                 );
             }
 
-            // Macro instead of closure to avoid borrowing push(). The zoom is per
+            // gnome-shell fades the whole `workspacesDisplay` out under a search
+            // (`_onSearchChanged`, `overviewControls.js:628-637`), and a Workspace
+            // actor owns its `WorkspaceBackground` — the rounded wallpaper and its
+            // shadow — as well as the window clones. So everything that makes up the
+            // row goes into ONE cross-faded group: the workspace-scoped layer-shell
+            // surfaces, the window picker, the wallpaper backing each workspace, and
+            // the workspace shadows. Fading only the picker (as we did) left the
+            // wallpaper rectangles sitting fully opaque under the results, where GNOME
+            // shows the bare `#overviewGroup` backdrop.
+            //
+            // One group rather than a per-element alpha, for the same reason the
+            // picker alone needed it: these overlap (a layer surface over the
+            // wallpaper, a preview over both), and fading them independently
+            // composites the overlap twice.
+            let mut group: Vec<OutputRenderElements> = Vec::new();
+
+            // Macro instead of closure to avoid borrowing the sink. The zoom is per
             // workspace: the one the row sits on draws a touch larger than its
             // neighbors (`Monitor::workspace_render_scale`).
             macro_rules! process {
@@ -5916,7 +5938,7 @@ impl Niri {
                     &mut |elem| {
                         if let Some(elem) = scale_relocate_crop(elem, output_scale, $ws_zoom, $geo)
                         {
-                            push(elem.into());
+                            group.push(elem.into());
                         }
                     }
                 }};
@@ -5930,18 +5952,7 @@ impl Niri {
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
             }
 
-            {
-                let mut group = Vec::new();
-                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem));
-                Self::push_group_at_alpha(
-                    ctx.renderer,
-                    &self.picker_offscreen,
-                    fade_scale,
-                    picker_alpha,
-                    group,
-                    push,
-                );
-            }
+            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem.into()));
 
             for ((idx, ws), geo) in mon.workspaces_with_render_geo_idx() {
                 let ws_zoom = zoom * mon.workspace_render_scale(idx);
@@ -5977,9 +5988,19 @@ impl Niri {
                     process!(ws_zoom, geo)(ws.render_background());
                 }
             }
-        }
 
-        mon.render_workspace_shadows(&mut |elem| push(elem.into()));
+            // Bottom of the group: the shadow each workspace casts on the backdrop.
+            mon.render_workspace_shadows(&mut |elem| group.push(elem.into()));
+
+            Self::push_group_at_alpha(
+                ctx.renderer,
+                &self.picker_offscreen,
+                fade_scale,
+                picker_alpha,
+                group,
+                push,
+            );
+        }
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
@@ -8459,7 +8480,7 @@ impl Niri {
         buffer: &OffscreenBuffer,
         scale: f64,
         alpha: f32,
-        elements: Vec<MonitorRenderElement>,
+        elements: Vec<OutputRenderElements>,
         push: &mut dyn FnMut(OutputRenderElements),
     ) {
         if alpha <= 0.001 {
@@ -8467,7 +8488,7 @@ impl Niri {
         }
         if alpha >= 0.999 {
             for elem in elements {
-                push(elem.into());
+                push(elem);
             }
             return;
         }
@@ -8479,7 +8500,7 @@ impl Niri {
             Err(err) => {
                 warn!("error compositing the overview search cross-fade: {err:?}");
                 for elem in elements {
-                    push(elem.into());
+                    push(elem);
                 }
             }
         }

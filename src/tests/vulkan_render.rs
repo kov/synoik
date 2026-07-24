@@ -6414,6 +6414,25 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
         "the covered picker must leave plain background, got {b:?}"
     );
 
+    // …and "plain background" means the `#overviewGroup` backdrop, not the
+    // workspace. gnome-shell fades the whole `workspacesDisplay` — a Workspace
+    // owns its `WorkspaceBackground`, so the rounded wallpaper goes with the
+    // window clones (`overviewControls.js:628-637`). Fading only the picker
+    // leaves the workspace rectangle sitting opaque under the results. Measured
+    // against a corner that is backdrop in any case, so a retuned backdrop colour
+    // keeps this honest.
+    let corner = px(&pixels, w, 8, 8 + crate::ui::panel::PANEL_HEIGHT as i32);
+    for c in 0..4 {
+        assert!(
+            b[c].abs_diff(corner[c]) <= 1,
+            "channel {c}: the searched-over preview reads {} but the bare backdrop \
+             reads {} — the workspace is still drawn under the results \
+             (preview={b:?} backdrop={corner:?})",
+            b[c],
+            corner[c],
+        );
+    }
+
     eprintln!("vulkan_search_fade: S={s:?} M={m:?} B={b:?} fade={fade}");
 
     // Both ends are measured, so this stays honest if the theme changes.
