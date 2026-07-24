@@ -131,6 +131,7 @@ use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 #[cfg(feature = "dbus")]
 use crate::dbus::system_status::SystemStatusToNiri;
 use crate::frame_clock::FrameClock;
+use crate::frame_log::{FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
@@ -631,6 +632,10 @@ pub struct Niri {
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
 
+    /// Frame-timing instrumentation, off unless `NIRI_FRAME_LOG` says otherwise.
+    /// See [`crate::frame_log`].
+    pub frame_log: FrameLog,
+
     #[cfg(feature = "dbus")]
     pub dbus: Option<crate::dbus::DBusServers>,
     #[cfg(feature = "dbus")]
@@ -738,6 +743,11 @@ pub struct OutputState {
     pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// How many render elements the last frame carried, and whether it had to
+    /// redraw the whole output. Recorded by the render path for
+    /// [`crate::frame_log`], which reports them alongside a slow frame.
+    pub last_frame_elements: usize,
+    pub last_frame_full_damage: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3818,6 +3828,8 @@ impl Niri {
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
 
+            frame_log: FrameLog::from_env(),
+
             #[cfg(feature = "dbus")]
             dbus: None,
             #[cfg(feature = "dbus")]
@@ -4099,6 +4111,8 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            last_frame_elements: 0,
+            last_frame_full_damage: false,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -6285,10 +6299,13 @@ impl Niri {
         ));
 
         let target_presentation_time = state.frame_clock.next_presentation_time();
+        let refresh_interval = state.frame_clock.refresh_interval();
 
         // Freeze the clock at the target time.
         self.clock.set_unadjusted(target_presentation_time);
 
+        self.frame_log.begin(&output.name());
+        self.frame_log.phase(Phase::Elements);
         self.update_render_elements(Some(output));
 
         let mut res = RenderResult::Skipped;
@@ -6324,7 +6341,8 @@ impl Niri {
                     .any(|mapped| mapped.are_animations_ongoing());
             }
 
-            // Render.
+            // Render. The backend marks its own sub-phases (collect / submit /
+            // queue) as it goes.
             res = backend.render(self, output, target_presentation_time);
         }
 
@@ -6394,14 +6412,30 @@ impl Niri {
         //
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
+        self.frame_log.phase(Phase::Callbacks);
         self.send_frame_callbacks(output);
 
+        self.frame_log.phase(Phase::Captures);
         let rendered = backend.with_vulkan_renderer(|renderer| {
             self.render_captures_with(renderer, output, target_presentation_time);
         });
         if rendered.is_none() {
             warn!("no renderer to render screencast and screencopy with");
         }
+
+        if self.frame_log.is_enabled() {
+            let state = &self.output_state[output];
+            self.frame_log.set_context(FrameContext {
+                elements: state.last_frame_elements,
+                full_damage: state.last_frame_full_damage,
+                animating: state.unfinished_animations_remain,
+                overview_state: self
+                    .layout
+                    .monitor_for_output(output)
+                    .and_then(|mon| mon.overview_state_value()),
+            });
+        }
+        self.frame_log.end(refresh_interval);
     }
 
     /// Render this output for everything that captures it as a side effect of the redraw: PipeWire

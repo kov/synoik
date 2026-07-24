@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod dbus;
 pub mod end_session;
 pub mod frame_clock;
+pub mod frame_log;
 pub mod gnome;
 pub mod handlers;
 pub mod idle_monitor;

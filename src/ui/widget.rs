@@ -720,6 +720,11 @@ pub fn bake_uncached_sized(
     phys: Size<i32, Physical>,
     paint: impl FnOnce(&mut VulkanFrame) -> anyhow::Result<()>,
 ) -> anyhow::Result<VkTexture> {
+    // Every offscreen bake funnels through here, and each one is a render pass,
+    // a submit and a fence wait. Counting them here (rather than at each caller)
+    // is what lets a slow frame say how much of itself was re-rasterization.
+    crate::frame_log::count_bake();
+
     let (w, h) = (phys.w.max(1), phys.h.max(1));
     let mut target =
         renderer.create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((w, h)))?;

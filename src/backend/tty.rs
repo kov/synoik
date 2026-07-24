@@ -59,6 +59,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
+use crate::frame_log::Phase;
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::vulkan::VulkanRenderer;
@@ -1728,7 +1729,17 @@ impl Tty {
 
         output_state.frame_clock.presented(presentation_time);
 
-        if redraw_needed || output_state.unfinished_animations_remain {
+        // Ends the `output_state` borrow so the frame log (which lives on `niri`)
+        // can be reached below.
+        let unfinished_animations_remain = output_state.unfinished_animations_remain;
+
+        // A gap in the vblank sequence is frames the display never got — the
+        // thing a user actually perceives as a stutter, and independent of
+        // whether any individual frame looked slow to build.
+        niri.frame_log
+            .presented(&output.name(), meta.sequence, refresh_interval);
+
+        if redraw_needed || unfinished_animations_remain {
             let vblank_frame = tracy_client::Client::running()
                 .unwrap()
                 .non_continuous_frame(surface.vblank_frame_name);
@@ -2835,6 +2846,7 @@ fn render_surface_with(
         target: RenderTarget::Output,
         xray: None,
     };
+    niri.frame_log.phase(Phase::Collect);
     let mut elements = niri.render_to_vec(ctx, output, true);
 
     // Visualize the damage, if enabled.
@@ -2860,6 +2872,13 @@ fn render_surface_with(
     if force_full_damage {
         drm_compositor.reset_buffer_ages();
     }
+
+    if let Some(state) = niri.output_state.get_mut(output) {
+        state.last_frame_elements = elements.len();
+        state.last_frame_full_damage = force_full_damage;
+    }
+
+    niri.frame_log.phase(Phase::Submit);
     match drm_compositor.render_frame::<_, _>(renderer, &elements, [0.; 4], flags) {
         Ok(res) => {
             let needs_sync = res.needs_sync()
@@ -2885,6 +2904,7 @@ fn render_surface_with(
                 let presentation_feedbacks = niri.take_presentation_feedbacks(output, &res.states);
                 let data = (presentation_feedbacks, target_presentation_time);
 
+                niri.frame_log.phase(Phase::Queue);
                 match drm_compositor.queue_frame(data) {
                     Ok(()) => {
                         let output_state = niri.output_state.get_mut(output).unwrap();

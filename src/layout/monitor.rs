@@ -1633,6 +1633,13 @@ impl<W: LayoutElement> Monitor<W> {
         progress * (1. + self.app_grid_fraction())
     }
 
+    /// [`Self::overview_state`] for instrumentation: `None` when the overview is
+    /// closed, so a log line can say "overview 1.42" or nothing at all.
+    pub fn overview_state_value(&self) -> Option<f64> {
+        let state = self.overview_state();
+        (state > 0.).then_some(state)
+    }
+
     /// How far the overview is open, as the *zoom* blend wants it: the `HIDDEN` →
     /// `WINDOW_PICKER` leg alone, saturating at 1 for the whole app-grid leg. That
     /// saturation is what parks the workspace zoom at its fully-open value while
