@@ -483,6 +483,13 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     app-grid zoom would otherwise reach). **Divergence:** past ~7 workspaces the width binds and
     gnome-shell narrows each box out of aspect; we keep one zoom per monitor, so the packed row
     overflows the edges instead.
+  - **Search fades the whole workspace row (`88290a78`).** The other half of the flat-dark search view:
+    S5b's cross-fade covered only the *picker*, so under a search the previews dimmed but the wallpaper
+    rectangle, its shadow and any workspace-scoped layer-shell surfaces stayed opaque — a lit desktop
+    with a card over it. gnome-shell fades the whole `workspacesDisplay` (`_onSearchChanged`,
+    `overviewControls.js:628-637`) and a Workspace owns its `WorkspaceBackground`, so the row is now one
+    group: layer surfaces + picker + wallpaper + shadows. Still a group, not a per-element alpha —
+    they overlap, and independent fades composite the overlap twice.
   - **Inactive-workspace shrink (`74536094`).** `WORKSPACE_INACTIVE_SCALE` 0.94 about a centered pivot
     (`_updateWorkspacesState`, `:243-266`; `workspace.js:1039`) — the "one we are in is a little
     bigger" read. The zoom became per workspace; the slot keeps the full size so the row's advance and
