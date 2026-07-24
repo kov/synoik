@@ -92,8 +92,24 @@ const H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
 const MESSAGES_INDICATOR_ICON: f64 = 16.;
 const MESSAGES_INDICATOR_SPACING: f64 = 2.;
 
-/// Bar background (opaque black — GNOME's dark panel), straight RGBA.
+/// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
+/// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
+
+/// The bar background at `overview_fade`, where 0 is the normal desktop and 1 the
+/// fully-open overview. GNOME drops the panel to `background-color: transparent`
+/// while the overview (or the lock/login screen) is up — `#panel:overview`,
+/// `_panel.scss:98-102` — so the `#overviewGroup` fill (`$system_base_color`,
+/// `_overview.scss:7-9`) runs unbroken from the top of the screen to the bottom and
+/// the bar reads as part of the overview rather than a black band above it. The
+/// crossfade is a plain CSS transition on the color, `$panel_transition_duration`
+/// 250ms = the overview's own `ANIMATION_TIME` (`_panel.scss:10-18`), which is why
+/// riding the overview progress directly reproduces it. Only the *background* fades:
+/// the clock, dots and status icons stay fully opaque throughout.
+fn bar_bg(overview_fade: f64) -> [f32; 4] {
+    let [r, g, b, a] = BAR_BG;
+    [r, g, b, a * (1. - overview_fade as f32)]
+}
 
 /// Panel-button container inset from its hit rect (`_drawing.scss` `panel_button`
 /// mixin): `$base_margin` (4px) horizontally so an edge button isn't glued to the
@@ -432,10 +448,11 @@ fn indicator_logical_width(count: usize) -> f64 {
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
     context: Option<ContextId<VkTexture>>,
-    /// Bar chrome keyed by (scale, physical width, workspace count, active index):
-    /// the count sets the checked-highlight width, and the count + active index
-    /// place the workspace dots (drawn into the bar as rounded rects).
-    textures: HashMap<(NotNan<f64>, i32, usize, usize), VkTexture>,
+    /// Bar chrome keyed by (scale, physical width, workspace count, active index,
+    /// overview): the count sets the checked-highlight width, the count + active
+    /// index place the workspace dots (drawn into the bar as rounded rects), and the
+    /// overview flag picks the background (opaque black vs transparent, [`bar_bg`]).
+    textures: HashMap<(NotNan<f64>, i32, usize, usize, bool), VkTexture>,
     /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name, tint). The tint is
     /// part of the key because the mic privacy icon uploads orange while the rest are white — the
     /// same name at two colors must not collide.
@@ -1064,12 +1081,16 @@ impl Panel {
         }
     }
 
+    /// Render the bar for `output`. `overview_fade` is that monitor's overview
+    /// progress (0 on the desktop, 1 with the overview fully open); it fades the
+    /// panel background out, per [`bar_bg`].
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
         output: &Output,
         ws: WorkspaceState,
         position: f64,
+        overview_fade: f64,
         icons: &IconCache,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
@@ -1201,16 +1222,22 @@ impl Panel {
 
         // While a workspace switch animates, `position` is fractional and the dots morph
         // every frame; while a button-container fill fades, the pill alpha changes every
-        // frame — in either case draw the bar fresh and skip the cache (keyed on the
-        // integer active index, not the animated state). The switch / fill animations
-        // already drive the per-frame redraws. At rest, cache as usual, drawing with the
-        // exact integer index so the cached texture always matches its key.
-        let animating = (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
+        // frame; while the overview opens or closes, the background alpha changes every
+        // frame — in any of those cases draw the bar fresh and skip the cache (keyed on
+        // the integer active index and the two settled background states, not the
+        // animated state). The switch / fill / overview animations already drive the
+        // per-frame redraws. At rest, cache as usual, drawing with the exact integer
+        // index so the cached texture always matches its key.
+        let bg = bar_bg(overview_fade);
+        let animating = (position - position.round()).abs() > 1e-6
+            || self.are_animations_ongoing()
+            || (overview_fade > 0. && overview_fade < 1.);
         let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
                 scale,
                 width_px,
+                bg,
                 &self.clock_text,
                 &containers,
                 ws.count,
@@ -1225,13 +1252,23 @@ impl Panel {
                 }
             }
         } else {
-            let bar_key = (scale_key, width_px, ws.count, ws.active());
+            // `overview_fade` is 0 or 1 here (the in-between is the animating arm), so
+            // the settled desktop and overview bars cache side by side instead of one
+            // evicting the other on every overview toggle.
+            let bar_key = (
+                scale_key,
+                width_px,
+                ws.count,
+                ws.active(),
+                overview_fade >= 1.,
+            );
             #[allow(clippy::map_entry)]
             if !cache.textures.contains_key(&bar_key) {
                 match draw_bar_texture(
                     renderer,
                     scale,
                     width_px,
+                    bg,
                     &self.clock_text,
                     &containers,
                     ws.count,
@@ -1252,8 +1289,14 @@ impl Panel {
         };
 
         if let Some(texture) = bar_texture {
-            // The whole bar is opaque, so let the compositor skip drawing behind it.
-            let opaque = vec![Rectangle::from_size(texture.size())];
+            // On the desktop the whole bar is opaque, so let the compositor skip drawing
+            // behind it. In (or entering) the overview the background is translucent and
+            // the overview backdrop has to show through, so it claims no opaque region.
+            let opaque = if bg[3] >= 1. {
+                vec![Rectangle::from_size(texture.size())]
+            } else {
+                Vec::new()
+            };
             let buffer =
                 TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
             elements.push(TextureRenderElement::from_texture_buffer(
@@ -1454,8 +1497,9 @@ fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::
     Ok(())
 }
 
-/// Draw the bar chrome into an offscreen [`VkTexture`]: clear the opaque
-/// background, paint the rounded hover/active button containers, then the
+/// Draw the bar chrome into an offscreen [`VkTexture`]: clear to `bg` (the panel
+/// background, opaque black on the desktop and transparent in the overview — see
+/// [`bar_bg`]), paint the rounded hover/active button containers, then the
 /// workspace dots and the centered clock glyph run. The returned texture is
 /// `SHADER_READ_ONLY` (sampleable) so the caller can composite it directly. The
 /// right-box status icons are composited separately, on top.
@@ -1464,6 +1508,7 @@ fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
+    bg: [f32; 4],
     clock: &str,
     containers: &[(Rectangle<f64, Logical>, [f32; 4])],
     count: usize,
@@ -1522,7 +1567,7 @@ fn draw_bar_texture(
     widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
 
-        p.clear(BAR_BG)?;
+        p.clear(bg)?;
         // The rounded button containers (hover/active), behind the button content.
         // Half the height clamps the SDF to a stadium (fully rounded pill).
         for (rect, color) in containers {
@@ -1928,6 +1973,7 @@ mod tests {
             &mut vk,
             scale,
             width_px,
+            BAR_BG,
             "12:34",
             &[],
             ws.count,
@@ -2017,9 +2063,19 @@ mod tests {
 
         // Peak red over the band row across just the two-dot region (far from the clock).
         let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex =
-                draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None, None)
-                    .expect("bar texture");
+            let mut tex = draw_bar_texture(
+                vk,
+                scale,
+                width_px,
+                BAR_BG,
+                "12:34",
+                &[],
+                2,
+                position,
+                None,
+                None,
+            )
+            .expect("bar texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -2199,6 +2255,7 @@ mod tests {
             &mut vk,
             1.,
             width_px,
+            BAR_BG,
             "12:34",
             &containers,
             ws.count,
@@ -2498,6 +2555,7 @@ mod tests {
             &mut vk,
             scale,
             width_px,
+            BAR_BG,
             "12:34",
             &containers,
             3,

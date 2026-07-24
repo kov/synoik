@@ -2095,10 +2095,11 @@ fn vulkan_renders_the_top_panel() {
         .with_vulkan_renderer(|vk| {
             let ws = state.niri.workspace_state_for(&output);
             let position = state.niri.workspace_position_for(&output);
-            let elems = state
-                .niri
-                .panel
-                .render(vk, &output, ws, position, &state.niri.icon_cache);
+            let elems =
+                state
+                    .niri
+                    .panel
+                    .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
             assert!(
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"
@@ -2173,7 +2174,7 @@ fn vulkan_renders_the_messages_indicator_dot() {
             let render_panel = |vk: &mut VulkanRenderer, niri: &crate::niri::Niri| {
                 let elems = niri
                     .panel
-                    .render(vk, &output, ws, position, &niri.icon_cache);
+                    .render(vk, &output, ws, position, 0., &niri.icon_cache);
                 render_to_vec(
                     vk,
                     Size::<i32, Physical>::from((width, bar_h)),
@@ -6429,6 +6430,75 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
             b[c],
             s[c],
             b[c],
+        );
+    }
+}
+
+/// GNOME turns the top panel's background transparent while the overview is up
+/// (`#panel:overview`, `_panel.scss:98-102`), so the `#overviewGroup` fill
+/// (`$system_base_color` `#222226`, `_overview.scss:7-9` / `_colors.scss:20`) runs
+/// unbroken from the top of the screen down and the bar reads as part of the
+/// overview rather than a black band above it.
+///
+/// Pin both ends over the *same* pixel: opaque black on the desktop, and — in the
+/// overview — the colour the backdrop has just below the bar. Comparing against the
+/// measured backdrop rather than a literal is what makes this a "no visible break"
+/// assertion: it keeps holding if the backdrop colour is retuned, and fails if the
+/// panel keeps any background of its own.
+#[test]
+fn vulkan_overview_panel_background_matches_the_backdrop() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+    f.niri().hotkey_overlay.hide();
+
+    // A column with no panel content in either state: left of the centered clock,
+    // right of the Activities button, and clear of the right-hand status cluster.
+    // Below the bar it is backdrop in the overview — the search entry is centred
+    // and much narrower than the output.
+    let x = 300;
+    let bar_y = (crate::ui::panel::PANEL_HEIGHT / 2.) as i32;
+    let below_y = (crate::ui::panel::PANEL_HEIGHT + 8.) as i32;
+
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let desktop = px(&pixels, w, x, bar_y);
+    assert_eq!(
+        [desktop[0], desktop[1], desktop[2], desktop[3]],
+        [0, 0, 0, 255],
+        "on the desktop the bar is opaque $panel_bg_color black"
+    );
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .and_then(|mon| mon.expose_progress()),
+        Some(1.),
+        "the overview must be fully open before sampling"
+    );
+
+    let (pixels, ..) = render_output_vulkan(&mut f, &output);
+    let bar = px(&pixels, w, x, bar_y);
+    let backdrop = px(&pixels, w, x, below_y);
+    eprintln!("vulkan_overview_panel_bg: desktop={desktop:?} bar={bar:?} backdrop={backdrop:?}");
+
+    assert!(
+        backdrop[0] > 0 && backdrop != desktop,
+        "the sampled backdrop must not be black, or the comparison below is vacuous \
+         (got {backdrop:?})"
+    );
+    for c in 0..4 {
+        assert!(
+            bar[c].abs_diff(backdrop[c]) <= 1,
+            "channel {c}: the overview bar reads {} but the backdrop right below it \
+             reads {} — the panel is still painting a background (bar={bar:?} \
+             backdrop={backdrop:?})",
+            bar[c],
+            backdrop[c],
         );
     }
 }

@@ -5657,10 +5657,21 @@ impl Niri {
         if self.layout.is_gnome_mode() {
             let ws = self.workspace_state_for(output);
             let ws_position = self.workspace_position_for(output);
-            for element in
-                self.panel
-                    .render(ctx.renderer, output, ws, ws_position, &self.icon_cache)
-            {
+            // The bar background fades out as the overview opens (`#panel:overview`),
+            // so the overview backdrop runs unbroken behind it.
+            let overview_fade = self
+                .layout
+                .monitor_for_output(output)
+                .and_then(|mon| mon.expose_progress())
+                .unwrap_or(0.);
+            for element in self.panel.render(
+                ctx.renderer,
+                output,
+                ws,
+                ws_position,
+                overview_fade,
+                &self.icon_cache,
+            ) {
                 push(element.into());
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the

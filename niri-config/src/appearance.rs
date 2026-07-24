@@ -9,7 +9,13 @@ use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
 
 pub const DEFAULT_BACKGROUND_COLOR: Color = Color::from_array_unpremul([0.25, 0.25, 0.25, 1.]);
-pub const DEFAULT_BACKDROP_COLOR: Color = Color::from_array_unpremul([0.15, 0.15, 0.15, 1.]);
+/// The overview backdrop — everything behind the zoomed workspaces, including the
+/// band behind the (then transparent) top panel. GNOME paints it on the container
+/// that holds the whole overview: `#overviewGroup { background-color:
+/// $system_base_color; }` (`_overview.scss:7-9`), and `$system_base_color` is
+/// `$_base_color_dark` `#222226` (`_colors.scss:20`, `_default-colors.scss:4`).
+/// niri's own default was a slightly lighter, neutral-grey `#262626`.
+pub const DEFAULT_BACKDROP_COLOR: Color = Color::from_array_unpremul([0.1333, 0.1333, 0.1490, 1.]);
 
 /// RGB color in [0, 1] with unpremultiplied alpha.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]

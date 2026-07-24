@@ -1698,9 +1698,9 @@ mod tests {
             overview: Overview {
                 zoom: 0.5,
                 backdrop_color: Color {
-                    r: 0.15,
-                    g: 0.15,
-                    b: 0.15,
+                    r: 0.1333,
+                    g: 0.1333,
+                    b: 0.149,
                     a: 1.0,
                 },
                 workspace_shadow: WorkspaceShadow {
