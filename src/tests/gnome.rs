@@ -5148,25 +5148,80 @@ fn overview_dash_favorite_right_click_consumed() {
     );
 }
 
-/// The trailing show-apps button consumes its click inertly in S3 (the app grid is
-/// S8): no launch, and the overview stays open.
+/// The trailing show-apps button toggles the overview's app grid (S8): no launch,
+/// the overview stays open, and the app-grid state eases in (the picker shrinks and
+/// the app-display box slides on-screen). Escape then returns to the window picker
+/// without closing the overview (the grid tier of the overview Escape), and closing
+/// the overview *from* the grid resets the state so the next open starts in the
+/// picker.
 #[test]
-fn overview_dash_show_apps_click_is_inert() {
+fn overview_show_apps_toggles_the_app_grid() {
     let (mut f, recorder) = dash_fixture(&["a.desktop"]);
     let i = f.niri().dash.show_apps_index();
     let center = dash_tile_center(&mut f, i);
-
+    // `pointer_motion` is relative; move onto the button once (from the origin) and
+    // leave the pointer there — keyboard/actions below don't move it, so later
+    // clicks land on the same spot without re-moving.
     f.pointer_motion(center.x, center.y);
-    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.niri_complete_animations();
+    let click = |f: &mut Fixture| {
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.niri_complete_animations();
+    };
 
+    // Click show-apps → the app grid opens (no launch, overview stays open).
+    click(&mut f);
     assert!(
         recorder.calls.borrow().is_empty(),
         "show-apps must not launch an app"
     );
     assert!(
         f.niri().layout.is_overview_open(),
-        "show-apps is inert in S3 — the overview stays open"
+        "show-apps keeps the overview open"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "show-apps opens the app grid"
+    );
+    // The app grid slid on-screen (parked below the work area at 1080 otherwise).
+    assert!(
+        overview_controls(&mut f).app_display.loc.y < 1080.,
+        "the app grid must slide up on screen in the app-grid state"
+    );
+
+    // Escape returns to the picker without closing the overview, and the grid parks.
+    // (The harness only sets overview keyboard focus on demand — the live loop does
+    // it every iteration.)
+    f.niri_state().update_keyboard_focus();
+    tap(&mut f, KEY_ESC);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_app_grid_open(),
+        "Escape returns to the window picker"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "…without closing the overview"
+    );
+    assert!(
+        overview_controls(&mut f).app_display.loc.y >= 1080.,
+        "the app grid must park below the work area again"
+    );
+
+    // Reopen the grid, then close the overview from it → the state resets on hide,
+    // so reopening the overview starts in the window picker.
+    click(&mut f);
+    assert!(f.niri().layout.is_app_grid_open());
+
+    f.niri_state().do_action(Action::CloseOverview, false);
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_app_grid_open(),
+        "reopening the overview starts in the window picker, not the app grid"
     );
 }
 

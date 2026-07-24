@@ -753,7 +753,13 @@ impl State {
                                     }
                                     SearchOutcome::Close => {
                                         this.niri.overview_search.clear();
-                                        this.niri.layout.close_overview();
+                                        // Escape tiers (`searchController.js:153-159`):
+                                        // search → grid → hide. The entry only returns
+                                        // Close with no query, so fall through to the
+                                        // app grid, then the overview.
+                                        if !this.niri.layout.close_app_grid() {
+                                            this.niri.layout.close_overview();
+                                        }
                                     }
                                 }
                                 this.niri.queue_redraw_all();
@@ -765,6 +771,15 @@ impl State {
 
                     // If we didn't find any bind, try other hardcoded keys.
                     if this.niri.keyboard_focus.is_overview() && pressed {
+                        // Escape returns the app grid to the window picker first (the
+                        // grid tier of GNOME's overview Escape, `searchController.js:
+                        // 153-159`); only when already in the picker does it fall
+                        // through to the CloseOverview bind below.
+                        if raw == Some(Keysym::Escape) && this.niri.layout.close_app_grid() {
+                            this.niri.suppressed_keys.insert(key_code);
+                            this.niri.queue_redraw_all();
+                            return FilterResult::Intercept(None);
+                        }
                         if let Some(bind) = raw.and_then(|raw| hardcoded_overview_bind(raw, *mods))
                         {
                             this.niri.suppressed_keys.insert(key_code);
@@ -3578,17 +3593,36 @@ impl State {
                     }) {
                         if let Some(hit) = self.niri.dash.hit_test(*pos, controls.dash) {
                             self.niri.suppressed_buttons.insert(button_code);
-                            if let DashHit::App(i) = hit {
-                                if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
-                                    if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
-                                        if let Err(err) =
-                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
+                            match hit {
+                                DashHit::App(i) => {
+                                    if matches!(
+                                        button,
+                                        Some(MouseButton::Left | MouseButton::Middle)
+                                    ) {
+                                        if let Some(id) =
+                                            self.niri.dash.item_id(i).map(str::to_owned)
                                         {
-                                            tracing::warn!("dash launch of {id} failed: {err:?}");
+                                            if let Err(err) = self
+                                                .niri
+                                                .app_system
+                                                .launch(&id, LaunchMode::Activate)
+                                            {
+                                                tracing::warn!(
+                                                    "dash launch of {id} failed: {err:?}"
+                                                );
+                                            }
+                                            self.niri.layout.close_overview();
                                         }
-                                        self.niri.layout.close_overview();
                                     }
                                 }
+                                // The show-apps button toggles the app grid
+                                // (`ShowAppsIcon`, `dash.js:189-213`).
+                                DashHit::ShowApps => {
+                                    if matches!(button, Some(MouseButton::Left)) {
+                                        self.niri.layout.toggle_app_grid();
+                                    }
+                                }
+                                DashHit::Background => {}
                             }
                             self.niri.queue_redraw_all();
                             return;

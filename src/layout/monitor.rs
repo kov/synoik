@@ -105,6 +105,12 @@ pub struct Monitor<W: LayoutElement> {
     thumbnails_expand: Option<Animation>,
     /// The settled target of [`Self::thumbnails_expand`], for edge detection.
     thumbnails_shown: bool,
+    /// gnome-shell's `ControlsState` show-apps fraction (0 = window picker, 1 = app
+    /// grid): eased when the show-apps state flips, shrinking the picker box and
+    /// sliding the app grid up (`overviewControls.js` state adjustment). The target.
+    app_grid_shown: bool,
+    /// The ease driving [`Self::app_grid_shown`], mirroring [`Self::thumbnails_expand`].
+    app_grid_expand: Option<Animation>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -387,6 +393,8 @@ impl<W: LayoutElement> Monitor<W> {
             overview_open: false,
             overview_progress: None,
             thumbnails_expand: None,
+            app_grid_shown: false,
+            app_grid_expand: None,
             thumbnails_shown: workspaces_len > thumbnails::NUM_WORKSPACES_THRESHOLD,
             workspace_switch: None,
             clock,
@@ -1137,6 +1145,7 @@ impl<W: LayoutElement> Monitor<W> {
             .is_some_and(|s| s.is_animation_ongoing())
             || self.thumbnails_expand.is_some()
             || self.thumbnails_should_show() != self.thumbnails_shown
+            || self.app_grid_expand.is_some()
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1146,6 +1155,7 @@ impl<W: LayoutElement> Monitor<W> {
             // it closed the zoom is 1 regardless, so counting it would defer
             // pointer-focus refresh for a quarter second over a still screen.
             || (self.thumbnails_expand.is_some() && self.overview_progress.is_some())
+            || self.app_grid_expand.is_some()
             || self
                 .workspaces
                 .iter()
@@ -1535,8 +1545,8 @@ impl<W: LayoutElement> Monitor<W> {
             crate::ui::dash::PREFERRED_HEIGHT,
             thumbnails::preferred_height(self.view_size, self.workspaces.len()),
             self.thumbnails_expand_fraction(),
-            // The app-grid state is not wired yet; the picker is the only state.
-            overview_layout::state::WINDOW_PICKER,
+            // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps state eases in.
+            overview_layout::state::WINDOW_PICKER + self.app_grid_fraction(),
         )
     }
 
@@ -1594,6 +1604,59 @@ impl<W: LayoutElement> Monitor<W> {
         if self.thumbnails_expand.as_ref().is_some_and(|a| a.is_done()) {
             self.thumbnails_expand = None;
         }
+
+        if self.app_grid_expand.as_ref().is_some_and(|a| a.is_done()) {
+            self.app_grid_expand = None;
+        }
+    }
+
+    /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
+    pub(super) fn app_grid_fraction(&self) -> f64 {
+        match &self.app_grid_expand {
+            Some(anim) => anim.clamped_value().clamp(0., 1.),
+            None => {
+                if self.app_grid_shown {
+                    1.
+                } else {
+                    0.
+                }
+            }
+        }
+    }
+
+    /// Ease the app grid in or out. gnome-shell drives the show-apps state
+    /// adjustment with `EASE_OUT_SINE` over `SIDE_CONTROLS_ANIMATION_TIME` (250ms,
+    /// `overviewControls.js:654-657`); our `Curve` has no sine, so the equivalent
+    /// cubic-bézier reproduces it. Only whether animations run is inherited from the
+    /// config (like [`Self::update_thumbnails_expand`]).
+    pub(super) fn set_app_grid(&mut self, shown: bool) {
+        if shown == self.app_grid_shown {
+            return;
+        }
+        let from = self.app_grid_fraction();
+        self.app_grid_shown = shown;
+        let config = niri_config::Animation {
+            off: self.options.animations.overview_open_close.0.off,
+            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                duration_ms: 250,
+                curve: niri_config::animations::Curve::CubicBezier(0.39, 0.575, 0.565, 1.),
+            }),
+        };
+        self.app_grid_expand = Some(Animation::new(
+            self.clock.clone(),
+            from,
+            if shown { 1. } else { 0. },
+            0.,
+            config,
+        ));
+    }
+
+    /// Snap the app grid back to the window picker with no animation — for when the
+    /// overview is fully hidden (the close deliberately froze the state) or freshly
+    /// entered, so it always opens in the picker.
+    pub(super) fn reset_app_grid(&mut self) {
+        self.app_grid_shown = false;
+        self.app_grid_expand = None;
     }
 
     /// The workspace zoom at an arbitrary overview progress.

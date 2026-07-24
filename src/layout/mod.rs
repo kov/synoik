@@ -373,6 +373,10 @@ pub struct Layout<W: LayoutElement> {
     /// This is a boolean flag that controls things like where input goes to. The actual animation
     /// is controlled by overview_progress.
     overview_open: bool,
+    /// Whether the overview's app grid (show-apps state) is showing. Only
+    /// meaningful while [`Self::overview_open`]; the per-monitor ease drives the
+    /// WINDOW_PICKER↔APP_GRID box interpolation.
+    app_grid_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
@@ -740,6 +744,7 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
             gnome_accent_color: crate::gnome::ACCENT_BLUE,
@@ -767,6 +772,7 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
             gnome_accent_color: crate::gnome::ACCENT_BLUE,
@@ -2814,12 +2820,17 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        let mut overview_hidden = false;
         if let Some(OverviewProgress::Animation(anim)) = &mut self.overview_progress {
             if anim.is_done() {
                 if self.overview_open {
                     self.overview_progress = Some(OverviewProgress::Open);
                 } else {
                     self.overview_progress = None;
+                    // Fully hidden: snap the frozen show-apps state back to the
+                    // picker so the next open starts there.
+                    self.app_grid_open = false;
+                    overview_hidden = true;
                 }
             }
         }
@@ -2828,6 +2839,9 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     mon.set_overview_progress(self.overview_progress.as_ref());
+                    if overview_hidden {
+                        mon.reset_app_grid();
+                    }
                     mon.advance_animations();
                 }
             }
@@ -4899,6 +4913,57 @@ impl<W: LayoutElement> Layout<W> {
         )));
 
         self.set_monitors_overview_state();
+
+        if self.overview_open {
+            // Always enter in the window picker: the show-apps state froze at the
+            // last close and is snapped back once hidden, but reset on the rising
+            // edge too so a direct open never inherits a stale grid.
+            self.app_grid_open = false;
+            for mon in self.monitors_mut() {
+                mon.reset_app_grid();
+            }
+        }
+        // On close we deliberately do NOT touch the app-grid state — it freezes so
+        // the zoom-out blends from the app-grid box, then snaps back once hidden
+        // (see `advance_animations`).
+    }
+
+    /// Whether the overview's app grid (show-apps state) is showing.
+    pub fn is_app_grid_open(&self) -> bool {
+        self.overview_open && self.app_grid_open
+    }
+
+    /// Toggle the app grid (the show-apps button / its keybind). A no-op unless the
+    /// overview is open. Returns whether the state changed.
+    pub fn toggle_app_grid(&mut self) -> bool {
+        if !self.overview_open {
+            return false;
+        }
+        self.set_app_grid(!self.app_grid_open);
+        true
+    }
+
+    /// Ease the app grid back to the window picker if it is open — the grid tier of
+    /// the overview's Escape (`searchController.js:153-159`: search → grid → hide).
+    /// Returns whether it was open, so Escape can fall through to closing the
+    /// overview when it wasn't.
+    pub fn close_app_grid(&mut self) -> bool {
+        if self.overview_open && self.app_grid_open {
+            self.set_app_grid(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_app_grid(&mut self, open: bool) {
+        if open == self.app_grid_open {
+            return;
+        }
+        self.app_grid_open = open;
+        for mon in self.monitors_mut() {
+            mon.set_app_grid(open);
+        }
     }
 
     pub fn open_overview(&mut self) -> bool {
