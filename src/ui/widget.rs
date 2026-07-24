@@ -256,6 +256,56 @@ impl AppIcon {
     }
 }
 
+/// Fixed geometry of a labelled `.overview-tile` — a full-color icon with a caption
+/// line beneath it. Shared by the search results grid and the app grid, which GNOME
+/// builds from the same `IconGrid.BaseIcon` (`search.js:144-146`, `appDisplay.js`),
+/// so the two stay pixel-identical. The hover/selection wash and the label are baked
+/// by [`Painter::labelled_tile`]; the icon pixels ride on top as an
+/// [`app_icon_element`].
+#[derive(Debug, Clone, Copy)]
+pub struct TileMetrics {
+    /// Full-color icon side (logical).
+    pub icon_px: f64,
+    /// `.overview-tile` padding around the icon+label (`_app-grid.scss:26`).
+    pub pad: f64,
+    /// Gap from the icon to the label (`.overview-icon-with-label` spacing,
+    /// `$base_padding`, `_app-grid.scss:31-35`).
+    pub label_gap: f64,
+    /// Height of the single label line.
+    pub label_h: f64,
+    /// `.overview-tile` corner radius of the hover/selection fill.
+    pub radius: f64,
+}
+
+impl TileMetrics {
+    /// The 96 px labelled tile the app grid and search results share (`ICON_SIZE`=96,
+    /// `iconGrid.js:11,83`; `.overview-tile` metrics `_app-grid.scss:24-35`).
+    pub const OVERVIEW: Self = Self {
+        icon_px: 96.,
+        pad: AppIcon::OVERVIEW_TILE_PADDING,
+        label_gap: 6.,
+        label_h: 18.,
+        radius: AppIcon::OVERVIEW_TILE_RADIUS,
+    };
+
+    /// The tile's outer size: pad+icon+pad wide, pad+icon+gap+label+pad tall.
+    pub fn size(&self) -> Size<f64, Logical> {
+        Size::from((
+            self.pad + self.icon_px + self.pad,
+            self.pad + self.icon_px + self.label_gap + self.label_h + self.pad,
+        ))
+    }
+
+    /// The icon's center within a tile box `rect` (logical) — the icon sits at the
+    /// top of the tile, the label below it.
+    pub fn icon_center(&self, rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+        Point::from((
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + self.pad + self.icon_px / 2.,
+        ))
+    }
+}
+
 /// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
 /// overview `search-entry` (`_search-entry.scss`, `overviewControls.js:325`). A
 /// **view + geometry** primitive: the caller owns the editable string (like
@@ -1148,6 +1198,44 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         if tile.hovered {
             self.fill_rounded(tile.rect, tile.radius, hover_bg)?;
         }
+        Ok(())
+    }
+
+    /// Paint one labelled `.overview-tile` into a card bake: its selection/hover wash
+    /// (when `active`) and its caption. `rel` is the tile box relative to the bake
+    /// origin; the icon pixels are composited separately on top as an
+    /// [`app_icon_element`]. Shared by the search results and the app grid.
+    pub fn labelled_tile(
+        &mut self,
+        rel: Rectangle<f64, Logical>,
+        label: &ShapedText,
+        metrics: &TileMetrics,
+        active: bool,
+        text_color: Rgba,
+    ) -> anyhow::Result<()> {
+        if active {
+            self.app_tile(
+                &AppIcon {
+                    rect: rel,
+                    hovered: true,
+                    radius: metrics.radius,
+                },
+                style::HOVER_WASH,
+            )?;
+        }
+        // Label centered under the icon, clipped to the tile so a long name doesn't
+        // widen the grid.
+        let lx = rel.loc.x + rel.size.w / 2.;
+        let ly = rel.loc.y + metrics.pad + metrics.icon_px + metrics.label_gap;
+        self.text_band(
+            label,
+            lx,
+            HAlign::Center,
+            ly,
+            metrics.label_h,
+            text_color,
+            rel,
+        )?;
         Ok(())
     }
 

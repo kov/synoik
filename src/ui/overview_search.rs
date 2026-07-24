@@ -650,30 +650,14 @@ impl OverviewSearch {
                                 Rectangle::from_size(card_size),
                             )?;
                         }
-                        for (i, rel) in rel_rects.iter().enumerate() {
-                            if i == selected || hovered == Some(SearchHit::Result(i)) {
-                                p.app_tile(
-                                    &AppIcon {
-                                        rect: *rel,
-                                        hovered: true,
-                                        radius: AppIcon::OVERVIEW_TILE_RADIUS,
-                                    },
-                                    widget::style::HOVER_WASH,
-                                )?;
-                            }
-                        }
-                        for (rel, label) in rel_rects.iter().zip(labels.iter()) {
-                            // Label centered under the icon, clipped to the tile.
-                            let lx = rel.loc.x + rel.size.w / 2.;
-                            let ly = rel.loc.y + TILE_PAD + RESULT_ICON_PX + 6.;
-                            p.text_band(
-                                label,
-                                lx,
-                                widget::HAlign::Center,
-                                ly,
-                                18.,
-                                style::TEXT,
+                        for (i, (rel, label)) in rel_rects.iter().zip(labels.iter()).enumerate() {
+                            let active = i == selected || hovered == Some(SearchHit::Result(i));
+                            p.labelled_tile(
                                 *rel,
+                                label,
+                                &widget::TileMetrics::OVERVIEW,
+                                active,
+                                style::TEXT,
                             )?;
                         }
                         Ok(())
