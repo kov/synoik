@@ -379,8 +379,18 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   which is what the cited rule produces but is worth an eyeball.
 - **S7 — `org.gnome.Shell` D-Bus.** `ShowApplications`/`FocusApp`/`FocusSearch`/`OverviewActive`.
   XML-signature-cited; small.
-- **S8 — App grid (APP_GRID state).** Paged grid, show-apps-button toggles WINDOW_PICKER↔APP_GRID,
-  `app-picker-layout` persistence. Larger; not required for launching (dash + search cover it).
+- **S8 — App grid (APP_GRID state).** Decisions (Gustavo, 2026-07-24): **full ControlsState port**
+  for integration (not a search-style cross-fade hack), and **S8a = single-page grid + launch**
+  (defer paging/PageIndicators, folders, `app-picker-layout` persistence, DnD reorder).
+  - **S8a-geometry ✅ DONE (`c0f38bd3`).** `overview_layout` gained the continuous `state` axis
+    (HIDDEN/WINDOW_PICKER/APP_GRID): per-state workspaces + a new `app_display` box, interpolated like
+    `ControlsManagerLayout`. Pure geometry; callers pass `WINDOW_PICKER` so behaviour is unchanged.
+    Pins cover the app-grid boxes + midpoint interpolation.
+  - **Next (S8a remaining):** (1) a state adjustment/animation so the overview drives `state` 1↔2,
+    (2) wire the show-apps button (`DashHit::ShowApps`, inert today) + Escape to toggle it, (3) the
+    app-grid **view** — installed-minus-favorites as labelled `.overview-tile` tiles (96px icon +
+    label, `AppIcon` + `ThemeNode`; the tile matches the S4 search-result tile) filling `app_display`,
+    with hit-test + click/Enter → launch + close.
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
