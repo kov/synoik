@@ -2914,6 +2914,66 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     );
 }
 
+/// Panel menus work inside the overview: a popover opened while the overview is
+/// up pushes its own grab on top of the overview's modal and stays open
+/// (`js/ui/popupMenu.js:1520`) — it must not be dismissed on the next frame.
+#[test]
+fn panel_popover_stays_open_in_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().do_action(Action::ToggleOverview, false);
+    f.niri().update_render_elements(None);
+    assert!(f.niri().layout.is_overview_open());
+
+    // Click the clock: the calendar popover opens.
+    pointer_motion_to(&mut f, 960., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "clicking the clock in the overview must open the calendar popover"
+    );
+
+    // Subsequent frames must not dismiss it (a level-triggered overview check
+    // once closed the popover on the render update right after it opened).
+    f.niri().update_render_elements(None);
+    f.niri().update_render_elements(None);
+    f.settle_animations();
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "a popover opened in the overview must stay open across frames"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the overview stays open under the popover"
+    );
+}
+
+/// A popover that is open when the overview *opens* is dismissed: GNOME's
+/// overview modal does not coexist with a held menu grab
+/// (`js/ui/overview.js:461` hides rather than fight an existing grab).
+#[test]
+fn overview_open_dismisses_open_panel_popover() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().update_render_elements(None);
+
+    pointer_motion_to(&mut f, 960., 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.niri().panel_popover.is_open());
+
+    f.niri_state().do_action(Action::ToggleOverview, false);
+    f.niri().update_render_elements(None);
+    f.settle_animations();
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "opening the overview must dismiss an already-open popover"
+    );
+    assert!(f.niri().layout.is_overview_open());
+}
+
 /// Clicking the right-box quick-settings indicator opens its popover; Escape and
 /// an outside click both dismiss it (the same popup-menu grab as the calendar).
 /// Clicking a tile inside flips its gsettings-backed state.

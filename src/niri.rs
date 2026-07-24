@@ -523,6 +523,10 @@ pub struct Niri {
     pub end_session_dialog: EndSessionDialog,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
+    /// Whether the overview was open at the last render-elements update, to
+    /// edge-detect the closed→open transition (which dismisses an open panel
+    /// popover, like GNOME's overview modal breaking the menu's grab).
+    overview_was_open: bool,
     /// The overview dash (favorites bar).
     pub dash: Dash,
     /// The overview search (entry + app results).
@@ -3717,6 +3721,7 @@ impl Niri {
             end_session_dialog,
             panel,
             panel_popover,
+            overview_was_open: false,
             dash: Dash::new(),
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(),
@@ -5395,10 +5400,17 @@ impl Niri {
         let overview_open = self.layout.is_overview_open();
         self.panel.set_overview_open(overview_open);
 
-        // A panel popover must not outlive the contexts it belongs to: close it when the
-        // overview opens or the session leaves GNOME mode, so its modal keyboard grab
-        // (`KeyboardFocus::Popover`) can never get stuck with no way to dismiss it.
-        if self.panel_popover.is_open() && (overview_open || !self.layout.is_gnome_mode()) {
+        // A menu open when the overview *opens* is dismissed (GNOME's overview modal
+        // won't coexist with a held menu grab — `js/ui/overview.js:461`), but a menu
+        // opened while the overview is already up pushes its own grab on top and stays
+        // (`js/ui/popupMenu.js:1520`) — so this must fire on the closed→open edge only,
+        // never level-triggered (that closed popovers the frame after they opened in
+        // the overview). Leaving GNOME mode still closes unconditionally, so the modal
+        // keyboard grab (`KeyboardFocus::Popover`) can never get stuck with no way to
+        // dismiss it.
+        let overview_just_opened = overview_open && !self.overview_was_open;
+        self.overview_was_open = overview_open;
+        if self.panel_popover.is_open() && (overview_just_opened || !self.layout.is_gnome_mode()) {
             self.panel_popover.close();
         }
 
