@@ -31,6 +31,7 @@ use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
+use crate::ui::overview_layout::{self, ControlsLayout};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
     output_size, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
@@ -98,6 +99,12 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// gnome-shell's `ThumbnailsBox.expandFraction` (`overviewControls.js:358-366`):
+    /// eased 0↔1 when the strip's `should-show` flips, so the picker box grows
+    /// into the thumbnails band (and back) instead of jumping.
+    thumbnails_expand: Option<Animation>,
+    /// The settled target of [`Self::thumbnails_expand`], for edge detection.
+    thumbnails_shown: bool,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -361,6 +368,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         let ws = Workspace::new(output.clone(), clock.clone(), options.clone());
         workspaces.push(ws);
+        let workspaces_len = workspaces.len();
 
         Self {
             output_name: output.name(),
@@ -378,6 +386,8 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            thumbnails_expand: None,
+            thumbnails_shown: workspaces_len > thumbnails::NUM_WORKSPACES_THRESHOLD,
             workspace_switch: None,
             clock,
             base_options,
@@ -1078,6 +1088,8 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        self.update_thumbnails_expand();
+
         match &mut self.workspace_switch {
             Some(WorkspaceSwitch::Animation(anim)) => {
                 if anim.is_done() {
@@ -1121,11 +1133,14 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || self.thumbnails_expand.is_some()
+            || self.thumbnails_should_show() != self.thumbnails_shown
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
+            || self.thumbnails_expand.is_some()
             || self
                 .workspaces
                 .iter()
@@ -1503,9 +1518,111 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// The allocated box of every piece of overview chrome on this monitor
+    /// (gnome-shell's `ControlsManagerLayout`). One place decides where the
+    /// search entry, thumbnails, dash and window picker go; everything else
+    /// consumes these boxes.
+    pub fn controls_layout(&self) -> ControlsLayout {
+        overview_layout::layout(
+            self.view_size,
+            self.working_area.loc.y,
+            crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
+            crate::ui::dash::PREFERRED_HEIGHT,
+            thumbnails::preferred_height(self.view_size, self.workspaces.len()),
+            self.thumbnails_expand_fraction(),
+        )
+    }
+
+    /// Whether the strip *wants* to be shown: gnome-shell's
+    /// `ThumbnailsBox.shouldShow`, which with dynamic workspaces is purely a
+    /// workspace count (it is not gated on the overview — that's the slide).
+    fn thumbnails_should_show(&self) -> bool {
+        self.workspaces.len() > thumbnails::NUM_WORKSPACES_THRESHOLD
+    }
+
+    fn thumbnails_expand_fraction(&self) -> f64 {
+        match &self.thumbnails_expand {
+            Some(anim) => anim.clamped_value().clamp(0., 1.),
+            None => {
+                if self.thumbnails_shown {
+                    1.
+                } else {
+                    0.
+                }
+            }
+        }
+    }
+
+    /// Starts (or retires) the expand ease when the strip's `should-show`
+    /// flips — dragging a window onto the trailing empty workspace crosses the
+    /// threshold *while the overview is open*, and the picker box depends on
+    /// the band, so an instant flip would pop the workspace zoom.
+    fn update_thumbnails_expand(&mut self) {
+        let should_show = self.thumbnails_should_show();
+        if should_show != self.thumbnails_shown {
+            let from = self.thumbnails_expand_fraction();
+            self.thumbnails_shown = should_show;
+            self.thumbnails_expand = Some(Animation::new(
+                self.clock.clone(),
+                from,
+                if should_show { 1. } else { 0. },
+                0.,
+                self.options.animations.overview_open_close.0,
+            ));
+        }
+
+        if self.thumbnails_expand.as_ref().is_some_and(|a| a.is_done()) {
+            self.thumbnails_expand = None;
+        }
+    }
+
+    /// The workspace zoom at an arbitrary overview progress.
+    ///
+    /// In GNOME mode the fully-zoomed-out size is not a constant: gnome-shell
+    /// fits the workspace by height into whatever the window-picker box works
+    /// out to, so the zoom follows the chrome. `progress` of `None` means the
+    /// overview is closed (zoom 1).
+    pub(super) fn zoom_at(&self, progress: Option<f64>) -> f64 {
+        let zoom = if self.options.layout.windowing_mode == WindowingMode::Floating {
+            // GNOME's overview geometry is by design, not configuration.
+            self.controls_layout().workspaces.size.h / self.view_size.h
+        } else {
+            // Clamp to some sane values.
+            self.options.overview.zoom.clamp(0.0001, 0.75)
+        };
+
+        compute_overview_zoom(zoom, progress)
+    }
+
     pub fn overview_zoom(&self) -> f64 {
         let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+        self.zoom_at(progress)
+    }
+
+    /// Where the workspace row sits within the view, before the strip offset.
+    ///
+    /// Closed, the active workspace covers the view exactly (`zoom == 1`, so
+    /// this is zero — a pointer against the screen edge at y = 0 must still hit
+    /// it). Open, it lands on its allocated picker box. In between the two
+    /// interpolate on the same progress that drives the zoom, which is how
+    /// gnome-shell blends its `HIDDEN` and `WINDOW_PICKER` boxes
+    /// (`overviewControls.js:207-216`).
+    fn workspaces_static_offset(&self, zoom: f64) -> Point<f64, Logical> {
+        let ws_size = self.workspace_size(zoom);
+        // Full width is available, so the row stays horizontally centered.
+        let x = (self.view_size.w - ws_size.w) / 2.;
+
+        let y = if self.options.layout.windowing_mode == WindowingMode::Floating {
+            let progress = self.overview_progress.as_ref().map_or(0., |p| p.value());
+            self.controls_layout().workspaces.loc.y * progress
+        } else {
+            (self.view_size.h - ws_size.h) / 2.
+        };
+
+        let scale = self.scale.fractional_scale();
+        Point::from((x, y))
+            .to_physical_precise_round(scale)
+            .to_logical(scale)
     }
 
     /// In GNOME windowing mode, the overview spreads each workspace's windows
@@ -1524,13 +1641,12 @@ impl<W: LayoutElement> Monitor<W> {
     /// dynamic workspaces show it only once a second desktop is populated
     /// (more workspaces than the threshold, counting the trailing empty).
     pub fn thumbnails_visible(&self) -> bool {
-        self.expose_progress().is_some()
-            && self.workspaces.len() > thumbnails::NUM_WORKSPACES_THRESHOLD
+        self.expose_progress().is_some() && self.thumbnails_expand_fraction() > 0.
     }
 
-    /// The thumbnails strip, laid out in the band above the zoomed-out
-    /// workspace row. While a drag hovers one of its gaps, the strip makes
-    /// room for the new-workspace drop placeholder there.
+    /// The thumbnails strip, laid out in the band [`Self::controls_layout`]
+    /// allocates it below the search entry. While a drag hovers one of its
+    /// gaps, the strip makes room for the new-workspace drop placeholder there.
     pub fn thumbnail_strip(&self) -> Option<Strip> {
         if !self.thumbnails_visible() {
             return None;
@@ -1544,18 +1660,9 @@ impl<W: LayoutElement> Monitor<W> {
                 InsertWorkspace::Existing(_) => None,
             }
         });
-        let top_band = self.view_size.h * (1. - super::GNOME_OVERVIEW_WORKSPACE_SCALE) / 2.;
-        // Reserve the top panel's strut (same gate as `compute_working_area`) so the strip sits
-        // below the panel instead of being clipped by it.
-        let top_inset = if self.options.layout.windowing_mode == WindowingMode::Floating {
-            crate::ui::panel::PANEL_HEIGHT.min(top_band)
-        } else {
-            0.
-        };
         Some(thumbnails::strip_geometry(
             self.view_size,
-            top_inset,
-            top_band,
+            self.controls_layout().thumbnails,
             self.workspaces.len(),
             placeholder,
         ))
@@ -1563,7 +1670,12 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// The strip slides in from above the screen with the overview
     /// transition (gnome-shell translates its box in and out).
+    ///
+    /// Divergence: gnome-shell instead eases `expandFraction` into the box
+    /// height when the strip appears mid-overview; we fold the expand into the
+    /// same slide, so the strip slides down as the picker makes room for it.
     fn thumbnail_slide_offset(&self, strip: &Strip, progress: f64) -> f64 {
+        let progress = progress * self.thumbnails_expand_fraction();
         let bounds = strip.bounds();
         let extent = bounds.loc.y + bounds.size.h + thumbnails::INDICATOR_WIDTH;
         -extent * (1. - progress)
@@ -1681,7 +1793,7 @@ impl<W: LayoutElement> Monitor<W> {
                 // - first_y = to * from_height - switch_anim.value() * from_height - to * current_height
                 // - first_y = -switch_anim.value() * from_height + to * (from_height - current_height)
                 let from = progress_anim.from();
-                let from_zoom = compute_overview_zoom(&self.options, Some(from));
+                let from_zoom = self.zoom_at(Some(from));
                 let from_ws_extent_with_gap = self.workspace_extent_with_gap(from_zoom);
 
                 let zoom = self.overview_zoom();
@@ -1709,10 +1821,7 @@ impl<W: LayoutElement> Monitor<W> {
         let ws_size = self.workspace_size(zoom);
         let ws_extent_with_gap = self.workspace_extent_with_gap(zoom);
 
-        let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
-        let static_offset = static_offset
-            .to_physical_precise_round(scale)
-            .to_logical(scale);
+        let static_offset = self.workspaces_static_offset(zoom);
 
         let first_ws_pos = -self.workspace_render_idx() * ws_extent_with_gap;
         let first_ws_pos = round_logical_in_physical(scale, first_ws_pos);
@@ -2336,6 +2445,10 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
         let zoom = self.overview_zoom();
+        // The strip is not necessarily centered in the view (in GNOME mode it
+        // sits in its allocated picker box), so take the cross-axis band from
+        // the same offset the row is rendered at.
+        let offset = self.workspaces_static_offset(zoom);
 
         let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
 
@@ -2366,12 +2479,12 @@ impl<W: LayoutElement> Monitor<W> {
         // layer-shell docks and such don't prevent scrolling.
         let (main, extent, cross, cross_extent) = if horizontal {
             let cross_extent = self.view_size.h * zoom;
-            let cross = pos.y - (self.view_size.h - cross_extent) / 2.;
+            let cross = pos.y - offset.y;
             let main = pos.x - self.working_area.loc.x;
             (main, self.working_area.size.w, cross, cross_extent)
         } else {
             let cross_extent = self.view_size.w * zoom;
-            let cross = pos.x - (self.view_size.w - cross_extent) / 2.;
+            let cross = pos.x - offset.x;
             let main = pos.y - self.working_area.loc.y;
             (main, self.working_area.size.h, cross, cross_extent)
         };

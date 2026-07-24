@@ -47,7 +47,6 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::widget::{self, AppIcon, AppIconUploads, Painter};
-use crate::utils::output_size;
 
 /// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`).
 const ICON_PX: f64 = 64.;
@@ -63,8 +62,16 @@ const PILL_PAD_V: f64 = 12.;
 const PILL_H: f64 = TILE + 2. * PILL_PAD_V; // 100
 /// Pill corner radius: `$modal_radius + $base_padding·2` (`_dash.scss:9,21`).
 const PILL_RADIUS: f64 = 28.;
-/// Gap from the screen bottom edge (`margin-bottom`, `_dash.scss:95-99`).
+/// Gap from the screen bottom edge (`margin-bottom` = `$dash_edge_offset`,
+/// `_dash.scss:8,95-99`).
 const MARGIN_BOTTOM: f64 = 12.;
+
+/// What the dash asks [`crate::ui::overview_layout`] for: the pill plus the
+/// gap below it. gnome-shell caps this at `DASH_MAX_HEIGHT_RATIO` of the work
+/// area and shrinks the icons to fit (`Dash._adjustIconSize`); we take the cap
+/// but keep the icon size, so on a very short screen the pill overflows its
+/// box upward rather than getting smaller.
+pub const PREFERRED_HEIGHT: f64 = PILL_H + MARGIN_BOTTOM;
 
 /// `$dash_background_color = mix(#222226, #fafafb, 90%)` (`_dash.scss:20`,
 /// `_colors.scss:50`, `_default-colors.scss:4-5`) ≈ `#38383B`.
@@ -187,15 +194,17 @@ impl Dash {
         cache.show_apps.clear();
     }
 
-    /// Lay out the dash for an output of `size` (logical): the bottom-centered pill
-    /// and its tiles. Always at least the show-apps button, so the pill is never
-    /// empty (GNOME renders it unconditionally, `dash.js:352-356`).
-    fn layout(&self, size: Size<f64, Logical>) -> DashLayout {
+    /// Lay out the dash within its allocated `box` (logical, output coords;
+    /// [`crate::ui::overview_layout`] bottom-anchors it to the work area): the
+    /// centered pill and its tiles, with the pill's own gap below it. Always at
+    /// least the show-apps button, so the pill is never empty (GNOME renders it
+    /// unconditionally, `dash.js:352-356`).
+    fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
         let n = self.favorites.len();
         let count = n + 1; // + show-apps
         let pill_w = ITEM_ADVANCE * count as f64 + 2. * PILL_PAD_H;
-        let pill_x = ((size.w - pill_w) / 2.).round();
-        let pill_y = (size.h - MARGIN_BOTTOM - PILL_H).round();
+        let pill_x = (area.loc.x + (area.size.w - pill_w) / 2.).round();
+        let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - PILL_H).round();
         let pill = Rectangle::new(Point::from((pill_x, pill_y)), Size::from((pill_w, PILL_H)));
 
         let tile_top = pill_y + PILL_PAD_V;
@@ -216,8 +225,12 @@ impl Dash {
     /// Which element is under `pos` (logical, output coords), or `None`. Click
     /// targets extend down to the screen bottom edge (`padding-bottom`,
     /// `_dash.scss:47,55`); the pill's side pads are `Background`.
-    pub fn hit_test(&self, pos: Point<f64, Logical>, size: Size<f64, Logical>) -> Option<DashHit> {
-        let layout = self.layout(size);
+    pub fn hit_test(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<DashHit> {
+        let layout = self.layout(area);
         let pill = layout.pill;
         // On the dash iff within the pill's x-range and at/below its top edge.
         if pos.x < pill.loc.x || pos.x >= pill.loc.x + pill.size.w || pos.y < pill.loc.y {
@@ -242,13 +255,17 @@ impl Dash {
         })
     }
 
-    /// The logical center of tile `i` for an output of `size` — favorites are
+    /// The logical center of tile `i` within `area` — favorites are
     /// `[0, n)`, the trailing show-apps button is `[n]`. A geometry probe for the
     /// conformance corpus, which clicks real pixels routed through
     /// [`hit_test`](Self::hit_test). `None` if out of range.
     #[cfg(test)]
-    pub fn tile_center(&self, i: usize, size: Size<f64, Logical>) -> Option<Point<f64, Logical>> {
-        let layout = self.layout(size);
+    pub fn tile_center(
+        &self,
+        i: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let layout = self.layout(area);
         (i < layout.tiles.len()).then(|| layout.icon_center(i))
     }
 
@@ -273,14 +290,14 @@ impl Dash {
         app_icons: &AppIconCache,
         sym_icons: &IconCache,
         output: &Output,
+        area: Rectangle<f64, Logical>,
         progress: f64,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let Some(scale_key) = NotNan::new(scale).ok() else {
             return Vec::new();
         };
-        let size = output_size(output);
-        let layout = self.layout(size);
+        let layout = self.layout(area);
         let alpha = progress as f32;
 
         let mut cache = self.cache.borrow_mut();
@@ -424,28 +441,37 @@ mod tests {
         dash
     }
 
+    /// The box `overview_layout` allocates the dash on 1920×1080 with the 35px
+    /// panel strut: bottom-anchored, `PREFERRED_HEIGHT` tall.
+    fn box_1080() -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((0., 1080. - PREFERRED_HEIGHT)),
+            Size::from((1920., PREFERRED_HEIGHT)),
+        )
+    }
+
     /// Every tile's center hit-tests back to that tile; side pads are Background.
     #[test]
     fn hit_test_round_trips_layout() {
         let dash = dash_with(3);
-        let size = Size::from((1920., 1080.));
-        let layout = dash.layout(size);
+        let area = box_1080();
+        let layout = dash.layout(area);
         for i in 0..3 {
             assert_eq!(
-                dash.hit_test(layout.icon_center(i), size),
+                dash.hit_test(layout.icon_center(i), area),
                 Some(DashHit::Favorite(i))
             );
         }
         // The show-apps button is the trailing tile.
         assert_eq!(
-            dash.hit_test(layout.icon_center(3), size),
+            dash.hit_test(layout.icon_center(3), area),
             Some(DashHit::ShowApps)
         );
         // The pill's left padding is Background, not a favorite.
         let pad = Point::from((layout.pill.loc.x + 2., layout.pill.loc.y + PILL_H / 2.));
-        assert_eq!(dash.hit_test(pad, size), Some(DashHit::Background));
+        assert_eq!(dash.hit_test(pad, area), Some(DashHit::Background));
         // Well outside the pill: no hit.
-        assert_eq!(dash.hit_test(Point::from((10., 10.)), size), None);
+        assert_eq!(dash.hit_test(Point::from((10., 10.)), area), None);
     }
 
     /// The pill's top padding band (pill top → tile top) is non-reactive
@@ -453,15 +479,15 @@ mod tests {
     #[test]
     fn hit_test_top_padding_is_background() {
         let dash = dash_with(2);
-        let size = Size::from((1920., 1080.));
-        let layout = dash.layout(size);
+        let area = box_1080();
+        let layout = dash.layout(area);
         let cx = layout.icon_center(0).x;
         // 1px below the pill's top edge, over favorite 0's column: still padding.
         let top_band = Point::from((cx, layout.pill.loc.y + 1.));
-        assert_eq!(dash.hit_test(top_band, size), Some(DashHit::Background));
+        assert_eq!(dash.hit_test(top_band, area), Some(DashHit::Background));
         // Just inside the tile top it becomes the favorite.
         let tile_top = Point::from((cx, layout.pill.loc.y + PILL_PAD_V + 1.));
-        assert_eq!(dash.hit_test(tile_top, size), Some(DashHit::Favorite(0)));
+        assert_eq!(dash.hit_test(tile_top, area), Some(DashHit::Favorite(0)));
     }
 
     /// A favorites change clears the (positional) hover so a stale index can't
@@ -484,12 +510,12 @@ mod tests {
     #[test]
     fn hit_test_extends_to_screen_bottom() {
         let dash = dash_with(2);
-        let size = Size::from((1920., 1080.));
-        let layout = dash.layout(size);
+        let area = box_1080();
+        let layout = dash.layout(area);
         let cx = layout.icon_center(0).x;
         // A click at the very bottom edge, under favorite 0, still hits it.
         assert_eq!(
-            dash.hit_test(Point::from((cx, size.h - 1.)), size),
+            dash.hit_test(Point::from((cx, 1080. - 1.)), area),
             Some(DashHit::Favorite(0))
         );
     }
@@ -498,11 +524,11 @@ mod tests {
     #[test]
     fn empty_favorites_still_has_show_apps() {
         let dash = dash_with(0);
-        let size = Size::from((1920., 1080.));
-        let layout = dash.layout(size);
+        let area = box_1080();
+        let layout = dash.layout(area);
         assert_eq!(layout.tiles.len(), 1);
         assert_eq!(
-            dash.hit_test(layout.icon_center(0), size),
+            dash.hit_test(layout.icon_center(0), area),
             Some(DashHit::ShowApps)
         );
     }

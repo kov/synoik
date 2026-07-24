@@ -2,9 +2,10 @@
 //! (js/ui/workspaceThumbnail.js), as pure geometry.
 //!
 //! The strip shows every workspace as a miniature, horizontally centered in
-//! the band above the zoomed-out workspace row. With dynamic workspaces it
-//! only appears once there are more than [`NUM_WORKSPACES_THRESHOLD`]
-//! workspaces, i.e. once a second desktop is populated.
+//! the band [`crate::ui::overview_layout`] allocates it just below the search
+//! entry. With dynamic workspaces it only appears once there are more than
+//! [`NUM_WORKSPACES_THRESHOLD`] workspaces, i.e. once a second desktop is
+//! populated.
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -41,27 +42,42 @@ pub struct Strip {
     pub placeholder: Option<Rectangle<f64, Logical>>,
 }
 
-/// Lays out the strip: each thumbnail is the workspace at 5% scale (smaller
-/// if the row wouldn't fit the view width), the row horizontally centered,
-/// and vertically centered in the margin above the workspace row — between
-/// `top_inset` (the top panel's strut, so the strip clears the panel rather
-/// than being drawn under it) and `top_band`. A `placeholder` index makes room
-/// for the new-workspace drop placeholder before that thumbnail (gnome-shell's
-/// drop placeholder).
+/// The thumbnail scale: 5% of the view, shrinking below the cap once `n`
+/// thumbnails plus spacing no longer fit the width (gnome-shell's
+/// `vfunc_get_preferred_height`).
+fn thumb_scale(view_size: Size<f64, Logical>, n: usize) -> f64 {
+    let avail = view_size.w - SPACING * 2.;
+    f64::min(
+        (avail - SPACING * (n - 1) as f64) / (view_size.w * n as f64),
+        MAX_THUMBNAIL_SCALE,
+    )
+}
+
+/// How tall a band the strip needs — gnome-shell's
+/// `ThumbnailsBox.get_preferred_height`, which is what
+/// [`crate::ui::overview_layout`] allocates it.
+///
+/// Divergence: gnome-shell measures against the work-area porthole
+/// (`workspaceThumbnail.js:1248-1255`); our miniature is the whole view,
+/// including the strip under the top panel, so we measure against the view.
+pub fn preferred_height(view_size: Size<f64, Logical>, n: usize) -> f64 {
+    (view_size.h * thumb_scale(view_size, n)).round()
+}
+
+/// Lays out the strip inside its allocated `band`: each thumbnail is the
+/// workspace at 5% scale (smaller if the row wouldn't fit the view width),
+/// the row horizontally centered in the band and anchored to its top —
+/// gnome-shell allocates the box exactly `get_preferred_height` tall
+/// (`overviewControls.js:184-196`), so at rest the two coincide. A
+/// `placeholder` index makes room for the new-workspace drop placeholder
+/// before that thumbnail (gnome-shell's drop placeholder).
 pub fn strip_geometry(
     view_size: Size<f64, Logical>,
-    top_inset: f64,
-    top_band: f64,
+    band: Rectangle<f64, Logical>,
     n: usize,
     placeholder: Option<usize>,
 ) -> Strip {
-    // gnome-shell's get_preferred_height: the scale shrinks below the cap
-    // when n thumbnails plus spacing exceed the available width.
-    let avail = view_size.w - SPACING * 2.;
-    let scale = f64::min(
-        (avail - SPACING * (n - 1) as f64) / (view_size.w * n as f64),
-        MAX_THUMBNAIL_SCALE,
-    );
+    let scale = thumb_scale(view_size, n);
 
     let thumb_h = (view_size.h * scale).round();
     let thumb_w = (thumb_h * (view_size.w / view_size.h)).round();
@@ -69,9 +85,8 @@ pub fn strip_geometry(
 
     let extra = placeholder.map_or(0., |_| PLACEHOLDER_WIDTH + SPACING);
     let total_w = thumb_w * n as f64 + SPACING * (n - 1) as f64 + extra;
-    let x0 = ((view_size.w - total_w) / 2.).round();
-    // Center within the band between the panel strut and the workspace row.
-    let y = ((top_inset + top_band - thumb_h) / 2.).round();
+    let x0 = (band.loc.x + (band.size.w - total_w) / 2.).round();
+    let y = band.loc.y.round();
 
     let mut x = x0;
     let mut placeholder_rect = None;
@@ -171,42 +186,52 @@ mod tests {
         Size::from((1920., 1080.))
     }
 
+    /// The band [`crate::ui::overview_layout`] allocates for `n` thumbnails at
+    /// the 1920×1080 / 35px-strut reference: y = 35 + 58 + 13.
+    fn band(n: usize) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((0., 106.)),
+            Size::from((1920., preferred_height(view(), n))),
+        )
+    }
+
     #[test]
     fn three_thumbnails_at_the_gnome_cap() {
         // 5% of 1080 = 54 tall, 96 wide; row of three centered.
-        let strip = strip_geometry(view(), 0., 108., 3, None);
+        let strip = strip_geometry(view(), band(3), 3, None);
         assert_eq!(strip.scale, 54. / 1080.);
         let expected_x0 = (1920. - (96. * 3. + 8. * 2.)) / 2.;
         assert_eq!(
             strip.thumbs[0],
-            Rectangle::new(Point::from((expected_x0, 27.)), Size::from((96., 54.)))
+            Rectangle::new(Point::from((expected_x0, 106.)), Size::from((96., 54.)))
         );
         assert_eq!(strip.thumbs[1].loc.x, expected_x0 + 96. + 8.);
         assert_eq!(strip.thumbs[2].loc.x, expected_x0 + (96. + 8.) * 2.);
     }
 
+    /// The strip fills the band it was allocated, so the allocator is the only
+    /// thing that decides whether it clears the top panel. (Before the
+    /// `ControlsManagerLayout` port the strip centered itself in a band derived
+    /// from the workspace zoom and had to re-derive the panel strut itself.)
     #[test]
-    fn top_inset_pushes_the_strip_below_the_panel() {
-        // Without reserving the panel, a 54px-tall thumbnail centered in the 108px
-        // band sits at y=27 — overlapping a 32px top panel by 5px (the clip bug).
-        let clipped = strip_geometry(view(), 0., 108., 3, None);
-        assert!(clipped.thumbs[0].loc.y < 32.);
+    fn the_strip_fills_its_allocated_band() {
+        let strip = strip_geometry(view(), band(3), 3, None);
+        assert_eq!(preferred_height(view(), 3), 54.);
+        assert_eq!(strip.thumbs[0].loc.y, 106.);
+        assert_eq!(strip.thumbs[0].size.h, band(3).size.h);
 
-        // Reserving the panel strut centers the thumbnail in [32, 108] instead, so
-        // its top clears the panel: (32 + 108 - 54) / 2 = 43.
-        let strip = strip_geometry(view(), 32., 108., 3, None);
-        assert!(
-            strip.thumbs[0].loc.y >= 32.,
-            "the thumbnail must clear the 32px panel, got y={}",
-            strip.thumbs[0].loc.y,
-        );
-        assert_eq!(strip.thumbs[0].loc.y, 43.);
+        // Move the band and the whole row follows, with no re-centering.
+        let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., 54.)));
+        let strip = strip_geometry(view(), moved, 3, None);
+        assert_eq!(strip.thumbs[0].loc.y, 300.);
+        let total_w = 96. * 3. + 8. * 2.;
+        assert_eq!(strip.thumbs[0].loc.x, 40. + (800. - total_w) / 2.);
     }
 
     #[test]
     fn placeholder_spreads_the_thumbnails_apart() {
-        let at_rest = strip_geometry(view(), 0., 108., 3, None);
-        let strip = strip_geometry(view(), 0., 108., 3, Some(1));
+        let at_rest = strip_geometry(view(), band(3), 3, None);
+        let strip = strip_geometry(view(), band(3), 3, Some(1));
 
         let rect = strip
             .placeholder
@@ -226,14 +251,14 @@ mod tests {
 
         // A pointer over the placeholder still maps to the same insertion
         // point, so the hover is stable.
-        let center = Point::from((rect.loc.x + rect.size.w / 2., 40.));
+        let center = Point::from((rect.loc.x + rect.size.w / 2., 130.));
         assert_eq!(strip.drop_target(center), Some(DropTarget::NewAt(1)));
     }
 
     #[test]
     fn many_thumbnails_shrink_to_fit() {
         let n = 25;
-        let strip = strip_geometry(view(), 0., 108., n, None);
+        let strip = strip_geometry(view(), band(n), n, None);
         assert!(strip.scale < MAX_THUMBNAIL_SCALE);
         let bounds = strip.bounds();
         assert!(bounds.loc.x >= 0. && bounds.loc.x + bounds.size.w <= 1920.);
@@ -241,8 +266,8 @@ mod tests {
 
     #[test]
     fn drop_targets_split_thumbs_and_gaps() {
-        let strip = strip_geometry(view(), 0., 108., 3, None);
-        let y = 40.;
+        let strip = strip_geometry(view(), band(3), 3, None);
+        let y = 130.;
         let first = strip.thumbs[0];
         let second = strip.thumbs[1];
 

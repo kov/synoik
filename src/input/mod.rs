@@ -3000,13 +3000,13 @@ impl State {
         let overview_visible = self.niri.overview_ui_visible();
         let (dash_hit, search_hit) = if overview_visible {
             match self.niri.output_under(pos) {
-                Some((output, p)) => {
-                    let size = output_size(output);
-                    (
-                        self.niri.dash.hit_test(p, size),
-                        self.niri.overview_search.hit_test(p, size),
-                    )
-                }
+                Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {
+                    Some(controls) => (
+                        self.niri.dash.hit_test(p, controls.dash),
+                        self.niri.overview_search.hit_test(p, controls.into()),
+                    ),
+                    None => (None, None),
+                },
                 None => (None, None),
             }
         } else {
@@ -3573,9 +3573,10 @@ impl State {
                 // a lock-screen bypass). GNOME sidesteps this by dropping the overview from the
                 // lock/unlock session modes (`sessionMode.js`).
                 if self.niri.overview_ui_visible() {
-                    if let Some((output, pos)) = &under {
-                        let size = output_size(output);
-                        if let Some(hit) = self.niri.dash.hit_test(*pos, size) {
+                    if let Some((controls, pos)) = under.as_ref().and_then(|(output, pos)| {
+                        Some((self.niri.layout.controls_layout_for_output(output)?, pos))
+                    }) {
+                        if let Some(hit) = self.niri.dash.hit_test(*pos, controls.dash) {
                             self.niri.suppressed_buttons.insert(button_code);
                             if let DashHit::Favorite(i) = hit {
                                 if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
@@ -3599,7 +3600,8 @@ impl State {
                         // the overview; the clear glyph clears the query; the entry / card
                         // background are consumed inertly. Every button consumed on a hit (same
                         // fall-through reasoning as the dash).
-                        if let Some(hit) = self.niri.overview_search.hit_test(*pos, size) {
+                        if let Some(hit) = self.niri.overview_search.hit_test(*pos, controls.into())
+                        {
                             use crate::ui::overview_search::SearchHit;
                             self.niri.suppressed_buttons.insert(button_code);
                             match hit {

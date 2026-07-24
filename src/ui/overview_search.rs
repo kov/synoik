@@ -53,8 +53,8 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::overview_layout::ControlsLayout;
 use crate::ui::widget::{self, AppIcon, AppIconUploads, Entry, EntryHit, EntryLayout, Painter};
-use crate::utils::output_size;
 
 /// The built-in `AppSearchProvider` result cap (`this.maxResults = 6`,
 /// `appDisplay.js:1760`).
@@ -65,9 +65,15 @@ pub const MAX_RESULTS: usize = 6;
 const PLACEHOLDER: &str = "Type to search";
 /// Entry pill width, logical (`.search-entry` `width: 24em`; em = 11pt·4/3 ≈ 14.67px).
 const ENTRY_WIDTH: f64 = 352.;
-/// Entry top edge from the output top, logical — below the panel + `.search-entry`
-/// `margin-top: $base_padding*2` (12px). Hardcoded until S5's `ControlsManagerLayout`.
-const ENTRY_TOP: f64 = 48.;
+/// `.search-entry` `margin-top: $base_padding*2` (`_search-entry.scss:4`).
+const ENTRY_MARGIN_TOP: f64 = 12.;
+/// `.search-entry` `margin-bottom: $base_padding` (`_search-entry.scss:5`).
+const ENTRY_MARGIN_BOTTOM: f64 = 6.;
+
+/// What the search entry asks [`crate::ui::overview_layout`] for: the pill plus
+/// its margins, which is what gnome-shell's `searchEntryBin` reports as its
+/// preferred height (`overviewControls.js:165`).
+pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + Entry::HEIGHT + ENTRY_MARGIN_BOTTOM;
 
 /// Full-color app-icon side in a result tile, logical. S5-tunable (GNOME's app-grid
 /// `IconGrid` sizes this dynamically); 64 matches the dash.
@@ -86,9 +92,8 @@ const GRID_SPACING: f64 = 30.;
 const CARD_PAD: f64 = 12.;
 /// `.search-section-content` corner radius (`$modal_radius*1.5`=24).
 const CARD_RADIUS: f64 = 24.;
-/// Gap from the entry's bottom to the results card top (`.search-entry` `margin-bottom`
-/// 6 + `.search-section` `spacing` 18).
-const CARD_GAP: f64 = 24.;
+/// Gap from the top of the results strip to the card (`.search-section` `spacing`).
+const SECTION_SPACING: f64 = 18.;
 /// "No results" status text size (`.search-statustext` `%title_1` — 20pt/800).
 const STATUS_PT: f64 = 20.;
 /// Width of the empty-state ("No results") card — wide enough for the 20pt status
@@ -340,9 +345,15 @@ impl OverviewSearch {
         cache.glyphs.clear();
     }
 
-    /// Lay out the entry pill + (when active) the results card + tiles for an output.
-    fn layout(&self, size: Size<f64, Logical>) -> SearchLayout {
-        let entry = Entry::layout(size.w / 2., ENTRY_TOP, ENTRY_WIDTH);
+    /// Lay out the entry pill + (when active) the results card + tiles inside the
+    /// boxes [`crate::ui::overview_layout`] allocated: the entry bin at the top of
+    /// the work area, the results strip spanning everything between it and the dash.
+    fn layout(&self, area: SearchArea) -> SearchLayout {
+        let entry = Entry::layout(
+            area.entry.loc.x + area.entry.size.w / 2.,
+            area.entry.loc.y + ENTRY_MARGIN_TOP,
+            ENTRY_WIDTH,
+        );
 
         let active = self.is_active();
         let (card, tiles) = if !active {
@@ -357,8 +368,8 @@ impl OverviewSearch {
                 n * TILE_W + (n - 1.) * GRID_SPACING + 2. * CARD_PAD
             };
             let card_h = TILE_H + 2. * CARD_PAD;
-            let card_x = ((size.w - card_w) / 2.).round();
-            let card_y = (entry.pill.loc.y + Entry::HEIGHT + CARD_GAP).round();
+            let card_x = (area.results.loc.x + (area.results.size.w - card_w) / 2.).round();
+            let card_y = (area.results.loc.y + SECTION_SPACING).round();
             let card = Rectangle::new(Point::from((card_x, card_y)), Size::from((card_w, card_h)));
             let tiles = (0..self.results.len())
                 .map(|i| {
@@ -375,23 +386,20 @@ impl OverviewSearch {
         SearchLayout { entry, card, tiles }
     }
 
-    /// Which interactive element is under `pos` (logical, output coords) — only while
-    /// a search is **active**. While inactive the entry is a passive hint and clicks
-    /// pass straight through: until S5's `ControlsManagerLayout` the hardcoded entry
-    /// position overlaps the workspace thumbnail strip, and an always-on hit region
-    /// would eat thumbnail clicks. Once active the pill is an opaque drawn control, so
-    /// its *body* consumes inertly ([`SearchHit::Background`]) — a visible control must
-    /// never actuate the hidden thumbnail behind it.
-    pub fn hit_test(
-        &self,
-        pos: Point<f64, Logical>,
-        size: Size<f64, Logical>,
-    ) -> Option<SearchHit> {
-        if !self.is_active() {
-            return None;
-        }
-        let layout = self.layout(size);
-        match Entry::hit(&layout.entry, pos, true) {
+    /// Which interactive element is under `pos` (logical, output coords).
+    ///
+    /// The entry pill is a visible, opaque control whether or not a search is
+    /// active, so it always consumes: its body is inert
+    /// ([`SearchHit::Background`]) rather than falling through to the workspace
+    /// behind it, which would leave the overview. The clear icon only exists
+    /// while there is something to clear.
+    ///
+    /// Divergence: gnome-shell focuses the entry on that click; we have no
+    /// click-to-focus yet, and typing engages the search from anywhere in the
+    /// overview regardless.
+    pub fn hit_test(&self, pos: Point<f64, Logical>, area: SearchArea) -> Option<SearchHit> {
+        let layout = self.layout(area);
+        match Entry::hit(&layout.entry, pos, self.is_active()) {
             Some(EntryHit::Clear) => return Some(SearchHit::Clear),
             Some(EntryHit::Field) => return Some(SearchHit::Background),
             None => {}
@@ -408,19 +416,18 @@ impl OverviewSearch {
         Some(SearchHit::Background)
     }
 
-    /// The entry pill box for an output of `size` — a geometry probe for the render
-    /// test.
+    /// The entry pill box — a geometry probe for the render test.
     #[cfg(test)]
-    pub fn entry_pill(&self, size: Size<f64, Logical>) -> Rectangle<f64, Logical> {
-        self.layout(size).entry.pill
+    pub fn entry_pill(&self, area: SearchArea) -> Rectangle<f64, Logical> {
+        self.layout(area).entry.pill
     }
 
-    /// The logical center of result tile `i` for an output of `size` — a geometry
-    /// probe for the conformance corpus (which clicks real pixels routed through
+    /// The logical center of result tile `i` — a geometry probe for the
+    /// conformance corpus (which clicks real pixels routed through
     /// [`hit_test`](Self::hit_test)). `None` if out of range.
     #[cfg(test)]
-    pub fn result_center(&self, i: usize, size: Size<f64, Logical>) -> Option<Point<f64, Logical>> {
-        let layout = self.layout(size);
+    pub fn result_center(&self, i: usize, area: SearchArea) -> Option<Point<f64, Logical>> {
+        let layout = self.layout(area);
         layout
             .tiles
             .get(i)
@@ -436,11 +443,11 @@ impl OverviewSearch {
         app_icons: &AppIconCache,
         sym_icons: &IconCache,
         output: &Output,
+        area: SearchArea,
         progress: f64,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
-        let size = output_size(output);
-        let layout = self.layout(size);
+        let layout = self.layout(area);
         let alpha = progress as f32;
 
         let mut cache = self.cache.borrow_mut();
@@ -673,6 +680,26 @@ impl OverviewSearch {
 use widget::style;
 
 /// Computed geometry for one output size.
+/// The two boxes [`crate::ui::overview_layout`] allocates the search: the entry
+/// bin at the top of the work area, and the results strip spanning everything
+/// between the entry and the dash (gnome-shell's `searchController`, which
+/// overlaps the thumbnails and the picker rather than carving space out of
+/// them — `overviewControls.js:242-245`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchArea {
+    pub entry: Rectangle<f64, Logical>,
+    pub results: Rectangle<f64, Logical>,
+}
+
+impl From<ControlsLayout> for SearchArea {
+    fn from(l: ControlsLayout) -> Self {
+        Self {
+            entry: l.search_entry,
+            results: l.search_results,
+        }
+    }
+}
+
 struct SearchLayout {
     entry: EntryLayout,
     /// The results card (`None` when search inactive).
@@ -810,36 +837,60 @@ mod tests {
         );
     }
 
+    /// The boxes `overview_layout` allocates the search on 1920×1080 with the
+    /// 35px panel strut.
+    fn area_1080() -> SearchArea {
+        let controls = crate::ui::overview_layout::layout(
+            Size::from((1920., 1080.)),
+            35.,
+            PREFERRED_ENTRY_HEIGHT,
+            crate::ui::dash::PREFERRED_HEIGHT,
+            54.,
+            1.,
+        );
+        controls.into()
+    }
+
+    /// The entry pill is opaque whether or not a search is active, so it always
+    /// consumes its own clicks — falling through would hit the workspace behind
+    /// it and leave the overview. Only the clear glyph and the result tiles act.
     #[test]
-    fn hit_test_inactive_passes_through_active_entry_consumes() {
+    fn entry_body_consumes_inactive_and_active() {
         let mut s = OverviewSearch::new();
-        let size = Size::from((1920., 1080.));
-        let layout = s.layout(size);
+        let area = area_1080();
+        let layout = s.layout(area);
         let entry_center = Point::from((
             layout.entry.pill.loc.x + ENTRY_WIDTH / 2.,
             layout.entry.pill.loc.y + Entry::HEIGHT / 2.,
         ));
-        // Inactive: nothing is hittable — the entry is a passive hint, so clicks pass
-        // through to the thumbnail strip it overlaps pre-S5.
-        assert_eq!(s.hit_test(entry_center, size), None);
+        assert_eq!(
+            s.hit_test(entry_center, area),
+            Some(SearchHit::Background),
+            "the idle entry pill must consume rather than fall through"
+        );
+        // No query yet, so there is nothing to clear: that glyph is not live.
+        assert_eq!(
+            s.hit_test(layout.entry.secondary_icon, area),
+            Some(SearchHit::Background)
+        );
+        // Well away from the entry: no hit at all.
+        assert_eq!(s.hit_test(Point::from((10., 600.)), area), None);
 
-        // Active: the entry is an opaque drawn pill, so its body must CONSUME (never
-        // actuate the hidden thumbnail behind it); the clear glyph and tiles are live.
         s.handle_key(None, Some('a'), true);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        let layout = s.layout(size);
+        let layout = s.layout(area);
         assert_eq!(
-            s.hit_test(entry_center, size),
+            s.hit_test(entry_center, area),
             Some(SearchHit::Background),
             "an active (opaque) entry body must consume its own clicks"
         );
         assert_eq!(
-            s.hit_test(layout.entry.secondary_icon, size),
+            s.hit_test(layout.entry.secondary_icon, area),
             Some(SearchHit::Clear)
         );
         let t0 = layout.tiles[0];
         let tc = Point::from((t0.loc.x + t0.size.w / 2., t0.loc.y + t0.size.h / 2.));
-        assert_eq!(s.hit_test(tc, size), Some(SearchHit::Result(0)));
+        assert_eq!(s.hit_test(tc, area), Some(SearchHit::Result(0)));
     }
 
     /// A modified key (Ctrl/Alt/Super held) must never act as its bare self: Ctrl+Escape
@@ -874,8 +925,10 @@ mod tests {
     fn empty_results_card_is_wide_enough_for_the_status_text() {
         let mut s = OverviewSearch::new();
         s.handle_key(None, Some('z'), true);
-        let size = Size::from((1920., 1080.));
-        let card = s.layout(size).card.expect("an active search has a card");
+        let card = s
+            .layout(area_1080())
+            .card
+            .expect("an active search has a card");
         assert!(
             card.size.w >= STATUS_CARD_W,
             "the No-results card must fit its status text, got {}",

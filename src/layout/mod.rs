@@ -68,6 +68,7 @@ use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
+use crate::ui::overview_layout::ControlsLayout;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
     ensure_min_max_size_maybe_zero, output_matches_name, output_size,
@@ -2377,7 +2378,7 @@ impl<W: LayoutElement> Layout<W> {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.output == *output {
                 if self.overview_progress.is_some() {
-                    let zoom = self.overview_zoom();
+                    let zoom = self.overview_zoom_for_output(output);
                     let tile_pos = move_.tile_render_location(zoom);
                     let pos_within_tile = (pos_within_output - tile_pos).downscale(zoom);
                     // During the overview animation, we cannot do input hits because we cannot
@@ -2446,9 +2447,29 @@ impl<W: LayoutElement> Layout<W> {
         mon.thumbnail_workspace_under(pos_within_output)
     }
 
-    pub fn overview_zoom(&self) -> f64 {
-        let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+    /// The workspace zoom on an output. In GNOME mode the fully-zoomed-out
+    /// size follows that monitor's overview chrome, so this is per-output
+    /// rather than a layout-wide constant.
+    pub fn overview_zoom_for_output(&self, output: &Output) -> f64 {
+        let Some(mon) = self.monitor_for_output(output) else {
+            return 1.;
+        };
+        mon.overview_zoom()
+    }
+
+    /// The workspace zoom on the output an interactive move is happening on
+    /// (1 when nothing is being dragged).
+    fn interactive_move_zoom(&self) -> f64 {
+        let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move else {
+            return 1.;
+        };
+        self.overview_zoom_for_output(&move_.output)
+    }
+
+    /// The allocated boxes of the overview chrome on an output
+    /// (gnome-shell's `ControlsManagerLayout`).
+    pub fn controls_layout_for_output(&self, output: &Output) -> Option<ControlsLayout> {
+        Some(self.monitor_for_output(output)?.controls_layout())
     }
 
     #[cfg(test)]
@@ -2457,7 +2478,7 @@ impl<W: LayoutElement> Layout<W> {
 
         use approx::assert_abs_diff_eq;
 
-        let zoom = self.overview_zoom();
+        let zoom = self.interactive_move_zoom();
 
         let mut move_win_id = None;
         if let Some(state) = &self.interactive_move {
@@ -2865,7 +2886,7 @@ impl<W: LayoutElement> Layout<W> {
 
         self.update_render_elements_time = self.clock.now();
 
-        let zoom = self.overview_zoom();
+        let zoom = self.interactive_move_zoom();
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if output.is_none_or(|output| move_.output == *output) {
                 let pos_within_output = move_.tile_render_location(zoom);
@@ -3814,15 +3835,14 @@ impl<W: LayoutElement> Layout<W> {
         timestamp: Duration,
         is_touchpad: bool,
     ) -> Option<Option<Output>> {
-        let zoom = self.overview_zoom();
-        let delta_x = delta_x / zoom;
-
         let monitors = match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => monitors,
             MonitorSet::NoOutputs { .. } => return None,
         };
 
         for monitor in monitors {
+            // The zoom follows each monitor's own overview chrome.
+            let delta_x = delta_x / monitor.overview_zoom();
             for ws in &mut monitor.workspaces {
                 if let Some(refresh) =
                     ws.view_offset_gesture_update(delta_x, timestamp, is_touchpad)
@@ -4034,7 +4054,7 @@ impl<W: LayoutElement> Layout<W> {
                     return false;
                 }
 
-                let zoom = self.overview_zoom();
+                let zoom = self.overview_zoom_for_output(&output);
                 let delta = delta.downscale(zoom);
 
                 pointer_delta += delta;
@@ -4930,7 +4950,7 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::store_unmap_snapshot");
 
-        let zoom = self.overview_zoom();
+        let zoom = self.interactive_move_zoom();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -5023,7 +5043,7 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let _span = tracy_client::span!("Layout::start_close_animation_for_window");
 
-        let zoom = self.overview_zoom();
+        let zoom = self.interactive_move_zoom();
 
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
@@ -5095,7 +5115,7 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
-        let zoom = self.overview_zoom();
+        let zoom = self.overview_zoom_for_output(output);
         // In the GNOME overview the drag carries the picker preview: the
         // tile keeps the on-screen footprint it was picked up at.
         let render_scale = zoom * move_.expose_extra_scale(zoom);
@@ -5313,21 +5333,10 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
     }
 }
 
-/// How large the active workspace is in the GNOME overview's window-picker
-/// state: gnome-shell fits it by height between the search entry and the
-/// dash, which works out to roughly this fraction of the monitor. We have no
-/// top/bottom chrome yet, so the fraction is fixed here.
-const GNOME_OVERVIEW_WORKSPACE_SCALE: f64 = 0.8;
-
-fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
-    let zoom = if options.layout.windowing_mode == WindowingMode::Floating {
-        // GNOME's overview geometry is by design, not configuration.
-        GNOME_OVERVIEW_WORKSPACE_SCALE
-    } else {
-        // Clamp to some sane values.
-        options.overview.zoom.clamp(0.0001, 0.75)
-    };
-
+/// Interpolates the workspace zoom from 1 (overview closed) to `zoom` (fully
+/// zoomed out) along the overview progress. What `zoom` itself is depends on
+/// the mode — see [`Monitor::zoom_at`].
+fn compute_overview_zoom(zoom: f64, overview_progress: Option<f64>) -> f64 {
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)
     } else {

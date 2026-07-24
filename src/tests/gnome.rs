@@ -1822,12 +1822,12 @@ fn overview_spreads_windows_into_picker_slots() {
     );
 }
 
-/// GNOME (40+) overview geometry: workspaces form a horizontal row with the
-/// active one centered at 85% of the monitor (gnome-shell WorkspacesView).
-/// The picker slot of a lone window pins both the workspace scale and its
-/// centering.
+/// GNOME overview geometry (gnome-shell `ControlsManagerLayout`): the workspace
+/// row is fit by height into the window-picker box the overview chrome leaves
+/// over — it is *not* centered in the output, and the scale is not a constant.
+/// The picker slot of a lone window pins both the box and the scale it implies.
 #[test]
-fn overview_workspace_is_centered_at_gnome_scale() {
+fn overview_workspace_fills_its_allocated_picker_box() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
@@ -1838,21 +1838,157 @@ fn overview_workspace_is_centered_at_gnome_scale() {
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
-    // Workspace-local slot (see expose::tests): 760 × 570 centered in the
-    // work area — the top panel insets it to 1920×1045, so the slot sits at
-    // (580, 35 + (1045-570)/2) = (580, 272) — then through zoom 0.8 with the
-    // workspace miniature centered at (192, 108) (that uses the full view size,
-    // so it is unshifted).
+    // Two workspaces (active + trailing empty) is at the strip threshold, so no
+    // thumbnails band is reserved. Work area 1045 tall ⇒ spacing round(20.9) = 21,
+    // round(21·0.6) = 13 above the (zero-height) band; the picker box is then
+    //   y = 35 + 58 + 13                                = 106
+    //   h = 1045 − 112(dash) − 21 − 58(entry) − 13     = 841
+    let controls = overview_controls(&mut f);
+    assert_eq!(controls.workspaces.loc.y, 106.);
+    assert_eq!(controls.workspaces.size.h, 841.);
+
+    // The row is fit by height into that box, and centered on what width is left.
+    let zoom: f64 = 841. / 1080.;
+    let ws_w = (1920. * zoom).ceil(); // 1496
+    let offset_x = ((1920. - ws_w) / 2.).round(); // 212
+
+    // Workspace-local slot (see expose::tests): 760 × 570 centered in the work
+    // area — the top panel insets it to 1920×1045, so the slot sits at
+    // (580, 35 + (1045−570)/2) = (580, 272).
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (192. + 580. * 0.8, 108. + 271. * 0.8),
-        "picker slot must reflect the centered 0.8-scale workspace",
+        (offset_x + 580. * zoom, 106. + 272. * zoom),
+        "picker slot must sit in the allocated window-picker box",
     );
     assert!(
-        (rect.size.w - 760. * 0.8).abs() <= 1. && (rect.size.h - 570. * 0.8).abs() <= 1.,
+        (rect.size.w - 760. * zoom).abs() <= 1. && (rect.size.h - 570. * zoom).abs() <= 1.,
         "picker slot size must scale by the workspace zoom, got {rect:?}"
     );
+}
+
+/// The workspace row lands on its picker box only when the overview is fully
+/// open; closed it covers the output exactly (a pointer against the screen edge
+/// at y = 0 must still hit it), and it travels between the two continuously.
+/// gnome-shell gets this by interpolating its `HIDDEN` and `WINDOW_PICKER`
+/// boxes (`overviewControls.js:207-216`); anchoring the row at the picker box
+/// outright would make every overview open/close jump.
+#[test]
+fn overview_workspace_offset_interpolates_out_of_the_desktop() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    let row_y = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .workspaces_render_geo()
+            .next()
+            .unwrap()
+            .loc
+            .y
+    };
+
+    // Closed: exactly on the desktop.
+    assert_eq!(row_y(&mut f), 0.);
+
+    tap(&mut f, KEY_LEFTMETA);
+    // Mid-animation: strictly between the desktop and the picker box.
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+    let box_y = overview_controls(&mut f).workspaces.loc.y;
+    let mid = row_y(&mut f);
+    assert!(
+        mid > 0. && mid < box_y,
+        "mid-open the row must be travelling toward the picker box, got y={mid} (box {box_y})"
+    );
+
+    f.settle_animations();
+    assert_eq!(row_y(&mut f), box_y);
+
+    // And all the way back down on close.
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    assert_eq!(row_y(&mut f), 0.);
+}
+
+/// The thumbnails strip fills the band the overview layout allocates it, just
+/// below the search entry — not a band derived from the workspace zoom.
+#[test]
+fn overview_thumbnail_strip_fills_its_allocated_band() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let band = overview_controls(&mut f).thumbnails;
+    // 35 + 58 + round(21 × 0.6) = 106, and 1080 × MAX_THUMBNAIL_SCALE = 54.
+    assert_eq!((band.loc.y, band.size.h), (106., 54.));
+
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let strip = mon
+        .expect("workspaces must be on a monitor")
+        .thumbnail_strip()
+        .expect("three workspaces must show the strip");
+    assert_eq!(strip.thumbs[0].loc.y, band.loc.y);
+    assert_eq!(strip.thumbs[0].size.h, band.size.h);
+    assert!(
+        strip.thumbs[0].loc.y >= crate::ui::panel::PANEL_HEIGHT,
+        "the strip must clear the top panel, got y={}",
+        strip.thumbs[0].loc.y
+    );
+}
+
+/// The picker box contains the thumbnails band, so the workspace zoom depends on
+/// whether the strip is showing. Crossing the strip threshold happens *inside*
+/// the overview (drag a window onto the trailing empty desktop), so gnome-shell
+/// eases `ThumbnailsBox.expandFraction` (`overviewControls.js:358-366`) and the
+/// picker follows continuously instead of popping.
+#[test]
+fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    // Two workspaces: no band, so the picker has the whole space.
+    let collapsed = overview_controls(&mut f).workspaces;
+    assert_eq!(collapsed.size.h, 841.);
+
+    // Populate a second desktop, which brings the strip in. The ease starts on
+    // the next frame, so advance once to arm it and once more to sample it.
+    f.niri().layout.move_to_workspace_down(true);
+    f.niri().advance_animations();
+
+    // Mid-expand the picker must be strictly between the two resting boxes —
+    // never at either end, which is what a popped (un-eased) flip would give.
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+    let mid = overview_controls(&mut f).workspaces;
+    assert!(
+        mid.size.h < collapsed.size.h && mid.size.h > 779.,
+        "mid-expand picker height must be between the two rest states, got {}",
+        mid.size.h
+    );
+    assert!(mid.loc.y > collapsed.loc.y && mid.loc.y < 168.);
+
+    // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
+    f.settle_animations();
+    let expanded = overview_controls(&mut f).workspaces;
+    assert_eq!((expanded.loc.y, expanded.size.h), (168., 779.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a
@@ -4868,15 +5004,25 @@ fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLau
     (f, recorder)
 }
 
-/// The center of dash tile `i` in the 1920×1080 output's logical coords.
+/// The overview chrome's allocated boxes on output 1 — the same
+/// `ControlsManagerLayout` the render and input paths consume.
+fn overview_controls(f: &mut Fixture) -> crate::ui::overview_layout::ControlsLayout {
+    let output = f.niri_output(1);
+    f.niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor")
+}
+
+/// The center of dash tile `i` in output 1's logical coords.
 fn dash_tile_center(
     f: &mut Fixture,
     i: usize,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
-    let size = smithay::utils::Size::from((1920., 1080.));
+    let area = overview_controls(f).dash;
     f.niri()
         .dash
-        .tile_center(i, size)
+        .tile_center(i, area)
         .expect("tile index in range")
 }
 
@@ -5195,11 +5341,11 @@ fn overview_search_click_result_launches() {
     let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop"]]);
     tap(&mut f, KEY_A);
 
-    let size = smithay::utils::Size::from((1920., 1080.));
+    let area = overview_controls(&mut f).into();
     let center = f
         .niri()
         .overview_search
-        .result_center(1, size)
+        .result_center(1, area)
         .expect("result tile 1");
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -5281,18 +5427,45 @@ fn overview_search_space_first_stays_inactive() {
     );
 }
 
-/// While a search is active the entry pill is an opaque drawn control, so a click on
-/// its body must be CONSUMED — never fall through to whatever it overlaps (pre-S5 the
-/// hardcoded entry position sits over the workspace thumbnail strip, where a
-/// fall-through would switch workspace or close the overview, discarding the search).
+/// The idle entry pill is drawn too, so it consumes its clicks the same way: a
+/// fall-through would land on the workspace behind it and leave the overview.
+/// (gnome-shell focuses the entry on that click; we have no click-to-focus, but
+/// the click must still not escape.)
+#[test]
+fn overview_search_idle_entry_body_consumes_clicks() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop"]]);
+    assert!(!f.niri().overview_search.is_active());
+
+    let area = overview_controls(&mut f).into();
+    let pill = f.niri().overview_search.entry_pill(area);
+    let center = (pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.);
+
+    f.pointer_motion(center.0, center.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a click on the idle entry must not fall through and close the overview"
+    );
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "clicking the entry must not launch anything"
+    );
+}
+
+/// The entry pill is an opaque drawn control, so a click on its body must be
+/// CONSUMED — never fall through to the workspace behind it, which would leave the
+/// overview and discard the search.
 #[test]
 fn overview_search_active_entry_body_consumes_clicks() {
     let (mut f, recorder) = search_overview(&[&["a.desktop"]]);
     tap(&mut f, KEY_A);
     assert!(f.niri().overview_search.is_active());
 
-    let size = smithay::utils::Size::from((1920., 1080.));
-    let pill = f.niri().overview_search.entry_pill(size);
+    let area = overview_controls(&mut f).into();
+    let pill = f.niri().overview_search.entry_pill(area);
     let center = (pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.);
 
     f.pointer_motion(center.0, center.1);

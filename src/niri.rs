@@ -4394,8 +4394,9 @@ impl Niri {
         // banner). Its own clicks/hover are handled in the input path.
         if self.layout.is_overview_open()
             && self
-                .dash
-                .hit_test(pos_within_output, output_size(output))
+                .layout
+                .controls_layout_for_output(output)
+                .and_then(|l| self.dash.hit_test(pos_within_output, l.dash))
                 .is_some()
         {
             return rv;
@@ -5488,16 +5489,17 @@ impl Niri {
             }
             // The overview dash (favorites) fades in with the overview — above the
             // zoomed workspaces (pushed later, below), below the panel/popover/banner.
-            if let Some(progress) = self
+            if let Some((progress, controls)) = self
                 .layout
                 .monitor_for_output(output)
-                .and_then(|mon| mon.expose_progress())
+                .and_then(|mon| Some((mon.expose_progress()?, mon.controls_layout())))
             {
                 for element in self.dash.render(
                     ctx.renderer,
                     &self.app_icon_cache,
                     &self.icon_cache,
                     output,
+                    controls.dash,
                     progress,
                 ) {
                     push(element.into());
@@ -5509,6 +5511,7 @@ impl Niri {
                     &self.app_icon_cache,
                     &self.icon_cache,
                     output,
+                    controls.into(),
                     progress,
                 ) {
                     push(element.into());

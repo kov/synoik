@@ -6160,9 +6160,13 @@ fn vulkan_dash_hover_lightens_the_tile() {
     f.niri().sync_dash_favorites();
     f.niri().dash.set_hovered(Some(DashHit::Favorite(0)));
 
-    let size = smithay::utils::Size::<f64, Logical>::from((1920., 1080.));
-    let c0 = f.niri().dash.tile_center(0, size).expect("tile 0");
-    let c1 = f.niri().dash.tile_center(1, size).expect("tile 1");
+    let controls = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let c0 = f.niri().dash.tile_center(0, controls.dash).expect("tile 0");
+    let c1 = f.niri().dash.tile_center(1, controls.dash).expect("tile 1");
 
     let state = f.niri_state();
     let composited = state.backend.headless().with_vulkan_renderer(
@@ -6170,9 +6174,14 @@ fn vulkan_dash_hover_lightens_the_tile() {
             let niri = &mut state.niri;
             // Render the dash directly at full opacity — this pins the bake, not the
             // overview open animation (whose progress is subject to the headless clock).
-            let elements =
-                niri.dash
-                    .render(vk, &niri.app_icon_cache, &niri.icon_cache, &output, 1.0);
+            let elements = niri.dash.render(
+                vk,
+                &niri.app_icon_cache,
+                &niri.icon_cache,
+                &output,
+                controls.dash,
+                1.0,
+            );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
             // First element is topmost, so composite back-to-front (pill under icons).
@@ -6256,17 +6265,22 @@ fn vulkan_overview_search_draws_entry_and_selection() {
         ]);
     }
 
-    let size = smithay::utils::Size::<f64, Logical>::from((1920., 1080.));
-    let pill = f.niri().overview_search.entry_pill(size);
+    let controls = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let area: crate::ui::overview_search::SearchArea = controls.into();
+    let pill = f.niri().overview_search.entry_pill(area);
     let c0 = f
         .niri()
         .overview_search
-        .result_center(0, size)
+        .result_center(0, area)
         .expect("tile 0");
     let c1 = f
         .niri()
         .overview_search
-        .result_center(1, size)
+        .result_center(1, area)
         .expect("tile 1");
 
     let state = f.niri_state();
@@ -6278,6 +6292,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                 &niri.app_icon_cache,
                 &niri.icon_cache,
                 &output,
+                area,
                 1.0,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;

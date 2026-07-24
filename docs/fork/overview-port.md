@@ -271,10 +271,45 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   Pins: 12 conformance tests (`overview_search_*`) + 12 `overview_search.rs` unit tests + a Vulkan
   render test (entry pill fill = `ENTRY_BG`, selected tile lighter than unselected). **Not yet
   live-validated.**
-- **S5 — Overview chrome layout (`ControlsManager` port).** Formalize placement: search-entry-top,
-  dash-bottom, results-replace-picker, driven by an `OverviewAdjustment` analogue; wire
-  `search-active` visibility. (S3/S4 may hardcode positions; S5 makes the layout faithful and is the
-  seam APP_GRID needs.)
+- **S5a — Overview chrome layout (`ControlsManagerLayout` port). ✅ DONE.**
+  `src/ui/overview_layout.rs`: a pure-geometry port of `ControlsManagerLayout.vfunc_allocate`
+  (`overviewControls.js:155-248`) — every control gets an allocated box computed top-down from the
+  work area, with gnome-shell's ratios verbatim (`DASH_MAX_HEIGHT_RATIO` 0.16, `VERTICAL_SPACING_RATIO`
+  0.02, thumbnails spacing adjustments 0.6/0.4). `Monitor::controls_layout()` is the single accessor;
+  the dash, search entry, results card and thumbnail strip all consume boxes instead of hardcoded
+  anchors, and the strip's *duplicate* panel-strut derivation is gone (one work area, one allocator).
+  The measured heights are published by their owners (`dash::PREFERRED_HEIGHT`,
+  `overview_search::PREFERRED_ENTRY_HEIGHT`, `thumbnails::preferred_height`), standing in for
+  gnome-shell's St theme-node lookups.
+  **The window picker is expressed through zoom + offset, not a sub-rect**: `GNOME_OVERVIEW_WORKSPACE_SCALE`
+  (the fixed 0.8) is gone — the zoom target is now `picker_box.h / view_size.h`, so it follows the
+  chrome, and the workspace row's vertical offset interpolates 0 → `picker_box.y` on the overview
+  progress (gnome-shell blends its `HIDDEN` and `WINDOW_PICKER` boxes the same way,
+  `overviewControls.js:207-216`). Anchoring the row at the box outright would make every overview
+  open/close jump and break the "active workspace at y = 0 exactly" pointer guarantee. Zoom is
+  therefore per-monitor: `Layout::overview_zoom()` → `overview_zoom_for_output()`, and the workspace
+  strip's `from_zoom` continuity derivation goes through `Monitor::zoom_at(progress)` so both ends use
+  the same target. The DnD edge-scroll cross-axis band now comes from the same static offset rather
+  than assuming a centered row.
+  **`ThumbnailsBox.expandFraction` is ported as a real animation** (`overviewControls.js:358-366`):
+  the picker box contains the thumbnails band, and the strip threshold is crossed *inside* the
+  overview (drag onto the trailing desktop), so an un-eased flip would pop the zoom.
+  S4's inactive-entry click-through hack is deleted: with real boxes the entry no longer overlaps the
+  strip, and a pass-through would instead land on the workspace and leave the overview — so the pill
+  consumes inertly whether or not a search is active.
+  Divergences recorded in the module docs: thumbnails measured against the view rather than
+  gnome-shell's work-area porthole (54px vs 52 at 1080p); no `Dash._adjustIconSize`, so a capped dash
+  box overflows instead of shrinking icons; the strip folds its expand into the existing slide rather
+  than easing its own box height; `ControlsState::AppGrid` boxes deferred to S8.
+  Pins: 6 `overview_layout.rs` unit tests (the full reference table at two resolutions, the collapsed
+  and half-expanded variants, the dash cap) + re-pinned `thumbnails.rs` band tests + 5 conformance
+  tests, including the mid-animation offset guard and the mid-expand picker continuity.
+  **Not yet live-validated.**
+- **S5b — `search-active` cross-fade.** Fade the picker and thumbnails out and the results in
+  (`_onSearchChanged`, `overviewControls.js:609-643`: opacity-only eases, 250ms `EASE_OUT_QUAD`, with
+  `visible`/`reactive` flipped in `onComplete`), via a second continuous adjustment and
+  `OffscreenRenderElement::with_alpha`. Also makes the faded-out picker/thumbnails non-reactive, which
+  is what stops a click during an active search from hitting a preview behind the results card.
 - **S6 — Running apps + running dots.** window `app_id`/WM_CLASS → `.desktop` matching (StartupWMClass
   rules); `get_running()` feeds dash trailing icons + the `AppIcon` running dot; `dash-separator`
   between favorites and running. Conformance test the matching table.
