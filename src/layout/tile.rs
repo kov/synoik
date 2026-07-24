@@ -476,9 +476,20 @@ impl<W: LayoutElement> Tile<W> {
         let animated_tile_size = self.animated_tile_size();
         let expanded_progress = self.expanded_progress();
 
-        let draw_border_with_background = rules
-            .draw_border_with_background
-            .unwrap_or_else(|| !self.window.has_ssd());
+        // Never paint a filled backdrop behind the window.
+        //
+        // niri defaulted this to `!has_ssd()`, i.e. ON for every CSD client — which is every
+        // modern Wayland app. With the border off (our default) it falls through to the focus
+        // ring at the bottom of this function, so the *focused* window got an opaque rect over
+        // its whole geometry, silently destroying client translucency: a 50%-opacity terminal
+        // measured a flat, zero-variance backdrop while focused and blended correctly the moment
+        // it lost focus (and in the overview, which draws no focus ring). GNOME has no such
+        // chrome, so there is nothing this can be right for.
+        //
+        // The window focus ring and border are niri-isms slated for removal outright; until then
+        // this keeps them from occluding anything. Note `FocusRing` the *type* stays either way —
+        // `ui::mru` and the overview's workspace thumbnails reuse it as a rounded-rect helper.
+        let draw_border_with_background = rules.draw_border_with_background.unwrap_or(false);
         let border_width = self.visual_border_width().unwrap_or(0.);
 
         // Do the inverse of tile_size() in order to handle the unfullscreen animation for windows
