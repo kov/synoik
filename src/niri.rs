@@ -1146,8 +1146,11 @@ impl State {
         // After the focus update, so the running order sees this cycle's focus
         // timestamps. Re-snapshots unconditionally and only reports a change —
         // like the keyboard-layout indicator below, that costs one window walk and
-        // needs no invalidation bookkeeping.
-        self.niri.sync_running_apps();
+        // needs no invalidation bookkeeping. A change redisplays the dash
+        // (GNOME's `_queueRedisplay` on `app-state-changed`, `dash.js:381`).
+        if self.niri.sync_running_apps() && self.niri.sync_dash_favorites() {
+            self.niri.queue_redraw_all();
+        }
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -8077,21 +8080,42 @@ impl Niri {
         }
     }
 
-    /// Snapshot the app catalog's favorites into the dash (GNOME's dash
-    /// `_queueRedisplay` on `AppFavorites`/`installed-changed`). Returns whether the
-    /// dash changed.
+    /// Snapshot the app catalog into the dash (GNOME's `Dash._redisplay`,
+    /// `dash.js:677-699`): every favorite, then every running app that is not
+    /// already a favorite, each flagged with whether it is running. Returns whether
+    /// the dash changed.
     pub fn sync_dash_favorites(&mut self) -> bool {
-        let favorites = self
-            .app_system
-            .favorites()
+        let favorites = self.app_system.favorites();
+        let n_favorites = favorites.len();
+
+        let mut items: Vec<DashEntry> = favorites
             .into_iter()
             .map(|e| DashEntry {
+                running: self.app_system.is_running(&e.id),
                 id: e.id,
                 name: e.name,
                 icon: e.icon,
             })
             .collect();
-        self.dash.set_favorites(favorites)
+
+        // Running non-favorites follow, in `get_running()` order.
+        for app in self.app_system.running() {
+            if items.iter().any(|item| item.id == app.id) {
+                continue;
+            }
+            // A running app that no longer resolves (uninstalled under us) is
+            // skipped rather than drawn iconless.
+            if let Some(entry) = self.app_system.lookup(&app.id) {
+                items.push(DashEntry {
+                    id: entry.id,
+                    name: entry.name,
+                    icon: entry.icon,
+                    running: true,
+                });
+            }
+        }
+
+        self.dash.set_items(items, n_favorites)
     }
 
     /// Snapshot every mapped window into the app model's running-app tracker —

@@ -5250,7 +5250,7 @@ fn overview_dash_hover_tracks_tile() {
     f.pointer_motion(center.x, center.y);
     assert_eq!(
         f.niri().dash.hovered_for_test(),
-        Some(DashHit::Favorite(0)),
+        Some(DashHit::App(0)),
         "hovering a favorite marks it hovered"
     );
 
@@ -5781,4 +5781,97 @@ fn overview_mapped_window_marks_its_app_running() {
         "unmapping the last window stops the app"
     );
     assert!(!f.niri().app_system.is_running("org.example.Editor.desktop"));
+}
+
+/// **S6 — running apps in the dash.** A running non-favorite joins the dash after
+/// the favorites, behind a `.dash-separator` (`Dash._redisplay`, `dash.js:677-699`
+/// and `806-808`), and clicking it launches like any other tile. Driven end to
+/// end: a real window maps, `sync_running_apps` resolves it, and the dash
+/// redisplays off that change.
+#[test]
+fn overview_dash_shows_running_apps_after_a_separator() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+    use crate::ui::dash::DashHit;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let recorder = RecordingLauncher::default();
+    let apps = vec![
+        AppEntry::fake("fav.desktop", "Favorite"),
+        AppEntry::fake_with_wm_class("runner.desktop", "Runner", "runner"),
+    ];
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
+    f.niri()
+        .app_system
+        .set_favorites(vec!["fav.desktop".to_owned()]);
+    f.niri().sync_dash_favorites();
+    f.niri_state().do_action(Action::OpenOverview, false);
+
+    let area = overview_controls(&mut f).dash;
+    assert!(
+        f.niri().dash.separator_box(area).is_none(),
+        "one favorite and nothing running draws no divider"
+    );
+    assert_eq!(
+        f.niri().dash.item_id(1),
+        None,
+        "only the favorite is listed"
+    );
+
+    // The non-favorite app opens a window.
+    let window = f.client(client).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("runner");
+    window.commit();
+    f.roundtrip(client);
+    let window = f.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(client);
+
+    assert_eq!(
+        f.niri().dash.item_id(1),
+        Some("runner.desktop"),
+        "the running non-favorite joins the dash after the favorites"
+    );
+    let area = overview_controls(&mut f).dash;
+    let sep = f
+        .niri()
+        .dash
+        .separator_box(area)
+        .expect("a favorite plus a running non-favorite draws the divider");
+
+    // The divider sits between the two tiles and is itself inert.
+    let fav = f.niri().dash.tile_center(0, area).unwrap();
+    let run = f.niri().dash.tile_center(1, area).unwrap();
+    assert!(sep.loc.x > fav.x && sep.loc.x < run.x);
+
+    // Clicking the running app's tile launches it, like any other dash tile.
+    pointer_motion_to(&mut f, run.x, run.y);
+    assert_eq!(f.niri().dash.hovered_for_test(), Some(DashHit::App(1)));
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    assert_eq!(
+        recorder
+            .calls
+            .borrow()
+            .iter()
+            .map(|(e, _)| e.id.clone())
+            .collect::<Vec<_>>(),
+        ["runner.desktop"],
+        "the running tile is a live launch target"
+    );
+
+    // Closing the window drops it back out of the dash, divider and all.
+    let window = f.client(client).window(&surface);
+    window.attach_null();
+    window.commit();
+    f.double_roundtrip(client);
+
+    assert_eq!(f.niri().dash.item_id(1), None);
+    let area = overview_controls(&mut f).dash;
+    assert!(f.niri().dash.separator_box(area).is_none());
 }

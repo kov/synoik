@@ -3578,11 +3578,9 @@ impl State {
                     }) {
                         if let Some(hit) = self.niri.dash.hit_test(*pos, controls.dash) {
                             self.niri.suppressed_buttons.insert(button_code);
-                            if let DashHit::Favorite(i) = hit {
+                            if let DashHit::App(i) = hit {
                                 if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
-                                    if let Some(id) =
-                                        self.niri.dash.favorite_id(i).map(str::to_owned)
-                                    {
+                                    if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
                                         if let Err(err) =
                                             self.niri.app_system.launch(&id, LaunchMode::Activate)
                                         {

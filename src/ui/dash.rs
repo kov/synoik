@@ -5,11 +5,18 @@
 //! each a full-color [`widget::AppIcon`] tile, followed by a trailing "show apps"
 //! button. Clicking a favorite launches it and closes the overview.
 //!
-//! **Scope (S3, `docs/fork/overview-port.md`):** favorites only — running apps and
-//! their running dots are S6, so the `dash-separator` (favorites↔running,
-//! `dash.js:806`) never appears here. Dash icons have no label (`showLabel:false`,
-//! `dash.js:26`); the hover tooltip is deferred. The show-apps button renders for
-//! fidelity but its toggle (→ APP_GRID) is S8; its clicks are consumed inertly.
+//! **Scope (S3 + S6, `docs/fork/overview-port.md`):** favorites, then running
+//! non-favorites behind a `.dash-separator` (`Dash._redisplay`, `dash.js:677-699`,
+//! `806-808`), each flagged with a running dot. Dash icons have no label
+//! (`showLabel:false`, `dash.js:26`); the hover tooltip is deferred. The show-apps
+//! button renders for fidelity but its toggle (→ APP_GRID) is S8; its clicks are
+//! consumed inertly.
+//!
+//! **S6 divergence — clicking a *running* app relaunches it.** GNOME's
+//! `AppIcon.activate` calls `shell_app_activate`, which for a running app raises
+//! its most recent window instead of spawning a second copy. We have no
+//! window-activation path from a desktop id yet, so every dash tile launches. That
+//! is deferred; it needs `RunningApp` to carry window ids and a focus action.
 //!
 //! **Input divergences (S3):** GNOME's dash icons are `St.Button`s that activate on
 //! *release* (`clicked`), so a press-then-drag-off cancels; ours launches on *press*
@@ -84,22 +91,48 @@ const SHOW_APPS_FG: [f32; 4] = [0.980, 0.980, 0.984, 1.];
 /// The show-apps button glyph (`view-app-grid-symbolic`, `dash.js:216`).
 const SHOW_APPS_ICON: &str = "view-app-grid-symbolic";
 
-/// One favorite in the dash — a plain-data snapshot (not a live catalog borrow).
+/// Separator line width (`.dash-separator`, `_dash.scss:84`).
+const SEPARATOR_W: f64 = 1.;
+/// Separator side margins (`$base_margin`, `_dash.scss:85-86`).
+const SEPARATOR_MARGIN: f64 = 4.;
+/// Horizontal space one separator takes from the item run.
+const SEPARATOR_ADVANCE: f64 = SEPARATOR_W + 2. * SEPARATOR_MARGIN; // 9
+/// Separator height (`height: this.iconSize`, `dash.js:813`).
+const SEPARATOR_H: f64 = ICON_PX;
+/// `$system_borders_color = transparentize($system_fg_color, .9)` — white at 10%
+/// (`_colors.scss:48`, `_dash.scss:87`).
+const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.1];
+
+/// Running-dot side (`.app-grid-running-dot`, `_app-grid.scss:46-47`).
+const DOT_PX: f64 = 5.;
+/// The dot's `offset-y` in the dash — `-$dash_padding` (`_dash.scss:72-78`),
+/// applied as `translationY` (`AppIcon._updateDotStyle`, `appDisplay.js:3002`).
+/// The dot is `y_align: END` within the button's *content* box, which is the
+/// `.overview-icon` tile, so this lifts it that far above the tile's bottom edge.
+const DOT_OFFSET_Y: f64 = 12.;
+/// The dot fill: `$system_fg_color` (`_app-grid.scss:49`).
+const DOT_COLOR: [f32; 4] = [0.980, 0.980, 0.984, 1.];
+
+/// One app in the dash — a plain-data snapshot (not a live catalog borrow).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashEntry {
     pub id: String,
     pub name: String,
     pub icon: AppIconRef,
+    /// Whether the app has an open window — draws the running dot
+    /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007`).
+    pub running: bool,
 }
 
 /// What a point over the dash hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashHit {
-    /// Favorite at index `.0`.
-    Favorite(usize),
+    /// App at index `.0` — favorites first, then running non-favorites.
+    App(usize),
     /// The trailing show-apps button.
     ShowApps,
-    /// The pill background (padding / gaps) — consumes the click, no action.
+    /// The pill background (padding / gaps / separator) — consumes the click, no
+    /// action.
     Background,
 }
 
@@ -108,9 +141,11 @@ pub enum DashHit {
 /// hit-testing from one place (the panel `items`/`hit_test`-agree invariant).
 struct DashLayout {
     pill: Rectangle<f64, Logical>,
-    /// Tile boxes; `[0, n)` favorites, `[n]` the show-apps button.
+    /// Tile boxes; `[0, n)` apps, `[n]` the show-apps button.
     tiles: Vec<Rectangle<f64, Logical>>,
-    n_favorites: usize,
+    n_items: usize,
+    /// The favorites/running divider, when one is drawn.
+    separator: Option<Rectangle<f64, Logical>>,
 }
 
 impl DashLayout {
@@ -123,18 +158,27 @@ impl DashLayout {
 #[derive(Default)]
 struct DashCache {
     context: Option<ContextId<VkTexture>>,
-    /// The pill chrome (background + hover fill), keyed `(scale, phys, revision)`.
+    /// The pill chrome (background + separator + hover fill), keyed
+    /// `(scale, phys, revision)`.
     bake: widget::BakeCache,
+    /// The running dots, baked separately because they draw *over* the icons
+    /// (`_dot` is added to `_iconContainer` after the icon, `appDisplay.js:2964`)
+    /// while the pill chrome draws under them.
+    dots: widget::BakeCache,
     /// Full-color favorite icon uploads.
     icons: AppIconUploads,
     /// The show-apps symbolic glyph upload (keyed by scale).
     show_apps: HashMap<NotNan<f64>, TextureBuffer<VkTexture>>,
 }
 
-/// The overview dash. Owned on `Niri`; fed favorites by `sync_dash_favorites`.
+/// The overview dash. Owned on `Niri`; fed by `sync_dash_apps`.
 pub struct Dash {
-    favorites: Vec<DashEntry>,
-    /// Bumped when `favorites` changes — the bake revision's content part.
+    /// Favorites first, then running non-favorites (`Dash._redisplay`,
+    /// `dash.js:677-699`).
+    items: Vec<DashEntry>,
+    /// How many leading `items` are favorites — where the separator goes.
+    n_favorites: usize,
+    /// Bumped when `items` changes — the bake revision's content part.
     content_rev: u64,
     hovered: Option<DashHit>,
     cache: RefCell<DashCache>,
@@ -149,32 +193,35 @@ impl Default for Dash {
 impl Dash {
     pub fn new() -> Self {
         Self {
-            favorites: Vec::new(),
+            items: Vec::new(),
+            n_favorites: 0,
             content_rev: 0,
             hovered: None,
             cache: RefCell::new(DashCache::default()),
         }
     }
 
-    /// Replace the favorites snapshot. Returns whether it changed (bumping the bake
-    /// revision so the pill re-bakes).
-    pub fn set_favorites(&mut self, favorites: Vec<DashEntry>) -> bool {
-        if favorites == self.favorites {
+    /// Replace the app snapshot: `items` is favorites (the first `n_favorites`)
+    /// followed by running non-favorites. Returns whether it changed (bumping the
+    /// bake revision so the pill re-bakes).
+    pub fn set_items(&mut self, items: Vec<DashEntry>, n_favorites: usize) -> bool {
+        if items == self.items && n_favorites == self.n_favorites {
             return false;
         }
-        self.favorites = favorites;
+        self.items = items;
+        self.n_favorites = n_favorites;
         self.content_rev = self.content_rev.wrapping_add(1);
-        // `hovered` is a positional index; a favorites change (pin/unpin/reorder from
-        // gsettings) can make it point at a different app or past the end. Clear it —
-        // the next pointer motion re-establishes it — so a stale index can't light the
-        // wrong tile or an out-of-range one.
+        // `hovered` is a positional index; a content change (pin/unpin/reorder from
+        // gsettings, or an app starting/stopping) can make it point at a different
+        // app or past the end. Clear it — the next pointer motion re-establishes it —
+        // so a stale index can't light the wrong tile or an out-of-range one.
         self.hovered = None;
         true
     }
 
-    /// The desktop id of favorite `i`, if present.
-    pub fn favorite_id(&self, i: usize) -> Option<&str> {
-        self.favorites.get(i).map(|e| e.id.as_str())
+    /// The desktop id of app `i`, if present.
+    pub fn item_id(&self, i: usize) -> Option<&str> {
+        self.items.get(i).map(|e| e.id.as_str())
     }
 
     /// Set the hovered element; returns whether it changed (→ redraw + re-bake).
@@ -199,26 +246,55 @@ impl Dash {
     /// centered pill and its tiles, with the pill's own gap below it. Always at
     /// least the show-apps button, so the pill is never empty (GNOME renders it
     /// unconditionally, `dash.js:352-356`).
+    /// Whether a separator is drawn, and after how many items: GNOME draws it iff
+    /// there is at least one favorite *and* at least one non-favorite icon
+    /// (`nFavorites > 0 && nFavorites < nIcons`, `dash.js:806-808`). `nIcons`
+    /// counts app icons only — the show-apps button lives outside `_box`
+    /// (`dash.js:350-356`), so it never triggers a separator.
+    fn separator_after(&self) -> Option<usize> {
+        (self.n_favorites > 0 && self.n_favorites < self.items.len()).then_some(self.n_favorites)
+    }
+
     fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
-        let n = self.favorites.len();
+        let n = self.items.len();
         let count = n + 1; // + show-apps
-        let pill_w = ITEM_ADVANCE * count as f64 + 2. * PILL_PAD_H;
+        let separator_after = self.separator_after();
+        let separator_space = if separator_after.is_some() {
+            SEPARATOR_ADVANCE
+        } else {
+            0.
+        };
+
+        let pill_w = ITEM_ADVANCE * count as f64 + separator_space + 2. * PILL_PAD_H;
         let pill_x = (area.loc.x + (area.size.w - pill_w) / 2.).round();
         let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - PILL_H).round();
         let pill = Rectangle::new(Point::from((pill_x, pill_y)), Size::from((pill_w, PILL_H)));
 
         let tile_top = pill_y + PILL_PAD_V;
+        let run_left = pill_x + PILL_PAD_H;
+        // Items after the separator are pushed right by its advance.
+        let shift = |k: usize| match separator_after {
+            Some(at) if k >= at => separator_space,
+            _ => 0.,
+        };
         let tiles = (0..count)
             .map(|k| {
-                let tile_left = pill_x + PILL_PAD_H + ITEM_ADVANCE * k as f64 + 2.;
+                let tile_left = run_left + ITEM_ADVANCE * k as f64 + shift(k) + 2.;
                 Rectangle::new(Point::from((tile_left, tile_top)), Size::from((TILE, TILE)))
             })
             .collect();
 
+        let separator = separator_after.map(|at| {
+            let x = run_left + ITEM_ADVANCE * at as f64 + SEPARATOR_MARGIN;
+            let y = tile_top + (TILE - SEPARATOR_H) / 2.;
+            Rectangle::new(Point::from((x, y)), Size::from((SEPARATOR_W, SEPARATOR_H)))
+        });
+
         DashLayout {
             pill,
             tiles,
-            n_favorites: n,
+            n_items: n,
+            separator,
         }
     }
 
@@ -242,14 +318,27 @@ impl Dash {
         if pos.y < pill.loc.y + PILL_PAD_V {
             return Some(DashHit::Background);
         }
-        let rel = pos.x - pill.loc.x - PILL_PAD_H;
+        let mut rel = pos.x - pill.loc.x - PILL_PAD_H;
+        if rel < 0. {
+            return Some(DashHit::Background); // left padding
+        }
+        // Take the separator's band out of the run before indexing; it is inert.
+        if let Some(at) = self.separator_after() {
+            let sep_start = ITEM_ADVANCE * at as f64;
+            if rel >= sep_start {
+                rel -= SEPARATOR_ADVANCE;
+                if rel < sep_start {
+                    return Some(DashHit::Background); // the separator itself
+                }
+            }
+        }
         let count = layout.tiles.len();
-        if rel < 0. || rel >= ITEM_ADVANCE * count as f64 {
-            return Some(DashHit::Background); // side padding
+        if rel >= ITEM_ADVANCE * count as f64 {
+            return Some(DashHit::Background); // right padding
         }
         let k = (rel / ITEM_ADVANCE) as usize;
-        Some(if k < layout.n_favorites {
-            DashHit::Favorite(k)
+        Some(if k < layout.n_items {
+            DashHit::App(k)
         } else {
             DashHit::ShowApps
         })
@@ -269,10 +358,43 @@ impl Dash {
         (i < layout.tiles.len()).then(|| layout.icon_center(i))
     }
 
-    /// The trailing show-apps button's index (= the favorite count).
+    /// The trailing show-apps button's index (= the app count).
     #[cfg(test)]
     pub fn show_apps_index(&self) -> usize {
-        self.favorites.len()
+        self.items.len()
+    }
+
+    /// The separator box within `area`, if one is drawn (for the corpus).
+    #[cfg(test)]
+    pub fn separator_box(&self, area: Rectangle<f64, Logical>) -> Option<Rectangle<f64, Logical>> {
+        self.layout(area).separator
+    }
+
+    /// The running dot's box for tile `i` — centered on the tile, its bottom edge
+    /// `DOT_OFFSET_Y` above the tile's, per `.app-grid-running-dot`'s dash
+    /// `offset-y` (`_dash.scss:72-78`).
+    fn dot_box(tile: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((
+                tile.loc.x + (tile.size.w - DOT_PX) / 2.,
+                tile.loc.y + tile.size.h - DOT_OFFSET_Y - DOT_PX,
+            )),
+            Size::from((DOT_PX, DOT_PX)),
+        )
+    }
+
+    /// The running dot's box for app `i` within `area`, if it is running.
+    #[cfg(test)]
+    pub fn dot_box_for(
+        &self,
+        i: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        let layout = self.layout(area);
+        self.items
+            .get(i)
+            .filter(|e| e.running)
+            .map(|_| Self::dot_box(layout.tiles[i]))
     }
 
     /// The currently-hovered element (for the conformance corpus).
@@ -309,10 +431,64 @@ impl Dash {
             cache.context = Some(context);
         }
 
-        let mut elements = Vec::with_capacity(layout.tiles.len() + 1);
+        let mut elements = Vec::with_capacity(layout.tiles.len() + 2);
 
-        // Favorite icons (topmost), on their tiles.
-        for (i, entry) in self.favorites.iter().enumerate() {
+        // The running dots — topmost, because GNOME adds `_dot` to the icon
+        // container *after* the icon (`appDisplay.js:2955-2964`) and the dash
+        // `offset-y` lifts it onto the icon's lower edge. Its own bake layer: the
+        // pill chrome underneath the icons cannot carry something that must draw
+        // over them. Skipped entirely when nothing is running.
+        if self.items.iter().any(|e| e.running) {
+            let dots: Vec<Rectangle<f64, Logical>> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.running)
+                .map(|(i, _)| {
+                    let d = Self::dot_box(layout.tiles[i]);
+                    Rectangle::new(d.loc - layout.pill.loc, d.size)
+                })
+                .collect();
+            let texture = widget::bake(
+                renderer,
+                &mut cache.dots,
+                scale,
+                layout.pill.size,
+                self.content_rev,
+                |_| Ok(()),
+                |frame, phys, ()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(widget::style::TRANSPARENT)?;
+                    for dot in &dots {
+                        p.fill_rounded(*dot, DOT_PX / 2., DOT_COLOR)?;
+                    }
+                    Ok(())
+                },
+            );
+            match texture {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        layout.pill.loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the dash running dots: {err:#}"),
+            }
+        }
+
+        // App icons, on their tiles.
+        for (i, entry) in self.items.iter().enumerate() {
             if let Some(el) = widget::app_icon_element(
                 renderer,
                 &mut cache.icons,
@@ -342,7 +518,7 @@ impl Dash {
             }
             if let Some(tb) = cache.show_apps.get(&scale_key) {
                 let logical = tb.logical_size();
-                let center = layout.icon_center(layout.n_favorites);
+                let center = layout.icon_center(layout.n_items);
                 let loc = center - Point::from((logical.w / 2., logical.h / 2.));
                 elements.push(TextureRenderElement::from_texture_buffer(
                     tb.clone(),
@@ -355,17 +531,18 @@ impl Dash {
             }
         }
 
-        // The pill chrome (background + the hovered tile's fill), baked + cached.
+        // The pill chrome (background + separator + running dots + the hovered
+        // tile's fill), baked + cached.
         let hovered_tile = match self.hovered {
-            Some(DashHit::Favorite(k)) if k < layout.n_favorites => Some(layout.tiles[k]),
+            Some(DashHit::App(k)) if k < layout.n_items => Some(layout.tiles[k]),
             Some(DashHit::ShowApps) => layout.tiles.last().copied(),
             _ => None,
         };
         // revision = content | hover-tile index (None = 0, else index+1).
         let hover_code = hovered_tile
             .map(|_| match self.hovered {
-                Some(DashHit::Favorite(k)) => k as u64 + 1,
-                Some(DashHit::ShowApps) => layout.n_favorites as u64 + 1,
+                Some(DashHit::App(k)) => k as u64 + 1,
+                Some(DashHit::ShowApps) => layout.n_items as u64 + 1,
                 _ => 0,
             })
             .unwrap_or(0);
@@ -383,6 +560,15 @@ impl Dash {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(widget::style::TRANSPARENT)?;
                 p.fill_rounded_full(PILL_RADIUS, DASH_BG)?;
+
+                // The favorites/running divider. `hairline` *clears* rather than
+                // blends, so the translucent `$system_borders_color` has to be
+                // pre-blended onto the pill or it would punch a hole in it.
+                if let Some(sep) = layout.separator {
+                    let rel = Rectangle::new(sep.loc - pill_origin, sep.size);
+                    p.hairline(rel, widget::style::over(DASH_BG, SEPARATOR_COLOR))?;
+                }
+
                 if let Some(tile) = hovered_tile {
                     // Tile box relative to the pill origin.
                     let rel = Rectangle::new(tile.loc - pill_origin, tile.size);
@@ -433,16 +619,34 @@ mod tests {
 
     fn dash_with(n: usize) -> Dash {
         let mut dash = Dash::new();
-        dash.set_favorites(
-            (0..n)
-                .map(|i| DashEntry {
-                    id: format!("app{i}.desktop"),
-                    name: format!("App {i}"),
-                    icon: AppIconRef::Fallback,
-                })
-                .collect(),
-        );
+        let items = (0..n).map(|i| entry(&format!("app{i}.desktop"))).collect();
+        dash.set_items(items, n);
         dash
+    }
+
+    /// A dash with `n_fav` favorites followed by `n_running` running non-favorites.
+    fn dash_with_running(n_fav: usize, n_running: usize) -> Dash {
+        let mut dash = Dash::new();
+        let mut items: Vec<DashEntry> = (0..n_fav)
+            .map(|i| entry(&format!("fav{i}.desktop")))
+            .collect();
+        for i in 0..n_running {
+            items.push(DashEntry {
+                running: true,
+                ..entry(&format!("run{i}.desktop"))
+            });
+        }
+        dash.set_items(items, n_fav);
+        dash
+    }
+
+    fn entry(id: &str) -> DashEntry {
+        DashEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            icon: AppIconRef::Fallback,
+            running: false,
+        }
     }
 
     /// The box `overview_layout` allocates the dash on 1920×1080 with the 35px
@@ -463,7 +667,7 @@ mod tests {
         for i in 0..3 {
             assert_eq!(
                 dash.hit_test(layout.icon_center(i), area),
-                Some(DashHit::Favorite(i))
+                Some(DashHit::App(i))
             );
         }
         // The show-apps button is the trailing tile.
@@ -491,7 +695,7 @@ mod tests {
         assert_eq!(dash.hit_test(top_band, area), Some(DashHit::Background));
         // Just inside the tile top it becomes the favorite.
         let tile_top = Point::from((cx, layout.pill.loc.y + PILL_PAD_V + 1.));
-        assert_eq!(dash.hit_test(tile_top, area), Some(DashHit::Favorite(0)));
+        assert_eq!(dash.hit_test(tile_top, area), Some(DashHit::App(0)));
     }
 
     /// A favorites change clears the (positional) hover so a stale index can't
@@ -499,14 +703,10 @@ mod tests {
     #[test]
     fn set_favorites_clears_hover() {
         let mut dash = dash_with(3);
-        assert!(dash.set_hovered(Some(DashHit::Favorite(2))));
-        assert_eq!(dash.hovered, Some(DashHit::Favorite(2)));
+        assert!(dash.set_hovered(Some(DashHit::App(2))));
+        assert_eq!(dash.hovered, Some(DashHit::App(2)));
         // Shrinking to one favorite would leave index 2 dangling — must clear.
-        dash.set_favorites(vec![DashEntry {
-            id: "only.desktop".into(),
-            name: "Only".into(),
-            icon: AppIconRef::Fallback,
-        }]);
+        dash.set_items(vec![entry("only.desktop")], 1);
         assert_eq!(dash.hovered, None, "a favorites change clears the hover");
     }
 
@@ -520,7 +720,7 @@ mod tests {
         // A click at the very bottom edge, under favorite 0, still hits it.
         assert_eq!(
             dash.hit_test(Point::from((cx, 1080. - 1.)), area),
-            Some(DashHit::Favorite(0))
+            Some(DashHit::App(0))
         );
     }
 
@@ -540,16 +740,86 @@ mod tests {
     #[test]
     fn set_favorites_reports_change() {
         let mut dash = Dash::new();
-        assert!(dash.set_favorites(vec![DashEntry {
-            id: "a.desktop".into(),
-            name: "A".into(),
-            icon: AppIconRef::Fallback,
-        }]));
-        let same = vec![DashEntry {
-            id: "a.desktop".into(),
-            name: "A".into(),
-            icon: AppIconRef::Fallback,
-        }];
-        assert!(!dash.set_favorites(same));
+        assert!(dash.set_items(vec![entry("a.desktop")], 1));
+        assert!(!dash.set_items(vec![entry("a.desktop")], 1));
+        assert!(
+            dash.set_items(
+                vec![DashEntry {
+                    running: true,
+                    ..entry("a.desktop")
+                }],
+                1
+            ),
+            "an app starting is a change — the running dot appears"
+        );
+    }
+
+    /// The separator is drawn only when there is at least one favorite *and* at
+    /// least one running non-favorite (`nFavorites > 0 && nFavorites < nIcons`,
+    /// `dash.js:806-808`), and it takes its own horizontal space.
+    #[test]
+    fn separator_only_between_favorites_and_running() {
+        let area = box_1080();
+
+        let both = dash_with_running(2, 1);
+        let with_sep = both.layout(area);
+        let sep = with_sep
+            .separator
+            .expect("favorites + running draws a divider");
+        assert_eq!(sep.size, Size::from((SEPARATOR_W, SEPARATOR_H)));
+
+        // It sits between the last favorite and the first running app.
+        assert!(sep.loc.x >= with_sep.tiles[1].loc.x + with_sep.tiles[1].size.w);
+        assert!(sep.loc.x + sep.size.w <= with_sep.tiles[2].loc.x);
+        // ...and is vertically centered on the tile row.
+        let tile = with_sep.tiles[0];
+        assert_eq!(
+            sep.loc.y + sep.size.h / 2.,
+            tile.loc.y + tile.size.h / 2.,
+            "the divider is centered on the icon row"
+        );
+
+        // Favorites only, and running only, both draw none.
+        assert!(dash_with_running(3, 0).layout(area).separator.is_none());
+        assert!(dash_with_running(0, 2).layout(area).separator.is_none());
+    }
+
+    /// The divider widens the pill by exactly its advance — the same three app
+    /// icons laid out with and without it differ by `SEPARATOR_ADVANCE`.
+    #[test]
+    fn separator_widens_the_pill_by_its_advance() {
+        let area = box_1080();
+        let without = dash_with_running(3, 0).layout(area).pill.size.w;
+        let with = dash_with_running(2, 1).layout(area).pill.size.w;
+        assert_eq!(with - without, SEPARATOR_ADVANCE);
+    }
+
+    /// Every tile still hit-tests back to itself across the divider, and the
+    /// divider's own band is inert background.
+    #[test]
+    fn separator_band_is_inert_and_does_not_shift_hits() {
+        let dash = dash_with_running(2, 2);
+        let area = box_1080();
+        let layout = dash.layout(area);
+
+        for i in 0..4 {
+            assert_eq!(
+                dash.hit_test(layout.icon_center(i), area),
+                Some(DashHit::App(i)),
+                "tile {i} round-trips across the divider"
+            );
+        }
+        assert_eq!(
+            dash.hit_test(layout.icon_center(4), area),
+            Some(DashHit::ShowApps)
+        );
+
+        let sep = layout.separator.unwrap();
+        let on_sep = Point::from((sep.loc.x + sep.size.w / 2., layout.icon_center(0).y));
+        assert_eq!(
+            dash.hit_test(on_sep, area),
+            Some(DashHit::Background),
+            "the divider consumes its click but does nothing"
+        );
     }
 }

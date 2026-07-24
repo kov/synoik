@@ -332,9 +332,51 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   unless you `hotkey_overlay.hide()` first; and a `green > 200` filter matches **white** — the panel
   clock, the entry caret and the card text all clear it — so the reference must come from the
   preview's own `expose_target_rect`, not from a colour filter.
-- **S6 — Running apps + running dots.** window `app_id`/WM_CLASS → `.desktop` matching (StartupWMClass
-  rules); `get_running()` feeds dash trailing icons + the `AppIcon` running dot; `dash-separator`
-  between favorites and running. Conformance test the matching table.
+- **S6a — Window↔app matching + the running-app model. ✅ DONE.** `src/app_system.rs`: a port of
+  `get_app_from_window_wmclass` (`shell-window-tracker.c:146`) — the `StartupWMClass` table first,
+  then a `.desktop` basename tried **verbatim before canonicalizing** (lowercase, spaces→dashes),
+  each retried under `vendor_prefixes`. The table is built by a faithful single pass of
+  `scan_startup_wm_class_to_id` (`shell-app-system.c:107`), including both order-dependent
+  tie-breaks: an entry whose id *is* the class evicts an incumbent, and a shown entry evicts a
+  hidden one. `AppEntry` gained `startup_wm_class`.
+  **Divergence — one string, not two.** xdg-shell has a single `app_id` where X11 has a `WM_CLASS`
+  pair, so GNOME's four-rung ladder collapses to its two distinct lookups; the cost is exactly the
+  Chromium web-app case (class `Chromium-browser`, instance `crx_<id>`). XWayland reaches us through
+  xwayland-satellite, which has already flattened the pair. `check_app_id_prefix`'s sandbox scoping
+  is unported (no sandbox id on a toplevel).
+  Running apps are resolved, grouped and ordered **inside the model** from a plain
+  `Vec<RunningWindow>`, so the whole policy is unit-testable. Ordering is `shell_app_compare`
+  (`shell-app.c:839`) reduced to the running set — every app there has windows and we have no
+  minimized state, so it is "most recently used first" off `Mapped::get_focus_timestamp`, ties by id
+  (GNOME's tie order is hash-table order, i.e. arbitrary). The raw window snapshot is kept so a
+  catalog refresh re-resolves it. **Windows matching nothing are dropped**, where GNOME synthesizes a
+  window-backed `ShellApp` and dashes it — that needs an icon a toplevel cannot give us.
+  `State::refresh` re-snapshots unconditionally and reports only resolved changes (the
+  keyboard-layout-indicator pattern: one window walk, no invalidation bookkeeping, immune to a
+  missed edge). Pins: 9 `app_system.rs` unit tests + a conformance test driving a real window's
+  map/unmap, both mutation-verified.
+- **S6b — Running apps in the dash. ✅ DONE.** `Dash` now takes `set_items(items, n_favorites)`:
+  favorites, then running non-favorites in `get_running()` order, each carrying `running`
+  (`Dash._redisplay`, `dash.js:677-699`). The `.dash-separator` appears iff
+  `nFavorites > 0 && nFavorites < nIcons` — `nIcons` counts app icons only, since `_showAppsIcon`
+  lives outside `_box` (`dash.js:350-356`) — and takes its own 9px advance out of the item run, with
+  `hit_test` subtracting that band so tile indices don't shift and the divider itself is inert
+  `Background`. `DashHit::Favorite` became `DashHit::App`.
+  **The running dot needs its own bake layer.** GNOME adds `_dot` to the icon container *after* the
+  icon (`appDisplay.js:2955-2964`) and the dash's `offset-y: -$dash_padding` (`_dash.scss:72-78`)
+  lifts it onto the icon's lower edge — so it draws **over** the icon, while the pill chrome draws
+  under it. Baking it into the pill made it invisible (the first render test caught exactly this:
+  both probes read the icon's blue). It bakes only when something is running.
+  **Trap: `Painter::hairline` clears, it does not blend.** Painting `$system_borders_color` (white at
+  10%) raw replaces the opaque pill with an alpha-26 pixel — a transparent slot through the dash to
+  the wallpaper — and every geometry test still passes, because the box is in the right place either
+  way. Pre-blend with `style::over(DASH_BG, …)`; the render test asserts *opacity* to catch it.
+  Divergence: **clicking a running app relaunches it** rather than raising its window
+  (`shell_app_activate`); that needs `RunningApp` to carry window ids and a focus action — deferred.
+  Pins: 3 `dash.rs` unit tests + a conformance test (real window → dash item + divider → click →
+  unmap) + a Vulkan render test on the divider's opacity and the dot's color, mutation-verified both
+  ways. **Not yet live-validated** — in particular the dot's vertical offset puts it *on* the icon,
+  which is what the cited rule produces but is worth an eyeball.
 - **S7 — `org.gnome.Shell` D-Bus.** `ShowApplications`/`FocusApp`/`FocusSearch`/`OverviewActive`.
   XML-signature-cited; small.
 - **S8 — App grid (APP_GRID state).** Paged grid, show-apps-button toggles WINDOW_PICKER↔APP_GRID,

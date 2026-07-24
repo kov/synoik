@@ -6158,7 +6158,7 @@ fn vulkan_dash_hover_lightens_the_tile() {
         .app_system
         .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
     f.niri().sync_dash_favorites();
-    f.niri().dash.set_hovered(Some(DashHit::Favorite(0)));
+    f.niri().dash.set_hovered(Some(DashHit::App(0)));
 
     let controls = f
         .niri()
@@ -6475,4 +6475,147 @@ fn vulkan_overview_search_draws_entry_and_selection() {
          `%tile`'s 16 it would still be washed: corner={corner:?} \
          plain={plain:?} selected={selected:?}"
     );
+}
+
+/// The dash's running chrome bakes correctly: the `.dash-separator` reads as a
+/// line *lighter* than the pill it sits on, and a running app's dot draws over
+/// the pill.
+///
+/// The separator is the one worth a render test. `Painter::hairline` *clears*
+/// rather than blends, so painting `$system_borders_color` (white at 10%) raw
+/// would replace the opaque pill with a 10%-alpha pixel — a transparent slot
+/// showing the wallpaper through the dash, invisible to every geometry test in
+/// `dash.rs` because the box is in exactly the right place either way. Asserting
+/// the sample is *opaque* is what catches it.
+#[test]
+fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_dash_separator_and_running_dot: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // One favorite (not running) plus one running non-favorite: the exact
+    // condition that draws a divider.
+    let apps = vec![
+        AppEntry::fake("fav.desktop", "fav.desktop"),
+        AppEntry::fake_with_wm_class("run.desktop", "run.desktop", "run"),
+    ];
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(apps)),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri()
+        .app_system
+        .set_favorites(vec!["fav.desktop".into()]);
+    f.niri()
+        .app_system
+        .set_windows(vec![crate::app_system::RunningWindow {
+            app_id: Some("run".to_owned()),
+            last_focus: None,
+        }]);
+    f.niri().sync_dash_favorites();
+
+    let controls = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let area = controls.dash;
+    let sep = f
+        .niri()
+        .dash
+        .separator_box(area)
+        .expect("a favorite plus a running non-favorite draws the divider");
+    let fav = f.niri().dash.tile_center(0, area).expect("tile 0");
+    let running = f.niri().dash.tile_center(1, area).expect("tile 1");
+    let f_dot = f.niri().dash.dot_box_for(1, area);
+    assert!(
+        f.niri().dash.dot_box_for(0, area).is_none(),
+        "the non-running favorite has no dot"
+    );
+
+    let state = f.niri_state();
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            let elements = niri.dash.render(
+                vk,
+                &niri.app_icon_cache,
+                &niri.icon_cache,
+                &output,
+                area,
+                1.0,
+            );
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let pixels = render_to_vec(
+                vk,
+                phys,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((pixels, phys.w, phys.h))
+        },
+    );
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_dash_separator_and_running_dot: no Vulkan device");
+        return;
+    };
+    let (pixels, w, _h) = result.expect("compositing the dash through Vulkan must not error");
+
+    let sample = |x: f64, y: f64| px(&pixels, w, x as i32, y as i32);
+
+    // Reference: bare pill, sampled above the icon row on the favorite's tile.
+    let pill = sample(fav.x, fav.y - 35.);
+    let on_sep = sample(sep.loc.x + sep.size.w / 2., sep.loc.y + sep.size.h / 2.);
+    // The dot boxes come from the dash itself, so the probe cannot drift from the
+    // geometry it is pinning.
+    let dot_box = f_dot.expect("the running app has a dot");
+    let dot = sample(
+        dot_box.loc.x + dot_box.size.w / 2.,
+        dot_box.loc.y + dot_box.size.h / 2.,
+    );
+    let no_dot = sample(
+        dot_box.loc.x + dot_box.size.w / 2. - (running.x - fav.x),
+        dot_box.loc.y + dot_box.size.h / 2.,
+    );
+    eprintln!("dash chrome: pill={pill:?} separator={on_sep:?} dot={dot:?} no_dot={no_dot:?}");
+
+    assert_eq!(pill[3], 255, "the dash pill must composite opaquely");
+    assert_eq!(
+        on_sep[3], 255,
+        "the divider must stay opaque — a raw translucent hairline would clear a \
+         hole through the pill to the wallpaper: {on_sep:?}"
+    );
+    for ch in 0..3 {
+        assert!(
+            on_sep[ch] > pill[ch],
+            "the divider must read lighter than the pill on channel {ch}: \
+             separator={on_sep:?} pill={pill:?}"
+        );
+        assert!(
+            dot[ch] >= 240,
+            "the running dot draws `$system_fg_color` over the icon, channel \
+             {ch}: dot={dot:?}"
+        );
+        assert!(
+            dot[ch] > no_dot[ch],
+            "the dot must only appear for a running app — the same spot on the \
+             non-running tile still shows its icon, channel {ch}: dot={dot:?} \
+             no_dot={no_dot:?}"
+        );
+    }
 }
