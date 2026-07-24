@@ -53,6 +53,7 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
 use crate::ui::widget::{self, AppIcon, AppIconUploads, Painter};
 
 /// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`).
@@ -83,6 +84,21 @@ pub const PREFERRED_HEIGHT: f64 = PILL_H + MARGIN_BOTTOM;
 /// `$dash_background_color = mix(#222226, #fafafb, 90%)` (`_dash.scss:20`,
 /// `_colors.scss:50`, `_default-colors.scss:4-5`) ≈ `#38383B`.
 const DASH_BG: [f32; 4] = [0.218, 0.218, 0.233, 1.];
+
+/// The `.dash-background` pill as a [`ThemeNode`] (`_dash.scss:19-25`): its padding
+/// wraps the icon run into the pill, and the box model derives the pill size
+/// ([`ThemeNode::allocation_for`]) and the run's origin ([`ThemeNode::content_box`])
+/// so those numbers aren't hand-summed. The icon tile itself is [`AppIcon`] (the
+/// `.overview-icon` primitive); only the pill needed modelling.
+const DASH_BACKGROUND: ThemeNode = ThemeNode {
+    padding: Edges::symmetric(PILL_PAD_V, PILL_PAD_H),
+    border: Edges::ZERO,
+    border_color: [0., 0., 0., 0.],
+    border_radius: PILL_RADIUS,
+    background: Some(DASH_BG),
+    width: None,
+    height: None,
+};
 /// The tile hover fill: `st-lighten($dash_background_color, 7%)` (flat + always-dark,
 /// `_drawing.scss:186-189,270-274`). Lightens (the per-widget hover direction).
 const TILE_HOVER: [f32; 4] = [0.286, 0.286, 0.305, 1.];
@@ -266,13 +282,16 @@ impl Dash {
             0.
         };
 
-        let pill_w = ITEM_ADVANCE * count as f64 + separator_space + 2. * PILL_PAD_H;
-        let pill_x = (area.loc.x + (area.size.w - pill_w) / 2.).round();
-        let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - PILL_H).round();
-        let pill = Rectangle::new(Point::from((pill_x, pill_y)), Size::from((pill_w, PILL_H)));
+        // The pill is the dash-background node wrapped around the icon run (its
+        // content): width = the run, height = one tile; padding adds the rest.
+        let run_w = ITEM_ADVANCE * count as f64 + separator_space;
+        let pill_size = DASH_BACKGROUND.allocation_for(Size::from((run_w, TILE)));
+        let pill_x = (area.loc.x + (area.size.w - pill_size.w) / 2.).round();
+        let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - pill_size.h).round();
+        let pill = Rectangle::new(Point::from((pill_x, pill_y)), pill_size);
 
-        let tile_top = pill_y + PILL_PAD_V;
-        let run_left = pill_x + PILL_PAD_H;
+        // The icon run occupies the pill's content box (pill minus padding).
+        let run = DASH_BACKGROUND.content_box(pill);
         // Items after the separator are pushed right by its advance.
         let shift = |k: usize| match separator_after {
             Some(at) if k >= at => separator_space,
@@ -280,15 +299,20 @@ impl Dash {
         };
         let tiles = (0..count)
             .map(|k| {
-                let tile_left = run_left + ITEM_ADVANCE * k as f64 + shift(k) + 2.;
-                Rectangle::new(Point::from((tile_left, tile_top)), Size::from((TILE, TILE)))
+                // `+2` is the tile's own `0 2px` margin within its advance slot.
+                let tile_left = run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + 2.;
+                Rectangle::new(
+                    Point::from((tile_left, run.loc.y)),
+                    Size::from((TILE, TILE)),
+                )
             })
             .collect();
 
         let separator = separator_after.map(|at| {
-            let x = run_left + ITEM_ADVANCE * at as f64 + SEPARATOR_MARGIN;
-            let y = tile_top + (TILE - SEPARATOR_H) / 2.;
-            Rectangle::new(Point::from((x, y)), Size::from((SEPARATOR_W, SEPARATOR_H)))
+            let x = run.loc.x + ITEM_ADVANCE * at as f64 + SEPARATOR_MARGIN;
+            // `.dash-separator` is iconSize-tall, centred on the tile row.
+            let (y, h) = allocate_1d(run.loc.y, TILE, SEPARATOR_H, Align1::Center);
+            Rectangle::new(Point::from((x, y)), Size::from((SEPARATOR_W, h)))
         });
 
         DashLayout {
@@ -383,13 +407,11 @@ impl Dash {
         tile: Rectangle<f64, Logical>,
         pill: Rectangle<f64, Logical>,
     ) -> Rectangle<f64, Logical> {
-        Rectangle::new(
-            Point::from((
-                tile.loc.x + (tile.size.w - DOT_PX) / 2.,
-                pill.loc.y + pill.size.h - DOT_OFFSET_Y - DOT_PX,
-            )),
-            Size::from((DOT_PX, DOT_PX)),
-        )
+        // `x_align: CENTER` on the tile, `y_align: END` in the pill-filling button,
+        // then the `-$dash_padding` `offset-y` translation lifts it off the bottom.
+        let (x, w) = allocate_1d(tile.loc.x, tile.size.w, DOT_PX, Align1::Center);
+        let (y, h) = allocate_1d(pill.loc.y, pill.size.h, DOT_PX, Align1::End);
+        Rectangle::new(Point::from((x, y - DOT_OFFSET_Y)), Size::from((w, h)))
     }
 
     /// The running dot's box for app `i` within `area`, if it is running.
@@ -558,6 +580,8 @@ impl Dash {
         let revision = (self.content_rev << 20) | (hover_code & 0xf_ffff);
 
         let pill_origin = layout.pill.loc;
+        // The bake buffer *is* the pill, so its local box is the pill at the origin.
+        let pill_local = Rectangle::new(Point::from((0., 0.)), layout.pill.size);
         let texture = widget::bake(
             renderer,
             &mut cache.bake,
@@ -568,7 +592,7 @@ impl Dash {
             |frame, phys, ()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(widget::style::TRANSPARENT)?;
-                p.fill_rounded_full(PILL_RADIUS, DASH_BG)?;
+                DASH_BACKGROUND.paint(&mut p, pill_local)?;
 
                 // The favorites/running divider. `hairline` *clears* rather than
                 // blends, so the translucent `$system_borders_color` has to be
@@ -793,6 +817,22 @@ mod tests {
             "dot top {} must be at/below the icon bottom {icon_bottom}",
             dot.loc.y
         );
+    }
+
+    /// The `DASH_BACKGROUND` theme-node reproduces the pill's hand-summed constants:
+    /// height is padding-only (`TILE + 2·PILL_PAD_V = PILL_H`), width is the run plus
+    /// horizontal padding, and its content box insets by exactly the padding. Pins
+    /// the node ⇄ const equivalence so a drift in either is caught.
+    #[test]
+    fn dash_background_node_matches_the_pill_constants() {
+        let size = DASH_BACKGROUND.allocation_for(Size::from((100., TILE)));
+        assert_eq!(size.h, PILL_H);
+        assert_eq!(size.w, 100. + 2. * PILL_PAD_H);
+
+        let pill = Rectangle::new(Point::from((0., 0.)), size);
+        let run = DASH_BACKGROUND.content_box(pill);
+        assert_eq!(run.loc, Point::from((PILL_PAD_H, PILL_PAD_V)));
+        assert_eq!(run.size, Size::from((100., TILE)));
     }
 
     /// The separator is drawn only when there is at least one favorite *and* at
