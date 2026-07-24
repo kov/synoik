@@ -9,6 +9,7 @@
 //! The first entries are *characterization* tests that pin the inherited niri overview
 //! contract before we reshape it toward GNOME's Activities overview (Experiment 1).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6074,4 +6075,162 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     assert_eq!(f.niri().dash.item_id(1), None);
     let area = overview_controls(&mut f).dash;
     assert!(f.niri().dash.separator_box(area).is_none());
+}
+
+// Display config: live applies vs the monitors.xml store ---------------------------------------
+//
+// mutter's model (meta-monitor-manager.c, `meta_monitor_manager_apply_monitors_config` →
+// `meta_monitor_config_manager_set_current`): an `ApplyMonitorsConfig` becomes the *current*
+// session config immediately; `monitors.xml` is only written for persistence and read back at
+// startup/hotplug — never re-read to override a live apply. Getting this backwards made GNOME
+// Settings' scale changes land one try late (the reload raced the store write and resurrected
+// the previous value).
+
+/// Points the monitors.xml store at a private per-test file (see `monitors_xml::TEST_PATH`;
+/// the whole fixture runs on the test's thread). Removes the file and the override on drop.
+struct MonitorsXmlGuard {
+    path: std::path::PathBuf,
+}
+
+impl MonitorsXmlGuard {
+    fn install(xml: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "gnome-shell-rs-test-monitors-{}-{:?}.xml",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::write(&path, xml).unwrap();
+        crate::monitors_xml::TEST_PATH.with(|p| *p.borrow_mut() = Some(path.clone()));
+        Self { path }
+    }
+
+    /// Overwrite the store, like the DBus handler's persist step does.
+    fn write(&self, xml: &str) {
+        std::fs::write(&self.path, xml).unwrap();
+    }
+}
+
+impl Drop for MonitorsXmlGuard {
+    fn drop(&mut self) {
+        crate::monitors_xml::TEST_PATH.with(|p| *p.borrow_mut() = None);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn monitors_xml_with_scale(scale: f64) -> String {
+    format!(
+        r#"<monitors version="2">
+  <configuration>
+    <logicalmonitor>
+      <x>0</x><y>0</y><scale>{scale}</scale>
+      <monitor><monitorspec><connector>headless-1</connector></monitorspec></monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>"#
+    )
+}
+
+fn output_scale(f: &Fixture) -> f64 {
+    f.niri_output(1).current_scale().fractional_scale()
+}
+
+/// The `ApplyMonitorsConfig` config for headless-1 at `scale`, the way the DBus handler builds it.
+fn dbus_scale_config(scale: f64) -> HashMap<String, Option<niri_config::Output>> {
+    HashMap::from([(
+        "headless-1".to_owned(),
+        Some(niri_config::Output {
+            off: false,
+            name: "headless-1".to_owned(),
+            scale: Some(niri_config::FloatOrInt(scale)),
+            position: Some(niri_config::Position { x: 0, y: 0 }),
+            ..Default::default()
+        }),
+    )])
+}
+
+/// A saved monitors.xml scale is honored from the first frame (store > KDL > DPI guess).
+#[test]
+fn monitors_xml_scale_applies_at_startup() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_scale(2.0));
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert_eq!(
+        output_scale(&f),
+        2.0,
+        "saved store scale wins over the guess"
+    );
+}
+
+/// The regression: a scale applied via GNOME Settings (`ApplyMonitorsConfig`) takes effect
+/// immediately — the reload must not re-read the store (whose persist write races behind, or
+/// never happens for a TEMPORARY apply) and resurrect the previous value.
+#[test]
+fn settings_scale_apply_takes_effect_immediately() {
+    let store = MonitorsXmlGuard::install(&monitors_xml_with_scale(1.0));
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    assert_eq!(output_scale(&f), 1.0);
+
+    // First apply: the store still holds the old value (TEMPORARY applies never write it, and a
+    // PERSISTENT write lands on the DBus thread after this runs). The new scale must win anyway.
+    f.niri_state().apply_display_config(dbus_scale_config(2.0));
+    assert_eq!(
+        output_scale(&f),
+        2.0,
+        "the applied scale takes effect on the FIRST apply"
+    );
+
+    // Any later reload keeps the live-applied value; the store never overrides it.
+    f.niri_state().reload_output_config();
+    assert_eq!(
+        output_scale(&f),
+        2.0,
+        "a reload must not resurrect the stored scale"
+    );
+
+    // Second apply after the first one persisted: what applies is THIS value, not the file's.
+    store.write(&monitors_xml_with_scale(2.0));
+    f.niri_state().apply_display_config(dbus_scale_config(1.5));
+    assert_eq!(
+        output_scale(&f),
+        1.5,
+        "the second apply must not land the first apply's value"
+    );
+}
+
+/// `niri msg output set-scale` also outranks the store; `set-scale automatic` falls back to it.
+#[test]
+fn ipc_scale_beats_store_and_automatic_returns_to_it() {
+    let _store = MonitorsXmlGuard::install(&monitors_xml_with_scale(2.0));
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    assert_eq!(output_scale(&f), 2.0);
+
+    f.niri_state().apply_transient_output_config(
+        "headless-1",
+        niri_ipc::OutputAction::Scale {
+            scale: niri_ipc::ScaleToSet::Specific(1.5),
+        },
+    );
+    assert_eq!(
+        output_scale(&f),
+        1.5,
+        "a live IPC apply beats the saved store scale"
+    );
+
+    f.niri_state().apply_transient_output_config(
+        "headless-1",
+        niri_ipc::OutputAction::Scale {
+            scale: niri_ipc::ScaleToSet::Automatic,
+        },
+    );
+    assert_eq!(
+        output_scale(&f),
+        2.0,
+        "automatic falls back to the store, not the guess"
+    );
 }

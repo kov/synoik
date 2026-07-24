@@ -100,16 +100,7 @@ impl DBusServers {
             niri.event_loop
                 .insert_source(from_display_config, move |event, _, state| match event {
                     calloop::channel::Event::Msg(new_conf) => {
-                        for (name, conf) in new_conf {
-                            state.modify_output_config(&name, move |output| {
-                                if let Some(new_output) = conf {
-                                    *output = new_output;
-                                } else {
-                                    output.off = true;
-                                }
-                            });
-                        }
-                        state.reload_output_config();
+                        state.apply_display_config(new_conf);
                     }
                     calloop::channel::Event::Closed => (),
                 })

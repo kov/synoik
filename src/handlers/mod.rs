@@ -90,7 +90,7 @@ use crate::protocols::virtual_pointer::{
     VirtualPointerInputBackend, VirtualPointerManagerState, VirtualPointerMotionAbsoluteEvent,
     VirtualPointerMotionEvent,
 };
-use crate::utils::{output_size, send_scale_transform};
+use crate::utils::{ipc_transform_to_smithay, output_size, send_scale_transform};
 use crate::{
     delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
@@ -883,6 +883,30 @@ impl OutputManagementHandler for State {
     }
 
     fn apply_output_config(&mut self, config: niri_config::Outputs) {
+        // Like the DisplayConfig DBus path, a live wlr-output-management apply outranks the
+        // monitors.xml store (see `Niri::applied_display_config`); an unset scale clears the
+        // override back to store/KDL/guess.
+        for output in &config.0 {
+            if output.off {
+                continue;
+            }
+            let Some(connector) = self.niri.output_by_name_match(&output.name).map(|o| {
+                o.user_data()
+                    .get::<niri_config::OutputName>()
+                    .unwrap()
+                    .connector
+                    .clone()
+            }) else {
+                continue;
+            };
+            let entry = self
+                .niri
+                .applied_display_config
+                .entry(connector)
+                .or_default();
+            entry.scale = output.scale.map(|s| s.0);
+            entry.transform = Some(ipc_transform_to_smithay(output.transform));
+        }
         self.niri.config.borrow_mut().outputs = config;
         self.reload_output_config();
     }

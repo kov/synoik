@@ -572,10 +572,31 @@ pub struct Niri {
     pub ipc_server: Option<IpcServer>,
     pub ipc_outputs_changed: bool,
 
+    /// Per-connector display settings applied live this session, keyed by connector.
+    ///
+    /// This is our equivalent of mutter's "current" monitors config
+    /// (`meta_monitor_config_manager_set_current`, meta-monitor-manager.c
+    /// `meta_monitor_manager_apply_monitors_config`): a config applied via
+    /// `org.gnome.Mutter.DisplayConfig` `ApplyMonitorsConfig` (GNOME Settings), `niri msg
+    /// output`, or wlr-output-management takes effect immediately and outranks the
+    /// `monitors.xml` store, which is only *written* for persistence (and read at
+    /// startup/hotplug) — never re-read to override a live apply.
+    pub applied_display_config: HashMap<String, AppliedDisplayConfig>,
+
     pub satellite: Option<Satellite>,
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+}
+
+/// A scale/transform override applied live this session (see
+/// [`Niri::applied_display_config`]). Only the fields the `monitors.xml` store also covers need
+/// overriding; mode/position/off flow through the regular output config and are never overridden
+/// by the store.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppliedDisplayConfig {
+    pub scale: Option<f64>,
+    pub transform: Option<Transform>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2292,21 +2313,25 @@ impl State {
         let mut resized_outputs = vec![];
         let mut recolored_outputs = vec![];
 
-        // GNOME's display-config store (`~/.config/monitors.xml`) is the authoritative source of
-        // per-monitor scale/transform — it is what the user set in Settings / quick-settings and
-        // what mutter restores every login. Per the fork tenet it wins over niri's KDL `output {}`
-        // config (advanced escape hatch) and over the DPI guess. Loaded fresh each reload (cheap,
-        // and picks up Settings changes without a file watcher).
+        // Precedence for scale/transform, top first: a config applied live this session
+        // (GNOME Settings' ApplyMonitorsConfig / `niri msg output` / wlr-output-management —
+        // mutter's "current" config, never overridden by the store), then GNOME's display-config
+        // store (`~/.config/monitors.xml` — what mutter restores every login; per the fork tenet
+        // it wins over niri's KDL), then the KDL `output {}` config (advanced escape hatch), then
+        // the DPI guess. The store is loaded fresh each reload (cheap, and picks up external
+        // edits without a file watcher).
         let monitors_config = crate::monitors_xml::MonitorsConfig::load();
 
         for output in self.niri.global_space.outputs() {
             let name = output.user_data().get::<OutputName>().unwrap();
+            let applied = self.niri.applied_display_config.get(&name.connector);
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
             let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
 
-            let scale = saved
-                .map(|s| s.scale)
+            let scale = applied
+                .and_then(|a| a.scale)
+                .or_else(|| saved.map(|s| s.scale))
                 .or_else(|| config.and_then(|c| c.scale).map(|s| s.0))
                 .unwrap_or_else(|| {
                     let size_mm = output.physical_properties().size;
@@ -2315,11 +2340,14 @@ impl State {
                 });
             let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-            let base_transform = saved.map(|s| s.transform).unwrap_or_else(|| {
-                config
-                    .map(|c| ipc_transform_to_smithay(c.transform))
-                    .unwrap_or(Transform::Normal)
-            });
+            let base_transform = applied
+                .and_then(|a| a.transform)
+                .or_else(|| saved.map(|s| s.transform))
+                .unwrap_or_else(|| {
+                    config
+                        .map(|c| ipc_transform_to_smithay(c.transform))
+                        .unwrap_or(Transform::Normal)
+                });
             let transform = panel_orientation(output) + base_transform;
 
             if output.current_scale().fractional_scale() != scale
@@ -2434,6 +2462,38 @@ impl State {
     }
 
     pub fn apply_transient_output_config(&mut self, name: &str, action: niri_ipc::OutputAction) {
+        // A live-applied scale/transform outranks the monitors.xml store (see
+        // `Niri::applied_display_config`); record it so the reload below doesn't resurrect the
+        // stored value.
+        let connector = self
+            .niri
+            .output_by_name_match(name)
+            .map(|o| o.user_data().get::<OutputName>().unwrap().connector.clone());
+        if let Some(connector) = connector {
+            match &action {
+                niri_ipc::OutputAction::Scale { scale } => {
+                    let entry = self
+                        .niri
+                        .applied_display_config
+                        .entry(connector)
+                        .or_default();
+                    // Automatic clears the override: fall back to the store, KDL, then the guess.
+                    entry.scale = match scale {
+                        niri_ipc::ScaleToSet::Automatic => None,
+                        niri_ipc::ScaleToSet::Specific(scale) => Some(*scale),
+                    };
+                }
+                niri_ipc::OutputAction::Transform { transform } => {
+                    self.niri
+                        .applied_display_config
+                        .entry(connector)
+                        .or_default()
+                        .transform = Some(ipc_transform_to_smithay(*transform));
+                }
+                _ => (),
+            }
+        }
+
         self.modify_output_config(name, move |config| match action {
             niri_ipc::OutputAction::Off => config.off = true,
             niri_ipc::OutputAction::On => config.off = false,
@@ -2507,6 +2567,43 @@ impl State {
             niri_ipc::OutputAction::MaxBpc { max_bpc } => config.max_bpc = Some(MaxBpc(max_bpc)),
         });
 
+        self.reload_output_config();
+    }
+
+    /// Applies a display configuration coming from `org.gnome.Mutter.DisplayConfig`
+    /// `ApplyMonitorsConfig` (GNOME Settings, our quick-settings).
+    ///
+    /// Mirrors mutter (meta-monitor-manager.c, `meta_monitor_manager_apply_monitors_config` →
+    /// `meta_monitor_config_manager_set_current`): the applied config becomes the current session
+    /// config immediately and outranks the `monitors.xml` store. Persisting the store is the DBus
+    /// handler's separate concern; it is never re-read to override a live apply — doing so is
+    /// what made Settings' scale changes land one try late (the reload raced the store write and
+    /// resurrected the previous value).
+    pub fn apply_display_config(&mut self, new_conf: HashMap<String, Option<niri_config::Output>>) {
+        for (name, conf) in new_conf {
+            match &conf {
+                Some(output) => {
+                    let applied = AppliedDisplayConfig {
+                        scale: output.scale.map(|s| s.0),
+                        transform: Some(ipc_transform_to_smithay(output.transform)),
+                    };
+                    self.niri
+                        .applied_display_config
+                        .insert(name.clone(), applied);
+                }
+                // Output disabled: drop the override so a later enable re-derives from the store.
+                None => {
+                    self.niri.applied_display_config.remove(&name);
+                }
+            }
+            self.modify_output_config(&name, move |output| {
+                if let Some(new_output) = conf {
+                    *output = new_output;
+                } else {
+                    output.off = true;
+                }
+            });
+        }
         self.reload_output_config();
     }
 
@@ -3642,6 +3739,7 @@ impl Niri {
 
             ipc_server,
             ipc_outputs_changed: false,
+            applied_display_config: HashMap::new(),
 
             satellite: None,
 
@@ -3832,13 +3930,15 @@ impl Niri {
 
         let config = self.config.borrow();
         let c = config.outputs.find(name);
-        // GNOME's `monitors.xml` store is authoritative for scale/transform (see
-        // `reload_output_config` for the precedence rationale); consult it before the KDL config
-        // and the DPI guess so a saved scale is honored from the first frame, not just on reload.
+        // Same precedence as `reload_output_config` (see the rationale there): live-applied
+        // session config, then GNOME's `monitors.xml` store (so a saved scale is honored from the
+        // first frame, not just on reload), then the KDL config, then the DPI guess.
+        let applied = self.applied_display_config.get(&name.connector);
         let monitors_config = crate::monitors_xml::MonitorsConfig::load();
         let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
-        let scale = saved
-            .map(|s| s.scale)
+        let scale = applied
+            .and_then(|a| a.scale)
+            .or_else(|| saved.map(|s| s.scale))
             .or_else(|| c.and_then(|c| c.scale).map(|s| s.0))
             .unwrap_or_else(|| {
                 let size_mm = output.physical_properties().size;
@@ -3847,10 +3947,13 @@ impl Niri {
             });
         let scale = closest_representable_scale(scale.clamp(0.1, 10.));
 
-        let base_transform = saved.map(|s| s.transform).unwrap_or_else(|| {
-            c.map(|c| ipc_transform_to_smithay(c.transform))
-                .unwrap_or(Transform::Normal)
-        });
+        let base_transform = applied
+            .and_then(|a| a.transform)
+            .or_else(|| saved.map(|s| s.transform))
+            .unwrap_or_else(|| {
+                c.map(|c| ipc_transform_to_smithay(c.transform))
+                    .unwrap_or(Transform::Normal)
+            });
         let transform = panel_orientation(&output) + base_transform;
 
         let mut backdrop_color = c

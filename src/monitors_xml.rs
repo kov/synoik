@@ -56,9 +56,23 @@ pub struct MonitorsConfig {
     settings: Vec<MonitorSetting>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`MonitorsConfig::path`]: the whole test harness runs on the test's
+    /// own thread, so this lets a test point the store at a private file instead of the
+    /// developer's real `~/.config/monitors.xml` — without the process-global races that
+    /// `std::env::set_var` would inflict on parallel tests.
+    pub static TEST_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl MonitorsConfig {
     /// The path GNOME uses: `$XDG_CONFIG_HOME/monitors.xml`, else `~/.config/monitors.xml`.
     pub fn path() -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = TEST_PATH.with(|p| p.borrow().clone()) {
+            return Some(path);
+        }
         if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
             return Some(PathBuf::from(dir).join("monitors.xml"));
         }
