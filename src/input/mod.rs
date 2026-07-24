@@ -3016,7 +3016,7 @@ impl State {
         // The grid is reactive only while it's open and no search is covering it.
         let grid_reactive =
             self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
-        let (dash_hit, search_hit, grid_hit) = if overview_visible {
+        let (dash_hit, search_hit, grid_hit, arrow_hit) = if overview_visible {
             match self.niri.output_under(pos) {
                 Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {
                     Some(controls) => (
@@ -3025,13 +3025,16 @@ impl State {
                         grid_reactive
                             .then(|| self.niri.app_grid.hit_test(p, controls.app_display))
                             .flatten(),
+                        grid_reactive
+                            .then(|| self.niri.app_grid.arrow_hit(p, controls.app_display))
+                            .flatten(),
                     ),
-                    None => (None, None, None),
+                    None => (None, None, None, None),
                 },
-                None => (None, None, None),
+                None => (None, None, None, None),
             }
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
         if self.niri.dash.set_hovered(dash_hit) {
             self.niri.queue_redraw_all();
@@ -3040,6 +3043,9 @@ impl State {
             self.niri.queue_redraw_all();
         }
         if self.niri.app_grid.set_hovered(grid_hit) {
+            self.niri.queue_redraw_all();
+        }
+        if self.niri.app_grid.set_arrow_hovered(arrow_hit) {
             self.niri.queue_redraw_all();
         }
 
@@ -3706,6 +3712,22 @@ impl State {
                                 self.niri.suppressed_buttons.insert(button_code);
                                 if button == Some(MouseButton::Left) {
                                     self.niri.app_grid.set_page(page, area);
+                                }
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                            // A click on a navigation arrow steps one page.
+                            if let Some(arrow) = self.niri.app_grid.arrow_hit(*pos, area) {
+                                self.niri.suppressed_buttons.insert(button_code);
+                                if button == Some(MouseButton::Left) {
+                                    let cur = self.niri.app_grid.current_page();
+                                    let target = match arrow {
+                                        crate::ui::app_grid::PageArrow::Prev => {
+                                            cur.saturating_sub(1)
+                                        }
+                                        crate::ui::app_grid::PageArrow::Next => cur + 1,
+                                    };
+                                    self.niri.app_grid.set_page(target, area);
                                 }
                                 self.niri.queue_redraw_all();
                                 return;

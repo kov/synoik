@@ -150,6 +150,12 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         "group-collapse-symbolic" => Some(include_bytes!(
             "../../resources/icons/group-collapse-symbolic.svg"
         )),
+        "carousel-arrow-next-symbolic" => Some(include_bytes!(
+            "../../resources/icons/carousel-arrow-next-symbolic.svg"
+        )),
+        "carousel-arrow-previous-symbolic" => Some(include_bytes!(
+            "../../resources/icons/carousel-arrow-previous-symbolic.svg"
+        )),
         _ => None,
     }
 }

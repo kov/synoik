@@ -5326,6 +5326,36 @@ fn overview_app_grid_paginates_and_navigates() {
         "clicking a dot jumps to its page"
     );
 
+    // Clicking the next navigation arrow steps forward one page.
+    use crate::ui::app_grid::PageArrow;
+    let next = f
+        .niri()
+        .app_grid
+        .arrow_center(PageArrow::Next, area)
+        .unwrap();
+    f.pointer_motion(next.x - dot0.x, next.y - dot0.y); // relative from the dot
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "clicking the next arrow advances a page"
+    );
+    // On page 1 the previous arrow exists; clicking it steps back to page 0.
+    let prev = f
+        .niri()
+        .app_grid
+        .arrow_center(PageArrow::Prev, area)
+        .unwrap();
+    f.pointer_motion(prev.x - next.x, prev.y - next.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        0,
+        "clicking the previous arrow steps back a page"
+    );
+
     // A fresh overview open resets to page 0.
     f.niri().app_grid.set_page(1, area);
     f.niri_state().do_action(Action::CloseOverview, false);

@@ -5598,6 +5598,7 @@ impl Niri {
                     for element in self.app_grid.render(
                         ctx.renderer,
                         &self.app_icon_cache,
+                        &self.icon_cache,
                         output,
                         controls.app_display,
                         alpha,

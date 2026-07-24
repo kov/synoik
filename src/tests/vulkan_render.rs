@@ -6528,9 +6528,14 @@ fn vulkan_app_grid_draws_hovered_tile() {
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
             let niri = &mut state.niri;
-            let elements = niri
-                .app_grid
-                .render(vk, &niri.app_icon_cache, &output, area, 1.0);
+            let elements = niri.app_grid.render(
+                vk,
+                &niri.app_icon_cache,
+                &niri.icon_cache,
+                &output,
+                area,
+                1.0,
+            );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
             let pixels = render_to_vec(
@@ -6620,9 +6625,14 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
             let niri = &mut state.niri;
-            let elements = niri
-                .app_grid
-                .render(vk, &niri.app_icon_cache, &output, area, 1.0);
+            let elements = niri.app_grid.render(
+                vk,
+                &niri.app_icon_cache,
+                &niri.icon_cache,
+                &output,
+                area,
+                1.0,
+            );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
             let pixels = render_to_vec(
@@ -6656,6 +6666,115 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
         "an inactive dot is dimmer than the active one: {inactive:?} vs {active:?}"
     );
     assert_eq!(gap[3], 0, "the gap between dots is transparent: {gap:?}");
+}
+
+/// The page-navigation arrow bakes correctly: the chevron glyph draws opaque, the
+/// button is flat (no resting background) off the glyph, and hovering it paints the
+/// standard wash disc there.
+#[test]
+fn vulkan_app_grid_draws_navigation_arrows() {
+    use smithay::utils::{Logical, Point};
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::{AppGridEntry, PageArrow};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_draws_navigation_arrows: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // 30 apps span two pages → page 0 shows a next arrow (and no previous one).
+    {
+        let g = &mut f.niri().app_grid;
+        g.set_entries(
+            (0..30)
+                .map(|i| AppGridEntry {
+                    id: format!("app{i:02}.desktop"),
+                    name: format!("App {i:02}"),
+                    icon: AppIconRef::Fallback,
+                })
+                .collect(),
+        );
+    }
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let center = f
+        .niri()
+        .app_grid
+        .arrow_center(PageArrow::Next, area)
+        .expect("the next arrow exists on page 0");
+    // A point inside the 60px disc but outside the central 24px glyph box: flat at
+    // rest, washed on hover.
+    let off_glyph: Point<f64, Logical> = Point::from((center.x + 20., center.y));
+
+    let render =
+        |f: &mut Fixture| -> (Vec<u8>, i32) {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            composited
+                .expect("no Vulkan device")
+                .expect("compositing the arrows through Vulkan must not error")
+        };
+
+    // At rest: the chevron glyph draws opaque somewhere in its central box, and the
+    // button is flat (transparent) off the glyph.
+    let (rest, w) = render(&mut f);
+    let glyph_max = (-10..=10)
+        .flat_map(|dy| (-10..=10).map(move |dx| (dx, dy)))
+        .map(|(dx, dy)| px(&rest, w, center.x as i32 + dx, center.y as i32 + dy)[3])
+        .max()
+        .unwrap();
+    assert!(
+        glyph_max > 128,
+        "the chevron glyph draws opaque (max alpha {glyph_max})"
+    );
+    let rest_off = px(&rest, w, off_glyph.x as i32, off_glyph.y as i32);
+    assert_eq!(
+        rest_off[3], 0,
+        "a resting flat button has no background off its glyph: {rest_off:?}"
+    );
+
+    // Hovering the arrow paints the wash disc under the glyph.
+    assert!(f.niri().app_grid.set_arrow_hovered(Some(PageArrow::Next)));
+    let (hover, w) = render(&mut f);
+    let hover_off = px(&hover, w, off_glyph.x as i32, off_glyph.y as i32);
+    eprintln!("vulkan_app_grid_arrow: rest_off={rest_off:?} hover_off={hover_off:?}");
+    assert!(
+        hover_off[3] > 0 && hover_off[3] < 255,
+        "hovering paints a translucent wash off the glyph: {hover_off:?}"
+    );
 }
 
 /// The dash's running chrome bakes correctly: the `.dash-separator` reads as a

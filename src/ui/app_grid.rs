@@ -19,15 +19,20 @@
 //! (`_findBestIconSize`, tiles laid in a `max(w,h)` square cell). Column/row spacing
 //! grows from `.icon-grid`'s 12 to a max of 36 to absorb slack, then the remainder
 //! centers the page (`_calculateSpacing`, FILL). Overflow paginates: a dots row below
-//! the grid (`.page-indicator`, 10px, inactive at 2/3 scale + half opacity), navigable
-//! by a wheel notch (debounced 150ms), a dot click, or reset to page 0 on a fresh
-//! overview open (`'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
+//! the grid (`.page-indicator`, 10px, inactive at 2/3 scale + half opacity) plus flat
+//! circular **navigation arrows** in the side gutters (`.page-navigation-arrow`,
+//! `carousel-arrow-{previous,next}-symbolic`, `appDisplay.js:553-575`; shown when a
+//! previous/next page exists, `appDisplay.js:255-302`). Either dot, arrow, a wheel
+//! notch (debounced 150ms), or a reset to page 0 on a fresh overview open (`'hidden'` →
+//! `goToPage(0)`, `appDisplay.js:1342`) changes the page.
 //!
 //! **Divergences, revisited later.** No `indicatorsPadding` (the ~10% side reserve for
 //! the DnD peek/arrows, `appDisplay.js:162-171`): geometry-identical at 1920, but it
-//! shifts mode/icon-size selection at narrow widths. No page-slide animation (snap),
+//! shifts mode/icon-size selection at narrow widths, and (lacking that reserve) the
+//! navigation arrows sit in the grid's centering gutter rather than a fixed 10% band —
+//! they can crowd the edge tiles at very narrow widths. No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
-//! 1:1 swipe is deferred), no side **navigation arrows**, no keyboard paging
+//! 1:1 swipe is deferred), no keyboard paging
 //! (`Page_Up/Down`), no folders/drag-reorder, and the saved `app-picker-layout` is
 //! ignored (pure name sort). The sort is a case-folded `to_lowercase` compare rather
 //! than full locale collation (`localeCompare`): std has no collator, so accented
@@ -36,14 +41,16 @@
 //! it on the primary only); hit-testing stays per-output.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
+use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::render_helpers::icon::AppIconCache;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::widget::{self, style, AppIconUploads, Painter, TileMetrics};
@@ -85,6 +92,21 @@ const INDICATORS_STRIP_H: f64 = DOT_PAD_TOP + DOT_SIZE + INDICATORS_MARGIN_BOTTO
 const INACTIVE_DOT_SCALE: f64 = 2. / 3.;
 const INACTIVE_DOT_ALPHA: f32 = 0.5;
 
+// Page navigation arrows (`.page-navigation-arrow`, `_app-grid.scss:172-185`): a flat
+// circular button — transparent at rest, [`style::HOVER_WASH`] on hover — holding a
+// `$medium_icon_size` (24px) `carousel-arrow-*-symbolic` chevron with `$base_padding*3`
+// (18px) padding, so the disc is 24 + 36 = 60px.
+const ARROW_ICON_PX: f64 = 24.;
+const ARROW_PAD: f64 = 18.;
+const ARROW_DISC: f64 = ARROW_ICON_PX + 2. * ARROW_PAD;
+
+/// Which navigation arrow — the previous (left) or next (right) page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageArrow {
+    Prev,
+    Next,
+}
+
 /// One grid app — a plain-data snapshot (not a live catalog borrow), like
 /// [`crate::ui::dash::DashEntry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +122,10 @@ struct GridCache {
     bake: widget::BakeCache,
     /// The page-indicator dots row.
     dots_bake: widget::BakeCache,
+    /// The (constant) navigation-arrow hover-wash disc.
+    arrow_bake: widget::BakeCache,
+    /// Recolored arrow-chevron uploads, keyed by (output scale, is-next).
+    arrow_icons: HashMap<(NotNan<f64>, bool), TextureBuffer<VkTexture>>,
     /// Full-color icon uploads (shared key space with the dash's and search's).
     icons: AppIconUploads,
 }
@@ -110,6 +136,9 @@ pub struct AppGrid {
     /// The mouse-hovered tile (an absolute entry index) — drives the
     /// `.overview-tile:hover` wash.
     hovered: Option<usize>,
+    /// The mouse-hovered navigation arrow — drives its `.page-navigation-arrow:hover`
+    /// wash.
+    hovered_arrow: Option<PageArrow>,
     /// The current page (`AppDisplay` paginates; `iconGrid.js`). Clamped to the page
     /// count at layout time; reset to 0 on a fresh overview open.
     current_page: usize,
@@ -141,6 +170,10 @@ struct GridLayout {
     page: usize,
     /// The dot centers below the grid, one per page — `None` when `n_pages <= 1`.
     indicators: Option<Vec<Point<f64, Logical>>>,
+    /// The previous-page arrow's disc box — `Some` only when a previous page exists.
+    prev_arrow: Option<Rectangle<f64, Logical>>,
+    /// The next-page arrow's disc box — `Some` only when a next page exists.
+    next_arrow: Option<Rectangle<f64, Logical>>,
 }
 
 /// The FILL spacing distribution for one axis (`iconGrid.js` `_calculateSpacing`):
@@ -170,6 +203,7 @@ impl AppGrid {
         Self {
             entries: Vec::new(),
             hovered: None,
+            hovered_arrow: None,
             current_page: 0,
             content_rev: 0,
             cache: RefCell::new(GridCache::default()),
@@ -208,6 +242,16 @@ impl AppGrid {
             return false;
         }
         self.hovered = hovered;
+        self.content_rev += 1;
+        true
+    }
+
+    /// Set the mouse-hovered navigation arrow; returns whether it changed (→ redraw).
+    pub fn set_arrow_hovered(&mut self, arrow: Option<PageArrow>) -> bool {
+        if self.hovered_arrow == arrow {
+            return false;
+        }
+        self.hovered_arrow = arrow;
         self.content_rev += 1;
         true
     }
@@ -258,6 +302,8 @@ impl AppGrid {
             n_pages: 0,
             page: 0,
             indicators: None,
+            prev_arrow: None,
+            next_arrow: None,
         };
         let n = self.entries.len();
         // The grid page is the band minus the reserved dots strip.
@@ -344,6 +390,25 @@ impl AppGrid {
                 .collect()
         });
 
+        // Navigation arrows, centered in each side gutter and vertically on the block
+        // (`.page-navigation-arrow`; shown when a previous / next page exists). Absent
+        // the ~10% `indicatorsPadding` reserve, they ride the grid's centering slack.
+        let disc = |cx: f64| {
+            let cy = block.loc.y + block.size.h / 2.;
+            Rectangle::new(
+                Point::from((
+                    (cx - ARROW_DISC / 2.).round(),
+                    (cy - ARROW_DISC / 2.).round(),
+                )),
+                Size::from((ARROW_DISC, ARROW_DISC)),
+            )
+        };
+        let block_right = block.loc.x + block.size.w;
+        let area_right = area.loc.x + area.size.w;
+        let prev_arrow = (page > 0).then(|| disc(area.loc.x + (block.loc.x - area.loc.x) / 2.));
+        let next_arrow =
+            (page + 1 < n_pages).then(|| disc(block_right + (area_right - block_right) / 2.));
+
         GridLayout {
             tiles,
             block,
@@ -352,6 +417,8 @@ impl AppGrid {
             n_pages,
             page,
             indicators,
+            prev_arrow,
+            next_arrow,
         }
     }
 
@@ -384,6 +451,23 @@ impl AppGrid {
             (pos.x - c.x).abs() <= DOT_SIZE / 2. + DOT_PAD_SIDE
                 && (pos.y - c.y).abs() <= DOT_SIZE / 2. + DOT_PAD_TOP
         })
+    }
+
+    /// The navigation arrow under `pos` (logical, output coords), if any. `Prev`/`Next`
+    /// map to `current_page ∓ 1` for the caller (clamped by [`set_page`](Self::set_page)).
+    pub fn arrow_hit(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<PageArrow> {
+        let layout = self.layout(area);
+        if layout.prev_arrow.is_some_and(|r| r.contains(pos)) {
+            return Some(PageArrow::Prev);
+        }
+        if layout.next_arrow.is_some_and(|r| r.contains(pos)) {
+            return Some(PageArrow::Next);
+        }
+        None
     }
 
     /// The logical center of the current page's tile `k` — a geometry probe for the
@@ -419,6 +503,25 @@ impl AppGrid {
         self.layout(area).tiles.len()
     }
 
+    /// The center of a navigation arrow's disc — a geometry probe for the conformance
+    /// corpus (which clicks real pixels routed through [`arrow_hit`](Self::arrow_hit)).
+    #[cfg(test)]
+    pub fn arrow_center(
+        &self,
+        arrow: PageArrow,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let layout = self.layout(area);
+        let disc = match arrow {
+            PageArrow::Prev => layout.prev_arrow,
+            PageArrow::Next => layout.next_arrow,
+        }?;
+        Some(Point::from((
+            disc.loc.x + disc.size.w / 2.,
+            disc.loc.y + disc.size.h / 2.,
+        )))
+    }
+
     /// The grid render elements for `output`, into the `app_display` box, at `alpha`.
     /// Icons are pushed first (topmost within the grid); the tile chrome (wash +
     /// labels) bakes last (below the icons) — the dash/search order. The grid as a
@@ -427,6 +530,7 @@ impl AppGrid {
         &self,
         renderer: &mut VulkanRenderer,
         app_icons: &AppIconCache,
+        sym_icons: &IconCache,
         output: &Output,
         area: Rectangle<f64, Logical>,
         alpha: f32,
@@ -592,6 +696,90 @@ impl AppGrid {
             }
         }
 
+        // --- The page-navigation arrows (flat circular buttons in the side gutters). A
+        //     hovered arrow gets the standard wash disc beneath its chevron. ---
+        let scale_key = NotNan::new(scale).ok();
+        for (is_next, disc) in [(false, layout.prev_arrow), (true, layout.next_arrow)] {
+            let Some(disc) = disc else { continue };
+            // The chevron glyph (topmost — pushed before its wash), its own upload cache.
+            let name = if is_next {
+                "carousel-arrow-next-symbolic"
+            } else {
+                "carousel-arrow-previous-symbolic"
+            };
+            if let (Some(scale_key), Some(buffer)) = (
+                scale_key,
+                sym_icons.buffer(name, ARROW_ICON_PX, scale, style::TEXT),
+            ) {
+                let key = (scale_key, is_next);
+                #[allow(clippy::map_entry)]
+                if !cache.arrow_icons.contains_key(&key) {
+                    match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                        Ok(tb) => {
+                            cache.arrow_icons.insert(key, tb);
+                        }
+                        Err(err) => tracing::error!("error uploading nav arrow: {err:#}"),
+                    }
+                }
+                if let Some(tb) = cache.arrow_icons.get(&key) {
+                    let logical = tb.logical_size();
+                    let center =
+                        Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
+                    let loc = center - Point::from((logical.w / 2., logical.h / 2.));
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        tb.clone(),
+                        loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+            }
+        }
+        // The hover wash disc, beneath the hovered arrow's chevron (a constant bake,
+        // repositioned). Only one arrow is hovered at a time.
+        if let Some(disc) = self.hovered_arrow.and_then(|a| match a {
+            PageArrow::Prev => layout.prev_arrow,
+            PageArrow::Next => layout.next_arrow,
+        }) {
+            let size = disc.size;
+            match widget::bake(
+                renderer,
+                &mut cache.arrow_bake,
+                scale,
+                size,
+                0,
+                |_| Ok(()),
+                move |frame, phys, _: &()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    let full = Rectangle::from_size(size);
+                    p.fill_rounded(full, ARROW_DISC / 2., style::HOVER_WASH)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        disc.loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the nav-arrow wash: {err:#}"),
+            }
+        }
+
         elements
     }
 }
@@ -675,6 +863,39 @@ mod tests {
         assert_eq!(g.indicator_hit(dots[1], area), Some(1));
         // A single page shows no dots.
         assert!(grid_n(10).layout(area).indicators.is_none());
+    }
+
+    #[test]
+    fn arrows_appear_only_beside_a_neighbouring_page() {
+        let mut g = grid_n(30);
+        let area = wide();
+        // Page 0: no previous, a next.
+        let l0 = g.layout(area);
+        assert!(l0.prev_arrow.is_none());
+        assert!(l0.next_arrow.is_some());
+        // Last page: a previous, no next.
+        g.set_page(1, area);
+        let l1 = g.layout(area);
+        assert!(l1.prev_arrow.is_some());
+        assert!(l1.next_arrow.is_none());
+        // A single page shows neither.
+        let l = grid_n(10).layout(area);
+        assert!(l.prev_arrow.is_none() && l.next_arrow.is_none());
+    }
+
+    #[test]
+    fn arrow_hit_steps_the_page() {
+        let mut g = grid_n(30);
+        let area = wide();
+        let next = g.arrow_center(PageArrow::Next, area).unwrap();
+        assert_eq!(g.arrow_hit(next, area), Some(PageArrow::Next));
+        // The next arrow sits to the right of the grid block; the prev arrow is absent.
+        assert!(g.arrow_center(PageArrow::Prev, area).is_none());
+        // Clicking through it advances, and the prev arrow then appears and returns.
+        g.set_page(1, area);
+        let prev = g.arrow_center(PageArrow::Prev, area).unwrap();
+        assert_eq!(g.arrow_hit(prev, area), Some(PageArrow::Prev));
+        assert_eq!(g.arrow_hit(Point::from((-100., -100.)), area), None);
     }
 
     #[test]
