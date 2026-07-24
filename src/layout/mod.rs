@@ -102,6 +102,16 @@ const INTERACTIVE_MOVE_START_THRESHOLD: f64 = 256. * 256.;
 /// Opacity of interactively moved tiles targeting the scrolling layout.
 const INTERACTIVE_MOVE_ALPHA: f64 = 0.75;
 
+/// Longest side a dragged window preview shrinks to in the overview, logical px
+/// — gnome-shell's `WINDOW_DND_SIZE` (`windowPreview.js:14`), handed to
+/// `DND.makeDraggable` as `dragActorMaxSize` (`:108`).
+const WINDOW_DND_SIZE: f64 = 256.;
+
+/// How long that shrink takes — `SCALE_ANIMATION_TIME` (`dnd.js:11`),
+/// EASE_OUT_QUAD. A fixed gnome-shell duration, not a configurable one; only
+/// whether animations run at all is inherited.
+const DND_SCALE_ANIMATION_TIME_MS: u32 = 250;
+
 /// Amount of touchpad movement to toggle the overview.
 const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
 
@@ -473,6 +483,11 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// The dragged tile keeps rendering at this footprint: gnome-shell drags
     /// the preview, never resizing the real window.
     pub(self) expose_pickup_size: Option<Size<f64, Logical>>,
+    /// Progress of the drag-actor shrink: gnome-shell eases the picked-up
+    /// preview down to fit `WINDOW_DND_SIZE` on its longest side over
+    /// `SCALE_ANIMATION_TIME` (`dnd.js:261-288`), so a drag across the row
+    /// carries something small enough to see the target under.
+    pub(self) expose_dnd_shrink: Option<Animation>,
 }
 
 #[derive(Debug)]
@@ -621,7 +636,8 @@ impl<W: LayoutElement> InteractiveMoveState<W> {
 
 impl<W: LayoutElement> InteractiveMoveData<W> {
     /// Extra render scale that fits the dragged tile into the picker-preview
-    /// footprint it had when picked up in the GNOME overview.
+    /// footprint it had when picked up in the GNOME overview, shrunk toward
+    /// `WINDOW_DND_SIZE` as the drag gets going.
     fn expose_extra_scale(&self, zoom: f64) -> f64 {
         let Some(pickup) = self.expose_pickup_size else {
             return 1.;
@@ -630,7 +646,24 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
         if size.w <= 0. || size.h <= 0. {
             return 1.;
         }
-        f64::min(pickup.w / (size.w * zoom), pickup.h / (size.h * zoom))
+        let fit = f64::min(pickup.w / (size.w * zoom), pickup.h / (size.h * zoom));
+        fit * self.expose_dnd_shrink_factor(pickup)
+    }
+
+    /// How far the drag actor has shrunk toward [`WINDOW_DND_SIZE`]: 1 at the
+    /// moment of pickup, easing to `WINDOW_DND_SIZE / longest side` (never up —
+    /// a preview already smaller than that is left alone, `dnd.js:262-264`).
+    fn expose_dnd_shrink_factor(&self, pickup: Size<f64, Logical>) -> f64 {
+        let longest = f64::max(pickup.w, pickup.h);
+        if longest <= WINDOW_DND_SIZE {
+            return 1.;
+        }
+        let target = WINDOW_DND_SIZE / longest;
+        let progress = self
+            .expose_dnd_shrink
+            .as_ref()
+            .map_or(0., |anim| anim.clamped_value().clamp(0., 1.));
+        1. + (target - 1.) * progress
     }
 
     fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
@@ -4251,6 +4284,23 @@ impl<W: LayoutElement> Layout<W> {
                     output_config,
                     workspace_config,
                     expose_pickup_size,
+                    expose_dnd_shrink: expose_pickup_size.map(|_| {
+                        Animation::new(
+                            self.clock.clone(),
+                            0.,
+                            1.,
+                            0.,
+                            niri_config::Animation {
+                                off: self.options.animations.overview_open_close.0.off,
+                                kind: niri_config::animations::Kind::Easing(
+                                    niri_config::animations::EasingParams {
+                                        duration_ms: DND_SCALE_ANIMATION_TIME_MS,
+                                        curve: niri_config::animations::Curve::EaseOutQuad,
+                                    },
+                                ),
+                            },
+                        )
+                    }),
                 };
 
                 if let Some((tile_pos, zoom)) = tile_pos {
@@ -5175,6 +5225,19 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// The on-screen footprint of the window being dragged, if any: in the
+    /// overview that is the picker preview it was picked up as, shrunk toward
+    /// [`WINDOW_DND_SIZE`] as the drag gets going. Same geometry
+    /// [`Self::render_interactive_move_for_output`] draws.
+    pub fn interactive_move_drawn_size(&self) -> Option<Size<f64, Logical>> {
+        let InteractiveMoveState::Moving(move_) = self.interactive_move.as_ref()? else {
+            return None;
+        };
+        let zoom = self.overview_zoom_for_output(&move_.output);
+        let scale = zoom * move_.expose_extra_scale(zoom);
+        Some(move_.tile.tile_size().upscale(scale))
+    }
+
     pub fn render_interactive_move_for_output(
         &self,
         ctx: RenderCtx,
@@ -5224,6 +5287,7 @@ impl<W: LayoutElement> Layout<W> {
                 // The overview closed mid-drag: drop the picker-preview
                 // footprint and render the window at its real size.
                 move_.expose_pickup_size = None;
+                move_.expose_dnd_shrink = None;
             }
 
             let win = move_.tile.window_mut();

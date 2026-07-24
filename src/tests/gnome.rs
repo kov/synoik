@@ -2464,6 +2464,63 @@ fn overview_drag_within_workspace_keeps_desktop_position() {
     );
 }
 
+/// Picking a preview up in the overview shrinks it: gnome-shell hands its
+/// draggable a `dragActorMaxSize` of `WINDOW_DND_SIZE` (256px,
+/// `windowPreview.js:14,108`) and `dnd.js:261-288` eases the drag actor down to
+/// fit it over `SCALE_ANIMATION_TIME`, so what you carry across the row is small
+/// enough to see the target under it.
+#[test]
+fn overview_dragged_preview_shrinks_to_the_dnd_size() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    assert!(
+        f64::max(slot.size.w, slot.size.h) > 256.,
+        "the preview must start bigger than WINDOW_DND_SIZE for this to test anything"
+    );
+
+    // Pick it up: the drag starts at the footprint it was picked up at.
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(-100., -100.);
+
+    let picked = f
+        .niri()
+        .layout
+        .interactive_move_drawn_size()
+        .expect("the drag must be in flight");
+    assert!(
+        (picked.w - slot.size.w).abs() <= 2.,
+        "the drag starts at the preview's own footprint, got {picked:?} vs {:?}",
+        slot.size
+    );
+
+    f.settle_animations();
+    let shrunk = f.niri().layout.interactive_move_drawn_size().unwrap();
+    assert!(
+        (f64::max(shrunk.w, shrunk.h) - 256.).abs() <= 1.,
+        "the dragged preview must shrink to 256px on its longest side, got {shrunk:?}"
+    );
+    assert!(
+        (shrunk.w / shrunk.h - picked.w / picked.h).abs() <= 0.01,
+        "and keep its aspect, got {shrunk:?} from {picked:?}"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+}
+
 /// Dropping a preview on a neighbor workspace peeking at the screen edge
 /// moves the window there and nothing else: it keeps its desktop position
 /// (not flush against the neighbor's left edge) and the overview stays open.
