@@ -6,6 +6,8 @@
 //! it makes an ideal oracle: the Pixman side needs no device, and the Vulkan side guard-skips when
 //! no Vulkan device is present. Runs on Venus (real target) and lavapipe (deterministic CPU).
 
+use std::time::Duration;
+
 use glam::Mat3;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_vk::render::{PostprocessPush, ResizePush};
@@ -3050,4 +3052,101 @@ fn vulkan_readback_host_buffer_grows_then_reuses() {
         2,
         "alternating sizes must reuse the grown buffer, not churn a blob per frame",
     );
+}
+
+/// GPU timing reports a real, plausible duration on this device.
+///
+/// The whole point of the `gpu` option is to split a slow `submit` into "the CPU
+/// was busy recording" versus "the GPU was busy executing", and the timestamp
+/// path is the part most likely to be quietly wrong: `timestampPeriod` and
+/// `timestampValidBits` are per-device, and a paravirtualized driver (this VM's
+/// Venus) can report a tick domain that makes the arithmetic nonsense. So assert
+/// the number is both non-zero and sane rather than trusting the API.
+///
+/// Skips itself where the whole Vulkan suite does (no device), and where the
+/// device declines to timestamp — which is a legitimate configuration, not a
+/// failure.
+#[test]
+fn vulkan_gpu_timing_reports_a_plausible_duration() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_gpu_timing_reports_a_plausible_duration: no device ({e})");
+            return;
+        }
+    };
+
+    if !vk.enable_gpu_timing() {
+        eprintln!("skipping vulkan_gpu_timing_reports_a_plausible_duration: no timestamp support");
+        return;
+    }
+
+    // Clear whatever an earlier test in this process banked, so the reading below
+    // is this render's alone.
+    let _ = crate::frame_log::take_gpu_time();
+
+    let elements: Vec<OutputRenderElements> = solid_scene()
+        .into_iter()
+        .map(OutputRenderElements::SolidColor)
+        .collect();
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    let _ = render_elements_into(&mut vk, &mut target, &elements);
+
+    // A device that advertises timestamps and then writes none disables itself on
+    // the first read (this VM's virtio-gpu/Venus does exactly that). That is a
+    // legitimate outcome to skip on — but only *after* a real submit has proven
+    // it, which is why the check is here rather than up front.
+    if !vk.gpu_timing_usable() {
+        eprintln!(
+            "skipping vulkan_gpu_timing_reports_a_plausible_duration: \
+             the device advertises timestamps but writes none"
+        );
+        return;
+    }
+
+    let gpu = crate::frame_log::take_gpu_time();
+    assert!(
+        gpu > Duration::ZERO,
+        "a submitted frame must report some GPU time"
+    );
+    // A handful of solid quads at 64x64 is microseconds of work. The ceiling is
+    // deliberately generous (this runs on a virtualized GPU under test load) —
+    // it is there to catch a broken tick scale, not to police performance.
+    assert!(
+        gpu < Duration::from_millis(100),
+        "implausible GPU time {gpu:?} — check timestampPeriod/validBits handling"
+    );
+}
+
+/// The timestamp arithmetic, which no device on this machine can exercise: the
+/// VM's driver advertises timestamp queries and writes none, so
+/// [`vulkan_gpu_timing_reports_a_plausible_duration`] skips here and the masking
+/// would otherwise ship untested.
+#[test]
+fn timestamp_ticks_masks_and_wraps() {
+    use super::renderer::timestamp_ticks;
+
+    // The ordinary case, at full width.
+    assert_eq!(timestamp_ticks([1_000, 4_500], 64), Some(3_500));
+
+    // Bits above `valid_bits` are undefined and must not reach the delta: the
+    // same low bits with different garbage on top give the same answer.
+    assert_eq!(timestamp_ticks([1_000, 4_500], 32), Some(3_500));
+    assert_eq!(
+        timestamp_ticks([(1 << 40) | 1_000, (1 << 41) | 4_500], 32),
+        Some(3_500)
+    );
+
+    // A counter that wrapped within the pass still yields the true delta,
+    // because the subtraction is modulo the same width.
+    assert_eq!(timestamp_ticks([u32::MAX as u64 - 99, 100], 32), Some(200));
+
+    // Not written at all.
+    assert_eq!(timestamp_ticks([0, 0], 64), None);
+
+    // A zero *start* is not the same thing — a device whose clock happens to be
+    // read as 0 at the top of the pass still reported a real end.
+    assert_eq!(timestamp_ticks([0, 500], 64), Some(500));
 }

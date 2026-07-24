@@ -153,6 +153,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // next frame; once the frame is constructed its `Drop` always submits
         // (`finish_internal`), so the recorded acquires are never orphaned. See
         // `VulkanRenderer::pending_dmabuf_acquires`.
+        // Outside the render pass, before any work: `vkCmdResetQueryPool` is not
+        // allowed inside one, and this must precede the acquires so they count.
+        renderer.gpu_timer_begin(cbuf);
+
         renderer.record_pending_dmabuf_acquires(cbuf);
 
         {
@@ -992,6 +996,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
             // Flush the capture so `dest` is fully written before the caller's separately-submitted
             // blur samples it, then re-open a fresh command buffer on the continuation pass.
+            self.renderer.gpu_timer_end(old_cbuf);
             dev.end_command_buffer(old_cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&old_cbuf));
@@ -1003,6 +1008,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&old_cbuf));
+            // Bank this segment's GPU time *before* re-arming: the pool has only
+            // two slots, and the continuation buffer's reset would otherwise
+            // discard this submit's pair unread.
+            self.renderer.gpu_timer_collect();
 
             let alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.renderer.command_pool)
@@ -1016,6 +1025,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .framebuffer(framebuffer)
                 .render_area(render_area);
             dev.begin_command_buffer(new_cbuf, &begin_info)?;
+            // Re-arm for the continuation buffer, still outside its render pass.
+            self.renderer.gpu_timer_begin(new_cbuf);
             dev.cmd_begin_render_pass(new_cbuf, &pass_begin, vk::SubpassContents::INLINE);
             dev.cmd_set_viewport(new_cbuf, 0, std::slice::from_ref(&viewport));
             dev.cmd_set_scissor(new_cbuf, 0, std::slice::from_ref(&render_area));
@@ -1443,6 +1454,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             if let Some(present) = self.fb.present.as_ref() {
                 self.record_present_blit(present);
             }
+            self.renderer.gpu_timer_end(self.cbuf);
             dev.end_command_buffer(self.cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit =
@@ -1456,6 +1468,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&self.cbuf));
         }
+        // The fence is signalled, so the queries are resolved and this does not
+        // block.
+        self.renderer.gpu_timer_collect();
         // The render pass's `final_layout` leaves the target in TRANSFER_SRC_OPTIMAL (see
         // `create_render_pass`); record it so readback is a no-op and `make_sampleable` knows the
         // source layout for its barrier.

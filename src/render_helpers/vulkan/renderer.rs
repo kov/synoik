@@ -1,6 +1,8 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ash::vk;
 use niri_vk::blur::BlurChain;
@@ -24,6 +26,7 @@ use smithay::backend::renderer::{
     TextureFilter,
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+use tracing::warn;
 
 use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
@@ -90,6 +93,10 @@ pub struct VulkanRenderer {
     custom_open: Option<Pipeline>,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
+    /// Timestamp queries bracketing each submit, when `NIRI_FRAME_LOG=…,gpu` asked
+    /// for GPU timing and the device can answer. `None` otherwise, which is the
+    /// normal case — see [`GpuTimer`].
+    gpu_timer: Option<GpuTimer>,
     /// Reused staging buffer for shm-client texture uploads (grown on demand), so the shm cache's
     /// hit path refreshes a client buffer every commit without churning a mappable allocation.
     shm_staging: niri_vk::texture::Staging,
@@ -350,6 +357,7 @@ impl VulkanRenderer {
             unsafe { gpu.device.create_command_pool(&ci, None) }?
         };
 
+        let gpu_for_timer = Arc::clone(&gpu);
         Ok(VulkanRenderer {
             gpu,
             context_id: ContextId::new(),
@@ -372,6 +380,7 @@ impl VulkanRenderer {
             custom_open: None,
             sampler_set_layout,
             command_pool,
+            gpu_timer: GpuTimer::if_requested(&gpu_for_timer)?,
             shm_staging: niri_vk::texture::Staging::new(),
             readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
             #[cfg(test)]
@@ -1131,11 +1140,177 @@ unsafe fn transition_image(
     );
 }
 
+/// GPU-side timing for one submit: a two-slot timestamp query pool, written at
+/// the top and bottom of each command buffer and read back right after the fence
+/// wait the renderer already does.
+///
+/// Two slots is enough precisely *because* the renderer is synchronous — every
+/// submit is fence-waited before the next command buffer is recorded, so the
+/// results are always collected before the pool is reset. An asynchronous
+/// renderer would need a pool per frame in flight.
+///
+/// Only built when `NIRI_FRAME_LOG` asked for `gpu` timing, so the query writes
+/// are absent (not merely unread) in a normal session.
+struct GpuTimer {
+    pool: vk::QueryPool,
+    /// Set when the device turns out not to write timestamps despite advertising
+    /// them, after which the whole thing goes quiet. See
+    /// [`VulkanRenderer::gpu_timer_collect`].
+    unusable: Cell<bool>,
+}
+
+impl GpuTimer {
+    /// The reading is bogus above this, so drop it rather than report it: a
+    /// paravirtualized device (our Venus VM) can hand back a tick delta from an
+    /// unrelated clock domain, and a "4200ms GPU pass" in the log is worse than
+    /// no number at all.
+    const SANE_LIMIT: Duration = Duration::from_secs(1);
+
+    /// The pool, if this device can answer timestamp queries at all.
+    fn create(gpu: &Gpu) -> Result<Option<Self>, VulkanError> {
+        if !gpu.timestamps_supported() {
+            warn!("GPU timing requested, but this device cannot timestamp");
+            return Ok(None);
+        }
+
+        let ci = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2);
+        let pool = unsafe { gpu.device.create_query_pool(&ci, None) }?;
+        Ok(Some(Self {
+            pool,
+            unusable: Cell::new(false),
+        }))
+    }
+
+    /// The pool only if the session asked for GPU timing.
+    fn if_requested(gpu: &Gpu) -> Result<Option<Self>, VulkanError> {
+        if !crate::frame_log::gpu_timing() {
+            return Ok(None);
+        }
+        Self::create(gpu)
+    }
+}
+
+impl VulkanRenderer {
+    /// Turn GPU timing on for this renderer alone, without touching the
+    /// process-wide flag the environment sets — tests run in one process and
+    /// share that flag, so flipping it would instrument every other renderer too.
+    /// Returns whether the device could provide it.
+    #[cfg(test)]
+    pub(crate) fn enable_gpu_timing(&mut self) -> bool {
+        if self.gpu_timer.is_none() {
+            self.gpu_timer = GpuTimer::create(&self.gpu).expect("query pool");
+        }
+        self.gpu_timer.is_some()
+    }
+
+    /// Whether GPU timing is still live: `false` once a device has been caught
+    /// advertising timestamps it does not write.
+    #[cfg(test)]
+    pub(crate) fn gpu_timing_usable(&self) -> bool {
+        self.gpu_timer.as_ref().is_some_and(|t| !t.unusable.get())
+    }
+
+    /// Reset the query pool and stamp the start of `cbuf`. Must be called with
+    /// `cbuf` recording and **outside** a render pass (`vkCmdResetQueryPool` is
+    /// not allowed inside one).
+    pub(super) fn gpu_timer_begin(&self, cbuf: vk::CommandBuffer) {
+        let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
+            return;
+        };
+        unsafe {
+            let dev = &self.gpu.device;
+            dev.cmd_reset_query_pool(cbuf, timer.pool, 0, 2);
+            dev.cmd_write_timestamp(cbuf, vk::PipelineStageFlags::TOP_OF_PIPE, timer.pool, 0);
+        }
+    }
+
+    /// Stamp the end of `cbuf`, just before it is ended and submitted.
+    pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer) {
+        let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
+            return;
+        };
+        unsafe {
+            self.gpu.device.cmd_write_timestamp(
+                cbuf,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                timer.pool,
+                1,
+            );
+        }
+    }
+
+    /// Read the pair back and report it to the frame log. Call after the submit's
+    /// fence wait, so the results are available without blocking further.
+    pub(super) fn gpu_timer_collect(&self) {
+        let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
+            return;
+        };
+
+        let mut ticks = [0u64; 2];
+        let res = unsafe {
+            self.gpu.device.get_query_pool_results(
+                timer.pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        if let Err(err) = res {
+            warn!("error reading GPU timestamps: {err}");
+            return;
+        }
+
+        let Some(delta) = timestamp_ticks(ticks, self.gpu.timestamp_valid_bits) else {
+            warn!(
+                "this device advertises timestamp queries but does not write them; \
+                 GPU timing is unavailable (CPU-side frame timing is unaffected)"
+            );
+            timer.unusable.set(true);
+            return;
+        };
+
+        let duration = self.gpu.timestamp_delta(delta);
+        if duration <= GpuTimer::SANE_LIMIT {
+            crate::frame_log::add_gpu_time(duration);
+        }
+    }
+}
+
+/// Turn a start/end timestamp pair into a tick delta, or `None` if the device
+/// did not write them.
+///
+/// Only the low `valid_bits` of a timestamp are defined, so the pair is masked
+/// before subtracting; a counter that wrapped inside the pass then still yields
+/// the right delta, since the subtraction is modulo the same width.
+///
+/// `None` means "both raw values are zero", which no device that actually wrote
+/// timestamps can produce: the GPU clock is free-running, so a real pass has a
+/// large absolute value at each end. Devices that advertise the feature and
+/// implement nothing (virtio-gpu/Venus, at least here) are the reason this is
+/// checked rather than assumed.
+pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> Option<u64> {
+    if ticks == [0, 0] {
+        return None;
+    }
+
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    Some((ticks[1] & mask).wrapping_sub(ticks[0] & mask) & mask)
+}
+
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         unsafe {
             let dev = &self.gpu.device;
             let _ = dev.device_wait_idle();
+            if let Some(timer) = self.gpu_timer.take() {
+                dev.destroy_query_pool(timer.pool, None);
+            }
             self.shm_staging.destroy(dev);
             self.readback_staging_buffer.destroy(dev);
             self.solid_pipeline.destroy(dev);

@@ -109,6 +109,13 @@ pub struct Gpu {
     // Used by the device probes (format-support / DRM-modifier / external-semaphore queries).
     pub phys: vk::PhysicalDevice,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Nanoseconds per timestamp-query tick (`VkPhysicalDeviceLimits::timestampPeriod`),
+    /// and how many bits of a timestamp the graphics queue actually fills
+    /// (`timestampValidBits`, 0 meaning the queue cannot timestamp at all). Both
+    /// are needed to turn a query result into a duration; see
+    /// [`Self::timestamps_supported`].
+    pub timestamp_period_ns: f32,
+    pub timestamp_valid_bits: u32,
     pub device_name: String,
     // CPU vs a real GPU — the dmabuf demo needs a hardware device tied to the DRM node, so it
     // skips on CPU devices (lavapipe).
@@ -147,6 +154,18 @@ pub enum DeviceSelector {
 }
 
 impl Gpu {
+    /// Whether the graphics queue can answer timestamp queries, i.e. whether GPU
+    /// pass durations are measurable at all. A tick period of zero means the
+    /// device declines to timestamp; zero valid bits means this queue does.
+    pub fn timestamps_supported(&self) -> bool {
+        self.timestamp_valid_bits > 0 && self.timestamp_period_ns > 0.
+    }
+
+    /// Turn a raw tick delta from a timestamp query into a duration.
+    pub fn timestamp_delta(&self, ticks: u64) -> std::time::Duration {
+        std::time::Duration::from_nanos((ticks as f64 * f64::from(self.timestamp_period_ns)) as u64)
+    }
+
     /// Bring up an instance + a single graphics-capable logical device, picking the best by type
     /// rank. See [`Gpu::with_selector`] — a compositor wants [`DeviceSelector::DrmRenderNode`].
     pub fn new() -> Result<Self> {
@@ -344,12 +363,19 @@ impl Gpu {
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
 
+        let timestamp_valid_bits =
+            unsafe { instance.get_physical_device_queue_family_properties(phys) }
+                .get(queue_family as usize)
+                .map_or(0, |f| f.timestamp_valid_bits);
+
         Ok(Gpu {
             device,
             queue,
             queue_family,
             phys,
             mem_props,
+            timestamp_period_ns: props.limits.timestamp_period,
+            timestamp_valid_bits,
             device_name,
             device_type: props.device_type,
             drm_render_node: drm_render_node(&instance, phys),
