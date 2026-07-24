@@ -398,9 +398,11 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     dash+search at overview-fade × (1 − search-fade) — the grid **slides, it does not fade** with the
     state axis (`overviewControls.js:582-627`; the box motion is the animation). Gated reactivity on
     `is_app_grid_open() && !search.is_active()`.
-  - **S8a divergences / follow-ups (deferred, all documented in-module):** thumbnails do NOT yet fade/
-    scale out with the grid fraction (`_getThumbnailsBoxParams` state-axis params) — they may sit
-    opaque above the shrunk picker; **single page only** (apps past the band are dropped, reachable via
+  - **S8a-thumbnails-fade ✅ DONE (`070d5be6`).** The thumbnails strip fades out with the grid
+    (opacity 255→0 × `app_grid_fraction`, `_getThumbnailsBoxParams`) instead of sitting opaque above
+    the shrunk picker. Deferred: GNOME's additional scale-0.5 + translationY-+h/2 shrink (transient —
+    the box ends invisible) and making the faded strip non-reactive (`visible=false` in APP_GRID).
+  - **S8a divergences / follow-ups (deferred, all documented in-module):** **single page only** (apps past the band are dropped, reachable via
     search — no pagination/PageIndicators/folders/`app-picker-layout`/DnD reorder); **no in-grid
     keynav** (arrows/Enter); sort is `to_lowercase` not locale collation. Floor/ceil vs transition-
     bracket interpolation noted in `overview_layout.rs` (`b6b3d86b`).
