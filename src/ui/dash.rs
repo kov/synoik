@@ -379,10 +379,10 @@ impl Dash {
     }
 
     /// The logical center of tile `i` within `area` — favorites are
-    /// `[0, n)`, the trailing show-apps button is `[n]`. A geometry probe for the
-    /// conformance corpus, which clicks real pixels routed through
-    /// [`hit_test`](Self::hit_test). `None` if out of range.
-    #[cfg(test)]
+    /// `[0, n)`, the trailing show-apps button is `[n]`. Where a drag of that tile
+    /// picks the icon up from, and a geometry probe for the conformance corpus,
+    /// which clicks real pixels routed through [`hit_test`](Self::hit_test).
+    /// `None` if out of range.
     pub fn tile_center(
         &self,
         i: usize,

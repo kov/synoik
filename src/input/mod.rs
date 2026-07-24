@@ -3591,14 +3591,17 @@ impl State {
 
         // Only the app icons are drag sources; the show-apps button, the page
         // controls and the search card are not.
-        let (id, icon) = match hit {
+        let controls = self.niri.layout.controls_layout_for_output(&output);
+        let (id, icon, tile_center) = match hit {
             OverviewHit::Dash(DashHit::App(i)) => (
                 self.niri.dash.item_id(*i).map(str::to_owned),
                 self.niri.dash.item_icon(*i).cloned(),
+                controls.and_then(|c| self.niri.dash.tile_center(*i, c.dash)),
             ),
             OverviewHit::GridApp(i) => (
                 self.niri.app_grid.entry_id(*i).map(str::to_owned),
                 self.niri.app_grid.entry_icon(*i).cloned(),
+                controls.and_then(|c| self.niri.app_grid.entry_center(*i, c.app_display)),
             ),
             _ => return,
         };
@@ -3606,9 +3609,10 @@ impl State {
             return;
         };
 
-        // The icon is carried at the point it was grabbed by, like the drag actor
-        // gnome-shell hands to `_dragActor.set_position` (`dnd.js:257-259`).
-        let grab_offset = *origin - pos_within_output;
+        // The icon keeps the point it was grabbed by: gnome-shell positions its drag
+        // actor at the pointer plus the offset the press had inside it
+        // (`dnd.js:257-259`), so the icon doesn't jump under the cursor.
+        let grab_offset = tile_center.map_or_else(Point::default, |center| center - *origin);
         self.niri.overview_pressed = None;
         self.niri.app_drag = Some(AppDrag {
             id,

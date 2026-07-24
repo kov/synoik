@@ -501,6 +501,22 @@ impl AppGrid {
             .map(|t| Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.)))
     }
 
+    /// The logical center of entry `i` — an *absolute* index, as
+    /// [`hit_test`](Self::hit_test) reports and a drag carries. `None` when the
+    /// entry is not on the current page (nothing is drawn for it).
+    pub fn entry_center(
+        &self,
+        i: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let layout = self.layout(area);
+        let k = i.checked_sub(layout.first_index)?;
+        layout
+            .tiles
+            .get(k)
+            .map(|t| Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.)))
+    }
+
     /// The center of page `p`'s indicator dot — a geometry probe for the conformance
     /// corpus (which clicks real pixels routed through
     /// [`indicator_hit`](Self::indicator_hit)).
