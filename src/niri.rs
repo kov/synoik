@@ -5990,6 +5990,11 @@ impl Niri {
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
+            // The overview search cross-fade lives on `Niri` (not the layout), so it
+            // must keep the redraw loop alive here too — otherwise the fade only
+            // advances when another event (e.g. pointer motion) forces a frame, and
+            // the results appear stuck at a partial alpha until the mouse moves.
+            state.unfinished_animations_remain |= self.overview_search_fade.is_some();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
