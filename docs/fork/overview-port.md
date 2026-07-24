@@ -464,6 +464,31 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     paging (from S8b's deferred list); `indicatorsPadding` reserve so the arrows sit in a fixed side band
     rather than the gutter; split theme-resolution (main) from decode (worker) per GNOME
     `st-texture-cache.c:976` (marginal — resolution is cheap/cached).
+- **S8d — Overview chrome fidelity (reported live, 2026-07-24). ✅ DONE.** Three gaps Gustavo spotted
+  against real GNOME, all reference-cited and live-checked on a headless seat:
+  - **Panel background over the backdrop (`5ce62549`).** GNOME drops the top panel to
+    `background-color: transparent` in the overview (`#panel:overview`, `_panel.scss:98-102`), so the
+    `#overviewGroup` fill runs unbroken from the top of the screen down; we kept painting opaque black,
+    leaving a visible break (loudest with a search active, where everything below the panel is flat).
+    The fade rides the bar's own clear color on the monitor's overview progress — GNOME's 250ms
+    `$panel_transition_duration` *is* the overview `ANIMATION_TIME` — with the settled desktop and
+    overview bars cached side by side and the opaque region dropped while it is translucent. The
+    backdrop itself moved from niri's `#262626` to `$system_base_color` `#222226`.
+  - **`FitMode` for the workspace row (`438a20fd`).** The app grid uses `FitMode.ALL` — every workspace
+    laid out inside the allocation, the run centered as a whole — where the picker uses `SINGLE`, which
+    slides the row so the *active* workspace is centered (`workspacesView.js:85-88,128-204`). We only
+    had SINGLE, so opening the grid from a non-middle workspace pushed the row off to one side. The row
+    now blends between the two boxes on the show-apps fraction, and `_getSpacing`'s `(1 - fitMode)`
+    factor comes with it (the fitted row packs at `WORKSPACE_MIN_SPACING`, not the max the small
+    app-grid zoom would otherwise reach). **Divergence:** past ~7 workspaces the width binds and
+    gnome-shell narrows each box out of aspect; we keep one zoom per monitor, so the packed row
+    overflows the edges instead.
+  - **Inactive-workspace shrink (`74536094`).** `WORKSPACE_INACTIVE_SCALE` 0.94 about a centered pivot
+    (`_updateWorkspacesState`, `:243-266`; `workspace.js:1039`) — the "one we are in is a little
+    bigger" read. The zoom became per workspace; the slot keeps the full size so the row's advance and
+    anchor don't move, and hit-testing / drag targets / xray / shadows all follow the same rect.
+    **Divergence:** gnome-shell scales overview-only actors, so ours ramps in with the overview
+    progress or a desktop workspace switch would shrink both workspaces mid-slide.
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
