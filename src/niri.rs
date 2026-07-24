@@ -173,6 +173,7 @@ use crate::render_helpers::{
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
 use crate::system_status::SystemStatus;
+use crate::ui::app_grid::{AppGrid, AppGridEntry};
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
@@ -526,6 +527,8 @@ pub struct Niri {
     pub dash: Dash,
     /// The overview search (entry + app results).
     pub overview_search: OverviewSearch,
+    /// The overview app grid (installed apps minus favorites).
+    pub app_grid: AppGrid,
     /// Tracks the overview-UI visibility rising edge (closed→open, unlock/screenshot
     /// close while open) so the search resets on a fresh open, matching GNOME's
     /// reset-on-enter — see [`Niri::refresh_overview_search_state`].
@@ -959,6 +962,7 @@ impl State {
                 .app_system
                 .set_favorites(state.niri.gnome_settings.favorite_apps.clone());
             state.niri.sync_dash_favorites();
+            state.niri.sync_app_grid();
             state
                 .niri
                 .event_loop
@@ -970,10 +974,12 @@ impl State {
                         state.niri.app_icon_cache.clear();
                         state.niri.dash.clear_icon_uploads();
                         state.niri.overview_search.clear_icon_uploads();
+                        state.niri.app_grid.clear_icon_uploads();
                         // A refreshed catalog may change what the current query
-                        // resolves to.
+                        // resolves to, and which apps populate the grid.
                         state.niri.sync_overview_search();
                         state.niri.sync_dash_favorites();
+                        state.niri.sync_app_grid();
                         // Unconditional: dropping the icon uploads and reshuffling
                         // search results both invalidate what is on screen, and an
                         // idle overview produces no frames on its own — a stale frame
@@ -1027,12 +1033,14 @@ impl State {
                         state.niri.wallpaper.update(&settings.background);
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
-                        // A `favorite-apps` change re-seeds the dash favorites.
+                        // A `favorite-apps` change re-seeds the dash favorites and
+                        // the grid (an app moves between the two).
                         state
                             .niri
                             .app_system
                             .set_favorites(settings.favorite_apps.clone());
                         state.niri.sync_dash_favorites();
+                        state.niri.sync_app_grid();
                         // A keymap-affecting change (layout list / options / model)
                         // rebuilds the keymap; an mru-only change (e.g. our own
                         // switch write) just re-seeds the active group — no rebuild.
@@ -3584,6 +3592,7 @@ impl Niri {
             panel_popover,
             dash: Dash::new(),
             overview_search: OverviewSearch::new(),
+            app_grid: AppGrid::new(),
             overview_search_was_visible: false,
             overview_search_fade: None,
             overview_search_fade_target: false,
@@ -5550,6 +5559,30 @@ impl Niri {
                     },
                 ) {
                     push(element.into());
+                }
+                // The app grid sits in the `app_display` band, below the dash and the
+                // search (child order `overviewControls.js:374-379`) — pushed after
+                // them so they draw on top. GNOME's grid slides up from off-screen and
+                // does not fade with the state axis (its opacity only rides the search
+                // cross-fade, `overviewControls.js:582-627`), so the alpha is the
+                // overview fade times the inverse search fade; the slide is the moving
+                // `app_display` box. Gated on the show-apps fraction so it isn't drawn
+                // while parked below the work area.
+                if self
+                    .layout
+                    .monitor_for_output(output)
+                    .is_some_and(|mon| mon.app_grid_fraction() > 0.)
+                {
+                    let alpha = (progress * (1. - self.overview_search_fade())) as f32;
+                    for element in self.app_grid.render(
+                        ctx.renderer,
+                        &self.app_icon_cache,
+                        output,
+                        controls.app_display,
+                        alpha,
+                    ) {
+                        push(element.into());
+                    }
                 }
             }
         }
@@ -8116,6 +8149,33 @@ impl Niri {
         }
 
         self.dash.set_items(items, n_favorites)
+    }
+
+    /// Snapshot the app catalog into the app grid (GNOME's `AppDisplay._redisplay`,
+    /// `appDisplay.js:1086,1492-1504`): every installed app that should show, minus
+    /// the favorites (they live in the dash), sorted by name (`_compareItems`,
+    /// `appDisplay.js:1122`). Returns whether the grid changed. (Parental controls are
+    /// not modeled yet, so that half of the filter is a no-op for now.)
+    pub fn sync_app_grid(&mut self) -> bool {
+        let mut entries: Vec<AppGridEntry> = self
+            .app_system
+            .installed()
+            .filter(|e| !self.app_system.is_favorite(&e.id))
+            .map(|e| AppGridEntry {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                icon: e.icon.clone(),
+            })
+            .collect();
+        // localeCompare, approximated by a case-folded compare (std has no collator;
+        // see the module divergence note).
+        entries.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        self.app_grid.set_entries(entries)
     }
 
     /// Snapshot every mapped window into the app model's running-app tracker —

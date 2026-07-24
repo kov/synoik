@@ -5225,6 +5225,70 @@ fn overview_show_apps_toggles_the_app_grid() {
     );
 }
 
+/// Like [`dash_fixture`], but also installs non-favorite apps so the app grid has
+/// tiles, and opens the grid (state = APP_GRID, settled). `favorites` seed the dash;
+/// `others` populate the grid (installed minus favorites).
+fn app_grid_fixture(
+    favorites: &[&str],
+    others: &[&str],
+) -> (Fixture, crate::app_system::RecordingLauncher) {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let recorder = RecordingLauncher::default();
+    let apps = favorites
+        .iter()
+        .chain(others)
+        .map(|id| AppEntry::fake(id, id))
+        .collect::<Vec<_>>();
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
+    f.niri()
+        .app_system
+        .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
+    f.niri().sync_dash_favorites();
+    f.niri().sync_app_grid();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    assert!(f.niri().layout.is_overview_open(), "overview must open");
+    f.niri().layout.toggle_app_grid();
+    f.niri_complete_animations();
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+
+    (f, recorder)
+}
+
+/// A left-click on an app-grid tile launches the app (`Activate`) and closes the
+/// overview (`AppIcon.activate` → `Main.overview.hide`, `appDisplay.js:3060,3077`).
+/// The grid holds the installed apps minus favorites, name-sorted.
+#[test]
+fn overview_app_grid_click_launches_and_closes() {
+    let (mut f, recorder) = app_grid_fixture(&["a.desktop"], &["m.desktop", "z.desktop"]);
+    let area = overview_controls(&mut f).app_display;
+    // Tile 0 is the first non-favorite in name order ("m.desktop"); "a.desktop" is a
+    // favorite and lives in the dash, not the grid.
+    let center = f
+        .niri()
+        .app_grid
+        .tile_center(0, area)
+        .expect("grid tile 0 in range");
+
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one app launched");
+    assert_eq!(calls[0].0.id, "m.desktop", "the clicked grid app launched");
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "launching from the grid closes the overview"
+    );
+}
+
 /// The dash is only live while the overview is open: a click at a favorite's
 /// position with the overview closed passes through to the windows/workspace, never
 /// launching the app.

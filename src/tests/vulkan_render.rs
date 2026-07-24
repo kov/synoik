@@ -6477,6 +6477,102 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     );
 }
 
+/// The app grid draws its labelled tiles into the `app_display` band: the hovered
+/// tile carries the `.overview-tile:hover` wash (an opaque, non-transparent pixel in
+/// its padding band), while a non-hovered tile's padding band stays transparent (the
+/// grid has no card background — tiles sit straight on the overview). This pins the
+/// render wiring, the hover bake key, and that the grid composites at all.
+#[test]
+fn vulkan_app_grid_draws_hovered_tile() {
+    use smithay::utils::{Logical, Point};
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_draws_hovered_tile: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Drive three apps into the grid, tile 0 hovered.
+    {
+        let g = &mut f.niri().app_grid;
+        g.set_entries(
+            ["A", "B", "C"]
+                .iter()
+                .map(|n| AppGridEntry {
+                    id: format!("{n}.desktop"),
+                    name: (*n).to_string(),
+                    icon: AppIconRef::Fallback,
+                })
+                .collect(),
+        );
+        g.set_hovered(Some(0));
+    }
+
+    // A fixed band to lay the grid into (independent of the state animation).
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let t0 = f.niri().app_grid.tile_center(0, area).expect("tile 0");
+    let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
+
+    let state = f.niri_state();
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            let elements = niri
+                .app_grid
+                .render(vk, &niri.app_icon_cache, &output, area, 1.0);
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let pixels = render_to_vec(
+                vk,
+                phys,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((pixels, phys.w, phys.h))
+        },
+    );
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_app_grid_draws_hovered_tile: no Vulkan device");
+        return;
+    };
+    let (pixels, w, _h) = result.expect("compositing the app grid through Vulkan must not error");
+
+    // Sample each tile's left padding band, mid-height, clear of the icon: the hovered
+    // tile 0 carries the wash (non-transparent); tile 1's band is transparent.
+    let band = |c: Point<f64, Logical>| {
+        px(
+            &pixels,
+            w,
+            (c.x - 48.) as i32, // left of the 96px icon, in the tile padding
+            c.y as i32,
+        )
+    };
+    let hovered = band(t0);
+    let plain = band(t1);
+    eprintln!("vulkan_app_grid: hovered={hovered:?} plain={plain:?}");
+    assert!(
+        hovered[3] > 0,
+        "the hovered tile must carry a wash (non-transparent): {hovered:?}"
+    );
+    assert_eq!(
+        plain[3], 0,
+        "a non-hovered tile's padding band must be transparent (no card bg): {plain:?}"
+    );
+}
+
 /// The dash's running chrome bakes correctly: the `.dash-separator` reads as a
 /// line *lighter* than the pill it sits on, and a running app's dot draws over
 /// the pill.

@@ -1611,7 +1611,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
-    pub(super) fn app_grid_fraction(&self) -> f64 {
+    pub fn app_grid_fraction(&self) -> f64 {
         match &self.app_grid_expand {
             Some(anim) => anim.clamped_value().clamp(0., 1.),
             None => {

@@ -3013,24 +3013,33 @@ impl State {
         // overview UI is actually on screen — see `Niri::overview_ui_visible` (matches
         // the render gate); otherwise this is churn (redraws) over UI nobody sees.
         let overview_visible = self.niri.overview_ui_visible();
-        let (dash_hit, search_hit) = if overview_visible {
+        // The grid is reactive only while it's open and no search is covering it.
+        let grid_reactive =
+            self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
+        let (dash_hit, search_hit, grid_hit) = if overview_visible {
             match self.niri.output_under(pos) {
                 Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {
                     Some(controls) => (
                         self.niri.dash.hit_test(p, controls.dash),
                         self.niri.overview_search.hit_test(p, controls.into()),
+                        grid_reactive
+                            .then(|| self.niri.app_grid.hit_test(p, controls.app_display))
+                            .flatten(),
                     ),
-                    None => (None, None),
+                    None => (None, None, None),
                 },
-                None => (None, None),
+                None => (None, None, None),
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
         if self.niri.dash.set_hovered(dash_hit) {
             self.niri.queue_redraw_all();
         }
         if self.niri.overview_search.set_hovered(search_hit) {
+            self.niri.queue_redraw_all();
+        }
+        if self.niri.app_grid.set_hovered(grid_hit) {
             self.niri.queue_redraw_all();
         }
 
@@ -3663,6 +3672,35 @@ impl State {
                             }
                             self.niri.queue_redraw_all();
                             return;
+                        }
+
+                        // The app grid (when open and not covered by a search): a
+                        // click on a tile launches the app and closes the overview
+                        // (`AppIcon.activate`, `appDisplay.js:3060,3077`). Reactive
+                        // only while open + search-inactive, matching the hover gate.
+                        if self.niri.layout.is_app_grid_open()
+                            && !self.niri.overview_search.is_active()
+                        {
+                            if let Some(i) = self.niri.app_grid.hit_test(*pos, controls.app_display)
+                            {
+                                self.niri.suppressed_buttons.insert(button_code);
+                                if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
+                                    if let Some(id) =
+                                        self.niri.app_grid.entry_id(i).map(str::to_owned)
+                                    {
+                                        if let Err(err) =
+                                            self.niri.app_system.launch(&id, LaunchMode::Activate)
+                                        {
+                                            tracing::warn!(
+                                                "app grid launch of {id} failed: {err:?}"
+                                            );
+                                        }
+                                        self.niri.layout.close_overview();
+                                    }
+                                }
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
                         }
                     }
                 }
