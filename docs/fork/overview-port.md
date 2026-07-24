@@ -496,6 +496,55 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     anchor don't move, and hit-testing / drag targets / xray / shadows all follow the same rect.
     **Divergence:** gnome-shell scales overview-only actors, so ours ramps in with the overview
     progress or a desktop workspace switch would shrink both workspaces mid-slide.
+- **S8e — Overview interaction fidelity (reported live, 2026-07-24). ✅ DONE.** A second batch
+  Gustavo spotted, all reference-cited and headless-pinned:
+  - **Double-Super opens the app grid (`e4e4a0bf`).** A second overlay-key tap that lands while the
+    overview is still opening shifts a state *up* instead of toggling shut
+    (`overviewControls.js:419-438`). With animations on the "quick enough" test is not a timer at
+    all — gnome-shell asks whether its state adjustment is mid-transition upward, so the escalation
+    window *is* the open animation; with animations off it falls back to comparing against the
+    previous overlay-key time (`Overview.ANIMATION_TIME`, 250ms). Both arms pinned. The shift
+    clamps at APP_GRID (`_shiftState`, `:669-676`), hence `open_app_grid()` and not the show-apps
+    toggle.
+  - **The overview's icons activate on release (`ca457085`).** Dash icons, the show-apps button,
+    app-grid tiles and page controls and search results are all St.Buttons, and an St.Button acts on
+    the *release*, only if it lands on the same widget (`clutter-click-gesture.c:68-81`;
+    `st-button.c:429-435` leaves `recognize-on-press` off). We launched on the press, which both
+    diverged and left no room for a press to start a drag. The scattered per-widget click handling
+    collapsed into one `overview_hit` + one `activate_overview_hit`, which is what makes "same
+    widget" a single comparison.
+  - **Hovering a preview grows it (`e809e26e`) and shows its close button (`5942dfcf`).**
+    `showOverlay` eases the pointed-at preview up by `WINDOW_ACTIVE_SIZE_INC` (5px each direction,
+    200ms EASE_OUT_QUAD), restacks it above its neighbours, and fades in the close button
+    (`windowPreview.js:310-352,620`). The growth is in *screen* pixels — gnome-shell bakes the row
+    scale into the slots it allocates (`workspace.js:690-736`) — so the hover scale is derived from
+    the zoomed size and applied in workspace space, about the center, fading in with the overview.
+    The button is centered on the preview's top-right corner (`:203-218`), hit-tests before the rest
+    of the chrome (it overhangs its preview), and asks the window to close.
+    **Divergences:** hit-testing still uses the unscaled slot, so the 5px halo isn't hoverable (GNOME
+    leaves on the *scaled* actor, giving it hysteresis); no `_windowCanClose()` gate; the button is
+    always on the right (GNOME follows `Meta.prefs_get_button_layout()`).
+    **Still missing from the overlay:** the title caption (`.window-caption`) and the always-visible
+    app icon (`ICON_SIZE` 64, `ICON_OVERLAP` 0.7) — both need a per-window text/app resolution the
+    picker doesn't do yet.
+  - **The dragged preview shrinks (`81f3946d`).** `dragActorMaxSize: WINDOW_DND_SIZE` (256px,
+    `windowPreview.js:14,108`), eased over `SCALE_ANIMATION_TIME` once the drag starts
+    (`dnd.js:261-288`). We carried the full picker footprint the whole way, covering the thumbnail
+    strip being dragged toward. **Gap:** gnome-shell also drops the drag actor to
+    `DRAGGING_WINDOW_OPACITY` (100/255); ours stays opaque — the moved tile renders straight into the
+    output elements and an alpha needs the offscreen-group path.
+  - **Dragging an app icon onto a workspace launches it there (`135b2773`).** `Workspace.acceptDrop`
+    → `source.app.open_new_window(workspaceIndex)` (`workspace.js:1429-1434`). The drag begins once
+    the pointer leaves the `drag-threshold` box (`st-dnd-start-gesture.c:73-90`) and cancels the
+    click. Since we have no GIO launch context to carry the workspace, the intent is parked on `Niri`
+    and claimed at map time by the first window that resolves to the app, expiring on mutter's
+    `STARTUP_TIMEOUT_MS` (15s). **Divergences:** hardcoded threshold 8 (the mouse schema isn't in the
+    gsettings model yet); a drop into a thumbnail *gap* does nothing where ThumbnailsBox would create
+    the workspace; favorites reordering inside the dash still unported.
+  - Also in the batch, outside the overview: the niri focus ring / border are off in GNOME mode
+    (`f524a7dc`) and the startup hotkey overlay is gone (`f1221928`).
+  - **Not yet live-validated** — geometry and colors are pinned headless (plus one Vulkan frame for
+    the close button), but the *feel* (hover timing, drag readability) needs a real seat.
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
