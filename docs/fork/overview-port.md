@@ -402,10 +402,19 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     (opacity 255→0 × `app_grid_fraction`, `_getThumbnailsBoxParams`) instead of sitting opaque above
     the shrunk picker. Deferred: GNOME's additional scale-0.5 + translationY-+h/2 shrink (transient —
     the box ends invisible) and making the faded strip non-reactive (`visible=false` in APP_GRID).
-  - **S8a divergences / follow-ups (deferred, all documented in-module):** **single page only** (apps past the band are dropped, reachable via
-    search — no pagination/PageIndicators/folders/`app-picker-layout`/DnD reorder); **no in-grid
-    keynav** (arrows/Enter); sort is `to_lowercase` not locale collation. Floor/ceil vs transition-
-    bracket interpolation noted in `overview_layout.rs` (`b6b3d86b`).
+  - **S8b-pagination ✅ DONE (`a6da91ad`).** Replaced the fill-by-width grid with GNOME's paginated
+    `IconGrid`: page mode `(cols,rows)` by aspect ratio from `{3×8,4×6,6×4,8×3}` (a wide app-display →
+    8×3, no longer full width), icon shrinks to the largest that fits in `max(w,h)` **square cells**,
+    spacing grows 12→36 then centers (`_calculateSpacing` FILL). Overflow paginates: a **dots row**
+    (active full / inactive 2/3-scale+half-alpha), navigable by a **wheel notch** (150ms debounce), a
+    **dot click**, or **reset to page 0** on a fresh overview open. Render pins the dots.
+  - **S8 divergences / follow-ups (deferred, documented in `app_grid.rs`):** no touchpad **swipe**
+    (continuous scroll over the grid is consumed but inert), no page-slide animation (snap), no side
+    **nav-arrows**, no keyboard paging (`Page_Up/Down`) or in-grid arrow/Enter keynav, no
+    `indicatorsPadding` (differs only at narrow widths), no folders/`app-picker-layout`/DnD reorder;
+    sort is `to_lowercase` not locale collation. The thumbnails' transient scale/translation shrink
+    and the faded-strip non-reactivity (S8a) also remain. Floor/ceil vs transition-bracket
+    interpolation noted in `overview_layout.rs` (`b6b3d86b`).
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
