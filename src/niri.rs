@@ -5725,15 +5725,21 @@ impl Niri {
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
             // The overview workspace thumbnails strip, above the workspaces. It
-            // cross-fades with the search results alongside the picker.
+            // cross-fades with the search results alongside the picker, and *also*
+            // fades out as the app grid opens: the thumbnails box has no place in the
+            // app grid, so its opacity eases 255 -> 0 across WINDOW_PICKER -> APP_GRID
+            // (`overviewControls.js:512-548`). (GNOME additionally scales it to 0.5 and
+            // sinks it +height/2 during the transition; since it ends fully invisible
+            // that shrink is transient polish, deferred — the fade is what removes it.)
             {
+                let thumbnails_alpha = picker_alpha * (1. - mon.app_grid_fraction() as f32);
                 let mut group = Vec::new();
                 mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| group.push(elem));
                 Self::push_group_at_alpha(
                     ctx.renderer,
                     &self.thumbnails_offscreen,
                     fade_scale,
-                    picker_alpha,
+                    thumbnails_alpha,
                     group,
                     push,
                 );
