@@ -14,6 +14,11 @@ Both reproduce **deterministically** (verified across repeated runs) and each wa
 adversarially checked to rule out reproducer-side confounds (see the per-issue "Confounds
 ruled out" notes).
 
+**A third, later finding lives next door:** timestamp queries are advertised in full and resolve
+to zero — see [`../venus-timestamp-gap.md`](../venus-timestamp-gap.md), with its reproducer in
+[`repro-vk-timestamp-query/`](./repro-vk-timestamp-query). It is written up separately because it
+is a handoff for the VM-stack work rather than a dmabuf-import finding.
+
 ---
 
 ## Environment

@@ -1,0 +1,13 @@
+# Standalone reproducer: detached from the parent workspace so a repo-root `cargo`
+# never picks it up and it builds with only its one dep.
+[workspace]
+
+[package]
+name = "repro-vk-timestamp-query"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Isolates a Venus (Mesa venus) gap: timestamp queries are advertised, vkCmdWriteTimestamp writes nothing, and vkGetQueryPoolResults(WAIT) reports success on the unavailable result."
+
+[dependencies]
+ash = "0.38.0"

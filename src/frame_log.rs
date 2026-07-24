@@ -28,6 +28,12 @@
 //!
 //! Two independent things, because they fail independently:
 //!
+//! **Known gap on the dev VM:** the `gpu` option produces nothing here. The
+//! virtio-gpu/Venus stack advertises timestamp queries and resolves every one to
+//! zero, which the renderer detects and reports once before going quiet. The
+//! evidence and the handoff for fixing it host-side are in
+//! `docs/fork/venus-timestamp-gap.md`.
+//!
 //! - **Frame cost**, phase by phase ([`Phase`]), measured on the compositor thread. Note the render
 //!   phase *includes* GPU execution: the Vulkan renderer submits and fence-waits synchronously, so
 //!   `finish` does not return until the GPU is done. A slow `submit` is therefore ambiguous between
