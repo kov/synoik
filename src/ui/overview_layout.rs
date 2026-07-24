@@ -25,8 +25,12 @@
 //!   (`workspacesView.js:589-720`) — thumbnails and padding only, no dash or search — so their
 //!   picker box, and now their zoom, differ from the primary's. We draw the full chrome on every
 //!   output (as the dash and search already did), so every monitor gets the primary layout.
-//! - The app grid's `ControlsState::AppGrid` boxes are not computed yet; this only produces the
-//!   window-picker state. `SMALL_WORKSPACE_RATIO` lands with the app grid.
+//!
+//! The `state` axis ports gnome-shell's `ControlsState` (HIDDEN/WINDOW_PICKER/APP_GRID): the
+//! workspaces and app-grid boxes are computed per integer state and interpolated by a fractional
+//! `state`, exactly as `ControlsManagerLayout` blends its cached per-state boxes. Only the geometry
+//! is ported here; driving the state (the show-apps toggle, the state adjustment/animation, and the
+//! app-grid *view*) is a following slice.
 
 use smithay::utils::{Logical, Rectangle, Size};
 
@@ -42,6 +46,21 @@ const THUMBNAILS_SPACING_ADJUSTMENT_TOP: f64 = 0.6;
 /// `THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM` (`overviewControls.js:25`): and the
 /// rest of the spacing goes below them.
 const THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM: f64 = 0.4;
+/// `SMALL_WORKSPACE_RATIO` (`overviewControls.js:21`): in the app-grid state the
+/// window picker shrinks to this fraction of the work-area height, a thin strip
+/// under the search entry, and the app grid fills the space below it.
+const SMALL_WORKSPACE_RATIO: f64 = 0.15;
+
+/// gnome-shell's `ControlsState` (`overviewControls.js:32-36`) as a continuous
+/// axis: `HIDDEN` 0, `WINDOW_PICKER` 1, `APP_GRID` 2. [`layout`] takes a fractional
+/// value and interpolates the state-dependent boxes (workspaces + app grid) between
+/// the two bracketing integer states, exactly as `ControlsManagerLayout` blends its
+/// cached per-state boxes by the state-adjustment progress.
+pub mod state {
+    pub const HIDDEN: f64 = 0.;
+    pub const WINDOW_PICKER: f64 = 1.;
+    pub const APP_GRID: f64 = 2.;
+}
 
 /// The allocated box of every overview control, in view (output) coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,9 +75,16 @@ pub struct ControlsLayout {
     /// The search results strip: everything between the entry and the dash,
     /// overlapping thumbnails and picker (`overviewControls.js:242-245`).
     pub search_results: Rectangle<f64, Logical>,
-    /// The window picker — gnome-shell's `ControlsState.WINDOW_PICKER`
-    /// workspaces box (`overviewControls.js:91-107`).
+    /// The window picker — the state-interpolated workspaces box
+    /// (`_computeWorkspacesBoxForState`, `overviewControls.js:80-110`). At
+    /// `WINDOW_PICKER` it fills the band; at `APP_GRID` it shrinks to the small
+    /// top strip.
     pub workspaces: Rectangle<f64, Logical>,
+    /// The app grid — the state-interpolated app-display box
+    /// (`_getAppDisplayBoxForState`, `overviewControls.js:112-138`). Parked at the
+    /// work-area bottom (off-screen below) in `HIDDEN`/`WINDOW_PICKER`, it slides up
+    /// to fill the space under the shrunken picker in `APP_GRID`.
+    pub app_display: Rectangle<f64, Logical>,
 }
 
 /// Lays out the overview chrome.
@@ -78,6 +104,7 @@ pub fn layout(
     dash_preferred_height: f64,
     thumbnails_preferred_height: f64,
     expand_fraction: f64,
+    state: f64,
 ) -> ControlsLayout {
     let width = view_size.w;
     let height = view_size.h - start_y;
@@ -96,9 +123,49 @@ pub fn layout(
     let spacing_bottom = (spacing * THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM).round() * expand_fraction;
     let thumbnails = rect(0., start_y + search_h + spacing_top, width, thumbs_h);
 
-    let picker_y = start_y + search_h + spacing_top + thumbs_h + spacing_bottom;
-    let picker_h = height - dash_h - spacing - search_h - spacing_top - thumbs_h - spacing_bottom;
-    let workspaces = rect(0., picker_y, width, picker_h.max(0.));
+    // The workspaces (picker) box per integer `ControlsState`
+    // (`_computeWorkspacesBoxForState`, `overviewControls.js:80-110`).
+    let workspaces_for = |s: f64| -> Rectangle<f64, Logical> {
+        if s == state::APP_GRID {
+            // A thin strip under the entry; the app grid fills the rest.
+            rect(
+                0.,
+                start_y + search_h + spacing,
+                width,
+                (height * SMALL_WORKSPACE_RATIO).round(),
+            )
+        } else if s == state::WINDOW_PICKER {
+            let y = start_y + search_h + spacing_top + thumbs_h + spacing_bottom;
+            let h = height - dash_h - spacing - search_h - spacing_top - thumbs_h - spacing_bottom;
+            rect(0., y, width, h.max(0.))
+        } else {
+            // HIDDEN: the whole work area (the live desktop behind the overview).
+            rect(0., start_y, width, height)
+        }
+    };
+
+    // The app-grid box per state (`_getAppDisplayBoxForState`,
+    // `overviewControls.js:112-138`): its height uses the APP_GRID picker height,
+    // and it is parked at the work-area bottom (`box.y2`) until the APP_GRID state
+    // slides it up.
+    let app_grid_ws_h = workspaces_for(state::APP_GRID).size.h;
+    let app_h = (height - search_h - spacing - app_grid_ws_h - spacing - dash_h - spacing).max(0.);
+    let app_display_for = |s: f64| -> Rectangle<f64, Logical> {
+        let y = if s == state::APP_GRID {
+            start_y + search_h + spacing + app_grid_ws_h + spacing
+        } else {
+            start_y + height // box.y2 — parked below the work area
+        };
+        rect(0., y, width, app_h)
+    };
+
+    // Interpolate the state-dependent boxes between the two bracketing states.
+    let s = state.clamp(state::HIDDEN, state::APP_GRID);
+    let lo = s.floor();
+    let hi = s.ceil();
+    let t = s - lo;
+    let workspaces = lerp_rect(workspaces_for(lo), workspaces_for(hi), t);
+    let app_display = lerp_rect(app_display_for(lo), app_display_for(hi), t);
 
     // Note: the thumbnails height is deliberately *not* subtracted here.
     let results_h = height - search_h - spacing - dash_h - spacing;
@@ -110,11 +177,28 @@ pub fn layout(
         dash,
         search_results,
         workspaces,
+        app_display,
     }
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> Rectangle<f64, Logical> {
     Rectangle::new((x, y).into(), (w, h).into())
+}
+
+/// Linearly interpolate two boxes (`ClutterActorBox.interpolate`,
+/// `overviewControls.js:135,169`).
+fn lerp_rect(
+    a: Rectangle<f64, Logical>,
+    b: Rectangle<f64, Logical>,
+    t: f64,
+) -> Rectangle<f64, Logical> {
+    let l = |x: f64, y: f64| x + (y - x) * t;
+    rect(
+        l(a.loc.x, b.loc.x),
+        l(a.loc.y, b.loc.y),
+        l(a.size.w, b.size.w),
+        l(a.size.h, b.size.h),
+    )
 }
 
 #[cfg(test)]
@@ -128,6 +212,10 @@ mod tests {
     const THUMBS_H: f64 = 54.; // 1080 × MAX_THUMBNAIL_SCALE
 
     fn layout_1080(expand: f64) -> ControlsLayout {
+        layout_1080_state(expand, state::WINDOW_PICKER)
+    }
+
+    fn layout_1080_state(expand: f64, state: f64) -> ControlsLayout {
         layout(
             Size::from((1920., 1080.)),
             35.,
@@ -135,6 +223,7 @@ mod tests {
             DASH_H,
             THUMBS_H,
             expand,
+            state,
         )
     }
 
@@ -201,7 +290,15 @@ mod tests {
     #[test]
     fn dash_is_capped_at_a_fraction_of_the_work_area() {
         // round(565 × 0.16) = 90 < the 112 the dash would like.
-        let l = layout(Size::from((1024., 600.)), 35., SEARCH_H, DASH_H, 30., 1.);
+        let l = layout(
+            Size::from((1024., 600.)),
+            35.,
+            SEARCH_H,
+            DASH_H,
+            30.,
+            1.,
+            state::WINDOW_PICKER,
+        );
         assert_eq!(l.dash.size.h, 90.);
         assert_eq!(l.dash.loc.y, 600. - 90.);
 
@@ -214,6 +311,7 @@ mod tests {
             400.,
             THUMBS_H,
             1.,
+            state::WINDOW_PICKER,
         );
         assert_eq!(l.dash.size.h, 167.);
     }
@@ -222,7 +320,15 @@ mod tests {
     /// at a second resolution the spacing follows the strut, not the panel.
     #[test]
     fn spacing_follows_the_work_area_not_the_view() {
-        let l = layout(Size::from((2560., 1440.)), 35., SEARCH_H, DASH_H, 72., 1.);
+        let l = layout(
+            Size::from((2560., 1440.)),
+            35.,
+            SEARCH_H,
+            DASH_H,
+            72.,
+            1.,
+            state::WINDOW_PICKER,
+        );
 
         // work area 1405 ⇒ spacing = round(28.1) = 28, top 17, bottom 11.
         assert_eq!(l.search_entry, rect(0., 35., 2560., 58.));
@@ -236,11 +342,60 @@ mod tests {
     /// Without a panel strut everything shifts up by exactly the strut.
     #[test]
     fn no_strut_starts_at_the_view_top() {
-        let l = layout(Size::from((1920., 1080.)), 0., SEARCH_H, DASH_H, 54., 1.);
+        let l = layout(
+            Size::from((1920., 1080.)),
+            0.,
+            SEARCH_H,
+            DASH_H,
+            54.,
+            1.,
+            state::WINDOW_PICKER,
+        );
 
         assert_eq!(l.search_entry.loc.y, 0.);
         assert_eq!(l.dash.loc.y, 1080. - 112.);
         // spacing = round(1080 × 0.02) = 22, top 13, bottom 9.
         assert_eq!(l.workspaces, rect(0., 134., 1920., 812.));
+    }
+
+    /// In the app-grid state the picker shrinks to the small top strip
+    /// (`round(1045 × 0.15) = 157` at y = 35 + 58 + 21) and the app grid fills the
+    /// band below it, up to the dash.
+    #[test]
+    fn app_grid_state_shrinks_the_picker_and_fills_below() {
+        let l = layout_1080_state(1., state::APP_GRID);
+
+        assert_eq!(l.workspaces, rect(0., 114., 1920., 157.));
+        // 35 + 58 + 21 + 157 + 21, and 1045 − 58 − 21 − 157 − 21 − 112 − 21.
+        assert_eq!(l.app_display, rect(0., 292., 1920., 655.));
+    }
+
+    /// In the window-picker state the app grid is parked at the work-area bottom
+    /// (off-screen below), keeping its app-grid height; the picker is unchanged.
+    #[test]
+    fn window_picker_state_parks_the_app_grid_below() {
+        let l = layout_1080(1.);
+
+        // Parked at box.y2 = start_y + work-area height = 35 + 1045.
+        assert_eq!(l.app_display, rect(0., 1080., 1920., 655.));
+        // The picker is exactly the pre-app-grid window-picker box.
+        assert_eq!(l.workspaces, rect(0., 168., 1920., 779.));
+    }
+
+    /// A fractional state interpolates both the picker and the app grid between the
+    /// two bracketing states — the smooth show-apps transition.
+    #[test]
+    fn state_interpolates_workspaces_and_app_grid() {
+        let mid = layout_1080_state(1., 1.5);
+        let picker = layout_1080_state(1., state::WINDOW_PICKER);
+        let grid = layout_1080_state(1., state::APP_GRID);
+
+        for (m, p, g) in [
+            (mid.workspaces, picker.workspaces, grid.workspaces),
+            (mid.app_display, picker.app_display, grid.app_display),
+        ] {
+            assert_eq!(m.loc.y, (p.loc.y + g.loc.y) / 2.);
+            assert_eq!(m.size.h, (p.size.h + g.size.h) / 2.);
+        }
     }
 }

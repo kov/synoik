@@ -1535,6 +1535,8 @@ impl<W: LayoutElement> Monitor<W> {
             crate::ui::dash::PREFERRED_HEIGHT,
             thumbnails::preferred_height(self.view_size, self.workspaces.len()),
             self.thumbnails_expand_fraction(),
+            // The app-grid state is not wired yet; the picker is the only state.
+            overview_layout::state::WINDOW_PICKER,
         )
     }
 

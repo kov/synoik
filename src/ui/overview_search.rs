@@ -884,6 +884,7 @@ mod tests {
             crate::ui::dash::PREFERRED_HEIGHT,
             54.,
             1.,
+            crate::ui::overview_layout::state::WINDOW_PICKER,
         );
         controls.into()
     }
