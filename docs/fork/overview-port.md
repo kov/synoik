@@ -549,6 +549,43 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     headless tests could not see — the drag offset was taken against the pointer at drag *start*
     instead of the icon, so the icon stayed at the press point (`3b3ff265`). Still un-checked on a
     real seat: the *feel* (the 200ms ease timings; the harness runs with animations off).
+- **S8f — Fit-mode transition geometry (reported live, 2026-07-24). ✅ DONE (`9a5e0959`).** Three
+  symptoms, one cause. Entering the app grid the workspace row slid ~85px *left* of its landing spot
+  and snapped back; grid → picker did the same in reverse; and closing the overview *from* the grid
+  ended with the row shifted right, snapping left only after the animation finished.
+  - **Cause.** `workspaces_strip_axis` built both the fit-single and the fit-all row at the
+    **current** zoom and lerped them on the fit fraction. That makes each end of the lerp a function
+    of the very parameter driving it, so the row's path bends instead of running straight between two
+    fixed points. gnome-shell does not do this: `_getInitialBoxes` (`workspacesView.js:281-324`) sees
+    that the two ends disagree on the fit mode and interpolates between the workspaces box of the
+    *initial* state and of the *final* state — frozen rectangles — falling back to the live
+    allocation only when both ends share a fit mode (the plain overview open/close). The terminal
+    snap on close was the second half: the fit fraction was ungated, so the row stayed fitted all the
+    way down and only un-fitted when the state flipped.
+  - **Fix.** Each row is built at its own endpoint state's zoom (`zoom_for_state(WINDOW_PICKER)` /
+    `zoom_for_state(APP_GRID)`), both expressed against the blended slot so the lerp is like for
+    like, and the fit fraction is gated on the overview progress (`app_grid_state_fraction`). At
+    `fit == 0` this reduces exactly to the old fit-single row, so the plain open/close is unchanged.
+  - **Tests (the reason this was reportable-but-not-caught).** Every overview test asserted *ends*,
+    and both ends were always right. Two layers now:
+    `Fixture::sample_animation` / `sample_workspace_geo` pin the clock at exact fractions of a
+    transition and read the real render geometry at each — so `overview_grid_transition_moves_the_row_monotonically`
+    fails on an overshoot and `overview_close_from_the_app_grid_lands_on_the_desktop` fails on a
+    terminal snap (both verified by mutation: reverting either half of the fix reddens exactly one).
+    Under it, `fit_single_row`/`fit_all_row` are pure functions with clock-free sweeps
+    (`monitor::row_tests`) pinning centering, rigidity, the end gaps and the overflow divergence.
+    The sampling helper's contract matters: trigger the transition first and do **not** round-trip a
+    client inside the closure, or the lazy clock resets and re-times everything (the
+    headless-animation-clock trap).
+  - **Follow-up (not done).** The real fix upstream-shaped is one adjustment, not two: gnome-shell
+    carries a single `_stateAdjustment` 0..2 (HIDDEN / WINDOW_PICKER / APP_GRID) and derives fit mode,
+    zoom and chrome from it, which is why it cannot get into an inconsistent pair. We carry
+    `overview_progress` and `app_grid_fraction` separately, and this fix keeps them consistent by
+    construction at the geometry layer rather than removing the possibility. Collapsing them touches
+    every `overview_progress` consumer, the gesture path, and `workspace_render_idx`'s
+    synchronized-animation pairing.
+  - **Not live-checked yet:** the harness runs with `animations { off }`, so the smooth path needs a
+    seat with animations on.
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
