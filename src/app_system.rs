@@ -27,6 +27,7 @@
 //! non-UTF-8 id). Desktop ids are `.desktop` filenames, so exposure is minimal;
 //! a raw-FFI lossy scrub is deferred as over-engineering for now.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gio::glib;
@@ -75,6 +76,9 @@ pub struct AppEntry {
     /// The app's icon descriptor (`g_app_info_get_icon()`), resolved to pixels by
     /// the [`AppIconCache`](crate::render_helpers::icon::AppIconCache).
     pub icon: AppIconRef,
+    /// `g_desktop_app_info_get_startup_wm_class()` — the `StartupWMClass` key that
+    /// window↔app matching consults first (see [`AppSystem::app_for_window`]).
+    pub startup_wm_class: Option<String>,
 }
 
 /// How a launch was requested — the two verbs of `AppIcon.activate`
@@ -108,6 +112,36 @@ pub enum LaunchError {
     Failed(String),
 }
 
+/// One mapped window as the running-app tracker sees it — the plain-data seam
+/// between the compositor's window list and the app model, so the whole matching
+/// + grouping + ordering policy is testable without a live `Layout`.
+///
+/// GNOME's `ShellWindowTracker` reads a `MetaWindow`; we read a toplevel. See
+/// [`AppSystem::app_for_window`] for what the single `app_id` costs us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningWindow {
+    /// The xdg-shell `app_id` — our only `WM_CLASS` analogue.
+    pub app_id: Option<String>,
+    /// `Mapped::get_focus_timestamp()`, standing in for
+    /// `shell_app_get_last_user_time()` in [`shell_app_compare`]'s last clause.
+    /// `None` (never focused) sorts last, as GNOME's `0` does.
+    ///
+    /// [`shell_app_compare`]: AppSystem::running
+    pub last_focus: Option<std::time::Duration>,
+}
+
+/// An application with at least one open window — an entry of
+/// `shell_app_system_get_running()` (`shell-app-system.c:508`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningApp {
+    /// The resolved desktop id.
+    pub id: String,
+    /// How many windows resolved to this app.
+    pub n_windows: usize,
+    /// The most recent `last_focus` among them — the app's user time.
+    pub last_focus: Option<std::time::Duration>,
+}
+
 /// The enumerate/lookup/search seam — GIO in production, a fake in tests.
 pub trait AppCatalog {
     /// Every installed app, unfiltered (`g_app_info_get_all`).
@@ -139,7 +173,19 @@ pub struct AppSystem {
     /// favorite operations act in **resolved space** (ids that both look up and
     /// `should_show`) — GNOME's `_favorites` is that filtered map, not the strv.
     stored: Vec<String>,
+    /// `StartupWMClass` → desktop id, rebuilt on every [`refresh`](Self::refresh)
+    /// (`scan_startup_wm_class_to_id`, `shell-app-system.c:107`).
+    startup_wm_class_to_id: HashMap<String, String>,
+    /// The raw window snapshot, kept so a catalog [`refresh`](Self::refresh) can
+    /// re-resolve it (an app installed while its window is open then matches).
+    windows: Vec<RunningWindow>,
+    /// `windows` resolved, grouped and ordered — `get_running()`'s answer.
+    running: Vec<RunningApp>,
 }
+
+/// Desktop-id prefixes tried when a bare `WM_CLASS`-derived basename misses
+/// (`vendor_prefixes`, `shell-app-system.c:29-33`).
+const VENDOR_PREFIXES: &[&str] = &["gnome-", "fedora-", "mozilla-", "debian-"];
 
 impl AppSystem {
     /// An inert model: empty catalog, a launcher that warns and drops. This is
@@ -151,6 +197,9 @@ impl AppSystem {
             launcher: Box::new(NullLauncher),
             installed: Vec::new(),
             stored: Vec::new(),
+            startup_wm_class_to_id: HashMap::new(),
+            windows: Vec::new(),
+            running: Vec::new(),
         }
     }
 
@@ -167,6 +216,9 @@ impl AppSystem {
             launcher: Box::new(GioLauncher),
             installed: Vec::new(),
             stored: Vec::new(),
+            startup_wm_class_to_id: HashMap::new(),
+            windows: Vec::new(),
+            running: Vec::new(),
         };
         system.refresh();
 
@@ -217,6 +269,9 @@ impl AppSystem {
             launcher,
             installed: Vec::new(),
             stored: Vec::new(),
+            startup_wm_class_to_id: HashMap::new(),
+            windows: Vec::new(),
+            running: Vec::new(),
         };
         system.refresh();
         system
@@ -234,6 +289,172 @@ impl AppSystem {
     /// refresh by the monitor's edge-trigger). Consider debouncing later.
     pub fn refresh(&mut self) {
         self.installed = self.catalog.enumerate();
+        self.scan_startup_wm_class_to_id();
+        // Re-resolve the open windows: an app installed while its window was
+        // already mapped now matches.
+        self.recompute_running();
+    }
+
+    /// Rebuild the `StartupWMClass` → id table (`scan_startup_wm_class_to_id`,
+    /// `shell-app-system.c:107-149`). Two entries can claim the same key; GNOME
+    /// breaks the tie in favour of, in order, the entry whose **id equals the
+    /// key** and the entry that **should show**. Both tie-breaks look only at ids
+    /// seen *earlier* in the enumeration, so the scan order is part of the
+    /// behavior and this is a faithful single pass, not a re-sort.
+    fn scan_startup_wm_class_to_id(&mut self) {
+        let mut table: HashMap<String, String> = HashMap::new();
+        // Ids seen so far that do not `should_show` — the `no_show_ids` array.
+        let mut no_show: Vec<&str> = Vec::new();
+
+        for entry in &self.installed {
+            let Some(wm_class) = entry.startup_wm_class.as_deref() else {
+                continue;
+            };
+            if !entry.should_show {
+                no_show.push(&entry.id);
+            }
+
+            let mut old = table.get(wm_class).map(|s| s.as_str());
+            // Prefer the entry whose id *is* the WM class.
+            if old.is_some() && startup_wm_class_is_exact_match(&entry.id, wm_class) {
+                old = None;
+            }
+            // Prefer a shown entry over a hidden incumbent.
+            if let Some(incumbent) = old {
+                if entry.should_show && no_show.contains(&incumbent) {
+                    old = None;
+                }
+            }
+            if old.is_none() {
+                table.insert(wm_class.to_string(), entry.id.clone());
+            }
+        }
+
+        self.startup_wm_class_to_id = table;
+    }
+
+    /// The app whose `.desktop` declares `StartupWMClass=<wm_class>`
+    /// (`shell_app_system_lookup_startup_wmclass`, `shell-app-system.c:456`).
+    pub fn lookup_startup_wmclass(&self, wm_class: &str) -> Option<AppEntry> {
+        let id = self.startup_wm_class_to_id.get(wm_class)?;
+        self.lookup(id)
+    }
+
+    /// The app whose `.desktop` *basename* matches `wm_class`
+    /// (`shell_app_system_lookup_desktop_wmclass`, `shell-app-system.c:405`).
+    /// Tried verbatim first — that is what resolves reverse-DNS ids like
+    /// `org.example.Foo.Bar` — then canonicalized (lowercased, spaces to dashes,
+    /// which is what handles "Fedora Eclipse").
+    pub fn lookup_desktop_wmclass(&self, wm_class: &str) -> Option<AppEntry> {
+        if let Some(app) = self.lookup_heuristic_basename(&format!("{wm_class}.desktop")) {
+            return Some(app);
+        }
+        let canonicalized = wm_class.to_lowercase().replace(' ', "-");
+        self.lookup_heuristic_basename(&format!("{canonicalized}.desktop"))
+    }
+
+    /// Look up a heuristically-derived desktop id, retrying under each vendor
+    /// prefix (`shell_app_system_lookup_heuristic_basename`,
+    /// `shell-app-system.c:376`).
+    fn lookup_heuristic_basename(&self, name: &str) -> Option<AppEntry> {
+        if let Some(app) = self.lookup(name) {
+            return Some(app);
+        }
+        VENDOR_PREFIXES
+            .iter()
+            .find_map(|prefix| self.lookup(&format!("{prefix}{name}")))
+    }
+
+    /// Resolve a window's `app_id` to a desktop id — our
+    /// `get_app_from_window_wmclass` (`shell-window-tracker.c:146`).
+    ///
+    /// **Divergence: one string, not two.** GNOME runs a four-step ladder because
+    /// X11 gives it a `WM_CLASS` *pair*: it tries the instance against
+    /// `StartupWMClass`, then the class, then the instance against `.desktop`
+    /// basenames, then the class. xdg-shell has a single `app_id`, so the ladder
+    /// collapses to its two distinct lookups. That costs us exactly GNOME's
+    /// Chromium case — a Chromium web-app window whose class is
+    /// `Chromium-browser` but whose *instance* is `crx_<id>` resolves to the
+    /// browser instead of the web app, because we never see the instance. XWayland
+    /// clients reach us through xwayland-satellite, which has already flattened the
+    /// pair into one `app_id`.
+    ///
+    /// Also unported: `check_app_id_prefix`'s sandbox scoping
+    /// (`meta_window_get_sandboxed_app_id`) — we have no sandbox id on the
+    /// toplevel, so a sandboxed app cannot currently be told from a host app
+    /// claiming its `WM_CLASS`.
+    pub fn app_for_window(&self, app_id: &str) -> Option<AppEntry> {
+        self.lookup_startup_wmclass(app_id)
+            .or_else(|| self.lookup_desktop_wmclass(app_id))
+    }
+
+    /// Replace the open-window snapshot (what the compositor's map/unmap/focus
+    /// bookkeeping feeds in). Returns whether the resolved running list changed —
+    /// the dash redisplay trigger.
+    pub fn set_windows(&mut self, windows: Vec<RunningWindow>) -> bool {
+        if windows == self.windows {
+            return false;
+        }
+        self.windows = windows;
+        let before = self.running.clone();
+        self.recompute_running();
+        before != self.running
+    }
+
+    /// Resolve, group and order the window snapshot into [`running`](Self::running).
+    ///
+    /// Ordering is `shell_app_compare` (`shell-app.c:839`) reduced to the running
+    /// set: every app here is running and has windows, and we have no minimized
+    /// state to speak of, so the two leading clauses are vacuous and the rule is
+    /// "most recently used first". Ties break by id — GNOME's tie order is its
+    /// hash-table iteration order, i.e. arbitrary; ours is merely deterministic.
+    fn recompute_running(&mut self) {
+        let mut apps: Vec<RunningApp> = Vec::new();
+        for window in &self.windows {
+            // A window with no `app_id`, or one that resolves to nothing, is
+            // dropped. GNOME instead synthesizes a window-backed `ShellApp` and
+            // shows it in the dash; that needs an icon we cannot get from a
+            // toplevel, so it is deferred (`overview-port.md` S6).
+            let Some(entry) = window
+                .app_id
+                .as_deref()
+                .and_then(|id| self.app_for_window(id))
+            else {
+                continue;
+            };
+            match apps.iter_mut().find(|a| a.id == entry.id) {
+                Some(app) => {
+                    app.n_windows += 1;
+                    app.last_focus = app.last_focus.max(window.last_focus);
+                }
+                None => apps.push(RunningApp {
+                    id: entry.id,
+                    n_windows: 1,
+                    last_focus: window.last_focus,
+                }),
+            }
+        }
+
+        // Most recent first; never-focused (`None`) last, as GNOME's `0` sorts.
+        apps.sort_by(|a, b| {
+            b.last_focus
+                .cmp(&a.last_focus)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        self.running = apps;
+    }
+
+    /// The apps with at least one open window, in `shell_app_compare` order
+    /// (`shell_app_system_get_running`, `shell-app-system.c:508`).
+    pub fn running(&self) -> &[RunningApp] {
+        &self.running
+    }
+
+    /// Whether `id` has at least one open window — what the running dot reads
+    /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007`).
+    pub fn is_running(&self, id: &str) -> bool {
+        self.running.iter().any(|a| a.id == id)
     }
 
     /// The installed apps that should be shown (`g_app_info_should_show`) — the
@@ -374,6 +595,13 @@ fn resolve_launch(mode: LaunchMode, entry: &AppEntry) -> ResolvedLaunch {
     }
 }
 
+/// Whether `id` is `wm_class` with an optional `.desktop` suffix — the
+/// `StartupWMClass` table's primary tie-break
+/// (`startup_wm_class_is_exact_match`, `shell-app-system.c:90`).
+fn startup_wm_class_is_exact_match(id: &str, wm_class: &str) -> bool {
+    matches!(id.strip_prefix(wm_class), Some("") | Some(".desktop"))
+}
+
 /// Build an [`AppEntry`] from a `GAppInfo`. Returns `None` for entries without an
 /// id (GNOME drops these too).
 fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
@@ -383,6 +611,10 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         .map(|d| d.list_actions().iter().map(|s| s.to_string()).collect())
         .unwrap_or_default();
     let icon = icon_ref(info.icon(), &id);
+    let startup_wm_class = info
+        .downcast_ref::<DesktopAppInfo>()
+        .and_then(|d| d.startup_wm_class())
+        .map(|s| s.to_string());
     Some(AppEntry {
         id,
         name: info.name().to_string(),
@@ -391,6 +623,7 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         actions,
         should_show: info.should_show(),
         icon,
+        startup_wm_class,
     })
 }
 
@@ -555,6 +788,15 @@ impl AppEntry {
             actions: Vec::new(),
             should_show: true,
             icon: AppIconRef::Fallback,
+            startup_wm_class: None,
+        }
+    }
+
+    /// The same, declaring a `StartupWMClass`.
+    pub fn fake_with_wm_class(id: &str, name: &str, wm_class: &str) -> Self {
+        Self {
+            startup_wm_class: Some(wm_class.to_string()),
+            ..Self::fake(id, name)
         }
     }
 }
@@ -844,5 +1086,210 @@ mod tests {
             ["a.desktop"]
         );
         assert_eq!(system.favorite_ids(), ["a.desktop", "b.desktop"]);
+    }
+
+    // ---- Window ↔ app matching (S6) ----
+
+    fn system_with(apps: Vec<AppEntry>) -> AppSystem {
+        AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(NullLauncher))
+    }
+
+    fn win(app_id: &str, secs: Option<u64>) -> RunningWindow {
+        RunningWindow {
+            app_id: Some(app_id.to_owned()),
+            last_focus: secs.map(std::time::Duration::from_secs),
+        }
+    }
+
+    /// The ladder's first rung wins: a `StartupWMClass` claim beats a `.desktop`
+    /// basename that would also match (`get_app_from_window_wmclass`,
+    /// `shell-window-tracker.c:191-212`).
+    #[test]
+    fn startup_wm_class_beats_the_desktop_basename() {
+        let system = system_with(vec![
+            AppEntry::fake("Emacs.desktop", "Emacs Basename"),
+            AppEntry::fake_with_wm_class("org.gnu.emacs.desktop", "Emacs", "Emacs"),
+        ]);
+        assert_eq!(
+            system.app_for_window("Emacs").map(|e| e.id),
+            Some("org.gnu.emacs.desktop".to_owned())
+        );
+    }
+
+    /// The basename lookup tries the class verbatim before canonicalizing, which
+    /// is what makes reverse-DNS ids resolve (`shell_app_system_lookup_desktop_wmclass`
+    /// "handles org.example.Foo.Bar.desktop applications").
+    #[test]
+    fn desktop_basename_matches_verbatim_before_canonicalizing() {
+        let system = system_with(vec![
+            AppEntry::fake("org.example.Foo.Bar.desktop", "Foo Bar"),
+            AppEntry::fake("org.example.foo.bar.desktop", "Lowercased Decoy"),
+        ]);
+        assert_eq!(
+            system.app_for_window("org.example.Foo.Bar").map(|e| e.id),
+            Some("org.example.Foo.Bar.desktop".to_owned()),
+            "the verbatim id must win; canonicalizing first would pick the decoy"
+        );
+    }
+
+    /// ...and canonicalizes when it has to: lowercase, spaces to dashes. This is
+    /// GNOME's cited "Fedora Eclipse" case (`shell-app-system.c:427-430`), which
+    /// also needs a vendor prefix.
+    #[test]
+    fn desktop_basename_canonicalizes_case_and_spaces() {
+        let system = system_with(vec![AppEntry::fake("fedora-eclipse.desktop", "Eclipse")]);
+        assert_eq!(
+            system.app_for_window("Fedora Eclipse").map(|e| e.id),
+            Some("fedora-eclipse.desktop".to_owned())
+        );
+    }
+
+    /// Vendor prefixes are retried in order (`vendor_prefixes`,
+    /// `shell-app-system.c:29-33`).
+    #[test]
+    fn vendor_prefixes_are_tried_for_a_bare_basename() {
+        let system = system_with(vec![AppEntry::fake("gnome-terminal.desktop", "Terminal")]);
+        assert_eq!(
+            system.app_for_window("terminal").map(|e| e.id),
+            Some("gnome-terminal.desktop".to_owned())
+        );
+        assert_eq!(system.app_for_window("nonesuch"), None);
+    }
+
+    /// When two entries claim the same `StartupWMClass`, the one whose id *is* the
+    /// class wins — even though it is enumerated second, i.e. the tie-break really
+    /// evicts an incumbent (`scan_startup_wm_class_to_id`, `shell-app-system.c:134-139`).
+    #[test]
+    fn startup_wm_class_table_prefers_the_exact_id_match() {
+        let system = system_with(vec![
+            AppEntry::fake_with_wm_class("other.desktop", "Other", "Navigator"),
+            AppEntry::fake_with_wm_class("Navigator.desktop", "Navigator", "Navigator"),
+        ]);
+        assert_eq!(
+            system.app_for_window("Navigator").map(|e| e.id),
+            Some("Navigator.desktop".to_owned())
+        );
+    }
+
+    /// A shown entry evicts a hidden incumbent for the same class
+    /// (`shell-app-system.c:141-144`). The reverse order must NOT evict, so this
+    /// pins the asymmetry rather than "last one wins".
+    #[test]
+    fn startup_wm_class_table_prefers_a_shown_entry_over_a_hidden_one() {
+        let hidden_first = system_with(vec![
+            AppEntry {
+                should_show: false,
+                ..AppEntry::fake_with_wm_class("hidden.desktop", "Hidden", "Steam")
+            },
+            AppEntry::fake_with_wm_class("shown.desktop", "Shown", "Steam"),
+        ]);
+        assert_eq!(
+            hidden_first.app_for_window("Steam").map(|e| e.id),
+            Some("shown.desktop".to_owned()),
+            "a shown entry must evict a hidden incumbent"
+        );
+
+        let shown_first = system_with(vec![
+            AppEntry::fake_with_wm_class("shown.desktop", "Shown", "Steam"),
+            AppEntry {
+                should_show: false,
+                ..AppEntry::fake_with_wm_class("hidden.desktop", "Hidden", "Steam")
+            },
+        ]);
+        assert_eq!(
+            shown_first.app_for_window("Steam").map(|e| e.id),
+            Some("shown.desktop".to_owned()),
+            "a hidden entry must not evict a shown incumbent"
+        );
+    }
+
+    // ---- Running-app tracking ----
+
+    /// Windows group by resolved app, and the app's user time is the most recent
+    /// among its windows.
+    #[test]
+    fn running_groups_windows_by_app() {
+        let mut system = system_with(vec![
+            AppEntry::fake("a.desktop", "A"),
+            AppEntry::fake("b.desktop", "B"),
+        ]);
+        assert!(system.set_windows(vec![
+            win("a", Some(1)),
+            win("b", Some(2)),
+            win("a", Some(9))
+        ]));
+
+        let running = system.running();
+        assert_eq!(running.len(), 2);
+        let a = running.iter().find(|r| r.id == "a.desktop").unwrap();
+        assert_eq!(a.n_windows, 2);
+        assert_eq!(a.last_focus, Some(std::time::Duration::from_secs(9)));
+        assert!(system.is_running("a.desktop"));
+        assert!(!system.is_running("c.desktop"));
+    }
+
+    /// `shell_app_compare` reduced to the running set: most recently used first,
+    /// never-focused last (`shell-app.c:860-868`).
+    #[test]
+    fn running_sorts_most_recently_used_first() {
+        let mut system = system_with(vec![
+            AppEntry::fake("a.desktop", "A"),
+            AppEntry::fake("b.desktop", "B"),
+            AppEntry::fake("c.desktop", "C"),
+        ]);
+        system.set_windows(vec![win("a", Some(5)), win("b", None), win("c", Some(7))]);
+        let ids: Vec<&str> = system.running().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["c.desktop", "a.desktop", "b.desktop"]);
+    }
+
+    /// A window that resolves to nothing is dropped rather than shown as a
+    /// window-backed app (recorded divergence from `_shell_app_new_for_window`).
+    #[test]
+    fn unmatched_windows_are_dropped() {
+        let mut system = system_with(vec![AppEntry::fake("a.desktop", "A")]);
+        system.set_windows(vec![
+            win("a", Some(1)),
+            win("nonesuch", Some(2)),
+            RunningWindow {
+                app_id: None,
+                last_focus: Some(std::time::Duration::from_secs(3)),
+            },
+        ]);
+        let ids: Vec<&str> = system.running().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a.desktop"]);
+    }
+
+    /// `set_windows` reports only *resolved* changes — the dash redisplay trigger.
+    /// A window of an unknown app appearing changes nothing observable.
+    #[test]
+    fn set_windows_reports_resolved_changes_only() {
+        let mut system = system_with(vec![AppEntry::fake("a.desktop", "A")]);
+        assert!(system.set_windows(vec![win("a", Some(1))]));
+        assert!(
+            !system.set_windows(vec![win("a", Some(1)), win("nonesuch", Some(2))]),
+            "an unresolvable window must not trigger a redisplay"
+        );
+        assert!(
+            system.set_windows(vec![win("a", Some(4))]),
+            "a focus-order change must trigger one"
+        );
+    }
+
+    /// Installing an app while its window is already open resolves it on the next
+    /// refresh — the reason the raw window snapshot is kept.
+    #[test]
+    fn refresh_re_resolves_open_windows() {
+        let catalog = FakeCatalog::new(Vec::new());
+        let mut system = AppSystem::with_parts(Box::new(catalog.clone()), Box::new(NullLauncher));
+        system.set_windows(vec![win("a", Some(1))]);
+        assert!(system.running().is_empty());
+
+        catalog
+            .apps
+            .borrow_mut()
+            .push(AppEntry::fake("a.desktop", "A"));
+        system.refresh();
+        let ids: Vec<&str> = system.running().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a.desktop"]);
     }
 }

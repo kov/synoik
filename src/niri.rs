@@ -1143,6 +1143,12 @@ impl State {
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
 
+        // After the focus update, so the running order sees this cycle's focus
+        // timestamps. Re-snapshots unconditionally and only reports a change —
+        // like the keyboard-layout indicator below, that costs one window walk and
+        // needs no invalidation bookkeeping.
+        self.niri.sync_running_apps();
+
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
         self.niri.global_space.refresh();
@@ -8086,6 +8092,29 @@ impl Niri {
             })
             .collect();
         self.dash.set_favorites(favorites)
+    }
+
+    /// Snapshot every mapped window into the app model's running-app tracker —
+    /// our `ShellWindowTracker` bookkeeping (`shell-window-tracker.c`), which
+    /// GNOME drives from `window-created`/`unmanaged`/`notify::wm-class` and the
+    /// focus-order updates. We instead re-snapshot whenever the window set or the
+    /// focus order could have moved, which is cheap (a walk of the window list)
+    /// and immune to a missed edge.
+    ///
+    /// Returns whether the resolved running list changed.
+    pub fn sync_running_apps(&mut self) -> bool {
+        use crate::app_system::RunningWindow;
+        use crate::utils::with_toplevel_role;
+
+        let mut windows = Vec::new();
+        self.layout.with_windows(|mapped, _, _, _| {
+            let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+            windows.push(RunningWindow {
+                app_id,
+                last_focus: mapped.get_focus_timestamp(),
+            });
+        });
+        self.app_system.set_windows(windows)
     }
 
     /// Whether the overview chrome (dash, search) is actually on screen: the GNOME

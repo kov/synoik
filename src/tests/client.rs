@@ -636,6 +636,10 @@ impl Window {
         self.xdg_toplevel.set_title(title.to_owned());
     }
 
+    pub fn set_app_id(&self, app_id: &str) {
+        self.xdg_toplevel.set_app_id(app_id.to_owned());
+    }
+
     pub fn recent_configures(&mut self) -> impl Iterator<Item = &Configure> {
         let start = self.configures_looked_at;
         self.configures_looked_at = self.configures_received.len();

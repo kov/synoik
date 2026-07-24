@@ -5710,3 +5710,75 @@ fn overview_search_resets_on_reopen() {
         "a re-opened overview starts with an empty search"
     );
 }
+
+/// **S6 — running apps.** A mapped window makes its app *running*, through the
+/// compositor's own bookkeeping: the real xdg-shell `app_id` crosses the
+/// `sync_running_apps` seam in `State::refresh`, runs the `StartupWMClass` ladder
+/// (`get_app_from_window_wmclass`, `shell-window-tracker.c:146`) and lands in
+/// `get_running()` (`shell-app-system.c:508`). Unmapping the window clears it.
+///
+/// The matching *table* is pinned by unit tests in `app_system.rs`; what this
+/// pins is that a real window reaches it at all, and that the running set follows
+/// map/unmap without an explicit invalidation hook.
+#[test]
+fn overview_mapped_window_marks_its_app_running() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // An installed app that claims the window's app_id via StartupWMClass — the
+    // rung that must beat a basename lookup (there is no `editor-instance.desktop`).
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "org.example.Editor.desktop",
+            "Editor",
+            "editor-instance",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+    assert!(
+        f.niri().app_system.running().is_empty(),
+        "nothing runs before a window maps"
+    );
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("editor-instance");
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let running: Vec<String> = f
+        .niri()
+        .app_system
+        .running()
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(
+        running,
+        ["org.example.Editor.desktop"],
+        "the mapped window's app_id resolved through StartupWMClass"
+    );
+    assert_eq!(f.niri().app_system.running()[0].n_windows, 1);
+    assert!(f.niri().app_system.is_running("org.example.Editor.desktop"));
+
+    // Unmap: the app stops running.
+    let window = f.client(id).window(&surface);
+    window.attach_null();
+    window.commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().app_system.running().is_empty(),
+        "unmapping the last window stops the app"
+    );
+    assert!(!f.niri().app_system.is_running("org.example.Editor.desktop"));
+}
