@@ -64,6 +64,10 @@ const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 const WORKSPACE_MIN_SPACING: f64 = 24.;
 const WORKSPACE_MAX_SPACING: f64 = 80.;
 
+/// gnome-shell's `WORKSPACE_INACTIVE_SCALE` (`workspacesView.js:25`): how far a
+/// workspace shrinks once the row has scrolled off it.
+pub const WORKSPACE_INACTIVE_SCALE: f64 = 0.94;
+
 /// How gnome-shell's overview arranges the workspace row (`FitMode`,
 /// `workspacesView.js:85-88`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1579,6 +1583,40 @@ impl<W: LayoutElement> Monitor<W> {
         self.app_grid_fraction()
     }
 
+    /// Where the row currently sits on the workspace axis — gnome-shell's
+    /// `_scrollAdjustment.value`, which eases to the active index over a switch
+    /// (`WorkspacesView._scrollToActive`, `workspacesView.js:441-455`) and is
+    /// what `_updateWorkspacesState` measures each workspace's distance from.
+    ///
+    /// Deliberately *not* [`Self::workspace_render_idx`]: that one carries a
+    /// correction term for a switch synchronized with the overview animation, so
+    /// it is a row offset rather than a workspace index.
+    fn workspace_scroll_position(&self) -> f64 {
+        match &self.workspace_switch {
+            Some(switch) => switch.current_idx(),
+            None => self.active_workspace_idx as f64,
+        }
+    }
+
+    /// How far the inactive-workspace shrink is faded in — see
+    /// [`workspace_render_scale`] for why it is ramped rather than constant.
+    fn workspace_inactive_ramp(&self) -> f64 {
+        if self.workspaces_horizontal() {
+            self.expose_progress().unwrap_or(0.)
+        } else {
+            0.
+        }
+    }
+
+    /// This monitor's [`workspace_render_scale`] for one workspace.
+    pub fn workspace_render_scale(&self, idx: usize) -> f64 {
+        workspace_render_scale(
+            self.workspace_scroll_position(),
+            idx,
+            self.workspace_inactive_ramp(),
+        )
+    }
+
     /// Where workspace 0 starts on the strip axis, and how far apart consecutive
     /// workspaces sit — both relative to the centered slot
     /// [`Self::workspaces_static_offset`] places, and both blended between
@@ -2017,6 +2055,13 @@ impl<W: LayoutElement> Monitor<W> {
 
         let first_ws_pos = round_logical_in_physical(scale, first_ws_pos);
 
+        // The *slot* keeps the full workspace size, so neither the row's advance
+        // nor its centered anchor move; only the workspace drawn in it shrinks,
+        // about the slot's center like gnome-shell's centered pivot.
+        let ramp = self.workspace_inactive_ramp();
+        let scroll_position = self.workspace_scroll_position();
+        let view_size = self.view_size;
+
         // Return position for one-past-last workspace too.
         (0..=self.workspaces.len()).map(move |idx| {
             let pos = first_ws_pos + idx as f64 * ws_extent_with_gap;
@@ -2027,13 +2072,22 @@ impl<W: LayoutElement> Monitor<W> {
             };
             let loc = loc + static_offset;
 
+            let ws_scale = workspace_render_scale(scroll_position, idx, ramp);
+            let size = if ws_scale == 1. {
+                ws_size
+            } else {
+                let size = view_size.upscale(zoom * ws_scale);
+                size.to_physical_precise_ceil(scale).to_logical(scale)
+            };
+            let loc = loc + Point::from(((ws_size.w - size.w) / 2., (ws_size.h - size.h) / 2.));
+
             // Even though all components that go into loc are rounded to physical pixels, the
             // floating point addition may lose precision. This can result for example in the
             // current workspace having y = 0.0000000000002 and thus missing pointer hits at the
             // monitor edge with y = 0. So, post-round the location too.
             let loc = loc.to_physical_precise_round(scale).to_logical(scale);
 
-            Rectangle::new(loc, ws_size)
+            Rectangle::new(loc, size)
         })
     }
 
@@ -2432,8 +2486,11 @@ impl<W: LayoutElement> Monitor<W> {
             .insert_hint_render_loc
             .filter(|_| !self.options.layout.insert_hint.off);
 
-        let scale_relocate = move |geo: Rectangle<f64, Logical>, elem| {
-            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+        // The workspace the row sits on draws a touch larger than its neighbors
+        // (`workspace_render_scale`), so the zoom is per workspace, not per
+        // monitor.
+        let scale_relocate = move |ws_zoom: f64, geo: Rectangle<f64, Logical>, elem| {
+            let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), ws_zoom);
             RelocateRenderElement::from_element(
                 elem,
                 // The offset we get from workspaces_with_render_geo() is already
@@ -2444,7 +2501,8 @@ impl<W: LayoutElement> Monitor<W> {
             )
         };
 
-        for (ws, geo) in self.workspaces_with_render_geo() {
+        for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
+            let ws_zoom = zoom * self.workspace_render_scale(idx);
             // Macro instead of closure because ws and insert hint have different elem types.
             macro_rules! push {
                 () => {{
@@ -2452,13 +2510,13 @@ impl<W: LayoutElement> Monitor<W> {
                         let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
                         if let Some(elem) = elem {
                             let elem = MonitorInnerRenderElement::from(elem);
-                            push(scale_relocate(geo, elem));
+                            push(scale_relocate(ws_zoom, geo, elem));
                         }
                     }
                 }};
             }
 
-            let xray_pos = XrayPos::new(geo.loc, zoom);
+            let xray_pos = XrayPos::new(geo.loc, ws_zoom);
 
             macro_rules! push_hint {
                 () => {
@@ -2515,11 +2573,12 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
 
-        for (ws, geo) in self.workspaces_with_render_geo() {
+        for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
+            let ws_zoom = zoom * self.workspace_render_scale(idx);
             ws.render_shadow(&mut |elem| {
                 let elem = elem.with_alpha(alpha);
                 let elem = MonitorInnerRenderElement::Shadow(elem);
-                let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
+                let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), ws_zoom);
                 let elem = RelocateRenderElement::from_element(
                     elem,
                     geo.loc.to_physical_precise_round(scale),
@@ -2967,6 +3026,30 @@ impl<W: LayoutElement> Monitor<W> {
             assert_abs_diff_eq!(pos.y, rounded_pos.y, epsilon = 1e-5);
         }
     }
+}
+
+/// How much the workspace at `idx` is scaled about its own center, given where
+/// the row sits (`scroll_position`) and how far the shrink is faded in (`ramp`).
+///
+/// `WorkspacesView._updateWorkspacesState` (`workspacesView.js:243-266`) keeps
+/// every workspace at [`WORKSPACE_INACTIVE_SCALE`] and grows it back to 1 as the
+/// row scrolls onto it — `lerp(0.94, 1, 1 - clamp(|value - i|, 0, 1))` — about a
+/// centered pivot (`workspace.js:1039`). It is what makes the workspace you are
+/// on read as slightly larger than its neighbors, in the window picker and in
+/// the app grid's fitted row alike.
+///
+/// **Divergence.** gnome-shell applies this to actors that only exist inside the
+/// overview, so it can leave them scaled unconditionally. Our row *is* the
+/// desktop, so the shrink is ramped in with the overview progress. At rest the
+/// two agree — the workspace you are on is 1 either way; what the ramp avoids is
+/// a plain desktop workspace switch, where the scroll position is briefly
+/// fractional, shrinking both workspaces on screen to 0.97.
+///
+/// A free function so the render-geometry iterator can call it from a `move`
+/// closure over plain `Copy` inputs without re-deriving the formula.
+fn workspace_render_scale(scroll_position: f64, idx: usize, ramp: f64) -> f64 {
+    let distance = (scroll_position - idx as f64).abs().clamp(0., 1.);
+    1. - (1. - WORKSPACE_INACTIVE_SCALE) * distance * ramp
 }
 
 /// The strip's drop placeholder: a translucent pill marking where the new

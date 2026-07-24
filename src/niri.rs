@@ -5908,22 +5908,26 @@ impl Niri {
                 );
             }
 
-            // Macro instead of closure to avoid borrowing push().
+            // Macro instead of closure to avoid borrowing push(). The zoom is per
+            // workspace: the one the row sits on draws a touch larger than its
+            // neighbors (`Monitor::workspace_render_scale`).
             macro_rules! process {
-                ($geo:expr) => {{
+                ($ws_zoom:expr, $geo:expr) => {{
                     &mut |elem| {
-                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo) {
+                        if let Some(elem) = scale_relocate_crop(elem, output_scale, $ws_zoom, $geo)
+                        {
                             push(elem.into());
                         }
                     }
                 }};
             }
 
-            for (ws, geo) in mon.workspaces_with_render_geo() {
+            for ((idx, ws), geo) in mon.workspaces_with_render_geo_idx() {
+                let ws_zoom = zoom * mon.workspace_render_scale(idx);
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                let xray_pos = XrayPos::new(geo.loc, ws_zoom);
+                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(ws_zoom, geo));
+                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
             }
 
             {
@@ -5939,7 +5943,8 @@ impl Niri {
                 );
             }
 
-            for (ws, geo) in mon.workspaces_with_render_geo() {
+            for ((idx, ws), geo) in mon.workspaces_with_render_geo_idx() {
+                let ws_zoom = zoom * mon.workspace_render_scale(idx);
                 // The render element namespace. This will be set to the workspace index for
                 // elements duplicated across workspaces (i.e. background and bottom layers) in
                 // order to have their non-xray framebuffer effects separated from each other.
@@ -5949,9 +5954,9 @@ impl Niri {
                 // namespace on the frame at once. Id + namespace is used as the cache key in the
                 // damage tracker.
                 let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                let xray_pos = XrayPos::new(geo.loc, ws_zoom);
+                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(ws_zoom, geo));
+                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
 
                 let mut wallpapered = false;
                 // As above: the GNOME wallpaper draws on GLES and on the owned Vulkan renderer.
@@ -5962,14 +5967,14 @@ impl Niri {
                         wallpaper_radius,
                         output_scale,
                     ) {
-                        process!(geo)(elem);
+                        process!(ws_zoom, geo)(elem);
                         wallpapered = true;
                     }
                 }
                 // The solid color would poke out of the wallpaper's rounded
                 // corners, so it only backs workspaces without one.
                 if !wallpapered {
-                    process!(geo)(ws.render_background());
+                    process!(ws_zoom, geo)(ws.render_background());
                 }
             }
         }

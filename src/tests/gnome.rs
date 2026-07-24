@@ -2239,11 +2239,11 @@ fn app_grid_fits_the_whole_workspace_row() {
             .take(3)
             .collect()
     };
+    // Each workspace is centered in its slot, so slot geometry is read off the
+    // rect *centers* — the inactive-workspace shrink leaves those untouched.
     let center_of = |r: &Rectangle<f64, Logical>| r.loc.x + r.size.w / 2.;
     let run_center = |row: &[Rectangle<f64, Logical>]| {
-        let first = row[0];
-        let last = row[row.len() - 1];
-        (first.loc.x + last.loc.x + last.size.w) / 2.
+        (center_of(&row[0]) + center_of(&row[row.len() - 1])) / 2.
     };
     let view_center = 1920. / 2.;
 
@@ -2281,10 +2281,89 @@ fn app_grid_fits_the_whole_workspace_row() {
     // the width, so the fit-*single* formula would run all the way up to
     // WORKSPACE_MAX_SPACING (80) instead — which is exactly what we drew before
     // the row learned about fit modes.
-    let gap = grid[1].loc.x - (grid[0].loc.x + grid[0].size.w);
+    // Slot pitch minus the slot width; workspace 0 is the active one, so its rect
+    // is the unshrunk slot.
+    let gap = center_of(&grid[1]) - center_of(&grid[0]) - grid[0].size.w;
     assert!(
         (gap - 24.).abs() <= 1.,
         "the fitted row must pack at WORKSPACE_MIN_SPACING 24, got {gap}"
+    );
+}
+
+/// The workspace the row sits on draws at full size while every other one is
+/// shrunk to `WORKSPACE_INACTIVE_SCALE` about its own center
+/// (`WorkspacesView._updateWorkspacesState`, `workspacesView.js:243-266`, with
+/// the centered pivot at `workspace.js:1039`) — what makes the workspace you are
+/// on read as slightly larger than its neighbors.
+///
+/// The shrink belongs to the overview: on the desktop, where the same row is the
+/// live session, everything stays at 1.
+#[test]
+fn overview_shrinks_the_inactive_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+
+    while f
+        .niri()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_idx()
+        != 0
+    {
+        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+    }
+    f.settle_animations();
+
+    use crate::layout::monitor::WORKSPACE_INACTIVE_SCALE;
+
+    let scales = |f: &mut Fixture| -> Vec<f64> {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let mon = mon.expect("workspaces must be on a monitor");
+        (0..3).map(|i| mon.workspace_render_scale(i)).collect()
+    };
+
+    let open = scales(&mut f);
+    assert_eq!(
+        open,
+        vec![1., WORKSPACE_INACTIVE_SCALE, WORKSPACE_INACTIVE_SCALE],
+        "in the overview only the workspace the row sits on stays full size"
+    );
+
+    // It reaches the drawn geometry, centered in an unmoved slot: the shrunk
+    // workspace is narrower yet its center is exactly where the full-size pitch
+    // puts it.
+    {
+        use smithay::utils::{Logical, Rectangle};
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let row: Vec<Rectangle<f64, Logical>> =
+            mon.unwrap().workspaces_render_geo().take(2).collect();
+        assert!(
+            row[1].size.w < row[0].size.w && row[1].size.h < row[0].size.h,
+            "the inactive workspace must draw smaller, got {row:?}"
+        );
+        // A centered pivot inset the shrunk rect by exactly half the size it lost,
+        // so its origin sits that much further along than the slot pitch would put
+        // it. Shrinking about the origin instead would leave the two equal.
+        let pitch = (row[1].loc.x + row[1].size.w / 2.) - (row[0].loc.x + row[0].size.w / 2.);
+        let origin_step = row[1].loc.x - row[0].loc.x;
+        let inset = (row[0].size.w - row[1].size.w) / 2.;
+        assert!(
+            (origin_step - pitch - inset).abs() <= 1.,
+            "the shrink must be about the workspace's own center (pitch {pitch}, \
+             origin step {origin_step}, half the width lost {inset})"
+        );
+    }
+
+    // Closed: the row is the live desktop, so nothing is scaled.
+    f.niri_state().do_action(Action::CloseOverview, false);
+    f.settle_animations();
+    assert_eq!(
+        scales(&mut f),
+        vec![1., 1., 1.],
+        "on the desktop no workspace may be shrunk"
     );
 }
 
