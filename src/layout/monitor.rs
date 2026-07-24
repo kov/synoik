@@ -58,6 +58,24 @@ const WORKSPACE_DND_EDGE_SCROLL_MOVEMENT: f64 = 1500.;
 /// WINDOW_REPOSITIONING_DELAY).
 const WORKSPACE_DND_EDGE_SNAP_GRACE: Duration = Duration::from_millis(750);
 
+/// gnome-shell's `WORKSPACE_MIN_SPACING` / `WORKSPACE_MAX_SPACING`
+/// (`workspacesView.js:22-23`), the clamp on the overview row's inter-workspace
+/// gap.
+const WORKSPACE_MIN_SPACING: f64 = 24.;
+const WORKSPACE_MAX_SPACING: f64 = 80.;
+
+/// How gnome-shell's overview arranges the workspace row (`FitMode`,
+/// `workspacesView.js:85-88`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitMode {
+    /// One workspace centered, its neighbors peeking off the screen edges — the
+    /// desktop and window-picker arrangement.
+    Single,
+    /// Every workspace fitted side by side, the row centered as a whole — the
+    /// app-grid arrangement.
+    All,
+}
+
 #[derive(Debug)]
 pub struct Monitor<W: LayoutElement> {
     /// Output for this monitor.
@@ -1255,7 +1273,9 @@ impl<W: LayoutElement> Monitor<W> {
 
                     let scale = self.scale.fractional_scale();
                     let zoom = self.overview_zoom();
-                    let gap = self.workspace_gap(zoom);
+                    // Fit-single: dropping into a new workspace is a window-picker
+                    // gesture, and the app grid is not a drop target.
+                    let gap = self.workspace_gap(zoom, FitMode::Single);
 
                     let hint_gap = round_logical_in_physical(scale, gap * 0.1);
                     let hint_thickness = gap - hint_gap * 2.;
@@ -1497,17 +1517,28 @@ impl<W: LayoutElement> Monitor<W> {
         self.options.layout.windowing_mode == WindowingMode::Floating
     }
 
-    fn workspace_gap(&self, zoom: f64) -> f64 {
+    /// The gap between two workspaces at a given [`FitMode`] — gnome-shell's
+    /// `WorkspacesView._getSpacing` (`workspacesView.js:207-226`):
+    /// `(availableSpace - workspaceSize * 0.4) * (1 - fitMode)`, clamped to
+    /// `WORKSPACE_MIN_SPACING`..`WORKSPACE_MAX_SPACING` (24..80).
+    ///
+    /// At [`FitMode::Single`] and the window picker's zoom the workspace takes
+    /// most of the width, so the raw value goes negative and clamps to the
+    /// minimum — which is the point: the side margins stay free so the neighbor
+    /// workspaces peek in at the screen edges. The app grid's much smaller zoom
+    /// would instead run the formula up to the maximum; there the
+    /// [`FitMode::All`] `(1 - fitMode)` factor zeroes it, so the fitted row packs
+    /// back at the minimum.
+    fn workspace_gap(&self, zoom: f64, fit_mode: FitMode) -> f64 {
         let scale = self.scale.fractional_scale();
         let gap = if self.workspaces_horizontal() {
-            // gnome-shell `_getSpacing`: `availableSpace - workspaceWidth*0.4`
-            // clamped to WORKSPACE_MIN_SPACING..WORKSPACE_MAX_SPACING (24..80).
-            // On any normal aspect ratio that clamps to the minimum, which is
-            // the point: the side margins stay free so the neighbor
-            // workspaces peek in at the screen edges.
             let ws_width = self.view_size.w * zoom;
             let available = (self.view_size.w - ws_width) / 2.;
-            (available - ws_width * 0.4).clamp(24., 80.)
+            let raw = match fit_mode {
+                FitMode::Single => available - ws_width * 0.4,
+                FitMode::All => 0.,
+            };
+            raw.clamp(WORKSPACE_MIN_SPACING, WORKSPACE_MAX_SPACING)
         } else {
             self.view_size.h * 0.1 * zoom
         };
@@ -1515,7 +1546,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     fn workspace_size_with_gap(&self, zoom: f64) -> Size<f64, Logical> {
-        let gap = self.workspace_gap(zoom);
+        let gap = self.workspace_gap(zoom, FitMode::Single);
         if self.workspaces_horizontal() {
             self.workspace_size(zoom) + Size::from((gap, 0.))
         } else {
@@ -1523,7 +1554,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    /// The strip-axis extent of one workspace plus the gap.
+    /// The strip-axis extent of one workspace plus the fit-single gap.
     fn workspace_extent_with_gap(&self, zoom: f64) -> f64 {
         let size = self.workspace_size_with_gap(zoom);
         if self.workspaces_horizontal() {
@@ -1531,6 +1562,84 @@ impl<W: LayoutElement> Monitor<W> {
         } else {
             size.h
         }
+    }
+
+    /// How far the workspace row is toward gnome-shell's [`FitMode::All`]: 0 is
+    /// fit-single, 1 fit-all, in between the blend.
+    ///
+    /// `WorkspacesView._getFitModeForState` (`workspacesView.js:268-279`) picks
+    /// SINGLE for `HIDDEN` and `WINDOW_PICKER` and ALL for `APP_GRID`, and
+    /// `ControlsManager._update` lerps between the two on the state progress
+    /// (`overviewControls.js:594-603`) — which for us is the show-apps fraction.
+    /// niri's vertical strip has no such mode and always stays fit-single.
+    fn fit_mode_fraction(&self) -> f64 {
+        if !self.workspaces_horizontal() {
+            return 0.;
+        }
+        self.app_grid_fraction()
+    }
+
+    /// Where workspace 0 starts on the strip axis, and how far apart consecutive
+    /// workspaces sit — both relative to the centered slot
+    /// [`Self::workspaces_static_offset`] places, and both blended between
+    /// gnome-shell's fit-single and fit-all boxes on [`Self::fit_mode_fraction`].
+    ///
+    /// `WorkspacesView.vfunc_allocate` (`workspacesView.js:330-420`) walks a
+    /// fit-single box and a fit-all box in lockstep — each advancing by its own
+    /// width plus its own spacing — and gives each workspace
+    /// `fitSingleBox.interpolate(fitAllBox, fitMode)`. For a uniform row that is
+    /// exactly a lerp of the origin and of the advance, which is what this
+    /// returns.
+    ///
+    /// The two modes differ in *where the row is anchored*. Fit-single slides the
+    /// whole row so the active workspace lands on the centered slot
+    /// (`_getFirstFitSingleWorkspaceBox`, `:172-204`) — its neighbors then hang
+    /// off the screen edges. Fit-all instead lays every workspace out inside the
+    /// allocation and centers the run as a whole
+    /// (`_getFirstFitAllWorkspaceBox`, `:128-170`), so which workspace is active
+    /// no longer moves anything.
+    ///
+    /// **Divergence.** When the row is wide enough that the *width* binds rather
+    /// than the height (roughly seven or more workspaces at 16:9), gnome-shell
+    /// narrows each fit-all box to `availableWidth / n`, squashing the workspaces
+    /// out of aspect. We keep one zoom per monitor, so our workspaces stay
+    /// aspect-locked and the packed row simply overflows the edges as it does in
+    /// fit-single. Everything up to that count matches.
+    fn workspaces_strip_axis(&self, zoom: f64) -> (f64, f64) {
+        let extent_single = self.workspace_extent_with_gap(zoom);
+        let origin_single = -self.workspace_render_idx() * extent_single;
+
+        let fit = self.fit_mode_fraction();
+        if fit <= 0. {
+            return (origin_single, extent_single);
+        }
+
+        let ws_w = self.workspace_size(zoom).w;
+        let n = self.workspaces.len() as f64;
+        let spacing = self.workspace_gap(zoom, FitMode::All);
+
+        // Spacing here is not only the space between workspaces, but also the
+        // space before the first and after the last, so the row never touches
+        // the edges of the allocation (`workspacesView.js:136-138`).
+        let available = self.view_size.w - spacing * (n + 1.);
+        let x1 = if available / n >= ws_w {
+            // The height binds, so the boxes keep their aspect-locked width and
+            // the leftover space centers the run.
+            spacing + f64::max((available - ws_w * n) / 2., 0.)
+        } else {
+            spacing
+        };
+
+        // Both modes are expressed against the slot `workspaces_static_offset`
+        // centers, so the fit-all anchor is the offset from there.
+        let origin_all = x1 - (self.view_size.w - ws_w) / 2.;
+        let extent_all = ws_w + spacing;
+
+        let lerp = |a: f64, b: f64| a + (b - a) * fit;
+        (
+            lerp(origin_single, origin_all),
+            lerp(extent_single, extent_all),
+        )
     }
 
     /// The allocated box of every piece of overview chrome on this monitor
@@ -1902,11 +2011,10 @@ impl<W: LayoutElement> Monitor<W> {
         let horizontal = self.workspaces_horizontal();
 
         let ws_size = self.workspace_size(zoom);
-        let ws_extent_with_gap = self.workspace_extent_with_gap(zoom);
+        let (first_ws_pos, ws_extent_with_gap) = self.workspaces_strip_axis(zoom);
 
         let static_offset = self.workspaces_static_offset(zoom);
 
-        let first_ws_pos = -self.workspace_render_idx() * ws_extent_with_gap;
         let first_ws_pos = round_logical_in_physical(scale, first_ws_pos);
 
         // Return position for one-past-last workspace too.

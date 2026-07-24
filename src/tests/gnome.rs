@@ -2198,6 +2198,96 @@ fn overview_drag_to_neighbor_keeps_position() {
     );
 }
 
+/// Opening the app grid switches the workspace row from gnome-shell's
+/// `FitMode.SINGLE` to `FitMode.ALL`: instead of sliding the row so the *active*
+/// workspace lands on the centered slot (`_getFirstFitSingleWorkspaceBox`,
+/// `workspacesView.js:172-204`), every workspace is laid out inside the
+/// allocation and the run is centered as a whole
+/// (`_getFirstFitAllWorkspaceBox`, `:128-170`) — so which workspace is active no
+/// longer shifts anything. The fitted row also packs at `WORKSPACE_MIN_SPACING`
+/// rather than the picker's roomy peek-at-the-edges gap (`_getSpacing`'s
+/// `(1 - fitMode)` factor, `:207-226`).
+///
+/// Driven from the *first* of three workspaces, where the two arrangements are
+/// furthest apart: fit-single puts a third of the row off the left edge.
+#[test]
+fn app_grid_fits_the_whole_workspace_row() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+
+    // Back to the first workspace, so the active one is off-center in the row.
+    while f
+        .niri()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_idx()
+        != 0
+    {
+        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+    }
+    f.settle_animations();
+
+    use smithay::utils::{Logical, Rectangle};
+
+    let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .workspaces_render_geo()
+            .take(3)
+            .collect()
+    };
+    let center_of = |r: &Rectangle<f64, Logical>| r.loc.x + r.size.w / 2.;
+    let run_center = |row: &[Rectangle<f64, Logical>]| {
+        let first = row[0];
+        let last = row[row.len() - 1];
+        (first.loc.x + last.loc.x + last.size.w) / 2.
+    };
+    let view_center = 1920. / 2.;
+
+    // The picker: fit-single, so the *active* workspace is the centered one and
+    // the run as a whole hangs off to the right.
+    let picker = row(&mut f);
+    assert_eq!(picker.len(), 3, "three workspaces must be laid out");
+    assert!(
+        (center_of(&picker[0]) - view_center).abs() <= 1.,
+        "in the picker the active workspace must be centered, got {picker:?}"
+    );
+    assert!(
+        run_center(&picker) > view_center + 100.,
+        "in the picker the run must hang off to one side, got {picker:?}"
+    );
+
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+
+    // The app grid: fit-all, so the run is centered and the active workspace is
+    // wherever its index puts it.
+    let grid = row(&mut f);
+    assert!(
+        (run_center(&grid) - view_center).abs() <= 1.,
+        "in the app grid the whole run must be centered, got {grid:?}"
+    );
+    assert!(
+        center_of(&grid[1]) > center_of(&grid[0]) && center_of(&grid[2]) > center_of(&grid[1]),
+        "the row must stay in workspace order, got {grid:?}"
+    );
+
+    // Packed at WORKSPACE_MIN_SPACING. `_getSpacing`'s `(1 - fitMode)` factor is
+    // what does this: at the app grid's small zoom the workspace takes little of
+    // the width, so the fit-*single* formula would run all the way up to
+    // WORKSPACE_MAX_SPACING (80) instead — which is exactly what we drew before
+    // the row learned about fit modes.
+    let gap = grid[1].loc.x - (grid[0].loc.x + grid[0].size.w);
+    assert!(
+        (gap - 24.).abs() <= 1.,
+        "the fitted row must pack at WORKSPACE_MIN_SPACING 24, got {gap}"
+    );
+}
+
 /// Two populated desktops with the overview open: window A stays on the
 /// first workspace, window B is dragged to the trailing one (leaving a new
 /// trailing empty third). Returns (A's window, B's window).
