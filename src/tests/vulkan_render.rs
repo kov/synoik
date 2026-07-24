@@ -6293,7 +6293,10 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                 &niri.icon_cache,
                 &output,
                 area,
-                1.0,
+                crate::ui::overview_search::SearchFade {
+                    overview: 1.0,
+                    search: 1.0,
+                },
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());

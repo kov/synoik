@@ -5484,6 +5484,130 @@ fn overview_search_space_first_stays_inactive() {
     );
 }
 
+/// gnome-shell cross-fades the search over the window picker (`_onSearchChanged`,
+/// `overviewControls.js:609-643`) and makes the covered picker inert, so a click
+/// beside the results neither activates a preview hiding under them nor reads as
+/// "clicked the empty desktop" and leaves the overview.
+#[test]
+fn overview_search_makes_the_picker_inert() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a.desktop")]);
+    *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_string()]];
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let center = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+
+    // Not searching: the preview is live and the fade is fully off.
+    assert_eq!(f.niri().overview_search_fade(), 0.);
+    pointer_motion_to(&mut f, center.0, center.1);
+    assert!(
+        f.niri().window_under_cursor().is_some(),
+        "a preview must be clickable while not searching"
+    );
+
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+    assert!(
+        f.niri().window_under_cursor().is_none(),
+        "a preview under the search results must not activate"
+    );
+
+    // The fade eases rather than snapping: armed on one frame, mid-way on the next.
+    f.niri().advance_animations();
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+    let mid = f.niri().overview_search_fade();
+    assert!(mid > 0. && mid < 1., "the search fade must ease, got {mid}");
+    f.settle_animations();
+    assert_eq!(f.niri().overview_search_fade(), 1.);
+
+    // A click out on the covered picker (the pointer has not moved) is consumed by
+    // the results strip.
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "clicking the covered picker must not leave the overview"
+    );
+    assert!(
+        f.niri().overview_search.is_active(),
+        "and must not discard the search"
+    );
+
+    // Clearing brings the picker back — and its reactivity with it.
+    tap(&mut f, KEY_ESC);
+    f.settle_animations();
+    assert!(!f.niri().overview_search.is_active());
+    assert_eq!(f.niri().overview_search_fade(), 0.);
+    assert!(
+        f.niri().window_under_cursor().is_some(),
+        "clearing the search must make the picker live again"
+    );
+}
+
+/// The thumbnail strip fades and goes inert with the picker (gnome-shell forces
+/// its opacity to 0 whenever `searchActive`, `overviewControls.js:550-580`), so a
+/// click where a thumbnail used to be must not switch workspace.
+#[test]
+fn overview_search_makes_the_thumbnail_strip_inert() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+
+    let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a.desktop")]);
+    *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_string()]];
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+
+    let (tx, ty) = thumbnail_center(&mut f, 0);
+    let active = f.niri().layout.active_workspace().unwrap().id();
+
+    // Sanity: the same click switches workspace when nothing covers the strip —
+    // otherwise this test could pass by simply missing the thumbnail.
+    pointer_motion_to(&mut f, tx, ty);
+    assert!(
+        f.niri().thumbnail_workspace_under_cursor().is_some(),
+        "the probe must actually be over a thumbnail"
+    );
+
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        f.niri().layout.active_workspace().unwrap().id(),
+        active,
+        "a thumbnail under the search results must not switch workspace"
+    );
+    assert!(f.niri().layout.is_overview_open());
+}
+
 /// The idle entry pill is drawn too, so it consumes its clicks the same way: a
 /// fall-through would land on the workspace behind it and leave the overview.
 /// (gnome-shell focuses the entry on that click; we have no click-to-focus, but

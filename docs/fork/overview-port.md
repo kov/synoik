@@ -305,11 +305,28 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   and half-expanded variants, the dash cap) + re-pinned `thumbnails.rs` band tests + 5 conformance
   tests, including the mid-animation offset guard and the mid-expand picker continuity.
   **Not yet live-validated.**
-- **S5b — `search-active` cross-fade.** Fade the picker and thumbnails out and the results in
-  (`_onSearchChanged`, `overviewControls.js:609-643`: opacity-only eases, 250ms `EASE_OUT_QUAD`, with
-  `visible`/`reactive` flipped in `onComplete`), via a second continuous adjustment and
-  `OffscreenRenderElement::with_alpha`. Also makes the faded-out picker/thumbnails non-reactive, which
-  is what stops a click during an active search from hitting a preview behind the results card.
+- **S5b — `search-active` cross-fade. ✅ DONE.** A second continuous adjustment on `Niri`
+  (`overview_search_fade`, fixed 250ms `EASE_OUT_QUAD` per `SIDE_CONTROLS_ANIMATION_TIME`, armed on the
+  `is_active()` edge in `advance_animations`) fades the window picker and the thumbnails out and the
+  results card in (`_onSearchChanged`, `overviewControls.js:609-643`). The fade lives on `Niri`, not
+  `Layout` — `Layout` stays ignorant of the search; the picker/thumbnails are composited as *groups*
+  through `OffscreenBuffer` + `OffscreenRenderElement::with_alpha` at the `render_workspaces` /
+  `render_thumbnails` call sites, because a per-element alpha would double-darken wherever previews
+  overlap. The composite is fail-open (falls back to a plain push on error, so a fade problem can
+  never blank the overview) and only runs strictly between the ends. The entry pill does **not** ride
+  the fade (gnome-shell's `searchEntryBin` is outside the cross-fade); only the results do.
+  Reactivity: the picker (`window_under`) and the strip (`thumbnail_workspace_under`) go inert while
+  searching, and — the part that matters — `OverviewSearch::hit_test` now consumes anywhere in the
+  allocated results strip, because without it a click beside the card reached the faded-out picker and
+  read as "clicked the empty desktop", leaving the overview. Divergences: reactivity flips with the
+  boolean rather than at the ease's end (gnome-shell flips in `onComplete`, so its previews stay
+  clickable for 250ms after a search starts); the results card disappears on deactivate instead of
+  fading out (the picker still fades back in under it).
+  **Test-coverage gap, deliberate and recorded:** the partial-alpha branch of the group composite has
+  no render test. Every headless test settles the fade to an end, where it is a pass-through, and three
+  attempts at a mid-fade pixel differential were each either vacuous or measuring the results card
+  rather than the picker. The blend is live-validation-only for now; the model (eases, mid value,
+  reactivity, click-consumption) is pinned by 2 conformance tests.
 - **S6 — Running apps + running dots.** window `app_id`/WM_CLASS → `.desktop` matching (StartupWMClass
   rules); `get_running()` feeds dash trailing icons + the `AppIcon` running dot; `dash-separator`
   between favorites and running. Conformance test the matching table.

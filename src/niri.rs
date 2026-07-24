@@ -115,7 +115,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
-use crate::animation::Clock;
+use crate::animation::{Animation, Clock};
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
@@ -160,6 +160,7 @@ use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
@@ -529,6 +530,16 @@ pub struct Niri {
     /// close while open) so the search resets on a fresh open, matching GNOME's
     /// reset-on-enter — see [`Niri::refresh_overview_search_state`].
     overview_search_was_visible: bool,
+    /// gnome-shell's search cross-fade (`_onSearchChanged`, `overviewControls.js:609-643`):
+    /// 0 while the window picker is fully shown, 1 while a search covers it.
+    overview_search_fade: Option<Animation>,
+    /// The settled target of [`Self::overview_search_fade`], for edge detection.
+    overview_search_fade_target: bool,
+    /// Offscreens for the cross-fade. The picker and the thumbnails are each faded
+    /// as a *group*: a per-element alpha would double-darken wherever previews
+    /// overlap, which the group composite avoids.
+    picker_offscreen: OffscreenBuffer,
+    thumbnails_offscreen: OffscreenBuffer,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
     /// Full-color application-icon loader for the dash / app grid / search.
@@ -3565,6 +3576,10 @@ impl Niri {
             dash: Dash::new(),
             overview_search: OverviewSearch::new(),
             overview_search_was_visible: false,
+            overview_search_fade: None,
+            overview_search_fade_target: false,
+            picker_offscreen: OffscreenBuffer::default(),
+            thumbnails_offscreen: OffscreenBuffer::default(),
             icon_cache: IconCache::new("Adwaita"),
             app_icon_cache: AppIconCache::new("Adwaita"),
 
@@ -4256,6 +4271,9 @@ impl Niri {
             || self.end_session_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
+            // Faded out under the search results: gnome-shell drops the strip's
+            // reactivity alongside the picker's (`overviewControls.js:550-580`).
+            || self.overview_search.is_active()
         {
             return None;
         }
@@ -4286,6 +4304,10 @@ impl Niri {
             || self.is_locked()
             || self.screenshot_ui.is_open()
             || self.window_mru_ui.is_open()
+            // The window picker is faded out under the search results, so its
+            // previews must not activate — gnome-shell drops `reactive` on the
+            // workspaces display while searching (`overviewControls.js:636-641`).
+            || (self.layout.is_overview_open() && self.overview_search.is_active())
         {
             return None;
         }
@@ -5162,6 +5184,7 @@ impl Niri {
         let _span = tracy_client::span!("Niri::advance_animations");
 
         self.layout.advance_animations();
+        self.update_overview_search_fade();
 
         // Banners are blocked while a panel popover is open; syncing here (once per
         // frame) covers every open/close path with a single site. The drain check
@@ -5512,7 +5535,10 @@ impl Niri {
                     &self.icon_cache,
                     output,
                     controls.into(),
-                    progress,
+                    crate::ui::overview_search::SearchFade {
+                        overview: progress,
+                        search: self.overview_search_fade(),
+                    },
                 ) {
                     push(element.into());
                 }
@@ -5522,6 +5548,11 @@ impl Niri {
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
         let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
+
+        // The window picker and the thumbnails cross-fade out as a search covers
+        // them; outside the overview the fade is 0, so this is a plain pass-through.
+        let fade_scale = output.current_scale().fractional_scale();
+        let picker_alpha = (1. - self.overview_search_fade()) as f32;
 
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();
@@ -5605,7 +5636,18 @@ impl Niri {
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            {
+                let mut group = Vec::new();
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem));
+                Self::push_group_at_alpha(
+                    ctx.renderer,
+                    &self.picker_offscreen,
+                    fade_scale,
+                    picker_alpha,
+                    group,
+                    push,
+                );
+            }
 
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
@@ -5640,10 +5682,20 @@ impl Niri {
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
-            // The overview workspace thumbnails strip, above the workspaces.
-            mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| {
-                push(elem.into())
-            });
+            // The overview workspace thumbnails strip, above the workspaces. It
+            // cross-fades with the search results alongside the picker.
+            {
+                let mut group = Vec::new();
+                mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| group.push(elem));
+                Self::push_group_at_alpha(
+                    ctx.renderer,
+                    &self.thumbnails_offscreen,
+                    fade_scale,
+                    picker_alpha,
+                    group,
+                    push,
+                );
+            }
 
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
@@ -5663,7 +5715,18 @@ impl Niri {
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
             }
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            {
+                let mut group = Vec::new();
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem));
+                Self::push_group_at_alpha(
+                    ctx.renderer,
+                    &self.picker_offscreen,
+                    fade_scale,
+                    picker_alpha,
+                    group,
+                    push,
+                );
+            }
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 // The render element namespace. This will be set to the workspace index for
@@ -8047,6 +8110,101 @@ impl Niri {
     /// load-bearing for the lock bypass — `overview_ui_visible` gates the intercepts.)
     /// Nothing clears on close, so the query stays visible through the close fade, as
     /// GNOME's does. Called each cycle from `State::refresh`.
+    /// Composite `elements` as one group at `alpha`, or push them straight through
+    /// at full opacity.
+    ///
+    /// NOTE: the partial-alpha branch has **no automated render coverage** — every
+    /// headless test settles the fade to one end, where this is a pass-through.
+    /// It is a thin, fail-open wrapper over the same `OffscreenBuffer` path
+    /// `Tile`'s alpha animation uses, but the blend itself is live-validated only.
+    ///
+    /// The group composite is what makes the search cross-fade correct: applying a
+    /// per-element alpha would double-darken wherever two window previews overlap.
+    /// Falls back to a plain push if the offscreen fails, so a fade problem can
+    /// never blank the overview.
+    fn push_group_at_alpha(
+        renderer: &mut VulkanRenderer,
+        buffer: &OffscreenBuffer,
+        scale: f64,
+        alpha: f32,
+        elements: Vec<MonitorRenderElement>,
+        push: &mut dyn FnMut(OutputRenderElements),
+    ) {
+        if alpha <= 0.001 {
+            return;
+        }
+        if alpha >= 0.999 {
+            for elem in elements {
+                push(elem.into());
+            }
+            return;
+        }
+
+        match buffer.render(renderer, Scale::from(scale), &elements) {
+            // The element carries the encompassing box's own offset already, so it
+            // composites where the group was.
+            Ok((elem, _sync, _data)) => push(elem.with_alpha(alpha).into()),
+            Err(err) => {
+                warn!("error compositing the overview search cross-fade: {err:?}");
+                for elem in elements {
+                    push(elem.into());
+                }
+            }
+        }
+    }
+
+    /// How far the search has covered the window picker: 0 = picker fully shown,
+    /// 1 = fully searching. gnome-shell cross-fades the two over
+    /// `SIDE_CONTROLS_ANIMATION_TIME` (`overviewControls.js:609-643`).
+    pub fn overview_search_fade(&self) -> f64 {
+        match &self.overview_search_fade {
+            Some(anim) => anim.clamped_value().clamp(0., 1.),
+            None => {
+                if self.overview_search_fade_target {
+                    1.
+                } else {
+                    0.
+                }
+            }
+        }
+    }
+
+    /// Arms (or retires) the cross-fade when the search engages or clears.
+    fn update_overview_search_fade(&mut self) {
+        let target = self.overview_search.is_active();
+        if target != self.overview_search_fade_target {
+            let from = self.overview_search_fade();
+            self.overview_search_fade_target = target;
+            // gnome-shell uses a fixed `SIDE_CONTROLS_ANIMATION_TIME` ease here,
+            // not a configurable animation; only whether animations run at all is
+            // taken from the config.
+            let config = niri_config::Animation {
+                off: self.config.borrow().animations.off,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: 250,
+                        curve: niri_config::animations::Curve::EaseOutQuad,
+                    },
+                ),
+            };
+            self.overview_search_fade = Some(Animation::new(
+                self.clock.clone(),
+                from,
+                if target { 1. } else { 0. },
+                0.,
+                config,
+            ));
+        }
+
+        if self
+            .overview_search_fade
+            .as_ref()
+            .is_some_and(|a| a.is_done())
+        {
+            self.overview_search_fade = None;
+        }
+    }
+
     pub fn refresh_overview_search_state(&mut self) {
         let open = self.layout.is_gnome_mode() && self.layout.is_overview_open();
         if open && !self.overview_search_was_visible {
@@ -8633,5 +8791,7 @@ niri_render_elements! {
         UiTexture = TextureRenderElement<VkTexture>,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
+        // A group of elements composited at one alpha — the overview's search cross-fade.
+        Offscreen = OffscreenRenderElement,
     }
 }

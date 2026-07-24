@@ -408,16 +408,28 @@ impl OverviewSearch {
             Some(EntryHit::Field) => return Some(SearchHit::Background),
             None => {}
         }
-        let card = layout.card?;
-        if !card.contains(pos) {
-            return None;
-        }
-        for (i, tile) in layout.tiles.iter().enumerate() {
-            if tile.contains(pos) {
-                return Some(SearchHit::Result(i));
+        if let Some(card) = layout.card {
+            if card.contains(pos) {
+                for (i, tile) in layout.tiles.iter().enumerate() {
+                    if tile.contains(pos) {
+                        return Some(SearchHit::Result(i));
+                    }
+                }
+                return Some(SearchHit::Background);
             }
         }
-        Some(SearchHit::Background)
+
+        // While searching, the results strip covers the whole space between the
+        // entry and the dash and is reactive there (gnome-shell allocates its
+        // `searchController` that strip and cross-fades it over the picker rather
+        // than carving space out of it — `overviewControls.js:242-245,609-643`).
+        // Without this a click beside the card would reach the faded-out picker
+        // and be read as "clicked empty desktop", leaving the overview.
+        if self.is_active() && area.results.contains(pos) {
+            return Some(SearchHit::Background);
+        }
+
+        None
     }
 
     /// The entry pill box — a geometry probe for the render test.
@@ -455,11 +467,15 @@ impl OverviewSearch {
         sym_icons: &IconCache,
         output: &Output,
         area: SearchArea,
-        progress: f64,
+        fade: SearchFade,
     ) -> Vec<TextureRenderElement<VkTexture>> {
+        let SearchFade { overview, search } = fade;
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
-        let alpha = progress as f32;
+        let alpha = overview as f32;
+        // The entry bin is always on screen (gnome-shell's `searchEntryBin` is not
+        // part of the cross-fade); only the results strip fades in over the picker.
+        let results_alpha = (overview * search) as f32;
 
         let mut cache = self.cache.borrow_mut();
         let context = renderer.context_id();
@@ -542,7 +558,7 @@ impl OverviewSearch {
                 scale,
                 Point::from((0., 0.)),
                 center,
-                alpha,
+                results_alpha,
             ) {
                 elements.push(el);
             }
@@ -674,7 +690,7 @@ impl OverviewSearch {
                         elements.push(TextureRenderElement::from_texture_buffer(
                             buffer,
                             card.loc,
-                            alpha,
+                            results_alpha,
                             None,
                             None,
                             Kind::Unspecified,
@@ -692,6 +708,15 @@ impl OverviewSearch {
 use widget::style;
 
 /// Computed geometry for one output size.
+/// How opaque the search chrome is: `overview` is the overview's own fade-in
+/// (everything the overview draws rides it), `search` is gnome-shell's
+/// search cross-fade, which the *results* ride and the entry does not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchFade {
+    pub overview: f64,
+    pub search: f64,
+}
+
 /// The two boxes [`crate::ui::overview_layout`] allocates the search: the entry
 /// bin at the top of the work area, and the results strip spanning everything
 /// between the entry and the dash (gnome-shell's `searchController`, which
