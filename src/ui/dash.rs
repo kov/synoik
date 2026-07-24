@@ -107,8 +107,9 @@ const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.1];
 const DOT_PX: f64 = 5.;
 /// The dot's `offset-y` in the dash — `-$dash_padding` (`_dash.scss:72-78`),
 /// applied as `translationY` (`AppIcon._updateDotStyle`, `appDisplay.js:3002`).
-/// The dot is `y_align: END` within the button's *content* box, which is the
-/// `.overview-icon` tile, so this lifts it that far above the tile's bottom edge.
+/// The dot is `y_align: END` within the button, which `y_expand`s to fill the
+/// whole dash-background, so this lifts it that far above the **pill's** bottom
+/// edge (into the gap below the icon), not the icon tile's.
 const DOT_OFFSET_Y: f64 = 12.;
 /// The dot fill: `$system_fg_color` (`_app-grid.scss:49`).
 const DOT_COLOR: [f32; 4] = [0.980, 0.980, 0.984, 1.];
@@ -370,14 +371,22 @@ impl Dash {
         self.layout(area).separator
     }
 
-    /// The running dot's box for tile `i` — centered on the tile, its bottom edge
-    /// `DOT_OFFSET_Y` above the tile's, per `.app-grid-running-dot`'s dash
-    /// `offset-y` (`_dash.scss:72-78`).
-    fn dot_box(tile: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    /// The running dot's box for tile `i` — centered on the tile horizontally,
+    /// its bottom edge `DOT_OFFSET_Y` above the **pill's** bottom.
+    ///
+    /// GNOME's `.app-grid-running-dot` is `y_align: END` inside the icon button,
+    /// which `y_expand`s to fill the whole dash-background (`appDisplay.js:2955-2961`,
+    /// `dash.js:150`); its `offset-y: -$dash_padding` then lifts it that far off the
+    /// bottom (`_dash.scss:72-78`). So the dot lands in the gap **below** the icon,
+    /// not over it — the reference edge is the pill, not the 76px icon tile.
+    fn dot_box(
+        tile: Rectangle<f64, Logical>,
+        pill: Rectangle<f64, Logical>,
+    ) -> Rectangle<f64, Logical> {
         Rectangle::new(
             Point::from((
                 tile.loc.x + (tile.size.w - DOT_PX) / 2.,
-                tile.loc.y + tile.size.h - DOT_OFFSET_Y - DOT_PX,
+                pill.loc.y + pill.size.h - DOT_OFFSET_Y - DOT_PX,
             )),
             Size::from((DOT_PX, DOT_PX)),
         )
@@ -394,7 +403,7 @@ impl Dash {
         self.items
             .get(i)
             .filter(|e| e.running)
-            .map(|_| Self::dot_box(layout.tiles[i]))
+            .map(|_| Self::dot_box(layout.tiles[i], layout.pill))
     }
 
     /// The currently-hovered element (for the conformance corpus).
@@ -445,7 +454,7 @@ impl Dash {
                 .enumerate()
                 .filter(|(_, e)| e.running)
                 .map(|(i, _)| {
-                    let d = Self::dot_box(layout.tiles[i]);
+                    let d = Self::dot_box(layout.tiles[i], layout.pill);
                     Rectangle::new(d.loc - layout.pill.loc, d.size)
                 })
                 .collect();
@@ -751,6 +760,38 @@ mod tests {
                 1
             ),
             "an app starting is a change — the running dot appears"
+        );
+    }
+
+    /// The running dot lands in the gap *below* the icon, not over it: its bottom
+    /// edge is `DOT_OFFSET_Y` above the **pill's** bottom (GNOME lifts the
+    /// pill-filling icon button's `y_align: END` dot by `-$dash_padding`,
+    /// `_dash.scss:72-78`, `appDisplay.js:2955-2961`). The prior bug referenced the
+    /// 76px icon tile's bottom instead, drawing the dot on the icon's lower third.
+    #[test]
+    fn running_dot_sits_in_the_gap_below_the_icon() {
+        let area = box_1080();
+        let dash = dash_with_running(1, 1); // fav0, then the running app at index 1
+        let layout = dash.layout(area);
+        let pill = layout.pill;
+        let dot = dash
+            .dot_box_for(1, area)
+            .expect("the running app has a dot");
+
+        // Bottom edge is DOT_OFFSET_Y above the pill bottom — the pin.
+        assert_eq!(
+            dot.loc.y + dot.size.h,
+            pill.loc.y + pill.size.h - DOT_OFFSET_Y
+        );
+        // Centered on its tile horizontally.
+        let tile = layout.tiles[1];
+        assert_eq!(dot.loc.x + dot.size.w / 2., tile.loc.x + tile.size.w / 2.);
+        // ...and strictly below the icon's canvas — in the gap, not on the icon.
+        let icon_bottom = layout.icon_center(1).y + ICON_PX / 2.;
+        assert!(
+            dot.loc.y >= icon_bottom,
+            "dot top {} must be at/below the icon bottom {icon_bottom}",
+            dot.loc.y
         );
     }
 
