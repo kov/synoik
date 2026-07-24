@@ -415,6 +415,17 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     sort is `to_lowercase` not locale collation. The thumbnails' transient scale/translation shrink
     and the faded-strip non-reactivity (S8a) also remain. Floor/ceil vs transition-bracket
     interpolation noted in `overview_layout.rs` (`b6b3d86b`).
+- **S8c — App-grid performance + nav polish.**
+  - **Async icon decode ✅ DONE (`e7a1c2ed`).** The ~24 first-frame icon rasterizations that froze the
+    open animation now run on a worker thread (like the wallpaper decoder): miss → enqueue + draw
+    nothing that frame; result lands via a calloop source → redraw, so icons pop in during the slide.
+    Generation counter + in-flight dedup + negative cache + `catch_unwind`; headless keeps the sync path.
+  - **Next (deferred, pending live measurement):** (1) **batch the GPU uploads** if the residual
+    submit+fence-wait-per-texture still hitches on Venus (or cap N-per-frame); (2) **prewarm** dash
+    favorites at startup + adjacent grid pages on page-land (kills first-open pop-in + makes paging
+    pop-free); (3) the **left/right page-navigation arrows** (`.page-navigation-arrow`, flanking the
+    grid, wired to `set_page`) — the one visible nav gap Gustavo noted; (4) touchpad **swipe**,
+    page-slide animation, keyboard paging (from S8b's deferred list).
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
