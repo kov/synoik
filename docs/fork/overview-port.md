@@ -434,14 +434,23 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     (`st-texture-cache.c:998`) and coalesces concurrent requests (`ensure_request`, `:877-910`). We
     already match the async worker + in-flight coalescing + decode-cache-forever; the gap is *when* the
     work happens. Plan, in order:
-    - **(1) Prewarm the whole grid + favorites' *decode* at startup idle** — the decisive fix (GNOME's
-      resident-grid + idle `_redisplay`). Kick the async decoder for every grid entry + dash favorite on
-      a low-priority pass right after `sync_app_grid` seeds the model, so the cache is warm before first
-      open. Decode is CPU-only (worker) so it can warm freely; makes blank-then-real genuinely rare
-      (only a truly cold first run or a brand-new app).
-    - **(2) Batch the first-frame GPU uploads** — uploads need the render context so they can only happen
-      on first render; batch them (one cbuf/submit/fence instead of ~24) or cap N-per-frame so the one
-      unavoidable warm frame doesn't hitch on Venus. Complements (1).
+    - **(1) Prewarm the whole grid + favorites' *decode* at startup idle ✅ DONE (`4eea62e4`).** GNOME's
+      resident-grid + idle `_redisplay`. `Niri::prewarm_app_icons` requests the dash (64px) + grid (96px)
+      icon decodes off-thread for every connected output scale; `buffer()` dedups cached/in-flight keys so
+      it is idempotent. Triggered once a scale exists (`add_output`) and re-warmed on content/theme change
+      (installed-changed, favorite-apps, icon-theme). Gated on `has_worker()` (before the worker exists,
+      `buffer()` would decode inline). Also fixes a latent bug: the grid's icon uploads weren't cleared on
+      an icon-theme change (added when the grid landed after that handler). Pinned by
+      `overview_prewarm_requests_dash_and_grid_icon_decodes`. Makes blank-then-real rare (only a truly cold
+      first run or a brand-new app). **Live-validation pending.**
+    - **(2) Batch the first-frame GPU uploads (NEXT — gated on live measurement).** Uploads need the render
+      context so they only happen on first render; each `NiriTexture::upload` is a separate cbuf + submit +
+      blocking `wait_for_fences` (`niri-vk/src/gpu.rs:501` `run_commands`), and ~24 serialized fence
+      round-trips is the residual Venus hitch Fable flagged. Fix = a `niri-vk` batch upload (one cbuf, N
+      copies, one submit, one wait, multi-resource cleanup guard) used by the grid render (collect misses →
+      batch → insert → build elements). **Only worth building if a residual hitch survives (1)** — scoped,
+      not yet built, because it is a change in the highest-risk (hand-rolled Vulkan) code and prewarm may
+      already have removed the stall.
     - **(3) Shared GPU-texture cache across dash + grid + search (DEFERRED, recorded).** GNOME keeps ONE
       Cogl texture per gicon+size shell-wide; we currently upload per surface (each keeps its own
       `AppIconUploads`). Fold the three surfaces' upload caches into one shared, gicon+size-keyed texture
