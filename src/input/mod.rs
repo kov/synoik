@@ -3681,8 +3681,8 @@ impl State {
                         if self.niri.layout.is_app_grid_open()
                             && !self.niri.overview_search.is_active()
                         {
-                            if let Some(i) = self.niri.app_grid.hit_test(*pos, controls.app_display)
-                            {
+                            let area = controls.app_display;
+                            if let Some(i) = self.niri.app_grid.hit_test(*pos, area) {
                                 self.niri.suppressed_buttons.insert(button_code);
                                 if matches!(button, Some(MouseButton::Left | MouseButton::Middle)) {
                                     if let Some(id) =
@@ -3697,6 +3697,15 @@ impl State {
                                         }
                                         self.niri.layout.close_overview();
                                     }
+                                }
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                            // A click on a page-indicator dot jumps to that page.
+                            if let Some(page) = self.niri.app_grid.indicator_hit(*pos, area) {
+                                self.niri.suppressed_buttons.insert(button_code);
+                                if button == Some(MouseButton::Left) {
+                                    self.niri.app_grid.set_page(page, area);
                                 }
                                 self.niri.queue_redraw_all();
                                 return;
@@ -4188,6 +4197,53 @@ impl State {
                         self.niri.queue_redraw_all();
                     }
                     return;
+                }
+            }
+        }
+
+        // A scroll over the open app grid pages it (gnome-shell's grid
+        // `scroll-event`, `appDisplay.js:658`). Consume every scroll over the grid so
+        // it can't leak to workspace switching; only discrete wheel notches flip a
+        // page, debounced so a fast spin doesn't fly through (`SCROLL_TIMEOUT_TIME`).
+        // Touchpad/continuous scrolling is reserved for the deferred 1:1 swipe, so it
+        // is consumed here but does nothing.
+        if is_overview_open
+            && should_handle_in_overview
+            && self.niri.layout.is_app_grid_open()
+            && !self.niri.overview_search.is_active()
+        {
+            let target = self
+                .niri
+                .output_under(pointer.current_location())
+                .map(|(output, pos)| (output.clone(), pos));
+            if let Some((output, pos)) = target {
+                if let Some(controls) = self.niri.layout.controls_layout_for_output(&output) {
+                    let area = controls.app_display;
+                    if area.contains(pos) {
+                        if source == AxisSource::Wheel {
+                            let v = vertical_amount_v120
+                                .or(horizontal_amount_v120)
+                                .unwrap_or(0.);
+                            let debounced = self.niri.app_grid_last_page_flip.is_some_and(|t| {
+                                timestamp.saturating_sub(t) < Duration::from_millis(150)
+                            });
+                            if v != 0. && !debounced {
+                                let n = self.niri.app_grid.page_count(area);
+                                let cur = self.niri.app_grid.current_page();
+                                let target_page = if v > 0. {
+                                    (cur + 1).min(n.saturating_sub(1))
+                                } else {
+                                    cur.saturating_sub(1)
+                                };
+                                if self.niri.app_grid.set_page(target_page, area) {
+                                    self.niri.app_grid_last_page_flip = Some(timestamp);
+                                    self.niri.queue_redraw_all();
+                                }
+                            }
+                        }
+                        // Consume all scroll over the grid.
+                        return;
+                    }
                 }
             }
         }

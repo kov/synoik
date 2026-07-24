@@ -529,6 +529,9 @@ pub struct Niri {
     pub overview_search: OverviewSearch,
     /// The overview app grid (installed apps minus favorites).
     pub app_grid: AppGrid,
+    /// When the app grid last flipped a page on a wheel notch, to debounce a fast
+    /// spin (`SCROLL_TIMEOUT_TIME`=150ms, `appDisplay.js:696-701`).
+    pub app_grid_last_page_flip: Option<Duration>,
     /// Tracks the overview-UI visibility rising edge (closed→open, unlock/screenshot
     /// close while open) so the search resets on a fresh open, matching GNOME's
     /// reset-on-enter — see [`Niri::refresh_overview_search_state`].
@@ -3593,6 +3596,7 @@ impl Niri {
             dash: Dash::new(),
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(),
+            app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
             overview_search_fade_target: false,
@@ -8333,6 +8337,9 @@ impl Niri {
         let open = self.layout.is_gnome_mode() && self.layout.is_overview_open();
         if open && !self.overview_search_was_visible {
             self.overview_search.clear();
+            // A fresh overview open starts the app grid on page 0
+            // (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
+            self.app_grid.reset_page();
         }
         self.overview_search_was_visible = open;
     }

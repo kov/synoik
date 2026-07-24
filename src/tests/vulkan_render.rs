@@ -6573,6 +6573,91 @@ fn vulkan_app_grid_draws_hovered_tile() {
     );
 }
 
+/// With more apps than one page holds, the app grid bakes its page-indicator dots:
+/// the active page's dot is a full-opacity white circle, an inactive one is dimmer,
+/// and the gap between dots is transparent.
+#[test]
+fn vulkan_app_grid_draws_page_indicator_dots() {
+    use smithay::utils::{Logical, Point};
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_draws_page_indicator_dots: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // 30 apps span two pages on a wide band → a two-dot indicator row.
+    {
+        let g = &mut f.niri().app_grid;
+        g.set_entries(
+            (0..30)
+                .map(|i| AppGridEntry {
+                    id: format!("app{i:02}.desktop"),
+                    name: format!("App {i:02}"),
+                    icon: AppIconRef::Fallback,
+                })
+                .collect(),
+        );
+    }
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let d0 = f.niri().app_grid.indicator_center(0, area).expect("dot 0");
+    let d1 = f.niri().app_grid.indicator_center(1, area).expect("dot 1");
+    let mid = Point::from(((d0.x + d1.x) / 2., d0.y));
+
+    let state = f.niri_state();
+    let composited = state.backend.headless().with_vulkan_renderer(
+        |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
+            let niri = &mut state.niri;
+            let elements = niri
+                .app_grid
+                .render(vk, &niri.app_icon_cache, &output, area, 1.0);
+            let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let pixels = render_to_vec(
+                vk,
+                phys,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((pixels, phys.w, phys.h))
+        },
+    );
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_app_grid_draws_page_indicator_dots: no Vulkan device");
+        return;
+    };
+    let (pixels, w, _h) = result.expect("compositing the dots through Vulkan must not error");
+
+    let at = |p: Point<f64, Logical>| px(&pixels, w, p.x as i32, p.y as i32);
+    let active = at(d0); // page 0 is current
+    let inactive = at(d1);
+    let gap = at(mid);
+    eprintln!("vulkan_app_grid_dots: active={active:?} inactive={inactive:?} gap={gap:?}");
+    assert_eq!(
+        active[3], 255,
+        "the active page dot is opaque white: {active:?}"
+    );
+    assert!(
+        inactive[3] > 0 && inactive[3] < active[3],
+        "an inactive dot is dimmer than the active one: {inactive:?} vs {active:?}"
+    );
+    assert_eq!(gap[3], 0, "the gap between dots is transparent: {gap:?}");
+}
+
 /// The dash's running chrome bakes correctly: the `.dash-separator` reads as a
 /// line *lighter* than the pill it sits on, and a running app's dot draws over
 /// the pill.

@@ -5289,6 +5289,57 @@ fn overview_app_grid_click_launches_and_closes() {
     );
 }
 
+/// With more apps than fit one page, the grid paginates: a wheel scroll over it and a
+/// click on a page-indicator dot move between pages, and a fresh overview open resets
+/// to the first page (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
+#[test]
+fn overview_app_grid_paginates_and_navigates() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&["a.desktop"], &others);
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(
+        f.niri().app_grid.page_count(area),
+        2,
+        "30 apps span two pages"
+    );
+    assert_eq!(f.niri().app_grid.current_page(), 0);
+
+    // A wheel notch over the grid pages forward.
+    let tile = f.niri().app_grid.tile_center(0, area).unwrap();
+    f.pointer_motion(tile.x, tile.y);
+    f.scroll_wheel();
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "a wheel notch pages the grid forward"
+    );
+
+    // Clicking the first page-indicator dot returns to page 0.
+    let dot0 = f.niri().app_grid.indicator_center(0, area).unwrap();
+    f.pointer_motion(dot0.x - tile.x, dot0.y - tile.y); // relative from the tile
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        0,
+        "clicking a dot jumps to its page"
+    );
+
+    // A fresh overview open resets to page 0.
+    f.niri().app_grid.set_page(1, area);
+    f.niri_state().do_action(Action::CloseOverview, false);
+    f.niri_complete_animations();
+    f.niri().refresh_overview_search_state(); // falling edge
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri().refresh_overview_search_state(); // rising edge → reset
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        0,
+        "a fresh overview open starts on page 0"
+    );
+}
+
 /// The dash is only live while the overview is open: a click at a favorite's
 /// position with the overview closed passes through to the windows/workspace, never
 /// launching the app.
