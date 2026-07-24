@@ -160,6 +160,14 @@ pub fn layout(
     };
 
     // Interpolate the state-dependent boxes between the two bracketing states.
+    //
+    // Divergence from GNOME: `overviewControls.js` interpolates against the
+    // *transition* bracket recorded when the state animation started (so a
+    // direct HIDDEN->APP_GRID move blends those two endpoints). We bracket by
+    // `floor(state)`/`ceil(state)` instead. The two agree for every adjacent
+    // transition (HIDDEN<->WINDOW_PICKER, WINDOW_PICKER<->APP_GRID), which is
+    // all our state machine drives; they would differ only for a direct
+    // two-step move through the middle state, which we never animate.
     let s = state.clamp(state::HIDDEN, state::APP_GRID);
     let lo = s.floor();
     let hi = s.ceil();
