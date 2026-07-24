@@ -112,20 +112,22 @@ pub enum Phase {
     Submit,
     /// Handing the finished buffer to KMS.
     Queue,
-    /// Screencast, recording and screencopy captures riding on this redraw.
-    Captures,
     /// Waking clients for the next frame.
     Callbacks,
+    /// Screencast, recording and screencopy captures riding on this redraw.
+    Captures,
 }
 
 impl Phase {
+    /// In the order they run, which is the order a log line prints them — so a
+    /// run of lines reads down the page as the frame reads across.
     const ALL: [Phase; 6] = [
         Phase::Elements,
         Phase::Collect,
         Phase::Submit,
         Phase::Queue,
-        Phase::Captures,
         Phase::Callbacks,
+        Phase::Captures,
     ];
 
     fn label(self) -> &'static str {
@@ -134,8 +136,8 @@ impl Phase {
             Phase::Collect => "collect",
             Phase::Submit => "submit",
             Phase::Queue => "queue",
-            Phase::Captures => "captures",
             Phase::Callbacks => "callbacks",
+            Phase::Captures => "captures",
         }
     }
 }
