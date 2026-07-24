@@ -426,11 +426,32 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     into `resources/icons/` + `embedded_icon()` (gresource icons, not on-disk). Divergence: absent
     `indicatorsPadding`, they ride the centering gutter, not a fixed 10% band. Render pins the chevron +
     hover wash.
-  - **Next (deferred, pending live measurement):** (1) **batch the GPU uploads** if the residual
-    submit+fence-wait-per-texture still hitches on Venus (or cap N-per-frame); (2) **prewarm** dash
-    favorites at startup + adjacent grid pages on page-land (kills first-open pop-in + makes paging
-    pop-free); (3) touchpad **swipe**, page-slide animation, keyboard paging (from S8b's deferred list);
-    (4) `indicatorsPadding` reserve so the arrows sit in a fixed side band rather than the gutter.
+  - **Icon-warmth performance (ACTIVE — reference-checked against GNOME 50.1).** GNOME never shows a
+    blank tile because the AppDisplay is built at `ControlsManager` construction (`overviewControls.js:372`),
+    kept resident, and its `_redisplay` runs off the **idle/deferred-work queue** at startup
+    (`appDisplay.js:1339` `initializeDeferredWork`) — so every app icon decodes+uploads during post-login
+    idle, minutes before the overview opens, into a shared `keyed_cache` that is `POLICY_FOREVER`
+    (`st-texture-cache.c:998`) and coalesces concurrent requests (`ensure_request`, `:877-910`). We
+    already match the async worker + in-flight coalescing + decode-cache-forever; the gap is *when* the
+    work happens. Plan, in order:
+    - **(1) Prewarm the whole grid + favorites' *decode* at startup idle** — the decisive fix (GNOME's
+      resident-grid + idle `_redisplay`). Kick the async decoder for every grid entry + dash favorite on
+      a low-priority pass right after `sync_app_grid` seeds the model, so the cache is warm before first
+      open. Decode is CPU-only (worker) so it can warm freely; makes blank-then-real genuinely rare
+      (only a truly cold first run or a brand-new app).
+    - **(2) Batch the first-frame GPU uploads** — uploads need the render context so they can only happen
+      on first render; batch them (one cbuf/submit/fence instead of ~24) or cap N-per-frame so the one
+      unavoidable warm frame doesn't hitch on Venus. Complements (1).
+    - **(3) Shared GPU-texture cache across dash + grid + search (DEFERRED, recorded).** GNOME keeps ONE
+      Cogl texture per gicon+size shell-wide; we currently upload per surface (each keeps its own
+      `AppIconUploads`). Fold the three surfaces' upload caches into one shared, gicon+size-keyed texture
+      cache (dash included — if we do it at all, all three) so an app that appears in more than one
+      surface uploads once. Lower payoff (favorites are excluded from the grid, so cross-surface overlap
+      is mostly search∩grid), but clean; do after (1)+(2).
+  - **Next (deferred, pending live measurement):** touchpad **swipe**, page-slide animation, keyboard
+    paging (from S8b's deferred list); `indicatorsPadding` reserve so the arrows sit in a fixed side band
+    rather than the gutter; split theme-resolution (main) from decode (worker) per GNOME
+    `st-texture-cache.c:976` (marginal — resolution is cheap/cached).
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
