@@ -28,7 +28,7 @@ use super::{
     expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
     RemovedTile, SizeFrac,
 };
-use crate::animation::Clock;
+use crate::animation::{Animation, Clock};
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::niri_render_elements;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -114,6 +114,13 @@ pub struct Workspace<W: LayoutElement> {
     /// (gnome-shell's frozen workspace layout), keyed by window.
     expose_frozen: Option<FrozenExposeSlots<W>>,
 
+    /// Per-window picker-overlay progress: 0 idle, 1 fully hovered. gnome-shell's
+    /// `showOverlay`/`hideOverlay` ease the pointed-at preview up to
+    /// `WINDOW_ACTIVE_SIZE_INC` bigger and back down again
+    /// (`windowPreview.js:310-390`). At most one entry is rising; entries that
+    /// have fallen back to 0 are dropped.
+    expose_hover: ExposeHovers<W>,
+
     /// Unique ID of this workspace.
     id: WorkspaceId,
 }
@@ -156,6 +163,84 @@ type ExposeLayout<'a, W> = Vec<(
 
 /// Frozen picker slots, keyed by window.
 type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logical>)>;
+
+/// Picker-overlay progress per window — see [`Workspace::expose_hover`].
+type ExposeHovers<W> = Vec<(<W as LayoutElement>::Id, Animation)>;
+
+/// How much bigger a hovered preview gets, in each direction
+/// (`WINDOW_ACTIVE_SIZE_INC`, `windowPreview.js:20`). GNOME multiplies it by the
+/// theme scale factor because its stage is in device pixels; ours is logical, so
+/// the render scale applies it for us.
+const WINDOW_ACTIVE_SIZE_INC: f64 = 5.;
+
+/// `WINDOW_SCALE_TIME` (`windowPreview.js:19`) — the fixed duration gnome-shell
+/// eases the hover scale over, EASE_OUT_QUAD. Not the configurable overview
+/// animation; only whether animations run at all is inherited.
+const WINDOW_SCALE_TIME_MS: u32 = 200;
+
+/// The hover ease itself — see [`WINDOW_SCALE_TIME_MS`].
+fn ease_hover(clock: &Clock, from: f64, to: f64, options: &Options) -> Animation {
+    let config = niri_config::Animation {
+        off: options.animations.overview_open_close.0.off,
+        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+            duration_ms: WINDOW_SCALE_TIME_MS,
+            curve: niri_config::animations::Curve::EaseOutQuad,
+        }),
+    };
+    Animation::new(clock.clone(), from, to, 0., config)
+}
+
+/// How much bigger a preview draws at hover progress `hover`: gnome-shell grows
+/// the longest side by `WINDOW_ACTIVE_SIZE_INC` in each direction and scales the
+/// whole container by that ratio (`windowPreview.js:340-352`).
+///
+/// `size` is the preview's size *on screen*: gnome-shell allocates its previews
+/// in stage coordinates (the workspace scale is baked into the slots by
+/// `WorkspaceLayout.vfunc_allocate`, `workspace.js:690-736`), so the 5px is 5
+/// screen pixels however far the workspace row is zoomed out. We render a
+/// workspace in its own coordinates and zoom the whole thing, so the caller
+/// hands over the zoomed size and gets a scale to apply in workspace space.
+fn hover_scale(size: Size<f64, Logical>, hover: f64) -> f64 {
+    let longest = f64::max(size.w, size.h);
+    if longest <= 0. {
+        return 1.;
+    }
+    (longest + 2. * WINDOW_ACTIVE_SIZE_INC * hover) / longest
+}
+
+/// Where one preview draws and at what scale: its rect interpolated toward its
+/// picker slot by `progress`, then grown about its center by the hover overlay.
+/// The single source of the picker's drawn geometry — rendering and the
+/// geometry accessors both go through it.
+fn expose_tile_render(
+    rect: Rectangle<f64, Logical>,
+    slot: Rectangle<f64, Logical>,
+    hover: f64,
+    progress: f64,
+    zoom: f64,
+) -> (Point<f64, Logical>, f64) {
+    let target_scale = slot.size.w / rect.size.w;
+    let tile_scale = 1. + (target_scale - 1.) * progress;
+    let pos = Point::from((
+        rect.loc.x + (slot.loc.x - rect.loc.x) * progress,
+        rect.loc.y + (slot.loc.y - rect.loc.y) * progress,
+    ));
+
+    // Hovering grows the preview about its center, so the slot it sits in doesn't
+    // move (`showOverlay` scales `window_container`, whose growth
+    // `_adjustOverlayOffsets` splits in half, `windowPreview.js:389-400`). The
+    // growth also fades in with the overview: on the desktop there is no picker
+    // and nothing to hover.
+    let drawn = rect.size.upscale(tile_scale);
+    let hover_scale = hover_scale(drawn.upscale(zoom), hover * progress);
+    let pos = pos
+        - Point::from((
+            drawn.w * (hover_scale - 1.) / 2.,
+            drawn.h * (hover_scale - 1.) / 2.,
+        ));
+
+    (pos, tile_scale * hover_scale)
+}
 
 niri_render_elements! {
     WorkspaceRenderElement => {
@@ -287,6 +372,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_hover: Vec::new(),
             id: WorkspaceId::next(),
         }
     }
@@ -352,6 +438,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_hover: Vec::new(),
             id: WorkspaceId::next(),
         }
     }
@@ -383,10 +470,14 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+        self.expose_hover
+            .retain(|(_, anim)| !(anim.is_done() && anim.to() == 0.));
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
+        self.scrolling.are_animations_ongoing()
+            || self.floating.are_animations_ongoing()
+            || self.expose_hover.iter().any(|(_, anim)| !anim.is_done())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -1867,6 +1958,46 @@ impl<W: LayoutElement> Workspace<W> {
             .collect()
     }
 
+    /// Point the picker overlay at `window` (or at nothing), easing the previous
+    /// one back down — gnome-shell's enter/leave `showOverlay`/`hideOverlay`
+    /// (`windowPreview.js:561-568`). A window that isn't on this workspace just
+    /// clears it, so the caller can hand the same target to every workspace.
+    /// Returns whether anything changed.
+    pub(super) fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
+        let mine = window.filter(|id| self.has_window(id));
+
+        let mut changed = false;
+        for (id, anim) in &mut self.expose_hover {
+            if Some(&*id) != mine && anim.to() != 0. {
+                *anim = ease_hover(&self.clock, anim.value(), 0., &self.options);
+                changed = true;
+            }
+        }
+
+        if let Some(window) = mine {
+            if let Some((_, anim)) = self.expose_hover.iter_mut().find(|(id, _)| id == window) {
+                if anim.to() != 1. {
+                    *anim = ease_hover(&self.clock, anim.value(), 1., &self.options);
+                    changed = true;
+                }
+            } else {
+                let anim = ease_hover(&self.clock, 0., 1., &self.options);
+                self.expose_hover.push((window.clone(), anim));
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    /// The picker-overlay progress of one window: 0 idle, 1 fully hovered.
+    fn expose_hover_value(&self, window: &W::Id) -> f64 {
+        self.expose_hover
+            .iter()
+            .find(|(id, _)| id == window)
+            .map_or(0., |(_, anim)| anim.clamped_value().clamp(0., 1.))
+    }
+
     /// Holds the current picker slots in place until [`Self::unfreeze_expose`].
     ///
     /// gnome-shell freezes the workspace layout while a preview drag is in
@@ -1899,16 +2030,26 @@ impl<W: LayoutElement> Workspace<W> {
         mut ctx: RenderCtx,
         xray_pos: XrayPos,
         progress: f64,
+        zoom: f64,
         push: &mut dyn FnMut(WorkspaceRenderElement),
     ) {
         let scale = self.scale().fractional_scale();
-        for (tile, rect, slot) in self.expose_layout() {
-            let target_scale = slot.size.w / rect.size.w;
-            let tile_scale = 1. + (target_scale - 1.) * progress;
-            let pos = Point::from((
-                rect.loc.x + (slot.loc.x - rect.loc.x) * progress,
-                rect.loc.y + (slot.loc.y - rect.loc.y) * progress,
-            ));
+
+        // The hovered preview draws on top of its neighbours (`_restack`,
+        // `windowPreview.js:620`); first pushed is topmost.
+        let mut layout = self.expose_layout();
+        if let Some(i) = layout
+            .iter()
+            .position(|(tile, _, _)| self.expose_hover_value(tile.window().id()) > 0.)
+        {
+            let hovered = layout.remove(i);
+            layout.insert(0, hovered);
+        }
+
+        for (tile, rect, slot) in layout {
+            let hover = self.expose_hover_value(tile.window().id());
+            let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+
             // Round to physical pixels.
             let pos = pos.to_physical_precise_round(scale).to_logical(scale);
 
@@ -1924,6 +2065,24 @@ impl<W: LayoutElement> Workspace<W> {
                 )
             });
         }
+    }
+
+    /// The rect a preview draws into at expose `progress`, in workspace
+    /// coordinates — [`Self::expose_slot`] plus the hover growth. Same geometry
+    /// [`Self::render_expose`] draws.
+    pub(super) fn expose_drawn_rect(
+        &self,
+        window: &W::Id,
+        progress: f64,
+        zoom: f64,
+    ) -> Option<Rectangle<f64, Logical>> {
+        let (_, rect, slot) = self
+            .expose_layout()
+            .into_iter()
+            .find(|(tile, _, _)| tile.window().id() == window)?;
+        let hover = self.expose_hover_value(window);
+        let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+        Some(Rectangle::new(pos, rect.size.upscale(tile_scale)))
     }
 
     /// Hit test for the exposé picker: slots, front-to-back. Activation hits

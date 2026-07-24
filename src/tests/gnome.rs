@@ -1919,6 +1919,68 @@ fn overview_spreads_windows_into_picker_slots() {
     );
 }
 
+/// Hovering a window preview grows it: gnome-shell's `showOverlay` eases the
+/// preview's container up by `WINDOW_ACTIVE_SIZE_INC` (5px) in each direction
+/// about its center (`windowPreview.js:340-352`), so the slot's center stays put
+/// while the preview overlaps its neighbours a little. Leaving eases it back.
+#[test]
+fn overview_hovering_a_preview_grows_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _first = map_window_sized(&mut f, id, (800, 600), None);
+    let first_win = f.niri().layout.focus().unwrap().window.clone();
+    let _second = map_window_sized(&mut f, id, (800, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let rest = f
+        .niri()
+        .layout
+        .expose_drawn_rect(&first_win)
+        .expect("a preview draws in the overview");
+    assert_eq!(
+        rest,
+        f.niri().layout.expose_target_rect(&first_win).unwrap(),
+        "un-hovered, a preview draws exactly in its slot"
+    );
+
+    let center = rest.loc + rest.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.settle_animations();
+
+    let grown = f.niri().layout.expose_drawn_rect(&first_win).unwrap();
+    assert!(
+        grown.size.w > rest.size.w && grown.size.h > rest.size.h,
+        "hovering must grow the preview, got {grown:?} from {rest:?}"
+    );
+    // The growth is in screen pixels — 5 in each direction on the longest side,
+    // whatever the row's zoom — and the short side follows the same ratio.
+    let longest = f64::max(rest.size.w, rest.size.h);
+    let expected = (longest + 10.) / longest;
+    assert!(
+        (grown.size.w / rest.size.w - expected).abs() <= 0.001
+            && (grown.size.h / rest.size.h - expected).abs() <= 0.001,
+        "the longest side must grow by 2x5 screen px: {grown:?} vs {rest:?}"
+    );
+    let grown_center = grown.loc + grown.size.downscale(2.).to_point();
+    assert!(
+        (grown_center.x - center.x).abs() <= 1. && (grown_center.y - center.y).abs() <= 1.,
+        "it grows about its center: {grown_center:?} vs {center:?}"
+    );
+
+    // Off the preview again and it eases back to the slot.
+    pointer_motion_to(&mut f, 5., 5.);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().layout.expose_drawn_rect(&first_win).unwrap(),
+        rest,
+        "leaving a preview eases it back into its slot"
+    );
+}
+
 /// GNOME overview geometry (gnome-shell `ControlsManagerLayout`): the workspace
 /// row is fit by height into the window-picker box the overview chrome leaves
 /// over — it is *not* centered in the output, and the scale is not a constant.

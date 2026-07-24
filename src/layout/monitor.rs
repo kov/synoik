@@ -2572,7 +2572,7 @@ impl<W: LayoutElement> Monitor<W> {
             // instead of the layers at their layout positions.
             if let Some(progress) = self.expose_progress() {
                 push_hint!();
-                ws.render_expose(ctx.r(), xray_pos, progress, push!());
+                ws.render_expose(ctx.r(), xray_pos, progress, ws_zoom, push!());
                 continue;
             }
 

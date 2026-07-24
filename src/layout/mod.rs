@@ -5382,6 +5382,18 @@ impl<W: LayoutElement> Layout<W> {
         self.overview_open
     }
 
+    /// Point the overview's window picker at the preview under the pointer, or at
+    /// nothing. Hovering a preview grows it and raises it above its neighbours
+    /// (gnome-shell's `showOverlay`, `windowPreview.js:310`). Returns whether
+    /// anything changed, so the caller can queue a redraw.
+    pub fn set_expose_hover(&mut self, window: Option<&W::Id>) -> bool {
+        let mut changed = false;
+        for ws in self.workspaces_mut() {
+            changed |= ws.set_expose_hover(window);
+        }
+        changed
+    }
+
     /// Whether the overview is still animating open — see
     /// [`Monitor::is_overview_opening`]. Asked of the active monitor, the one the
     /// overlay key is about to act on.
@@ -5394,6 +5406,24 @@ impl<W: LayoutElement> Layout<W> {
     /// panel is drawn and reserves a strut.
     pub fn is_gnome_mode(&self) -> bool {
         self.options.layout.windowing_mode == WindowingMode::Floating
+    }
+
+    /// Where a window's preview actually draws on screen right now, in output
+    /// coordinates: its picker slot plus the hover overlay's growth. Same
+    /// geometry the picker renders (`Workspace::expose_drawn_rect`).
+    pub fn expose_drawn_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.monitors().find_map(|mon| {
+            let progress = mon.expose_progress()?;
+            let zoom = mon.overview_zoom();
+            let (ws, geo) = mon
+                .workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(window))?;
+            let rect = ws.expose_drawn_rect(window, progress, zoom)?;
+            Some(Rectangle::new(
+                geo.loc + rect.loc.upscale(zoom),
+                rect.size.upscale(zoom),
+            ))
+        })
     }
 
     /// The overview picker slot of a window, in output coordinates — where

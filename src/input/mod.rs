@@ -52,7 +52,7 @@ use crate::gnome::{
     Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, TileSide,
 };
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::PageArrow;
 use crate::ui::dash::DashHit;
@@ -3097,6 +3097,25 @@ impl State {
             self.niri.queue_redraw_all();
         }
         if self.niri.app_grid.set_arrow_hovered(arrow_hit) {
+            self.niri.queue_redraw_all();
+        }
+
+        // Hovering a window preview in the overview's picker grows it and raises it
+        // above its neighbours (`showOverlay`, `windowPreview.js:310-352`). The
+        // hit is the picker slot the click would activate, so what grows is always
+        // what a click would pick.
+        let hovered = self
+            .niri
+            .layout
+            .is_overview_open()
+            .then(|| {
+                let (output, p) = self.niri.output_under(pos)?;
+                let output = output.clone();
+                let (window, _) = self.niri.layout.window_under(&output, p)?;
+                Some(LayoutElement::id(window).clone())
+            })
+            .flatten();
+        if self.niri.layout.set_expose_hover(hovered.as_ref()) {
             self.niri.queue_redraw_all();
         }
 
