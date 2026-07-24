@@ -18,7 +18,13 @@
 //! - gnome-shell measures the thumbnails against the *work area* porthole
 //!   (`workspaceThumbnail.js:1204-1219,1248-1255`); our workspace miniature is the whole view (it
 //!   includes the strip under the top panel), so [`crate::layout::thumbnails`] measures against the
-//!   view. At 1920×1080 that is 54px where gnome-shell has 52.
+//!   view. At 1920×1080 that is 54px where gnome-shell has 52. gnome-shell additionally clamps that
+//!   measurement at `height × maxThumbnailScale` (`overviewControls.js:190-192`); ours is already
+//!   the cap by construction, so there is nothing left to clamp.
+//! - gnome-shell lays out *secondary* monitors with `SecondaryMonitorDisplay`
+//!   (`workspacesView.js:589-720`) — thumbnails and padding only, no dash or search — so their
+//!   picker box, and now their zoom, differ from the primary's. We draw the full chrome on every
+//!   output (as the dash and search already did), so every monitor gets the primary layout.
 //! - The app grid's `ControlsState::AppGrid` boxes are not computed yet; this only produces the
 //!   window-picker state. `SMALL_WORKSPACE_RATIO` lands with the app grid.
 

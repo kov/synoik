@@ -1945,6 +1945,63 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     );
 }
 
+/// The collapse direction eases too, and the strip stays drawn until the band is
+/// actually gone: emptying the second desktop takes the workspace count back
+/// under the threshold, and the picker must grow into the band continuously
+/// rather than snapping the zoom out from under the previews.
+#[test]
+fn overview_picker_grows_smoothly_when_the_strip_collapses() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    let _w2 = map_window_sized(&mut f, id, (640, 480), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    // Populate a second desktop and let the band settle in. The ease is armed on
+    // the frame after the count changes, so advance once before settling.
+    f.niri().layout.move_to_workspace_down(true);
+    f.niri().advance_animations();
+    f.settle_animations();
+    let expanded = overview_controls(&mut f).workspaces;
+    assert_eq!((expanded.loc.y, expanded.size.h), (168., 779.));
+
+    // Back to one populated desktop: the emptied workspace is only reaped once the
+    // switch settles, and the collapse ease arms on that frame.
+    f.niri().layout.move_to_workspace_up(true);
+    f.settle_animations();
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+
+    let mid = overview_controls(&mut f).workspaces;
+    assert!(
+        mid.size.h > expanded.size.h && mid.size.h < 841.,
+        "mid-collapse picker height must be between the two rest states, got {}",
+        mid.size.h
+    );
+    // The strip is still drawn while the band is shrinking — dropping it the
+    // instant the count changes would leave a hole over the still-reserved band.
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    assert!(
+        mon.expect("workspaces must be on a monitor")
+            .thumbnails_visible(),
+        "the strip must stay visible until the expand fraction reaches zero"
+    );
+
+    f.settle_animations();
+    let collapsed = overview_controls(&mut f).workspaces;
+    assert_eq!((collapsed.loc.y, collapsed.size.h), (106., 841.));
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    assert!(!mon.unwrap().thumbnails_visible());
+}
+
 /// The picker box contains the thumbnails band, so the workspace zoom depends on
 /// whether the strip is showing. Crossing the strip threshold happens *inside*
 /// the overview (drag a window onto the trailing empty desktop), so gnome-shell

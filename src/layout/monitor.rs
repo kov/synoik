@@ -1088,8 +1088,6 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn advance_animations(&mut self) {
-        self.update_thumbnails_expand();
-
         match &mut self.workspace_switch {
             Some(WorkspaceSwitch::Animation(anim)) => {
                 if anim.is_done() {
@@ -1127,6 +1125,10 @@ impl<W: LayoutElement> Monitor<W> {
         for ws in &mut self.workspaces {
             ws.advance_animations();
         }
+
+        // After `clean_up_workspaces` above, so the strip's `should-show` is
+        // evaluated against this frame's workspace count rather than lagging it.
+        self.update_thumbnails_expand();
     }
 
     pub(super) fn are_animations_ongoing(&self) -> bool {
@@ -1140,7 +1142,10 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
-            || self.thumbnails_expand.is_some()
+            // The expand only moves anything while the overview is in play — with
+            // it closed the zoom is 1 regardless, so counting it would defer
+            // pointer-focus refresh for a quarter second over a still screen.
+            || (self.thumbnails_expand.is_some() && self.overview_progress.is_some())
             || self
                 .workspaces
                 .iter()
@@ -1562,12 +1567,25 @@ impl<W: LayoutElement> Monitor<W> {
         if should_show != self.thumbnails_shown {
             let from = self.thumbnails_expand_fraction();
             self.thumbnails_shown = should_show;
+            // gnome-shell eases this one with `SIDE_CONTROLS_ANIMATION_TIME`
+            // (250ms, EASE_OUT_QUAD, `overviewControls.js:360-366`) — a fixed
+            // duration, not the configurable overview open/close animation. Only
+            // whether animations run at all is inherited from the config.
+            let config = niri_config::Animation {
+                off: self.options.animations.overview_open_close.0.off,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: 250,
+                        curve: niri_config::animations::Curve::EaseOutQuad,
+                    },
+                ),
+            };
             self.thumbnails_expand = Some(Animation::new(
                 self.clock.clone(),
                 from,
                 if should_show { 1. } else { 0. },
                 0.,
-                self.options.animations.overview_open_close.0,
+                config,
             ));
         }
 

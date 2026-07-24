@@ -4975,13 +4975,16 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
+                    // Not the drag's zoom: this window is on a workspace, so the
+                    // snapshot must record the zoom its *own* monitor renders at.
+                    let ws_zoom = mon.overview_zoom();
                     for (ws, geo) in mon.workspaces_with_render_geo_mut(false) {
                         if ws.has_window(window) {
                             ws.store_unmap_snapshot_if_empty(
                                 renderer,
                                 xray,
                                 xray_has_blocked_out_layers,
-                                XrayPos::new(geo.loc, zoom),
+                                XrayPos::new(geo.loc, ws_zoom),
                                 window,
                             );
                             return;
