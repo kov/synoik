@@ -443,14 +443,17 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
       an icon-theme change (added when the grid landed after that handler). Pinned by
       `overview_prewarm_requests_dash_and_grid_icon_decodes`. Makes blank-then-real rare (only a truly cold
       first run or a brand-new app). **Live-validation pending.**
-    - **(2) Batch the first-frame GPU uploads (NEXT — gated on live measurement).** Uploads need the render
-      context so they only happen on first render; each `NiriTexture::upload` is a separate cbuf + submit +
-      blocking `wait_for_fences` (`niri-vk/src/gpu.rs:501` `run_commands`), and ~24 serialized fence
-      round-trips is the residual Venus hitch Fable flagged. Fix = a `niri-vk` batch upload (one cbuf, N
-      copies, one submit, one wait, multi-resource cleanup guard) used by the grid render (collect misses →
-      batch → insert → build elements). **Only worth building if a residual hitch survives (1)** — scoped,
-      not yet built, because it is a change in the highest-risk (hand-rolled Vulkan) code and prewarm may
-      already have removed the stall.
+    - **(2) Batch the first-frame GPU uploads ✅ DONE (`ca164e9e`).** Live-confirmed the residual hitch
+      survived (1). Each `NiriTexture::upload` was a separate cbuf + submit + blocking `wait_for_fences`
+      (`niri-vk/src/gpu.rs` `run_commands`); ~24 serialized fence round-trips is the Venus stutter. Added a
+      reusable `TextureBatch` (start/`upload`/`finish`) to niri-vk: stages N textures (staging +
+      image/view/sampler, no commands) then records every copy into **one** cbuf, one submit, one wait. The
+      single `Texture::upload` now shares resource creation (`build_pending`) + copy recording
+      (`record_upload_copy`) so the paths can't drift. `VulkanRenderer::import_memory_batch` wraps it; the
+      grid render collects a page's 2+ pending icon uploads and imports them in one batch. Fable-reviewed
+      (no CRITICAL; also fixed two pre-existing descriptor-pool/texture leaks on `make_texture_set` failure
+      it surfaced). Pinned by a 2-distinct-icon render test + `NIRI_VK_VALIDATION` clean. **Live-validation
+      pending.** Reusable for any future many-textures-at-once path.
     - **(3) Shared GPU-texture cache across dash + grid + search (DEFERRED, recorded).** GNOME keeps ONE
       Cogl texture per gicon+size shell-wide; we currently upload per surface (each keeps its own
       `AppIconUploads`). Fold the three surfaces' upload caches into one shared, gicon+size-keyed texture
