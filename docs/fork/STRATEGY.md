@@ -170,6 +170,35 @@ edge/half tiling, and the **~112 named keybinding actions** (workspace switch/mo
 app/window/group/panel switchers, etc.). Encode the behaviors *you actually use* as a
 ~30-test conformance corpus (§8); let the rest drift.
 
+**Backlog — remove niri's window focus ring + border (decided 2026-07-24).** GNOME draws neither:
+focus is conveyed by CSD titlebar styling and shadow, and windows have no compositor-drawn border.
+Per the fork tenet these are niri's way of doing something GNOME does differently, so both go —
+config surface included, no compatibility shims ("we support GNOME's focus and tiling only").
+
+*Why it's not just cosmetic:* `draw_border_with_background` defaulted to `!has_ssd()`, i.e. ON for
+every CSD client, and with the border off it fell through to the focus ring — so the **focused**
+window got an opaque rect painted over its whole geometry, silently destroying client translucency
+(a 50%-opacity terminal measured a flat, zero-variance backdrop focused vs. correctly blended
+unfocused). `c81062ec` defaulted that to `false` as a stop-gap; the removal subsumes it.
+
+Scope, already surveyed:
+- `Tile::border` and `Tile::focus_ring` (`src/layout/tile.rs`) — both are `FocusRing` instances.
+- Their config: `layout.border`, `layout.focus_ring` (`niri-config/src/{layout,appearance}.rs`) and
+  the `border` / `focus_ring` / `draw_border_with_background` window rules
+  (`niri-config/src/window_rule.rs`, `src/window/mod.rs`).
+- The geometry contribution — `visual_border_width()` feeds tile sizing, so removing it collapses
+  the border-width arithmetic in `tile.rs` onto the already-default "off" path.
+- Fallout in `src/layout/{workspace,scrolling,floating,monitor}.rs` and the layout test suite.
+- **`FocusRing` the type must SURVIVE**: `src/ui/mru.rs` (switcher background/border) and
+  `src/layout/monitor.rs` (workspace thumbnail indicator + placeholder) reuse it as a rounded-rect
+  drawing helper. Only the *window-chrome* users go. Consider renaming it once it has no
+  focus-ring users left.
+- **Add the automated pin `c81062ec` still lacks**: a focused translucent window must composite
+  the backdrop through it. Cheapest honest form is a Vulkan render test asserting the readback
+  under a focused partial-alpha window varies with what's behind it (the focused-vs-unfocused
+  spread differential above is the shape); a white-box assert that the default is `false` would
+  not have caught the fall-through through the focus ring.
+
 ### 3.4 The observable control plane (cross-cutting — first class)
 
 A single, typed, **inspectable** `Command → Event → State` model for shell/WM **policy and
