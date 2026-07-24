@@ -18,14 +18,13 @@
 //! window-activation path from a desktop id yet, so every dash tile launches. That
 //! is deferred; it needs `RunningApp` to carry window ids and a focus action.
 //!
-//! **Input divergences (S3):** GNOME's dash icons are `St.Button`s that activate on
-//! *release* (`clicked`), so a press-then-drag-off cancels; ours launches on *press*
-//! (the house pattern shared with the panel intercepts) — simpler, but it forecloses
-//! the later drag-a-favorite-out gesture and can't be canceled. A right-click on a
-//! GNOME dash icon opens the app context menu (`AppIconMenu`); we consume it inertly
-//! (the menu is a later slice). The dash is mouse-only for now: touch taps fall
-//! through to the overview's touch grab (the panel has the same gap). All three are
-//! revisited when the relevant gesture/menu slices land.
+//! **Input divergences (S3):** a right-click on a GNOME dash icon opens the app
+//! context menu (`AppIconMenu`); we consume it inertly (the menu is a later slice).
+//! The dash is mouse-only for now: touch taps fall through to the overview's touch
+//! grab (the panel has the same gap). Both are revisited when the relevant
+//! gesture/menu slices land. (Activation itself is GNOME's: like every St.Button
+//! these act on the *release*, and only if it lands on the same icon — see
+//! `State::activate_overview_hit`.)
 //!
 //! **Divergences from GNOME, revisited by S5's `ControlsManagerLayout` port:** the
 //! placement is a hardcoded bottom-center anchor (S5 gives it an allocated box and a
