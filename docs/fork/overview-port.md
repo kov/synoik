@@ -467,6 +467,15 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
+- **S10 — Keyboard-navigation pass (deferred, 2026-07-24).** Reported live: in the search results
+  **Tab steps forward but Shift+Tab also steps forward** instead of backward. Cause is pinned, not a
+  logic bug in the search: `overview_search.rs:262` already treats `Keysym::ISO_Left_Tab` as
+  select-prev, but `input/mod.rs:734` hands `handle_key` the **raw** keysym, and xkb only yields
+  `ISO_Left_Tab` as the *modified* sym — so Shift+Tab arrives as plain `Tab` and falls into the
+  select-next arm, leaving that `ISO_Left_Tab` match dead for real input. (`modified` is already in
+  scope at that call site, used for `key_char`.) Fix belongs in a full keyboard-nav pass rather than
+  a one-key patch: audit every UI surface that keys off `raw` for the same shifted-keysym blind spot,
+  and pin Shift+Tab per surface. GNOME reference: `js/ui/search.js` / `st-focus-manager`.
 
 **Rough dependency order:** S1 → S2 → {S3, S4} → S5 → S6/S7 → S8 → S9+. S1 gates everything; S2 gates
 any icon rendering; S7 is independent and small.
