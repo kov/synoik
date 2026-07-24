@@ -19,6 +19,7 @@ pub mod screen_transition;
 pub mod screenshot_ui;
 pub mod theme_node;
 pub mod widget;
+pub mod window_preview;
 
 /// GNOME authors font sizes in points; we size glyphs in logical pixels-per-em, so route every
 /// GNOME point size through [`pt_to_px`] instead of hardcoding a px (which drifted per-UI: 11pt

@@ -156,6 +156,9 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         "carousel-arrow-previous-symbolic" => Some(include_bytes!(
             "../../resources/icons/carousel-arrow-previous-symbolic.svg"
         )),
+        "preview-close-symbolic" => Some(include_bytes!(
+            "../../resources/icons/preview-close-symbolic.svg"
+        )),
         _ => None,
     }
 }

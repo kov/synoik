@@ -61,6 +61,7 @@ use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::overview_search::SearchHit;
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
+use crate::ui::window_preview;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
 
@@ -90,8 +91,10 @@ const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 /// A widget of the overview's chrome under the pointer. The overview's controls
 /// are St.Buttons, which act on release rather than press, so a click needs a
 /// press-time target to compare the release against — this is that target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverviewHit {
+    /// The close button of a window preview in the picker.
+    PreviewClose(smithay::desktop::Window),
     /// The dash (favorites bar).
     Dash(DashHit),
     /// The search entry / results card.
@@ -3119,6 +3122,18 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
+        // ...and its close button lightens under the pointer (`.window-close:hover`,
+        // `_window-picker.scss:46-48`).
+        let close_hovered = self
+            .niri
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p))
+            .and_then(|(output, p)| self.preview_close_under(&output, p));
+        if self.niri.preview_close_hovered != close_hovered {
+            self.niri.preview_close_hovered = close_hovered;
+            self.niri.queue_redraw_all();
+        }
+
         // Hovering the notification banner holds its expiry and expands the
         // banner; leaving restarts the countdown
         // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
@@ -3541,6 +3556,12 @@ impl State {
             return None;
         }
 
+        // The picker's close buttons come first: they overhang their preview and
+        // sit above everything else in the row.
+        if let Some(window) = self.preview_close_under(output, pos) {
+            return Some(OverviewHit::PreviewClose(window));
+        }
+
         let controls = self.niri.layout.controls_layout_for_output(output)?;
 
         if let Some(hit) = self.niri.dash.hit_test(pos, controls.dash) {
@@ -3565,6 +3586,22 @@ impl State {
         None
     }
 
+    /// The window whose picker close button is at `pos`, if any. Only a preview
+    /// showing its overlay has one, and the button is hit-tested at full size
+    /// however far the overlay has faded — the fade is 200ms of easing, and a
+    /// click on a button you can see should land.
+    fn preview_close_under(
+        &self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Option<smithay::desktop::Window> {
+        let mon = self.niri.layout.monitor_for_output(output)?;
+        mon.preview_overlays()
+            .into_iter()
+            .find(|(_, preview, _)| window_preview::close_rect(*preview).contains(pos))
+            .map(|(window, _, _)| window)
+    }
+
     /// Activate an overview widget: the release half of a click on the chrome.
     /// `button` is the button that was lifted; the backgrounds (dash pill, search
     /// card, entry body) are hit-tested so they consume the click, but do nothing.
@@ -3581,6 +3618,18 @@ impl State {
         let launches = matches!(button, Some(MouseButton::Left | MouseButton::Middle));
 
         match hit {
+            // The close button asks the window to close, like GNOME's
+            // `_deleteAll` (`windowPreview.js:218`), and leaves the overview open.
+            OverviewHit::PreviewClose(window) if primary => {
+                if let Some((_, mapped)) = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, mapped)| mapped.window == window)
+                {
+                    mapped.toplevel().send_close();
+                }
+            }
             // A favorite launches and closes the overview. All our apps are stopped,
             // so this is a plain `Activate` — GNOME's dash icon does `open_new_window`
             // only for a *running* app (`appDisplay.js:3060`).
@@ -3675,7 +3724,7 @@ impl State {
                         .output_under(location)
                         .map(|(o, p)| (o.clone(), p));
                     if let Some((output, pos)) = under {
-                        if self.overview_hit(&output, pos) == Some(hit) {
+                        if self.overview_hit(&output, pos).as_ref() == Some(&hit) {
                             self.activate_overview_hit(&output, hit, button);
                         }
                     }

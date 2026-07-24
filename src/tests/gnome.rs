@@ -1981,6 +1981,69 @@ fn overview_hovering_a_preview_grows_it() {
     );
 }
 
+/// Hovering a preview also reveals its close button — the other half of
+/// `showOverlay` (`windowPreview.js:326-337`). It is centered on the preview's
+/// top-right corner (`:203-218`) and asks the window to close (`_deleteAll`),
+/// leaving the overview open. No hover, no button.
+#[test]
+fn overview_preview_close_button_closes_the_window() {
+    use crate::ui::window_preview::{close_rect, CLOSE_SIZE};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    // Un-hovered there is no button: clicking where it would be — the half of its
+    // box that overhangs the preview's corner, clear of the preview itself —
+    // closes nothing.
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let button = close_rect(slot);
+    let outside = button.loc + smithay::utils::Point::from((CLOSE_SIZE * 0.75, CLOSE_SIZE * 0.25));
+    pointer_motion_to(&mut f, outside.x, outside.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id).window(&surface).close_requested,
+        "there is no close button until the preview is hovered"
+    );
+
+    // That click landed on the overview backdrop, which leaves the overview.
+    if !f.niri().layout.is_overview_open() {
+        tap(&mut f, KEY_LEFTMETA);
+    }
+    f.settle_animations();
+
+    // Hover the preview, then click the button on its top-right corner. The
+    // preview has grown by then, so take the button from the drawn rect.
+    let inside = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, inside.x, inside.y);
+    f.settle_animations();
+
+    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let button = close_rect(drawn);
+    let center = button.loc + button.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "clicking the close button must ask the window to close"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "and must leave the overview open"
+    );
+}
+
 /// GNOME overview geometry (gnome-shell `ControlsManagerLayout`): the workspace
 /// row is fit by height into the window-picker box the overview chrome leaves
 /// over — it is *not* centered in the output, and the scale is not a constant.

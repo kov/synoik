@@ -1990,6 +1990,15 @@ impl<W: LayoutElement> Workspace<W> {
         changed
     }
 
+    /// Every window whose picker overlay is showing, with its progress — the
+    /// hovered one plus any still easing back down.
+    pub(super) fn expose_hovers(&self) -> impl Iterator<Item = (&W::Id, f64)> + '_ {
+        self.expose_hover.iter().filter_map(|(id, anim)| {
+            let value = anim.clamped_value().clamp(0., 1.);
+            (value > 0.).then_some((id, value))
+        })
+    }
+
     /// The picker-overlay progress of one window: 0 idle, 1 fully hovered.
     fn expose_hover_value(&self, window: &W::Id) -> f64 {
         self.expose_hover

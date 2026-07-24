@@ -2197,6 +2197,35 @@ impl<W: LayoutElement> Monitor<W> {
             .find_map(|(ws, geo)| geo.contains(pos_within_output).then_some(ws))
     }
 
+    /// Every window preview showing its picker overlay on this monitor: the
+    /// window, where it draws in output coordinates, and how far the overlay has
+    /// faded in (`showOverlay`, `windowPreview.js:310`).
+    pub fn preview_overlays(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
+        let Some(progress) = self.expose_progress() else {
+            return Vec::new();
+        };
+
+        let zoom = self.overview_zoom();
+        let mut overlays = Vec::new();
+        for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
+            let ws_zoom = zoom * self.workspace_render_scale(idx);
+            for (window, hover) in ws.expose_hovers() {
+                let Some(rect) = ws.expose_drawn_rect(window, progress, ws_zoom) else {
+                    continue;
+                };
+                overlays.push((
+                    window.clone(),
+                    Rectangle::new(
+                        geo.loc + rect.loc.upscale(ws_zoom),
+                        rect.size.upscale(ws_zoom),
+                    ),
+                    hover * progress,
+                ));
+            }
+        }
+        overlays
+    }
+
     pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
         let (ws, geo) = self.workspace_under(pos_within_output)?;
 

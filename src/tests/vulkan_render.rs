@@ -6335,6 +6335,61 @@ fn vulkan_dash_hover_lightens_the_tile() {
     }
 }
 
+/// The window picker's close button actually draws: hovering a preview must put
+/// the `.window-close` disc on its top-right corner, and un-hovering must take it
+/// away again. The headless test pins the geometry and the close request; this
+/// pins that the chrome reaches the frame at all.
+#[test]
+fn vulkan_hovered_preview_draws_its_close_button() {
+    use crate::ui::window_preview::close_rect;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+    f.niri().hotkey_overlay.hide();
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+
+    // Un-hovered: the button's outer corner is bare backdrop.
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let probe = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        let b = close_rect(rect);
+        (
+            (b.loc.x + b.size.w / 2.) as i32,
+            (b.loc.y + b.size.h / 2. - b.size.h * 0.3) as i32,
+        )
+    };
+    let (bx, by) = probe(slot);
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let bare = px(&pixels, w, bx, by);
+
+    // Hover the preview and settle the 200ms overlay fade.
+    let center = slot.loc + slot.size.downscale(2.).to_point();
+    let cur = f.niri().seat.get_pointer().unwrap().current_location();
+    f.pointer_motion(center.x - cur.x, center.y - cur.y);
+    f.settle_animations();
+
+    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let (bx, by) = probe(drawn);
+    let (pixels, w, _) = render_output_vulkan(&mut f, &output);
+    let button = px(&pixels, w, bx, by);
+
+    assert_ne!(
+        button, bare,
+        "hovering must draw the close button over the preview's corner"
+    );
+    // The disc is `$window_close_button_color` = #3f3f46 at 98%
+    // (`_window-picker.scss:2`), a hair of whatever it covers showing through.
+    assert!(
+        button[0].abs_diff(63) <= 2 && button[1].abs_diff(63) <= 2 && button[2].abs_diff(70) <= 2,
+        "the disc must be $window_close_button_color #3f3f46, got {button:?} over {bare:?}"
+    );
+}
+
 /// The overview search bakes through the owned renderer: the entry pill composites an
 /// opaque dark fill, and (with a query + results) the results card draws with the
 /// selected tile washed *lighter* than an unselected one — the `.overview-tile`

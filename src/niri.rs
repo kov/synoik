@@ -188,6 +188,7 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
     OutputScreenshot, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
+use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -543,6 +544,10 @@ pub struct Niri {
     pub overview_search: OverviewSearch,
     /// The overview app grid (installed apps minus favorites).
     pub app_grid: AppGrid,
+    /// GPU caches for the window picker's per-preview chrome (the close button).
+    pub preview_chrome: PreviewChrome,
+    /// The preview whose close button the pointer is on, for its hover fill.
+    pub preview_close_hovered: Option<Window>,
     /// When the app grid last flipped a page on a wheel notch, to debounce a fast
     /// spin (`SCROLL_TIMEOUT_TIME`=150ms, `appDisplay.js:696-701`).
     pub app_grid_last_page_flip: Option<Duration>,
@@ -3738,6 +3743,8 @@ impl Niri {
             dash: Dash::new(),
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(),
+            preview_chrome: PreviewChrome::new(),
+            preview_close_hovered: None,
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
@@ -5962,6 +5969,30 @@ impl Niri {
                 let xray_pos = XrayPos::new(geo.loc, ws_zoom);
                 push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(ws_zoom, geo));
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
+            }
+
+            // Topmost in the group: the hovered preview's close button. It is a
+            // child of the preview in gnome-shell (so it fades with the search like
+            // everything else here), but drawn in screen pixels — the workspace zoom
+            // is baked into the previews' allocations there, not applied to them.
+            {
+                let overlays: Vec<_> = mon
+                    .preview_overlays()
+                    .into_iter()
+                    .map(|(window, preview, hover)| PreviewOverlay {
+                        preview,
+                        alpha: hover as f32,
+                        hovered: self.preview_close_hovered.as_ref() == Some(&window),
+                    })
+                    .collect();
+                for element in self.preview_chrome.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    fade_scale,
+                    &overlays,
+                ) {
+                    group.push(element.into());
+                }
             }
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| group.push(elem.into()));
