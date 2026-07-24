@@ -122,6 +122,9 @@ struct GridCache {
     bake: widget::BakeCache,
     /// The page-indicator dots row.
     dots_bake: widget::BakeCache,
+    /// The tile hover wash — a separate element so a hover change repositions it without
+    /// re-baking (re-shaping) the labels (keeps the open animation smooth under the mouse).
+    hover_bake: widget::BakeCache,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
     /// Recolored arrow-chevron uploads, keyed by (output scale, is-next).
@@ -241,23 +244,26 @@ impl AppGrid {
     }
 
     /// Set the mouse-hovered tile (an absolute entry index); returns whether it
-    /// changed (→ redraw).
+    /// changed (→ redraw). Deliberately does **not** bump `content_rev`: the hover wash
+    /// is a separate element, so a hover change repositions it without re-baking (and
+    /// re-shaping) the page's labels — the difference between a smooth and a stuttering
+    /// open animation when the mouse is moving.
     pub fn set_hovered(&mut self, hovered: Option<usize>) -> bool {
         if self.hovered == hovered {
             return false;
         }
         self.hovered = hovered;
-        self.content_rev += 1;
         true
     }
 
     /// Set the mouse-hovered navigation arrow; returns whether it changed (→ redraw).
+    /// Like [`set_hovered`](Self::set_hovered), does not bump `content_rev` — the arrow
+    /// wash is its own element.
     pub fn set_arrow_hovered(&mut self, arrow: Option<PageArrow>) -> bool {
         if self.hovered_arrow == arrow {
             return false;
         }
         self.hovered_arrow = arrow;
-        self.content_rev += 1;
         true
     }
 
@@ -508,6 +514,13 @@ impl AppGrid {
         self.layout(area).tiles.len()
     }
 
+    /// The label-bake revision — a test probe for the invariant that a hover change does
+    /// not invalidate it (which would re-shape the labels every mouse move).
+    #[cfg(test)]
+    pub fn content_rev(&self) -> u64 {
+        self.content_rev
+    }
+
     /// The logical center of the current page's tile `k`'s **icon** (not the whole tile —
     /// the icon sits above the label) — a render-test probe for sampling the drawn glyph.
     #[cfg(test)]
@@ -634,11 +647,12 @@ impl AppGrid {
             }
         }
 
-        // --- The tile chrome (hover wash + labels), one baked transparent texture the
-        //     size of the block. ---
+        // --- The tile labels, one baked transparent texture the size of the block. The
+        //     hover wash is drawn as a SEPARATE element below, so a hover change (every
+        //     mouse move) never re-runs this text shaping — the bake is keyed on
+        //     `content_rev`, which no longer bumps on hover. ---
         let block = layout.block;
         let origin = block.loc;
-        let hovered = self.hovered;
         let rel_rects: Vec<Rectangle<f64, Logical>> = layout
             .tiles
             .iter()
@@ -661,9 +675,8 @@ impl AppGrid {
             move |frame, phys, labels| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                for (k, (rel, label)) in rel_rects.iter().zip(labels.iter()).enumerate() {
-                    let active = hovered == Some(first + k);
-                    p.labelled_tile(*rel, label, &metrics, active, style::TEXT)?;
+                for (rel, label) in rel_rects.iter().zip(labels.iter()) {
+                    p.labelled_tile(*rel, label, &metrics, false, style::TEXT)?;
                 }
                 Ok(())
             },
@@ -686,6 +699,50 @@ impl AppGrid {
                 ));
             }
             Err(err) => tracing::error!("error baking the app grid: {err:#}"),
+        }
+
+        // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten
+        //     element under the labels/icons. Baked at one tile's size and just
+        //     repositioned as the pointer moves between tiles, so it costs no re-shape. ---
+        if let Some(tile) = self
+            .hovered
+            .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
+            .map(|i| layout.tiles[i - first])
+        {
+            let radius = metrics.radius;
+            match widget::bake(
+                renderer,
+                &mut cache.hover_bake,
+                scale,
+                tile.size,
+                0,
+                |_| Ok(()),
+                move |frame, phys, _: &()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    p.fill_rounded(Rectangle::from_size(tile.size), radius, style::HOVER_WASH)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        tile.loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the app-grid hover wash: {err:#}"),
+            }
         }
 
         // --- The page-indicator dots, below the grid (a single baked strip). ---
@@ -982,6 +1039,35 @@ mod tests {
         assert_eq!(grid_n(0).visible_len(wide()), 0);
         // A band too small for the padding + one tile.
         assert_eq!(grid_n(1).layout(rect(0., 0., 20., 20.)).tiles.len(), 0);
+    }
+
+    #[test]
+    fn hover_does_not_bump_the_bake_revision() {
+        // The label bake is keyed on `content_rev`; a hover change must not touch it, or
+        // every mouse move during the open animation re-shapes the page's labels (the
+        // stutter). Page/entry changes, which DO change the labels, still bump it.
+        let mut g = grid_n(30);
+        let area = wide();
+        let rev = g.content_rev();
+        assert!(
+            g.set_hovered(Some(2)),
+            "a new hover still reports a change (→ redraw)"
+        );
+        assert!(g.set_arrow_hovered(Some(PageArrow::Next)));
+        assert_eq!(
+            g.content_rev(),
+            rev,
+            "tile/arrow hover must not invalidate the label bake"
+        );
+        assert!(g.set_page(1, area));
+        assert_ne!(
+            g.content_rev(),
+            rev,
+            "a page change re-bakes (labels differ)"
+        );
+        let rev = g.content_rev();
+        assert!(g.set_entries(vec![entry("a", "a")]));
+        assert_ne!(g.content_rev(), rev, "an entries change re-bakes");
     }
 
     #[test]
