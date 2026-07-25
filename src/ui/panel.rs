@@ -646,7 +646,10 @@ impl Panel {
             return false;
         }
         self.recording.as_mut().unwrap().label = label;
-        self.cache.borrow_mut().clear();
+        // Bars only: the label is drawn into the bar, but the composited status-icon
+        // uploads are keyed by name and tint and do not depend on it. This ticks once
+        // a second while recording, so re-uploading every icon here is pure waste.
+        self.cache.borrow_mut().clear_bars();
         true
     }
 
@@ -692,7 +695,9 @@ impl Panel {
         let text = format_clock(now, self.clock_format);
         if text != self.clock_text {
             self.clock_text = text;
-            self.cache.borrow_mut().clear();
+            // Bars only — see `update_recording_label`. With seconds shown this fires
+            // every second, and the status icons have nothing to do with the time.
+            self.cache.borrow_mut().clear_bars();
             true
         } else {
             false
