@@ -40,8 +40,12 @@ frame prints:
 ```
 frame on Virtual-1 took 17.54ms (budget 16.67ms) — elements 0.15ms collect 3.16ms submit 14.15ms
 queue 0.05ms callbacks 0.01ms captures 0.01ms; 98 elements, 138 draws covering 2.0x the output,
-2 submits in 15.06ms (1 to scanout in 12.69ms), 1 bakes in 2.57ms, animating, overview 0.56
+2 submits in 0.09ms, waiting 14.97ms (1 to scanout in 0.05ms, waiting 12.69ms),
+1 bakes in 2.57ms, animating, overview 0.56
 ```
+
+(This frame was captured before enqueue and wait were timed apart, so its two
+enqueue figures are reconstructed; everything else is as logged.)
 
 Each field exists because an earlier guess was wrong without it:
 
@@ -49,6 +53,9 @@ Each field exists because an earlier guess was wrong without it:
 - **elements** — the *collected* list, not a redraw count. Damage tracking culls before recording.
 - **draws** and **covering N.Nx the output** — shaded fragments as a multiple of output area.
 - **submits, and how many were to scanout** — the two are different by an order of magnitude.
+- **enqueue time vs `waiting`** — `vkQueueSubmit` against the fence wait after it. Split because
+  the fix under consideration moves the wait rather than removing it, and one number cannot tell
+  those apart (`7b5f016d`). A frame that waits for work it did not submit says so.
 - **bakes / shaped runs** — the widget path, which used to dominate `collect` and no longer does.
 - **missed vblanks** — a frame that arrived a refresh later than the one it was built for, *not*
   a gap in the DRM vblank sequence (see §5).
@@ -117,6 +124,11 @@ remaining slow frame is an overview animation or first-time startup work.
   assert on the counters (`niri_vk::stats`, `frame_log::bakes()`), not on pixels.
 - **Verify a mutation actually applied.** A `str.replace` that silently matched nothing once
   "confirmed" a vacuous test for me; the mutation must be asserted to have changed the file.
+- **A counter those tests assert on must be per-thread.** Same reason: the assertion is
+  "*this* repaint cost nothing", and libtest runs tests in parallel against their own renderers,
+  so a process-wide counter folds a neighbour's bake or submit into your delta. It fails about
+  one run in five under `NIRI_VK_VALIDATION=1` and names the innocent test in front of you
+  (`917c69b0`).
 - **First-entry costs are not steady-state costs.** Opening the app grid the first time is
   ~40–70 ms of icon uploads (~20 submits). It caches. Do not optimise it by mistake.
 
