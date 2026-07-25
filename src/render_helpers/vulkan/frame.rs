@@ -269,6 +269,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         for s in scissors {
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(s));
             dev.cmd_draw(cbuf, 6, 1, 0, 0);
+            niri_vk::stats::draw();
         }
     }
 
@@ -651,6 +652,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 for s in &scissors {
                     dev.cmd_set_scissor(self.cbuf, 0, std::slice::from_ref(s));
                     dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
+                    niri_vk::stats::draw();
                 }
             }
         }
@@ -1005,12 +1007,15 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.end_command_buffer(old_cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&old_cbuf));
-            dev.queue_submit(
-                self.renderer.gpu.queue,
-                std::slice::from_ref(&submit),
-                fence,
-            )?;
-            dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            {
+                let _timed = niri_vk::stats::submit();
+                dev.queue_submit(
+                    self.renderer.gpu.queue,
+                    std::slice::from_ref(&submit),
+                    fence,
+                )?;
+                dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            }
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&old_cbuf));
             // Bank this segment's GPU time *before* re-arming: the pool has only
@@ -1496,12 +1501,15 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cbuf));
-            dev.queue_submit(
-                self.renderer.gpu.queue,
-                std::slice::from_ref(&submit),
-                fence,
-            )?;
-            dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            {
+                let _timed = niri_vk::stats::submit();
+                dev.queue_submit(
+                    self.renderer.gpu.queue,
+                    std::slice::from_ref(&submit),
+                    fence,
+                )?;
+                dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+            }
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&self.cbuf));
         }

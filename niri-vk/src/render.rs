@@ -630,6 +630,7 @@ impl QuadPipeline {
                 as_bytes(quad),
             );
             gpu.device.cmd_draw(cbuf, 6, 1, 0, 0);
+            crate::stats::draw();
         }
     }
 

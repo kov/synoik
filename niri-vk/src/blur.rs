@@ -331,6 +331,7 @@ impl BlurChain {
                 as_bytes(&push),
             );
             device.cmd_draw(cbuf, 3, 1, 0, 0);
+            crate::stats::draw();
             device.cmd_end_render_pass(cbuf);
         }
     }

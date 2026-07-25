@@ -85,6 +85,7 @@ pub fn measure_line_width(text: &str, px: f32) -> f64 {
 /// (e.g. the panel clock, which draws `font-weight: bold` like GNOME's `panel_button`) lays out to,
 /// so its hit rectangle and centering match the glyphs `build_glyph_run_weighted` rasterizes.
 pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
+    let _timed = crate::stats::shape();
     let mut fonts = measure_fonts().lock().unwrap();
     let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
     {
@@ -227,6 +228,7 @@ impl TextContext {
         px: f32,
         bold: bool,
     ) -> Result<GlyphAtlas> {
+        let _timed = crate::stats::shape();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
         {
@@ -253,6 +255,7 @@ impl TextContext {
         wrap_px: f32,
         base_px: f32,
     ) -> Result<GlyphAtlas> {
+        let _timed = crate::stats::shape();
         let mut buffer = Buffer::new(
             &mut self.fonts,
             Metrics::new(base_px, (base_px * 1.25).round()),
@@ -674,6 +677,7 @@ impl TextRenderer {
                     as_bytes(&push),
                 );
                 device.cmd_draw(cbuf, 6, 1, 0, 0);
+                crate::stats::draw();
             }
         }
     }

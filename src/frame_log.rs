@@ -77,13 +77,14 @@ static GPU_TIMING: AtomicBool = AtomicBool::new(false);
 /// the log, and this is debug instrumentation, not a data path.
 static GPU_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// Nanoseconds spent baking, and shaping text, during the frame being built.
+/// Nanoseconds spent baking during the frame being built.
 ///
-/// Both live *inside* the `collect` phase, which is where the live seat put 22ms
+/// This lives *inside* the `collect` phase, which is where the live seat put 22ms
 /// of a 31ms frame with only 18 elements on screen. A phase total says a frame was
-/// slow; these say which half of the widget path it was in.
+/// slow; this says which part of the widget path it was in. Shaping — the other
+/// half — is counted by [`niri_vk::stats`], because it happens on both the draw
+/// and the measure path and only the renderer crate sees both.
 static BAKE_NANOS: AtomicU64 = AtomicU64::new(0);
-static SHAPE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether anything is listening. Sampled by the scoped timers so an unlogged
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
@@ -114,11 +115,6 @@ pub fn time_bake() -> Timed {
     // worth an ordering for.
     BAKES.fetch_add(1, Ordering::Relaxed);
     timed(&BAKE_NANOS)
-}
-
-/// Time shaping one run of text (font selection, layout, glyph-atlas residency).
-pub fn time_shape() -> Timed {
-    timed(&SHAPE_NANOS)
 }
 
 /// Whether the renderer should measure GPU pass durations. See [`FrameLog::from_env`].
@@ -264,7 +260,28 @@ struct InFlight {
     phase: Option<Phase>,
     spans: Vec<(Phase, Duration)>,
     bakes_at_start: u64,
+    shapes_at_start: u64,
+    submits_at_start: u64,
+    draws_at_start: u64,
     context: FrameContext,
+}
+
+/// What a finished frame cost, beyond its per-phase wall clock: the counters and
+/// timers that live in process-wide statics because the code that feeds them sits
+/// too deep to carry a log handle.
+#[derive(Debug, Default)]
+struct Totals {
+    gpu: Duration,
+    bakes: u64,
+    baking: Duration,
+    shapes: u64,
+    shaping: Duration,
+    /// GPU round trips (`vkQueueSubmit` + fence wait). The number to watch on a
+    /// virtualized stack, where each one costs milliseconds no matter how little
+    /// work it carries.
+    submits: u64,
+    submitting: Duration,
+    draws: u64,
 }
 
 /// See the [module docs](self).
@@ -286,6 +303,7 @@ impl FrameLog {
             .and_then(|raw| Self::parse(&raw));
 
         ENABLED.store(settings.is_some(), Ordering::Relaxed);
+        niri_vk::stats::set_enabled(settings.is_some());
 
         if let Some(settings) = &settings {
             tracing::info!(
@@ -373,6 +391,9 @@ impl FrameLog {
             phase: None,
             spans: Vec::with_capacity(Phase::ALL.len()),
             bakes_at_start: BAKES.load(Ordering::Relaxed),
+            shapes_at_start: niri_vk::stats::shapes(),
+            submits_at_start: niri_vk::stats::submits(),
+            draws_at_start: niri_vk::stats::draws(),
             context: FrameContext::default(),
         });
     }
@@ -416,10 +437,16 @@ impl FrameLog {
             frame.spans.push((last, now - frame.phase_started));
         }
         let total = now - frame.started;
-        let bakes = BAKES.load(Ordering::Relaxed) - frame.bakes_at_start;
-        let gpu = take_gpu_time();
-        let baking = Duration::from_nanos(BAKE_NANOS.swap(0, Ordering::Relaxed));
-        let shaping = Duration::from_nanos(SHAPE_NANOS.swap(0, Ordering::Relaxed));
+        let totals = Totals {
+            gpu: take_gpu_time(),
+            bakes: BAKES.load(Ordering::Relaxed) - frame.bakes_at_start,
+            baking: Duration::from_nanos(BAKE_NANOS.swap(0, Ordering::Relaxed)),
+            shapes: niri_vk::stats::shapes() - frame.shapes_at_start,
+            shaping: niri_vk::stats::take_shape_time(),
+            submits: niri_vk::stats::submits() - frame.submits_at_start,
+            submitting: niri_vk::stats::take_submit_time(),
+            draws: niri_vk::stats::draws() - frame.draws_at_start,
+        };
 
         // The budget: an explicit threshold if given, else the refresh interval.
         // With neither (a headless output with no refresh) nothing is "too long",
@@ -428,7 +455,7 @@ impl FrameLog {
         let over = budget.is_some_and(|budget| total > budget);
 
         if over || settings.log_all {
-            let line = Self::format_frame(&frame, total, gpu, bakes, baking, shaping, budget);
+            let line = Self::format_frame(&frame, total, &totals, budget);
             if over {
                 tracing::warn!("{line}");
             } else {
@@ -439,19 +466,15 @@ impl FrameLog {
         self.stats
             .entry(frame.output)
             .or_default()
-            .record(total, over, gpu);
+            .record(total, over, totals.gpu);
 
         self.maybe_summarize(now);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn format_frame(
         frame: &InFlight,
         total: Duration,
-        gpu: Duration,
-        bakes: u64,
-        baking: Duration,
-        shaping: Duration,
+        totals: &Totals,
         budget: Option<Duration>,
     ) -> String {
         let mut line = format!("frame on {} took {}", frame.output, ms(total));
@@ -473,17 +496,33 @@ impl FrameLog {
                 let _ = write!(line, " {} {}", phase.label(), ms(spent));
             }
         }
-        if !gpu.is_zero() {
-            let _ = write!(line, " (gpu {})", ms(gpu));
+        if !totals.gpu.is_zero() {
+            let _ = write!(line, " (gpu {})", ms(totals.gpu));
         }
 
         let ctx = &frame.context;
         let _ = write!(line, "; {} elements", ctx.elements);
-        if bakes > 0 {
-            let _ = write!(line, ", {bakes} bakes in {}", ms(baking));
+        let _ = write!(line, ", {} draws", totals.draws);
+        // Submits before bakes and shaping: on a virtualized GPU the round-trip
+        // count is usually the headline, and both of those are ways of spending it.
+        if totals.submits > 0 {
+            let _ = write!(
+                line,
+                ", {} submits in {}",
+                totals.submits,
+                ms(totals.submitting)
+            );
         }
-        if !shaping.is_zero() {
-            let _ = write!(line, ", shaping {}", ms(shaping));
+        if totals.bakes > 0 {
+            let _ = write!(line, ", {} bakes in {}", totals.bakes, ms(totals.baking));
+        }
+        if totals.shapes > 0 {
+            let _ = write!(
+                line,
+                ", {} shaped runs in {}",
+                totals.shapes,
+                ms(totals.shaping)
+            );
         }
         if ctx.full_damage {
             line.push_str(", full damage");

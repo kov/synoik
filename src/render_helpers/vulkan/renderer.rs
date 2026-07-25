@@ -664,11 +664,6 @@ impl VulkanRenderer {
         px: f32,
         bold: bool,
     ) -> Result<GlyphRun, VulkanError> {
-        // Every shaped run funnels through here — shaping proper plus the atlas
-        // upload it needs — so this is where the frame log can tell "the widget
-        // path was slow" apart from "the text in it was".
-        let _timed = crate::frame_log::time_shape();
-
         // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;

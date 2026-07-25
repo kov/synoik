@@ -561,6 +561,7 @@ impl Gpu {
         };
         guard.fence = fence;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cbuf));
+        let _timed = crate::stats::submit();
         unsafe {
             self.device
                 .queue_submit(self.queue, &[submit], fence)
