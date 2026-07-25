@@ -295,8 +295,8 @@ fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
     let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
     let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.context("text pool")?;
 
-    let atlas = build_text(gpu, pool, TEXT, TEXT_PX)?;
-    anyhow::ensure!(!atlas.glyphs.is_empty(), "no glyphs were shaped/rasterized");
+    let (atlas, atlas_side, run) = build_text(gpu, pool, TEXT, TEXT_PX)?;
+    anyhow::ensure!(!run.glyphs.is_empty(), "no glyphs were shaped/rasterized");
 
     let target = RenderTarget::new(gpu, TW, TH)?;
     let set_layout = render::sampler_set_layout(gpu)?;
@@ -315,8 +315,8 @@ fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
         .set_layouts(std::slice::from_ref(&set_layout));
     let set = unsafe { gpu.device.allocate_descriptor_sets(&alloc) }.context("set")?[0];
     let img = vk::DescriptorImageInfo::default()
-        .sampler(atlas.texture.sampler)
-        .image_view(atlas.texture.view)
+        .sampler(atlas.sampler)
+        .image_view(atlas.view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     let write = vk::WriteDescriptorSet::default()
         .dst_set(set)
@@ -328,7 +328,16 @@ fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
     let dims = [TW as f32, TH as f32];
     gpu.run_commands(pool, |cbuf| {
         target.begin(gpu, cbuf, unorm(TEXT_BG));
-        renderer.draw(gpu, cbuf, set, &atlas, TEXT_ORIGIN, dims, unorm(TEXT_FG));
+        renderer.draw(
+            gpu,
+            cbuf,
+            set,
+            &run,
+            atlas_side,
+            TEXT_ORIGIN,
+            dims,
+            unorm(TEXT_FG),
+        );
         unsafe { gpu.device.cmd_end_render_pass(cbuf) };
     })?;
     let ours = target.read_back(gpu, pool)?;
@@ -339,7 +348,7 @@ fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
         gpu.device.destroy_command_pool(pool, None);
     }
     renderer.destroy(gpu);
-    atlas.texture.destroy(gpu);
+    atlas.destroy(gpu);
     target.destroy(gpu);
     Ok(ours)
 }

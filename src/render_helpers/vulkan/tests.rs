@@ -3155,9 +3155,9 @@ fn timestamp_ticks_masks_and_wraps() {
 /// cached [`GlyphRun`] is handed back, so no shape and no upload submit happen.
 ///
 /// This is the frame-cost fix, so the assertion is on the *counters*, not on the
-/// pixels — a run rebuilt every frame renders identically and costs an atlas
-/// image plus a fence wait each time, which is exactly the regression that would
-/// otherwise slip back in unnoticed.
+/// pixels — a run rebuilt every frame renders identically and costs a fence wait
+/// each time, which is exactly the regression that would otherwise slip back in
+/// unnoticed.
 #[test]
 fn a_repeated_glyph_run_is_cached() {
     let mut vk = match VulkanRenderer::new() {
@@ -3184,19 +3184,126 @@ fn a_repeated_glyph_run_is_cached() {
         first.glyphs().len(),
         "the cached run does not match the run it replaced"
     );
+}
 
-    // A different string, size or weight is a different run and must still build.
-    for (text, px, bold) in [
-        ("other", 20.0, false),
-        ("cached", 21.0, false),
-        ("cached", 20.0, true),
-    ] {
+/// **New text made of already-drawn glyphs must cost no GPU round trip.**
+///
+/// This is the whole reason the atlas is persistent. A clock showing seconds is
+/// never the same string twice, so the run cache always misses on it — but the
+/// digits it is made of were rasterized the first time round, so re-shaping must
+/// be pure CPU. Before the persistent atlas each such string allocated a fresh
+/// atlas image and paid an upload submit, once a second, forever.
+///
+/// Asserted on the submit counter because that is the cost: the pixels are
+/// identical either way.
+#[test]
+fn text_of_resident_glyphs_costs_no_submit() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping text_of_resident_glyphs_costs_no_submit: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Make every digit and the separator resident, the way a first clock tick would.
+    let warm = vk.build_glyph_run("0123456789:", 20.0).expect("glyph run");
+    assert!(!warm.glyphs().is_empty(), "no glyphs were shaped");
+
+    // Now a run of the same glyphs in a combination never drawn before — a later second.
+    for text in ["12:34:56", "12:34:57", "09:58:03"] {
         let submits = niri_vk::stats::submits();
-        vk.build_glyph_run_weighted(text, px, bold)
-            .expect("glyph run");
+        let shapes = niri_vk::stats::shapes();
+        let run = vk.build_glyph_run(text, 20.0).expect("glyph run");
+        assert_eq!(
+            run.glyphs().len(),
+            text.chars().filter(|c| !c.is_whitespace()).count(),
+            "{text:?} placed the wrong number of glyphs"
+        );
+        assert_eq!(
+            niri_vk::stats::submits(),
+            submits,
+            "{text:?} cost a GPU round trip despite every glyph being resident"
+        );
         assert!(
-            niri_vk::stats::submits() > submits,
-            "{text:?} at {px}px bold={bold} wrongly reused the cached run"
+            niri_vk::stats::shapes() > shapes,
+            "{text:?} should still have been shaped (only the rasterizing is saved)"
         );
     }
+
+    // A size or weight not yet resident is a genuinely new glyph set and must upload.
+    let submits = niri_vk::stats::submits();
+    vk.build_glyph_run_weighted("12:34:56", 20.0, true)
+        .expect("glyph run");
+    assert!(
+        niri_vk::stats::submits() > submits,
+        "bold digits were never rasterized, so they must reach the atlas"
+    );
+}
+
+/// Growing the atlas must not corrupt runs already built against the smaller image: each holds
+/// its own reference, so the old image stays alive and its coordinates stay right. Drawn rather
+/// than counted — this is the case where getting it wrong shows up as garbled glyphs.
+#[test]
+fn runs_survive_an_atlas_growth() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping runs_survive_an_atlas_growth: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let before = vk.build_glyph_run("before", 18.0).expect("glyph run");
+    let placements: Vec<_> = before.glyphs().to_vec();
+
+    // Force growth: a full printable-ASCII set at a large size, in both weights.
+    let ascii: String = (33u8..127).map(char::from).collect();
+    for px in [64.0, 96.0, 128.0] {
+        for bold in [false, true] {
+            let _ = vk.build_glyph_run_weighted(&ascii, px, bold);
+        }
+    }
+
+    // The old run is untouched — same atlas, same slots — and still draws.
+    let same = before.glyphs().len() == placements.len()
+        && before.glyphs().iter().zip(&placements).all(|(a, b)| {
+            (a.x, a.y, a.w, a.h, a.atlas_x, a.atlas_y) == (b.x, b.y, b.w, b.h, b.atlas_x, b.atlas_y)
+        });
+    assert!(same, "an atlas growth rewrote a run built before it");
+
+    let size = Size::<i32, Physical>::from((200, 48));
+    let full = Rectangle::from_size(size);
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((200, 48)))
+        .expect("vulkan offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("frame");
+        frame
+            .clear(Color32F::from([0., 0., 0., 1.]), &[full])
+            .expect("clear");
+        frame
+            .render_glyphs(
+                &before,
+                Point::from((8, 8)),
+                [1.0, 1.0, 1.0, 1.0],
+                full,
+                &[full],
+            )
+            .expect("draw the pre-growth run");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((200, 48)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 150).count();
+    assert!(
+        ink > 0,
+        "a run built before the atlas grew drew nothing afterwards"
+    );
 }

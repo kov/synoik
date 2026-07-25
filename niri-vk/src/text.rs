@@ -28,7 +28,7 @@ use swash::zeno::{Format, Vector};
 use crate::gpu::Gpu;
 use crate::render::{as_bytes, load_module, TextPush};
 use crate::shaders::{TEXT_FRAG, TEXT_VERT};
-use crate::texture::Texture;
+use crate::texture::{CoverageRegion, Texture};
 
 /// One placed glyph: where it goes on screen (run-local, top-left) and its slot in the atlas.
 #[derive(Clone, Copy, Debug)]
@@ -41,15 +41,16 @@ pub struct PlacedGlyph {
     pub atlas_y: u32,
 }
 
-pub struct GlyphAtlas {
-    pub texture: Texture,
+/// A shaped, rasterized run, with every glyph resolved to a slot in the caller's persistent
+/// atlas. Holds no GPU resource: the atlas image belongs to whoever owns
+/// [`GlyphAtlasIndex`]'s companion texture, and outlives any one run.
+pub struct ShapedRun {
     pub glyphs: Vec<PlacedGlyph>,
     /// Source-span index of each glyph in [`Self::glyphs`], parallel to it. For
-    /// [`TextContext::build_paragraph`] this is the position in its `spans` slice; for the
-    /// single-run [`TextContext::build_atlas`] it is all zeroes. Lets a caller recover a span's
-    /// ink rectangle to paint an inline background (e.g. a keycap).
+    /// [`TextContext::shape_paragraph`] this is the position in its `spans` slice; for a single
+    /// run it is all zeroes. Lets a caller recover a span's ink rectangle to paint an inline
+    /// background (e.g. a keycap).
     pub spans: Vec<u32>,
-    pub side: u32,
     /// Line-box metrics of the run's first line, in physical px, for baseline (line-box) vertical
     /// centering — what GNOME/Pango do (center the font's ascent+descent extents, reserving
     /// descent space) rather than ink centering. `baseline` is the run-local y of the first
@@ -61,8 +62,135 @@ pub struct GlyphAtlas {
     pub descent: f32,
 }
 
-/// Atlas slot (top-left in atlas px) for each distinct glyph, keyed by its shaping cache key.
-type GlyphSlots = HashMap<CacheKey, (u32, u32)>;
+/// Where one glyph lives in the atlas, plus the ink offset from its pen position (swash's
+/// `placement.left`/`top`). Cached so a glyph is rasterized once for the life of the atlas.
+#[derive(Clone, Copy, Debug)]
+struct GlyphSlot {
+    atlas_x: u32,
+    atlas_y: u32,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+}
+
+/// The largest atlas we will grow to, per side. 2048² R8 is 4 MiB.
+pub const MAX_ATLAS_SIDE: u32 = 2048;
+
+/// Where a fresh atlas starts. 512² R8 is 256 KiB and comfortably holds the Latin alphabet at
+/// every size and weight the chrome uses, so in practice it never grows.
+pub const INITIAL_ATLAS_SIDE: u32 = 512;
+
+/// CPU-side residency map for a **persistent** glyph atlas: which glyph occupies which slot, and
+/// where the next one can go.
+///
+/// Owns no GPU resource. The atlas image belongs to the renderer — that is where texture
+/// ownership and uploads live — and the two are kept in step by [`Self::generation`]: when it
+/// changes, the image must be recreated at [`Self::side`] and every run built against the old one
+/// keeps working, because it holds its own reference to the old image.
+///
+/// This is the whole point of the persistent atlas: a run whose glyphs are already resident needs
+/// no rasterization and no upload, so redrawing changing text (a clock ticking seconds) costs a
+/// shape and nothing else. The per-run atlas it replaced allocated a fresh image and paid an
+/// upload — a full GPU round trip — for every string, every frame.
+pub struct GlyphAtlasIndex {
+    side: u32,
+    allocator: AtlasAllocator,
+    /// `None` marks a key that draws nothing (whitespace, missing font, empty raster), remembered
+    /// so we neither re-rasterize it nor emit an instance for it.
+    slots: HashMap<CacheKey, Option<GlyphSlot>>,
+    generation: u64,
+}
+
+impl GlyphAtlasIndex {
+    fn new(side: u32) -> Self {
+        GlyphAtlasIndex {
+            side,
+            allocator: AtlasAllocator::new(size2(side as i32, side as i32)),
+            slots: HashMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// Side length of the atlas image this index describes.
+    pub fn side(&self) -> u32 {
+        self.side
+    }
+
+    /// Bumped whenever the image must be recreated (only on growth). The owner of the image
+    /// compares against its own copy to decide whether to reallocate.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Double the atlas and forget every slot, so the run that ran out is re-rasterized into the
+    /// larger image. Returns `false` at [`MAX_ATLAS_SIDE`], where the caller must fail the run.
+    ///
+    /// Wholesale reset rather than a repack: the glyphs are cheap to rasterize again, a repack
+    /// would have to rewrite every already-built run's coordinates, and growth is a once-ever
+    /// event in practice.
+    fn grow(&mut self) -> bool {
+        if self.side >= MAX_ATLAS_SIDE {
+            return false;
+        }
+        self.side *= 2;
+        self.allocator = AtlasAllocator::new(size2(self.side as i32, self.side as i32));
+        self.slots.clear();
+        self.generation += 1;
+        true
+    }
+
+    /// Reserve a slot for a rasterized glyph, or `None` if the atlas is out of room. The `+1` on
+    /// each side is a bleed guard, so NEAREST sampling at the slot edge cannot pick up a
+    /// neighbour.
+    fn allocate(&mut self, key: CacheKey, raster: &GlyphRaster) -> Option<GlyphSlot> {
+        let alloc = self
+            .allocator
+            .allocate(size2(raster.w as i32 + 1, raster.h as i32 + 1))?;
+        let slot = GlyphSlot {
+            atlas_x: alloc.rectangle.min.x as u32,
+            atlas_y: alloc.rectangle.min.y as u32,
+            w: raster.w,
+            h: raster.h,
+            left: raster.left,
+            top: raster.top,
+        };
+        self.slots.insert(key, Some(slot));
+        Some(slot)
+    }
+}
+
+/// One glyph's hinted R8 coverage bitmap, as swash rasterized it.
+struct GlyphRaster {
+    data: Vec<u8>,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+}
+
+/// A glyph that just became resident and still has to reach the atlas image. The caller uploads
+/// these (one round trip for the batch) before drawing the run.
+pub struct PendingGlyph {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub coverage: Vec<u8>,
+}
+
+impl PendingGlyph {
+    /// Borrow as an upload region for [`Texture::upload_coverage_regions`].
+    pub fn region(&self) -> CoverageRegion<'_> {
+        CoverageRegion {
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+            coverage: &self.coverage,
+        }
+    }
+}
 
 /// A process-global font system used only for GPU-free text *measurement* — sizing a hit rectangle
 /// or a layout box before any renderer (hence any [`TextContext`]) exists. The first call scans the
@@ -225,12 +353,14 @@ pub fn wrap_lines_weighted(
 
 /// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
 /// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and
-/// cheap to reuse, so the compositor holds ONE `TextContext` for the life of the renderer and
-/// rebuilds only the per-string atlas. (The atlas itself is still per-call for now — a shared
-/// growing atlas is deferred until dynamic text needs it.)
+/// cheap to reuse, so the compositor holds ONE `TextContext` for the life of the renderer.
+///
+/// It also owns the residency map for the **persistent** glyph atlas ([`GlyphAtlasIndex`]): glyphs
+/// are rasterized once and stay, so re-shaping changing text costs a shape and nothing more.
 pub struct TextContext {
     fonts: FontSystem,
     scale: ScaleContext,
+    atlas: GlyphAtlasIndex,
 }
 
 impl Default for TextContext {
@@ -244,31 +374,28 @@ impl TextContext {
         TextContext {
             fonts: FontSystem::new(),
             scale: ScaleContext::new(),
+            atlas: GlyphAtlasIndex::new(INITIAL_ATLAS_SIDE),
         }
     }
 
-    /// Shape a single run of `text` at `px` pixels-per-em (SansSerif), rasterize hinted, and pack
-    /// into an R8 coverage atlas, reusing this context's font system and scaler cache.
-    pub fn build_atlas(
-        &mut self,
-        gpu: &Gpu,
-        pool: vk::CommandPool,
-        text: &str,
-        px: f32,
-    ) -> Result<GlyphAtlas> {
-        self.build_atlas_weighted(gpu, pool, text, px, false)
+    /// Shape `text` at `px` pixels-per-em (SansSerif) and resolve every glyph into the persistent
+    /// atlas, rasterizing and returning only the glyphs that were not already resident.
+    ///
+    /// The returned [`PendingGlyph`]s must be uploaded into the atlas image before the run is
+    /// drawn; an empty list — the steady state, once the alphabet in use is resident — means the
+    /// run needs no GPU work at all.
+    pub fn shape_line(&mut self, text: &str, px: f32) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
+        self.shape_line_weighted(text, px, false)
     }
 
-    /// Like [`Self::build_atlas`], but shapes and rasterizes at [`Weight::BOLD`] when `bold` — the
+    /// Like [`Self::shape_line`], but shapes and rasterizes at [`Weight::BOLD`] when `bold` — the
     /// bold panel-clock path (GNOME's `panel_button` is `font-weight: bold`).
-    pub fn build_atlas_weighted(
+    pub fn shape_line_weighted(
         &mut self,
-        gpu: &Gpu,
-        pool: vk::CommandPool,
         text: &str,
         px: f32,
         bold: bool,
-    ) -> Result<GlyphAtlas> {
+    ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         let _timed = crate::stats::shape();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
@@ -279,23 +406,20 @@ impl TextContext {
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
-        Self::rasterize(&mut self.fonts, &mut self.scale, gpu, pool, &buffer)
+        self.resolve(&buffer)
     }
 
     /// Lay out a styled, center-aligned paragraph wrapped to `wrap_px` pixels: each [`TextSpan`]
     /// carries its own family/weight/size (via cosmic-text rich text), and the multi-line result is
-    /// rasterized hinted into one R8 coverage atlas. `base_px` sets the default line metrics.
-    /// Glyph placements are paragraph-local (top-left origin), so one [`GlyphAtlas`] draws the
-    /// whole block. This is the dialog/notification text path (title + body + hints in one
-    /// box).
-    pub fn build_paragraph(
+    /// resolved into the same persistent atlas. `base_px` sets the default line metrics.
+    /// Glyph placements are paragraph-local (top-left origin), so one atlas draws the whole block.
+    /// This is the dialog/notification text path (title + body + hints in one box).
+    pub fn shape_paragraph(
         &mut self,
-        gpu: &Gpu,
-        pool: vk::CommandPool,
         spans: &[TextSpan],
         wrap_px: f32,
         base_px: f32,
-    ) -> Result<GlyphAtlas> {
+    ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         let _timed = crate::stats::shape();
         let mut buffer = Buffer::new(
             &mut self.fonts,
@@ -307,7 +431,7 @@ impl TextContext {
             b.set_size(Some(wrap_px), None);
             let default_attrs = Attrs::new().family(SANS_FAMILY);
             // Tag each span with its index (cosmic-text carries it to every laid-out glyph as
-            // `metadata`), so `rasterize` can record which span each glyph came from and a caller
+            // `metadata`), so `resolve` can record which span each glyph came from and a caller
             // can recover a span's ink rectangle (e.g. to paint an inline keycap background).
             let rich = spans
                 .iter()
@@ -316,37 +440,39 @@ impl TextContext {
             b.set_rich_text(rich, &default_attrs, Shaping::Advanced, Some(Align::Center));
             b.shape_until_scroll(false);
         }
-        Self::rasterize(&mut self.fonts, &mut self.scale, gpu, pool, &buffer)
+        self.resolve(&buffer)
     }
 
-    /// Rasterize every glyph of an already-shaped `buffer` (hinted) into one R8 coverage atlas.
-    /// Shared by [`Self::build_atlas`] and [`Self::build_paragraph`]; the placements it emits are
-    /// buffer-local (top-left), spanning as many lines as the buffer holds.
-    fn rasterize(
-        fonts: &mut FontSystem,
-        ctx: &mut ScaleContext,
-        gpu: &Gpu,
-        pool: vk::CommandPool,
-        buffer: &Buffer,
-    ) -> Result<GlyphAtlas> {
-        // One R8 coverage bitmap per DISTINCT glyph (a `CacheKey` folds in glyph id, font, size,
-        // weight, and subpixel bin) — a repeated character costs one atlas slot, not one per
-        // instance. Rasterize each distinct glyph once; every on-screen instance then points at the
-        // shared slot. Without this dedup a long line (a pasted / history-recalled command) blows a
-        // fixed atlas one slot per character; with it the slot count is bounded by the alphabet.
-        struct Raster {
-            data: Vec<u8>,
-            w: u32,
-            h: u32,
-            left: i32,
-            top: i32,
-        }
-        // `None` marks a key that draws nothing (whitespace / missing font / empty raster), so we
-        // neither re-rasterize it nor emit an instance for it.
-        let mut distinct: HashMap<CacheKey, Option<Raster>> = HashMap::new();
-        // Per-instance placement (one entry per on-screen glyph): key, x, y, source-span index.
-        let mut instances: Vec<(CacheKey, i32, i32, u32)> = Vec::new();
+    /// The atlas residency map, for the owner of the atlas image (see [`GlyphAtlasIndex`]).
+    pub fn atlas(&self) -> &GlyphAtlasIndex {
+        &self.atlas
+    }
 
+    /// Resolve every glyph of an already-shaped `buffer` into the persistent atlas. Shared by
+    /// [`Self::shape_line_weighted`] and [`Self::shape_paragraph`]; the placements it emits are
+    /// buffer-local (top-left), spanning as many lines as the buffer holds.
+    ///
+    /// Grows the atlas and retries whenever a glyph does not fit, which discards residency — so
+    /// the next pass re-rasterizes this run's glyphs, and any earlier run keeps drawing from the
+    /// image it was built against.
+    ///
+    /// Loops rather than retrying once: a single doubling need not be enough (a full ASCII set at
+    /// 44px overflows both a 64px atlas and the 128px one it first grows to), and stopping early
+    /// would fail a run the atlas can in fact hold.
+    fn resolve(&mut self, buffer: &Buffer) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
+        loop {
+            if let Some(resolved) = self.resolve_once(buffer) {
+                return Ok(resolved);
+            }
+            if !self.atlas.grow() {
+                bail!("glyph atlas full at {MAX_ATLAS_SIDE}px");
+            }
+        }
+    }
+
+    /// One resolution pass. `None` means the atlas ran out of room, which is the caller's cue to
+    /// grow and retry — not an error.
+    fn resolve_once(&mut self, buffer: &Buffer) -> Option<(ShapedRun, Vec<PendingGlyph>)> {
         // Line-box metrics for baseline centering: the font's ascent/descent (px) at this size,
         // taken from the first line's first glyph, plus that line's baseline. Pango/St center a
         // single-line label on this box (ascent+descent) — reserving descent space — not on the
@@ -358,7 +484,7 @@ impl TextContext {
         'metrics: for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
-                if let Some(font) = fonts.get_font(key.font_id, key.font_weight) {
+                if let Some(font) = self.fonts.get_font(key.font_id, key.font_weight) {
                     let m = font.as_swash().metrics(&[]).scale(ppem);
                     baseline = run.line_y.round() as i32;
                     ascent = m.ascent;
@@ -368,147 +494,112 @@ impl TextContext {
             }
         }
 
+        let mut glyphs = Vec::new();
+        let mut spans = Vec::new();
+        let mut pending = Vec::new();
+
         for run in buffer.layout_runs() {
-            let baseline = run.line_y.round() as i32;
+            let line_baseline = run.line_y.round() as i32;
             for glyph in run.glyphs {
                 // Whole-pixel origin: round X, then physical() truncates Y (its own hinting).
                 let mut lg = glyph.clone();
                 lg.x = lg.x.round();
                 let phys = lg.physical((0.0, 0.0), 1.0);
                 let key = phys.cache_key;
-                let span = glyph.metadata as u32;
 
-                let raster = distinct.entry(key).or_insert_with(|| {
-                    // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
-                    let font = fonts.get_font(key.font_id, key.font_weight)?;
-                    let mut scaler = ctx
-                        .builder(font.as_swash())
-                        .size(f32::from_bits(key.font_size_bits))
-                        .hint(true)
-                        .build();
-
-                    // Subpixel remainder from the cache key (0 once fully snapped).
-                    let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
-                    let image = Render::new(&[Source::Outline])
-                        .format(Format::Alpha)
-                        .offset(offset)
-                        .render(&mut scaler, key.glyph_id)?;
-
-                    let (w, h) = (image.placement.width, image.placement.height);
-                    if w == 0 || h == 0 {
-                        return None; // whitespace: no bitmap, pen still advances
+                // One coverage bitmap per DISTINCT glyph (a `CacheKey` folds in glyph id, font,
+                // size, weight, and subpixel bin), and now for the life of the atlas rather than
+                // of one run — so a repeated character, a repeated label, and the same digit next
+                // second all share the slot.
+                let slot = match self.atlas.slots.get(&key) {
+                    Some(cached) => *cached,
+                    None => {
+                        let raster = Self::rasterize_glyph(&mut self.fonts, &mut self.scale, key);
+                        match raster {
+                            Some(raster) => {
+                                let slot = self.atlas.allocate(key, &raster)?;
+                                pending.push(PendingGlyph {
+                                    x: slot.atlas_x,
+                                    y: slot.atlas_y,
+                                    w: slot.w,
+                                    h: slot.h,
+                                    coverage: raster.data,
+                                });
+                                Some(slot)
+                            }
+                            None => {
+                                // Whitespace / missing glyph: no bitmap, pen still advances.
+                                self.atlas.slots.insert(key, None);
+                                None
+                            }
+                        }
                     }
-                    debug_assert!(matches!(image.content, Content::Mask));
-                    Some(Raster {
-                        data: image.data,
-                        w,
-                        h,
-                        left: image.placement.left,
-                        top: image.placement.top,
-                    })
-                });
+                };
 
-                if let Some(raster) = raster {
-                    instances.push((
-                        key,
-                        phys.x + raster.left,
-                        baseline + phys.y - raster.top,
-                        span,
-                    ));
+                if let Some(slot) = slot {
+                    glyphs.push(PlacedGlyph {
+                        x: phys.x + slot.left,
+                        y: line_baseline + phys.y - slot.top,
+                        w: slot.w,
+                        h: slot.h,
+                        atlas_x: slot.atlas_x,
+                        atlas_y: slot.atlas_y,
+                    });
+                    spans.push(glyph.metadata as u32);
                 }
             }
         }
 
-        // Demand-size the atlas: pick the smallest power-of-two square that plausibly holds every
-        // distinct slot (each `(w+1)x(h+1)` for a 1px bleed guard), then pack. `pack` returns the
-        // per-key slot positions, or `None` if this side couldn't fit them (etagere packing can
-        // fall short of the area estimate); grow and retry up to `MAX_SIDE`.
-        const MAX_SIDE: u32 = 2048;
-        let drawn: Vec<(CacheKey, &Raster)> = distinct
-            .iter()
-            .filter_map(|(k, r)| r.as_ref().map(|r| (*k, r)))
-            .collect();
+        Some((
+            ShapedRun {
+                glyphs,
+                spans,
+                baseline,
+                ascent,
+                descent,
+            },
+            pending,
+        ))
+    }
 
-        let total_area: u64 = drawn
-            .iter()
-            .map(|(_, r)| u64::from(r.w + 1) * u64::from(r.h + 1))
-            .sum();
-        let max_slot = drawn
-            .iter()
-            .map(|(_, r)| (r.w + 1).max(r.h + 1))
-            .max()
-            .unwrap_or(1);
-        // Start from the larger of 256, the biggest single slot, and ~sqrt(area / 0.7 packing).
-        let mut side = 256u32.max(max_slot.next_power_of_two());
-        while side < MAX_SIDE && u64::from(side) * u64::from(side) * 7 < total_area * 10 {
-            side *= 2;
+    /// Rasterize one glyph, hinted. `None` for a glyph with no ink (whitespace) or a font that no
+    /// longer resolves.
+    fn rasterize_glyph(
+        fonts: &mut FontSystem,
+        ctx: &mut ScaleContext,
+        key: CacheKey,
+    ) -> Option<GlyphRaster> {
+        // Same font cosmic-text shaped with (get_font promotes File->SharedFile).
+        let font = fonts.get_font(key.font_id, key.font_weight)?;
+        let mut scaler = ctx
+            .builder(font.as_swash())
+            .size(f32::from_bits(key.font_size_bits))
+            .hint(true)
+            .build();
+
+        // Subpixel remainder from the cache key (0 once fully snapped).
+        let offset = Vector::new(key.x_bin.as_float(), key.y_bin.as_float());
+        let image = Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .offset(offset)
+            .render(&mut scaler, key.glyph_id)?;
+
+        let (w, h) = (image.placement.width, image.placement.height);
+        if w == 0 || h == 0 {
+            return None;
         }
-
-        let pack = |side: u32| -> Option<(Vec<u8>, GlyphSlots)> {
-            let mut pixels = vec![0u8; (side * side) as usize];
-            let mut atlas = AtlasAllocator::new(size2(side as i32, side as i32));
-            let mut slots = HashMap::with_capacity(drawn.len());
-            for (key, r) in &drawn {
-                let alloc = atlas.allocate(size2(r.w as i32 + 1, r.h as i32 + 1))?;
-                let (ax, ay) = (alloc.rectangle.min.x as u32, alloc.rectangle.min.y as u32);
-                for row in 0..r.h {
-                    let src = &r.data[(row * r.w) as usize..((row + 1) * r.w) as usize];
-                    let dst = ((ay + row) * side + ax) as usize;
-                    pixels[dst..dst + r.w as usize].copy_from_slice(src);
-                }
-                slots.insert(*key, (ax, ay));
-            }
-            Some((pixels, slots))
-        };
-
-        let (atlas_pixels, slots) = loop {
-            if let Some(packed) = pack(side) {
-                break packed;
-            }
-            if side >= MAX_SIDE {
-                bail!(
-                    "glyph atlas full: {} distinct glyphs exceed {MAX_SIDE}px",
-                    drawn.len()
-                );
-            }
-            side *= 2;
-        };
-
-        // Resolve every instance to its shared slot; `spans` stays parallel to `glyphs`.
-        let mut glyphs = Vec::with_capacity(instances.len());
-        let mut spans = Vec::with_capacity(instances.len());
-        for &(key, x, y, span) in &instances {
-            let (ax, ay) = slots[&key];
-            let r = distinct[&key]
-                .as_ref()
-                .expect("drawn instance has a raster");
-            glyphs.push(PlacedGlyph {
-                x,
-                y,
-                w: r.w,
-                h: r.h,
-                atlas_x: ax,
-                atlas_y: ay,
-            });
-            spans.push(span);
-        }
-
-        // 1:1 glyph-px to screen-px with integer placement, so NEAREST sampling is pixel-exact.
-        let texture =
-            Texture::from_coverage(gpu, pool, side, side, &atlas_pixels, vk::Filter::NEAREST)?;
-        Ok(GlyphAtlas {
-            texture,
-            glyphs,
-            spans,
-            side,
-            baseline,
-            ascent,
-            descent,
+        debug_assert!(matches!(image.content, Content::Mask));
+        Some(GlyphRaster {
+            data: image.data,
+            w,
+            h,
+            left: image.placement.left,
+            top: image.placement.top,
         })
     }
 }
 
-/// One styled span of a [`TextContext::build_paragraph`] paragraph.
+/// One styled span of a [`TextContext::shape_paragraph`] paragraph.
 #[derive(Clone, Copy)]
 pub struct TextSpan<'a> {
     pub text: &'a str,
@@ -566,11 +657,30 @@ impl TextSpan<'_> {
     }
 }
 
-/// Shape `text` at `px` pixels-per-em, rasterize hinted, and pack into an R8 coverage atlas.
-/// One-shot: builds a throwaway [`TextContext`]. Callers drawing repeatedly should hold a
-/// `TextContext` and call [`TextContext::build_atlas`] to reuse the font system.
-pub fn build_text(gpu: &Gpu, pool: vk::CommandPool, text: &str, px: f32) -> Result<GlyphAtlas> {
-    TextContext::new().build_atlas(gpu, pool, text, px)
+/// Shape `text` at `px` pixels-per-em into a freshly allocated coverage atlas, returning the atlas
+/// image, its side, and the run.
+///
+/// One-shot: builds a throwaway [`TextContext`], so it also throws away glyph residency. Callers
+/// drawing repeatedly should hold a `TextContext` and call [`TextContext::shape_line`], which is
+/// the whole point of the persistent atlas.
+pub fn build_text(
+    gpu: &Gpu,
+    pool: vk::CommandPool,
+    text: &str,
+    px: f32,
+) -> Result<(Texture, u32, ShapedRun)> {
+    let mut ctx = TextContext::new();
+    let (run, pending) = ctx.shape_line(text, px)?;
+    let side = ctx.atlas().side();
+    let texture = Texture::new_coverage_atlas(gpu, pool, side)?;
+    let regions: Vec<_> = pending.iter().map(PendingGlyph::region).collect();
+    match texture.upload_coverage_regions(gpu, pool, &regions) {
+        Ok(()) => Ok((texture, side, run)),
+        Err(err) => {
+            texture.destroy(gpu);
+            Err(err)
+        }
+    }
 }
 
 /// Graphics pipeline for glyph quads: `text.vert` + `text.frag`, alpha blending on, one sampler.
@@ -675,21 +785,23 @@ impl TextRenderer {
         })
     }
 
-    /// Draw every glyph in `atlas`, offset to `(ox, oy)` in a `target`-sized image, in `color`
+    /// Draw every glyph of `run`, offset to `(ox, oy)` in a `target`-sized image, in `color`
     /// (**premultiplied** — the glyph material blends premultiplied-over like every other).
+    /// `atlas_side` is the side of the atlas `set` samples, for the UV divide.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         gpu: &Gpu,
         cbuf: vk::CommandBuffer,
         set: vk::DescriptorSet,
-        atlas: &GlyphAtlas,
+        run: &ShapedRun,
+        atlas_side: u32,
         origin: (f32, f32),
         target: [f32; 2],
         color: [f32; 4],
     ) {
         let device = &gpu.device;
-        let side = atlas.side as f32;
+        let side = atlas_side as f32;
         unsafe {
             device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             device.cmd_bind_descriptor_sets(
@@ -700,7 +812,7 @@ impl TextRenderer {
                 &[set],
                 &[],
             );
-            for g in &atlas.glyphs {
+            for g in &run.glyphs {
                 let push = TextPush {
                     origin: [origin.0 + g.x as f32, origin.1 + g.y as f32],
                     size: [g.w as f32, g.h as f32],
@@ -752,6 +864,59 @@ mod tests {
         ]
     }
 
+    /// Owns the atlas image for a [`TextContext`], recreating it when the residency index's
+    /// generation moves and uploading each run's newly resident glyphs. This is the same handshake
+    /// the compositor's renderer keeps, deliberately — including the ordering that matters:
+    /// **check the generation before uploading**, because a run that grew the atlas mid-resolve
+    /// returns slots for the new, larger image.
+    struct TestAtlas {
+        texture: Texture,
+        generation: u64,
+        side: u32,
+    }
+
+    impl TestAtlas {
+        fn new(gpu: &Gpu, pool: vk::CommandPool, ctx: &TextContext) -> Result<Self> {
+            let side = ctx.atlas().side();
+            Ok(TestAtlas {
+                texture: Texture::new_coverage_atlas(gpu, pool, side)?,
+                generation: ctx.atlas().generation(),
+                side,
+            })
+        }
+
+        fn absorb(
+            &mut self,
+            gpu: &Gpu,
+            pool: vk::CommandPool,
+            ctx: &TextContext,
+            pending: &[PendingGlyph],
+        ) -> Result<()> {
+            if ctx.atlas().generation() != self.generation {
+                self.texture.destroy(gpu);
+                self.side = ctx.atlas().side();
+                self.texture = Texture::new_coverage_atlas(gpu, pool, self.side)?;
+                self.generation = ctx.atlas().generation();
+            }
+            let regions: Vec<_> = pending.iter().map(PendingGlyph::region).collect();
+            self.texture.upload_coverage_regions(gpu, pool, &regions)
+        }
+    }
+
+    /// Shape `text` through `ctx` into a fresh atlas image and return both.
+    fn shape_into_atlas(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        ctx: &mut TextContext,
+        text: &str,
+        px: f32,
+    ) -> Result<(ShapedRun, TestAtlas)> {
+        let (run, pending) = ctx.shape_line(text, px)?;
+        let mut atlas = TestAtlas::new(gpu, pool, ctx)?;
+        atlas.absorb(gpu, pool, ctx, &pending)?;
+        Ok((run, atlas))
+    }
+
     /// Render one string through `ctx` into a `tw`x`th` RGBA target and read it back.
     fn render_string(
         gpu: &Gpu,
@@ -762,19 +927,20 @@ mod tests {
         tw: u32,
         th: u32,
     ) -> Result<Vec<u8>> {
-        let atlas = ctx.build_atlas(gpu, pool, text, px)?;
-        anyhow::ensure!(!atlas.glyphs.is_empty(), "no glyphs shaped for {text:?}");
-        let pixels = render_atlas(gpu, pool, &atlas, (10.0, 8.0), tw, th);
+        let (run, atlas) = shape_into_atlas(gpu, pool, ctx, text, px)?;
+        anyhow::ensure!(!run.glyphs.is_empty(), "no glyphs shaped for {text:?}");
+        let pixels = render_run(gpu, pool, &atlas, &run, (10.0, 8.0), tw, th);
         atlas.texture.destroy(gpu);
         pixels
     }
 
-    /// Draw a prebuilt `atlas` at `origin` into a `tw`x`th` RGBA target and read it back. The
-    /// caller owns `atlas` (its texture is not destroyed here).
-    fn render_atlas(
+    /// Draw a shaped `run` from `atlas` at `origin` into a `tw`x`th` RGBA target and read it back.
+    /// The caller owns `atlas` (its texture is not destroyed here).
+    fn render_run(
         gpu: &Gpu,
         pool: vk::CommandPool,
-        atlas: &GlyphAtlas,
+        atlas: &TestAtlas,
+        run: &ShapedRun,
         origin: (f32, f32),
         tw: u32,
         th: u32,
@@ -808,7 +974,7 @@ mod tests {
         let dims = [tw as f32, th as f32];
         gpu.run_commands(pool, |cbuf| {
             target.begin(gpu, cbuf, unorm(BG));
-            renderer.draw(gpu, cbuf, set, atlas, origin, dims, unorm(FG));
+            renderer.draw(gpu, cbuf, set, run, atlas.side, origin, dims, unorm(FG));
             unsafe { gpu.device.cmd_end_render_pass(cbuf) };
         })?;
         let pixels = target.read_back(gpu, pool)?;
@@ -978,16 +1144,13 @@ mod tests {
                 px: 11.0,
             },
         ];
-        let atlas = ctx
-            .build_paragraph(&gpu, pool, &spans, 360.0, 14.0)
-            .unwrap();
-        assert!(
-            !atlas.glyphs.is_empty(),
-            "no glyphs shaped for the paragraph"
-        );
+        let (run, pending) = ctx.shape_paragraph(&spans, 360.0, 14.0).unwrap();
+        let mut atlas = TestAtlas::new(&gpu, pool, &ctx).unwrap();
+        atlas.absorb(&gpu, pool, &ctx, &pending).unwrap();
+        assert!(!run.glyphs.is_empty(), "no glyphs shaped for the paragraph");
 
-        let min_y = atlas.glyphs.iter().map(|g| g.y).min().unwrap();
-        let max_y = atlas.glyphs.iter().map(|g| g.y + g.h as i32).max().unwrap();
+        let min_y = run.glyphs.iter().map(|g| g.y).min().unwrap();
+        let max_y = run.glyphs.iter().map(|g| g.y + g.h as i32).max().unwrap();
         assert!(
             max_y - min_y > 30,
             "expected a multi-line paragraph, got vertical span {min_y}..{max_y}",
@@ -995,7 +1158,7 @@ mod tests {
 
         let tw = 400u32;
         let th = (max_y as u32) + 40;
-        let pixels = render_atlas(&gpu, pool, &atlas, (20.0, 10.0), tw, th).unwrap();
+        let pixels = render_run(&gpu, pool, &atlas, &run, (20.0, 10.0), tw, th).unwrap();
         let band_bright = |y0: u32, y1: u32| -> usize {
             let mut n = 0;
             for y in y0..y1 {
@@ -1019,96 +1182,44 @@ mod tests {
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 
-    /// Three atlas-capacity invariants of the paragraph path:
+    /// Residency invariants of the persistent atlas — the properties the whole design exists for:
     ///  1. A long, high-DPI command line (the pathological run-dialog case) lays out every glyph
     ///     WITHOUT erroring — an errored draw would make the modal dialog vanish while it still
-    ///     owns the keyboard. (Dedup usually keeps it inside the 256px default, which is the
-    ///     point.)
-    ///  2. When there really are more distinct large glyphs than fit 256px, the atlas GROWS past
-    ///     256 instead of erroring.
-    ///  3. The same glyph repeated 400x dedups to ONE slot (atlas stays 256), yet every instance is
-    ///     still placed.
+    ///     owns the keyboard.
+    ///  2. Repeated glyphs share one slot, so 400 copies of a character cost one upload, not 400.
+    ///  3. **Re-shaping text whose glyphs are already resident uploads nothing.** This is the
+    ///     frame-cost property: a clock ticking seconds re-shapes every second and must not touch
+    ///     the GPU for it.
+    ///  4. Running out of room grows the atlas and still resolves, bumping the generation so the
+    ///     image's owner knows to reallocate — never an error while under `MAX_ATLAS_SIDE`.
     #[test]
-    fn build_paragraph_atlas_capacity() {
+    fn the_atlas_keeps_glyphs_resident_across_runs() {
         let Ok(gpu) = Gpu::new() else {
-            eprintln!("no Vulkan device — skipping build_paragraph_atlas_capacity");
+            eprintln!("no Vulkan device — skipping the_atlas_keeps_glyphs_resident_across_runs");
             return;
         };
         let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
         let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.unwrap();
-
         let mut ctx = TextContext::new();
 
-        // (1) ~180 chars of a real command line at scale-2 sizes: this overflowed
-        // the old fixed 256x256 atlas and returned an error; it must lay out now.
-        let long = "firefox --new-window https://example.org/a/very/long/path?\
-                    q=alpha+beta+gamma&x=1&y=2&z=3#anchor-position-deep-in-the-doc \
-                    && echo done && ls -la /usr/share/applications | grep foo";
-        let long_spans = [
-            TextSpan {
-                text: "Run a Command",
-                family: SpanFamily::Sans,
-                bold: true,
-                px: 28.0,
-            },
-            TextSpan {
-                text: "\n\n",
-                family: SpanFamily::Sans,
-                bold: false,
-                px: 28.0,
-            },
-            TextSpan {
-                text: long,
-                family: SpanFamily::Mono,
-                bold: false,
-                px: 28.0,
-            },
-        ];
-        let atlas = ctx
-            .build_paragraph(&gpu, pool, &long_spans, 720.0, 28.0)
-            .expect("a long command line must lay out, not error");
+        // (1) Capacity: a long line at a large size lays out without erroring.
+        let long = "cargo build --workspace --all-targets 2>&1 | grep -E error".repeat(3);
+        let long_spans = [TextSpan {
+            text: &long,
+            family: SpanFamily::Mono,
+            bold: false,
+            px: 28.0,
+        }];
+        let (run, _) = ctx
+            .shape_paragraph(&long_spans, 720.0, 28.0)
+            .expect("a long high-DPI line must lay out, not error");
         assert!(
-            atlas.glyphs.len() > 100,
-            "expected the whole long line laid out, got {} glyphs",
-            atlas.glyphs.len()
+            run.glyphs.len() > 100,
+            "expected a long wrapped paragraph, got {} glyphs",
+            run.glyphs.len()
         );
-        atlas.texture.destroy(&gpu);
 
-        // (2) Force the grow path: the full printable-ASCII set in TWO styles
-        // (mono + bold sans) at a large size is ~180 genuinely distinct large
-        // glyphs — more than 256x256 holds even after dedup.
-        let ascii: String = (0x21u8..=0x7e).map(char::from).collect();
-        let grow_spans = [
-            TextSpan {
-                text: &ascii,
-                family: SpanFamily::Mono,
-                bold: false,
-                px: 44.0,
-            },
-            TextSpan {
-                text: "\n",
-                family: SpanFamily::Sans,
-                bold: false,
-                px: 44.0,
-            },
-            TextSpan {
-                text: &ascii,
-                family: SpanFamily::Sans,
-                bold: true,
-                px: 44.0,
-            },
-        ];
-        let atlas = ctx
-            .build_paragraph(&gpu, pool, &grow_spans, 100_000.0, 44.0)
-            .expect("a large distinct-glyph set must grow the atlas, not error");
-        assert!(
-            atlas.side > 256,
-            "expected a grown atlas for ~180 distinct large glyphs, got {}",
-            atlas.side
-        );
-        atlas.texture.destroy(&gpu);
-
-        // (3) Dedup: 400 copies of one glyph share one slot, so the atlas stays 256.
+        // (2) Dedup: 400 copies of one glyph share one slot.
         let repeated = "l".repeat(400);
         let dedup_spans = [TextSpan {
             text: &repeated,
@@ -1116,21 +1227,71 @@ mod tests {
             bold: false,
             px: 14.0,
         }];
-        let atlas = ctx
-            .build_paragraph(&gpu, pool, &dedup_spans, 100_000.0, 14.0)
+        let (run, pending) = ctx
+            .shape_paragraph(&dedup_spans, 100_000.0, 14.0)
             .expect("400 identical glyphs must dedup, not overflow");
         assert_eq!(
-            atlas.side, 256,
-            "identical glyphs should not grow the atlas (side {})",
-            atlas.side
-        );
-        assert_eq!(
-            atlas.glyphs.len(),
+            run.glyphs.len(),
             400,
             "every instance is still placed, got {}",
-            atlas.glyphs.len()
+            run.glyphs.len()
         );
-        atlas.texture.destroy(&gpu);
+        assert!(
+            pending.len() <= 1,
+            "400 copies of one glyph should need at most one upload, got {}",
+            pending.len()
+        );
+
+        // (3) Residency: shaping the same text again uploads nothing at all.
+        let generation = ctx.atlas().generation();
+        let (again, pending) = ctx
+            .shape_paragraph(&dedup_spans, 100_000.0, 14.0)
+            .expect("a re-shape must not fail");
+        assert!(
+            pending.is_empty(),
+            "re-shaping resident text uploaded {} glyph(s) — the atlas is not persisting",
+            pending.len()
+        );
+        assert_eq!(
+            ctx.atlas().generation(),
+            generation,
+            "a re-shape must not disturb the atlas"
+        );
+        assert_eq!(
+            again.glyphs.len(),
+            run.glyphs.len(),
+            "the re-shaped run differs from the first"
+        );
+
+        // (4) Growth: enough large distinct glyphs to exhaust a fresh atlas still resolve, and
+        // say so through the generation.
+        let mut small = TextContext::new();
+        small.atlas = GlyphAtlasIndex::new(64);
+        let ascii: String = (33u8..127).map(char::from).collect();
+        let grow_spans = [TextSpan {
+            text: &ascii,
+            family: SpanFamily::Sans,
+            bold: false,
+            px: 44.0,
+        }];
+        let (run, pending) = small
+            .shape_paragraph(&grow_spans, 100_000.0, 44.0)
+            .expect("a full atlas must grow, not error");
+        assert!(
+            small.atlas().generation() > 0,
+            "the atlas should have grown past its 64px start"
+        );
+        assert!(
+            small.atlas().side() > 64,
+            "grown side should exceed 64, got {}",
+            small.atlas().side()
+        );
+        assert!(!run.glyphs.is_empty(), "the grown run placed no glyphs");
+        assert_eq!(
+            pending.len(),
+            run.glyphs.len(),
+            "after growth every glyph is freshly resident, so all must be uploaded"
+        );
 
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
@@ -1169,21 +1330,20 @@ mod tests {
                 px: 20.0,
             },
         ];
-        let atlas = ctx
-            .build_paragraph(&gpu, pool, &spans, 100_000.0, 20.0)
-            .unwrap();
+        let (run, pending) = ctx.shape_paragraph(&spans, 100_000.0, 20.0).unwrap();
+        let mut atlas = TestAtlas::new(&gpu, pool, &ctx).unwrap();
+        atlas.absorb(&gpu, pool, &ctx, &pending).unwrap();
         assert_eq!(
-            atlas.spans.len(),
-            atlas.glyphs.len(),
+            run.spans.len(),
+            run.glyphs.len(),
             "spans must be parallel to glyphs"
         );
 
         // Horizontal ink extent of the glyphs tagged with a given span index.
         let span_x = |idx: u32| -> Option<(i32, i32)> {
-            atlas
-                .glyphs
+            run.glyphs
                 .iter()
-                .zip(&atlas.spans)
+                .zip(&run.spans)
                 .filter(|(_, s)| **s == idx)
                 .map(|(g, _)| (g.x, g.x + g.w as i32))
                 .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))

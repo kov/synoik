@@ -86,9 +86,12 @@ pub struct VulkanRenderer {
     /// The long-lived text stack (font system + scaler cache) behind [`Self::build_glyph_run`], so
     /// chrome redraws reshape a string without rescanning the system fonts each time.
     text_ctx: niri_vk::text::TextContext,
-    /// Shaped, rasterized single-line runs, keyed by `(text, px bits, bold)`. See
+    /// Shaped single-line runs, keyed by `(text, px bits, bold)`. See
     /// [`Self::build_glyph_run_weighted`].
     glyph_runs: HashMap<(String, u32, bool), GlyphRun>,
+    /// The image behind [`text_ctx`](Self::text_ctx)'s residency index, `None` until the first
+    /// run. See [`Self::absorb_glyphs`].
+    glyph_atlas: Option<GlyphAtlasImage>,
     /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
     /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
     custom_resize: Option<Pipeline>,
@@ -228,6 +231,15 @@ const MAX_READBACK_STAGING: usize = 4;
 /// panel label, dash tooltip and app name at once is well under this. See
 /// [`VulkanRenderer::build_glyph_run_weighted`].
 const GLYPH_RUN_CACHE_CAP: usize = 256;
+
+/// The persistent glyph-atlas image, paired with the generation of the residency index that
+/// describes it. Recreated (never resized in place) when that generation moves; runs built
+/// against an older image keep it alive through their own reference.
+struct GlyphAtlasImage {
+    texture: VkTexture,
+    generation: u64,
+    side: u32,
+}
 
 /// A cached present-blit shadow plus the tick it was last used on (for LRU eviction).
 #[derive(Debug)]
@@ -385,6 +397,7 @@ impl VulkanRenderer {
             text_pipeline,
             text_ctx: niri_vk::text::TextContext::new(),
             glyph_runs: HashMap::new(),
+            glyph_atlas: None,
             custom_resize: None,
             custom_close: None,
             custom_open: None,
@@ -687,34 +700,18 @@ impl VulkanRenderer {
             return Ok(run.clone());
         }
 
-        // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
-        let gpu = self.gpu.clone();
-        let pool = self.command_pool;
-        let atlas = self
-            .text_ctx
-            .build_atlas_weighted(&gpu, pool, text, px, bold)?;
-
-        let side = atlas.side;
-        let line_box = (atlas.baseline, atlas.ascent, atlas.descent);
-        let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
-        // The atlas is R8 coverage, only ever sampled (never scanned out or read back), so the
-        // fourcc is informational; R8 names the byte layout honestly.
-        let vk_tex = VkTexture::new(
-            gpu,
-            atlas.texture,
-            desc_pool,
-            set,
-            side,
-            side,
-            Fourcc::R8,
-            false,
+        let (shaped, atlas) = self.shape_line(text, px, bold)?;
+        let run = GlyphRun::new(
+            atlas.0,
+            shaped.glyphs,
+            shaped.spans,
+            atlas.1,
+            (shaped.baseline, shaped.ascent, shaped.descent),
         );
-        let run = GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side, line_box);
 
-        // Bounded by clearing wholesale: each entry pins an atlas image, and a clock
-        // showing seconds mints one never-reused key per second. Dropping the lot
-        // costs a rebuild of the live labels — which is what no cache at all paid on
-        // every frame.
+        // Bounded by clearing wholesale: a clock showing seconds mints one never-reused
+        // key per second. Entries no longer pin an atlas image of their own — they share
+        // the persistent one — so this bounds bookkeeping, not GPU memory.
         if self.glyph_runs.len() >= GLYPH_RUN_CACHE_CAP {
             self.glyph_runs.clear();
         }
@@ -723,8 +720,8 @@ impl VulkanRenderer {
     }
 
     /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)
-    /// carries its own family/weight/size) wrapped to `wrap_px`, into a single [`GlyphRun`] — one
-    /// R8 coverage atlas plus paragraph-local placements spanning every line. This is the
+    /// carries its own family/weight/size) wrapped to `wrap_px`, into a single [`GlyphRun`] —
+    /// placements spanning every line, against the shared coverage atlas. This is the
     /// dialog/notification text path; draw it with [`VulkanFrame::render_glyphs`] at the block
     /// origin. Reuses the renderer's long-lived [`text_ctx`](Self::text_ctx).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -734,33 +731,99 @@ impl VulkanRenderer {
         wrap_px: f32,
         base_px: f32,
     ) -> Result<GlyphRun, VulkanError> {
-        // Split the disjoint borrows, as in `build_glyph_run`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
-        let atlas = self
-            .text_ctx
-            .build_paragraph(&gpu, pool, spans, wrap_px, base_px)?;
-
-        let side = atlas.side;
-        let line_box = (atlas.baseline, atlas.ascent, atlas.descent);
-        let (desc_pool, set) = self.make_texture_set(&atlas.texture)?;
-        let vk_tex = VkTexture::new(
-            gpu,
-            atlas.texture,
-            desc_pool,
-            set,
-            side,
-            side,
-            Fourcc::R8,
-            false,
-        );
+        let (shaped, pending) = self.text_ctx.shape_paragraph(spans, wrap_px, base_px)?;
+        let (atlas, side) = self.absorb_glyphs(&gpu, pool, &pending)?;
         Ok(GlyphRun::new(
-            vk_tex,
-            atlas.glyphs,
-            atlas.spans,
+            atlas,
+            shaped.glyphs,
+            shaped.spans,
             side,
-            line_box,
+            (shaped.baseline, shaped.ascent, shaped.descent),
         ))
+    }
+
+    /// Shape one line and make sure its glyphs are in the atlas image, returning the run and the
+    /// `(atlas, side)` it resolved against.
+    fn shape_line(
+        &mut self,
+        text: &str,
+        px: f32,
+        bold: bool,
+    ) -> Result<(niri_vk::text::ShapedRun, (VkTexture, u32)), VulkanError> {
+        // Split the disjoint borrows: shaping needs `&mut text_ctx`, uploading needs `&gpu`.
+        let gpu = self.gpu.clone();
+        let pool = self.command_pool;
+        let (shaped, pending) = self.text_ctx.shape_line_weighted(text, px, bold)?;
+        let atlas = self.absorb_glyphs(&gpu, pool, &pending)?;
+        Ok((shaped, atlas))
+    }
+
+    /// Bring the atlas image in line with the residency index and upload `pending`, returning the
+    /// image and its side.
+    ///
+    /// The generation check comes **first and always**: a run that exhausted the atlas grew it
+    /// mid-shape, and its slots refer to the new, larger image — uploading them into the old one
+    /// would scribble at the wrong coordinates. Existing [`GlyphRun`]s keep their own reference to
+    /// the image they were built against, so replacing ours never invalidates them.
+    ///
+    /// With nothing pending — the steady state once the alphabet in use is resident — this does no
+    /// GPU work at all. That is the point: re-shaping a clock every second stops costing a round
+    /// trip.
+    fn absorb_glyphs(
+        &mut self,
+        gpu: &Arc<Gpu>,
+        pool: vk::CommandPool,
+        pending: &[niri_vk::text::PendingGlyph],
+    ) -> Result<(VkTexture, u32), VulkanError> {
+        let side = self.text_ctx.atlas().side();
+        let generation = self.text_ctx.atlas().generation();
+
+        let stale = self
+            .glyph_atlas
+            .as_ref()
+            .is_none_or(|atlas| atlas.generation != generation);
+        if stale {
+            let texture = NiriTexture::new_coverage_atlas(gpu, pool, side)
+                .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))?;
+            let (desc_pool, set) = self.make_texture_set(&texture)?;
+            // R8 coverage, only ever sampled (never scanned out or read back), so the fourcc is
+            // informational; R8 names the byte layout honestly.
+            let texture = VkTexture::new(
+                gpu.clone(),
+                texture,
+                desc_pool,
+                set,
+                side,
+                side,
+                Fourcc::R8,
+                false,
+            );
+            self.glyph_atlas = Some(GlyphAtlasImage {
+                texture,
+                generation,
+                side,
+            });
+            // Cached runs stay *correct* — each holds the image it was built against — but
+            // keeping them would pin the old atlas for as long as the cache lives. Dropping
+            // them lets it go; they rebuild against the new one on demand.
+            self.glyph_runs.clear();
+        }
+
+        let atlas = self.glyph_atlas.as_ref().expect("just ensured");
+        if !pending.is_empty() {
+            let regions: Vec<_> = pending
+                .iter()
+                .map(niri_vk::text::PendingGlyph::region)
+                .collect();
+            atlas
+                .texture
+                .inner()
+                .upload_coverage_regions(gpu, pool, &regions)
+                .map_err(|e| VulkanError::Other(format!("glyph atlas upload: {e:#}")))?;
+        }
+        Ok((atlas.texture.clone(), atlas.side))
     }
 
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The

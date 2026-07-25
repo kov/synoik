@@ -203,6 +203,12 @@ impl VkTexture {
     }
 
     /// The underlying color image (sampled source and, for offscreens, the render-pass attachment).
+    /// The wrapped `niri-vk` texture, for operations that live on it (the glyph atlas's
+    /// region upload).
+    pub(super) fn inner(&self) -> &NiriTexture {
+        &self.0.tex
+    }
+
     pub(super) fn image(&self) -> vk::Image {
         self.0.tex.image
     }

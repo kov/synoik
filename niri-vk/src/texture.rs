@@ -1031,6 +1031,242 @@ impl Texture {
         }
     }
 
+    /// A blank R8 coverage image of `side` × `side`, `SAMPLED | TRANSFER_DST` with a NEAREST
+    /// sampler, left in `SHADER_READ_ONLY_OPTIMAL` and zero-filled — the persistent glyph atlas.
+    ///
+    /// Unlike [`from_coverage`](Self::from_coverage) this uploads nothing: glyphs are copied in
+    /// afterwards, region by region, by [`upload_coverage_regions`](Self::upload_coverage_regions).
+    /// It is immediately safe to sample (all zero coverage = fully transparent), so a run whose
+    /// glyphs are all already resident needs no GPU work at all.
+    ///
+    /// Zeroing is done with a clear rather than a host copy so no `side`-squared staging buffer is
+    /// allocated (2048² would be a 4 MiB mappable blob, the allocation type that pressures the
+    /// Venus host).
+    pub fn new_coverage_atlas(gpu: &Gpu, pool: vk::CommandPool, side: u32) -> Result<Self> {
+        let device = &gpu.device;
+        let mut guard = UploadGuard::new(device);
+
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .extent(vk::Extent3D {
+                width: side,
+                height: side,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&image_ci, None) }.context("atlas image")?;
+        guard.image = image;
+        let ireq = unsafe { device.get_image_memory_requirements(image) };
+        let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        guard.memory = memory;
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .components(vk::ComponentMapping::default())
+            .subresource_range(COLOR_RANGE);
+        let view = unsafe { device.create_image_view(&view_ci, None) }.context("atlas view")?;
+        guard.view = view;
+
+        // NEAREST: glyph coverage is placed at whole pixels and sampled 1:1, so filtering would
+        // only blur it.
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
+
+        let result = gpu.run_commands(pool, |cbuf| unsafe {
+            transition(
+                device,
+                cbuf,
+                image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+            device.cmd_clear_color_image(
+                cbuf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [0.; 4] },
+                std::slice::from_ref(&COLOR_RANGE),
+            );
+            transition(
+                device,
+                cbuf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            );
+        });
+
+        let texture = Texture {
+            image,
+            view,
+            sampler,
+            memory,
+            width: side,
+            height: side,
+        };
+        // Past the fallible steps: the handles belong to `texture` now.
+        guard.image = vk::Image::null();
+        guard.memory = vk::DeviceMemory::null();
+        guard.view = vk::ImageView::null();
+        guard.sampler = vk::Sampler::null();
+
+        match result {
+            Ok(()) => Ok(texture),
+            Err(err) => {
+                texture.destroy(gpu);
+                Err(err)
+            }
+        }
+    }
+
+    /// Copy freshly rasterized glyphs into this atlas: one `(x, y, w, h, coverage)` region each,
+    /// all in a single command buffer, so a run that missed on several glyphs still costs one GPU
+    /// round trip. No-op for an empty `regions`, which is the common case once the alphabet in use
+    /// is resident — that is the whole point of a persistent atlas.
+    ///
+    /// The regions must not overlap and must lie inside the image; the atlas allocator guarantees
+    /// both. Everything outside them keeps its contents (`SHADER_READ_ONLY_OPTIMAL` in, same out),
+    /// so glyphs uploaded by earlier calls survive.
+    pub fn upload_coverage_regions(
+        &self,
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        regions: &[CoverageRegion<'_>],
+    ) -> Result<()> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let device = &gpu.device;
+
+        // One staging buffer for every region, concatenated; `buffer_offset` picks each out.
+        let total: vk::DeviceSize = regions.iter().map(|r| r.coverage.len() as u64).sum();
+        let mut guard = UploadGuard::new(device);
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(total)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging =
+            unsafe { device.create_buffer(&staging_ci, None) }.context("atlas staging")?;
+        guard.staging = staging;
+        let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
+        let smem = gpu.allocate(
+            sreq,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        guard.smem = smem;
+
+        let mut copies = Vec::with_capacity(regions.len());
+        unsafe {
+            device.bind_buffer_memory(staging, smem, 0)?;
+            let base = device
+                .map_memory(smem, 0, total, vk::MemoryMapFlags::empty())
+                .context("map atlas staging")? as *mut u8;
+            let mut offset: vk::DeviceSize = 0;
+            for r in regions {
+                debug_assert_eq!(
+                    r.coverage.len(),
+                    (r.w * r.h) as usize,
+                    "coverage size does not match the region"
+                );
+                std::ptr::copy_nonoverlapping(
+                    r.coverage.as_ptr(),
+                    base.add(offset as usize),
+                    r.coverage.len(),
+                );
+                copies.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .buffer_row_length(r.w)
+                        .buffer_image_height(r.h)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_offset(vk::Offset3D {
+                            x: r.x as i32,
+                            y: r.y as i32,
+                            z: 0,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: r.w,
+                            height: r.h,
+                            depth: 1,
+                        }),
+                );
+                offset += r.coverage.len() as u64;
+            }
+            device.unmap_memory(smem);
+        }
+
+        let image = self.image;
+        let result = gpu.run_commands(pool, |cbuf| unsafe {
+            // Preserve what is already in the atlas: transition FROM the sampleable layout the
+            // image is left in, not from UNDEFINED (which would license discarding it).
+            transition(
+                device,
+                cbuf,
+                image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+            device.cmd_copy_buffer_to_image(
+                cbuf,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copies,
+            );
+            transition(
+                device,
+                cbuf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            );
+        });
+        unsafe {
+            device.destroy_buffer(staging, None);
+            device.free_memory(smem, None);
+        }
+        guard.staging = vk::Buffer::null();
+        guard.smem = vk::DeviceMemory::null();
+        result
+    }
+
     /// Re-upload a full `width*height` frame of tightly-packed pixels into this already-allocated
     /// image, reusing `staging` (the caller must have `ensure`d capacity and `write`n the data).
     /// It's a full overwrite, so the barrier discards the old contents (`UNDEFINED` old layout,
@@ -1083,6 +1319,17 @@ impl Texture {
             );
         })
     }
+}
+
+/// One glyph's coverage bitmap and where it goes in the atlas, for
+/// [`Texture::upload_coverage_regions`].
+pub struct CoverageRegion<'a> {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    /// Tightly packed `w * h` R8 coverage.
+    pub coverage: &'a [u8],
 }
 
 /// A reusable `HOST_VISIBLE | HOST_COHERENT` staging buffer for repeated transfers, in either
