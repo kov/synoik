@@ -1004,14 +1004,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.renderer.gpu_timer_end(old_cbuf);
             dev.end_command_buffer(old_cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&old_cbuf));
             {
                 let _timed = niri_vk::stats::submit(self.submit_kind());
-                dev.queue_submit(
-                    self.renderer.gpu.queue,
-                    std::slice::from_ref(&submit),
-                    fence,
-                )?;
+                self.renderer
+                    .gpu
+                    .submit(std::slice::from_ref(&old_cbuf), fence)
+                    .map_err(VulkanError::from)?;
             }
             {
                 let _timed = niri_vk::stats::retire(self.submit_kind());
@@ -1492,15 +1490,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.renderer.gpu_timer_end(self.cbuf);
             dev.end_command_buffer(self.cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            let submit =
-                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cbuf));
             {
                 let _timed = niri_vk::stats::submit(self.submit_kind());
-                dev.queue_submit(
-                    self.renderer.gpu.queue,
-                    std::slice::from_ref(&submit),
-                    fence,
-                )?;
+                self.renderer
+                    .gpu
+                    .submit(std::slice::from_ref(&self.cbuf), fence)
+                    .map_err(VulkanError::from)?;
             }
             // Timed apart from the submit above: this park is where a scanout frame spends
             // 12–14 ms of its budget, and it is the one this renderer means to stop paying on

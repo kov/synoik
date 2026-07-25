@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
@@ -127,6 +127,11 @@ pub struct Gpu {
     enabled_extensions: Vec<String>,
     // Memoized DRM-modifier tiling features per format. See `modifier_features`.
     modifier_features: Mutex<HashMap<vk::Format, Vec<(u64, vk::FormatFeatureFlags)>>>,
+    /// Chains every submit on the queue after the previous one. See [`Self::submit`].
+    /// `None` when the device does not support timeline semaphores, in which case
+    /// submits are unordered relative to each other and the caller must keep
+    /// waiting on each one's fence.
+    order: Option<SubmitOrder>,
     // The validation layer's messenger, when `NIRI_VK_VALIDATION` is set. Destroyed before the
     // instance in `Drop`.
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -134,6 +139,26 @@ pub struct Gpu {
     // Owns the loaded Vulkan library; must outlive `instance`/`device`.
     #[allow(dead_code)]
     pub entry: ash::Entry,
+}
+
+/// A timeline semaphore whose value counts submits on the queue.
+///
+/// Its whole job is to make GPU execution order equal submission order without
+/// blocking the CPU. Today every submit is followed by its own fence wait, so
+/// nothing can overlap and this changes nothing observable — but that wait is what
+/// we mean to stop paying (`docs/fork/renderer-synchronous-submits.md`), and the
+/// moment a submit is left in flight, everything issued after it may execute
+/// alongside it. That is not a lifetime problem, which is the easy half: the
+/// present-blit shadow is one image shared by consecutive frames and the glyph
+/// atlas is uploaded while frames sample it, so overlap is a data race on live
+/// pixels. Chaining wait(N) → signal(N+1) keeps the order we already rely on and
+/// costs nothing on a stack where the GPU is not the bottleneck.
+struct SubmitOrder {
+    semaphore: vk::Semaphore,
+    /// The value the *next* submit waits on; it signals one past it. Starts at 0,
+    /// which the semaphore is created already holding, so the first submit is not
+    /// blocked.
+    next: AtomicU64,
 }
 
 /// Which physical device to bring up.
@@ -351,15 +376,47 @@ impl Gpu {
             eprintln!("  enabling device extensions: {enabled_extensions:?}");
         }
 
+        // Timeline semaphores (core in 1.2, still opt-in as a feature) are what lets a submit be
+        // left in flight without letting the next one execute alongside it. See [`SubmitOrder`].
+        let mut supported12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut supported = vk::PhysicalDeviceFeatures2::default().push_next(&mut supported12);
+        unsafe { instance.get_physical_device_features2(phys, &mut supported) };
+        let has_timeline = supported12.timeline_semaphore == vk::TRUE;
+        if !has_timeline {
+            eprintln!(
+                "  warning: no timelineSemaphore; submits cannot be ordered without blocking, \
+                 so each one keeps its fence wait"
+            );
+        }
+
         let priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
-        let device_ci = vk::DeviceCreateInfo::default()
+        let mut enable12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+        let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_info))
             .enabled_extension_names(&enabled_ptrs);
+        if has_timeline {
+            device_ci = device_ci.push_next(&mut enable12);
+        }
         let device =
             unsafe { instance.create_device(phys, &device_ci, None) }.context("vkCreateDevice")?;
+
+        let order = has_timeline
+            .then(|| {
+                let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
+                    .semaphore_type(vk::SemaphoreType::TIMELINE)
+                    .initial_value(0);
+                let ci = vk::SemaphoreCreateInfo::default().push_next(&mut type_ci);
+                unsafe { device.create_semaphore(&ci, None) }
+                    .context("create timeline semaphore")
+                    .map(|semaphore| SubmitOrder {
+                        semaphore,
+                        next: AtomicU64::new(0),
+                    })
+            })
+            .transpose()?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
 
@@ -381,6 +438,7 @@ impl Gpu {
             drm_render_node: drm_render_node(&instance, phys),
             enabled_extensions,
             modifier_features: Mutex::new(HashMap::new()),
+            order,
             debug,
             instance,
             entry,
@@ -523,6 +581,50 @@ impl Gpu {
         unsafe { self.device.allocate_memory(&info, None) }.context("allocate_memory")
     }
 
+    /// Submit `cbufs` on the queue, chained after every previous submit, signalling `fence`.
+    ///
+    /// **Every** submit in this renderer goes through here. The chain is what makes it safe to
+    /// leave a submit in flight: without it, the next submit could execute alongside the one
+    /// still running and race it on the shared images the renderer reuses across frames (the
+    /// present-blit shadow, the glyph atlas). With it, GPU execution order is submission order,
+    /// which is the order the code was written for — and the CPU is free to walk away.
+    ///
+    /// Waiting and signalling the same timeline semaphore in one submit is legal as long as the
+    /// signalled value is greater, which it is by construction.
+    pub fn submit(&self, cbufs: &[vk::CommandBuffer], fence: vk::Fence) -> Result<()> {
+        let submit = vk::SubmitInfo::default().command_buffers(cbufs);
+        let Some(order) = self.order.as_ref() else {
+            return unsafe { self.device.queue_submit(self.queue, &[submit], fence) }
+                .context("vkQueueSubmit");
+        };
+
+        // Relaxed: submits are issued from the thread that owns the renderer, so this is not
+        // synchronizing anything — it is just handing out consecutive numbers.
+        let wait = order.next.fetch_add(1, Ordering::Relaxed);
+        let semaphores = [order.semaphore];
+        let wait_values = [wait];
+        let signal_values = [wait + 1];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wait_values)
+            .signal_semaphore_values(&signal_values);
+        let submit = submit
+            .wait_semaphores(&semaphores)
+            .wait_dst_stage_mask(&stages)
+            .signal_semaphores(&semaphores)
+            .push_next(&mut timeline);
+        unsafe { self.device.queue_submit(self.queue, &[submit], fence) }.context("vkQueueSubmit")
+    }
+
+    /// How many submits the queue has *completed*, or `None` when the device cannot order
+    /// submits. Test-only observability: the counter advances once per submit, so comparing it
+    /// against [`crate::stats::submits`] catches a `vkQueueSubmit` that bypassed [`Self::submit`]
+    /// and is therefore unordered against everything else.
+    pub fn submit_order_value(&self) -> Option<u64> {
+        let order = self.order.as_ref()?;
+        unsafe { self.device.get_semaphore_counter_value(order.semaphore) }.ok()
+    }
+
     /// Record `record` into a one-time primary command buffer, submit, and block until done.
     pub fn run_commands(
         &self,
@@ -560,14 +662,11 @@ impl Gpu {
                 .create_fence(&vk::FenceCreateInfo::default(), None)?
         };
         guard.fence = fence;
-        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cbuf));
+        {
+            let _timed = crate::stats::submit(crate::stats::SubmitKind::Offscreen);
+            self.submit(std::slice::from_ref(&cbuf), fence)?;
+        }
         unsafe {
-            {
-                let _timed = crate::stats::submit(crate::stats::SubmitKind::Offscreen);
-                self.device
-                    .queue_submit(self.queue, &[submit], fence)
-                    .context("vkQueueSubmit")?;
-            }
             let _timed = crate::stats::retire(crate::stats::SubmitKind::Offscreen);
             if let Err(e) = self.device.wait_for_fences(&[fence], true, u64::MAX) {
                 // The submit already succeeded, so the command buffer and the copy's source/dest
@@ -609,6 +708,9 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(order) = self.order.as_ref() {
+                self.device.destroy_semaphore(order.semaphore, None);
+            }
             self.device.destroy_device(None);
             // Before the instance it was created from, and after the device so it can still report
             // on teardown.

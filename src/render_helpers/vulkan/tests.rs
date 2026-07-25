@@ -3307,3 +3307,57 @@ fn runs_survive_an_atlas_growth() {
         "a run built before the atlas grew drew nothing afterwards"
     );
 }
+
+/// **Every submit must be chained on the queue's timeline.**
+///
+/// That chain is what will make it safe to leave a submit in flight: without it, the next submit
+/// may execute alongside one still running and race it on the images this renderer reuses across
+/// frames — the present-blit shadow, the glyph atlas. Nothing about the pixels would change, so
+/// only a counter can catch a `vkQueueSubmit` that went around `Gpu::submit`.
+///
+/// The timeline advances exactly once per chained submit, so it must track the submit counter
+/// step for step. A raw submit bumps one and not the other.
+#[test]
+fn every_submit_is_chained_on_the_queue_timeline() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping every_submit_is_chained_on_the_queue_timeline: no device ({e})");
+            return;
+        }
+    };
+    let Some(timeline_before) = vk.gpu.submit_order_value() else {
+        eprintln!("skipping every_submit_is_chained_on_the_queue_timeline: no timeline semaphore");
+        return;
+    };
+    let submits_before = niri_vk::stats::submits();
+
+    // Work that submits through more than one path: a glyph upload (`run_commands`) and a render
+    // pass (`VulkanFrame::finish`).
+    vk.build_glyph_run("chained", 20.0).expect("glyph run");
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .expect("target");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk
+            .render(&mut fb, Size::from((16, 16)), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(1., 0., 0., 1.),
+                &[Rectangle::from_size((16, 16).into())],
+            )
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let submits = niri_vk::stats::submits() - submits_before;
+    assert!(submits > 0, "the work under test submitted nothing");
+    let timeline = vk.gpu.submit_order_value().expect("timeline value") - timeline_before;
+    assert_eq!(
+        timeline, submits,
+        "{submits} submits advanced the timeline by {timeline} — one of them bypassed Gpu::submit \
+         and is unordered against the rest"
+    );
+}
