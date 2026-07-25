@@ -202,25 +202,15 @@ in `collect`, and after this change it is the only thing that puts a frame over 
 startup frames confirm it: the 9-submit startup frame costs 46.4 ms deferred against 50.3–68.3 ms
 before, i.e. the scanout wait was never its problem.
 
-The same treatment applies, and the seam is already built. `should_defer_finish` is a policy
-question, not a mechanism one: the timeline chain already guarantees GPU order, so a bake's
-consumer — later GPU work sampling the result — needs no CPU wait at all. The waits that must
-stay are the ones where the **CPU** reads the result (`map_texture`, screenshots) or a foreign
-consumer takes the buffer (screencopy, screencast). See
-[`frame-cost-investigation.md`](./frame-cost-investigation.md) §6.
+Scoped below — and that scoping turned up a **defect in this change**, already enabled on the
+seat: the in-flight record holds the textures a frame *samples* but not the ones it *renders into*,
+either of which a cache can free while the submit is in flight. Fix that before anything else and
+before dropping the gate; details under
+[First, a defect in what already shipped](#first-a-defect-in-what-already-shipped).
 
 **Whether to drop the env-var gate** is the other open decision. The evidence says default-on;
 the counter-argument is that this VM is one stack and `supports_fencing` being false elsewhere
 falls back to `needs_sync` → a CPU wait, which is today's behaviour anyway.
-
-*Superseded, kept for the record — the questions this section used to pose, all four now answered
-above: does `waiting` leave the frame line without reappearing as `waiting … on earlier work`; do
-frames stop going over budget and does `submit` collapse toward `queue`; does presentation get
-later; is there any visual corruption. Headless covers none of them — there is no KMS plane to
-take the fence. What a test does cover
-(`a_deferred_finish_returns_a_fence_and_still_orders_what_follows`) is that the sync point comes
-back exportable, that the `sync_file` export succeeds on Venus, and that a readback issued with
-no wait still sees a finished frame — which is only true because of the timeline chain.*
 
 ### Client buffer release ordering — settled, not a blocker
 
@@ -280,6 +270,193 @@ the existing `held` list defers the release to retirement along with everything 
   next one. The CPU stops blocking either way — that is the stated goal — so the thing to measure
   is *presentation* time, not main-loop time. Measured: it does not. 41.6 missed vblanks/min
   deferred, 52.5/min with the wait forced back on, 41.3–45.6/min before the change.
+## The other submits — scoping (2026-07-25)
+
+*Same question as the scanout scoping, one level down: what would it take, and what is separable.
+The answer is a different shape. The first draft of this section assumed the mechanism was already
+built and only policy was left; an adversarial review of it against the code found that wrong in
+two central places, and turned up three latent defects in what already shipped. Both corrections
+are below — the first draft's claims are kept where they were right and struck where they were not,
+because the mistakes are the instructive part.*
+
+### First, a defect in what already shipped
+
+**The in-flight record does not hold the frame's own render target.** `InFlightSubmit._held`
+(`renderer.rs:1319`) is populated only by `VulkanFrame::retain` (`frame.rs:216`), which holds every
+texture a draw *samples*. The scanout submit's command buffer also references two textures nobody
+holds:
+
+- **`fb.buffer`** — the present-blit shadow, owned by `present_blit_shadows`, an 8-entry LRU
+  (`renderer.rs:233`, eviction at `:1990`). Bind a ninth size while a frame is in flight and the
+  shadow it renders into is destroyed under it.
+- **`fb.present`** — the imported dmabuf target, dropped by `dmabuf_target_cache` eviction when its
+  weak handle goes (`renderer.rs:1817`).
+
+`VkTextureInner::Drop` destroys the image, framebuffer and descriptor pool with no wait
+(`types.rs:61`), so either is a use-after-free on an in-flight submit. Both cache comments still
+justify their safety with "rendering is synchronous (`finish` CPU-waits, so no shadow is in flight
+when the next bind reuses or drops it)" (`renderer.rs:146`, `:200`) — true when written, stale
+since `6f645bd8`. `set_custom_shader` carries the same stale justification, "every submit
+fence-waits in `finish`, so the old pipeline is guaranteed idle — no `device_wait_idle` needed"
+(`renderer.rs:498`): a config reload that changes a custom shader while a frame is in flight
+destroys a pipeline that submit is using.
+
+Reachability is narrow — more than eight live present-blit sizes means several outputs plus casts
+plus screencopy, and custom shaders are a debug/animation feature — but this is a correctness bug
+in code that is enabled on the seat, not a scoping item. **Fix it before any slice below:** clone
+`fb.buffer` and `fb.present` into the record, drain in-flight work before a cache eviction or
+pipeline destroy (or hold the resource the same way), and rewrite the three comments so the next
+reader is not told a false invariant.
+
+### There are only two submit sites, and we cannot currently tell them apart
+
+Every `vkQueueSubmit` goes through one of:
+
+- **`Gpu::run_commands`** (`gpu.rs:681`) — the one-shot: allocate cbuf, record, create fence,
+  submit, `wait_for_fences`, free.
+- **`VulkanFrame::finish_internal`** (`frame.rs:1495`) — a whole rendered frame. Plus a third
+  path hiding inside it: **`capture_region`'s mid-frame flush** (`frame.rs:1011`) ends the command
+  buffer, submits, waits, and re-opens a continuation buffer, once per captured region.
+
+`SubmitKind` has two variants and `submit_kind()` keys on `fb.offscreen` (`frame.rs:1456`), so
+"scanout" means *any non-offscreen target* — a screencast or screencopy render into a dmabuf counts
+as scanout, and so does every mid-frame capture flush of the KMS frame. `N to scanout` is therefore
+not "the frame that went to KMS", and the frame line's `N bakes` counts only *widget* bakes, while
+window previews, snapshots, `ClosingWindow`, xray and effect buffers submit without being bakes.
+A frame from the seat reads `36 elements, 67 draws covering 0.3x the output, 15 submits, waiting
+15.58ms, 1 bakes in 1.13ms`: **fourteen submits attributable to nothing.**
+
+The leading code-grounded hypothesis, from the review: **N xray/translucent surfaces × 2 submits
+each** — one offscreen re-render of the effect buffer (`effect_buffer.rs:288`) plus one
+`EffectBlur::run` (`effect_blur.rs:96`). Seven such surfaces is fourteen. If that is right, slices
+1 and 2 are the whole fix and the upload work is not worth building. That is a hypothesis, and this
+investigation's own history (`frame-cost-investigation.md` §3) is four plausible unmeasured
+hypotheses that all died — so it is still slice 0's job to confirm it.
+
+### Two hazard classes, and the timeline only closed one
+
+The scanout deferral's risk was **GPU-vs-GPU**: work issued after an in-flight submit executing
+alongside it. The timeline chain (`6bef18ac`) closed that uniformly and costs nothing. Two classes
+remain, and neither is helped by it:
+
+**CPU-vs-GPU.** A CPU write into a mapped `HOST_VISIBLE` buffer is not a queue submission, so the
+timeline does not order it against anything:
+
+- **`VulkanRenderer::shm_staging`** (`renderer.rs:119`) is *one reused staging buffer* for every
+  shm client upload: `ensure` → `write` → `reupload_full` → submit → wait (`renderer.rs:2124`).
+  Remove the wait and the next commit's `write` memcpys over bytes the previous copy is still
+  reading. Worse, `Staging::ensure` **destroys and reallocates** when it grows (`texture.rs:1385`)
+  — a use-after-free, not a stale pixel.
+- **`Texture::upload` / `TextureBatch::finish`** free their staging buffer and memory immediately
+  after `run_commands` returns (`texture.rs:219`, `:893`), commented "the staging buffers have
+  served their purpose … `run_commands` already drained the device". That comment is load-bearing.
+- **`upload_coverage_regions`** (the glyph atlas, `texture.rs:1154`) allocates staging per call
+  under an `UploadGuard` that frees on scope exit — same shape, per-call rather than shared.
+- **Readbacks** (`copy_framebuffer` → `Staging::read`) must wait by definition: the CPU reads the
+  bytes. Screenshots, screencopy, screencast. Correct as they are; they must stay that way.
+
+**Manual teardown.** Resources freed by an explicit `destroy(&gpu)` rather than a refcount, which a
+`Vec<VkTexture>` record cannot express. `BlurChain` is the case that matters: destroyed with no
+wait by `EffectBlur::Drop` (`effect_blur.rs:110`), by `BackdropBlur` slot replacement on a size or
+pass-count change (`frame.rs:1104`), and by `render_blur` immediately after `run_commands` returns
+(`renderer.rs:1181`) — correct only because of the wait. Deferring a blur submit means keeping its
+pipelines, level pyramid, framebuffers and descriptor pool alive to retirement. The render-target
+defect above is the same class.
+
+So "the timeline already orders it" is true for image *contents* and false for every staging buffer
+and every manually torn-down object.
+
+### Site inventory
+
+| site | what fires it | hazard if deferred | verdict |
+|---|---|---|---|
+| offscreen `VulkanFrame::finish` | widget bakes, window previews, snapshots, `ClosingWindow`, xray/effect buffers | **the render target itself** — caller-owned, recreated by `OffscreenBuffer`/`EffectBuffer` on size change, freed without a wait | the biggest win, but not free; see slice 1 |
+| `capture_region` mid-frame flush | one per captured region per frame | none — the consumer is the separately-submitted blur, which the timeline already orders after it | **the cheapest win in the table**: its wait is redundant *today* |
+| `EffectBlur::run`, `BackdropBlur::run_blur`, `render_blur` | one per blurred surface per frame | `BlurChain` teardown (manual, no refcount) | defer once the record can hold non-texture resources |
+| `make_sampleable` | nothing, in practice | none | confirmed ~dead: an offscreen `finish` already leaves `SHADER_READ_ONLY_OPTIMAL` (`frame.rs:1485`) |
+| `import_dmabuf_sampled` | a new or reallocated client dmabuf | the texture must be cloned into the record against cache eviction (`renderer.rs:1824`) | defer, cheap |
+| ~~`reacquire_dmabuf_sampled`~~ | **nothing** — the hot path was folded into the frame submit; `record_reacquire_dmabuf` (`renderer.rs:1878`) is the only live user and the standalone submitting variant (`texture.rs:855`) has no compositor caller | — | dead; deferring it is worth zero |
+| `reupload_shm` | every shm client commit | **shared staging: overwrite + realloc-free** | needs a staging ring or per-submit ownership |
+| `Texture::upload`, `TextureBatch::finish` | icon uploads, first app-grid page | per-call staging freed on return | staging moves into the record |
+| `upload_coverage_regions` | new glyphs entering the atlas | same | same |
+| `new_coverage_atlas` | atlas creation and growth (`texture.rs:1091`) | none | rare; defer with the transitions |
+| `copy_framebuffer` / readbacks | screenshots, screencopy, screencast | the CPU reads the result | **must keep waiting** — and that is what makes slice 1 safe |
+
+### Where the bookkeeping belongs
+
+The in-flight list lives on `VulkanRenderer`, retired by polling the timeline at
+`VulkanFrame::begin`. That does not generalise: `run_commands` is called from inside `niri-vk`
+(`texture.rs`, `dmabuf.rs`, `blur.rs`) by code with no renderer to reach. Moving the ring onto
+`Gpu` is the obvious answer — it owns the queue, the timeline and `submit()` — but it is not free,
+and the first draft of this section said none of this:
+
+- **Command buffers are pool-scoped.** `Gpu` outlives `VulkanRenderer` (it is an `Arc`), and
+  `VulkanRenderer::Drop` destroys `command_pool` (`renderer.rs:1582`), implicitly freeing every
+  cbuf in it. A ring on `Gpu` still holding those handles double-frees. Records must carry
+  `(pool, cbuf)`, every pool owner must drain before destroying its pool, and `Gpu::drop` must
+  release records without touching cbufs.
+- **`Gpu` is shared across threads.** It is behind an `Arc` and `VkTexture` is asserted
+  `Send + Sync` (`types.rs:280`), so the ring needs a `Mutex` (`modifier_features`, `gpu.rs:130`,
+  is the precedent). `SubmitOrder.next`'s `Relaxed` ordering is justified by "issued from the
+  thread that owns the renderer" (`gpu.rs:613`) — that comment becomes load-bearing.
+- **`Gpu` cannot name `VkTexture`.** It is a niri-crate type (`types.rs:80`); the record needs
+  erasure (`Box<dyn Any + Send>`) or a drop-callback.
+- **Retirement wants to poll inside `Gpu::submit`**, not only at `VulkanFrame::begin` — every
+  deferring site already calls it, and frameless stretches would otherwise never retire uploads.
+
+### Proposed slices
+
+0. **Attribute the submits. No behaviour change.** Give a submit a label of where it came from —
+   and note the label must *not* key on `fb.offscreen`, which is what makes today's counters
+   misleading — then print the top few in the frame line. It decides everything below: if the
+   fourteen are effect-buffer re-renders and blurs, slices 1–2 are the whole fix and 3–4 are not
+   worth building.
+1. **Let offscreen frames defer.** Two things the first draft got wrong: this is *not* removing
+   the `!fb.offscreen` clause (`frame.rs:1502`), because `finish_may_defer` is only true inside the
+   tty bracket around `render_frame` (`tty.rs:2892`) and every offscreen finish happens earlier,
+   during element collection — dropping the clause defers nothing. Offscreen has to become its own
+   eligibility rule. And the record must hold the target: `OffscreenBuffer` drops its texture on
+   size increase or non-uniqueness (`offscreen.rs:105`), `EffectBuffer` replaces its offscreen on
+   size change (`effect_buffer.rs:236`). **Then the trap:** holding a clone makes
+   `is_unique_reference` (`types.rs:201`) false, and `OffscreenBuffer` reuses on exactly that test
+   (`offscreen.rs:113`) — so a naive keep-alive turns into reallocate-every-frame, the Venus blob
+   churn these caches exist to prevent. The reuse test has to learn about retirement.
+2. **The capture flush and the blurs.** The flush needs only its cbuf and fence deferred; the blurs
+   need the record to hold non-texture resources. Together these are the other half of the M1
+   hypothesis.
+3. **Move the ring to `Gpu`** with the constraints above, and defer the host-free one-shots
+   (transitions, dmabuf acquires, atlas creation).
+4. **Upload sites**, each needing its staging kept alive; `shm_staging` needs a small ring or
+   per-submit ownership. Last, and only if slice 0 says it is worth it.
+
+### The invariant that makes any of this safe
+
+Every capture of an offscreen goes through `copy_framebuffer` → `run_commands`, which submits on
+the chained timeline *after* the deferred offscreen submit and then CPU-waits
+(`renderer.rs:1009`). So a deferred offscreen feeding a readback is provably finished when the
+bytes are read — **iff** (a) readbacks keep their wait and (b) every submit goes through
+`Gpu::submit`. Those two conditions are the whole safety argument for slice 1; write them down and
+pin them. The existing cross-check that the timeline advanced exactly once per counted submit
+(`every_submit_is_chained_on_the_queue_timeline`) is the tool for (b).
+
+### What would tell us it went wrong
+
+Corruption here is **not** a torn frame — it is a stale or garbled *texture*: a window preview
+showing the previous frame, an icon with another icon's pixels, glyphs from the wrong atlas slot.
+`NIRI_VK_VALIDATION=1` catches the use-after-free half and must be run after every slice. It will
+not catch a staging buffer overwritten while a copy reads it: that is legal Vulkan, and no layer
+will say a word. Only a test that uploads twice without a wait and checks the first result, or eyes
+on the seat, will find that one.
+
+Two smaller things to write down rather than discover:
+
+- **Device loss moves.** Today a wait failure (≈ `DEVICE_LOST`) is caught at the call site, which
+  drains the device before any guard frees anything (`gpu.rs:721`). A deferred one-shot surfaces it
+  at retirement, where the caller's context is gone.
+- **In-flight growth is bounded only by GPU progress.** Retirement polls and never blocks
+  (`renderer.rs:1327`). A burst of offscreen submits while the host stalls accumulates command
+  buffers and keep-alive lists with no cap. That is probably fine — say so deliberately rather than
+  leaving it unstated.
 
 ## Related
 

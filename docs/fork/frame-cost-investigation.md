@@ -159,11 +159,13 @@ remaining slow frame is an overview animation or first-time startup work.
    `wait_for_fences` → destroy on each, at ~1.3–1.6 ms a piece. Fifteen of those is ~20 ms, it
    lands in `collect`, and it is now the only thing that puts a frame over budget.
 
-   The mechanism to fix it already exists: the queue timeline (`6bef18ac`) guarantees GPU order
-   equals submission order, so work whose only consumer is *later GPU work* needs no CPU wait.
-   What has to stay synchronous is where the **CPU** reads the result (`map_texture`, screenshots)
-   or a foreign consumer takes the buffer (screencopy, screencast) — the same distinction
-   `set_finish_may_defer` already draws for the scanout frame, applied to `run_commands`.
+   Scoped 2026-07-25 in
+   [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md#the-other-submits--scoping-2026-07-25),
+   and the scoping is worth reading before assuming this is the same change again. It is not: the
+   timeline orders GPU work against GPU work, and half these sites are gated by a **CPU** write
+   into a mapped buffer instead, which it does nothing for. Read the two hazard classes and the
+   site table there — and the defect it found in the *landed* change, which is the first thing to
+   fix.
 2. **The panel still bakes during an overview animation** — but not for the reason we fixed.
    `are_animations_ongoing()` (`ui/panel.rs:848`) is the button-fill fades, and opening the
    overview toggles Activities to checked, so the fill fade covers the same window. That bake
