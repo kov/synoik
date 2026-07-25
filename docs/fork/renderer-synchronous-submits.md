@@ -110,6 +110,34 @@ So the remaining contained win is *not* here: it is a persistent glyph atlas, wh
 retire the per-tick atlas upload submit and the ~4.2 ms of re-shaping. After that, the idle
 frame is ~13 ms and under budget, and what is left over is this document.
 
+### The condition above is now met (2026-07-25, measured, `25b9ed2f`)
+
+The glyph atlas landed and the idle frames went under budget. Submits are now counted by
+target kind, so the scanout submit is measured directly rather than inferred:
+
+| | scanout submit |
+|---|---|
+| animation frames, one per refresh | **12.36 / 12.69 / 13.12 / 13.85 ms** |
+| sparse frames (startup, one-offs) | 3.71 / 4.88 / 5.25 / 5.45 ms |
+| every *other* submit in those frames | 0.55 – 1.8 ms |
+
+**It does not track content.** Across those animation frames coverage ranged 1.7–2.0× the
+output and draws 138–173, with no correlation to the number. What it tracks is how closely
+frames follow each other: back-to-back it is ~13 ms, sparse it is ~4 ms.
+
+That is not a GPU being slow, and no amount of drawing less will move it. It is a
+synchronous wait on a pipeline paced by something outside the guest — the host compositor
+executing Venus's command stream on its own 60 Hz loop is the obvious candidate, which
+would make ~13 ms ≈ one refresh interval exactly the expected figure. It cannot be
+attributed further from inside the guest ([`venus-timestamp-gap.md`](./venus-timestamp-gap.md)).
+
+**What that changes about the fix.** The goal is no longer "make submits faster" — we
+probably cannot. It is to stop *blocking the CPU* on them, so a frame's remaining 3–4 ms of
+budget is not spent staring at a fence. Of the four items above, item 2 (a real `SyncPoint`,
+handed to KMS instead of waited on) is the one that matters here and it is the smallest;
+items 1 and 3 are what make it safe. Worth scoping item 2 against the KMS path specifically
+before committing to the whole rewrite — this may be narrower than the doc implies.
+
 ## Related
 
 - `src/frame_log.rs` — the `NIRI_FRAME_LOG` grammar and what each phase covers.
