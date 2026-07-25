@@ -77,12 +77,48 @@ static GPU_TIMING: AtomicBool = AtomicBool::new(false);
 /// the log, and this is debug instrumentation, not a data path.
 static GPU_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// Count one widget bake. Called from the single uncached-bake path.
-pub fn count_bake() {
+/// Nanoseconds spent baking, and shaping text, during the frame being built.
+///
+/// Both live *inside* the `collect` phase, which is where the live seat put 22ms
+/// of a 31ms frame with only 18 elements on screen. A phase total says a frame was
+/// slow; these say which half of the widget path it was in.
+static BAKE_NANOS: AtomicU64 = AtomicU64::new(0);
+static SHAPE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether anything is listening. Sampled by the scoped timers so an unlogged
+/// session does not pay two `Instant::now()` calls per bake and per shaped run.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Accumulates its lifetime into a counter when dropped. Inert when frame logging
+/// is off, so call sites can be unconditional.
+pub struct Timed(Option<Instant>, &'static AtomicU64);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        if let Some(started) = self.0 {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.1.fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+}
+
+fn timed(counter: &'static AtomicU64) -> Timed {
+    Timed(ENABLED.load(Ordering::Relaxed).then(Instant::now), counter)
+}
+
+/// Time a widget bake — an uncached rasterization into its own GPU texture. Hold
+/// the returned guard for the operation.
+pub fn time_bake() -> Timed {
     // Relaxed throughout: these counters are read on the same thread that writes
     // them in the common case, and a torn count in a debug log is not a problem
     // worth an ordering for.
     BAKES.fetch_add(1, Ordering::Relaxed);
+    timed(&BAKE_NANOS)
+}
+
+/// Time shaping one run of text (font selection, layout, glyph-atlas residency).
+pub fn time_shape() -> Timed {
+    timed(&SHAPE_NANOS)
 }
 
 /// Whether the renderer should measure GPU pass durations. See [`FrameLog::from_env`].
@@ -249,6 +285,8 @@ impl FrameLog {
             .ok()
             .and_then(|raw| Self::parse(&raw));
 
+        ENABLED.store(settings.is_some(), Ordering::Relaxed);
+
         if let Some(settings) = &settings {
             tracing::info!(
                 "frame logging on: {}, summary {}{}",
@@ -380,6 +418,8 @@ impl FrameLog {
         let total = now - frame.started;
         let bakes = BAKES.load(Ordering::Relaxed) - frame.bakes_at_start;
         let gpu = take_gpu_time();
+        let baking = Duration::from_nanos(BAKE_NANOS.swap(0, Ordering::Relaxed));
+        let shaping = Duration::from_nanos(SHAPE_NANOS.swap(0, Ordering::Relaxed));
 
         // The budget: an explicit threshold if given, else the refresh interval.
         // With neither (a headless output with no refresh) nothing is "too long",
@@ -388,7 +428,7 @@ impl FrameLog {
         let over = budget.is_some_and(|budget| total > budget);
 
         if over || settings.log_all {
-            let line = Self::format_frame(&frame, total, gpu, bakes, budget);
+            let line = Self::format_frame(&frame, total, gpu, bakes, baking, shaping, budget);
             if over {
                 tracing::warn!("{line}");
             } else {
@@ -404,11 +444,14 @@ impl FrameLog {
         self.maybe_summarize(now);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn format_frame(
         frame: &InFlight,
         total: Duration,
         gpu: Duration,
         bakes: u64,
+        baking: Duration,
+        shaping: Duration,
         budget: Option<Duration>,
     ) -> String {
         let mut line = format!("frame on {} took {}", frame.output, ms(total));
@@ -437,7 +480,10 @@ impl FrameLog {
         let ctx = &frame.context;
         let _ = write!(line, "; {} elements", ctx.elements);
         if bakes > 0 {
-            let _ = write!(line, ", {bakes} bakes");
+            let _ = write!(line, ", {bakes} bakes in {}", ms(baking));
+        }
+        if !shaping.is_zero() {
+            let _ = write!(line, ", shaping {}", ms(shaping));
         }
         if ctx.full_damage {
             line.push_str(", full damage");
