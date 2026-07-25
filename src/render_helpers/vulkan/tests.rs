@@ -3443,6 +3443,16 @@ fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
         1,
         "the deferred submit was not recorded, so its command buffer and textures are unowned"
     );
+    // The bound target belongs to the renderer's dmabuf cache, not to us, and that cache evicts.
+    // Nothing a draw *samples* covers it — `held` is built from sampled textures — so if the
+    // record does not name it, a cache eviction destroys an image this submit is still writing.
+    // An Abgr8888 target is rendered into directly, so there is exactly one.
+    assert_eq!(
+        vk.in_flight_targets_len(),
+        1,
+        "the deferred submit does not hold what it renders into: the renderer's cache is free to \
+         destroy the target image while the GPU writes it"
+    );
 
     // No wait: the readback is ordered after the render by the queue timeline alone.
     let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((64, 64)));
@@ -3464,4 +3474,76 @@ fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
         0,
         "the deferred submit was never retired"
     );
+}
+
+/// The present-blit path renders into a *cached* shadow and blits into a *cached* dmabuf, and both
+/// caches drop entries on their own schedule — the shadow on an LRU eviction, the target when its
+/// weak handle goes. A deferred submit must hold both, or the frame it is still writing can have
+/// its images destroyed underneath it.
+///
+/// This is the sibling of `a_deferred_finish_returns_a_fence_and_still_orders_what_follows`, which
+/// covers the direct-target shape. Neither can assert on pixels: the image survives whenever the
+/// cache happens not to evict, so the keep-alive is only visible as a count.
+#[test]
+fn a_deferred_present_blit_holds_both_the_shadow_and_the_scanout_buffer() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let skip = |why: &str| eprintln!("skipping a_deferred_present_blit_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    else {
+        return skip("no render node");
+    };
+    let Ok(gbm) = GbmDevice::new(file) else {
+        return skip("no GBM");
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    // Xrgb8888 is a present-blit format: its byte order differs from the render pass, so the
+    // renderer binds an R8G8B8A8 shadow and blits into the dmabuf on finish.
+    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Xrgb8888, &[Modifier::Linear]) else {
+        return skip("GBM cannot allocate an Xrgb8888 LINEAR scanout buffer");
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    vk.set_defer_scanout(true);
+    vk.set_finish_may_defer(true);
+
+    let size = Size::<i32, Physical>::from((64, 64));
+    let mut fb = vk.bind(&mut dmabuf).expect("bind scanout dmabuf");
+    let sync = {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 1., 0., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        frame.finish().expect("finish")
+    };
+    assert!(
+        sync.contains_fence(),
+        "the present-blit frame finished synchronously, so there is nothing in flight to hold"
+    );
+    assert_eq!(
+        vk.in_flight_targets_len(),
+        2,
+        "a present-blit submit writes two images it does not own — the shadow it renders into and \
+         the dmabuf it blits out to — and must hold both"
+    );
+
+    drop(fb);
+    vk.drain_in_flight();
 }

@@ -1528,8 +1528,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             if let (Some(fence), Some(timeline)) = (deferred, timeline) {
                 let fence = VkSubmitFence::new(self.renderer.gpu.clone(), fence);
                 let held = std::mem::take(&mut self.held);
+                // What we render *into* is not in `held` and is not ours: the target may be a
+                // present-blit shadow the renderer's LRU can evict, or an imported dmabuf its
+                // cache can drop. Both free the image without a wait, so the record keeps them.
+                let targets = std::iter::once(self.fb.buffer.clone())
+                    .chain(self.fb.present.clone())
+                    .collect();
                 self.renderer
-                    .add_in_flight(timeline, self.cbuf, fence.clone(), held);
+                    .add_in_flight(timeline, self.cbuf, fence.clone(), held, targets);
                 // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
                 // leaves a scanout target in TRANSFER_SRC_OPTIMAL. Every later command is ordered
                 // after this submit, so recording it now is as true as recording it after a wait.
