@@ -631,6 +631,77 @@ impl VulkanRenderer {
         Ok((pool, set))
     }
 
+    /// The device this renderer draws on, for the few producers that build GPU resources off the
+    /// render thread ([`niri_vk::staging::HostStaging`], filled by the wallpaper decoder). Handing
+    /// out the `Arc` is what keeps the device alive for as long as such a producer holds one.
+    pub fn gpu(&self) -> &Arc<niri_vk::gpu::Gpu> {
+        &self.gpu
+    }
+
+    /// Import a texture whose pixels a **worker thread already wrote into device-visible memory**
+    /// ([`niri_vk::staging::HostStaging`]). The counterpart of `import_memory`, minus the part that
+    /// costs: the multi-megabyte host write happened on the producer's thread, so all that is left
+    /// here is creating the image, recording the copy and submitting it.
+    ///
+    /// Errors if the staging belongs to a *different* device — a renderer recreated under a decode
+    /// in flight. That is not recoverable here (there is no host copy left to fall back to), so the
+    /// caller re-requests the decode.
+    pub fn import_host_staging(
+        &mut self,
+        staging: &niri_vk::staging::HostStaging,
+        format: Fourcc,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<VkTexture, VulkanError> {
+        if !staging.belongs_to(&self.gpu) {
+            return Err(VulkanError::Other(
+                "staged pixels belong to a device this renderer replaced".to_owned(),
+            ));
+        }
+        let Some((vk_format, alpha_one)) = import_format(format) else {
+            return Err(VulkanError::UnsupportedFormat(format));
+        };
+        let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+        if w == 0 || h == 0 {
+            return Err(VulkanError::Other(format!(
+                "import_host_staging: zero extent {w}x{h}"
+            )));
+        }
+        let filter = match self.upscale_filter {
+            TextureFilter::Linear => vk::Filter::LINEAR,
+            TextureFilter::Nearest => vk::Filter::NEAREST,
+        };
+        let tex = NiriTexture::from_host_staging(
+            &self.gpu,
+            self.command_pool,
+            staging,
+            w,
+            h,
+            vk_format,
+            alpha_one,
+            filter,
+        )
+        .map_err(|e| VulkanError::Other(format!("staged upload: {e:#}")))?;
+        // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches
+        // `import_memory`).
+        let (desc_pool, set) = match self.make_texture_set(&tex) {
+            Ok(v) => v,
+            Err(err) => {
+                tex.destroy(&self.gpu);
+                return Err(err);
+            }
+        };
+        Ok(VkTexture::new(
+            self.gpu.clone(),
+            tex,
+            desc_pool,
+            set,
+            w,
+            h,
+            format,
+            false,
+        ))
+    }
+
     /// Import many host-memory buffers as textures with a **single** GPU submit + fence-wait
     /// instead of one per texture (see [`TextureBatch`]). Each item is `(tight w*h*4 bytes, its
     /// `Fourcc`, size, flipped)`; the returned textures are in the same order. The overview app

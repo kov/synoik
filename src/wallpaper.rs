@@ -9,14 +9,25 @@
 //! gnome-shell fits the picture with `picture-options`; we implement `zoom`
 //! (cover + center crop, the default) and draw every other mode the same way for
 //! now.
+//!
+//! The worker writes its pixels **straight into device-visible memory** when a device is
+//! available ([`niri_vk::staging::HostStaging`]). Moving the decode off the main loop had left one
+//! multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a staging
+//! buffer, measured at 7–9 ms for a 4K picture — pure write-combined-memory bandwidth, no GPU work
+//! in it at all. Staging on the worker leaves the render thread with only the image creation, the
+//! copy command and the submit. Without a device (headless tests, or before the renderer exists)
+//! it falls back to a plain `Vec` and the old upload path.
 
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use calloop::channel::Sender;
 use image::ImageReader;
+use niri_vk::gpu::Gpu;
+use niri_vk::staging::HostStaging;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer as _};
@@ -38,7 +49,11 @@ pub struct Wallpaper {
     /// The path currently being decoded on the worker, if any. While a decode is
     /// in flight the old `image` keeps showing, so the screen never blanks or
     /// freezes mid-change.
-    pending: Option<PathBuf>,
+    ///
+    /// A `RefCell` because [`render_vulkan`](Self::render_vulkan) — which only has `&self` — is
+    /// where a device change is noticed, and staged pixels cannot outlive their device, so it has
+    /// to be able to re-request the decode.
+    pending: RefCell<Option<PathBuf>>,
     image: Option<Image>,
     /// Lazily uploaded from `image`; the outer `Option` is "not tried yet", the inner one records
     /// a failed upload so we don't retry every frame.
@@ -52,19 +67,50 @@ pub struct Wallpaper {
     /// (e.g. in headless tests), in which case decoding falls back to synchronous.
     ///
     /// [`spawn_worker`]: Wallpaper::spawn_worker
-    decode_tx: Option<std::sync::mpsc::Sender<PathBuf>>,
+    decode_tx: Option<std::sync::mpsc::Sender<DecodeRequest>>,
+}
+
+/// What the main loop asks the worker for: a picture, and the device to stage it on if there is
+/// one. The device rides with the *request* rather than being wired in at
+/// [`spawn_worker`](Wallpaper::spawn_worker), because the worker outlives any one renderer — a
+/// device that has been replaced must not be reused for the next decode.
+struct DecodeRequest {
+    path: PathBuf,
+    gpu: Option<Arc<Gpu>>,
 }
 
 struct Image {
-    /// RGBA8, tightly packed.
-    data: Vec<u8>,
+    /// RGBA8, tightly packed, either on the heap or already in device-visible memory.
+    pixels: Pixels,
     size: Size<i32, Buffer>,
     opaque: bool,
 }
 
+/// Where a decoded picture's bytes live.
+enum Pixels {
+    /// On the heap. The upload copies them into a staging buffer it makes itself — the write this
+    /// module exists to keep off the render thread, kept for when there is no device to stage on.
+    Host(Vec<u8>),
+    /// Already in mapped device-visible memory, written by the decode worker. The upload only has
+    /// to record a copy.
+    Staged(HostStaging),
+}
+
+impl Pixels {
+    /// Only the decode test looks at this — the uploads check the length themselves, against the
+    /// extent they are about to create, which is the check that matters.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn len(&self) -> usize {
+        match self {
+            Pixels::Host(data) => data.len(),
+            Pixels::Staged(staging) => staging.len(),
+        }
+    }
+}
+
 /// A finished decode, delivered from the worker thread back to the main loop.
 /// Opaque to the caller (which just routes it to [`Wallpaper::apply_decoded`]);
-/// `Send` because [`Image`] is plain data.
+/// `Send` because [`Image`] is plain data or a `Send` staging buffer.
 pub struct WallpaperDecoded {
     path: PathBuf,
     image: Option<Image>,
@@ -76,14 +122,14 @@ impl Wallpaper {
     /// a calloop source that calls [`apply_decoded`](Self::apply_decoded)). Until
     /// this is called, [`update`](Self::update) decodes synchronously.
     pub fn spawn_worker(&mut self, result_tx: Sender<WallpaperDecoded>) {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<DecodeRequest>();
         self.decode_tx = Some(req_tx);
         if let Err(err) = std::thread::Builder::new()
             .name("wallpaper-decode".to_owned())
             .spawn(move || {
                 // Ends when the request sender (held by `Wallpaper`) is dropped.
-                for path in req_rx {
-                    let image = decode(&path);
+                for DecodeRequest { path, gpu } in req_rx {
+                    let image = decode(&path, gpu.as_ref());
                     if result_tx.send(WallpaperDecoded { path, image }).is_err() {
                         break;
                     }
@@ -97,38 +143,45 @@ impl Wallpaper {
 
     /// The picture we're heading toward: the in-flight decode if any, else the one
     /// on screen. `update` compares against this so a repeated setting is a no-op.
-    fn target(&self) -> Option<&PathBuf> {
-        self.pending.as_ref().or(self.picture.as_ref())
+    fn target(&self) -> Option<PathBuf> {
+        self.pending
+            .borrow()
+            .clone()
+            .or_else(|| self.picture.clone())
     }
 
     /// Syncs with the current settings, decoding the picture if it changed. The
     /// decode runs on the worker thread ([`spawn_worker`](Self::spawn_worker)); the
     /// previous wallpaper stays up until the new one is ready. Falls back to a
     /// synchronous decode when no worker is wired.
-    pub fn update(&mut self, settings: &BackgroundSettings) {
-        if settings.picture.as_ref() != self.target() {
+    pub fn update(&mut self, settings: &BackgroundSettings, gpu: Option<&Arc<Gpu>>) {
+        if settings.picture != self.target() {
             match (&settings.picture, &self.decode_tx) {
                 // Async: keep the current image, ask the worker to decode the new one.
                 (Some(path), Some(tx)) => {
-                    self.pending = Some(path.clone());
-                    if tx.send(path.clone()).is_err() {
+                    *self.pending.borrow_mut() = Some(path.clone());
+                    let request = DecodeRequest {
+                        path: path.clone(),
+                        gpu: gpu.cloned(),
+                    };
+                    if tx.send(request).is_err() {
                         // Worker gone; fall back to a synchronous decode.
-                        self.pending = None;
+                        *self.pending.borrow_mut() = None;
                         self.picture = Some(path.clone());
-                        self.image = decode(path);
+                        self.image = decode(path, gpu);
                         self.vk_texture.replace(None);
                     }
                 }
                 // No worker (tests): decode inline.
                 (Some(path), None) => {
-                    self.pending = None;
+                    *self.pending.borrow_mut() = None;
                     self.picture = Some(path.clone());
-                    self.image = decode(path);
+                    self.image = decode(path, gpu);
                     self.vk_texture.replace(None);
                 }
                 // Cleared.
                 (None, _) => {
-                    self.pending = None;
+                    *self.pending.borrow_mut() = None;
                     self.picture = None;
                     self.image = None;
                     self.vk_texture.replace(None);
@@ -153,10 +206,10 @@ impl Wallpaper {
     /// change superseded it). Returns whether the displayed wallpaper changed, so
     /// the caller can queue a redraw.
     pub fn apply_decoded(&mut self, decoded: WallpaperDecoded) -> bool {
-        if self.pending.as_deref() != Some(decoded.path.as_path()) {
+        if self.pending.borrow().as_deref() != Some(decoded.path.as_path()) {
             return false;
         }
-        self.picture = self.pending.take();
+        self.picture = self.pending.borrow_mut().take();
         self.image = decoded.image;
         self.vk_texture.replace(None);
         true
@@ -194,6 +247,29 @@ impl Wallpaper {
             *self.context.borrow_mut() = Some(context);
         }
 
+        // Heap pixels survive a device change and simply re-upload; staged ones do not — they live
+        // in memory belonging to the device that is gone. Re-request the decode rather than draw
+        // nothing forever, and guard against asking once a frame while it runs.
+        if let Pixels::Staged(staging) = &image.pixels {
+            if !staging.belongs_to(renderer.gpu()) {
+                let path = self.picture.clone();
+                if path.is_some() && *self.pending.borrow() != path {
+                    warn!("wallpaper was staged on a device that is gone; decoding it again");
+                    if let (Some(tx), Some(path)) = (self.decode_tx.as_ref(), path) {
+                        *self.pending.borrow_mut() = Some(path.clone());
+                        let request = DecodeRequest {
+                            path,
+                            gpu: Some(renderer.gpu().clone()),
+                        };
+                        if tx.send(request).is_err() {
+                            *self.pending.borrow_mut() = None;
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+
         let mut texture = self.vk_texture.borrow_mut();
         let buffer = texture
             .get_or_insert_with(|| upload_vulkan(renderer, image))
@@ -220,21 +296,43 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
     } else {
         Vec::new()
     };
-    TextureBuffer::from_memory(
-        renderer,
-        &image.data,
-        Fourcc::Abgr8888,
-        image.size,
-        false,
-        1.,
-        Transform::Normal,
-        opaque_regions,
-    )
-    .map_err(|err| warn!("error uploading wallpaper texture to Vulkan: {err}"))
-    .ok()
+    match &image.pixels {
+        Pixels::Host(data) => TextureBuffer::from_memory(
+            renderer,
+            data,
+            Fourcc::Abgr8888,
+            image.size,
+            false,
+            1.,
+            Transform::Normal,
+            opaque_regions,
+        )
+        .map_err(|err| warn!("error uploading wallpaper texture to Vulkan: {err}"))
+        .ok(),
+        Pixels::Staged(staging) => {
+            match renderer.import_host_staging(staging, Fourcc::Abgr8888, image.size) {
+                Ok(texture) => Some(TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    1.,
+                    Transform::Normal,
+                    opaque_regions,
+                )),
+                Err(err) => {
+                    warn!("error uploading staged wallpaper texture to Vulkan: {err}");
+                    None
+                }
+            }
+        }
+    }
 }
 
-fn decode(path: &Path) -> Option<Image> {
+/// Decode `path` into RGBA8. With a `gpu`, the pixels are written straight into device-visible
+/// memory so the render thread never has to copy them; without one (no renderer yet, headless
+/// tests) they land on the heap and the upload copies them as before. A staging allocation that
+/// fails falls back to the heap rather than failing the decode — running with the old cost beats
+/// no wallpaper.
+fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
     // TODO(perf): a stock 4K JPEG-XL takes *seconds* here, which is why this had
@@ -290,8 +388,23 @@ fn decode(path: &Path) -> Option<Image> {
 
     let opaque = !decoded.color().has_alpha();
     let size = Size::new(decoded.width() as i32, decoded.height() as i32);
+    let data = decoded.into_rgba8().into_raw();
+
+    // This copy is the whole point of the staging path: it is tens of megabytes into
+    // write-combined memory, and here it runs on the worker instead of between two frames.
+    let pixels = match gpu.map(|gpu| HostStaging::new(gpu, data.len())) {
+        Some(Ok(mut staging)) => {
+            staging.as_mut_slice().copy_from_slice(&data);
+            Pixels::Staged(staging)
+        }
+        Some(Err(err)) => {
+            warn!("could not stage the wallpaper on the GPU ({err:#}); uploading from the heap");
+            Pixels::Host(data)
+        }
+        None => Pixels::Host(data),
+    };
     Some(Image {
-        data: decoded.into_rgba8().into_raw(),
+        pixels,
         size,
         opaque,
     })
@@ -329,8 +442,8 @@ mod tests {
         wp.decode_tx = Some(req_tx);
 
         // Requesting A leaves the display empty (nothing decoded yet), A pending.
-        wp.update(&bg(&a));
-        assert_eq!(wp.pending.as_ref(), Some(&a));
+        wp.update(&bg(&a), None);
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&a));
         assert!(wp.picture.is_none());
 
         // A lands → it's shown, nothing pending.
@@ -339,11 +452,11 @@ mod tests {
             image: None,
         }));
         assert_eq!(wp.picture.as_ref(), Some(&a));
-        assert!(wp.pending.is_none());
+        assert!(wp.pending.borrow().is_none());
 
         // Switching to B keeps A on screen while B decodes.
-        wp.update(&bg(&b));
-        assert_eq!(wp.pending.as_ref(), Some(&b));
+        wp.update(&bg(&b), None);
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&b));
         assert_eq!(
             wp.picture.as_ref(),
             Some(&a),
@@ -355,7 +468,7 @@ mod tests {
             path: a.clone(),
             image: None,
         }));
-        assert_eq!(wp.pending.as_ref(), Some(&b));
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&b));
         assert_eq!(wp.picture.as_ref(), Some(&a));
 
         // B lands → B is shown.
@@ -364,11 +477,11 @@ mod tests {
             image: None,
         }));
         assert_eq!(wp.picture.as_ref(), Some(&b));
-        assert!(wp.pending.is_none());
+        assert!(wp.pending.borrow().is_none());
 
         // Re-applying the same setting is a no-op (no re-request, no flicker).
-        wp.update(&bg(&b));
-        assert!(wp.pending.is_none());
+        wp.update(&bg(&b), None);
+        assert!(wp.pending.borrow().is_none());
     }
 
     #[test]
@@ -408,9 +521,12 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let image = decode(path).unwrap();
+        let image = decode(path, None).unwrap();
         assert!(image.size.w > 0 && image.size.h > 0);
-        assert_eq!(image.data.len(), (image.size.w * image.size.h * 4) as usize);
+        assert_eq!(
+            image.pixels.len(),
+            (image.size.w * image.size.h * 4) as usize
+        );
     }
 
     /// The upload is cached across frames, but it belongs to the renderer that made
@@ -431,7 +547,7 @@ mod tests {
 
         let wp = Wallpaper {
             image: Some(Image {
-                data: vec![0xffu8; 8 * 8 * 4],
+                pixels: Pixels::Host(vec![0xffu8; 8 * 8 * 4]),
                 size: Size::from((8, 8)),
                 opaque: true,
             }),
@@ -462,6 +578,65 @@ mod tests {
         );
         assert!(render(&wp, &mut vk_b).is_some());
         assert_eq!(uploads(()), 0, "the new renderer must then cache too");
+    }
+
+    /// Staged pixels live in memory belonging to one device, so unlike heap pixels they cannot
+    /// survive a renderer recreation — and there is no host copy left to re-upload from. Rather
+    /// than leave the desktop on its solid backstop for the rest of the session, the render that
+    /// notices has to ask for the picture again. It must also ask **once**, not once per frame,
+    /// or a device change turns into a decode storm on a worker that is already the slow part.
+    #[test]
+    fn a_wallpaper_staged_on_a_dead_device_is_decoded_again_exactly_once() {
+        let (mut vk_a, mut vk_b) = match (VulkanRenderer::new(), VulkanRenderer::new()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!("skipping a_wallpaper_staged_on_a_dead_device...: no Vulkan device");
+                return;
+            }
+        };
+
+        let path = PathBuf::from("/wall.png");
+        let mut staging = HostStaging::new(vk_a.gpu(), 8 * 8 * 4).expect("staging");
+        staging.as_mut_slice().fill(0xff);
+
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let wp = Wallpaper {
+            picture: Some(path.clone()),
+            image: Some(Image {
+                pixels: Pixels::Staged(staging),
+                size: Size::from((8, 8)),
+                opaque: true,
+            }),
+            decode_tx: Some(req_tx),
+            ..Default::default()
+        };
+        let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
+            wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
+        };
+
+        assert!(
+            render(&wp, &mut vk_a).is_some(),
+            "the device that staged the pixels could not draw them"
+        );
+        assert!(req_rx.try_recv().is_err(), "nothing should be re-requested");
+
+        assert!(
+            render(&wp, &mut vk_b).is_none(),
+            "a renderer drew a wallpaper staged on a device it does not own"
+        );
+        assert_eq!(
+            req_rx.try_recv().map(|r| r.path).ok(),
+            Some(path.clone()),
+            "the wallpaper was dropped without being re-requested — it never comes back"
+        );
+        assert_eq!(wp.pending.borrow().as_ref(), Some(&path));
+
+        // The decode is in flight now; further frames must not pile more requests onto it.
+        assert!(render(&wp, &mut vk_b).is_none());
+        assert!(
+            req_rx.try_recv().is_err(),
+            "every frame re-requested the decode while one was already running"
+        );
     }
 
     #[test]

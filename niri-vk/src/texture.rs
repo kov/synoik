@@ -9,6 +9,7 @@ use ash::vk;
 
 use crate::gpu::Gpu;
 use crate::render::{COLOR_RANGE, FORMAT};
+use crate::staging::HostStaging;
 
 pub struct Texture {
     pub image: vk::Image,
@@ -442,6 +443,60 @@ impl Texture {
         Self::upload(
             gpu, pool, width, height, data, format, 4, components, filter,
         )
+    }
+
+    /// Upload a texture whose pixels are **already in device-visible memory**, written there by
+    /// whichever thread produced them ([`HostStaging`]). The render thread is left with the image
+    /// creation, the copy command and the submit — the multi-megabyte host write, which is the
+    /// whole cost of a wallpaper upload and has no GPU work in it, has already happened elsewhere.
+    ///
+    /// The counterpart of [`from_bytes_32bpp`](Self::from_bytes_32bpp), and byte-for-byte the same
+    /// result: same image, same barriers (via [`record_upload_copy`]), same submit site. Only where
+    /// the copy's *source* came from differs.
+    ///
+    /// `staging` must hold exactly `width * height * 4` bytes, and must belong to `gpu` — see
+    /// [`HostStaging::belongs_to`], which the caller checks, because a device mismatch is a wasted
+    /// decode rather than something this can recover from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_host_staging(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        staging: &HostStaging,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        alpha_one: bool,
+        filter: vk::Filter,
+    ) -> Result<Self> {
+        let size = (width as usize) * (height as usize) * 4;
+        anyhow::ensure!(
+            staging.len() == size,
+            "staged wallpaper is {} bytes for {width}x{height}, need {size}",
+            staging.len()
+        );
+        crate::stats::uploaded(size as vk::DeviceSize);
+
+        let components = if alpha_one {
+            vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
+        } else {
+            vk::ComponentMapping::default()
+        };
+        let texture = Self::new_sampled_image_raw(gpu, width, height, format, components, filter)?;
+
+        let device = &gpu.device;
+        let buffer = staging.buffer();
+        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
+            record_upload_copy(device, cbuf, texture.image, buffer, width, height);
+        });
+        match result {
+            Ok(()) => Ok(texture),
+            Err(err) => {
+                // `run_commands` drains the device on a wait error, so the copy that never ran
+                // cannot still be reading this image.
+                texture.destroy(gpu);
+                Err(err)
+            }
+        }
     }
 
     /// Upload tight `width*height` single-channel coverage (R8) — the glyph atlas format.
@@ -1054,16 +1109,37 @@ impl Texture {
     /// one staging buffer across the batch and so cannot use
     /// [`build_pending`](Self::build_pending).
     fn new_sampled_image(gpu: &Gpu, item: &BatchItem<'_>) -> Result<Texture> {
+        Self::new_sampled_image_raw(
+            gpu,
+            item.width,
+            item.height,
+            item.format,
+            item.components,
+            item.filter,
+        )
+    }
+
+    /// [`new_sampled_image`](Self::new_sampled_image) against loose parameters rather than a
+    /// [`BatchItem`], for the callers that have no host slice to point one at
+    /// ([`from_host_staging`](Self::from_host_staging)).
+    fn new_sampled_image_raw(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        components: vk::ComponentMapping,
+        filter: vk::Filter,
+    ) -> Result<Texture> {
         let _timed = crate::stats::creating();
         let device = &gpu.device;
         let mut guard = UploadGuard::new(device);
 
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(item.format)
+            .format(format)
             .extent(vk::Extent3D {
-                width: item.width,
-                height: item.height,
+                width,
+                height,
                 depth: 1,
             })
             .mip_levels(1)
@@ -1083,15 +1159,15 @@ impl Texture {
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(item.format)
-            .components(item.components)
+            .format(format)
+            .components(components)
             .subresource_range(COLOR_RANGE);
         let view = unsafe { device.create_image_view(&view_ci, None) }.context("texture view")?;
         guard.view = view;
 
         let sampler_ci = vk::SamplerCreateInfo::default()
-            .mag_filter(item.filter)
-            .min_filter(item.filter)
+            .mag_filter(filter)
+            .min_filter(filter)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
@@ -1107,8 +1183,8 @@ impl Texture {
             view,
             sampler,
             memory,
-            width: item.width,
-            height: item.height,
+            width,
+            height,
         })
     }
 

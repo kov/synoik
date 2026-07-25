@@ -4135,6 +4135,107 @@ fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
     }
 }
 
+/// The wallpaper decoder writes its pixels straight into device-visible memory on its worker
+/// thread, so the render thread never does the multi-megabyte host copy. That means the bytes take
+/// a different route into the image than every other texture in the tree, and the only thing that
+/// can go wrong quietly is *which* bytes land where — a wrong extent or a channel order picked up
+/// from the wrong side of `import_format` shows up as a tinted or smeared wallpaper, never as an
+/// error.
+///
+/// So: fill a staging buffer by hand, import it, draw it and read the pixels back. Deliberately a
+/// non-grey, non-symmetric colour — grey and fully-opaque white both survive a channel swap.
+#[test]
+fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_texture_staged_off_thread...: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const W: i32 = 12;
+    const H: i32 = 7;
+    let want = [17u8, 200, 99, 255];
+
+    let mut staging = niri_vk::staging::HostStaging::new(vk.gpu(), (W * H * 4) as usize)
+        .expect("host staging buffer");
+    for px in staging.as_mut_slice().chunks_exact_mut(4) {
+        px.copy_from_slice(&want);
+    }
+
+    let tex = vk
+        .import_host_staging(
+            &staging,
+            Fourcc::Abgr8888,
+            Size::<i32, BufferCoord>::from((W, H)),
+        )
+        .expect("import staged texture");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((W, H)))
+        .expect("target");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        let full = Rectangle::from_size(size);
+        frame
+            .clear(Color32F::new(0., 0., 0., 1.), &[full])
+            .expect("clear");
+        let src = Rectangle::<f64, BufferCoord>::from_size(Size::from((W as f64, H as f64)));
+        frame
+            .render_texture_from_to(&tex, src, full, &[full], &[], Transform::Normal, 1.0)
+            .expect("draw");
+        let _sync = frame.finish().expect("finish");
+    }
+    let fb = vk.bind(&mut target).expect("rebind");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let px = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    let mid = (((H / 2) * W + W / 2) * 4) as usize;
+    let got = [px[mid], px[mid + 1], px[mid + 2]];
+    assert_eq!(
+        got,
+        [want[0], want[1], want[2]],
+        "the staged copy read back {got:?}, wanted {:?}",
+        [want[0], want[1], want[2]]
+    );
+}
+
+/// A staging buffer outlives the renderer that made it (it holds an `Arc<Gpu>`, so the device stays
+/// alive), but it is only *usable* on that device — a copy does not cross devices. The guard is the
+/// difference between "the wallpaper is re-decoded" and "the wallpaper is uploaded from a buffer
+/// belonging to a device the image is not on", which no validation layer would call an error.
+#[test]
+fn staged_pixels_are_refused_by_a_renderer_that_did_not_allocate_them() {
+    let (mut vk_a, mut vk_b) = match (VulkanRenderer::new(), VulkanRenderer::new()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            eprintln!("skipping staged_pixels_are_refused_...: no Vulkan device");
+            return;
+        }
+    };
+
+    let staging = niri_vk::staging::HostStaging::new(vk_a.gpu(), 4 * 4 * 4).expect("staging");
+    assert!(staging.belongs_to(vk_a.gpu()));
+    assert!(!staging.belongs_to(vk_b.gpu()));
+
+    let size = Size::<i32, BufferCoord>::from((4, 4));
+    assert!(
+        vk_a.import_host_staging(&staging, Fourcc::Abgr8888, size)
+            .is_ok(),
+        "the device that allocated the staging refused it"
+    );
+    assert!(
+        vk_b.import_host_staging(&staging, Fourcc::Abgr8888, size)
+            .is_err(),
+        "a second renderer uploaded from another device's memory"
+    );
+}
+
 /// Every offscreen render — a widget bake, a window snapshot, an effect buffer — used to park the
 /// compositor thread on a fence, and there are several per frame. They are also the *only* submits
 /// that could never take the deferred path: it was gated on `finish_may_defer`, the tty backend's

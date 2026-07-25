@@ -1129,10 +1129,15 @@ impl State {
                     }
                 })
                 .unwrap();
+            // The device, so the decode worker can write its pixels straight into device-visible
+            // memory instead of leaving the render thread a multi-megabyte copy (see
+            // `wallpaper`'s module doc). `None` before a renderer exists — the decode then falls
+            // back to the heap.
+            let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
             state
                 .niri
                 .wallpaper
-                .update(&state.niri.gnome_settings.background);
+                .update(&state.niri.gnome_settings.background, gpu.as_ref());
             state
                 .niri
                 .panel
@@ -1155,7 +1160,11 @@ impl State {
                             .niri
                             .layout
                             .set_gnome_accent_color(settings.accent_color);
-                        state.niri.wallpaper.update(&settings.background);
+                        let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
+                        state
+                            .niri
+                            .wallpaper
+                            .update(&settings.background, gpu.as_ref());
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
                         // A `favorite-apps` change re-seeds the dash favorites and
