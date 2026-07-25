@@ -250,7 +250,44 @@ a Venus one).
 5. **The two dmabuf/gbm findings (§3.7)**, which are correctness rather than performance and
    already have reproducers waiting.
 
-## 6. Reproducing / re-measuring any of this
+## 6. The baseline, pinned
+
+Written down so a **host-side change can be judged against it**. Everything below is one session on
+the live seat, `2026-07-25T19:19:48Z` onward, guest build `v26.04-591-g4504c5b5`, VMM build as of
+2026-07-25. The journal on this guest is persistent (`/var/log/journal`), so the raw lines survive
+a reboot: `journalctl _UID=$(id -u gsrs) --since "2026-07-25 19:19"`.
+
+| measure | baseline | where |
+|---|---|---|
+| per upload submit | **1.52 – 1.88 ms**, flat across 0.0 → 3.2 MiB | §3.1 |
+| per created resource | **0.018 – 2.11 ms** (117× spread, same session) | §3.3 |
+| worst frame's creation cost | `19 created in 40.02 ms` | §3.3 |
+| host-visible write | **5.95 GB/s** (48.0 MiB in 8.46 ms) | §3.4 |
+| scanout fence wait, back-to-back frames | 12.36 – 13.85 ms | §3.2 |
+| offscreen fence wait | **0.00 ms** — already fixed guest-side, do not read as a host win | §4.2 |
+| frames over the 16.67 ms budget | 6, all within 13 s of login; none after | — |
+
+**Making the comparison valid.** Our own investigation notes that comparing two sessions is not an
+A/B — session-to-session frame counts are dominated by how much the desktop was driven, and the
+same build reported 0.8 and 12.3 over-budget frames per minute depending on the session. Across a
+reboot that caveat is unavoidable, so:
+
+- **Keep the guest binary identical.** `target/debug/niri` currently corresponds to `4504c5b5`
+  (`2ca2e164` is docs-only and does not change it). If the guest is rebuilt as well, nothing in a
+  before/after is attributable.
+- **Compare per-submit and per-resource numbers, not per-session totals.** The two rate columns in
+  the table above are the ones that mean something; "frames over budget" is not, on its own.
+- The most sensitive single number is **cost per created resource** (§3.3): it is large, it is
+  frequent, and its 117× spread is the contention signature, so a host scheduling change should
+  show up there first and most clearly.
+
+**One clean negative result worth having.** `VN_DEBUG=result` has been set for the seat since
+2026-07-10 and logs every non-`VK_SUCCESS` result the guest sees. Across the last two hours of
+real use it produced **zero** such lines (the only Venus output at all is the 2-line device banner
+per `vkCreateDevice`, 38 processes' worth). So the cost in this document is **not** error handling,
+retries, or a fallback path being taken — it is plain round-trip latency on calls that all succeed.
+
+## 7. Reproducing / re-measuring any of this
 
 1. `NIRI_FRAME_LOG=1` is set for the gsrs session via
    `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `NIRI_VK_ASYNC_SCANOUT=1` via
