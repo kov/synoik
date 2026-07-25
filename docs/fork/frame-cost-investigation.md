@@ -40,9 +40,10 @@ three seconds, `submit` p50 11.1 → 0.48 ms, and no presentation penalty. The f
 wait created — light 2-submit frames, 376 of 400 over-budget frames in the last pre-change
 session — no longer exists.
 
-**The headline has moved.** What puts a frame over budget now is the **other** submits: 7–27 per
-frame (bakes, glyph uploads, dmabuf transitions), each still blocking ~1.3–1.6 ms, all inside
-`collect`. §6 item 1.
+**The headline has moved, and then moved again.** With the scanout wait gone, what puts a frame
+over budget is the other submits — and once they were attributed by site (`984774f7`) and the
+frame's first wait separated from the rest (`fd0eda51`), they turned out to be **three unrelated
+problems**, not one. §6 item 1.
 
 ## 2. What the instrumentation reports
 
@@ -159,19 +160,32 @@ remaining slow frame is an overview animation or first-time startup work.
 
 ## 6. Open items
 
-1. **Every *other* submit still blocks.** The scanout wait is done (§1); this is what replaced it
-   as the headline. A frame issues 7–27 non-scanout submits — widget bakes, glyph-atlas uploads,
-   dmabuf import transitions — and `Gpu::run_commands` still does create-fence → submit →
-   `wait_for_fences` → destroy on each, at ~1.3–1.6 ms a piece. Fifteen of those is ~20 ms, it
-   lands in `collect`, and it is now the only thing that puts a frame over budget.
+1. **The other submits — measured 2026-07-25, and they are three problems, not one.** Attributed
+   by site on the live seat, with the frame's first wait separated out. What the data killed and
+   what it found:
 
-   Scoped 2026-07-25 in
-   [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md#the-other-submits--scoping-2026-07-25),
-   and the scoping is worth reading before assuming this is the same change again. It is not: the
-   timeline orders GPU work against GPU work, and half these sites are gated by a **CPU** write
-   into a mapped buffer instead, which it does nothing for. Read the two hazard classes and the
-   site table there — and the defect it found in the *landed* change, which is the first thing to
-   fix.
+   **Dead: the wait did not move into the next frame.** Every submit is chained on the queue
+   timeline, so the plausible reading was that a frame's *first* submit drains whatever the
+   previous frame left running, and whichever site went first merely looked expensive. Measured,
+   `first` is **1.4–2.4 ms in six of seven frames**. The chain is not costing us a frame's tail,
+   and the structural work (dependency-accurate ordering, frames in flight) is **not urgent** for
+   this reason. It was a good hypothesis and it was wrong; do not re-derive it.
+
+   **Real, in order of how much they cost:**
+
+   | what | evidence | why it costs | the fix |
+   |---|---|---|---|
+   | blur execution | `2 blur in 42.38ms` + `7 offscreen in 28.81ms` on a 132 ms frame covering **8.2× the output** | fill rate, not round trips — ~21 ms per blur submit | fewer/cheaper passes, or cache the blurred result; a separate investigation |
+   | one huge upload | `first upload 18.62ms`, **48.0 MiB uploaded** in one frame | payload. The wallpaper. Deferring the fence moves it, it does not remove it | off the frame entirely — the async-decode pattern (`e7a1c2ed`) extended through the *upload* |
+   | uncoalesced round trips | `13 glyphs in 13.43ms`, `10 shm in 15.85ms`, `9 upload in 14.67ms` — all in single frames | ~1 ms each, and they go into the **same image** | coalesce at the call site. `absorb_glyphs` (`renderer.rs:792`) uploads per *shaped line*, though `upload_coverage_regions` already takes a slice of regions |
+
+   The glyph one is the clearest: a frame that shapes 13 new strings makes 13 submits into one
+   atlas. Flushing once per frame instead is a call-site change, not a scheduling change.
+
+   Deferring these submits — [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md)
+   slices 1–4 — is therefore **not** the top lever any more. Coalescing removes the round trips
+   outright, and the two big costs are real GPU work that no amount of scheduling makes cheaper.
+
 2. **The panel still bakes during an overview animation** — but not for the reason we fixed.
    `are_animations_ongoing()` (`ui/panel.rs:848`) is the button-fill fades, and opening the
    overview toggles Activities to checked, so the fill fade covers the same window. That bake
