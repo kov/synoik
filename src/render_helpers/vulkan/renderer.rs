@@ -664,6 +664,11 @@ impl VulkanRenderer {
         px: f32,
         bold: bool,
     ) -> Result<GlyphRun, VulkanError> {
+        // Every shaped run funnels through here — shaping proper plus the atlas
+        // upload it needs — so this is where the frame log can tell "the widget
+        // path was slow" apart from "the text in it was".
+        let _timed = crate::frame_log::time_shape();
+
         // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
@@ -1110,7 +1115,7 @@ fn src_masks_for(old: vk::ImageLayout) -> (vk::AccessFlags, vk::PipelineStageFla
 /// Record a single-image layout transition barrier into `cbuf`. Prior hazards are already resolved
 /// by this renderer's fence-per-submit model, so the source masks come only from `old`'s layout.
 #[allow(clippy::too_many_arguments)]
-unsafe fn transition_image(
+pub(super) unsafe fn transition_image(
     dev: &ash::Device,
     cbuf: vk::CommandBuffer,
     image: vk::Image,

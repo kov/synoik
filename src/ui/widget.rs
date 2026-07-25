@@ -27,7 +27,6 @@ use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle,
 
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
     premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer,
@@ -721,9 +720,10 @@ pub fn bake_uncached_sized(
     paint: impl FnOnce(&mut VulkanFrame) -> anyhow::Result<()>,
 ) -> anyhow::Result<VkTexture> {
     // Every offscreen bake funnels through here, and each one is a render pass,
-    // a submit and a fence wait. Counting them here (rather than at each caller)
-    // is what lets a slow frame say how much of itself was re-rasterization.
-    crate::frame_log::count_bake();
+    // a submit and a fence wait. Counting and timing them here (rather than at
+    // each caller) is what lets a slow frame say how much of itself was
+    // re-rasterization.
+    let _timed = crate::frame_log::time_bake();
 
     let (w, h) = (phys.w.max(1), phys.h.max(1));
     let mut target =
@@ -732,9 +732,12 @@ pub fn bake_uncached_sized(
         let mut fb = renderer.bind(&mut target)?;
         let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
         paint(&mut frame)?;
-        let _sync = frame.finish()?;
+        // `finish_sampleable`, not `finish` + `make_offscreen_sampleable`: the
+        // layout transition rides this submit instead of costing a second command
+        // buffer, submit and fence wait of its own. A bake's GPU work is
+        // negligible, so the round trips were most of what a bake cost.
+        let _sync = frame.finish_sampleable()?;
     }
-    renderer.make_offscreen_sampleable(&target)?;
     Ok(target)
 }
 
