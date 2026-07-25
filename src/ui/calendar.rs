@@ -1752,19 +1752,19 @@ impl CalendarMessageList {
                 collapse.loc.x + collapse.size.w / 2.,
                 collapse.loc.y + collapse.size.h / 2.,
             ));
-        if let Some(buffer) = icons.buffer("group-collapse-symbolic", SMALL_ICON, scale, TEXT) {
-            if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                let logical = tb.logical_size();
-                let loc = icon_center - Point::from((logical.w / 2., logical.h / 2.));
-                elements.push(TextureRenderElement::from_texture_buffer(
-                    tb,
-                    loc,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ));
-            }
+        if let Some(tb) =
+            icons.texture(renderer, "group-collapse-symbolic", SMALL_ICON, scale, TEXT)
+        {
+            let logical = tb.logical_size();
+            let loc = icon_center - Point::from((logical.w / 2., logical.h / 2.));
+            elements.push(TextureRenderElement::from_texture_buffer(
+                tb,
+                loc,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
         }
         // The header texture (title + button circle) below the chevron.
         if !cache.has_card(scale_key, key) {
@@ -3003,24 +3003,23 @@ impl DateMenu {
         if self.list.is_empty() {
             let (icon_cy, _) = placeholder_centers(size.h);
             let center = Point::from((LIST_PAD + LIST_W / 2., icon_cy));
-            if let Some(buffer) = icons.buffer(
+            if let Some(tb) = icons.texture(
+                renderer,
                 "no-notifications-symbolic",
                 PLACEHOLDER_ICON,
                 scale,
                 PLACEHOLDER_FG,
             ) {
-                if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                    let logical = tb.logical_size();
-                    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        tb,
-                        loc,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ));
-                }
+                let logical = tb.logical_size();
+                let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+                elements.push(TextureRenderElement::from_texture_buffer(
+                    tb,
+                    loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
             }
         } else {
             elements.extend(self.list.render(renderer, icons, scale, origin, size.h));

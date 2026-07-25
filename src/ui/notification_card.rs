@@ -623,8 +623,7 @@ pub fn card_elements(
                    color: [f32; 4],
                    center: Point<f64, Logical>|
      -> Option<TextureRenderElement<VkTexture>> {
-        let buffer = icons.buffer(name, size_l, scale, color)?;
-        let tb = TextureBuffer::from_memory_buffer(renderer, &buffer).ok()?;
+        let tb = icons.texture(renderer, name, size_l, scale, color)?;
         let logical = tb.logical_size();
         let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
         Some(TextureRenderElement::from_texture_buffer(

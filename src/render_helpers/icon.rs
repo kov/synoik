@@ -30,10 +30,13 @@ use std::sync::mpsc;
 use anyhow::Context as _;
 use calloop::channel::Sender as CalloopSender;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Scale, Size, Transform};
 
 use crate::app_system::AppIconRef;
 use crate::render_helpers::memory::MemoryBuffer;
+use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::utils::to_physical_precise_round;
 
 /// The icon-theme subdirectories that hold symbolic icons, and the categories
@@ -59,6 +62,17 @@ pub struct IconCache {
     themes: Vec<String>,
     resolved: RefCell<HashMap<String, Option<PathBuf>>>,
     buffers: RefCell<HashMap<(String, u32, u32), MemoryBuffer>>,
+    /// The GPU uploads of `buffers`, keyed identically ([`icon_key`]). Symbolic icons
+    /// are *elements*, rebuilt from scratch on every frame that draws them, and each
+    /// upload is a synchronous submit + fence-wait — measured at ~1.7ms apiece on the
+    /// Venus queue, independent of size. One quick-settings popover frame asks for
+    /// nine, so an open popover paid ~13ms a frame to re-upload identical pixels.
+    /// Caching the texture makes a redraw free; the CPU raster above was already
+    /// cached, so only this half was recurring.
+    textures: RefCell<HashMap<(String, u32, u32), TextureBuffer<VkTexture>>>,
+    /// Identifies the renderer `textures` were uploaded to; a mismatch drops them all
+    /// (they belong to a device that is gone). Same guard the widget bake caches use.
+    context: RefCell<Option<ContextId<VkTexture>>>,
 }
 
 impl IconCache {
@@ -74,6 +88,8 @@ impl IconCache {
             themes,
             resolved: RefCell::new(HashMap::new()),
             buffers: RefCell::new(HashMap::new()),
+            textures: RefCell::new(HashMap::new()),
+            context: RefCell::new(None),
         }
     }
 
@@ -103,8 +119,8 @@ impl IconCache {
         scale: f64,
         color: [f32; 4],
     ) -> Option<MemoryBuffer> {
-        let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
-        let key = (name.to_string(), px, color_key(color));
+        let key = icon_key(name, logical_px, scale, color);
+        let px = key.1;
         if let Some(buf) = self.buffers.borrow().get(&key) {
             return Some(buf.clone());
         }
@@ -125,6 +141,51 @@ impl IconCache {
             }
         }
     }
+
+    /// The uploaded texture for what [`buffer`](Self::buffer) would rasterize — the
+    /// form every caller actually wants, since a symbolic icon is only ever
+    /// composited. Cached by the same key, so drawing the same icon on a later frame
+    /// costs no submit at all. `None` if it can't be resolved or the upload fails
+    /// (never cached, so the next frame retries).
+    pub fn texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        name: &str,
+        logical_px: f64,
+        scale: f64,
+        color: [f32; 4],
+    ) -> Option<TextureBuffer<VkTexture>> {
+        let context = renderer.context_id();
+        if self.context.borrow().as_ref() != Some(&context) {
+            self.textures.borrow_mut().clear();
+            *self.context.borrow_mut() = Some(context);
+        }
+
+        let key = icon_key(name, logical_px, scale, color);
+        if let Some(tb) = self.textures.borrow().get(&key) {
+            return Some(tb.clone());
+        }
+
+        let buffer = self.buffer(name, logical_px, scale, color)?;
+        match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+            Ok(tb) => {
+                self.textures.borrow_mut().insert(key, tb.clone());
+                Some(tb)
+            }
+            Err(err) => {
+                tracing::error!("error uploading icon {name:?}: {err:#}");
+                None
+            }
+        }
+    }
+}
+
+/// The cache key shared by [`IconCache::buffer`] and [`IconCache::texture`]: the
+/// name, the *physical* pixel size (so scale is folded in), and the quantized tint.
+/// One function so the two maps can never key differently on the same request.
+fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> (String, u32, u32) {
+    let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
+    (name.to_string(), px, color_key(color))
 }
 
 /// Icons gnome-shell ships inside its own gresource — they exist in NO icon

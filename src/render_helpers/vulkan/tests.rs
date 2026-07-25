@@ -3267,6 +3267,84 @@ fn text_of_resident_glyphs_costs_no_submit() {
     );
 }
 
+/// A symbolic icon is an *element*: rebuilt from scratch on every frame that draws it. The CPU
+/// raster was always cached, the upload was not — so an open quick-settings popover re-uploaded
+/// its nine icons every frame, each a synchronous submit + fence-wait (~13ms a frame on the seat).
+/// Drawing the same icon again must cost no submit at all.
+///
+/// The three axes of the key each get a case, because a cache that keys too coarsely does not
+/// merely lose a hit — it hands back *another icon's pixels*, or the same icon in the wrong tint
+/// or the wrong size, and no counter would notice.
+#[test]
+fn a_repeated_symbolic_icon_uploads_once() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_repeated_symbolic_icon_uploads_once: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Embedded icons are compiled in, so this needs no icon theme installed.
+    let icons = crate::render_helpers::icon::IconCache::new("Adwaita");
+    const NAME: &str = "no-notifications-symbolic";
+    const WHITE: [f32; 4] = [1., 1., 1., 1.];
+
+    let upload_site = niri_vk::stats::SubmitSite::ALL
+        .iter()
+        .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
+        .unwrap();
+    let uploads = |_: ()| niri_vk::stats::take_sites()[upload_site].submits;
+
+    let _ = uploads(());
+    assert!(
+        icons.texture(&mut vk, NAME, 16., 1., WHITE).is_some(),
+        "the embedded icon should rasterize and upload"
+    );
+    assert_eq!(uploads(()), 1, "a cold icon costs exactly one upload");
+
+    for _ in 0..8 {
+        assert!(icons.texture(&mut vk, NAME, 16., 1., WHITE).is_some());
+    }
+    assert_eq!(
+        uploads(()),
+        0,
+        "re-drawing the same icon cost a GPU round trip; that is the per-frame cost the cache \
+         exists to remove (see IconCache::texture)"
+    );
+
+    // Each axis of the key, in turn: a miss (so the pixels are right), then a hit (so the axis
+    // is part of the key rather than simply defeating it).
+    for (label, px, scale, color) in [
+        ("a different tint", 16., 1., [1., 0., 0., 1.]),
+        ("a different size", 24., 1., WHITE),
+        ("a different scale", 16., 2., WHITE),
+    ] {
+        assert!(icons.texture(&mut vk, NAME, px, scale, color).is_some());
+        assert_eq!(uploads(()), 1, "{label} must be its own upload, not a hit");
+        assert!(icons.texture(&mut vk, NAME, px, scale, color).is_some());
+        assert_eq!(uploads(()), 0, "{label} did not cache");
+    }
+
+    // A name that resolves to nothing must not be cached as anything, and must keep costing
+    // nothing — a `None` stored as a hit would be indistinguishable from a real miss.
+    for _ in 0..3 {
+        assert!(
+            icons
+                .texture(
+                    &mut vk,
+                    "definitely-not-an-icon-xyz-symbolic",
+                    16.,
+                    1.,
+                    WHITE
+                )
+                .is_none(),
+            "an unresolvable icon must stay None"
+        );
+    }
+    assert_eq!(uploads(()), 0, "an unresolvable icon uploaded something");
+}
+
 /// Growing the atlas must not corrupt runs already built against the smaller image: each holds
 /// its own reference, so the old image stays alive and its coordinates stay right. Drawn rather
 /// than counted — this is the case where getting it wrong shows up as garbled glyphs.

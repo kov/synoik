@@ -138,16 +138,9 @@ pub fn icon_element<S: AsRef<str>>(
     origin: Point<f64, Logical>,
     center: Point<f64, Logical>,
 ) -> Option<TextureRenderElement<VkTexture>> {
-    let buffer = candidates
+    let tb = candidates
         .iter()
-        .find_map(|name| icons.buffer(name.as_ref(), logical_px, scale, color))?;
-    let tb = match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-        Ok(tb) => tb,
-        Err(err) => {
-            tracing::error!("error uploading widget icon: {err:#}");
-            return None;
-        }
-    };
+        .find_map(|name| icons.texture(renderer, name.as_ref(), logical_px, scale, color))?;
     let logical = tb.logical_size();
     let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
     Some(TextureRenderElement::from_texture_buffer(
