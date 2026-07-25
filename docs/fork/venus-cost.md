@@ -714,3 +714,23 @@ resource is no longer the most sensitive number.** It moves for reasons on both 
 boundary now (cache hit rate, image shape, and whether the ring happened to be awake), so a
 host-side change is better judged on the §9.3 fit — intercept and slope, same probe, same
 arguments — which is reproducible on demand and does not need a live seat.
+
+### 8.6 §3.7 update — issue 1 is fixed, issue 2 is answered (2026-07-25)
+
+Both re-run on the current stack; full write-up appended to
+[`venus-bugs/README.md`](./venus-bugs/README.md).
+
+- **`vkGetMemoryFdPropertiesKHR` (bug): FIXED and already deployed.** Host-side in our
+  `virglrenderer` fork since 2026-07-04 (`patches/virglrenderer/0024`), which cites this issue by
+  name — venus routes the query through `vkGetMemoryResourcePropertiesMESA`, whose handler gated on
+  a Linux-dmabuf fd type that our IOSurface/shm-backed resources never have. The query now agrees
+  with the import, so the `image_bits & fd_props_bits` masking pattern is safe and the best-effort
+  fallback can be dropped.
+- **gbm (question): answered, and it is two separate things, neither of them virtio-gpu.**
+  `GBM_BO_USE_WRITE` → `EINVAL` is generic Mesa gbm — `USE_WRITE` is routed to the KMS dumb-buffer
+  path, which only accepts `CURSOR|ARGB8888` or `SCANOUT|XRGB8888/XBGR8888` and fails before any
+  driver call. So yes: allocate LINEAR without `WRITE`, then `gbm_bo_map`, is the sanctioned path.
+  The legacy `gbm_bo_create` `ENOENT`, though, is **specific to zink** — the same binary on the
+  same node allocates fine under `virtio_gpu`/virgl. That makes it a zink-on-venus gap worth
+  filing, not a property of this stack. And the `ENOENT` itself is a **stale errno**: gbm's failure
+  path returns `NULL` without setting `errno`.

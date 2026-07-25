@@ -147,3 +147,97 @@ cd repro-gbm-alloc && cargo run
 Each crate is standalone (empty `[workspace]` table) and depends only on the crates listed
 above. `Cargo.lock`/`target/` are gitignored; the crate versions that exhibit the behavior are
 `gbm 0.18.0` and `ash 0.38.0`, but the behavior is in the driver, not the bindings.
+
+---
+
+## Resolution (2026-07-25, from the VM/host side)
+
+Both issues were re-run on the **current** stack and investigated against Mesa source. The
+environment table above is stale — it records mesa `26.1.3` / kernel `7.1.2`; these runs are on
+mesa `26.1.4-3.limina.fc44` / kernel `7.1.4-limina16k`.
+
+### Issue 1 — **FIXED**, already deployed
+
+```
+QUERY  vkGetMemoryFdPropertiesKHR -> Ok(())
+IMPORT vkAllocateMemory(ImportMemoryFdInfoKHR) -> Ok("Ok")
+BIND   vkBindImageMemory -> Ok(())
+```
+
+Fixed host-side in our `virglrenderer` fork on 2026-07-04 by
+`patches/virglrenderer/0024-vkr-gkvm-vkGetMemoryResourcePropertiesMESA-answers-I.patch`, which
+cites this issue by name. The diagnosis matched: venus routes the guest's
+`vkGetMemoryFdPropertiesKHR(DMA_BUF, fd)` through `vkGetMemoryResourcePropertiesMESA` against the
+fd's virtio-gpu resource, and that handler gated on `fd_type == VIRGL_RESOURCE_FD_DMABUF`. On
+macOS our resources are **IOSurface / host-memory / shm backed and never Linux dmabufs**, so the
+query rejected every resource with `memoryTypeBits = 0` — while the `vkAllocateMemory` path
+imported the same resource as a host pointer without complaint. Exactly the inconsistency
+reported. The fix mirrors the import in the query: resolve the resource's host pointer and report
+the device's host-visible memory types.
+
+The `image_bits & fd_props_bits` masking pattern is safe again; the best-effort fallback can be
+dropped whenever convenient.
+
+> **Reproducer nit:** `repro-vk-getmemfdprops` prints its `CONCLUSION: query=INVALID_EXTERNAL_HANDLE
+> but import=SUCCESS → inconsistent` line unconditionally, so it now contradicts its own output.
+> Worth making conditional — otherwise the next reader sees a passing run reported as a failure.
+
+### Issue 2 — **answered; both questions resolved, and it is two separate things**
+
+Still reproduces, and the two halves have different causes. Neither is a virtio-gpu property.
+
+**(a) `GBM_BO_USE_WRITE` → `EINVAL` is generic Mesa gbm, not this stack.** In
+`src/gbm/backends/dri/gbm_dri.c`, `gbm_dri_bo_create` opens with:
+
+```c
+if (usage & GBM_BO_USE_WRITE || !dri->has_dmabuf_export)
+   return create_dumb(gbm, width, height, format, usage);
+```
+
+so *any* `USE_WRITE` request is routed to the KMS dumb-buffer path, which begins:
+
+```c
+is_cursor  = (usage & GBM_BO_USE_CURSOR)  != 0 && format == GBM_FORMAT_ARGB8888;
+is_scanout = (usage & GBM_BO_USE_SCANOUT) != 0 && (format == XRGB8888 || format == XBGR8888);
+if (!is_cursor && !is_scanout) { errno = EINVAL; return NULL; }
+```
+
+`LINEAR|WRITE` is neither, so it fails **before any driver or ioctl is involved**. This is
+identical on every Mesa driver and matches what `gbm.h` documents — `GBM_BO_USE_WRITE` is only
+guaranteed alongside `GBM_BO_USE_CURSOR`. (Even past that gate it would still fail here:
+`create_dumb` issues `DRM_IOCTL_MODE_CREATE_DUMB`, and the reproducer opens `renderD128`, a render
+node with no KMS.)
+
+**Answer to question 1: yes, expected — and "allocate LINEAR without `WRITE`, then `gbm_bo_map`"
+is the sanctioned path.** Confirmed by control: the same `LINEAR|WRITE` call fails identically
+under both gallium drivers available here.
+
+**(b) The legacy `gbm_bo_create` `ENOENT` is specific to zink, not to virtio-gpu.** Same binary,
+same node, only the gallium driver differs:
+
+```
+--- MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu (virgl) ---
+OK    create_buffer_object ARGB8888 RENDERING|LINEAR  -> modifier=Linear stride=256 planes=1
+OK    create_buffer_object ARGB8888 LINEAR            -> modifier=Linear stride=256 planes=1
+
+--- MESA_LOADER_DRIVER_OVERRIDE=zink ---
+ERR   create_buffer_object ARGB8888 RENDERING|LINEAR  -> errno=Some(2)   # ENOENT
+ERR   create_buffer_object ARGB8888 LINEAR            -> errno=Some(2)   # ENOENT
+```
+
+virgl allocates modifier-less buffers fine. The enhanced tier selects **zink** for guest GL (via
+`/etc/environment.d/90-limina-zink.conf`), which is why the legacy entry point looks broken "on
+this stack". So `create_buffer_object_with_modifiers2` being the only usable entry point is a
+**zink-on-venus gap**, not something inherent to virtio-gpu — and it is worth filing there, since
+plenty of software still uses the legacy path.
+
+**Answer to question 2, on the surprising errno: the `ENOENT` is stale and carries no
+information.** `gbm_dri_bo_create`'s `failed:` label frees and returns `NULL` **without setting
+`errno`**, so what the caller reads is whatever a previous unrelated syscall left behind (almost
+certainly a probe `open()` during driver loading). Only some paths in that function set `errno`
+deliberately (`EINVAL`, `ENOMEM`); the driver-allocation failure is not one of them. Don't read
+meaning into it — that is also worth reporting upstream on its own.
+
+The path down to the driver is otherwise unremarkable: `dri_create_image_with_modifiers` only
+rejects a list that is *entirely* `DRM_FORMAT_MOD_INVALID` and otherwise forwards straight to
+`dri_create_image`, including with `modifiers = NULL, count = 0`.
