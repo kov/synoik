@@ -911,7 +911,7 @@ impl VulkanRenderer {
     /// made. Everything downstream has to go: the index would otherwise keep claiming those
     /// glyphs are resident (so nothing would ever upload them again), and any run or bake made
     /// from them drew blanks.
-    fn invalidate_glyphs(&mut self) {
+    pub(super) fn invalidate_glyphs(&mut self) {
         self.text_ctx.atlas_mut().invalidate();
         self.glyph_runs.clear();
         self.pending_glyphs.clear();
@@ -946,6 +946,61 @@ impl VulkanRenderer {
             // re-rasterizes them, the generation bump recreates the image, and the text that drew
             // blank is re-baked rather than staying blank for the life of its cache entry.
             self.invalidate_glyphs();
+        }
+    }
+
+    /// Fold the queued glyph copies into `cbuf` — a frame's own command buffer, before its render
+    /// pass — instead of paying a standalone submit + fence wait for them. The returned staging
+    /// buffer **must outlive that command buffer's submit**; the caller ([`VulkanFrame`]) hands it
+    /// to the in-flight record or drops it after its fence wait, whichever branch it takes.
+    ///
+    /// This is the same trick as
+    /// [`record_pending_dmabuf_acquires`](Self::record_pending_dmabuf_acquires): a copy has to
+    /// be recorded outside a render pass, which is exactly where that slot is. It replaces the
+    /// submit rather than deferring it — on an idle queue a round trip here measured
+    /// ~2-3.5ms, which was most of what an uncached widget bake cost.
+    ///
+    /// The standalone [`flush_glyph_uploads`](Self::flush_glyph_uploads) stays: `absorb_glyphs`
+    /// flushes into the *old* atlas image during shaping, where there is no frame to ride.
+    ///
+    /// **If the caller then fails to submit `cbuf`, it must call
+    /// [`invalidate_glyphs`](Self::invalidate_glyphs)** — the residency index already claims these
+    /// glyphs are in the atlas, so a copy that never runs is blank text for as long as that
+    /// residency lives.
+    pub(super) fn record_pending_glyph_uploads(
+        &mut self,
+        cbuf: vk::CommandBuffer,
+    ) -> Option<niri_vk::texture::GlyphStaging> {
+        if self.pending_glyphs.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending_glyphs);
+        let Some(atlas) = self.glyph_atlas.as_ref() else {
+            debug_assert!(false, "glyphs queued with no atlas image to put them in");
+            self.invalidate_glyphs();
+            return None;
+        };
+
+        let regions: Vec<_> = pending
+            .iter()
+            .map(niri_vk::text::PendingGlyph::region)
+            .collect();
+        let image = atlas.texture.inner().image;
+        match atlas
+            .texture
+            .inner()
+            .stage_coverage_regions(&self.gpu, &regions)
+        {
+            Ok(None) => None,
+            Ok(Some(staged)) => {
+                niri_vk::texture::record_coverage_copy(&self.gpu.device, cbuf, image, &staged);
+                Some(staged)
+            }
+            Err(err) => {
+                warn!("glyph atlas staging failed, rebuilding the atlas: {err:#}");
+                self.invalidate_glyphs();
+                None
+            }
         }
     }
 
@@ -1444,6 +1499,11 @@ struct InFlightSubmit {
     /// destroy the image on drop with no wait ([`VkTexture`]'s inner `Drop`), so without this the
     /// caches are free to delete an image a submit in flight is still writing.
     _targets: Vec<VkTexture>,
+    /// The glyph-atlas staging buffer whose copy this command buffer carries, if any
+    /// ([`VulkanRenderer::record_pending_glyph_uploads`]). Held for the same reason as everything
+    /// else here — the copy reads it on the GPU long after the CPU has moved on. It frees itself
+    /// when this record is dropped, so neither retirement path has to know it exists.
+    _glyph_staging: Option<niri_vk::texture::GlyphStaging>,
 }
 
 impl VulkanRenderer {
@@ -1500,6 +1560,7 @@ impl VulkanRenderer {
         fence: VkSubmitFence,
         held: Vec<VkTexture>,
         targets: Vec<VkTexture>,
+        glyph_staging: Option<niri_vk::texture::GlyphStaging>,
     ) {
         self.in_flight.push(InFlightSubmit {
             timeline,
@@ -1507,6 +1568,7 @@ impl VulkanRenderer {
             _fence: fence,
             _held: held,
             _targets: targets,
+            _glyph_staging: glyph_staging,
         });
     }
 

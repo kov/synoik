@@ -2,6 +2,7 @@
 //! view and sampler. This is the infrastructure both the blur passes and the glyph atlas reuse.
 
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -1158,12 +1159,35 @@ impl Texture {
     /// so glyphs uploaded by earlier calls survive.
     pub fn upload_coverage_regions(
         &self,
-        gpu: &Gpu,
+        gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
         regions: &[CoverageRegion<'_>],
     ) -> Result<()> {
-        if regions.is_empty() {
+        let Some(staged) = self.stage_coverage_regions(gpu, regions)? else {
             return Ok(());
+        };
+        let image = self.image;
+        gpu.run_commands(pool, crate::stats::SubmitSite::UploadGlyphs, |cbuf| {
+            record_coverage_copy(&gpu.device, cbuf, image, &staged)
+        })
+        // `staged` frees itself here; `run_commands` already waited (and drained the device on a
+        // wait error), so no copy can still be reading it.
+    }
+
+    /// The host half of [`upload_coverage_regions`](Self::upload_coverage_regions): allocate the
+    /// staging buffer and write every region's coverage into it, recording **no** commands. The
+    /// returned [`GlyphStaging`] carries what a later [`record_coverage_copy`] needs, and frees
+    /// itself when dropped — so whoever ends up owning it (a one-shot submit, a frame's in-flight
+    /// record) does not have to remember to.
+    ///
+    /// `Ok(None)` for an empty `regions` — the common case once the alphabet in use is resident.
+    pub fn stage_coverage_regions(
+        &self,
+        gpu: &Arc<Gpu>,
+        regions: &[CoverageRegion<'_>],
+    ) -> Result<Option<GlyphStaging>> {
+        if regions.is_empty() {
+            return Ok(None);
         }
         let device = &gpu.device;
 
@@ -1230,51 +1254,15 @@ impl Texture {
             device.unmap_memory(smem);
         }
 
-        let image = self.image;
-        let result = gpu.run_commands(
-            pool,
-            crate::stats::SubmitSite::UploadGlyphs,
-            |cbuf| unsafe {
-                // Preserve what is already in the atlas: transition FROM the sampleable layout the
-                // image is left in, not from UNDEFINED (which would license discarding it).
-                transition(
-                    device,
-                    cbuf,
-                    image,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::AccessFlags::SHADER_READ,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                );
-                device.cmd_copy_buffer_to_image(
-                    cbuf,
-                    staging,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &copies,
-                );
-                transition(
-                    device,
-                    cbuf,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::SHADER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                );
-            },
-        );
-        unsafe {
-            device.destroy_buffer(staging, None);
-            device.free_memory(smem, None);
-        }
+        // The handles belong to `GlyphStaging` now; disarm the guard.
         guard.staging = vk::Buffer::null();
         guard.smem = vk::DeviceMemory::null();
-        result
+        Ok(Some(GlyphStaging {
+            gpu: gpu.clone(),
+            buffer: staging,
+            memory: smem,
+            copies,
+        }))
     }
 
     /// Re-upload a full `width*height` frame of tightly-packed pixels into this already-allocated
@@ -1493,6 +1481,82 @@ impl Staging {
 impl Default for Staging {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A glyph-atlas staging buffer with its pixels already written and its copy regions computed,
+/// waiting for someone to record the copy ([`record_coverage_copy`]) into a command buffer.
+///
+/// Owns its buffer + memory and frees them on drop, holding an `Arc<Gpu>` to guarantee the device
+/// outlives them — the same shape as `VkSubmitFence`. That is what lets the *frame* decide, at
+/// submit time, whether this lives in an in-flight record or dies with the fence wait, without any
+/// retirement path having to know a glyph staging exists.
+///
+/// **It must outlive the submit of the command buffer its copy was recorded into.** Dropping it
+/// earlier leaves the GPU reading freed memory — legal Vulkan as far as any validation layer is
+/// concerned, and invisible until glyphs come out as garbage.
+pub struct GlyphStaging {
+    gpu: Arc<Gpu>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    copies: Vec<vk::BufferImageCopy>,
+}
+
+impl Drop for GlyphStaging {
+    fn drop(&mut self) {
+        unsafe {
+            self.gpu.device.destroy_buffer(self.buffer, None);
+            self.gpu.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Record a staged glyph upload into `cbuf`: barrier out of the sampleable layout, copy every
+/// region, barrier back. Must be called **outside a render pass** (copies and layout transitions
+/// both are), and the second barrier is what orders the copy before any glyph draw later in the
+/// same command buffer.
+///
+/// Split out of [`Texture::upload_coverage_regions`] so the same recording serves a standalone
+/// submit and a fold into a frame's own command buffer.
+pub fn record_coverage_copy(
+    device: &ash::Device,
+    cbuf: vk::CommandBuffer,
+    image: vk::Image,
+    staged: &GlyphStaging,
+) {
+    unsafe {
+        // Preserve what is already in the atlas: transition FROM the sampleable layout the image is
+        // left in, not from UNDEFINED (which would license discarding it). The image is never in
+        // UNDEFINED here — `new_coverage_atlas` transitions it at creation.
+        transition(
+            device,
+            cbuf,
+            image,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+        device.cmd_copy_buffer_to_image(
+            cbuf,
+            staged.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &staged.copies,
+        );
+        transition(
+            device,
+            cbuf,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
     }
 }
 

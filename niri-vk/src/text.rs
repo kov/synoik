@@ -12,7 +12,7 @@
 //! differ slightly from pango/cairo/FreeType — expected, not a bug.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -684,7 +684,7 @@ impl TextSpan<'_> {
 /// drawing repeatedly should hold a `TextContext` and call [`TextContext::shape_line`], which is
 /// the whole point of the persistent atlas.
 pub fn build_text(
-    gpu: &Gpu,
+    gpu: &Arc<Gpu>,
     pool: vk::CommandPool,
     text: &str,
     px: f32,
@@ -907,7 +907,7 @@ mod tests {
 
         fn absorb(
             &mut self,
-            gpu: &Gpu,
+            gpu: &Arc<Gpu>,
             pool: vk::CommandPool,
             ctx: &TextContext,
             pending: &[PendingGlyph],
@@ -925,7 +925,7 @@ mod tests {
 
     /// Shape `text` through `ctx` into a fresh atlas image and return both.
     fn shape_into_atlas(
-        gpu: &Gpu,
+        gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
         ctx: &mut TextContext,
         text: &str,
@@ -939,7 +939,7 @@ mod tests {
 
     /// Render one string through `ctx` into a `tw`x`th` RGBA target and read it back.
     fn render_string(
-        gpu: &Gpu,
+        gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
         ctx: &mut TextContext,
         text: &str,
@@ -1086,7 +1086,7 @@ mod tests {
     /// `TextContext` against a stale-cache regression. Skips cleanly on a machine with no Vulkan.
     #[test]
     fn text_context_reuse_rasterizes_coverage() {
-        let Ok(gpu) = Gpu::new() else {
+        let Ok(gpu) = Gpu::new().map(Arc::new) else {
             eprintln!("no Vulkan device — skipping text_context_reuse_rasterizes_coverage");
             return;
         };
@@ -1124,7 +1124,7 @@ mod tests {
     /// bottom thirds. Guards the dialog/notification text path. Skips cleanly with no Vulkan.
     #[test]
     fn build_paragraph_lays_out_styled_lines() {
-        let Ok(gpu) = Gpu::new() else {
+        let Ok(gpu) = Gpu::new().map(Arc::new) else {
             eprintln!("no Vulkan device — skipping build_paragraph_lays_out_styled_lines");
             return;
         };
@@ -1214,7 +1214,7 @@ mod tests {
     ///     image's owner knows to reallocate — never an error while under `MAX_ATLAS_SIDE`.
     #[test]
     fn the_atlas_keeps_glyphs_resident_across_runs() {
-        let Ok(gpu) = Gpu::new() else {
+        let Ok(gpu) = Gpu::new().map(Arc::new) else {
             eprintln!("no Vulkan device — skipping the_atlas_keeps_glyphs_resident_across_runs");
             return;
         };
@@ -1322,7 +1322,7 @@ mod tests {
     /// middle span's ink must be a non-empty strict horizontal subset of the whole run.
     #[test]
     fn build_paragraph_tags_spans() {
-        let Ok(gpu) = Gpu::new() else {
+        let Ok(gpu) = Gpu::new().map(Arc::new) else {
             eprintln!("no Vulkan device — skipping build_paragraph_tags_spans");
             return;
         };

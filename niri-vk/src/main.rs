@@ -23,6 +23,7 @@
 mod pango_ref;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -50,7 +51,7 @@ const TEX_BR: [u8; 4] = [240, 240, 240, 255];
 
 fn main() -> Result<()> {
     eprintln!("niri-vk: enumerating Vulkan devices");
-    let gpu = Gpu::new()?;
+    let gpu = Arc::new(Gpu::new()?);
     eprintln!("niri-vk: using {:?}", gpu.device_name);
 
     let scene = render_scene(&gpu)?;
@@ -293,7 +294,7 @@ const TEXT_FG: [u8; 4] = [235, 235, 235, 255];
 const TEXT_ORIGIN: (f32, f32) = (10.0, 8.0);
 
 /// Shape + rasterize hinted text through our swash atlas into a TW x TH Vulkan target.
-fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
+fn render_text(gpu: &Arc<Gpu>) -> Result<Vec<u8>> {
     let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
     let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.context("text pool")?;
 
@@ -567,7 +568,7 @@ mod tests {
     // (resolution-independent), so they hold on any conformant driver — no golden images.
     #[test]
     fn renders_all_primitives() -> Result<()> {
-        let gpu = Gpu::new()?;
+        let gpu = Arc::new(Gpu::new()?);
         assert_scene(&render_scene(&gpu)?)?;
         assert_blur(&render_blur(&gpu)?)?;
         assert_text(&render_text(&gpu)?)?;

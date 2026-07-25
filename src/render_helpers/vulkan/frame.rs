@@ -75,6 +75,12 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// rest from its own age-N-ago presentation. Empty (e.g. a clear-only frame that cleared
     /// nothing) falls back to a whole-frame blit. See [`Self::record_present_blit`].
     present_damage: Vec<vk::Rect2D>,
+    /// The staging buffer behind the glyph-atlas copies recorded into `cbuf` at `begin`, if this
+    /// frame carried any. Owned here so the branch `finish_internal` actually takes decides its
+    /// fate: into the in-flight record on the deferred path, dropped after the fence wait on the
+    /// synchronous one. Keying that on `fb.offscreen` instead would miss the KMS frame that falls
+    /// back to synchronous because no exportable fence could be made.
+    glyph_staging: Option<niri_vk::texture::GlyphStaging>,
     finished: bool,
 }
 
@@ -137,10 +143,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // a blocking drain here would just move the wait we are removing from the end of one
         // frame to the start of the next.
         renderer.retire_completed();
-        // Glyphs shaped since the last frame are still only in host memory; put them in the atlas
-        // before anything can sample it. This is the one place that has to happen, and it is
-        // enough — see `VulkanRenderer::flush_glyph_uploads`.
-        renderer.flush_glyph_uploads();
 
         let cbuf = {
             let dev = &renderer.gpu.device;
@@ -168,6 +170,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         renderer.gpu_timer_begin(cbuf);
 
         renderer.record_pending_dmabuf_acquires(cbuf);
+
+        // Glyphs shaped since the last frame are still only in host memory; they must reach the
+        // atlas before anything samples it, and this is the one place that has to happen (nothing
+        // samples the atlas outside a frame's glyph draws). Recorded into *this* frame's command
+        // buffer rather than submitted on its own: the copy rides the submit below instead of
+        // costing a round trip of its own, which on an idle queue measured ~2-3.5ms and was most
+        // of what an uncached widget bake cost. Same slot and same reason as the acquires above.
+        let glyph_staging = renderer.record_pending_glyph_uploads(cbuf);
 
         {
             let dev = &renderer.gpu.device;
@@ -203,6 +213,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             held: Vec::new(),
             clip_override: None,
             present_damage: Vec::new(),
+            glyph_staging,
             finished: false,
         })
     }
@@ -1035,6 +1046,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             }
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&old_cbuf));
+            // This flush submitted and waited on `old_cbuf` — the command buffer our glyph copy
+            // was recorded into. It has run, so the staging can go and, crucially, a later failure
+            // finishing this frame must NOT be read as "the copy never happened".
+            self.glyph_staging = None;
             // Bank this segment's GPU time *before* re-arming: the pool has only
             // two slots, and the continuation buffer's reset would otherwise
             // discard this submit's pair unread.
@@ -1481,7 +1496,26 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         }
     }
 
+    /// The command buffer carrying our recorded glyph copies is never going to be submitted, so
+    /// the atlas will never receive glyphs the residency index already records as resident. Forget
+    /// the residency: the next shape re-rasterizes them and the affected bakes are redone. Without
+    /// this, a transient submit failure is *permanently* blank text — the cache key a widget would
+    /// have to change to re-bake has no reason to change.
+    fn abandon_glyph_copies(&mut self) {
+        if self.glyph_staging.take().is_some() {
+            self.renderer.invalidate_glyphs();
+        }
+    }
+
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
+        let result = self.finish_internal_impl();
+        if result.is_err() {
+            self.abandon_glyph_copies();
+        }
+        result
+    }
+
+    fn finish_internal_impl(&mut self) -> Result<SyncPoint, VulkanError> {
         if self.finished {
             return Ok(SyncPoint::signaled());
         }
@@ -1552,8 +1586,15 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 let targets = std::iter::once(self.fb.buffer.clone())
                     .chain(self.fb.present.clone())
                     .collect();
-                self.renderer
-                    .add_in_flight(timeline, self.cbuf, fence.clone(), held, targets);
+                let glyph_staging = self.glyph_staging.take();
+                self.renderer.add_in_flight(
+                    timeline,
+                    self.cbuf,
+                    fence.clone(),
+                    held,
+                    targets,
+                    glyph_staging,
+                );
                 // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
                 // leaves a scanout target in TRANSFER_SRC_OPTIMAL. Every later command is ordered
                 // after this submit, so recording it now is as true as recording it after a wait.
@@ -1572,6 +1613,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             }
             dev.destroy_fence(fence, None);
             dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&self.cbuf));
+            // The wait above proves our recorded glyph copy has executed; the staging can go.
+            self.glyph_staging = None;
         }
         // The fence is signalled, so the queries are resolved and this does not
         // block.

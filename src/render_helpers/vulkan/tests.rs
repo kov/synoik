@@ -3260,10 +3260,15 @@ fn text_of_resident_glyphs_costs_no_submit() {
         .unwrap()]
     .submits;
     assert_eq!(
-        glyph_uploads, 1,
-        "bold digits were never rasterized and never uploaded either — beginning a frame must \
-         put the queued glyphs in the atlas, or they would draw blank. (Counted per site: the \
-         frame makes a submit of its own, so a total would pass with the flush deleted.)"
+        glyph_uploads, 0,
+        "the queued glyphs cost a standalone submit; beginning a frame is supposed to record \
+         their copy into the frame's own command buffer instead"
+    );
+    assert!(
+        !vk.has_pending_glyphs(),
+        "beginning a frame left glyphs queued — the residency index already calls them resident, \
+         so they would draw blank. (With the copy folded there is no submit left to count, so \
+         the drained queue is what stands in for one.)"
     );
 }
 
@@ -3533,8 +3538,11 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
     }
     assert_eq!(
         glyph_submits(),
-        1,
-        "thirteen shaped lines did not coalesce into one atlas upload"
+        0,
+        "the glyph copies cost a submit of their own; they are supposed to ride the frame's \
+         command buffer (see VulkanRenderer::record_pending_glyph_uploads). Zero is only \
+         meaningful together with the per-band ink check below, which is what proves the copy \
+         still happened."
     );
 
     let fb = vk.bind(&mut target).expect("rebind for readback");
@@ -3594,8 +3602,8 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
         "shaping uploaded on the spot instead of queueing"
     );
 
-    // The queued glyphs go in when a frame begins — under their own site, which is the point:
-    // the four upload paths want four different fixes, so a generic "upload" cannot be acted on.
+    // The queued glyphs go in when a frame begins — and cost no submit of their own, because the
+    // copy is recorded into the frame's own command buffer.
     {
         let mut warm = vk
             .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
@@ -3605,11 +3613,15 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
             .render(&mut fb, Size::from((16, 16)), Transform::Normal)
             .expect("render");
     }
+    assert!(
+        !vk.has_pending_glyphs(),
+        "beginning a frame left the glyphs queued"
+    );
     let sites = niri_vk::stats::take_sites();
     assert_eq!(
         at(&sites, SubmitSite::UploadGlyphs),
-        1,
-        "the queued glyphs did not reach the atlas in exactly one submit"
+        0,
+        "the folded glyph copy still cost a standalone submit"
     );
     assert_eq!(
         at(&sites, SubmitSite::Upload),
@@ -3887,4 +3899,106 @@ fn a_deferred_present_blit_holds_both_the_shadow_and_the_scanout_buffer() {
 
     drop(fb);
     vk.drain_in_flight();
+}
+
+/// A deferred frame walks away from its submit, so the glyph staging its command buffer copies
+/// *from* must outlive the frame — it is read on the GPU long after `finish` returned. Freeing it
+/// on the frame's own scope, or keying the decision on `fb.offscreen` (which misses a KMS frame
+/// that fell back to a synchronous finish), leaves the copy reading freed memory: legal Vulkan as
+/// far as any validation layer is concerned, and visible only as garbled glyphs.
+///
+/// Asserted through the drawn result: the run is shaped *after* the atlas exists, so its glyphs
+/// are queued and copied by this very frame, and reading ink back proves the copy read live bytes.
+///
+/// **Known limit, measured rather than assumed.** Freeing the staging on the frame's own scope was
+/// injected as a mutation and this test still *passed* — the freed buffer had not been reused, so
+/// the copy read plausible bytes and the ink was there. What caught it was `NIRI_VK_VALIDATION=1`
+/// (exit 101, one error). So this test pins the wiring, and the validation run is what pins the
+/// lifetime; the two are only a real gate together. Do not read a green run of this test alone as
+/// proof the staging is held long enough.
+#[test]
+fn a_deferred_frames_glyph_staging_outlives_it() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let skip = |why: &str| eprintln!("skipping a_deferred_frames_glyph_staging_outlives_it: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    else {
+        return skip("no render node");
+    };
+    let Ok(gbm) = GbmDevice::new(file) else {
+        return skip("no GBM");
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let Ok(bo) = alloc.create_buffer(256, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+        return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    // A size never shaped before, so these glyphs are genuinely new and this frame carries a copy.
+    let run = vk.build_glyph_run("MMMM", 37.0).expect("glyph run");
+    assert!(
+        vk.has_pending_glyphs(),
+        "the run's glyphs should be queued, not yet in the atlas"
+    );
+
+    vk.set_defer_scanout(true);
+    vk.set_finish_may_defer(true);
+
+    let size = Size::<i32, Physical>::from((256, 64));
+    let full = Rectangle::from_size(size);
+    let mut fb = vk.bind(&mut dmabuf).expect("bind scanout dmabuf");
+    let sync = {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::new(0., 0., 0., 1.), &[full])
+            .expect("clear");
+        frame
+            .render_glyphs(
+                &run,
+                Point::from((4, 8)),
+                [1.0, 1.0, 1.0, 1.0],
+                full,
+                &[full],
+            )
+            .expect("render_glyphs");
+        frame.finish().expect("finish")
+    };
+    assert!(
+        sync.contains_fence(),
+        "the frame finished synchronously — nothing was deferred, so this proves nothing"
+    );
+    assert!(
+        !vk.has_pending_glyphs(),
+        "the frame did not take the queued glyphs"
+    );
+
+    // Let the submit complete, then read back. Ink here means the copy sourced live staging.
+    vk.drain_in_flight();
+    drop(fb);
+    let fb = vk.bind(&mut dmabuf).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((256, 64)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 128).count();
+    assert!(
+        ink > 40,
+        "only {ink} lit pixels — the glyph copy did not land, which is what a staging buffer \
+         freed before its submit completed looks like"
+    );
 }
