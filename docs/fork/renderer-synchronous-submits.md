@@ -1,9 +1,12 @@
 # The synchronous-submit ceiling
 
-**Status:** open, and now the only frame-cost item left. Deliberately not attempted alongside
-the work in `844c02d6`…`f2300f36`; that removed *wasted* round trips, and this is about the cost
-of the one that remains. Full evidence in
+**Status: built, opt-in, unmeasured.** `NIRI_VK_ASYNC_SCANOUT=1` turns it on; without it the
+renderer still waits, exactly as before. What is left is not code — it is a session on the live
+seat, because the thing this buys can only be read there. Full evidence in
 [`frame-cost-investigation.md`](./frame-cost-investigation.md).
+
+Landed: `6bef18ac` (chain every submit on a queue timeline), `6f645bd8` (the scanout frame hands
+its fence to KMS), on top of `7b5f016d` (time the wait apart from the submit).
 
 **One-line summary:** every `vkQueueSubmit` in the owned renderer is immediately followed by
 `wait_for_fences(…, u64::MAX)`. The CPU blocks until the GPU drains, every time. On the scanout
@@ -119,17 +122,42 @@ readbacks, blur chains and layout transitions all keep blocking, so `RunGuard`
 one submit that costs 12–14 ms changes. Offscreen frames keep waiting too — their results are
 sampled immediately and there is nothing to hand the fence to.
 
-### The plan
+### What was built
 
-1. A `Fence` impl over `VkFence` — four methods (`is_signaled` / `wait` / `is_exportable` /
-   `export` via `vkGetFenceFdKHR` with `SYNC_FD`) — and `finish_internal` returning
-   `SyncPoint::from(it)` instead of `SyncPoint::signaled()`, for **scanout targets only**.
-2. A retirement list on `VulkanRenderer`: `(fence, cbuf, held)`, drained at the top of `begin`.
-   `Gpu::drop` already does `device_wait_idle`, so teardown is covered.
-3. Keep the synchronous path selectable and use it where it is load-bearing: the existing
-   `wait_for_frame_completion_before_queueing` debug flag, and forced on when
-   `NIRI_FRAME_LOG=gpu` is set (one query pool is reused per frame, so `gpu_timer_begin`'s
-   `cmd_reset_query_pool` would race an in-flight frame).
+1. **`VkSubmitFence`** (`src/render_helpers/vulkan/fence.rs`) — Smithay's `Fence` over a `VkFence`
+   created exportable *before* the submit, since a `SYNC_FD` fence's handle types are fixed at
+   creation. Cheaply clonable: the same completion is both the sync point KMS holds and the
+   renderer's proof that a command buffer is still busy, and the fence dies with the last clone.
+2. **A queue timeline** (`Gpu::submit`) that every submit is chained on, wait(N) → signal(N+1).
+   This is the part the scoping missed and it is not optional; see above.
+3. **An in-flight list** on `VulkanRenderer`, holding `(timeline, cbuf, fence, held)` and retired
+   by **polling** the timeline at the top of `VulkanFrame::begin`. The timeline rather than the
+   fence, because the `SYNC_FD` export resets the fence and one device call covers every
+   outstanding submit; polling rather than waiting, for the reason in the last bullet above.
+4. **Eligibility, deliberately narrow.** Only the frame going to KMS: `tty.rs` brackets
+   `DrmCompositor::render_frame` with `set_finish_may_defer`, because a screencopy or screencast
+   render into a dmabuf is indistinguishable from inside the renderer and hands its buffer to a
+   consumer that expects it finished. Deferral additionally requires the device to order submits,
+   GPU timing to be off (its query pool is per-frame), and the session to have asked.
+
+### What is left
+
+**Run it on the seat.** Headless there is no KMS plane to take the fence, so the part that pays
+off is exactly the part no test here covers. What a test *does* cover
+(`a_deferred_finish_returns_a_fence_and_still_orders_what_follows`) is that the sync point comes
+back exportable, that the `sync_file` export succeeds on Venus, and that a readback issued with
+no wait still sees a finished frame — which is only true because of the timeline chain.
+
+On the seat, with `NIRI_VK_ASYNC_SCANOUT=1` and `NIRI_FRAME_LOG=1`, the questions in order:
+
+1. Does `waiting` leave the frame line without reappearing as `waiting … on earlier work`? If it
+   reappears, the wait moved rather than went.
+2. Do frames stop going over budget, and does `submit` collapse toward `queue`?
+3. **Does presentation get later?** The one that decides whether this ships. If our fence signals
+   ~13 ms after submit and we commit immediately, the kernel's commit worker may miss the coming
+   vblank. Read the missed-deadline line, not the frame totals.
+4. Any visual corruption at all — tearing, a stale frame, a torn client window — is the ordering
+   assumption being wrong somewhere, and the flag goes back off.
 
 ### Client buffer release ordering — settled, not a blocker
 
