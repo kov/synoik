@@ -19,6 +19,7 @@ use calloop::channel::Sender;
 use image::ImageReader;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::gnome::{BackgroundOptions, BackgroundSettings};
@@ -42,6 +43,11 @@ pub struct Wallpaper {
     /// Lazily uploaded from `image`; the outer `Option` is "not tried yet", the inner one records
     /// a failed upload so we don't retry every frame.
     vk_texture: RefCell<Option<Option<TextureBuffer<VkTexture>>>>,
+    /// Identifies the renderer `vk_texture` was uploaded to. A mismatch drops it: the
+    /// image belongs to a device that is gone, and handing it out would sample freed
+    /// memory. Every other texture cache in the tree carries this guard; this one was
+    /// the exception, reachable only through a renderer recreation (device loss).
+    context: RefCell<Option<ContextId<VkTexture>>>,
     /// Request sink to the decode worker. `None` before [`spawn_worker`] wires it
     /// (e.g. in headless tests), in which case decoding falls back to synchronous.
     ///
@@ -180,6 +186,13 @@ impl Wallpaper {
         scale: Scale<f64>,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
         let image = self.image.as_ref()?;
+
+        // A recreated renderer invalidates the upload before anything else looks at it.
+        let context = renderer.context_id();
+        if self.context.borrow().as_ref() != Some(&context) {
+            self.vk_texture.replace(None);
+            *self.context.borrow_mut() = Some(context);
+        }
 
         let mut texture = self.vk_texture.borrow_mut();
         let buffer = texture
@@ -398,6 +411,57 @@ mod tests {
         let image = decode(path).unwrap();
         assert!(image.size.w > 0 && image.size.h > 0);
         assert_eq!(image.data.len(), (image.size.w * image.size.h * 4) as usize);
+    }
+
+    /// The upload is cached across frames, but it belongs to the renderer that made
+    /// it. A recreated renderer must re-upload — handing the old texture out would
+    /// sample an image destroyed with its device. Counted by submits, because the
+    /// failure mode (a stale handle) is invisible until it is drawn.
+    #[test]
+    fn a_recreated_renderer_re_uploads_the_wallpaper() {
+        let (mut vk_a, mut vk_b) = match (VulkanRenderer::new(), VulkanRenderer::new()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!(
+                    "skipping a_recreated_renderer_re_uploads_the_wallpaper: no Vulkan device"
+                );
+                return;
+            }
+        };
+
+        let wp = Wallpaper {
+            image: Some(Image {
+                data: vec![0xffu8; 8 * 8 * 4],
+                size: Size::from((8, 8)),
+                opaque: true,
+            }),
+            ..Default::default()
+        };
+
+        let site = niri_vk::stats::SubmitSite::ALL
+            .iter()
+            .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
+            .unwrap();
+        let uploads = |_: ()| niri_vk::stats::take_sites()[site].submits;
+        let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
+            wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
+        };
+
+        let _ = uploads(());
+        assert!(render(&wp, &mut vk_a).is_some());
+        assert_eq!(uploads(()), 1, "the first frame must upload");
+        assert!(render(&wp, &mut vk_a).is_some());
+        assert_eq!(uploads(()), 0, "the same renderer must reuse the upload");
+
+        assert!(render(&wp, &mut vk_b).is_some());
+        assert_eq!(
+            uploads(()),
+            1,
+            "a different renderer got a texture built by the old one — that image was \
+             destroyed with its device"
+        );
+        assert!(render(&wp, &mut vk_b).is_some());
+        assert_eq!(uploads(()), 0, "the new renderer must then cache too");
     }
 
     #[test]
