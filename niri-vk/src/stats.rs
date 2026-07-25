@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 static SUBMITS: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static SCANOUT_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static SCANOUT_NANOS: AtomicU64 = AtomicU64::new(0);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static SHADED: AtomicU64 = AtomicU64::new(0);
 static SHAPES: AtomicU64 = AtomicU64::new(0);
@@ -32,25 +34,52 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// What a submit renders into. Worth telling apart: on this stack a submit into an
+/// offscreen costs a fraction of a millisecond, while one into the KMS scanout buffer
+/// costs most of a refresh interval — which is a different problem with a different fix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubmitKind {
+    /// An offscreen texture, an upload, a transition, a blur chain, a readback.
+    Offscreen,
+    /// The dmabuf a display controller scans out.
+    Scanout,
+}
+
 /// Times a submit + fence wait, counting it immediately and banking its duration
 /// on drop. Hold across `vkQueueSubmit` *and* the wait: the wait is where the
 /// round trip actually costs.
-pub struct SubmitTimer(Option<Instant>);
+pub struct SubmitTimer(Option<Instant>, SubmitKind);
 
 impl Drop for SubmitTimer {
     fn drop(&mut self) {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             SUBMIT_NANOS.fetch_add(nanos, Ordering::Relaxed);
+            if self.1 == SubmitKind::Scanout {
+                SCANOUT_NANOS.fetch_add(nanos, Ordering::Relaxed);
+            }
         }
     }
 }
 
 /// Record one GPU round trip. Counted even when timing is off, so the count is
 /// always meaningful; only the clock reads are gated.
-pub fn submit() -> SubmitTimer {
+pub fn submit(kind: SubmitKind) -> SubmitTimer {
     SUBMITS.fetch_add(1, Ordering::Relaxed);
-    SubmitTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+    if kind == SubmitKind::Scanout {
+        SCANOUT_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    }
+    SubmitTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now), kind)
+}
+
+/// Scanout submits since process start. The caller takes a delta across a frame.
+pub fn scanout_submits() -> u64 {
+    SCANOUT_SUBMITS.load(Ordering::Relaxed)
+}
+
+/// Time spent in scanout submits since the last call, clearing the counter.
+pub fn take_scanout_submit_time() -> Duration {
+    Duration::from_nanos(SCANOUT_NANOS.swap(0, Ordering::Relaxed))
 }
 
 /// Times one text shaping run — layout *or* measurement. Both matter: a measure

@@ -1006,7 +1006,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&old_cbuf));
             {
-                let _timed = niri_vk::stats::submit();
+                let _timed = niri_vk::stats::submit(self.submit_kind());
                 dev.queue_submit(
                     self.renderer.gpu.queue,
                     std::slice::from_ref(&submit),
@@ -1446,6 +1446,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         present.set_layout(vk::ImageLayout::GENERAL);
     }
 
+    /// Whether this frame is drawing into a scanout buffer or an offscreen. See
+    /// [`niri_vk::stats::SubmitKind`].
+    fn submit_kind(&self) -> niri_vk::stats::SubmitKind {
+        if self.fb.offscreen {
+            niri_vk::stats::SubmitKind::Offscreen
+        } else {
+            niri_vk::stats::SubmitKind::Scanout
+        }
+    }
+
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
         if self.finished {
             return Ok(SyncPoint::signaled());
@@ -1482,7 +1492,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             let submit =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cbuf));
             {
-                let _timed = niri_vk::stats::submit();
+                let _timed = niri_vk::stats::submit(self.submit_kind());
                 dev.queue_submit(
                     self.renderer.gpu.queue,
                     std::slice::from_ref(&submit),
