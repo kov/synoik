@@ -443,6 +443,11 @@ impl Entry {
 #[derive(Default)]
 pub struct BakeCache {
     context: Option<ContextId<VkTexture>>,
+    /// The renderer's glyph epoch when these were baked. It moves only when a glyph upload failed
+    /// and the residency was thrown away — at which point anything baked from it drew blank text,
+    /// under a key the widget has no reason to change. Without this the blank survives as long as
+    /// the widget's content does. See `VulkanRenderer::text_epoch`.
+    text_epoch: u64,
     // key: (scale, physical_w, physical_h) -> (revision, texture)
     textures: HashMap<(NotNan<f64>, i32, i32), (u64, VkTexture)>,
 }
@@ -487,11 +492,15 @@ pub fn bake<P>(
     let phys = physical_size(scale, logical_size);
     let key = (scale_key, phys.w, phys.h);
 
-    // The renderer context changing invalidates every cached GPU texture.
+    // The renderer context changing invalidates every cached GPU texture, and so does the glyph
+    // residency being rebuilt — a texture baked from glyphs that never reached the atlas holds
+    // blank text.
     let context = renderer.context_id();
-    if cache.context.as_ref() != Some(&context) {
+    let text_epoch = renderer.text_epoch();
+    if cache.context.as_ref() != Some(&context) || cache.text_epoch != text_epoch {
         cache.textures.clear();
         cache.context = Some(context);
+        cache.text_epoch = text_epoch;
     }
 
     let fresh = matches!(cache.textures.get(&key), Some((rev, _)) if *rev == revision);
@@ -664,6 +673,11 @@ pub fn rounded_opaque_regions(
 #[derive(Default)]
 pub struct ContentCache {
     context: Option<ContextId<VkTexture>>,
+    /// The renderer's glyph epoch when these were baked. It moves only when a glyph upload failed
+    /// and the residency was thrown away — at which point anything baked from it drew blank text,
+    /// under a key the widget has no reason to change. Without this the blank survives as long as
+    /// the widget's content does. See `VulkanRenderer::text_epoch`.
+    text_epoch: u64,
     textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
 }
 
@@ -690,10 +704,14 @@ pub fn bake_content<P>(
 ) -> anyhow::Result<VkTexture> {
     let scale_key = NotNan::new(scale).context("non-finite scale")?;
 
+    // Same two invalidations as `bake`: a new renderer context, and a rebuilt glyph residency
+    // (which means anything cached here was baked with blank text).
     let context = renderer.context_id();
-    if cache.context.as_ref() != Some(&context) {
+    let text_epoch = renderer.text_epoch();
+    if cache.context.as_ref() != Some(&context) || cache.text_epoch != text_epoch {
         cache.textures.clear();
         cache.context = Some(context);
+        cache.text_epoch = text_epoch;
     }
 
     let fresh = matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == revision);

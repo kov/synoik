@@ -103,6 +103,12 @@ pub struct VulkanRenderer {
     /// coordinates only mean anything in the atlas it was placed in.
     pending_glyphs: Vec<niri_vk::text::PendingGlyph>,
     pending_glyph_generation: u64,
+    /// Bumped whenever the glyph residency is thrown away after a failed upload. Anything holding
+    /// a *baked* texture has to notice: a bake that drew blank glyphs is cached under a key its
+    /// widget will not change (`ui::widget::BakeCache`), so without this the text stays blank for
+    /// as long as that widget's content does — not for one frame. Read by the bake caches the way
+    /// they already read `context_id`.
+    text_epoch: u64,
     /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
     /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
     custom_resize: Option<Pipeline>,
@@ -423,6 +429,7 @@ impl VulkanRenderer {
             glyph_atlas: None,
             pending_glyphs: Vec::new(),
             pending_glyph_generation: 0,
+            text_epoch: 0,
             custom_resize: None,
             custom_close: None,
             custom_open: None,
@@ -822,9 +829,23 @@ impl VulkanRenderer {
             // Growth is a once-ever event, so the extra submit costs nothing in practice.
             self.flush_glyph_uploads();
 
-            let texture = NiriTexture::new_coverage_atlas(gpu, pool, side)
-                .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))?;
-            let (desc_pool, set) = self.make_texture_set(&texture)?;
+            // Failing here is the same trap as a failed upload, one step earlier: `pending` is
+            // dropped on the way out, but its glyphs were recorded resident when they were
+            // rasterized, so a retry finds them "already there", emits nothing to upload, and
+            // draws blank once an image finally exists. Throw the residency away on the way out.
+            let made = NiriTexture::new_coverage_atlas(gpu, pool, side)
+                .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))
+                .and_then(|texture| {
+                    let set = self.make_texture_set(&texture)?;
+                    Ok((texture, set))
+                });
+            let (texture, (desc_pool, set)) = match made {
+                Ok(made) => made,
+                Err(err) => {
+                    self.invalidate_glyphs();
+                    return Err(err);
+                }
+            };
             // R8 coverage, only ever sampled (never scanned out or read back), so the fourcc is
             // informational; R8 names the byte layout honestly.
             let texture = VkTexture::new(
@@ -874,6 +895,29 @@ impl VulkanRenderer {
     /// the GPU, and a resident glyph emits nothing to upload ever again — so a lost copy means
     /// that character stays blank for the life of the atlas. Throwing the residency away
     /// (`invalidate`) costs a re-rasterization and puts everything back.
+    /// Whether any glyph is queued but not yet in the atlas image. For the assertion in
+    /// `render_glyphs_with` that nothing shaped text after this frame began.
+    pub(super) fn has_pending_glyphs(&self) -> bool {
+        !self.pending_glyphs.is_empty()
+    }
+
+    /// See [`Self::text_epoch`](#structfield.text_epoch). Changes only when glyph residency was
+    /// thrown away, so a cache comparing it clears at most once per failure.
+    pub(crate) fn text_epoch(&self) -> u64 {
+        self.text_epoch
+    }
+
+    /// Throw away glyph residency and everything built from it, after an upload could not be
+    /// made. Everything downstream has to go: the index would otherwise keep claiming those
+    /// glyphs are resident (so nothing would ever upload them again), and any run or bake made
+    /// from them drew blanks.
+    fn invalidate_glyphs(&mut self) {
+        self.text_ctx.atlas_mut().invalidate();
+        self.glyph_runs.clear();
+        self.pending_glyphs.clear();
+        self.text_epoch = self.text_epoch.wrapping_add(1);
+    }
+
     pub(super) fn flush_glyph_uploads(&mut self) {
         if self.pending_glyphs.is_empty() {
             return;
@@ -883,7 +927,7 @@ impl VulkanRenderer {
             // Glyphs are only queued after the image is ensured, so this cannot happen; drop them
             // rather than panic, and rebuild the residency so nothing is silently missing.
             debug_assert!(false, "glyphs queued with no atlas image to put them in");
-            self.text_ctx.atlas_mut().invalidate();
+            self.invalidate_glyphs();
             return;
         };
 
@@ -899,10 +943,9 @@ impl VulkanRenderer {
         if let Err(err) = result {
             warn!("glyph atlas upload failed, rebuilding the atlas: {err:#}");
             // The index still claims these glyphs are resident. Forget the lot: the next shape
-            // re-rasterizes them, the generation bump recreates the image, and the frame that is
-            // starting draws one frame of missing text instead of missing it forever.
-            self.text_ctx.atlas_mut().invalidate();
-            self.glyph_runs.clear();
+            // re-rasterizes them, the generation bump recreates the image, and the text that drew
+            // blank is re-baked rather than staying blank for the life of its cache entry.
+            self.invalidate_glyphs();
         }
     }
 

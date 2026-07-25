@@ -610,6 +610,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         damage: &[Rectangle<i32, Physical>],
         color_for: impl Fn(usize) -> [f32; 4],
     ) -> Result<(), VulkanError> {
+        // Every glyph this could sample was uploaded by the flush at `begin`, and nothing can have
+        // queued more since — shaping needs `&mut VulkanRenderer`, which this frame holds. That is
+        // a property of the borrow rather than of any type, so assert it: a future frame method
+        // that shaped text mid-frame would draw blanks, silently, in release.
+        debug_assert!(
+            !self.renderer.has_pending_glyphs(),
+            "glyphs were queued after this frame began, so they are not in the atlas it samples"
+        );
         debug_assert!(
             matches!(self.transform, Transform::Normal),
             "render_glyphs is offscreen-only (identity transform), got {:?}",

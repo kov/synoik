@@ -3253,10 +3253,17 @@ fn text_of_resident_glyphs_costs_no_submit() {
             .render(&mut fb, Size::from((16, 16)), Transform::Normal)
             .expect("render");
     }
-    assert!(
-        niri_vk::stats::submits() > submits,
+    let sites = niri_vk::stats::take_sites();
+    let glyph_uploads = sites[niri_vk::stats::SubmitSite::ALL
+        .iter()
+        .position(|s| *s == niri_vk::stats::SubmitSite::UploadGlyphs)
+        .unwrap()]
+    .submits;
+    assert_eq!(
+        glyph_uploads, 1,
         "bold digits were never rasterized and never uploaded either — beginning a frame must \
-         put the queued glyphs in the atlas, or they would draw blank"
+         put the queued glyphs in the atlas, or they would draw blank. (Counted per site: the \
+         frame makes a submit of its own, so a total would pass with the flush deleted.)"
     );
 }
 
@@ -3458,12 +3465,20 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
         .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
         .expect("copy_framebuffer");
     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
-    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 128).count();
-    assert!(
-        ink > 13,
-        "one submit uploaded nothing usable — only {ink} lit pixels across thirteen runs, so the \
-         glyphs coalesced by being dropped"
-    );
+    // Every run separately: one submit that copied only the first region would still light plenty
+    // of pixels overall, so a total is not an answer. Each run drew in its own 24px band.
+    for (i, _) in runs.iter().enumerate() {
+        let top = (4 + i as i32 * 24).max(0) as usize;
+        let bottom = (top + 24).min(320);
+        let ink = pixels[top * 64 * 4..bottom * 64 * 4]
+            .chunks_exact(4)
+            .filter(|p| p[0] > 128)
+            .count();
+        assert!(
+            ink > 10,
+            "run {i} drew only {ink} lit pixels — the one submit did not carry every glyph"
+        );
+    }
 }
 
 /// **A submit is counted where it came from, not by what it renders into.**
