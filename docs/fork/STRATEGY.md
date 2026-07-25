@@ -391,6 +391,10 @@ first-class constraint on this work.
   structurally can't cross virtio).
 - **(4) cut over at parity; delete GLES/pango/cairo.**
 
+**Performance ceiling of the owned renderer — see `docs/fork/renderer-synchronous-submits.md`.**
+Every submit fence-waits, so a frame costs what its round trips cost, not what it draws. Deferred
+by decision while cheaper per-frame wins remain.
+
 **Known gaps of the owned renderer vs GLES — see `docs/fork/renderer-gaps.md`.** Deleting GLES is
 **not** a one-way door: single-device / LINEAR-only / single-plane are configurations of the Vulkan
 renderer, not its architecture, and Smithay's multi-GPU machinery is GLES-typed top to bottom, so
