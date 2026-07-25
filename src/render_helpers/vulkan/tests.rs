@@ -2704,6 +2704,70 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
     );
 }
 
+/// The `N created` counter must count creations, not calls. `import_dmabuf_as_texture` used to
+/// start its timer at the top of the function — above the cache lookup — so every cache **hit**
+/// reported a GPU resource creation, and the frame log's per-frame `created` number counted the
+/// work the cache exists to avoid. That is the one number telling us whether a frame allocates or
+/// reuses (`docs/fork/venus-cost.md` §9.1: a dmabuf/modifier `vkCreateImage` miss costs 0.06-0.7 ms
+/// against 3 us for a plain one), so a hit that reads as a create makes it useless in the exact
+/// case it was added for.
+///
+/// Import the same buffer twice and count: the miss creates, the hit does not.
+#[test]
+fn vulkan_dmabuf_import_cache_hit_is_not_counted_as_a_creation() {
+    use niri_vk::dmabuf::ForeignBuffer;
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::Modifier;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_dmabuf_import_cache_hit_is_not_counted: no device ({e})");
+            return;
+        }
+    };
+    let fb = match ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 255, 0, 255]; 4]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_dmabuf_import_cache_hit_is_not_counted: no GBM ({e})");
+            return;
+        }
+    };
+    let mut builder = Dmabuf::builder(
+        (W, H),
+        Fourcc::Argb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+    );
+    assert!(builder.add_plane(
+        fb.fd().try_clone_to_owned().expect("dup fd"),
+        0,
+        fb.offset,
+        fb.stride,
+    ));
+    let dmabuf = builder.build().expect("build dmabuf");
+
+    let _ = niri_vk::stats::take_creates();
+    let first = vk.import_dmabuf_as_texture(&dmabuf).expect("import (miss)");
+    let (miss, _) = niri_vk::stats::take_creates();
+    assert_eq!(
+        miss, 1,
+        "a cache miss really imports an image, and must count"
+    );
+
+    let second = vk.import_dmabuf_as_texture(&dmabuf).expect("import (hit)");
+    let (hit, _) = niri_vk::stats::take_creates();
+    assert!(
+        first.same_image(&second),
+        "the second import of one buffer must be a cache hit",
+    );
+    assert_eq!(
+        hit, 0,
+        "a cache hit allocated nothing but counted {hit} creations — the frame log's `created` \
+         number then reports the work the cache avoided",
+    );
+}
+
 // --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
 
 /// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads

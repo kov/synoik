@@ -279,6 +279,18 @@ pub fn uploaded(bytes: u64) {
 /// the seat's worst frames — collect time that is neither a fence wait nor a bake — and this is the
 /// counter that says whether it is this or something else.
 ///
+/// **Call this at the constructor that actually creates, never at a caller.** Two rules follow
+/// from that, and both were violated before they were written down:
+///
+/// - *Never above a cache lookup.* `import_dmabuf_as_texture` timed itself from the top, so every
+///   cache **hit** — the whole point of that cache — reported a creation that never happened.
+/// - *Never nested.* `create_buffer` wrapped its own call to `Texture::new_color_target`, so one
+///   offscreen counted as two resources.
+///
+/// The rule makes the number mean one thing: GPU images and allocations that were really made.
+/// A site that creates nothing must not appear here at all, or the counter cannot answer the
+/// question it exists for — is this frame allocating, or reusing?
+///
 /// Counted even when timing is off, so the count stays meaningful on its own; the clock reads are
 /// gated like every other timer here.
 pub fn creating() -> CreateTimer {

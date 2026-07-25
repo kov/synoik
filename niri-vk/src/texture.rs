@@ -543,6 +543,7 @@ impl Texture {
         height: u32,
         format: vk::Format,
     ) -> Result<Self> {
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
 
         let image_ci = vk::ImageCreateInfo::default()
@@ -593,6 +594,7 @@ impl Texture {
         height: u32,
         filter: vk::Filter,
     ) -> Result<Self> {
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
 
         let image_ci = vk::ImageCreateInfo::default()
@@ -682,6 +684,10 @@ impl Texture {
         usage: vk::ImageUsageFlags,
         filter: vk::Filter,
     ) -> Result<Self> {
+        // Counted like any other create, and it is the *expensive* one: a dmabuf/DRM-modifier
+        // `vkCreateImage` that misses venus's requirements cache costs 0.06-0.7 ms against 3 us
+        // for a plain image (`docs/fork/venus-cost.md` §9.1).
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
 
         let plane_layout = vk::SubresourceLayout {
@@ -839,6 +845,10 @@ impl Texture {
         alpha_one: bool,
         filter: vk::Filter,
     ) -> Result<Self> {
+        // Counted like any other create, and it is the *expensive* one: a dmabuf/DRM-modifier
+        // `vkCreateImage` that misses venus's requirements cache costs 0.06-0.7 ms against 3 us
+        // for a plain image (`docs/fork/venus-cost.md` §9.1).
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
 
         let plane_layout = vk::SubresourceLayout {

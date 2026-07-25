@@ -1100,7 +1100,9 @@ impl VulkanRenderer {
         &mut self,
         dmabuf: &Dmabuf,
     ) -> Result<VkTexture, VulkanError> {
-        let _timed = niri_vk::stats::creating();
+        // NOT counted here: this function's fast path is a *cache hit*, and timing it from the
+        // top counted every hit as a creation. `Texture::import_dmabuf_sampled` counts itself, on
+        // the miss path only.
         // PRODUCER SYNC — this is an ownership *acquire* barrier (FOREIGN queue family →
         // ours), NOT a readiness wait on the client's producing GPU fence. That's fine:
         // producer readiness is guaranteed UPSTREAM, at commit time, renderer-agnostically.
@@ -2364,7 +2366,8 @@ impl Offscreen<VkTexture> for VulkanRenderer {
         if !is_rgba8888(format) {
             return Err(VulkanError::UnsupportedFormat(format));
         }
-        let _timed = niri_vk::stats::creating();
+        // `Texture::new_color_target` below counts the image it creates; counting here as well
+        // would report two resources for one offscreen.
         let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
         let filter = match self.upscale_filter {
             TextureFilter::Linear => vk::Filter::LINEAR,
