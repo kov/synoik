@@ -13,10 +13,11 @@
 //! The worker writes its pixels **straight into device-visible memory** when a device is
 //! available ([`niri_vk::staging::HostStaging`]). Moving the decode off the main loop had left one
 //! multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a staging
-//! buffer, measured at 7–9 ms for a 4K picture — pure write-combined-memory bandwidth, no GPU work
-//! in it at all. Staging on the worker leaves the render thread with only the image creation, the
-//! copy command and the submit. Without a device (headless tests, or before the renderer exists)
-//! it falls back to a plain `Vec` and the old upload path.
+//! buffer, measured at 7–9 ms for a 4K picture — first-touch page faults on a freshly mapped
+//! buffer, no GPU work in it at all (`docs/fork/venus-cost.md` §9.2). Staging on the worker leaves
+//! the render thread with only the image creation, the copy command and the submit. Without a
+//! device (headless tests, or before the renderer exists) it falls back to a plain `Vec` and the
+//! old upload path.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -390,8 +391,8 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let size = Size::new(decoded.width() as i32, decoded.height() as i32);
     let data = decoded.into_rgba8().into_raw();
 
-    // This copy is the whole point of the staging path: it is tens of megabytes into
-    // write-combined memory, and here it runs on the worker instead of between two frames.
+    // This copy is the whole point of the staging path: it is tens of megabytes into a mapping
+    // that has never been touched, and here it runs on the worker instead of between two frames.
     let pixels = match gpu.map(|gpu| HostStaging::new(gpu, data.len())) {
         Some(Ok(mut staging)) => {
             staging.as_mut_slice().copy_from_slice(&data);

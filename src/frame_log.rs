@@ -325,13 +325,16 @@ struct Totals {
     /// that moved a wallpaper — different costs, different fixes.
     uploaded: u64,
     /// GPU resources created, and the wall time it took. Not a submit and not free: on a
-    /// virtualized driver every `vkCreateImage`/`vkAllocateMemory` is a synchronous round trip to
-    /// the host, so this is collect time that the submit breakdown structurally cannot see. Added
-    /// because the seat's worst frames had ~50ms that was neither a fence wait nor a bake.
+    /// virtualized driver a `vkCreateImage` round-trips to the host whenever venus misses its
+    /// image-requirements cache, so this is collect time that the submit breakdown structurally
+    /// cannot see. Added because the seat's worst frames had ~50ms that was neither a fence wait
+    /// nor a bake.
     creates: (u64, Duration),
     /// Wall time memcpying host bytes into mapped staging. Separate from `creates` because it is a
-    /// different cost with a different fix — a write into write-combined memory, scaling with
-    /// payload — and folding it in made a wallpaper frame read as 9.96ms of "creation".
+    /// different cost with a different fix — first-touch page faults on a freshly mapped buffer,
+    /// scaling with payload (`docs/fork/venus-cost.md` §9.2; the mapping itself is cached and does
+    /// ~58 GB/s once warm) — and folding it in made a wallpaper frame read as 9.96ms of
+    /// "creation".
     staging_write: Duration,
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed

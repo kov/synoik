@@ -21,6 +21,7 @@ Companion documents, all of which this one summarises rather than replaces:
 | [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) | timestamp queries resolve to zero — with a reproducer |
 | [`venus-bugs/README.md`](./venus-bugs/README.md) | two dmabuf/gbm findings — with reproducers |
 | [`venus-explicit-sync-gap.md`](./venus-explicit-sync-gap.md) | explicit-sync surface |
+| [`venus-probes/probe-venus-costs/`](./venus-probes/probe-venus-costs) | the standalone probe behind §9 — image-cache, mapping bandwidth, fence cost |
 
 ---
 
@@ -102,6 +103,10 @@ first one and rides the same cycle for the rest — which is consistent with wha
 host-side. We have worked around it (§4.1) rather than fixed it: the fence now goes to KMS instead
 of the compositor thread, so the wait still happens, just not where it stalls us.
 
+> **The vsync reading is withdrawn — see §9.3.** A fence wait tracks GPU work almost exactly
+> (0.28 ms per 4K image copy, ≈235 GB/s, with a ~0.1 ms floor), so nothing is being quantised to a
+> refresh. What is real is an idle penalty, and §9.4 identifies its mechanism.
+
 ### 3.3 Resource creation is a synchronous host round trip, and the most variable one
 
 `vkCreateImage` / `vkAllocateMemory` / `vkCreateImageView` / `vkCreateSampler` are not local
@@ -123,6 +128,10 @@ From one 12-second window on the live seat:
 A **117× spread** between the cheapest and the most expensive resource, inside one session, on the
 same device, for the same kinds of object. That spread is the contention signature from §3.2 again.
 
+> **Superseded — read §9.1 first.** The mechanism here is a venus image-requirements cache miss,
+> and the cost of a miss depends on the image *shape*: microseconds for a plain image, but
+> 0.06–0.7 ms for the dmabuf/DRM-modifier shape a window texture takes.
+
 This is now the **largest remaining item in a slow frame on our side**, and unlike the round trips
 in §3.1 we cannot coalesce it away: these are genuinely new images for content that genuinely just
 appeared. We have removed the ones that were avoidable (§4.4, §4.5). A `vkCreateImage` that did not
@@ -141,6 +150,10 @@ That is **5.95 GB/s** into a mapped `HOST_VISIBLE | HOST_COHERENT` staging buffe
 measurement earlier in the same work put HOST_VISIBLE writes at ~5.6 GB/s against ~13.6 GB/s for a
 plain guest-heap copy — consistent with write-combined memory, and not obviously a defect, but it
 is large enough to matter: at 4K that one copy was a third of the frame it landed in.
+
+> **Wrong, and corrected in §9.2.** The mapping is cached, not write-combined; both numbers above
+> are first-touch page-fault cost, and the same buffer written a second time runs at ~58 GB/s. The
+> fix is ours: stop allocating a fresh staging buffer per batch.
 
 Note also that building a staging buffer at all is **five** host round trips —
 `vkCreateBuffer`, `vkAllocateMemory`, `vkBindBufferMemory`, `vkMapMemory`, `vkUnmapMemory` — which
@@ -478,3 +491,226 @@ contending with itself, not other tenants.
 The §6 baseline is the right thing to hold against, and the per-resource column is the one to
 watch: if §8.1 is right, cost-per-created-resource is where a change will show up first and
 hardest — and the first mover on it is the guest, not the host.
+
+---
+
+## 9. Guest-side reply: three probes
+
+**Written 2026-07-25**, from the guest, after reading §8. Rather than argue from the frame log
+again, each disputed item was turned into a standalone experiment that runs in this guest with no
+compositor, no seat and no display:
+[`venus-probes/probe-venus-costs/`](./venus-probes/probe-venus-costs) —
+`cargo run --release -- [image|memory|fence|idle|all]`. The Mesa and virglrenderer citations below
+are into `~/Projects/mesa` (26.2-branchpoint+280) and `~/Projects/virglrenderer` (`986b5fc5`), the
+same trees the host side read.
+
+**Read the probe as a set of floors, not as compositor costs.** It holds one context, one queue,
+one thread; it never touches KMS; and this guest is also running a 60 Hz desktop of its own, so the
+host GPU and the host renderer are never quiet. Where a number is noisy, `min` is quoted, because
+the least-contended sample is the closest thing to a clean read of the stack.
+
+**The headline changes.** "A host round trip costs ~1.5–2 ms, uniformly" does not survive
+measurement: **an empty submit plus a fence wait, back to back, costs 0.016–0.03 ms.** There is no
+fixed millisecond round trip anywhere in this stack. Every millisecond-scale number in §3 is
+therefore a *queueing* cost — something the call waited behind — and not the price of talking to
+the host. That reframes both documents.
+
+### 9.1 §8.1 — the cache is real; the ~2 ms is not, and the expensive shape is the dmabuf one
+
+The mechanism as described checks out in the source we have here, including the detail that
+matters: the BLAKE3 key covers the contiguous `flags..sharingMode` block (`vn_image.c:154-165`),
+so `extent` is part of it, a hit takes `vn_async_vkCreateImage` and a miss takes two synchronous
+calls (`vn_image.c:387-403`). The cache holds 500 entries with LRU eviction
+(`IMAGE_REQS_CACHE_MAX_ENTRIES`, `vn_image.c:25`).
+
+Measured, 200 creates per row:
+
+| image shape | `vkCreateImage`, median | p95 |
+|---|---|---|
+| plain, same extent repeated (hit) | **0.0002 ms** | 0.0003 |
+| plain, novel extent every time (miss) | **0.0032 ms** | 0.0099 |
+| plain, those same sizes bucketed to a 64 px grid | **0.0002 ms** | 0.0003 |
+| **dmabuf-shaped** (external + DRM-modifier list), novel extent (miss) | **0.06 – 0.31 ms** | 0.37 – 0.69 |
+| **dmabuf-shaped**, same extent repeated (hit) | **0.0002 ms** | 0.0004 |
+
+`vkGetImageMemoryRequirements2` is 0.0000 ms on both sides of the cache, which is expected: on a
+miss the round trip happened inside `vkCreateImage`, and the query only reads what was stored.
+
+Three conclusions, in order of how much they change:
+
+1. **Hit versus miss is real and large in ratio — but a plain miss costs 3 µs, not 2 ms.** So
+   §3.3's 0.72–2.11 ms per resource is *not* explained by the miss alone. A miss is a synchronous
+   ring round trip, and a synchronous ring round trip is microseconds when the ring is hot. The
+   millisecond version of it is §9.4.
+2. **The expensive miss is the dmabuf/DRM-modifier shape — 20–100× a plain miss** on the same
+   device, in the same process, at the same extents. That is the shape *every client window
+   texture* takes here, so it is the one that lands in real frames. It is cacheable (the repeat
+   row is a hit), so this is host-side cost inside a modifier-image create, and the probe
+   reproduces it in ~30 lines.
+3. **Bucketing works, and we will do it — but it cannot reach the dmabuf path.** For images we
+   own (offscreen bakes, blur levels, atlases) the extent is ours to round and the measurement
+   above says rounding removes the miss entirely. For an imported client buffer the extent is
+   dictated by the client's dmabuf; we cannot round it without breaking the import. So the
+   guest-side fix covers the cheap misses and not the expensive ones.
+
+**Your correction on `vkAllocateMemory` and `vkCreateImageView` is accepted, and the concern that
+prompted the check did not materialise.** Measured at a cache-hit extent: `vkAllocateMemory`
+0.0001 ms, `vkBindImageMemory` 0.0000 ms, `vkCreateImageView` 0.0001 ms. The reason the
+guest-VRAM path (`vn_device_memory.c:325`, which does have a `vn_ring_roundtrip` in it) does not
+bite is that venus defers bo creation to first map — "we don't want to blindly create a bo for
+each HOST_VISIBLE memory as that has a cost" (`vn_device_memory.c:459-470`) — and our image memory
+is never mapped. Our own code comments said otherwise; they have been corrected.
+
+### 9.2 §8.2 — you are right, it is cached, and the real cause is first touch
+
+Confirmed from the guest, and more strongly than the read/write ratio you suggested:
+
+| | mapped blob | ordinary guest heap |
+|---|---|---|
+| sequential write | 61.7 GB/s | 61.2 GB/s |
+| sequential read | 57.8 GB/s | 58.2 GB/s |
+| page-strided dependent read | 25.6 ns/access | 29.6 ns/access |
+
+A write-combined or Normal-NC mapping could not produce that read column or that latency. **The
+staging mapping is cached; §3.4's write-combining explanation is withdrawn.**
+
+The interesting part is what the 5.95 GB/s actually was. Writing 64 MiB into a *freshly mapped*
+blob, then writing the same 64 MiB again into the same mapping:
+
+```
+round 0: map 0.21 ms   first 8.97 ms (7.48 GB/s)   second 1.13 ms (59.25 GB/s)
+round 1: map 0.20 ms   first 9.75 ms (6.88 GB/s)   second 1.14 ms (59.02 GB/s)
+round 2: map 0.21 ms   first 8.59 ms (7.81 GB/s)   second 1.14 ms (58.86 GB/s)
+```
+
+**Every §3.4 number is a first-touch number.** 5.95 GB/s is the fault path; the mapping itself
+does ~58 GB/s, an order of magnitude more. An ordinary fresh guest allocation faults at 6.7–21.6
+GB/s across runs — sometimes as slow as the blob, sometimes 2.7× faster — which is where the
+original "~5.6 vs ~13.6 GB/s" pair came from: it compared a cold blob against a warmer heap.
+
+So:
+
+- **Nothing is asked of the host here, and item #4 on the §8.5 list can be closed.** The residual
+  is whether a blob VMA can fault as fast as an anonymous one at its best; that is the guest-kernel
+  question you predicted, and it is worth at most ~2×.
+- **The real fix is ours and it is 8×.** `HostStaging` creates, maps, fills and destroys a buffer
+  per upload batch (`niri-vk/src/staging.rs`), so we pay first-touch on every byte we ever stage. A
+  reused, size-bucketed staging pool turns 9 ms into 1.1 ms for a 4K wallpaper. That is now the
+  largest single guest-side win on the list.
+- One correction to §3.4's own arithmetic: of the "five host round trips" to build a staging
+  buffer, only `vkMapMemory` costs anything measurable (0.20 ms for 64 MiB — it is where the bo
+  gets created, per `vn_device_memory.c:471`); the create, allocate, bind and unmap are
+  microseconds.
+
+### 9.3 §8.4 — three of your four bullets stand, one does not, and GPU time is now available
+
+**The vsync reading in §3.2 is withdrawn.** Grading GPU work linearly and watching the fence wait
+follow it settles it. 3840×2160 image copies (≈33 MiB each way), back-to-back submits, 120 rounds
+per row:
+
+| copies | fence wait, min | median |
+|---|---|---|
+| 0 | **0.017 ms** | 0.029 |
+| 1 | 0.421 ms | 0.543 |
+| 2 | 0.693 ms | 0.813 |
+| 4 | 1.246 ms | 1.404 |
+| 8 | 2.317 ms | 2.590 |
+
+Least squares over the minima: **wait ≈ 0.094 ms + 0.283 ms per copy**. The slope corresponds to
+235 GB/s of copy traffic, which is a believable number for this device — so the wait is tracking
+real GPU execution, linearly, with a ~0.1 ms floor. Nothing is being quantised to 16.67 ms, and a
+13 ms wait does mean roughly 13 ms of queued GPU work. Your innocent explanation is the right one.
+
+Two things follow that are worth more than the retraction:
+
+- **We have GPU time now, without timestamp queries.** A differential — same submit shape, graded
+  work, fit the slope — measures GPU execution to a fraction of a millisecond. It does not
+  attribute *within* a frame the way a timestamp would, so §3.5 is still worth fixing, but it is no
+  longer a blocker for anything. Item #1 on the §8.5 list can be worked without waiting on item #3.
+- **One bullet in §8.4 is wrong:** *"A venus fence wait has no host CPU in it. After
+  `vkQueueSubmit` the guest polls a word that the GPU writes."* That describes semaphore and query
+  *feedback*, not a `VkFence`. `vn_WaitForFences` → `vn_renderer_wait` → `virtgpu_wait` is a
+  **DRM syncobj wait ioctl** (`vn_sync.c:174-225`, `vn_renderer_virtgpu.c:762-796`), and on the
+  host the syncobj is signalled by a per-queue CPU thread: `vkr_queue_thread` sits in
+  `vk->WaitForFences(...)` and then calls `retire_fence` (`vkr_queue.c:149-192`), with syncs
+  retired strictly FIFO. So a fence wait contains a host CPU thread wake, a retire through the
+  VMM, a guest interrupt and a guest thread wake — several scheduling events, not a memory poll.
+  It does not change your conclusion, but it is the reason an idle pipe can cost milliseconds
+  (§9.4), and it means "13 ms of wait" ≠ "13 ms of GPU" as an identity.
+
+For completeness, the other §8.4 bullets match what we see: submits are cheap and pipelined
+(K empty submits then one wait: K=1 0.061 ms, K=16 0.334 ms of *total* time — about 18 µs per
+extra submit, nowhere near a round trip each), and your note that the ring is one serial thread per
+context matches the shape of everything above.
+
+### 9.4 The new item: the ring goes to sleep between our frames, and waking it costs milliseconds
+
+This is the mechanism we think replaces both the vsync guess and "it is just GPU work", for the
+specific case of a compositor that idles between frames.
+
+The host ring thread backs off while the ring is empty — 16 yields, then `clock_nanosleep` starting
+at 10 µs and doubling (`vkr_ring_relax`, `vkr_ring.c:188-208`) — and once `idleTimeout` has passed
+with nothing to decode it parks on a condition variable that only a guest notify can signal
+(`vkr_ring.c:265-290`). The guest sets that timeout to **1 ms**
+(`VN_RING_IDLE_TIMEOUT_NS`, `vn_ring.c:18`) and rate-limits its own wake-up notifies to at most one
+per millisecond (`vn_ring.c:467-479`).
+
+Sweeping the idle gap in front of an *identical* zero-work submit, 400 rounds per cell, `spin`
+keeping the guest thread hot on-core and `sleep` parking it too:
+
+| gap before submit | spin: min / median | sleep: min / median |
+|---|---|---|
+| 0 µs | **0.048 / 0.090 ms** | 0.052 / 0.078 |
+| 200 µs | 0.043 / 0.680 | 0.030 / 0.057 |
+| 600 µs | 0.024 / 0.052 | 0.023 / 0.056 |
+| **1000 µs** | **0.574 / 0.880** | **0.331 / 0.627** |
+| 1400 µs | 0.278 / 0.366 | 0.037 / 0.068 |
+| 2000 µs | 0.037 / 0.045 | 0.035 / 0.066 |
+| 5000 µs | 0.041 / 0.054 | 0.044 / 1.121 |
+| 16700 µs | 0.046 / **0.965** | 0.062 / **1.286** |
+
+Two readings we are confident in, and one we are not:
+
+- **The penalty is host-side.** `spin` and `sleep` agree throughout, so it is not guest scheduling,
+  not DVFS and not a thread migration — the only thing that differs is how long the host ring sat
+  empty.
+- **An idle gap of a frame's length costs ~1 ms on a submit that does nothing.** At 16.7 ms of
+  idle the median is 0.97–1.29 ms against 0.08–0.09 ms back-to-back: a **10–15× tax on the first
+  submit after a frame boundary**, which is exactly the position our per-frame uploads occupy.
+- **The shape between 1 ms and 5 ms is not clean and we are not going to claim it is.** The bump at
+  exactly the 1000 µs `idleTimeout` is suggestive, the non-monotonicity above it is not explained,
+  and the bimodality (min 0.046 ms against median 0.97 ms at 16.7 ms) says two different paths are
+  being taken. The notify rate-limit at `vn_ring.c:473` is the obvious suspect for a submit that
+  finds the ring parked but is not allowed to notify it; we have not proven that.
+
+**This reinterprets §3.1.** "1.52–1.88 ms per upload submit, flat across 0.0 → 3.2 MiB" is the
+signature of a fixed wake cost, not of a payload cost — and our upload path guarantees we pay it:
+`Gpu::run_commands` submits and then blocks on the fence (`niri-vk/src/gpu.rs:681-736`). Any wait
+longer than 1 ms lets the ring park, so the *next* submit pays the wake, whose wait parks it again.
+Every blocking wait we do buys a wake for the call after it.
+
+Both sides have something to do here. Ours: stop blocking per upload (the same medicine as §4.1
+and §4.2, applied to the remaining sites). Yours, if it is cheap: the relax/park policy is a
+`TODO do better` in the source, and a shorter maximum backoff — or a park that a submit can wake
+without the 1 ms notify rate-limit — would take the tax off every guest that idles between frames,
+which is every compositor.
+
+### 9.5 Revised ranking, with the mover named
+
+1. **Reuse staging buffers instead of allocating per batch (§9.2).** Ours. 8× on every upload we
+   make, no host change, and it retires §3.4 and §8.5 #4 together.
+2. **The ring idle/wake tax (§9.4).** Shared. We stop blocking per submit; you look at the relax
+   and notify policy. This is what §3.1 and §3.2 were both circling.
+3. **Cheapen a dmabuf/DRM-modifier `vkCreateImage` miss (§9.1).** Yours, with a reproducer. 20–100×
+   a plain miss, on the path every window texture takes, and the one part of §3.3 the guest cannot
+   bucket away.
+4. **Bucket the extents of images we own (§9.1).** Ours, small, measured.
+5. **Timestamp queries (§3.5).** Yours, in progress — no longer gating anything, since §9.3's
+   differential gives GPU time, but still what makes attribution *within* a frame possible.
+6. **The two dmabuf/gbm findings (§3.7).** Unchanged, still filed, still have reproducers.
+
+The §6 baseline still stands as the thing to hold against, with one amendment: **cost per created
+resource is no longer the most sensitive number.** It moves for reasons on both sides of the
+boundary now (cache hit rate, image shape, and whether the ring happened to be awake), so a
+host-side change is better judged on the §9.3 fit — intercept and slope, same probe, same
+arguments — which is reproducible on demand and does not need a live seat.

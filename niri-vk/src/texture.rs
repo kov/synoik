@@ -172,9 +172,12 @@ struct BatchedUpload {
 /// Build every texture in `items` against **one** staging buffer and one submit.
 ///
 /// The per-texture path ([`Texture::build_pending`]) creates a staging buffer, allocates its
-/// memory, binds, maps and unmaps for each texture — five host round trips apiece, on top of the
-/// image, its memory, the view, the sampler, the descriptor pool and the set. On a virtualized
-/// driver those round trips are the dominant cost of an upload: the seat's app-grid open measured
+/// memory, binds, maps and unmaps for each texture, on top of the image, its memory, the view, the
+/// sampler, the descriptor pool and the set. Of those calls only `vkMapMemory` reaches the host —
+/// it is where venus creates the bo (`vn_device_memory.c:471`), measured at 0.20 ms for 64 MiB —
+/// but the mapping it hands back is *untouched*, so the fill that follows pays a page fault per
+/// page: 7.5 GB/s cold against 58 GB/s warm (`docs/fork/venus-cost.md` §9.2). Per texture, that
+/// cost repeats. The seat's app-grid open measured
 /// **26 resources created in 28.24 ms** with only 11.32 ms of fence waits, i.e. creation was 65% of
 /// the frame and 2.5× everything spent waiting on the GPU.
 ///
@@ -1239,8 +1242,8 @@ impl Texture {
                 .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
                 .context("map staging")? as *mut u8;
             {
-                // Timed apart from creation: this is a host write into write-combined memory, not
-                // a round trip, and it is the entire cost of a wallpaper upload. Conflating the
+                // Timed apart from creation: this is a host write into a never-touched mapping,
+                // not a round trip, and it is the entire cost of a wallpaper upload. Conflating the
                 // two made `created` read as 9.96ms on a frame that created almost nothing.
                 let _timed = crate::stats::staging_write();
                 std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());

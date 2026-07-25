@@ -2,10 +2,12 @@
 //! trips and draw calls.
 //!
 //! A "submit" here is `vkQueueSubmit`; a "retire" is the fence wait that follows
-//! it. Together they are one full CPU↔GPU round trip, and on a virtualized stack
-//! (Venus over virtio-gpu) that round trip costs milliseconds regardless of how
-//! much work it carries, so *how many* a frame does is a more useful number than
-//! how much it drew.
+//! it. Together they are one full CPU↔GPU round trip. On a virtualized stack
+//! (Venus over virtio-gpu) the wait tracks GPU work closely, but a submit issued
+//! after the ring has been idle for a millisecond pays ~1 ms to wake the host ring
+//! thread — flat, whatever it carries (`docs/fork/venus-cost.md` §9.4). A blocking
+//! wait puts the ring back to sleep, so *how many* round trips a frame makes is a
+//! more useful number than how much it drew.
 //!
 //! The two are timed **separately** even though today every submit in this
 //! renderer is immediately retired by its own caller. The cost lives almost
@@ -269,11 +271,13 @@ pub fn uploaded(bytes: u64) {
 /// framebuffer, a pipeline.
 ///
 /// Worth its own bucket because on a virtualized driver these are **not** free and **not**
-/// submits: every `vkCreateImage`/`vkAllocateMemory` is a synchronous round trip to the host, so a
-/// frame that allocates can spend milliseconds somewhere the submit accounting cannot see. That is
-/// exactly the shape of the unattributed CPU on the seat's worst frames — collect time that is
-/// neither a fence wait nor a bake — and this is the counter that says whether it is this or
-/// something else.
+/// submits. `vkAllocateMemory` and `vkCreateImageView` are asynchronous and cost microseconds, but
+/// `vkCreateImage` round-trips whenever venus misses its image-requirements cache — keyed on the
+/// whole `VkImageCreateInfo`, `extent` included — and a miss on the dmabuf/DRM-modifier shape runs
+/// 0.06–0.7 ms (`docs/fork/venus-cost.md` §9.1). So a frame that allocates can spend milliseconds
+/// somewhere the submit accounting cannot see. That is exactly the shape of the unattributed CPU on
+/// the seat's worst frames — collect time that is neither a fence wait nor a bake — and this is the
+/// counter that says whether it is this or something else.
 ///
 /// Counted even when timing is off, so the count stays meaningful on its own; the clock reads are
 /// gated like every other timer here.
@@ -296,8 +300,9 @@ impl Drop for CreateTimer {
 /// Times a host write into mapped `HOST_VISIBLE` staging memory.
 ///
 /// Its own bucket rather than part of [`creating`] because it is a different cost with a different
-/// fix: not a round trip to the host but a straight memcpy into write-combined memory, which on
-/// this VM runs at ~5.6 GB/s against ~13.6 GB/s for the same bytes into ordinary heap. It scales
+/// fix: not a round trip to the host but a straight memcpy into a mapping whose pages have never
+/// been touched, which on this VM runs at ~7 GB/s against ~58 GB/s once the same buffer is warm.
+/// The mapping is cached, not write-combined (`docs/fork/venus-cost.md` §9.2). It scales
 /// with payload, so it is the number that describes a wallpaper (48 MiB ≈ 8 ms) and rounds to
 /// nothing for an icon. Read together with the uploaded-bytes counter.
 pub fn staging_write() -> StagingTimer {

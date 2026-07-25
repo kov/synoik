@@ -1,0 +1,18 @@
+# Standalone probe: detached from the parent workspace so a repo-root `cargo`
+# never picks it up and it builds with only its one dep.
+[workspace]
+
+[package]
+name = "probe-venus-costs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Measures the three costs disputed in docs/fork/venus-cost.md §8: image-requirements cache hit vs miss, host-visible mapping bandwidth (read and write), and the fixed cost of a submit + fence wait."
+
+[dependencies]
+ash = "0.38.0"
+
+# Release: these measure host round trips and memcpy bandwidth, both of which a
+# debug build would drown in guest CPU noise.
+[profile.release]
+debug = true

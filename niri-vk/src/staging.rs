@@ -2,9 +2,11 @@
 //!
 //! The normal upload path ([`crate::texture::Texture::from_bytes_32bpp`]) takes a `&[u8]` the
 //! caller already owns and copies it into a staging buffer it makes on the spot. That copy is a
-//! host write into write-combined memory — measured at ~5.6 GB/s on this VM's Venus device against
-//! 13.6 GB/s for a plain heap — and for a 4K wallpaper it is tens of megabytes, so it lands on the
-//! compositor thread as a single 7–9 ms stall with no GPU work in it at all.
+//! host write into a mapping whose pages have never been touched — measured at ~7 GB/s on this
+//! VM's Venus device against ~58 GB/s into the same buffer once warm (`docs/fork/venus-cost.md`
+//! §9.2) — and for a 4K wallpaper it is tens of megabytes, so it lands on the compositor thread as
+//! a single 7–9 ms stall with no GPU work in it at all. TODO(perf): reusing buffers across uploads
+//! would remove the fault cost entirely; each `HostStaging` is created and dropped per batch.
 //!
 //! Nothing about that copy needs the render thread. Buffer creation, memory allocation, mapping
 //! and the write itself are all `VkDevice`-level calls the spec internally synchronizes; only
