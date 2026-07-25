@@ -16,7 +16,7 @@ use niri_vk::shaders::{
     POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG, SHADOW_FRAG,
     SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
-use niri_vk::texture::{Texture as NiriTexture, TextureBatch};
+use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
@@ -647,7 +647,7 @@ impl VulkanRenderer {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
-        let mut batch = TextureBatch::new(&self.gpu, self.command_pool);
+        let mut batch = Vec::with_capacity(items.len());
         for (data, format, size, _flipped) in items {
             let Some((vk_format, alpha_one)) = import_format(*format) else {
                 return Err(VulkanError::UnsupportedFormat(*format));
@@ -673,13 +673,21 @@ impl VulkanRenderer {
             } else {
                 vk::ComponentMapping::default()
             };
-            batch
-                .upload(w, h, &data[..expected], vk_format, 4, components, filter)
-                .map_err(|e| VulkanError::Other(format!("batch upload: {e:#}")))?;
+            batch.push(niri_vk::texture::BatchItem {
+                data: &data[..expected],
+                width: w,
+                height: h,
+                format: vk_format,
+                components,
+                filter,
+            });
         }
-        let textures = batch
-            .finish()
-            .map_err(|e| VulkanError::Other(format!("batch finish: {e:#}")))?;
+        // One staging buffer for the whole page, not one per icon: on Venus each staging buffer is
+        // a create + allocate + bind + map + unmap, five host round trips, and creation was
+        // measured at 65% of the app-grid open frame. See `upload_batch_shared_staging`.
+        let textures =
+            niri_vk::texture::upload_batch_shared_staging(&self.gpu, self.command_pool, &batch)
+                .map_err(|e| VulkanError::Other(format!("batch upload: {e:#}")))?;
 
         // Wrap each texture with its descriptor set. If that fails partway, destroy the current
         // texture and every not-yet-wrapped one; the already-wrapped ones in `out` free via

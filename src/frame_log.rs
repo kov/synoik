@@ -329,6 +329,10 @@ struct Totals {
     /// the host, so this is collect time that the submit breakdown structurally cannot see. Added
     /// because the seat's worst frames had ~50ms that was neither a fence wait nor a bake.
     creates: (u64, Duration),
+    /// Wall time memcpying host bytes into mapped staging. Separate from `creates` because it is a
+    /// different cost with a different fix — a write into write-combined memory, scaling with
+    /// payload — and folding it in made a wallpaper frame read as 9.96ms of "creation".
+    staging_write: Duration,
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -506,6 +510,7 @@ impl FrameLog {
             first_wait: niri_vk::stats::take_first_wait(),
             uploaded: niri_vk::stats::take_uploaded_bytes(),
             creates: niri_vk::stats::take_creates(),
+            staging_write: niri_vk::stats::take_staging_write(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -617,8 +622,9 @@ impl FrameLog {
             if totals.uploaded > 0 {
                 let _ = write!(
                     line,
-                    ", {:.1}MiB uploaded",
-                    totals.uploaded as f64 / (1 << 20) as f64
+                    ", {:.1}MiB uploaded in {}",
+                    totals.uploaded as f64 / (1 << 20) as f64,
+                    ms(totals.staging_write)
                 );
             }
             if totals.creates.0 > 0 {
@@ -900,6 +906,7 @@ mod tests {
             ]),
             uploaded: 3 << 20,
             creates: (7, Duration::from_micros(4300)),
+            staging_write: Duration::from_micros(1200),
             ..Totals::default()
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
@@ -907,7 +914,7 @@ mod tests {
             line.contains("(first upload 13.42ms; 1 upload in 14.00ms, 1 scanout in 0.00ms)"),
             "{line}"
         );
-        assert!(line.contains("3.0MiB uploaded"), "{line}");
+        assert!(line.contains("3.0MiB uploaded in 1.20ms"), "{line}");
         // Resource creation is neither a submit nor a bake, so it has to say so itself or it is
         // invisible — which is exactly how ~50ms hid on the seat's worst frames.
         assert!(line.contains("7 created in 4.30ms"), "{line}");

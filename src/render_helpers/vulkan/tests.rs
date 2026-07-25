@@ -4046,3 +4046,90 @@ fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
          per-frame allocation apart from allocate-once"
     );
 }
+
+/// The batch now packs every texture's pixels into **one** staging buffer and picks each out with
+/// a `buffer_offset`. That arithmetic is the whole risk of the change, and it is only exercised by
+/// textures of *differing* sizes — equal sizes make every offset a multiple of one stride, so an
+/// off-by-one in the accumulation still lands on a boundary and the pixels come out right anyway.
+///
+/// Three textures, three different sizes, three different solid colors. Each must read back its
+/// own color: a wrong offset shows up as one texture wearing its neighbour's pixels, or as a
+/// diagonal smear where the row stride no longer matches.
+#[test]
+fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_shared_staging_batch...: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // Deliberately not multiples of one another, so a mis-accumulated offset cannot land right.
+    let specs: [(i32, i32, [u8; 4]); 3] = [
+        (7, 5, [255, 0, 0, 255]),
+        (13, 3, [0, 255, 0, 255]),
+        (2, 11, [0, 0, 255, 255]),
+    ];
+    let datas: Vec<Vec<u8>> = specs
+        .iter()
+        .map(|(w, h, c)| {
+            c.iter()
+                .copied()
+                .cycle()
+                .take((w * h * 4) as usize)
+                .collect()
+        })
+        .collect();
+    let items: Vec<_> = specs
+        .iter()
+        .zip(&datas)
+        .map(|((w, h, _), data)| {
+            (
+                data.as_slice(),
+                Fourcc::Abgr8888,
+                Size::<i32, BufferCoord>::from((*w, *h)),
+                false,
+            )
+        })
+        .collect();
+
+    let textures = vk.import_memory_batch(&items).expect("batch import");
+    assert_eq!(textures.len(), 3, "batch dropped a texture");
+
+    // Draw each into its own target and read the middle pixel back.
+    for (i, (tex, (w, h, want))) in textures.iter().zip(specs.iter()).enumerate() {
+        let size = Size::<i32, Physical>::from((*w, *h));
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((*w, *h)))
+            .expect("target");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            let full = Rectangle::from_size(size);
+            frame
+                .clear(Color32F::new(0., 0., 0., 1.), &[full])
+                .expect("clear");
+            let src = Rectangle::<f64, BufferCoord>::from_size(Size::from((*w as f64, *h as f64)));
+            frame
+                .render_texture_from_to(tex, src, full, &[full], &[], Transform::Normal, 1.0)
+                .expect("draw");
+            let _sync = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((*w, *h)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let px = vk.map_texture(&mapping).expect("map_texture").to_vec();
+        let mid = (((*h / 2) * *w + *w / 2) * 4) as usize;
+        let got = [px[mid], px[mid + 1], px[mid + 2]];
+        assert_eq!(
+            got,
+            [want[0], want[1], want[2]],
+            "texture {i} ({w}x{h}) read back {got:?}, wanted {:?} — a shared-staging offset is \
+             wrong, so this texture is showing another one's bytes",
+            [want[0], want[1], want[2]]
+        );
+    }
+}

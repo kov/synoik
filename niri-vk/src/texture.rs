@@ -160,6 +160,145 @@ pub struct TextureBatch<'a> {
     pending: Vec<PendingUpload>,
 }
 
+/// One texture staged into a shared batch staging buffer: its device-local resources, and where
+/// its pixels sit in that buffer. The batched sibling of [`PendingUpload`], which owns a staging
+/// buffer of its own.
+struct BatchedUpload {
+    texture: Texture,
+    buffer_offset: vk::DeviceSize,
+}
+
+/// Build every texture in `items` against **one** staging buffer and one submit.
+///
+/// The per-texture path ([`Texture::build_pending`]) creates a staging buffer, allocates its
+/// memory, binds, maps and unmaps for each texture — five host round trips apiece, on top of the
+/// image, its memory, the view, the sampler, the descriptor pool and the set. On a virtualized
+/// driver those round trips are the dominant cost of an upload: the seat's app-grid open measured
+/// **26 resources created in 28.24 ms** with only 11.32 ms of fence waits, i.e. creation was 65% of
+/// the frame and 2.5× everything spent waiting on the GPU.
+///
+/// [`TextureBatch`] already collapsed N submits into one. This collapses the *staging* half too,
+/// the same way the glyph atlas does it: one buffer, every region concatenated, `buffer_offset`
+/// picking each out. The device-local image and its descriptor set stay per texture.
+///
+/// Each item is `(tight w*h*bpp bytes, width, height, format, bpp, components, filter)`; the
+/// returned textures are in the same order. On any error every resource built so far is freed.
+pub fn upload_batch_shared_staging(
+    gpu: &Gpu,
+    pool: vk::CommandPool,
+    items: &[BatchItem<'_>],
+) -> Result<Vec<Texture>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let device = &gpu.device;
+    let mut guard = UploadGuard::new(device);
+
+    // --- one staging buffer for every texture's pixels, concatenated ---
+    let total: vk::DeviceSize = items.iter().map(|i| i.data.len() as vk::DeviceSize).sum();
+    crate::stats::uploaded(total);
+    let (staging, smem) = {
+        let _timed = crate::stats::creating();
+        let ci = vk::BufferCreateInfo::default()
+            .size(total)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging = unsafe { device.create_buffer(&ci, None) }.context("batch staging")?;
+        guard.staging = staging;
+        let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
+        let smem = gpu.allocate(
+            sreq,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        guard.smem = smem;
+        unsafe { device.bind_buffer_memory(staging, smem, 0) }?;
+        (staging, smem)
+    };
+
+    let mut staged: Vec<BatchedUpload> = Vec::with_capacity(items.len());
+    unsafe {
+        let base = device
+            .map_memory(smem, 0, total, vk::MemoryMapFlags::empty())
+            .context("map batch staging")? as *mut u8;
+        let mut offset: vk::DeviceSize = 0;
+        for item in items {
+            {
+                let _timed = crate::stats::staging_write();
+                std::ptr::copy_nonoverlapping(
+                    item.data.as_ptr(),
+                    base.add(offset as usize),
+                    item.data.len(),
+                );
+            }
+            offset += item.data.len() as vk::DeviceSize;
+        }
+        device.unmap_memory(smem);
+    }
+
+    // --- the device-local image + view + sampler + descriptor-visible resources, per texture ---
+    let mut offset: vk::DeviceSize = 0;
+    for item in items {
+        match Texture::new_sampled_image(gpu, item) {
+            Ok(texture) => {
+                staged.push(BatchedUpload {
+                    texture,
+                    buffer_offset: offset,
+                });
+                offset += item.data.len() as vk::DeviceSize;
+            }
+            Err(err) => {
+                for s in &staged {
+                    s.texture.destroy(gpu);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    let result = gpu.run_commands(pool, crate::stats::SubmitSite::UploadBatch, |cbuf| unsafe {
+        for s in &staged {
+            record_upload_copy_at(
+                device,
+                cbuf,
+                s.texture.image,
+                staging,
+                s.buffer_offset,
+                s.texture.width,
+                s.texture.height,
+            );
+        }
+    });
+
+    // The staging has served its purpose either way — `run_commands` waited, and drained the
+    // device on a wait error, so nothing can still be reading it.
+    unsafe {
+        device.destroy_buffer(staging, None);
+        device.free_memory(smem, None);
+    }
+    guard.staging = vk::Buffer::null();
+    guard.smem = vk::DeviceMemory::null();
+
+    match result {
+        Ok(()) => Ok(staged.into_iter().map(|s| s.texture).collect()),
+        Err(err) => {
+            for s in &staged {
+                s.texture.destroy(gpu);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// One texture's worth of input to [`upload_batch_shared_staging`].
+pub struct BatchItem<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub components: vk::ComponentMapping,
+    pub filter: vk::Filter,
+}
+
 impl<'a> TextureBatch<'a> {
     pub fn new(gpu: &'a Gpu, pool: vk::CommandPool) -> Self {
         Self {
@@ -910,6 +1049,69 @@ impl Texture {
         }
     }
 
+    /// The device-local half of an upload: a sampled image, its memory, view and sampler, with no
+    /// staging buffer and no commands. Split out for [`upload_batch_shared_staging`], which shares
+    /// one staging buffer across the batch and so cannot use
+    /// [`build_pending`](Self::build_pending).
+    fn new_sampled_image(gpu: &Gpu, item: &BatchItem<'_>) -> Result<Texture> {
+        let _timed = crate::stats::creating();
+        let device = &gpu.device;
+        let mut guard = UploadGuard::new(device);
+
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(item.format)
+            .extent(vk::Extent3D {
+                width: item.width,
+                height: item.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&image_ci, None) }.context("texture image")?;
+        guard.image = image;
+        let ireq = unsafe { device.get_image_memory_requirements(image) };
+        let memory = gpu.allocate(ireq, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        guard.memory = memory;
+        unsafe { device.bind_image_memory(image, memory, 0)? };
+
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(item.format)
+            .components(item.components)
+            .subresource_range(COLOR_RANGE);
+        let view = unsafe { device.create_image_view(&view_ci, None) }.context("texture view")?;
+        guard.view = view;
+
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(item.filter)
+            .min_filter(item.filter)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
+
+        guard.image = vk::Image::null();
+        guard.memory = vk::DeviceMemory::null();
+        guard.view = vk::ImageView::null();
+        guard.sampler = vk::Sampler::null();
+        Ok(Texture {
+            image,
+            view,
+            sampler,
+            memory,
+            width: item.width,
+            height: item.height,
+        })
+    }
+
     /// Build everything `upload` needs before the GPU copy — the host staging buffer (already
     /// holding the pixels) and the device-local `Texture` (image/view/sampler), with the copy
     /// still un-recorded. Shared by the single [`upload`](Self::upload) and the batched
@@ -960,7 +1162,13 @@ impl Texture {
             let ptr = device
                 .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
                 .context("map staging")? as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            {
+                // Timed apart from creation: this is a host write into write-combined memory, not
+                // a round trip, and it is the entire cost of a wallpaper upload. Conflating the
+                // two made `created` read as 9.96ms on a frame that created almost nothing.
+                let _timed = crate::stats::staging_write();
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            }
             device.unmap_memory(smem);
         }
 
@@ -1095,6 +1303,11 @@ impl Texture {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
         guard.sampler = sampler;
+
+        // Creation ends here. What follows is a submit + fence wait, which the `Transition` site
+        // already reports — leaving the timer running would count the same milliseconds twice, in
+        // two clauses of the same log line.
+        drop(_timed);
 
         let result = gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| unsafe {
             transition(
@@ -1574,6 +1787,21 @@ unsafe fn record_upload_copy(
     width: u32,
     height: u32,
 ) {
+    record_upload_copy_at(device, cbuf, image, staging, 0, width, height)
+}
+
+/// [`record_upload_copy`] against a shared staging buffer, reading from `buffer_offset` rather
+/// than the start. One function for both so a batch and a single upload cannot drift in the
+/// barriers they record.
+unsafe fn record_upload_copy_at(
+    device: &ash::Device,
+    cbuf: vk::CommandBuffer,
+    image: vk::Image,
+    staging: vk::Buffer,
+    buffer_offset: vk::DeviceSize,
+    width: u32,
+    height: u32,
+) {
     transition(
         device,
         cbuf,
@@ -1586,6 +1814,7 @@ unsafe fn record_upload_copy(
         vk::PipelineStageFlags::TRANSFER,
     );
     let region = vk::BufferImageCopy::default()
+        .buffer_offset(buffer_offset)
         .image_subresource(vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             mip_level: 0,

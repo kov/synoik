@@ -178,6 +178,8 @@ thread_local! {
     /// Wall time inside GPU resource creation this frame, and how many creations. See [`creating`].
     static CREATE_NANOS: Cell<u64> = const { Cell::new(0) };
     static CREATES: Cell<u64> = const { Cell::new(0) };
+    /// Wall time spent memcpying into mapped host-visible staging. See [`staging_write`].
+    static STAGE_NANOS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn bank(site: SubmitSite, nanos: u64, retire: bool) {
@@ -289,6 +291,33 @@ impl Drop for CreateTimer {
             add(&CREATE_NANOS, nanos);
         }
     }
+}
+
+/// Times a host write into mapped `HOST_VISIBLE` staging memory.
+///
+/// Its own bucket rather than part of [`creating`] because it is a different cost with a different
+/// fix: not a round trip to the host but a straight memcpy into write-combined memory, which on
+/// this VM runs at ~5.6 GB/s against ~13.6 GB/s for the same bytes into ordinary heap. It scales
+/// with payload, so it is the number that describes a wallpaper (48 MiB ≈ 8 ms) and rounds to
+/// nothing for an icon. Read together with the uploaded-bytes counter.
+pub fn staging_write() -> StagingTimer {
+    StagingTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+}
+
+pub struct StagingTimer(Option<Instant>);
+
+impl Drop for StagingTimer {
+    fn drop(&mut self) {
+        if let Some(started) = self.0 {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            add(&STAGE_NANOS, nanos);
+        }
+    }
+}
+
+/// Time spent writing host bytes into staging since the last call. Clears.
+pub fn take_staging_write() -> Duration {
+    Duration::from_nanos(STAGE_NANOS.with(|c| c.replace(0)))
 }
 
 /// GPU resource creations since the last call and the wall time they took, clearing both.
