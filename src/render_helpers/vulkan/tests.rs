@@ -3361,3 +3361,107 @@ fn every_submit_is_chained_on_the_queue_timeline() {
          and is unordered against the rest"
     );
 }
+
+/// **A deferred scanout finish hands back a real fence, and everything after it still sees a
+/// finished frame.**
+///
+/// The point of the whole exercise is that `finish` returns while the GPU is still working, so
+/// `DrmCompositor` can put the fence on the plane as `IN_FENCE_FD` instead of parking the
+/// compositor thread on it. Two things have to hold at once, and only one of them is obvious:
+///
+/// - the sync point must carry an exportable fence, or Smithay's `needs_sync()` stays true and the
+///   caller blocks anyway — nothing gained;
+/// - and work issued *after* it must still observe the finished frame. Here that is a readback with
+///   no wait in between: it is only correct because every submit is chained on the queue timeline,
+///   so the copy cannot start before the render it copies. Without that chain this is a race, and
+///   on this stack it is a race the CPU would usually win.
+///
+/// Needs GBM (a real scanout dmabuf), so it is Venus-only and skips elsewhere.
+#[test]
+fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let skip = |why: &str| eprintln!("skipping a_deferred_finish_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    else {
+        return skip("no render node");
+    };
+    let Ok(gbm) = GbmDevice::new(file) else {
+        return skip("no GBM");
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+        return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    vk.set_defer_scanout(true);
+    vk.set_finish_may_defer(true);
+
+    let size = Size::<i32, Physical>::from((64, 64));
+    let mut fb = vk.bind(&mut dmabuf).expect("bind scanout dmabuf");
+    let sync = {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 1., 0., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        frame.finish().expect("finish")
+    };
+
+    assert!(
+        sync.contains_fence(),
+        "a deferred finish returned a signalled sync point — the caller would have nothing to \
+         give KMS and would block instead"
+    );
+    assert!(
+        sync.is_exportable(),
+        "the fence cannot be exported, so DrmCompositor::needs_sync stays true and the CPU waits"
+    );
+    assert!(
+        sync.export().is_some(),
+        "exporting the fence as a sync_file failed"
+    );
+    assert_eq!(
+        vk.in_flight_len(),
+        1,
+        "the deferred submit was not recorded, so its command buffer and textures are unowned"
+    );
+
+    // No wait: the readback is ordered after the render by the queue timeline alone.
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((64, 64)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    assert_eq!(
+        &pixels[..4],
+        &[0, 255, 0, 255],
+        "the readback saw an unfinished frame — work after a deferred submit is not ordered \
+         against it"
+    );
+
+    drop(fb);
+    vk.drain_in_flight();
+    assert_eq!(
+        vk.in_flight_len(),
+        0,
+        "the deferred submit was never retired"
+    );
+}

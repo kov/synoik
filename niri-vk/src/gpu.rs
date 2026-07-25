@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -132,6 +133,10 @@ pub struct Gpu {
     /// submits are unordered relative to each other and the caller must keep
     /// waiting on each one's fence.
     order: Option<SubmitOrder>,
+    /// `VK_KHR_external_fence_fd`, when the device has it: turns a submit's pending
+    /// completion into a `sync_file` FD that KMS can take as `IN_FENCE_FD`. Measured
+    /// pipelined on Venus — see `sync_spike`.
+    external_fence: Option<ash::khr::external_fence_fd::Device>,
     // The validation layer's messenger, when `NIRI_VK_VALIDATION` is set. Destroyed before the
     // instance in `Drop`.
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -403,6 +408,10 @@ impl Gpu {
         let device =
             unsafe { instance.create_device(phys, &device_ci, None) }.context("vkCreateDevice")?;
 
+        let external_fence = enabled_cstr
+            .contains(&c"VK_KHR_external_fence_fd")
+            .then(|| ash::khr::external_fence_fd::Device::new(&instance, &device));
+
         let order = has_timeline
             .then(|| {
                 let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
@@ -439,6 +448,7 @@ impl Gpu {
             enabled_extensions,
             modifier_features: Mutex::new(HashMap::new()),
             order,
+            external_fence,
             debug,
             instance,
             entry,
@@ -591,11 +601,12 @@ impl Gpu {
     ///
     /// Waiting and signalling the same timeline semaphore in one submit is legal as long as the
     /// signalled value is greater, which it is by construction.
-    pub fn submit(&self, cbufs: &[vk::CommandBuffer], fence: vk::Fence) -> Result<()> {
+    pub fn submit(&self, cbufs: &[vk::CommandBuffer], fence: vk::Fence) -> Result<Option<u64>> {
         let submit = vk::SubmitInfo::default().command_buffers(cbufs);
         let Some(order) = self.order.as_ref() else {
-            return unsafe { self.device.queue_submit(self.queue, &[submit], fence) }
-                .context("vkQueueSubmit");
+            unsafe { self.device.queue_submit(self.queue, &[submit], fence) }
+                .context("vkQueueSubmit")?;
+            return Ok(None);
         };
 
         // Relaxed: submits are issued from the thread that owns the renderer, so this is not
@@ -613,7 +624,48 @@ impl Gpu {
             .wait_dst_stage_mask(&stages)
             .signal_semaphores(&semaphores)
             .push_next(&mut timeline);
-        unsafe { self.device.queue_submit(self.queue, &[submit], fence) }.context("vkQueueSubmit")
+        unsafe { self.device.queue_submit(self.queue, &[submit], fence) }
+            .context("vkQueueSubmit")?;
+        Ok(Some(wait + 1))
+    }
+
+    /// A fence whose completion can be handed to KMS as a `sync_file`, or `None` when the device
+    /// cannot export one. Create the fence this way *before* submitting: the handle types are
+    /// fixed at creation.
+    pub fn create_exportable_fence(&self) -> Option<Result<vk::Fence>> {
+        self.external_fence.as_ref()?;
+        let mut export = vk::ExportFenceCreateInfo::default()
+            .handle_types(vk::ExternalFenceHandleTypeFlags::SYNC_FD);
+        let ci = vk::FenceCreateInfo::default().push_next(&mut export);
+        Some(unsafe { self.device.create_fence(&ci, None) }.context("create exportable fence"))
+    }
+
+    /// Export `fence`'s pending completion as a `sync_file` FD. The fence must have been created
+    /// by [`Self::create_exportable_fence`] and already submitted — a `SYNC_FD` export needs a
+    /// signal operation to be pending or complete.
+    pub fn export_fence_sync_fd(&self, fence: vk::Fence) -> Result<OwnedFd> {
+        let ext = self
+            .external_fence
+            .as_ref()
+            .ok_or_else(|| anyhow!("no VK_KHR_external_fence_fd"))?;
+        let raw = unsafe {
+            ext.get_fence_fd(
+                &vk::FenceGetFdInfoKHR::default()
+                    .fence(fence)
+                    .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD),
+            )
+        }
+        .context("vkGetFenceFdKHR")?;
+        if raw < 0 {
+            return Err(anyhow!("fence export returned an already-signalled stub"));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+
+    /// Whether submits are ordered against each other, which is what makes it safe to leave one
+    /// in flight. See [`SubmitOrder`].
+    pub fn orders_submits(&self) -> bool {
+        self.order.is_some()
     }
 
     /// How many submits the queue has *completed*, or `None` when the device cannot order

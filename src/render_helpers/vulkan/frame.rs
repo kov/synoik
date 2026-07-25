@@ -13,6 +13,7 @@ use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Tr
 use super::backdrop_blur::BackdropBlur;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
+use super::fence::VkSubmitFence;
 use super::renderer::{transition_image, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
 
@@ -132,6 +133,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
         };
+        // Free anything the GPU has finished with since the last frame. Polls, never blocks —
+        // a blocking drain here would just move the wait we are removing from the end of one
+        // frame to the start of the next.
+        renderer.retire_completed();
+
         let cbuf = {
             let dev = &renderer.gpu.device;
             let alloc = vk::CommandBufferAllocateInfo::default()
@@ -1489,14 +1495,50 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             }
             self.renderer.gpu_timer_end(self.cbuf);
             dev.end_command_buffer(self.cbuf)?;
-            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            {
+
+            // A frame we intend to walk away from needs an *exportable* fence, and a `SYNC_FD`
+            // fence's handle types are fixed at creation — so the decision is made here, before
+            // the submit, and falls back to a plain fence if the device cannot export.
+            let exportable = self.renderer.should_defer_finish() && !self.fb.offscreen;
+            let deferred = exportable
+                .then(|| self.renderer.gpu.create_exportable_fence())
+                .flatten()
+                .transpose()
+                .unwrap_or_else(|err| {
+                    tracing::warn!("no exportable fence, finishing synchronously: {err}");
+                    None
+                });
+            let fence = match deferred {
+                Some(fence) => fence,
+                None => dev.create_fence(&vk::FenceCreateInfo::default(), None)?,
+            };
+
+            let timeline = {
                 let _timed = niri_vk::stats::submit(self.submit_kind());
                 self.renderer
                     .gpu
                     .submit(std::slice::from_ref(&self.cbuf), fence)
-                    .map_err(VulkanError::from)?;
+                    .map_err(VulkanError::from)?
+            };
+
+            // Hand the completion onward instead of parking on it. The command buffer, the
+            // fence and every texture the draws reference move into the renderer's in-flight
+            // list and are freed once the queue timeline passes this submit; `should_defer_finish`
+            // has already established that nothing issued after this can execute alongside it.
+            if let (Some(fence), Some(timeline)) = (deferred, timeline) {
+                let fence = VkSubmitFence::new(self.renderer.gpu.clone(), fence);
+                let held = std::mem::take(&mut self.held);
+                self.renderer
+                    .add_in_flight(timeline, self.cbuf, fence.clone(), held);
+                // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
+                // leaves a scanout target in TRANSFER_SRC_OPTIMAL. Every later command is ordered
+                // after this submit, so recording it now is as true as recording it after a wait.
+                self.fb
+                    .buffer
+                    .set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                return Ok(SyncPoint::from(fence));
             }
+
             // Timed apart from the submit above: this park is where a scanout frame spends
             // 12–14 ms of its budget, and it is the one this renderer means to stop paying on
             // the compositor thread. See `docs/fork/renderer-synchronous-submits.md`.

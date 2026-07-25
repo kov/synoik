@@ -2883,7 +2883,16 @@ fn render_surface_with(
     }
 
     niri.frame_log.phase(Phase::Submit);
-    match drm_compositor.render_frame::<_, _>(renderer, &elements, [0.; 4], flags) {
+    // This is the one frame whose completion has somewhere to go: `DrmCompositor` puts the sync
+    // point on the primary plane and the atomic commit takes it as `IN_FENCE_FD`, so the renderer
+    // may leave the submit in flight rather than parking the compositor thread on it. Every other
+    // render through the same renderer — screencopy, screencast, a widget bake — hands its buffer
+    // straight to a consumer and must still be finished when it returns. Cleared right after, so
+    // the permission cannot leak to the next caller.
+    renderer.set_finish_may_defer(true);
+    let rendered = drm_compositor.render_frame::<_, _>(renderer, &elements, [0.; 4], flags);
+    renderer.set_finish_may_defer(false);
+    match rendered {
         Ok(res) => {
             let needs_sync = res.needs_sync()
                 || config

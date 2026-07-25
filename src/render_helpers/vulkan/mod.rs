@@ -17,6 +17,7 @@ mod backdrop_blur;
 mod custom;
 mod effect_blur;
 mod error;
+mod fence;
 mod frame;
 mod integration;
 mod renderer;

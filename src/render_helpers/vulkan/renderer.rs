@@ -30,6 +30,7 @@ use tracing::warn;
 
 use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
+use super::fence::VkSubmitFence;
 use super::frame::VulkanFrame;
 use super::types::{
     import_format, is_rgba8888, GlyphRun, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
@@ -103,6 +104,16 @@ pub struct VulkanRenderer {
     /// for GPU timing and the device can answer. `None` otherwise, which is the
     /// normal case — see [`GpuTimer`].
     gpu_timer: Option<GpuTimer>,
+    /// Submits left running, oldest first. See [`Self::retire_completed`].
+    in_flight: Vec<InFlightSubmit>,
+    /// Whether the frame being finished is the one going to KMS, set by the tty backend around
+    /// `DrmCompositor::render_frame`. Only that frame has somewhere to hand its fence; a
+    /// screencopy or screencast render into a dmabuf looks identical from in here, and deferring
+    /// those would hand an unfinished buffer to a consumer that does not expect one.
+    finish_may_defer: bool,
+    /// Whether this renderer defers at all, defaulting to what the session asked for. A field
+    /// rather than a bare environment read so a test can exercise the path.
+    defer_scanout: bool,
     /// Reused staging buffer for shm-client texture uploads (grown on demand), so the shm cache's
     /// hit path refreshes a client buffer every commit without churning a mappable allocation.
     shm_staging: niri_vk::texture::Staging,
@@ -404,6 +415,9 @@ impl VulkanRenderer {
             sampler_set_layout,
             command_pool,
             gpu_timer: GpuTimer::if_requested(&gpu_for_timer)?,
+            in_flight: Vec::new(),
+            finish_may_defer: false,
+            defer_scanout: deferred_scanout_requested(),
             shm_staging: niri_vk::texture::Staging::new(),
             readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
             #[cfg(test)]
@@ -1287,7 +1301,124 @@ impl GpuTimer {
     }
 }
 
+/// A submit the CPU walked away from, and everything it must outlive.
+///
+/// Freeing any of this while the GPU still reads it is a fault or silent corruption, not a panic
+/// — which is why the synchronous renderer never needed the type. See
+/// `docs/fork/renderer-synchronous-submits.md`.
+struct InFlightSubmit {
+    /// The queue-timeline value this submit signals. The timeline is what proves completion here,
+    /// rather than the fence: a `SYNC_FD` export resets the fence, so once KMS has taken it the
+    /// fence can no longer answer "are you done" — the timeline always can, with one device call
+    /// covering every outstanding submit at once.
+    timeline: u64,
+    cbuf: vk::CommandBuffer,
+    /// Shared with the sync point handed to KMS; the fence outlives whichever lets go last.
+    _fence: VkSubmitFence,
+    /// Every texture the command buffer samples, held for exactly the reason `VulkanFrame::held`
+    /// holds them — the draw records reference the image and descriptor set, and the elements
+    /// that own them are dropped long before the GPU is finished.
+    _held: Vec<VkTexture>,
+}
+
 impl VulkanRenderer {
+    /// Free everything belonging to submits the GPU has finished. Polls — it must never block, or
+    /// the wait we removed from the end of one frame simply reappears at the start of the next.
+    pub(super) fn retire_completed(&mut self) {
+        if self.in_flight.is_empty() {
+            return;
+        }
+        let Some(completed) = self.gpu.submit_order_value() else {
+            return;
+        };
+        // Submitted in order and signalled in order, so this is a prefix.
+        let done = self
+            .in_flight
+            .iter()
+            .take_while(|f| f.timeline <= completed)
+            .count();
+        for frame in self.in_flight.drain(..done) {
+            unsafe {
+                self.gpu
+                    .device
+                    .free_command_buffers(self.command_pool, std::slice::from_ref(&frame.cbuf));
+            }
+        }
+    }
+
+    /// Wait out every in-flight submit and free it. For teardown, and for the paths that need the
+    /// GPU quiet before they touch shared state.
+    pub(super) fn drain_in_flight(&mut self) {
+        if self.in_flight.is_empty() {
+            return;
+        }
+        let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitKind::Scanout);
+        unsafe { self.gpu.device.device_wait_idle() }.ok();
+        self.retire_completed();
+        // A device that cannot report its timeline leaves the records unretired above; the wait
+        // above already proved them complete, so free them here rather than leak.
+        for frame in std::mem::take(&mut self.in_flight) {
+            unsafe {
+                self.gpu
+                    .device
+                    .free_command_buffers(self.command_pool, std::slice::from_ref(&frame.cbuf));
+            }
+        }
+    }
+
+    /// Record a submit the CPU is not going to wait for.
+    pub(super) fn add_in_flight(
+        &mut self,
+        timeline: u64,
+        cbuf: vk::CommandBuffer,
+        fence: VkSubmitFence,
+        held: Vec<VkTexture>,
+    ) {
+        self.in_flight.push(InFlightSubmit {
+            timeline,
+            cbuf,
+            _fence: fence,
+            _held: held,
+        });
+    }
+
+    /// Tell the renderer whether the frame it is about to finish is the one going to KMS. The tty
+    /// backend brackets `DrmCompositor::render_frame` with this; everything else renders with it
+    /// false and keeps the synchronous finish.
+    pub fn set_finish_may_defer(&mut self, may: bool) {
+        self.finish_may_defer = may;
+    }
+
+    /// Whether this frame's finish should hand its fence onward instead of waiting for it.
+    ///
+    /// Every condition here is load-bearing:
+    /// - the caller must have somewhere to put the fence (`finish_may_defer`);
+    /// - the device must order submits, or work issued next could execute alongside this one and
+    ///   race it on the images the renderer reuses across frames (`Gpu::submit`);
+    /// - GPU timing reuses a single query pool per frame, whose reset would race an in-flight
+    ///   frame's queries;
+    /// - and the session must have asked, until this has run on a real seat.
+    pub(super) fn should_defer_finish(&self) -> bool {
+        self.finish_may_defer
+            && self.defer_scanout
+            && self.gpu.orders_submits()
+            && self.gpu_timer.is_none()
+    }
+
+    /// Override the session's opt-in for this renderer alone. Tests only: headless there is no KMS
+    /// plane to take the fence, so the deferred path has to be asked for explicitly to be covered
+    /// at all.
+    #[cfg(test)]
+    pub(super) fn set_defer_scanout(&mut self, on: bool) {
+        self.defer_scanout = on;
+    }
+
+    /// How many submits the CPU has walked away from and not yet retired.
+    #[cfg(test)]
+    pub(super) fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Turn GPU timing on for this renderer alone, without touching the
     /// process-wide flag the environment sets — tests run in one process and
     /// share that flag, so flipping it would instrument every other renderer too.
@@ -1398,8 +1529,26 @@ pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> Option<u64> {
     Some((ticks[1] & mask).wrapping_sub(ticks[0] & mask) & mask)
 }
 
+/// Whether the session asked for the scanout submit to be left in flight, via
+/// `NIRI_VK_ASYNC_SCANOUT=1`. Read once — it decides how frames are built, so it must answer the
+/// same way for the whole process.
+///
+/// Opt-in because the win it targets can only be confirmed on a real seat: headless there is no
+/// KMS plane to take the fence, so nothing here exercises the part that pays off. See
+/// `docs/fork/renderer-synchronous-submits.md`.
+fn deferred_scanout_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var("NIRI_VK_ASYNC_SCANOUT")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
+    })
+}
+
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
+        // Before anything is destroyed: an in-flight submit still references its command buffer,
+        // and the pool it came from is about to go.
+        self.drain_in_flight();
         unsafe {
             let dev = &self.gpu.device;
             let _ = dev.device_wait_idle();
