@@ -391,9 +391,10 @@ first-class constraint on this work.
   structurally can't cross virtio).
 - **(4) cut over at parity; delete GLES/pango/cairo.**
 
-**Performance ceiling of the owned renderer — see `docs/fork/renderer-synchronous-submits.md`.**
-Every submit fence-waits, so a frame costs what its round trips cost, not what it draws. Deferred
-by decision while cheaper per-frame wins remain.
+**Performance ceiling of the owned renderer — see `docs/fork/renderer-synchronous-submits.md`,
+arrived at in `docs/fork/frame-cost-investigation.md`.** Every submit fence-waits; the scanout one
+costs 12-14ms of a 16.67ms frame and does not depend on anything we draw. The cheaper per-frame
+wins are done, so this is the only frame-cost item left.
 
 **Known gaps of the owned renderer vs GLES — see `docs/fork/renderer-gaps.md`.** Deleting GLES is
 **not** a one-way door: single-device / LINEAR-only / single-plane are configurations of the Vulkan

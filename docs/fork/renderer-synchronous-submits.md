@@ -1,13 +1,14 @@
 # The synchronous-submit ceiling
 
-**Status:** open, deferred by decision (2026-07-25). Deliberately not attempted alongside the
-frame-cost work in `844c02d6`…`bdec0c84`; that work removed *wasted* round trips, and this is
-about the cost of the ones that remain.
+**Status:** open, and now the only frame-cost item left. Deliberately not attempted alongside
+the work in `844c02d6`…`f2300f36`; that removed *wasted* round trips, and this is about the cost
+of the one that remains. Full evidence in
+[`frame-cost-investigation.md`](./frame-cost-investigation.md).
 
 **One-line summary:** every `vkQueueSubmit` in the owned renderer is immediately followed by
-`wait_for_fences(…, u64::MAX)`. The CPU blocks until the GPU drains, every time, so a frame's
-cost is dominated by how many round trips it makes rather than how much it draws — and the
-floor is set by round-trip latency we never overlap with anything.
+`wait_for_fences(…, u64::MAX)`. The CPU blocks until the GPU drains, every time. On the scanout
+submit that wait is 12–14 ms of a 16.67 ms frame, it does not depend on anything we draw, and we
+never overlap it with anything.
 
 ## What the code does today
 
@@ -23,22 +24,29 @@ trivial (nothing is ever in flight, so nothing needs deferred destruction) and i
 
 ## Why it is the ceiling
 
-Measured on this VM (Venus over virtio-gpu, host Apple M4 Pro): a submit costs roughly
-0.7–2 ms **regardless of its contents**. An empty command buffer costs about what a 1920×1080
-render pass does. A composited overview frame draws ~30 quads and spends almost all of its time
-in round trips, not drawing — which is why "116 elements" was never the problem and why
-`GPU timing` would not have told us much either (see
-[`venus-timestamp-gap.md`](./venus-timestamp-gap.md); the GPU-side number is unavailable here
-anyway).
+Measured on the live seat: the submit that renders into the scanout buffer costs **12.4–13.9 ms**
+when frames run back-to-back at 60 Hz, and 3.7–5.5 ms when they are sparse. Every other submit
+in the same frames is 0.55–1.8 ms. It does not track coverage or draw count at all — only how
+closely frames follow each other.
+
+~13 ms is about one refresh interval, which is what you would expect if the host compositor
+executes Venus's command stream on its own 60 Hz loop and our fence wait absorbs a host vsync.
+That cannot be confirmed from inside the guest
+([`venus-timestamp-gap.md`](./venus-timestamp-gap.md)).
+
+The full evidence, and the four content hypotheses that were measured and rejected on the way
+to it, are in [`frame-cost-investigation.md`](./frame-cost-investigation.md). The short version:
+everything else in an animation frame now fits in ~3.5 ms of a 16.67 ms budget, and the wait is
+the rest.
 
 Two consequences worth writing down:
 
-- **Frame cost scales with round trips, not work.** Adding draws to an existing pass is nearly
-  free; adding a pass is expensive. Every optimisation so far has been "make this stop being a
-  separate submit", and each one paid.
 - **Nothing overlaps.** The CPU cannot build frame N+1 while the GPU finishes N, and the GPU
   idles while the CPU builds. On a virtualized stack, where the round trip is mostly latency
   rather than execution, that idle time is most of the budget.
+- **The goal is not to make submits faster.** We probably cannot reach whatever paces them. It
+  is to stop *blocking the CPU* on one, so a frame's remaining budget is not spent staring at a
+  fence.
 
 ## What fixing it involves
 
@@ -64,82 +72,23 @@ here is a GPU fault or silent corruption, not a panic. The validation layer catc
 
 ## When to do it
 
-Not while the cheaper wins remain. The pattern so far is that each frame had round trips that
-did not need to exist at all, and removing one is a contained change with a measurable result:
+The condition this document used to set — "revisit when a frame's remaining submits are all
+load-bearing" — **is now met**. Every round trip that did not need to exist has been removed
+(`1020cd4f`, `bdec0c84`, `6da5f9a4`, `79def103`), the idle frames are under budget, and the
+submit counter has stopped falling while the time stayed high. See
+[`frame-cost-investigation.md`](./frame-cost-investigation.md) §4.
 
-- `1020cd4f` — folded the bake's layout transition into the bake's own submit.
-- `bdec0c84` — same for every offscreen render, driven off the target kind rather than an
-  opt-in.
-- `6da5f9a4` — cached shaped runs, so an unchanged label stops rebuilding its atlas (and the
-  upload submit behind it) every frame.
-
-Revisit this document when a frame's remaining submits are all load-bearing. The frame log's
-submit counter (`niri_vk::stats`, reported as `N submits in Xms`) is how to tell: when that
-count stops falling and the time stays high, the waits are what is left.
-
-### Where the live seat stands (2026-07-25, gsrs, Virtual-1 @ 60Hz, budget 16.67ms)
-
-Measured before and after `6da5f9a4`…`bdec0c84`, overview open. The clock shows seconds, so the
-idle case is a genuine 1Hz repaint, not an artefact.
-
-| overview, idle (clock tick) | before | after |
-|---|---|---|
-| total | 31.3 ms | ~19 ms |
-| `collect` | 23.4 ms | ~8.6 ms |
-| `submit` phase | 7.3 ms | ~10 ms |
-| shaped runs | (uncounted) | 2 in ~4.2 ms |
-| submits | (uncounted) | 3 in ~10.4 ms |
-| vblanks missed per hitch | 1.60 | 1.14 |
-
-The diagnosis inverted. `collect` — the CPU widget path — went from most of the frame to a
-minor part of it, and **submit is now essentially the whole cost**. On an overview *animation*
-frame the split is starker still: `collect` ~2 ms, and 2 submits accounting for ~15 ms of a
-17–19 ms frame, with ~159 draws.
-
-Two numbers to read off that:
-
-- **~3.5 ms per round trip** on the idle frame (3 submits, ~10.4 ms), against ~0.7–2 ms measured
-  headless. Real scene, real scanout target, same order.
-- **~30–60 µs per draw**, from the idle/animating pair (53 draws vs 159, ~3.5 vs ~7.5 ms per
-  submit). That is not GPU shading cost; on Venus every draw is encoded into the ring and
-  replayed host-side. Batching quads into instanced draws is the lever there, and it is a
-  separate piece of work from this document — but it lands in the same place: fewer, fatter
-  submissions.
-
-So the remaining contained win is *not* here: it is a persistent glyph atlas, which would
-retire the per-tick atlas upload submit and the ~4.2 ms of re-shaping. After that, the idle
-frame is ~13 ms and under budget, and what is left over is this document.
-
-### The condition above is now met (2026-07-25, measured, `25b9ed2f`)
-
-The glyph atlas landed and the idle frames went under budget. Submits are now counted by
-target kind, so the scanout submit is measured directly rather than inferred:
-
-| | scanout submit |
-|---|---|
-| animation frames, one per refresh | **12.36 / 12.69 / 13.12 / 13.85 ms** |
-| sparse frames (startup, one-offs) | 3.71 / 4.88 / 5.25 / 5.45 ms |
-| every *other* submit in those frames | 0.55 – 1.8 ms |
-
-**It does not track content.** Across those animation frames coverage ranged 1.7–2.0× the
-output and draws 138–173, with no correlation to the number. What it tracks is how closely
-frames follow each other: back-to-back it is ~13 ms, sparse it is ~4 ms.
-
-That is not a GPU being slow, and no amount of drawing less will move it. It is a
-synchronous wait on a pipeline paced by something outside the guest — the host compositor
-executing Venus's command stream on its own 60 Hz loop is the obvious candidate, which
-would make ~13 ms ≈ one refresh interval exactly the expected figure. It cannot be
-attributed further from inside the guest ([`venus-timestamp-gap.md`](./venus-timestamp-gap.md)).
-
-**What that changes about the fix.** The goal is no longer "make submits faster" — we
-probably cannot. It is to stop *blocking the CPU* on them, so a frame's remaining 3–4 ms of
-budget is not spent staring at a fence. Of the four items above, item 2 (a real `SyncPoint`,
-handed to KMS instead of waited on) is the one that matters here and it is the smallest;
-items 1 and 3 are what make it safe. Worth scoping item 2 against the KMS path specifically
-before committing to the whole rewrite — this may be narrower than the doc implies.
+**The next step is scoping, not building.** Of the four items above, item 2 — a real
+`SyncPoint`, handed to KMS instead of waited on — is the one that matters here and the
+smallest. Items 1 and 3 are what make it safe. Before committing to the whole rewrite, find
+out how far Smithay's `SyncPoint` already threads through our KMS path and whether handing the
+fence to `queue_frame` is separable from the deferred-destruction work. That answer decides
+between a contained change and a renderer project.
 
 ## Related
 
+- [`frame-cost-investigation.md`](./frame-cost-investigation.md) — how this was arrived at, and
+  every hypothesis measured and rejected on the way.
 - `src/frame_log.rs` — the `NIRI_FRAME_LOG` grammar and what each phase covers.
 - `niri-vk/src/stats.rs` — the submit/draw/shape counters.
 - [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) — why GPU-side timing cannot separate
