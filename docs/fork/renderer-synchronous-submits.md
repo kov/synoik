@@ -1,9 +1,9 @@
 # The synchronous-submit ceiling
 
-**Status: built, opt-in, unmeasured.** `NIRI_VK_ASYNC_SCANOUT=1` turns it on; without it the
-renderer still waits, exactly as before. What is left is not code — it is a session on the live
-seat, because the thing this buys can only be read there. Full evidence in
-[`frame-cost-investigation.md`](./frame-cost-investigation.md).
+**Status: built, opt-in, measured on the seat 2026-07-25 — it works.** `NIRI_VK_ASYNC_SCANOUT=1`
+turns it on; without it the renderer still waits, exactly as before. The measurement, including
+the A/B against the wait forced back on, is [below](#measured-on-the-seat-2026-07-25). Full
+context in [`frame-cost-investigation.md`](./frame-cost-investigation.md).
 
 Landed: `6bef18ac` (chain every submit on a queue timeline), `6f645bd8` (the scanout frame hands
 its fence to KMS), on top of `7b5f016d` (time the wait apart from the submit).
@@ -146,24 +146,81 @@ sampled immediately and there is nothing to hand the fence to.
    consumer that expects it finished. Deferral additionally requires the device to order submits,
    GPU timing to be off (its query pool is per-frame), and the session to have asked.
 
+## Measured on the seat (2026-07-25)
+
+One session, `niri[79726]` at `v26.04-573-g6c5a5c10`, `NIRI_VK_ASYNC_SCANOUT=1` +
+`NIRI_FRAME_LOG=1`: 12.2 min of real use (startup, overview open/close, the app grid, workspace
+switches), then the same interactions again for 56 s with
+`debug { wait-for-frame-completion-before-queueing }` written into the live config — which niri
+re-reads on save, so the control ran **in the same process, on the same binary, minutes apart**.
+That flag leaves the renderer deferring and still hands the fence to KMS; it only makes
+`tty.rs` block on the sync point before queueing. So it isolates *who pays the wait* and nothing
+else.
+
+| | deferred (12.2 min) | wait forced back on (56 s) |
+|---|---|---|
+| frames over budget | **4, all within 3 s of startup; zero after** | **2 in 56 s**, both overview-close |
+| `submit` phase | p50 **0.48 ms** | **13.33 / 16.51 ms** |
+| scanout wait on the frame line | absent (`1 to scanout in 0.00ms`) | absent — the wait is `tty.rs`'s, not the renderer's |
+| missed vblanks | 41.6/min | 52.5/min |
+
+The two control frames are the whole argument:
+
+```
+took 18.46ms — collect 4.49ms submit 13.33ms; 2 submits in 0.02ms, waiting 3.04ms
+              (1 to scanout in 0.01ms), 1 bakes in 3.36ms, animating, overview 1.87
+```
+
+A light frame — two submits, 4.5 ms of collect — pushed over budget by nothing but the wait.
+Frames of exactly this shape were **376 of 400** over-budget frames in the last pre-change
+session (`138865`: median total 18.6 ms, median submit phase 11.3 ms) and 21 of 34 in the one
+before it. Under the deferred path that entire class is gone: every over-budget frame in both
+new sessions has more than three submits.
+
+Answers to the four questions, in the order they were asked:
+
+1. **The wait went, it did not move.** `waiting … on earlier work` never printed once, and the
+   renderer's own `waiting` on a 2-submit frame is ~3 ms, not ~13.
+2. **Yes.** `submit` collapsed from p50 11.1 ms to p50 0.48 ms, and the frame class the wait
+   created stopped appearing.
+3. **No — presentation does not get later.** 41.6 missed vblanks/min deferred against 52.5/min
+   with the wait on, and 41.3 / 45.6 per min in the two comparable pre-change sessions. Every
+   event is "presented 16.67 ms late", one refresh, in every build. The once-per-second idle miss
+   (the clock repaint; 70–79% of baseline missed-vblank events are 1.00 s apart) is unchanged in
+   rate and magnitude — it is a scheduling artefact of the tick, not something this touches.
+4. **No corruption, no fallback.** `could not export the frame's fence` never fired, so the
+   `SYNC_FD` reached the atomic commit every frame; `needs_sync` stayed false, so smithay never
+   took its CPU-wait path (`queue` held at 0.07–0.08 ms); no Vulkan errors; no visual artefacts
+   observed while driving it.
+
 ### What is left
 
-**Run it on the seat.** Headless there is no KMS plane to take the fence, so the part that pays
-off is exactly the part no test here covers. What a test *does* cover
+**The other submits, and they are now the whole cost.** A frame issues 7–27 non-scanout submits —
+widget bakes, glyph-atlas uploads, dmabuf import transitions — and each still does create-fence →
+submit → `wait_for_fences` → destroy at **~1.3–1.6 ms**. Fifteen of those is ~20 ms, it all lands
+in `collect`, and after this change it is the only thing that puts a frame over budget. Matched
+startup frames confirm it: the 9-submit startup frame costs 46.4 ms deferred against 50.3–68.3 ms
+before, i.e. the scanout wait was never its problem.
+
+The same treatment applies, and the seam is already built. `should_defer_finish` is a policy
+question, not a mechanism one: the timeline chain already guarantees GPU order, so a bake's
+consumer — later GPU work sampling the result — needs no CPU wait at all. The waits that must
+stay are the ones where the **CPU** reads the result (`map_texture`, screenshots) or a foreign
+consumer takes the buffer (screencopy, screencast). See
+[`frame-cost-investigation.md`](./frame-cost-investigation.md) §6.
+
+**Whether to drop the env-var gate** is the other open decision. The evidence says default-on;
+the counter-argument is that this VM is one stack and `supports_fencing` being false elsewhere
+falls back to `needs_sync` → a CPU wait, which is today's behaviour anyway.
+
+*Superseded, kept for the record — the questions this section used to pose, all four now answered
+above: does `waiting` leave the frame line without reappearing as `waiting … on earlier work`; do
+frames stop going over budget and does `submit` collapse toward `queue`; does presentation get
+later; is there any visual corruption. Headless covers none of them — there is no KMS plane to
+take the fence. What a test does cover
 (`a_deferred_finish_returns_a_fence_and_still_orders_what_follows`) is that the sync point comes
 back exportable, that the `sync_file` export succeeds on Venus, and that a readback issued with
-no wait still sees a finished frame — which is only true because of the timeline chain.
-
-On the seat, with `NIRI_VK_ASYNC_SCANOUT=1` and `NIRI_FRAME_LOG=1`, the questions in order:
-
-1. Does `waiting` leave the frame line without reappearing as `waiting … on earlier work`? If it
-   reappears, the wait moved rather than went.
-2. Do frames stop going over budget, and does `submit` collapse toward `queue`?
-3. **Does presentation get later?** The one that decides whether this ships. If our fence signals
-   ~13 ms after submit and we commit immediately, the kernel's commit worker may miss the coming
-   vblank. Read the missed-deadline line, not the frame totals.
-4. Any visual corruption at all — tearing, a stale frame, a torn client window — is the ordering
-   assumption being wrong somewhere, and the flag goes back off.
+no wait still sees a finished frame — which is only true because of the timeline chain.*
 
 ### Client buffer release ordering — settled, not a blocker
 
@@ -188,7 +245,9 @@ So: match upstream, do not build for it. If it ever bites, the mitigation is kno
 hold a `Buffer` clone (`RendererSurfaceState::buffer()` is public) on the imported texture, so
 the existing `held` list defers the release to retirement along with everything else.
 
-### What must be settled before it ships
+### What had to be settled before it shipped
+
+*All four settled; the measurement above is what settled the last two.*
 
 - **Nothing may execute alongside an in-flight frame unless proven disjoint.** This is the real
   weight of item 1, and lifetime is only half of it. The present-blit shadow is *one image per
@@ -205,26 +264,22 @@ the existing `held` list defers the release to retirement along with everything 
   nothing on a stack where the GPU is not the bottleneck. `timelineSemaphore` is available here
   (Venus reports Vulkan 1.3 and the feature true) but is **not currently enabled** — the device
   is created with no feature struct at all (`niri-vk/src/gpu.rs:355`).
-- **The frame log must not report a fake win.** Done — `7b5f016d` times the enqueue apart from
-  the wait, and a frame that waits for work it did not submit says so.
-- **It may trade CPU time for a frame of latency.** If our fence signals ~13 ms after submit and
-  we commit immediately, the kernel's commit worker may miss the upcoming vblank and flip on the
-  next one. The CPU stops blocking either way — that is the stated goal — but the thing to
-  measure is *presentation* time, not main-loop time, or we will have smoothed the loop and
-  added a frame of latency without noticing.
+- **The frame log must not report a fake win.** `stats::submit` used to time the submit *and* the
+  wait, so removing the wait would collapse that number to the cost of `vkQueueSubmit` alone and
+  read as a 12 ms saving that merely moved. Settled by `7b5f016d`: enqueue and wait are timed
+  apart, retirement has its own counter, and a frame that waits for work it did not submit says
+  so. That split is what let the A/B above attribute 13.33 ms to `tty.rs`'s wait rather than to
+  anything the renderer did.
 - **Retirement must not become the wait by another name.** Draining the previous frame at the
   top of the next one is where GLES puts it (`renderer.cleanup()` in its `finish_internal`), but
   it has to *poll* — a blocking drain one frame later, with frames back-to-back, moves the 13 ms
-  rather than removing it, and the split counters above are what would show that.
-- **The frame log must not report a fake win.** `stats::submit` currently times the submit *and*
-  the wait. Remove the wait and that number collapses to the cost of `vkQueueSubmit` alone, which
-  would read as a 12 ms saving that merely moved. The retirement wait needs its own counter, or
-  the win cannot be told from the bookkeeping.
+  rather than removing it. It polls, and the measurement confirms it: `waiting … on earlier work`
+  never printed, and the renderer's wait on a light frame is ~3 ms.
 - **It may trade CPU time for a frame of latency.** If our fence signals ~13 ms after submit and
   we commit immediately, the kernel's commit worker may miss the upcoming vblank and flip on the
-  next one. The CPU stops blocking either way — that is the stated goal — but the thing to
-  measure is *presentation* time, not main-loop time, or we will have smoothed the loop and
-  added a frame of latency without noticing.
+  next one. The CPU stops blocking either way — that is the stated goal — so the thing to measure
+  is *presentation* time, not main-loop time. Measured: it does not. 41.6 missed vblanks/min
+  deferred, 52.5/min with the wait forced back on, 41.3–45.6/min before the change.
 
 ## Related
 

@@ -32,6 +32,18 @@ That cannot be confirmed from inside the guest.
 
 Everything else in an animation frame now fits in ~3.5 ms.
 
+**Fixed, and measured on the seat 2026-07-25** — the scanout submit now hands its fence to KMS
+instead of blocking the compositor
+([`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md#measured-on-the-seat-2026-07-25)).
+12 min of real use with `NIRI_VK_ASYNC_SCANOUT=1`: **zero frames over budget** after the first
+three seconds, `submit` p50 11.1 → 0.48 ms, and no presentation penalty. The frame class this
+wait created — light 2-submit frames, 376 of 400 over-budget frames in the last pre-change
+session — no longer exists.
+
+**The headline has moved.** What puts a frame over budget now is the **other** submits: 7–27 per
+frame (bakes, glyph uploads, dmabuf transitions), each still blocking ~1.3–1.6 ms, all inside
+`collect`. §6 item 1.
+
 ## 2. What the instrumentation reports
 
 `NIRI_FRAME_LOG=1` (grammar in `src/frame_log.rs`; counters in `niri-vk/src/stats.rs`). A slow
@@ -129,17 +141,29 @@ remaining slow frame is an overview animation or first-time startup work.
   so a process-wide counter folds a neighbour's bake or submit into your delta. It fails about
   one run in five under `NIRI_VK_VALIDATION=1` and names the innocent test in front of you
   (`917c69b0`).
+- **An A/B on the live seat does not need a restart, and comparing two sessions is not an A/B.**
+  Session-to-session numbers are dominated by how much the desktop was driven — the same build
+  reported 0.8 and 12.3 over-budget frames/min depending on the session. `debug` options are read
+  per frame out of the live config and niri re-reads the file on save, so the control can run in
+  the *same process* minutes later: writing
+  `debug { wait-for-frame-completion-before-queueing }` into `~gsrs/.config/niri/config.kdl` is
+  what turned "the deferred run looks better" into an attributable 13.33 ms.
 - **First-entry costs are not steady-state costs.** Opening the app grid the first time is
   ~40–70 ms of icon uploads (~20 submits). It caches. Do not optimise it by mistake.
 
 ## 6. Open items
 
-1. **The scanout wait.** [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md).
-   Scoped 2026-07-25: **contained change, not a renderer project.** Smithay already threads the
-   `SyncPoint` into `IN_FENCE_FD`, this VM's virtio-gpu plane carries that property, Venus's
-   `VkFence` `SYNC_FD` export is pipelined, and deferred destruction reduces to retiring
-   `(fence, cbuf, held)` at the next frame — `run_commands` keeps its wait. Plan, and the three
-   things that must be settled before it ships, in that doc.
+1. **Every *other* submit still blocks.** The scanout wait is done (§1); this is what replaced it
+   as the headline. A frame issues 7–27 non-scanout submits — widget bakes, glyph-atlas uploads,
+   dmabuf import transitions — and `Gpu::run_commands` still does create-fence → submit →
+   `wait_for_fences` → destroy on each, at ~1.3–1.6 ms a piece. Fifteen of those is ~20 ms, it
+   lands in `collect`, and it is now the only thing that puts a frame over budget.
+
+   The mechanism to fix it already exists: the queue timeline (`6bef18ac`) guarantees GPU order
+   equals submission order, so work whose only consumer is *later GPU work* needs no CPU wait.
+   What has to stay synchronous is where the **CPU** reads the result (`map_texture`, screenshots)
+   or a foreign consumer takes the buffer (screencopy, screencast) — the same distinction
+   `set_finish_may_defer` already draws for the scanout frame, applied to `run_commands`.
 2. **The panel still bakes during an overview animation** — but not for the reason we fixed.
    `are_animations_ongoing()` (`ui/panel.rs:848`) is the button-fill fades, and opening the
    overview toggles Activities to checked, so the fill fade covers the same window. That bake
