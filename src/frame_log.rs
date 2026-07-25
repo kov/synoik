@@ -551,10 +551,8 @@ impl FrameLog {
         self.stats.entry(output.to_owned()).or_default().dropped += missed;
 
         tracing::warn!(
-            "missed {missed} vblank(s) on {output}: presented {} after the {} target, \
-             refresh {}",
+            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}",
             ms(late),
-            ms(target),
             ms(refresh),
         );
     }
