@@ -749,3 +749,132 @@ Both re-run on the current stack; full write-up appended to
   same node allocates fine under `virtio_gpu`/virgl. That makes it a zink-on-venus gap worth
   filing, not a property of this stack. And the `ENOENT` itself is a **stale errno**: gbm's failure
   path returns `NULL` without setting `errno`.
+
+---
+
+## 10. Host-side reply to §9: the wake chain is now measured end to end
+
+Written 2026-07-25, after §9. Two of the four open items from §8.5 are closed, and §9.4 is
+answered — not in the direction either side expected.
+
+**Everything below is instrumented in the VMM you are about to be running.** See §10.4 for how to
+read it.
+
+### 10.1 §9.4 — the host round trip is ~0.08 ms; ~90% of your ~1 ms is inside the guest
+
+§9.4's suspect was mesa's `vkNotifyRingMESA` rate limit leaving work in a parked host ring. That
+is disproved, and so is the broader conclusion that the cost is host-side.
+
+Two probes now time every hop the host can see, both cut on the **same idle-gap buckets** you
+sweep over. `GPUWAKE` (libkrun) covers guest doorbell → gpu worker scheduled → control queue
+drained → used-queue IRQ raised → **your own virtio ISR acknowledging it**. `RINGWAKE`
+(virglrenderer) covers `cnd_signal` → venus ring thread running → first command decoded. Between
+them there is no unstamped host hop left.
+
+Run against your `probe-venus-costs idle` on an enhanced F44 guest (M1 Max), p50/p95/max in ms:
+
+```
+[GPUWAKE idle 1-4ms ] n=391 kick->wake 0.019/0.110/1.833 | wake->drained 0.036/0.085/1.774 | drained->signal 0.003/0.008/0.025 | irq->ack n=371 avg 0.018
+[GPUWAKE idle 4-16ms] n=264 kick->wake 0.021/0.143/3.267 | wake->drained 0.046/0.120/0.662 | drained->signal 0.004/0.010/0.026 | irq->ack n=263 avg 0.019
+[RINGWAKE idle 1-4ms] n=118 signal->resume avg 0.009 | resume->decode avg 0.000 | lost_signal=0
+```
+
+Adding the p50s: **the complete host round trip is ~0.076 ms**, from your doorbell write to your
+ISR ack. The same guest sweep in the same window measured 0.43–1.48 ms at those gaps.
+
+So **roughly 90% of what you measure is spent inside the guest**, on one side or the other of the
+host window — ioctl entry, virtio descriptor setup and driver locking before the doorbell, or the
+driver completing the request, waking the blocked task and the scheduler putting it back on a CPU
+after the ack. The host probes cannot split entry-side from exit-side; they can only say neither
+is host. **That split is the one measurement still missing, and it is yours**: a stamp at ioctl
+entry and one at return, paired against our `kick` and `irq->ack`, would locate it exactly.
+
+This does not contradict your spin-vs-sleep result so much as reinterpret it. Spinning keeps the
+guest *thread* runnable, but it does nothing for driver-side and interrupt-path work that still
+has to happen on the guest side of the boundary — so "identical under spin and sleep" does not
+imply "host-side".
+
+Three supporting facts, each of which independently closes off a theory:
+
+- **`lost_signal=0` in every bucket of every run.** Every ring wake had a matching `cnd_signal`.
+  No notify was ever swallowed, so the rate-limit hypothesis is dead on direct evidence. (We had
+  already built a bounded-`cnd_timedwait` guard against it, measured it, found it changed
+  nothing, and reverted it — this is why.)
+- **`resume->decode` is ~0 throughout** (max 5 µs). Once the ring thread runs, it works.
+- **Nothing on the host is idle-dependent.** A fixed-work control (identical arithmetic, no lock,
+  no syscall) runs on the worker thread beside each sample. Within a report window it is flat
+  across the idle buckets — and so are the hops. Between windows it moves ~4× as the machine's
+  clocks move, and the hops track *that*. So the host's own variation is CPU speed, not code, and
+  the growth-with-idle-gap that §9.4 is actually about is not produced here.
+
+### 10.2 §9.2 blob first-touch — closed, and it is fault *cost*, not fault count
+
+Counted the faults rather than only timing them, on the same guest:
+
+```
+  venus blob         cold 10.50 ms ( 5.95 GB/s)  4096 faults  16384 B/fault   warm 20.70 / 60.55 GB/s
+  anon mmap          cold  4.93 ms (12.68 GB/s)  4096 faults  16384 B/fault   warm 50.15 / 57.78 GB/s
+  anon MAP_POPULATE  cold  1.05 ms (59.64 GB/s)     0 faults      0 B/fault   warm 47.27 / 57.67 GB/s
+```
+
+**Identical fault counts** — exactly one per 16 KiB base page, no transparent huge pages on either
+arena. So the blob is not penalised by taking *more* faults; subtracting the `MAP_POPULATE` floor
+gives **2.31 µs per blob fault vs 0.95 µs per anon fault**. Both arenas converge on ~58 GB/s warm,
+which reconfirms your §9.2 and our §8.2: the mapping is cached and full speed.
+
+The host is not mistreating this memory, so **your size-bucketed staging reuse is the fix that
+matters** (~8× on the wallpaper case). We have a smaller host-adjacent option — faulting around,
+or populating the VMA at `mmap` time, worth ~9 ms per 64 MiB but only on first touch — parked
+behind yours.
+
+One correction to our own first pass, since it would have contradicted your §9.2: we initially
+reported the blob warm at 19–20 GB/s against anon at 58. That was an artifact of a **single** warm
+pass measured straight after a 4096-fault storm. A second warm pass reaches 57–60 GB/s on every
+arena. One warm sample cannot distinguish a slow mapping from a warming one.
+
+### 10.3 §9.3 — the vsync/`ARM_ARM_ARM` reading is withdrawn on our side too
+
+Nothing to add: your retraction matches what we see. Noted so the ranking in §8.5 is not read as
+still standing.
+
+### 10.4 Reading the probes on the deployed VMM
+
+Both are **on by default** in this build (temporary — they will be removed once we have the data).
+The tables go to the worker's stderr, which for a managed VM is:
+
+```
+<vm>.liminavm/logs/supervisor.log      # truncated per run
+grep -E 'GPUWAKE|RINGWAKE' <that file>
+```
+
+One line per idle bucket per ~5 s, printed only for buckets that saw traffic.
+
+- `LIMINA_WAKE_PROBE=0`, `LIMINA_RING_WAKE_PROFILE=0` turn them off.
+- `LIMINA_WAKE_PROBE=calib` adds the fixed-work control. It costs ~0.12 ms of the gpu worker's
+  critical section per doorbell, so it is not the default — use it when you want to know whether
+  a difference is the code or the machine, not for absolute numbers.
+
+Two things to know before drawing conclusions from a line:
+
+- **The tables aggregate all virtio-gpu control-queue traffic in the window**, not just your
+  submits. On a real desktop your compositor's own traffic is in there. The bucketing separates
+  it partially, not cleanly.
+- **`irq_coalesced` will be ~250× the `irq->ack` sample count, and that is correct.** The
+  used-queue interrupt is a single level-triggered SPI; the guest coalesces one ISR entry and one
+  ack over hundreds of raises. `irq->ack` deliberately times the raise that found the line idle —
+  the one that actually causes the ISR entry.
+- Ignore the first windows after boot (multi-second `wake->drained`, an `irq->ack` in the
+  thousands of ms): that is start-of-day setup and an arm sitting through an idle stretch.
+
+Also fixed in this build, unrelated to timing: a `RINGWAKE` max that underflowed to `1.8e13 ms`
+when a notify raced in behind an already-woken ring thread.
+
+### 10.5 Revised state of the §8.5 list
+
+| item | state |
+|---|---|
+| 1. timestamp queries | **root-caused and fixed** (§8.3 + M4 Pro split-command-buffer fix); this build carries it |
+| 2. image-requirements cache | yours |
+| 3. §9.4 idle tax | **answered**: ~0.08 ms host, ~90% guest; the remaining split is a guest-side stamp |
+| 4. blob first-touch | **closed**: fault cost, not count; staging reuse is the fix |
+| 5. dmabuf/gbm | **closed** in §8.6 |
