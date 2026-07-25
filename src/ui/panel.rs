@@ -35,14 +35,16 @@ use std::time::Duration;
 use niri_config::Config;
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer, Texture};
+use smithay::backend::renderer::{Color32F, ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{ClockFormat, QuickToggles};
+use crate::niri_render_elements;
 use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::system_status::{self, SystemStatus};
@@ -448,15 +450,23 @@ fn indicator_logical_width(count: usize) -> f64 {
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
     context: Option<ContextId<VkTexture>>,
-    /// Bar chrome keyed by (scale, physical width, workspace count, active index,
-    /// overview): the count sets the checked-highlight width, the count + active
-    /// index place the workspace dots (drawn into the bar as rounded rects), and the
-    /// overview flag picks the background (opaque black vs transparent, [`bar_bg`]).
-    textures: HashMap<(NotNan<f64>, i32, usize, usize, bool), VkTexture>,
+    /// Bar chrome keyed by (scale, physical width, workspace count, active index): the
+    /// count sets the checked-highlight width, and the count + active index place the
+    /// workspace dots (drawn into the bar as rounded rects). The background is NOT in
+    /// here — it is a separate element ([`bar_bg`]), which is what lets one cached bake
+    /// serve the whole overview fade.
+    textures: HashMap<(NotNan<f64>, i32, usize, usize), VkTexture>,
     /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name, tint). The tint is
     /// part of the key because the mic privacy icon uploads orange while the rest are white — the
     /// same name at two colors must not collide.
     qs_icons: HashMap<(NotNan<f64>, String, [u8; 4]), TextureBuffer<VkTexture>>,
+    /// The bar background. A buffer rather than a bare colour so its commit counter
+    /// bumps when the colour or width changes — that is what tells damage tracking the
+    /// background moved, now that it is no longer part of the chrome bake.
+    ///
+    /// Not dropped by `clear`/`clear_bars`: a fresh one would carry a new `Id` and force
+    /// a full-panel redraw for nothing.
+    bg: SolidColorBuffer,
 }
 
 impl BarCache {
@@ -465,6 +475,7 @@ impl BarCache {
             context: None,
             textures: HashMap::new(),
             qs_icons: HashMap::new(),
+            bg: SolidColorBuffer::default(),
         }
     }
 
@@ -479,6 +490,20 @@ impl BarCache {
     /// leaves the composited icons untouched — hover moves must not re-upload icons.
     fn clear_bars(&mut self) {
         self.textures.clear();
+    }
+}
+
+// One thing the panel contributes to a frame, front-to-back.
+//
+// Two variants because the bar is two layers: chrome baked into a texture, and a plain
+// coloured background rectangle underneath it. They are separate because only the
+// background's alpha animates (it fades out as the overview opens), and folding it into
+// the bake would make the bake uncacheable for the whole animation — a GPU round trip
+// per frame for a colour change.
+niri_render_elements! {
+    PanelElement => {
+        Texture = TextureRenderElement<VkTexture>,
+        Solid = SolidColorRenderElement,
     }
 }
 
@@ -1097,7 +1122,7 @@ impl Panel {
         position: f64,
         overview_fade: f64,
         icons: &IconCache,
-    ) -> Vec<TextureRenderElement<VkTexture>> {
+    ) -> Vec<PanelElement> {
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
         let width_px: i32 = to_physical_precise_round(scale, width);
@@ -1151,13 +1176,15 @@ impl Panel {
                 if let Some(tb) = cache.qs_icons.get(&key) {
                     let logical = tb.logical_size();
                     let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        tb.clone(),
-                        location,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
+                    elements.push(PanelElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            tb.clone(),
+                            location,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
                     ));
                 }
             }
@@ -1192,13 +1219,15 @@ impl Panel {
                         rect.loc.x + (rect.size.w - logical.w) / 2.,
                         (PANEL_HEIGHT - logical.h) / 2.,
                     ));
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        tb.clone(),
-                        location,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
+                    elements.push(PanelElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            tb.clone(),
+                            location,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
                     ));
                 }
             }
@@ -1227,22 +1256,21 @@ impl Panel {
 
         // While a workspace switch animates, `position` is fractional and the dots morph
         // every frame; while a button-container fill fades, the pill alpha changes every
-        // frame; while the overview opens or closes, the background alpha changes every
-        // frame — in any of those cases draw the bar fresh and skip the cache (keyed on
-        // the integer active index and the two settled background states, not the
-        // animated state). The switch / fill / overview animations already drive the
-        // per-frame redraws. At rest, cache as usual, drawing with the exact integer
-        // index so the cached texture always matches its key.
-        let bg = bar_bg(overview_fade);
-        let animating = (position - position.round()).abs() > 1e-6
-            || self.are_animations_ongoing()
-            || (overview_fade > 0. && overview_fade < 1.);
+        // frame — in either case draw the bar fresh and skip the cache (keyed on the
+        // integer active index, not the animated state). The switch / fill animations
+        // already drive the per-frame redraws. At rest, cache as usual, drawing with the
+        // exact integer index so the cached texture always matches its key.
+        //
+        // The overview opening is deliberately NOT in that list any more. It changes only
+        // the background alpha, which is now its own element below — so the chrome bake
+        // stays cached for the whole animation instead of costing a GPU round trip on
+        // every frame of it.
+        let animating = (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
         let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
                 scale,
                 width_px,
-                bg,
                 &self.clock_text,
                 &containers,
                 ws.count,
@@ -1257,23 +1285,13 @@ impl Panel {
                 }
             }
         } else {
-            // `overview_fade` is 0 or 1 here (the in-between is the animating arm), so
-            // the settled desktop and overview bars cache side by side instead of one
-            // evicting the other on every overview toggle.
-            let bar_key = (
-                scale_key,
-                width_px,
-                ws.count,
-                ws.active(),
-                overview_fade >= 1.,
-            );
+            let bar_key = (scale_key, width_px, ws.count, ws.active());
             #[allow(clippy::map_entry)]
             if !cache.textures.contains_key(&bar_key) {
                 match draw_bar_texture(
                     renderer,
                     scale,
                     width_px,
-                    bg,
                     &self.clock_text,
                     &containers,
                     ws.count,
@@ -1294,24 +1312,41 @@ impl Panel {
         };
 
         if let Some(texture) = bar_texture {
-            // On the desktop the whole bar is opaque, so let the compositor skip drawing
-            // behind it. In (or entering) the overview the background is translucent and
-            // the overview backdrop has to show through, so it claims no opaque region.
-            let opaque = if bg[3] >= 1. {
-                vec![Rectangle::from_size(texture.size())]
-            } else {
-                Vec::new()
-            };
-            let buffer =
-                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, opaque);
-            elements.push(TextureRenderElement::from_texture_buffer(
-                buffer,
+            let buffer = TextureBuffer::from_texture(
+                renderer,
+                texture,
+                scale,
+                Transform::Normal,
+                // The chrome is transparent everywhere it does not draw, so it never
+                // occludes; the background element below claims the opaque region.
+                Vec::new(),
+            );
+            elements.push(PanelElement::Texture(
+                TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    Point::from((0., 0.)),
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            ));
+        }
+
+        // The bar background, last so it composites *under* everything pushed above
+        // (this list is front-to-back). Its alpha is the only thing the overview
+        // animates, which is exactly why it is not baked into the chrome.
+        let bg = bar_bg(overview_fade);
+        cache
+            .bg
+            .update(Size::from((width, PANEL_HEIGHT)), Color32F::from(bg));
+        if bg[3] > 0. {
+            elements.push(PanelElement::Solid(SolidColorRenderElement::from_buffer(
+                &cache.bg,
                 Point::from((0., 0.)),
                 1.,
-                None,
-                None,
                 Kind::Unspecified,
-            ));
+            )));
         }
 
         elements
@@ -1328,7 +1363,7 @@ impl Panel {
         scale: f64,
         scale_key: NotNan<f64>,
         output_width: f64,
-        elements: &mut Vec<TextureRenderElement<VkTexture>>,
+        elements: &mut Vec<PanelElement>,
         icons: &IconCache,
     ) {
         let rect = self.quick_settings_rect(output_width);
@@ -1363,13 +1398,15 @@ impl Panel {
             if let Some(tb) = cache.qs_icons.get(&key) {
                 let logical = tb.logical_size();
                 let location = Point::from((x, (PANEL_HEIGHT - logical.h) / 2.));
-                elements.push(TextureRenderElement::from_texture_buffer(
-                    tb.clone(),
-                    location,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
+                elements.push(PanelElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb.clone(),
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
                 ));
             }
             x += QS_ICON + QS_ICON_GAP;
@@ -1502,18 +1539,22 @@ fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::
     Ok(())
 }
 
-/// Draw the bar chrome into an offscreen [`VkTexture`]: clear to `bg` (the panel
-/// background, opaque black on the desktop and transparent in the overview — see
-/// [`bar_bg`]), paint the rounded hover/active button containers, then the
-/// workspace dots and the centered clock glyph run. The returned texture is
-/// `SHADER_READ_ONLY` (sampleable) so the caller can composite it directly. The
-/// right-box status icons are composited separately, on top.
+/// Draw the bar chrome into an offscreen [`VkTexture`]: the rounded hover/active
+/// button containers, the workspace dots and the centered clock glyph run, over a
+/// **transparent** background. The returned texture is `SHADER_READ_ONLY`
+/// (sampleable) so the caller can composite it directly. The right-box status icons
+/// are composited separately, on top, and the bar background is a separate solid
+/// element underneath.
+///
+/// Keeping the background out is what makes this bake cacheable across an overview
+/// animation. The background alpha changes every frame while the overview opens
+/// ([`bar_bg`]); the chrome does not, and a bake is a GPU round trip — the single
+/// most expensive thing a frame can do on this stack.
 #[allow(clippy::too_many_arguments)]
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
-    bg: [f32; 4],
     clock: &str,
     containers: &[(Rectangle<f64, Logical>, [f32; 4])],
     count: usize,
@@ -1572,7 +1613,7 @@ fn draw_bar_texture(
     widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
 
-        p.clear(bg)?;
+        p.clear([0., 0., 0., 0.])?;
         // The rounded button containers (hover/active), behind the button content.
         // Half the height clamps the SDF to a stadium (fully rounded pill).
         for (rect, color) in containers {
@@ -1978,7 +2019,6 @@ mod tests {
             &mut vk,
             scale,
             width_px,
-            BAR_BG,
             "12:34",
             &[],
             ws.count,
@@ -2068,19 +2108,9 @@ mod tests {
 
         // Peak red over the band row across just the two-dot region (far from the clock).
         let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex = draw_bar_texture(
-                vk,
-                scale,
-                width_px,
-                BAR_BG,
-                "12:34",
-                &[],
-                2,
-                position,
-                None,
-                None,
-            )
-            .expect("bar texture");
+            let mut tex =
+                draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None, None)
+                    .expect("bar texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -2230,9 +2260,15 @@ mod tests {
         assert_eq!(panel.clock_tick_interval(), Duration::from_secs(1));
     }
 
-    /// Drive the GPU bar into an offscreen and read it back: an opaque dark
-    /// background, the active Activities container pill on the left, and bright
-    /// clock glyph ink. Skips cleanly with no device.
+    /// Drive the GPU bar chrome into an offscreen and read it back: the active
+    /// Activities container pill on the left, bright clock glyph ink — and **nothing
+    /// where the background used to be**.
+    ///
+    /// That last one is the invariant, not a detail: the bar background is a separate
+    /// element now, and if it crept back into this bake the bake would stop being
+    /// cacheable across an overview fade (its colour changes every frame), costing a GPU
+    /// round trip per animation frame. Transparency here is what keeps it cached.
+    /// Skips cleanly with no device.
     #[test]
     fn draws_a_bar_with_glyph_coverage() {
         let mut vk = match VulkanRenderer::new() {
@@ -2260,7 +2296,6 @@ mod tests {
             &mut vk,
             1.,
             width_px,
-            BAR_BG,
             "12:34",
             &containers,
             ws.count,
@@ -2282,21 +2317,21 @@ mod tests {
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
 
-        // A pixel deep in the right half (away from any text) is the opaque dark bar.
+        // A pixel deep in the right half (away from any text) is where the background
+        // would be. The chrome must not paint it at all.
         let bg = px_at(width_px - 4, height_px / 2);
-        assert_eq!(bg[3], 255, "the bar must be opaque, got {bg:?}");
-        assert!(
-            bg[0] < 40 && bg[1] < 40 && bg[2] < 40,
-            "bar bg not dark: {bg:?}"
+        assert_eq!(
+            bg[3], 0,
+            "the chrome bake must be transparent where the background element goes, got {bg:?}",
         );
 
-        // The active Activities container fills the left pill with grey (white α0.28
-        // over black ≈ 71). Sampled above the dot band, inside the inset pill, so it's
-        // container fill, not a workspace dot and not the (transparent) screen-edge margin.
+        // The active Activities container fills the left pill with white at α0.28,
+        // premultiplied over transparency. Sampled above the dot band, inside the inset
+        // pill, so it's container fill, not a workspace dot and not the screen-edge margin.
         let hl = px_at(17, 6);
         assert!(
-            hl[3] == 255 && hl[0] > 45 && hl[0] < 100 && hl[0] == hl[1] && hl[1] == hl[2],
-            "expected the active container grey inside the pill, got {hl:?}",
+            hl[3] > 45 && hl[3] < 100 && hl[0] == hl[1] && hl[1] == hl[2],
+            "expected the active container fill inside the pill, got {hl:?}",
         );
 
         // Bright glyph ink somewhere (the clock text).
@@ -2305,6 +2340,87 @@ mod tests {
             .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
             .count();
         assert!(bright > 40, "expected visible glyph ink, got {bright}");
+    }
+
+    /// **An overview fade must not re-bake the bar.** The background alpha animates every
+    /// frame while the overview opens; the chrome does not. Since a bake is a GPU round
+    /// trip — the single most expensive thing a frame does on this stack — sweeping the
+    /// fade must reuse one cached bake and vary only the separate background element.
+    ///
+    /// Asserted on the bake counter, because pixels cannot see this: a bar re-baked every
+    /// frame looks exactly like a cached one.
+    #[test]
+    fn an_overview_fade_reuses_one_bar_bake() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping an_overview_fade_reuses_one_bar_bake: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let panel = test_panel();
+        let output = Output::new(
+            "panel-test".to_owned(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "niri".to_owned(),
+                model: "test".to_owned(),
+                serial_number: "0".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: Size::from((1920, 1080)),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        let ws = WorkspaceState {
+            count: 3,
+            active: 1,
+        };
+        let icons = IconCache::new("Adwaita");
+
+        // First render at rest warms the cache (and pays the one bake).
+        let _ = panel.render(&mut vk, &output, ws, 1., 0., &icons);
+
+        let before = crate::frame_log::bakes();
+        let mut backgrounds = Vec::new();
+        for step in 0..=10 {
+            let fade = f64::from(step) / 10.;
+            let elements = panel.render(&mut vk, &output, ws, 1., fade, &icons);
+            let solid = elements.iter().find_map(|e| match e {
+                PanelElement::Solid(s) => Some(s.color()),
+                _ => None,
+            });
+            backgrounds.push(solid.map(|c| c.a()));
+        }
+        assert_eq!(
+            crate::frame_log::bakes(),
+            before,
+            "sweeping the overview fade re-baked the bar instead of reusing the cache"
+        );
+
+        // And the background really did fade — otherwise the assertion above would pass
+        // for the trivial reason that nothing was drawn.
+        let first = backgrounds[0].expect("the desktop bar has a background");
+        let last = backgrounds[10];
+        assert!(
+            first > 0.9,
+            "the desktop bar background should be opaque, got {first}"
+        );
+        assert!(
+            last.is_none_or(|a| a < 0.01),
+            "the overview bar background should have faded out, got {last:?}"
+        );
+        assert!(
+            backgrounds[5].is_some_and(|a| a > 0.2 && a < 0.8),
+            "mid-fade should be partly transparent, got {:?}",
+            backgrounds[5]
+        );
     }
 
     /// The clock is vertically centered on its font *line-box* (the constant ascent+descent about
@@ -2560,7 +2676,6 @@ mod tests {
             &mut vk,
             scale,
             width_px,
-            BAR_BG,
             "12:34",
             &containers,
             3,

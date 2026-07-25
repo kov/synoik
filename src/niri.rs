@@ -183,7 +183,7 @@ use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderE
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::overview_search::{OverviewSearch, SearchResultEntry};
-use crate::ui::panel::Panel;
+use crate::ui::panel::{Panel, PanelElement};
 use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
@@ -9348,6 +9348,8 @@ niri_render_elements! {
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).
         UiTexture = TextureRenderElement<VkTexture>,
+        // The panel: baked chrome, plus its background as its own solid layer.
+        Panel = PanelElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
         // A group of elements composited at one alpha — the overview's search cross-fade.

@@ -117,6 +117,13 @@ pub fn time_bake() -> Timed {
     timed(&BAKE_NANOS)
 }
 
+/// Widget bakes since process start. Exposed so a test can assert that a repaint did
+/// **not** re-bake — a bake is a GPU round trip, so "did this stay cached?" is a
+/// correctness question about frame cost that pixels cannot answer.
+pub fn bakes() -> u64 {
+    BAKES.load(Ordering::Relaxed)
+}
+
 /// Whether the renderer should measure GPU pass durations. See [`FrameLog::from_env`].
 pub fn gpu_timing() -> bool {
     GPU_TIMING.load(Ordering::Relaxed)
@@ -264,6 +271,7 @@ struct InFlight {
     bakes_at_start: u64,
     shapes_at_start: u64,
     submits_at_start: u64,
+    scanout_at_start: u64,
     draws_at_start: u64,
     shaded_at_start: u64,
     context: FrameContext,
@@ -284,6 +292,10 @@ struct Totals {
     /// work it carries.
     submits: u64,
     submitting: Duration,
+    /// Of those, the ones rendering into the scanout buffer. Called out separately because on
+    /// this stack they cost a different order of magnitude from every other submit.
+    scanout_submits: u64,
+    scanout_submitting: Duration,
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -399,6 +411,7 @@ impl FrameLog {
             bakes_at_start: BAKES.load(Ordering::Relaxed),
             shapes_at_start: niri_vk::stats::shapes(),
             submits_at_start: niri_vk::stats::submits(),
+            scanout_at_start: niri_vk::stats::scanout_submits(),
             draws_at_start: niri_vk::stats::draws(),
             shaded_at_start: niri_vk::stats::shaded(),
             context: FrameContext::default(),
@@ -452,6 +465,8 @@ impl FrameLog {
             shaping: niri_vk::stats::take_shape_time(),
             submits: niri_vk::stats::submits() - frame.submits_at_start,
             submitting: niri_vk::stats::take_submit_time(),
+            scanout_submits: niri_vk::stats::scanout_submits() - frame.scanout_at_start,
+            scanout_submitting: niri_vk::stats::take_scanout_submit_time(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -527,6 +542,14 @@ impl FrameLog {
                 totals.submits,
                 ms(totals.submitting)
             );
+            if totals.scanout_submits > 0 {
+                let _ = write!(
+                    line,
+                    " ({} to scanout in {})",
+                    totals.scanout_submits,
+                    ms(totals.scanout_submitting)
+                );
+            }
         }
         if totals.bakes > 0 {
             let _ = write!(line, ", {} bakes in {}", totals.bakes, ms(totals.baking));
