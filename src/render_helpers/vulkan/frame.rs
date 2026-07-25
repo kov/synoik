@@ -137,6 +137,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // a blocking drain here would just move the wait we are removing from the end of one
         // frame to the start of the next.
         renderer.retire_completed();
+        // Glyphs shaped since the last frame are still only in host memory; put them in the atlas
+        // before anything can sample it. This is the one place that has to happen, and it is
+        // enough — see `VulkanRenderer::flush_glyph_uploads`.
+        renderer.flush_glyph_uploads();
 
         let cbuf = {
             let dev = &renderer.gpu.device;

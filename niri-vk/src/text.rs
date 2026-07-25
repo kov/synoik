@@ -123,6 +123,21 @@ impl GlyphAtlasIndex {
         self.generation
     }
 
+    /// Forget every slot at the current size, bumping the generation so the image is recreated and
+    /// every glyph re-rasterizes on demand.
+    ///
+    /// For the owner of the image to call when an upload **failed**. A glyph is recorded resident
+    /// the moment it is rasterized, before its bytes reach the GPU (see
+    /// [`resolve_once`](TextContext::resolve_once)), so a lost upload leaves the index claiming
+    /// residency for glyphs no image contains — and because a hit emits no `PendingGlyph`, nothing
+    /// would ever upload them again. Text would stay blank for the life of the atlas. This is the
+    /// way back: throw the residency away and let it rebuild.
+    pub fn invalidate(&mut self) {
+        self.allocator = AtlasAllocator::new(size2(self.side as i32, self.side as i32));
+        self.slots.clear();
+        self.generation += 1;
+    }
+
     /// Double the atlas and forget every slot, so the run that ran out is re-rasterized into the
     /// larger image. Returns `false` at [`MAX_ATLAS_SIDE`], where the caller must fail the run.
     ///
@@ -446,6 +461,11 @@ impl TextContext {
     /// The atlas residency map, for the owner of the atlas image (see [`GlyphAtlasIndex`]).
     pub fn atlas(&self) -> &GlyphAtlasIndex {
         &self.atlas
+    }
+
+    /// The residency index, mutably — for [`GlyphAtlasIndex::invalidate`] after a failed upload.
+    pub fn atlas_mut(&mut self) -> &mut GlyphAtlasIndex {
+        &mut self.atlas
     }
 
     /// Resolve every glyph of an already-shaped `buffer` into the persistent atlas. Shared by

@@ -3231,13 +3231,32 @@ fn text_of_resident_glyphs_costs_no_submit() {
         );
     }
 
-    // A size or weight not yet resident is a genuinely new glyph set and must upload.
+    // A size or weight not yet resident is a genuinely new glyph set and must reach the atlas —
+    // but shaping no longer uploads. New glyphs queue and go in one submit at the next
+    // `VulkanFrame::begin`, so the round trip is owed to the *frame*, not to the shape.
     let submits = niri_vk::stats::submits();
     vk.build_glyph_run_weighted("12:34:56", 20.0, true)
         .expect("glyph run");
+    assert_eq!(
+        niri_vk::stats::submits(),
+        submits,
+        "shaping uploaded on the spot; that is the per-line round trip coalescing exists to \
+         remove (see VulkanRenderer::flush_glyph_uploads)"
+    );
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .expect("target");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let _frame = vk
+            .render(&mut fb, Size::from((16, 16)), Transform::Normal)
+            .expect("render");
+    }
     assert!(
         niri_vk::stats::submits() > submits,
-        "bold digits were never rasterized, so they must reach the atlas"
+        "bold digits were never rasterized and never uploaded either — beginning a frame must \
+         put the queued glyphs in the atlas, or they would draw blank"
     );
 }
 
@@ -3362,6 +3381,91 @@ fn every_submit_is_chained_on_the_queue_timeline() {
     );
 }
 
+/// **Every new glyph of a frame reaches the atlas in one submit, not one per shaped line.**
+///
+/// Measured on the live seat before this: `13 glyphs in 13.43ms` — thirteen round trips in a
+/// single frame, each ~1 ms, all writing into the *same* image, because shaping uploaded per line.
+/// A round trip on this stack costs that much whatever it carries, so thirteen of them are twelve
+/// wasted milliseconds.
+///
+/// The submit count alone cannot tell coalescing from *not uploading at all*, and no pixel can see
+/// the difference between one submit and thirteen — so this asserts both halves: exactly one
+/// submit, and the glyphs actually drew.
+#[test]
+fn a_frames_new_glyphs_upload_in_one_submit() {
+    use niri_vk::stats::SubmitSite;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_frames_new_glyphs_upload_in_one_submit: no device ({e})");
+            return;
+        }
+    };
+    let glyph_submits = || {
+        let sites = niri_vk::stats::take_sites();
+        sites[SubmitSite::ALL
+            .iter()
+            .position(|s| *s == SubmitSite::UploadGlyphs)
+            .unwrap()]
+        .submits
+    };
+    let _ = niri_vk::stats::take_sites();
+
+    // Thirteen runs that cannot share a glyph: a `CacheKey` folds in the size, so the same text at
+    // thirteen distinct sizes rasterizes thirteen distinct sets. Sizes kept small so the atlas
+    // does not grow (which would flush early and confuse the count).
+    let mut runs = Vec::new();
+    for i in 0..13u32 {
+        let px = 20.0 + i as f32;
+        runs.push(vk.build_glyph_run("W", px).expect("glyph run"));
+    }
+    assert_eq!(
+        glyph_submits(),
+        0,
+        "shaping thirteen lines uploaded before a frame ever began"
+    );
+
+    // One frame, one flush — and draw every run, so "coalesced" cannot mean "dropped".
+    let size = Size::<i32, Physical>::from((64, 320));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 320)))
+        .expect("target");
+    let full = Rectangle::from_size(size);
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::new(0., 0., 0., 1.), &[full])
+            .expect("clear");
+        for (i, run) in runs.iter().enumerate() {
+            let origin = Point::<i32, Physical>::from((4, 4 + i as i32 * 24));
+            frame
+                .render_glyphs(run, origin, [1.0, 1.0, 1.0, 1.0], full, &[full])
+                .expect("render_glyphs");
+        }
+        let _sync = frame.finish().expect("finish");
+    }
+    assert_eq!(
+        glyph_submits(),
+        1,
+        "thirteen shaped lines did not coalesce into one atlas upload"
+    );
+
+    let fb = vk.bind(&mut target).expect("rebind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((64, 320)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    let ink = pixels.chunks_exact(4).filter(|p| p[0] > 128).count();
+    assert!(
+        ink > 13,
+        "one submit uploaded nothing usable — only {ink} lit pixels across thirteen runs, so the \
+         glyphs coalesced by being dropped"
+    );
+}
+
 /// **A submit is counted where it came from, not by what it renders into.**
 ///
 /// A frame on the live seat makes 7–27 round trips and, until this split, the log could say only
@@ -3388,24 +3492,36 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
     // Clear whatever this thread has accumulated (renderer construction submits).
     let _ = niri_vk::stats::take_sites();
 
-    // A glyph upload: host memory into the atlas, through `run_commands`. It gets its own site
-    // rather than a generic "upload", because the four upload paths want four different fixes —
-    // the atlas grows rarely, an shm client re-uploads every commit, icons arrive in bursts.
+    // Shaping queues glyphs; it no longer submits anything at all.
     vk.build_glyph_run("sited", 20.0).expect("glyph run");
     let sites = niri_vk::stats::take_sites();
-    assert!(
-        at(&sites, SubmitSite::UploadGlyphs) > 0,
-        "a glyph upload was not counted against the atlas"
+    assert_eq!(
+        at(&sites, SubmitSite::UploadGlyphs),
+        0,
+        "shaping uploaded on the spot instead of queueing"
+    );
+
+    // The queued glyphs go in when a frame begins — under their own site, which is the point:
+    // the four upload paths want four different fixes, so a generic "upload" cannot be acted on.
+    {
+        let mut warm = vk
+            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+            .expect("target");
+        let mut fb = vk.bind(&mut warm).expect("bind");
+        let _frame = vk
+            .render(&mut fb, Size::from((16, 16)), Transform::Normal)
+            .expect("render");
+    }
+    let sites = niri_vk::stats::take_sites();
+    assert_eq!(
+        at(&sites, SubmitSite::UploadGlyphs),
+        1,
+        "the queued glyphs did not reach the atlas in exactly one submit"
     );
     assert_eq!(
         at(&sites, SubmitSite::Upload),
         0,
         "a glyph upload landed in the generic upload bucket, which cannot be acted on"
-    );
-    assert_eq!(
-        at(&sites, SubmitSite::OffscreenFrame),
-        0,
-        "an upload was counted as a rendered frame"
     );
 
     // An offscreen render: a frame, but not one anybody scans out.

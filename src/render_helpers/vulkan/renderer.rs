@@ -93,6 +93,16 @@ pub struct VulkanRenderer {
     /// The image behind [`text_ctx`](Self::text_ctx)'s residency index, `None` until the first
     /// run. See [`Self::absorb_glyphs`].
     glyph_atlas: Option<GlyphAtlasImage>,
+    /// Newly rasterized glyphs waiting to be copied into [`Self::glyph_atlas`], and the atlas
+    /// generation they were placed in.
+    ///
+    /// Shaping used to upload per *line*: a frame that shaped thirteen new strings made thirteen
+    /// submits into the one atlas image, ~1 ms each on this stack, where a round trip costs that
+    /// much whatever it carries. They queue here instead and go in one submit at
+    /// [`Self::flush_glyph_uploads`]. The generation is carried because a queued glyph's
+    /// coordinates only mean anything in the atlas it was placed in.
+    pending_glyphs: Vec<niri_vk::text::PendingGlyph>,
+    pending_glyph_generation: u64,
     /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
     /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
     custom_resize: Option<Pipeline>,
@@ -411,6 +421,8 @@ impl VulkanRenderer {
             text_ctx: niri_vk::text::TextContext::new(),
             glyph_runs: HashMap::new(),
             glyph_atlas: None,
+            pending_glyphs: Vec::new(),
+            pending_glyph_generation: 0,
             custom_resize: None,
             custom_close: None,
             custom_open: None,
@@ -752,7 +764,7 @@ impl VulkanRenderer {
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
         let (shaped, pending) = self.text_ctx.shape_paragraph(spans, wrap_px, base_px)?;
-        let (atlas, side) = self.absorb_glyphs(&gpu, pool, &pending)?;
+        let (atlas, side) = self.absorb_glyphs(&gpu, pool, pending)?;
         Ok(GlyphRun::new(
             atlas,
             shaped.glyphs,
@@ -774,7 +786,7 @@ impl VulkanRenderer {
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
         let (shaped, pending) = self.text_ctx.shape_line_weighted(text, px, bold)?;
-        let atlas = self.absorb_glyphs(&gpu, pool, &pending)?;
+        let atlas = self.absorb_glyphs(&gpu, pool, pending)?;
         Ok((shaped, atlas))
     }
 
@@ -793,7 +805,7 @@ impl VulkanRenderer {
         &mut self,
         gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
-        pending: &[niri_vk::text::PendingGlyph],
+        pending: Vec<niri_vk::text::PendingGlyph>,
     ) -> Result<(VkTexture, u32), VulkanError> {
         let side = self.text_ctx.atlas().side();
         let generation = self.text_ctx.atlas().generation();
@@ -803,6 +815,13 @@ impl VulkanRenderer {
             .as_ref()
             .is_none_or(|atlas| atlas.generation != generation);
         if stale {
+            // Anything queued belongs to the image about to be replaced, and its coordinates mean
+            // nothing in the new one. Put it where it was meant to go first: a `GlyphRun` already
+            // handed to a caller holds its own reference to the old image and will draw from it
+            // even though the cache below is cleared. Discarding instead would blank that run.
+            // Growth is a once-ever event, so the extra submit costs nothing in practice.
+            self.flush_glyph_uploads();
+
             let texture = NiriTexture::new_coverage_atlas(gpu, pool, side)
                 .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))?;
             let (desc_pool, set) = self.make_texture_set(&texture)?;
@@ -831,17 +850,60 @@ impl VulkanRenderer {
 
         let atlas = self.glyph_atlas.as_ref().expect("just ensured");
         if !pending.is_empty() {
-            let regions: Vec<_> = pending
-                .iter()
-                .map(niri_vk::text::PendingGlyph::region)
-                .collect();
+            debug_assert!(
+                self.pending_glyphs.is_empty() || self.pending_glyph_generation == generation,
+                "queued glyphs from another atlas generation — their coordinates are meaningless \
+                 in this image"
+            );
+            self.pending_glyph_generation = generation;
+            self.pending_glyphs.extend(pending);
+        }
+        Ok((atlas.texture.clone(), atlas.side))
+    }
+
+    /// Copy every queued glyph into the atlas image, in **one** submit, and clear the queue.
+    ///
+    /// Called from [`VulkanFrame::begin`](super::VulkanFrame::begin), which is both correct and
+    /// the latest possible moment: the only thing that samples the atlas is a glyph draw, every
+    /// glyph draw goes through a `VulkanFrame`, and a `VulkanFrame` borrows the renderer mutably
+    /// — so no shaping, hence no queueing, can happen while one is open. A queued glyph therefore
+    /// cannot be drawn before the next `begin` flushes it.
+    ///
+    /// Never fails the caller. An upload error here would otherwise be unrecoverable rather than
+    /// merely ugly: a glyph is recorded resident when it is *rasterized*, before its bytes reach
+    /// the GPU, and a resident glyph emits nothing to upload ever again — so a lost copy means
+    /// that character stays blank for the life of the atlas. Throwing the residency away
+    /// (`invalidate`) costs a re-rasterization and puts everything back.
+    pub(super) fn flush_glyph_uploads(&mut self) {
+        if self.pending_glyphs.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_glyphs);
+        let Some(atlas) = self.glyph_atlas.as_ref() else {
+            // Glyphs are only queued after the image is ensured, so this cannot happen; drop them
+            // rather than panic, and rebuild the residency so nothing is silently missing.
+            debug_assert!(false, "glyphs queued with no atlas image to put them in");
+            self.text_ctx.atlas_mut().invalidate();
+            return;
+        };
+
+        let regions: Vec<_> = pending
+            .iter()
+            .map(niri_vk::text::PendingGlyph::region)
+            .collect();
+        let result =
             atlas
                 .texture
                 .inner()
-                .upload_coverage_regions(gpu, pool, &regions)
-                .map_err(|e| VulkanError::Other(format!("glyph atlas upload: {e:#}")))?;
+                .upload_coverage_regions(&self.gpu, self.command_pool, &regions);
+        if let Err(err) = result {
+            warn!("glyph atlas upload failed, rebuilding the atlas: {err:#}");
+            // The index still claims these glyphs are resident. Forget the lot: the next shape
+            // re-rasterizes them, the generation bump recreates the image, and the frame that is
+            // starting draws one frame of missing text instead of missing it forever.
+            self.text_ctx.atlas_mut().invalidate();
+            self.glyph_runs.clear();
         }
-        Ok((atlas.texture.clone(), atlas.side))
     }
 
     /// Import a single-plane client dmabuf as a sampled [`VkTexture`] (the [`ImportDma`] path). The
