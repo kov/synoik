@@ -19,6 +19,10 @@ to zero — see [`../venus-timestamp-gap.md`](../venus-timestamp-gap.md), with i
 [`repro-vk-timestamp-query/`](./repro-vk-timestamp-query). It is written up separately because it
 is a handoff for the VM-stack work rather than a dmabuf-import finding.
 
+**For the performance picture rather than individual defects**, see
+[`../venus-cost.md`](../venus-cost.md): what this stack prices per round trip, measured on a live
+compositor, and what would help most at the VMM level. These two findings appear there as §3.7.
+
 ---
 
 ## Environment

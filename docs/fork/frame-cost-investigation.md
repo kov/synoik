@@ -7,7 +7,9 @@ obvious hypotheses are already measured and dead, and re-deriving them costs a d
 
 Companion docs: [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md) is the
 design of the one fix that is left; [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) is why
-GPU-side timing is unavailable here.
+GPU-side timing is unavailable here; [`venus-cost.md`](./venus-cost.md) is the same material
+rewritten as a **handoff to whoever works on the VM/VMM stack** — what is priced by the host, what
+it costs us, and what would help most. Send that one outward; keep this one for the guest side.
 
 ---
 
