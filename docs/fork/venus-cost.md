@@ -300,3 +300,181 @@ retries, or a fallback path being taken — it is plain round-trip latency on ca
 4. **The headless backend cannot be used for any of this.** It has no real output; frames cost
    0.02 ms and never touch the paths this document is about. Frame-cost work on this fork is
    live-seat-only.
+
+---
+
+## 8. Reply from the VM/host side
+
+**Written 2026-07-25**, from the host (`limina` repo, dev Mac), after reading this document and
+§3.5's companion, then checking each claim against the actual sources: our `virglrenderer` fork
+(`third_party/virglrenderer`), libkrun's virtio-gpu device
+(`third_party/libkrun/src/devices/src/virtio/gpu`), the host Vulkan driver KosmicKrisp
+(`mesa/src/kosmickrisp`), and guest Mesa `venus` (`mesa/src/virtio/vulkan`). Line citations
+below are into those trees.
+
+**The headline holds, and is sharper than stated.** "A call is cheap, a round trip is expensive"
+is correct, and the constant is one number: **a host round trip costs ~1.5–2 ms, uniformly, for
+everything that waits for a reply.** §3.1's 1.52–1.88 ms per upload submit and the expensive end
+of §3.3's 0.018–2.11 ms are the *same* cost, not two phenomena.
+
+Three of the five items are misattributed, though, and the ranking should change. Details follow;
+the revised order is in §8.5.
+
+### 8.1 §3.3 is not irreducible from the guest — it is a cache miss, and it is ~100×
+
+This is the largest correctable item in the document.
+
+Of the four calls §3.3 names, **two are already asynchronous** and cost no round trip at all:
+`vkAllocateMemory` (`vn_device_memory.c:28-47` — submit-with-seqno, no reply wait, unless
+`VN_PERF=no_async_mem_alloc`) and `vkCreateImageView` (`vn_image.c:833`).
+
+The synchronous ones are `vkCreateImage` and `vkGetImageMemoryRequirements2`, and **only on a miss
+in venus's image-requirements cache** (`vn_image.c:387-396`):
+
+```c
+if (cacheable && vn_image_init_reqs_from_cache(dev, img, key)) {
+   vn_async_vkCreateImage(...);       /* no round trip */
+   return VK_SUCCESS;
+}
+result = vn_call_vkCreateImage(...);              /* round trip 1 */
+... vn_call_vkGetImageMemoryRequirements2(...);   /* round trip 2 */
+```
+
+The cache key is a BLAKE3 over the contiguous `VkImageCreateInfo` block from `flags` through
+`sharingMode` (`vn_image.c:155-163`) — **which includes `extent`**. A novel width×height is a miss
+even when format, usage and flags all repeat.
+
+That is the 117× spread. **0.018 ms is the async path; 2.11 ms is the sync path.** It is not a
+contention signature — it is hit versus miss, and the two populations sit ~100× apart because one
+of them never talks to the host.
+
+So the sentence "we cannot coalesce it away: these are genuinely new images for content that
+genuinely just appeared" is true of the *content* and false of the *cost*. The round trip is
+priced by the image **configuration**, not by its novelty.
+
+**What to do, entirely guest-side:** bucket image extents — round allocations up to a 32 px or
+64 px grid, or to powers of two — so that repeat surface sizes reuse a cached requirements entry.
+The dmabuf path is cacheable too: `VkExternalMemoryImageCreateInfo` and the DRM-modifier structs
+are all handled by the hasher (`vn_image.c:105-137`); only an *unrecognised* `pNext` disables
+caching, and it bumps a counter (`dev->image_reqs_cache.debug.cache_skip_count`) if you ever want
+to check.
+
+**Confirm the mechanism before optimising:** run with `VN_PERF=no_async_image_create`, which
+disables the cache entirely (`vn_image.c:185-199`) and makes *every* create synchronous. If the
+cheap creates become expensive, the model is right.
+
+### 8.2 §3.4 is not write-combining
+
+KosmicKrisp exposes exactly **one** memory type (`kk_physical_device.c:1098-1104`):
+
+```
+HOST_VISIBLE | HOST_COHERENT | HOST_CACHED | DEVICE_LOCAL
+```
+
+and virglrenderer chooses the guest mapping as
+`(coherent && cached) ? VIRGL_RENDERER_MAP_CACHE_CACHED : ..._WC` (`vkr_device_memory.c:906-908`).
+Both bits are set, so the staging blob is mapped **cached**. Asking for
+`HOST_VISIBLE | HOST_COHERENT` gets the cached type by construction — there is no other type to
+pick, and venus additionally guarantees a coherent-cached type exists
+(`vn_physical_device.c:1015-1018`).
+
+The 5.95 vs 13.6 GB/s gap is real; the write-combining explanation is not. The first place to look
+is the **guest kernel's** page protection on the blob VMA — a layer we own — not the host.
+
+Cheap way to settle it from your side: a 20-line A/B that memcpys the same buffer into a mapped
+blob and into ordinary anonymous guest memory, same thread, same size. If the blob side is ~2.3×
+slower on a *cached* mapping, that is a guest-kernel finding and we will chase it there.
+
+### 8.3 §3.5 — KosmicKrisp is exonerated; the gap is inside the VM path
+
+§5 of `venus-timestamp-gap.md` asks for exactly one experiment first: *does the host driver pass
+the same reproducer natively?* It does.
+
+New probe, committed in the limina repo as `spikes/kk-timestamp-probe/` (`be0d0df`), run natively
+on the host with no VM, against our own KK build. It covers three shapes, because a native app and
+the guest hit **different** KK code paths:
+
+| | path exercised | result |
+|---|---|---|
+| A | `vkGetQueryPoolResults` → `kk_GetQueryPoolResults` (CPU readback) | pass, delta 32 250 ns |
+| B | `vkCmdCopyQueryPoolResults` → `libkk_copy_queries` (GPU kernel) | pass, delta 27 500 ns |
+| C | as B, copy in a **separate** command buffer submitted alongside | pass, delta 28 000 ns |
+
+C is the one that matters: **Mesa venus never calls `vkGetQueryPoolResults` on the host.** It
+serves the guest from a guest-visible *feedback buffer* which it fills with a
+`vkCmdCopyQueryPoolResults` recorded into a linked feedback command buffer
+(`vn_query_pool.c:320` `vn_get_query_pool_feedback`, `vn_feedback.c:580-660`
+`vn_query_feedback_cmd_record_internal`). That is the shape your session actually produces, and it
+works natively.
+
+Two further eliminations:
+
+1. **The feedback path is not the culprit.** Re-running your reproducer on this guest with
+   `VN_PERF=no_query_feedback` — which forces the synchronous `vn_call_vkGetQueryPoolResults`
+   host round trip and bypasses the feedback buffer entirely — still returns `[0, 0]` with
+   availability 1. **So the host-side query pool genuinely holds zero.**
+2. **virglrenderer is a pass-through.** `vkr_query_pool.c:32` forwards `vkGetQueryPoolResults`
+   verbatim; `vkr_command_buffer.c:519` and `:883` dispatch `vkCmdWriteTimestamp` and
+   `vkCmdWriteTimestamp2` with no special handling.
+
+The zero is itself diagnostic. KK's convention for a TIMESTAMP pool is `UINT64_MAX == unavailable`
+(`kk_query_pool.c:28`, `libkk/kk_query.cl:30-49`), so a query that was reset and never written
+reads **all ones**, not zero. Your `value 0, avail 1` therefore is *not* "the write was dropped
+after a reset" — it is a pool report holding literal zero, which is fresh, untouched memory.
+
+Remaining uncontrolled variable: the probe ran on an M1 Max, this guest runs on an M4 Pro. Closing
+that, and instrumenting `kk_CmdWriteTimestamp2` / `kk_encoder_write_timestamp` in a local
+enhanced-tier VM to see whether they are reached at all when the commands arrive via vkr replay
+rather than via the loader, is the next step and is in progress on our side.
+
+Nothing is being asked of the guest here. The note in §5 — "please do not fix this by making the
+guest tolerate zeros" — is the right call and the all-zero heuristic should stay.
+
+### 8.4 §3.2 — the stated mechanism is almost certainly wrong, and §3.5 gates it
+
+"The host executes Venus's command stream on its own 60 Hz loop" does not match the host:
+
+- **There is no timer in the host command path.** The venus ring thread is a poll/park loop with
+  no periodic component whatsoever (`vkr_ring.c:503-616`); it either drains the ring, backs off,
+  or parks on a condition variable until the guest notifies it.
+- **Presents are fire-and-forget.** The VMM hands an IOSurface id to the UI process and returns;
+  nothing in the flush path blocks on a drawable, a display link, or a vsync.
+- **The one host mechanism that would pace a guest fence to a refresh is off.** Fence-accurate
+  present parks a flush until the frame latches, and it is opt-in
+  (`virtio_gpu.rs:1888 fence_present_enabled`) — it is **not** set in this VM's `limina-vmm`
+  environment (checked on the live process). Nothing host-side is latching you to a refresh.
+- **A venus fence wait has no host CPU in it.** After `vkQueueSubmit` the guest polls a word that
+  the *GPU* writes; the host CPU is not in the loop. A 13 ms fence wait therefore means the GPU
+  genuinely finished 13 ms later.
+
+The innocent explanation you cannot presently exclude: at 3840×2160 with 1.7–2.0× overdraw and
+138–173 draws, **the frame's GPU work really is ~13 ms**, and the scanout submit is last, so it
+waits behind all of it. §3.8 already reports a single blur at 13.63 ms. The sparse frames at
+3.71–5.45 ms are then simply an idle GPU with nothing queued ahead. That fits the data at least as
+well as the vsync reading — and note 13 ms is not 16.67 ms.
+
+Distinguishing the two is *precisely* what §3.5 buys. **Items #1 and #3 on the §5 list are the
+same item, and #3 comes first.** Until GPU time is available, #1 is unfalsifiable from either side
+of the boundary.
+
+One thing that is true and worth knowing: the venus ring is **one thread per context**, and it
+decodes the guest's stream and encodes host Vulkan serially (`vkr_ring.c:503-616`). So the
+"priced by contention" observation in §3.2 is real — but the contention is largely your own stream
+contending with itself, not other tenants.
+
+### 8.5 Revised ranking
+
+1. **Fix timestamp queries.** Not a second-order tool — it gates the biggest item on the list.
+   Host-side work, in progress; nothing needed from the compositor.
+2. **Bucket image extents (§8.1).** Guest-side, no host change, ~100× on what is currently the
+   largest remaining in-frame cost. Verify with `VN_PERF=no_async_image_create` first.
+3. **Re-measure §3.2 with GPU time in hand.** It may evaporate; if it does not, the residue will
+   be attributable rather than inferred.
+4. **Verify §3.4 in the guest before anyone invests.** The host says cached; the A/B in §8.2
+   decides whether there is a bug at all.
+5. **The two dmabuf/gbm findings (§3.7)** stand as filed — correctness, with reproducers, unchanged
+   by anything above.
+
+The §6 baseline is the right thing to hold against, and the per-resource column is the one to
+watch: if §8.1 is right, cost-per-created-resource is where a change will show up first and
+hardest — and the first mover on it is the guest, not the host.
