@@ -371,7 +371,7 @@ and every manually torn-down object.
 
 | site | what fires it | hazard if deferred | verdict |
 |---|---|---|---|
-| offscreen `VulkanFrame::finish` | widget bakes, window previews, snapshots, `ClosingWindow`, xray/effect buffers | **the render target itself** — caller-owned, recreated by `OffscreenBuffer`/`EffectBuffer` on size change, freed without a wait | the biggest win, but not free; see slice 1 |
+| offscreen `VulkanFrame::finish` | widget bakes, window previews, snapshots, `ClosingWindow`, xray/effect buffers | **the render target itself** — caller-owned, recreated by `OffscreenBuffer`/`EffectBuffer` on size change, freed without a wait | **done**, slice 1: record holds the target, reuse test retires first |
 | `capture_region` mid-frame flush | one per captured region per frame | none — the consumer is the separately-submitted blur, which the timeline already orders after it | **the cheapest win in the table**: its wait is redundant *today* |
 | `EffectBlur::run`, `BackdropBlur::run_blur`, `render_blur` | one per blurred surface per frame | `BlurChain` teardown (manual, no refcount) | defer once the record can hold non-texture resources |
 | `make_sampleable` | nothing, in practice | none | confirmed ~dead: an offscreen `finish` already leaves `SHADER_READ_ONLY_OPTIMAL` (`frame.rs:1485`) |
@@ -415,20 +415,46 @@ and the first draft of this section said none of this:
    submits will name themselves on the next seat run. Pinned by
    `a_submit_is_counted_at_the_site_that_made_it`, whose dmabuf half fails against the old
    target-keyed logic.
-1. **Let offscreen frames defer.** Two things the first draft got wrong: this is *not* removing
-   the `!fb.offscreen` clause (`frame.rs:1502`), because `finish_may_defer` is only true inside the
-   tty bracket around `render_frame` (`tty.rs:2892`) and every offscreen finish happens earlier,
-   during element collection — dropping the clause defers nothing. Offscreen has to become its own
-   eligibility rule. And the record must hold the target: `OffscreenBuffer` drops its texture on
-   size increase or non-uniqueness (`offscreen.rs:105`), `EffectBuffer` replaces its offscreen on
-   size change (`effect_buffer.rs:236`). **Then the trap:** holding a clone makes
-   `is_unique_reference` (`types.rs:201`) false, and `OffscreenBuffer` reuses on exactly that test
-   (`offscreen.rs:113`) — so a naive keep-alive turns into reallocate-every-frame, the Venus blob
-   churn these caches exist to prevent. The reuse test has to learn about retirement.
-   **Severity, corrected 2026-07-25:** this churn used to *abort* the session, and that abort was
-   fixed at the VMM level — so it is a performance and host-resource problem now, not a stability
-   one. That downgrades the risk of getting slice 1 wrong from "the seat dies" to "the seat gets
-   slower", which is a material argument for doing slice 1 sooner rather than later.
+1. ~~**Let offscreen frames defer.**~~ **Done (2026-07-25).** Two things the first draft got wrong:
+   this is *not* removing the `!fb.offscreen` clause, because `finish_may_defer` is only true inside
+   the tty bracket around `render_frame` (`tty.rs:2892`) and every offscreen finish happens earlier,
+   during element collection — dropping the clause defers nothing. Offscreen had to become its own
+   eligibility rule (`VulkanRenderer::should_defer_offscreen_finish`): the same two device
+   requirements as scanout — a total order on submits, and no per-frame query pool — minus the tty
+   bracket, and minus the *exportable* fence, since nothing outside the process ever takes an
+   offscreen's completion. That last point also means an offscreen finish can never be pushed back
+   onto the synchronous path by an export failure, the way a scanout frame can.
+   And the record holds the target: `OffscreenBuffer` drops its texture on size increase or
+   non-uniqueness (`offscreen.rs:105`), `EffectBuffer` replaces its offscreen on size change
+   (`effect_buffer.rs:236`).
+
+   **The trap, and what it cost to close.** Holding a clone makes `is_unique_reference`
+   (`types.rs:201`) false, and `OffscreenBuffer` reuses on exactly that test (`offscreen.rs:113`) —
+   so a naive keep-alive turns into reallocate-every-frame, trading the fence wait we just removed
+   for a synchronous host round trip through `vkCreateImage`. The fix is that
+   `OffscreenRenderer::offscreen_is_reusable` now takes `&mut self` and retires first: a record only
+   disappears once the GPU has passed that submit, which is the *same* condition that makes
+   overwriting the image safe, so the poll is not a workaround but the honest answer. Pinned by
+   `retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated`, which fails (as
+   "not unique") with the retire removed, and whose second half pins that retirement did not
+   overcorrect into "reusable, always" — a snapshot someone else still holds must still block reuse.
+
+   Deferral itself is pinned by `an_offscreen_finish_defers_without_the_kms_bracket`, which
+   deliberately does *not* set `finish_may_defer` (a rule that needs it is a rule that never fires)
+   and reads the target back with no intervening wait, so only the queue timeline can order it.
+
+   Layout bookkeeping had to follow: the deferred branch used to hardcode `TRANSFER_SRC_OPTIMAL`,
+   which is right for scanout and wrong for an offscreen — the barrier to `SHADER_READ_ONLY_OPTIMAL`
+   rides the same command buffer, and recording it is what keeps `make_offscreen_sampleable` the
+   no-op it must be here (`renderer.rs` `make_sampleable` early-returns on that layout). Getting it
+   wrong would have put a whole extra submit-and-wait back per offscreen.
+
+   Still gated on `NIRI_VK_ASYNC_SCANOUT`, the same opt-in as slice 0, so the suite exercises it
+   only through the two tests above.
+
+   **Severity, corrected 2026-07-25:** the reallocate-every-frame churn used to *abort* the session,
+   and that abort was fixed at the VMM level — so it was a performance and host-resource problem by
+   the time this landed, not a stability one.
 2. **The capture flush and the blurs.** The flush needs only its cbuf and fence deferred; the blurs
    need the record to hold non-texture resources. Together these are the other half of the M1
    hypothesis.

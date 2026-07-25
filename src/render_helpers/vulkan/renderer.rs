@@ -1619,6 +1619,24 @@ impl VulkanRenderer {
             && self.gpu_timer.is_none()
     }
 
+    /// Whether a finish that targets an **offscreen** should hand its completion to the in-flight
+    /// list instead of parking on it.
+    ///
+    /// Deliberately not `should_defer_finish`: that one requires `finish_may_defer`, the tty
+    /// backend's bracket around `DrmCompositor::render_frame`, and an offscreen finish never runs
+    /// inside it — widget bakes, window snapshots and effect buffers are all built while elements
+    /// are being collected, before the backend asks for a frame. So the offscreen path would never
+    /// defer at all, which is how it came to be the largest block of blocked time in the frame log.
+    ///
+    /// It also needs no *exportable* fence: nothing outside this process ever takes an offscreen's
+    /// completion, so a plain fence in the record is enough. What is left is the two device
+    /// requirements that make walking away sound at all — a total order on submits, so nothing
+    /// issued afterwards can execute alongside this one, and no per-frame query pool whose reset
+    /// would race an in-flight frame.
+    pub(super) fn should_defer_offscreen_finish(&self) -> bool {
+        self.defer_scanout && self.gpu.orders_submits() && self.gpu_timer.is_none()
+    }
+
     /// Override the session's opt-in for this renderer alone. Tests only: headless there is no KMS
     /// plane to take the fence, so the deferred path has to be asked for explicitly to be covered
     /// at all.

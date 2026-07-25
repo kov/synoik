@@ -29,6 +29,7 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
 use crate::render_helpers::render_to_vec;
+use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
@@ -4132,4 +4133,164 @@ fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
             [want[0], want[1], want[2]]
         );
     }
+}
+
+/// Every offscreen render — a widget bake, a window snapshot, an effect buffer — used to park the
+/// compositor thread on a fence, and there are several per frame. They are also the *only* submits
+/// that could never take the deferred path: it was gated on `finish_may_defer`, the tty backend's
+/// bracket around `DrmCompositor::render_frame`, and offscreens are all built earlier, while
+/// elements are being collected. So the gate has to be a separate one, and this pins that it is:
+/// no KMS bracket here, and the finish still walks away.
+///
+/// The readback afterwards is the safety half. It is issued with no wait of any kind between it
+/// and the deferred submit, so the only thing that can order them is the queue timeline — the
+/// property `should_defer_offscreen_finish` requires. Green pixels mean the render really had
+/// completed; a torn or cleared read is what an unordered device would give.
+#[test]
+fn an_offscreen_finish_defers_without_the_kms_bracket() {
+    let skip = |why: &str| eprintln!("skipping an_offscreen_finish_defers_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    vk.set_defer_scanout(true);
+    // Deliberately NOT set_finish_may_defer: an offscreen never renders inside that bracket, and a
+    // rule that needs it is a rule that never fires.
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .expect("offscreen target");
+    let mut fb = vk.bind(&mut target).expect("bind offscreen");
+    let sync = {
+        let mut frame = vk
+            .render(
+                &mut fb,
+                Size::<i32, Physical>::from((64, 64)),
+                Transform::Normal,
+            )
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 1., 0., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        frame.finish().expect("finish")
+    };
+
+    assert!(
+        sync.contains_fence(),
+        "the offscreen finish still waited on its fence — the compositor thread is paying for \
+         every bake, snapshot and effect buffer again"
+    );
+    assert_eq!(
+        vk.in_flight_len(),
+        1,
+        "the deferred offscreen submit was not recorded, so its command buffer is unowned"
+    );
+    assert_eq!(
+        vk.in_flight_targets_len(),
+        1,
+        "the record does not hold the offscreen it renders into"
+    );
+
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((64, 64)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    assert_eq!(
+        &pixels[..4],
+        &[0, 255, 0, 255],
+        "the readback saw an unfinished offscreen — work issued after a deferred submit is not \
+         ordered against it"
+    );
+
+    drop(fb);
+    vk.drain_in_flight();
+}
+
+/// The trap that comes with deferring an offscreen finish, and it costs more than it saves if it
+/// is missed. `OffscreenBuffer` reuses its texture only while nobody else references it — and a
+/// deferred submit's record references exactly what it rendered into. So the renderer would answer
+/// "not unique" about *itself*, the caller would drop the texture and `create_buffer` a new one,
+/// and every reused offscreen would turn into a fresh allocation every frame: a synchronous host
+/// round trip on a virtualized driver, traded for the fence wait we just removed.
+///
+/// Retiring first is the fix, and it is also the honest answer — a record only disappears once the
+/// GPU has passed that submit, which is the same condition that makes overwriting the image safe.
+///
+/// The second half is the guard against overcorrecting. Retirement must not turn the question into
+/// "yes, always": a snapshot someone else still holds has to come back not-reusable, or a
+/// still-displayed frame gets drawn over.
+#[test]
+fn retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated() {
+    let skip = |why: &str| eprintln!("skipping retirement_lets_a_deferred_offscreen_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    vk.set_defer_scanout(true);
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .expect("offscreen target");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind offscreen");
+        let mut frame = vk
+            .render(
+                &mut fb,
+                Size::<i32, Physical>::from((64, 64)),
+                Transform::Normal,
+            )
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 1., 0., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        assert!(
+            frame.finish().expect("finish").contains_fence(),
+            "the finish did not defer, so this test is not exercising the trap"
+        );
+    }
+    assert_eq!(vk.in_flight_len(), 1, "nothing was deferred");
+
+    // Stand in for the rest of the frame: by the time the next one asks to reuse this offscreen,
+    // the GPU is long past the submit. Retirement is a *poll*, so what it can free is exactly what
+    // has completed — this makes the completion real without pre-freeing the record.
+    unsafe { vk.gpu.device.device_wait_idle() }.expect("wait idle");
+
+    let _ = niri_vk::stats::take_creates();
+    assert!(
+        vk.offscreen_is_reusable(&mut target),
+        "the renderer called its own keep-alive a foreign reference: the caller now throws this \
+         texture away and allocates a new one on every single frame"
+    );
+    let (created, _) = niri_vk::stats::take_creates();
+    assert_eq!(
+        created, 0,
+        "answering the reuse question allocated {created} GPU resources"
+    );
+    assert_eq!(
+        vk.in_flight_len(),
+        0,
+        "the completed submit was not retired, so its command buffer is still held"
+    );
+
+    // ...but a live reference elsewhere — a snapshot still on screen — must still block reuse.
+    let displayed = target.clone();
+    assert!(
+        !vk.offscreen_is_reusable(&mut target),
+        "reuse was allowed while another reference is live: whatever is still drawing this \
+         texture gets rendered over"
+    );
+    drop(displayed);
 }

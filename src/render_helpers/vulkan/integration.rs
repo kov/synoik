@@ -35,7 +35,14 @@ impl OffscreenRenderer for VulkanRenderer {
         self.make_sampleable(texture).map_err(Into::into)
     }
 
-    fn offscreen_is_reusable(&self, texture: &mut VkTexture) -> bool {
+    fn offscreen_is_reusable(&mut self, texture: &mut VkTexture) -> bool {
+        // Retire first, or this answers "not unique" about ourselves. An offscreen finish hands
+        // its completion to the in-flight list (see `should_defer_offscreen_finish`), and that
+        // record keeps a reference to the render target — so the frame that rendered *into* this
+        // texture is exactly the thing holding the second reference. Retiring is a poll, so this
+        // says yes only once the GPU is genuinely done with the previous render, which is also
+        // the condition for overwriting it to be safe.
+        self.retire_completed();
         texture.is_unique_reference()
     }
 }

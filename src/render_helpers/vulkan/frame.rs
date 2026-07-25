@@ -1548,11 +1548,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.renderer.gpu_timer_end(self.cbuf);
             dev.end_command_buffer(self.cbuf)?;
 
-            // A frame we intend to walk away from needs an *exportable* fence, and a `SYNC_FD`
-            // fence's handle types are fixed at creation — so the decision is made here, before
-            // the submit, and falls back to a plain fence if the device cannot export.
+            // A *scanout* frame we intend to walk away from needs an **exportable** fence, because
+            // KMS takes it — and a `SYNC_FD` fence's handle types are fixed at creation, so the
+            // decision is made here, before the submit, and falls back to a plain fence (and thus
+            // a synchronous finish) if the device cannot export. An offscreen finish has no such
+            // consumer: its completion never leaves this process, so it defers on a plain fence
+            // and can never be forced back onto the synchronous path by an export failure.
             let exportable = self.renderer.should_defer_finish() && !self.fb.offscreen;
-            let deferred = exportable
+            let exported = exportable
                 .then(|| self.renderer.gpu.create_exportable_fence())
                 .flatten()
                 .transpose()
@@ -1560,7 +1563,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     tracing::warn!("no exportable fence, finishing synchronously: {err}");
                     None
                 });
-            let fence = match deferred {
+            let defer = exported.is_some()
+                || (self.fb.offscreen && self.renderer.should_defer_offscreen_finish());
+            let fence = match exported {
                 Some(fence) => fence,
                 None => dev.create_fence(&vk::FenceCreateInfo::default(), None)?,
             };
@@ -1577,7 +1582,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // fence and every texture the draws reference move into the renderer's in-flight
             // list and are freed once the queue timeline passes this submit; `should_defer_finish`
             // has already established that nothing issued after this can execute alongside it.
-            if let (Some(fence), Some(timeline)) = (deferred, timeline) {
+            if let (true, Some(timeline)) = (defer, timeline) {
                 let fence = VkSubmitFence::new(self.renderer.gpu.clone(), fence);
                 let held = std::mem::take(&mut self.held);
                 // What we render *into* is not in `held` and is not ours: the target may be a
@@ -1596,11 +1601,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     glyph_staging,
                 );
                 // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
-                // leaves a scanout target in TRANSFER_SRC_OPTIMAL. Every later command is ordered
-                // after this submit, so recording it now is as true as recording it after a wait.
-                self.fb
-                    .buffer
-                    .set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                // leaves a scanout target in TRANSFER_SRC_OPTIMAL, and an offscreen was taken the
+                // rest of the way to SHADER_READ_ONLY_OPTIMAL by the barrier recorded above. Every
+                // later command is ordered after this submit, so recording it now is as true as
+                // recording it after a wait — and it is what keeps `make_offscreen_sampleable` the
+                // no-op it has to be here, since a barrier submitted from outside this command
+                // buffer would put the round trip straight back.
+                self.fb.buffer.set_layout(if self.fb.offscreen {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                });
                 return Ok(SyncPoint::from(fence));
             }
 
