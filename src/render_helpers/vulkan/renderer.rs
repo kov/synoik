@@ -249,6 +249,31 @@ pub struct VulkanRenderer {
     /// drained (harmless extra acquire) by the next real `begin()`. De-duped by image so a surface
     /// imported twice before a frame records the barrier once.
     pending_dmabuf_acquires: Vec<VkTexture>,
+
+    /// Host-staged texture uploads whose GPU copy has not been recorded yet. Drained by
+    /// [`super::VulkanFrame::begin`] into the frame's own command buffer, in the same slot (and
+    /// for the same reason) as [`Self::pending_dmabuf_acquires`] and the glyph uploads.
+    ///
+    /// `import_memory` used to submit **and block** per texture. A live seat frame was measured at
+    /// `9 upload in 16.22ms` moving 1.0 MiB — the bytes cost 0.24 ms of that, so the other 16 ms
+    /// was nine round trips. Each blocking wait also idles the guest↔host ring past its 1 ms
+    /// timeout, so the *next* submit pays a ~1 ms wake on top (`docs/fork/venus-cost.md` §9.4):
+    /// the waits were buying each other.
+    ///
+    /// Invariant, identical to the acquires': a [`super::VulkanFrame`] mutably borrows the
+    /// renderer, so no import can happen while a frame exists — every push therefore precedes some
+    /// `begin()`, and every `begin()` drains.
+    ///
+    /// What makes deferring *safe* rather than merely ordered is that nothing reads an imported
+    /// texture's contents outside a frame: `ExportMem::copy_texture` is `Unsupported` here and
+    /// `can_read_texture` is `false`, so every read goes through `copy_framebuffer` — i.e. through
+    /// something a frame rendered, after this drained. Should either of those ever be implemented,
+    /// it must record these copies (or submit them) before reading, or it will read a blank image.
+    ///
+    /// A queue left undrained (elements built, then damage tracking skips the frame) is harmless:
+    /// the entries simply wait for the next `begin`, and if the renderer dies first they free
+    /// their staging and leave a blank image behind — never an invalid one.
+    pending_texture_uploads: Vec<niri_vk::texture::StagedTexture>,
 }
 
 /// How many differently-sized present-blit shadows to keep. Comfortably covers what a live session
@@ -465,6 +490,7 @@ impl VulkanRenderer {
             dmabuf_import_cache: HashMap::new(),
             warned_modifiers: HashSet::new(),
             pending_dmabuf_acquires: Vec::new(),
+            pending_texture_uploads: Vec::new(),
         })
     }
 
@@ -1236,6 +1262,8 @@ impl VulkanRenderer {
         h: u32,
         via: Option<&VkTexture>,
     ) -> Result<Vec<u8>, VulkanError> {
+        // Reading an image whose staged copy has not landed would read a blank one.
+        self.flush_pending_texture_uploads()?;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
         let image = tex.image();
         let old_layout = tex.layout();
@@ -1432,6 +1460,8 @@ impl VulkanRenderer {
         source: &VkTexture,
         options: BlurOptions,
     ) -> Result<VkTexture, VulkanError> {
+        // The chain samples `source` on a submit of its own, ahead of any frame.
+        self.flush_pending_texture_uploads()?;
         let (w, h) = source.extent();
         let output = self.create_buffer(Fourcc::Abgr8888, Size::from((w as i32, h as i32)))?;
 
@@ -1593,6 +1623,10 @@ struct InFlightSubmit {
     /// else here — the copy reads it on the GPU long after the CPU has moved on. It frees itself
     /// when this record is dropped, so neither retirement path has to know it exists.
     _glyph_staging: Option<niri_vk::texture::GlyphStaging>,
+    /// The texture-upload staging buffers whose copies this command buffer carries
+    /// ([`VulkanRenderer::record_pending_texture_uploads`]). Held for the same reason and freed
+    /// the same way as `_glyph_staging`.
+    _texture_staging: Vec<niri_vk::texture::StagedTexture>,
 }
 
 impl VulkanRenderer {
@@ -1642,6 +1676,7 @@ impl VulkanRenderer {
 
     /// Record a submit the CPU is not going to wait for. `targets` is what the command buffer
     /// renders into — see [`InFlightSubmit::_targets`], which is why it is separate from `held`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn add_in_flight(
         &mut self,
         timeline: u64,
@@ -1650,6 +1685,7 @@ impl VulkanRenderer {
         held: Vec<VkTexture>,
         targets: Vec<VkTexture>,
         glyph_staging: Option<niri_vk::texture::GlyphStaging>,
+        texture_staging: Vec<niri_vk::texture::StagedTexture>,
     ) {
         self.in_flight.push(InFlightSubmit {
             timeline,
@@ -1658,6 +1694,7 @@ impl VulkanRenderer {
             _held: held,
             _targets: targets,
             _glyph_staging: glyph_staging,
+            _texture_staging: texture_staging,
         });
     }
 
@@ -2194,6 +2231,63 @@ impl VulkanRenderer {
         }
     }
 
+    /// Record every staged texture upload into `cbuf` and hand the staging buffers back, for the
+    /// caller to keep alive until that command buffer's submit has retired. Same slot, same
+    /// contract and same reason as [`Self::record_pending_glyph_uploads`].
+    ///
+    /// Returns them as a batch rather than dropping them here precisely because dropping frees the
+    /// staging: the GPU reads it long after this returns.
+    pub(super) fn record_pending_texture_uploads(
+        &mut self,
+        cbuf: vk::CommandBuffer,
+    ) -> Vec<niri_vk::texture::StagedTexture> {
+        let staged = std::mem::take(&mut self.pending_texture_uploads);
+        for upload in &staged {
+            upload.record(cbuf);
+        }
+        staged
+    }
+
+    /// Record and submit the queued texture copies on their own, blocking until they land.
+    ///
+    /// **Every path that submits work outside a [`super::VulkanFrame`] must call this first.** A
+    /// frame is not the only thing that touches an imported image: a readback reads it, a blur
+    /// samples it, `make_sampleable` transitions it, and an shm re-upload overwrites it. Each of
+    /// those submits on its own, ahead of the next `begin()`, so without this they see the image
+    /// as it was before its copy — blank, or (worse, and how this was found) they get overwritten
+    /// *afterwards* when the frame finally records the stale copy. The shm test caught exactly
+    /// that: a re-upload to green came out red.
+    ///
+    /// Cheap where it matters: on the render path the queue is empty by the time any of these run,
+    /// because `begin` drained it. When it is not empty this is precisely the old per-upload
+    /// behaviour, except still batched into one submit.
+    fn flush_pending_texture_uploads(&mut self) -> Result<(), VulkanError> {
+        if self.pending_texture_uploads.is_empty() {
+            return Ok(());
+        }
+        let staged = std::mem::take(&mut self.pending_texture_uploads);
+        let gpu = self.gpu.clone();
+        // `run_commands` waits, so `staged` — and the staging buffers it frees on drop — outlives
+        // the copy it carries.
+        gpu.run_commands(
+            self.command_pool,
+            niri_vk::stats::SubmitSite::Upload,
+            |cbuf| {
+                for upload in &staged {
+                    upload.record(cbuf);
+                }
+            },
+        )
+        .map_err(|e| VulkanError::Other(format!("flushing staged texture uploads: {e:#}")))
+    }
+
+    /// Count of texture uploads awaiting a deferred copy (test-only: asserts a frame drained
+    /// them). See [`Self::pending_texture_uploads`].
+    #[cfg(test)]
+    pub(super) fn pending_texture_uploads_len(&self) -> usize {
+        self.pending_texture_uploads.len()
+    }
+
     /// Count of client-dmabuf imports awaiting a deferred re-acquire barrier (test-only: asserts a
     /// frame drained them). See [`Self::pending_dmabuf_acquires`].
     #[cfg(test)]
@@ -2436,6 +2530,9 @@ impl VulkanRenderer {
             (tex.size().w as usize) * (tex.size().h as usize) * 4,
             "reupload_shm data must be the texture's w*h*4 (32bpp) extent",
         );
+        // This overwrites the image *now*. A staged copy still queued for this same texture would
+        // otherwise land afterwards, at the next `begin`, and undo it.
+        self.flush_pending_texture_uploads()?;
         self.shm_staging.ensure(&self.gpu, data.len() as u64)?;
         self.shm_staging.write(&self.gpu, data)?;
         tex.reupload_shm(self.command_pool, &self.shm_staging)?;
@@ -2468,9 +2565,10 @@ impl ImportMem for VulkanRenderer {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
-        let tex = NiriTexture::from_bytes_32bpp(
+        // Staged, not uploaded: the copy is recorded into the next frame's own command buffer
+        // (`pending_texture_uploads`) instead of costing a submit and a blocking fence wait here.
+        let (tex, staged) = NiriTexture::stage_32bpp(
             &self.gpu,
-            self.command_pool,
             w,
             h,
             &data[..expected],
@@ -2478,6 +2576,7 @@ impl ImportMem for VulkanRenderer {
             alpha_one,
             filter,
         )?;
+        self.pending_texture_uploads.push(staged);
         // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches the batch
         // path's cleanup on the same failure).
         let (desc_pool, set) = match self.make_texture_set(&tex) {

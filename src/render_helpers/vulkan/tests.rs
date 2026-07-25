@@ -2768,6 +2768,105 @@ fn vulkan_dmabuf_import_cache_hit_is_not_counted_as_a_creation() {
     );
 }
 
+/// An `import_memory` upload costs **no submit of its own**: the staging→image copy is queued and
+/// recorded into the next frame's command buffer, riding a submit that was going to happen anyway.
+///
+/// This is worth a test rather than a comment because the cost it removes is invisible in pixels.
+/// A live seat frame was logged at `9 upload in 16.22ms` while moving 1.0 MiB — the pixels were
+/// 0.24 ms of it, the rest was nine submits each parked on its own fence, and each of those waits
+/// re-idles the guest↔host ring so the *next* submit pays a wake too (`docs/fork/venus-cost.md`
+/// §9.4). Revert the deferral and every assertion here still renders the right colour; only the
+/// counters move.
+///
+/// Also pins the invariant that makes it safe: the queue is empty once a frame has begun.
+#[test]
+fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_texture_upload_rides_the_frame: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let upload_site = niri_vk::stats::SubmitSite::ALL
+        .iter()
+        .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
+        .unwrap();
+    let upload_submits = |_: ()| niri_vk::stats::take_sites()[upload_site].submits;
+
+    // Rendered at the module's W×H so `px` can index the readback.
+    let red = [255u8, 0, 0, 255].repeat((W * H) as usize);
+
+    let _ = upload_submits(());
+    let _ = niri_vk::stats::take_creates();
+
+    let buffer = TextureBuffer::from_memory(
+        &mut vk,
+        &red,
+        Fourcc::Abgr8888,
+        Size::<i32, BufferCoord>::from((W, H)),
+        false,
+        1.0,
+        Transform::Normal,
+        Vec::new(),
+    )
+    .expect("import");
+
+    assert_eq!(
+        upload_submits(()),
+        0,
+        "importing a texture submitted on its own — that is the round trip (and the fence wait \
+         behind it) this path exists to remove",
+    );
+    assert_eq!(
+        niri_vk::stats::take_creates().0,
+        1,
+        "the image itself is still allocated exactly once",
+    );
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        1,
+        "the copy must be queued for the next frame",
+    );
+
+    // Render it. The frame's own command buffer carries the copy, so the pixels must arrive with
+    // no upload submit having happened at any point.
+    let element = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let out = render_to_vec(
+        &mut vk,
+        Size::<i32, Physical>::from((W, H)),
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [element].into_iter(),
+    )
+    .expect("render");
+
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        0,
+        "VulkanFrame::begin must drain the queue",
+    );
+    assert_eq!(
+        upload_submits(()),
+        0,
+        "the copy rode the frame's submit; nothing may have submitted an upload of its own",
+    );
+    let c = px(&out, W / 2, H / 2);
+    assert!(
+        close_px(c, [255, 0, 0, 255], 8),
+        "the deferred copy must actually land — sampled {c:?}, wanted red",
+    );
+}
+
 // --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
 
 /// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads
@@ -3360,11 +3459,12 @@ fn a_repeated_symbolic_icon_uploads_once() {
     const NAME: &str = "no-notifications-symbolic";
     const WHITE: [f32; 4] = [1., 1., 1., 1.];
 
-    let upload_site = niri_vk::stats::SubmitSite::ALL
-        .iter()
-        .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
-        .unwrap();
-    let uploads = |_: ()| niri_vk::stats::take_sites()[upload_site].submits;
+    // Counted as *resources created*, not as upload submits: an import no longer submits at all —
+    // its copy rides the next frame's command buffer
+    // (`VulkanRenderer::pending_texture_uploads`), so the submit count is zero either way and
+    // could no longer tell a cold icon from a cached one. The image is still allocated once per
+    // real upload, which is what the cache is here to avoid.
+    let uploads = |_: ()| niri_vk::stats::take_creates().0;
 
     let _ = uploads(());
     assert!(

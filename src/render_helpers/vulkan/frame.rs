@@ -81,6 +81,10 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// synchronous one. Keying that on `fb.offscreen` instead would miss the KMS frame that falls
     /// back to synchronous because no exportable fence could be made.
     glyph_staging: Option<niri_vk::texture::GlyphStaging>,
+    /// The staged texture uploads whose copies this frame's command buffer carries. Held for the
+    /// same reason as `glyph_staging`: the GPU reads the staging buffers long after `begin`
+    /// returned, so they must survive to the submit's retirement.
+    texture_staging: Vec<niri_vk::texture::StagedTexture>,
     finished: bool,
 }
 
@@ -179,6 +183,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // of what an uncached widget bake cost. Same slot and same reason as the acquires above.
         let glyph_staging = renderer.record_pending_glyph_uploads(cbuf);
 
+        // Textures imported since the last frame are staged on the host but not yet copied into
+        // their images. Same slot and same reason as the two above: the copies ride this frame's
+        // submit instead of costing one round trip *and one blocking fence wait* apiece. The
+        // staging buffers must outlive this submit, so they travel with the frame exactly as
+        // `glyph_staging` does.
+        let texture_staging = renderer.record_pending_texture_uploads(cbuf);
+
         {
             let dev = &renderer.gpu.device;
             // `render_pass` is the DONT_CARE base pass (callers clear explicitly) or, when
@@ -214,6 +225,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             clip_override: None,
             present_damage: Vec::new(),
             glyph_staging,
+            texture_staging,
             finished: false,
         })
     }
@@ -1592,6 +1604,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     .chain(self.fb.present.clone())
                     .collect();
                 let glyph_staging = self.glyph_staging.take();
+                // The staging buffers whose copies this command buffer carries. On the
+                // synchronous path below they simply drop after the fence wait; here they have to
+                // outlive a submit nobody is waiting for.
+                let texture_staging = std::mem::take(&mut self.texture_staging);
                 self.renderer.add_in_flight(
                     timeline,
                     self.cbuf,
@@ -1599,6 +1615,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     held,
                     targets,
                     glyph_staging,
+                    texture_staging,
                 );
                 // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
                 // leaves a scanout target in TRANSFER_SRC_OPTIMAL, and an offscreen was taken the

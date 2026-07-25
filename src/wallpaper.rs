@@ -555,11 +555,12 @@ mod tests {
             ..Default::default()
         };
 
-        let site = niri_vk::stats::SubmitSite::ALL
-            .iter()
-            .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
-            .unwrap();
-        let uploads = |_: ()| niri_vk::stats::take_sites()[site].submits;
+        // Counted as *resources created*, not as upload submits: an import no longer submits at
+        // all — its copy rides the next frame's command buffer
+        // (`VulkanRenderer::pending_texture_uploads`), so the submit count is zero either way and
+        // could no longer tell a cold upload from a cached one. The image is still allocated once
+        // per real upload, which is the thing this test is about.
+        let uploads = |_: ()| niri_vk::stats::take_creates().0;
         let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
             wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
         };

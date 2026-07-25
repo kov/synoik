@@ -148,6 +148,63 @@ struct PendingUpload {
     texture: Texture,
 }
 
+/// A texture whose pixels are staged on the host but whose GPU copy has **not been recorded
+/// yet** — produced by [`Texture::stage_32bpp`], recorded by [`StagedTexture::record`] into a
+/// command buffer the caller is already submitting.
+///
+/// Owns its staging buffer + memory and frees them on drop, holding an `Arc<Gpu>` to guarantee the
+/// device outlives them — deliberately the same shape as [`GlyphStaging`], so a frame can decide
+/// at submit time whether this lives on in an in-flight record or dies with a fence wait, and no
+/// retirement path has to know it exists.
+///
+/// **It must outlive the submit of the command buffer its copy was recorded into.** Dropping it
+/// earlier leaves the GPU copying from freed memory — which no validation layer will call, and
+/// which shows up as a texture of garbage.
+///
+/// It owns **only** the staging half: the [`Texture`] went to the caller of
+/// [`Texture::stage_32bpp`] and is destroyed the usual way. So a staged upload dropped without
+/// ever being recorded costs nothing but the pixels' journey — the image is blank, not invalid,
+/// which is what makes it safe for a frame that never happens to simply drop the queue.
+pub struct StagedTexture {
+    gpu: Arc<Gpu>,
+    staging: vk::Buffer,
+    smem: vk::DeviceMemory,
+    /// The destination. Borrowed by handle, not owned — see the type docs.
+    image: vk::Image,
+    width: u32,
+    height: u32,
+}
+
+impl StagedTexture {
+    /// Record the staging→image copy into `cbuf`, with the barriers that leave the image
+    /// `SHADER_READ_ONLY_OPTIMAL` and order the copy before any later draw in the same command
+    /// buffer.
+    ///
+    /// Must be called **outside a render pass** (copies and layout transitions both are), which is
+    /// the same slot the glyph uploads and the deferred dmabuf acquires use.
+    pub fn record(&self, cbuf: vk::CommandBuffer) {
+        unsafe {
+            record_upload_copy(
+                &self.gpu.device,
+                cbuf,
+                self.image,
+                self.staging,
+                self.width,
+                self.height,
+            );
+        }
+    }
+}
+
+impl Drop for StagedTexture {
+    fn drop(&mut self) {
+        unsafe {
+            self.gpu.device.destroy_buffer(self.staging, None);
+            self.gpu.device.free_memory(self.smem, None);
+        }
+    }
+}
+
 /// Uploads many textures with a single submit + fence-wait instead of one per texture — the
 /// overview app grid decodes ~24 icons and would otherwise pay ~24 serialized queue round-trips on
 /// first open (a real stutter on virtualized/Venus queues). Usage: [`TextureBatch::new`], then
@@ -1115,6 +1172,51 @@ impl Texture {
                 Err(err)
             }
         }
+    }
+
+    /// Build a texture and stage its pixels, but **do not record or submit the copy** — the
+    /// caller folds it into a command buffer it is already going to submit
+    /// ([`StagedTexture::record`]).
+    ///
+    /// This is [`upload`](Self::upload) with the round trip taken out, and it is the same trick as
+    /// [`stage_coverage_regions`](Self::stage_coverage_regions) for glyphs. It exists because the
+    /// per-texture path costs a full submit *and a blocking fence wait* each, and a live seat frame
+    /// was measured at `9 upload in 16.22ms` for 1.0 MiB of pixels — the bytes were 0.24ms of that.
+    /// Worse, each wait re-parks the host ring (`docs/fork/venus-cost.md` §9.4), so every upload
+    /// also taxes the *next* submit with a ~1ms wake.
+    ///
+    /// The returned texture is complete except for its contents — view and sampler are valid, and
+    /// it belongs to the caller like any other — but nothing may **sample** it until the copy
+    /// carried by the returned [`StagedTexture`] has been recorded and submitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_32bpp(
+        gpu: &Arc<Gpu>,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        format: vk::Format,
+        alpha_one: bool,
+        filter: vk::Filter,
+    ) -> Result<(Self, StagedTexture)> {
+        let components = if alpha_one {
+            vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
+        } else {
+            vk::ComponentMapping::default()
+        };
+        let PendingUpload {
+            staging,
+            smem,
+            texture,
+        } = Self::build_pending(gpu, width, height, data, format, 4, components, filter)?;
+        let staged = StagedTexture {
+            gpu: gpu.clone(),
+            staging,
+            smem,
+            image: texture.image,
+            width,
+            height,
+        };
+        Ok((texture, staged))
     }
 
     /// The device-local half of an upload: a sampled image, its memory, view and sampler, with no
