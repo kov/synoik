@@ -123,10 +123,11 @@ remaining slow frame is an overview animation or first-time startup work.
 ## 6. Open items
 
 1. **The scanout wait.** [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md).
-   The next concrete step is *scoping*, not building: how far Smithay's `SyncPoint` already
-   threads through our KMS path, and whether handing the fence to `queue_frame` is separable
-   from the deferred-destruction work. That answer decides between a contained change and a
-   renderer project.
+   Scoped 2026-07-25: **contained change, not a renderer project.** Smithay already threads the
+   `SyncPoint` into `IN_FENCE_FD`, this VM's virtio-gpu plane carries that property, Venus's
+   `VkFence` `SYNC_FD` export is pipelined, and deferred destruction reduces to retiring
+   `(fence, cbuf, held)` at the next frame — `run_commands` keeps its wait. Plan, and the three
+   things that must be settled before it ships, in that doc.
 2. **The panel still bakes during an overview animation** — but not for the reason we fixed.
    `are_animations_ongoing()` (`ui/panel.rs:848`) is the button-fill fades, and opening the
    overview toggles Activities to checked, so the fill fade covers the same window. That bake
