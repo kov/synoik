@@ -425,6 +425,10 @@ and the first draft of this section said none of this:
    `is_unique_reference` (`types.rs:201`) false, and `OffscreenBuffer` reuses on exactly that test
    (`offscreen.rs:113`) — so a naive keep-alive turns into reallocate-every-frame, the Venus blob
    churn these caches exist to prevent. The reuse test has to learn about retirement.
+   **Severity, corrected 2026-07-25:** this churn used to *abort* the session, and that abort was
+   fixed at the VMM level — so it is a performance and host-resource problem now, not a stability
+   one. That downgrades the risk of getting slice 1 wrong from "the seat dies" to "the seat gets
+   slower", which is a material argument for doing slice 1 sooner rather than later.
 2. **The capture flush and the blurs.** The flush needs only its cbuf and fence deferred; the blurs
    need the record to hold non-texture resources. Together these are the other half of the M1
    hypothesis.

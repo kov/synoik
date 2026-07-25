@@ -137,9 +137,11 @@ pub struct VulkanRenderer {
     ///
     /// This used to be a fresh `VkBuffer` + `HOST_VISIBLE` allocation per call. On Venus
     /// host-visible memory is a virtio-gpu blob, and shm screencopy reads back **every frame** —
-    /// exactly the per-frame mappable-blob churn that exhausts the host pool and aborts the
-    /// session. Grow-only, so a steady stream of same-size reads allocates once; a larger read
-    /// grows it and smaller ones then reuse the larger buffer.
+    /// per-frame mappable-blob churn, which costs real host time and host pool pressure.
+    /// (It used to *abort* the session; that was fixed at the VMM level in 2026-07, so this is
+    /// now a performance and resource argument, not a stability one — but it is still the
+    /// reason this is cached.) Grow-only, so a steady stream of same-size reads allocates once;
+    /// a larger read grows it and smaller ones then reuse the larger buffer.
     readback_staging_buffer: niri_vk::texture::Staging,
     /// Count of readback host-buffer (re)allocations (test-only): the no-churn invariant is that
     /// this stops growing once the largest read size has been seen. See
@@ -157,7 +159,9 @@ pub struct VulkanRenderer {
     /// `Argb8888`/`Xrgb8888` targets are bound within one frame**: the scanout buffer of each
     /// output, a screencast buffer (window casts are sized to the window's bbox, and a rotated
     /// output's cast is transform-sized), and any screencopy region. A single slot would evict and
-    /// reallocate on every bind as those alternate — the exact per-frame churn that aborts Venus.
+    /// reallocate on every bind as those alternate — exactly the per-frame Venus blob churn these
+    /// caches exist to avoid (costly on the host; no longer an abort — see
+    /// `readback_staging_buffer`).
     ///
     /// Bounded by [`MAX_PRESENT_BLIT_SHADOWS`], evicting least-recently-used, so a stream of new
     /// sizes (an interactively resized window cast renegotiates its size as it grows) cannot grow
@@ -184,8 +188,9 @@ pub struct VulkanRenderer {
     /// CPU swizzle.
     ///
     /// Cached for the same reason the present-blit shadows are: shm screencopy can fire every
-    /// frame, and allocating a `VkImage` per frame exhausts the Venus blob pool and aborts the
-    /// session. Keyed by size **and** format; LRU-evicted under [`MAX_READBACK_STAGING`]. Reuse
+    /// frame, and allocating a `VkImage` per frame churns the Venus blob pool (host cost and
+    /// pressure; no longer an abort — see `readback_staging_buffer`).
+    /// Keyed by size **and** format; LRU-evicted under [`MAX_READBACK_STAGING`]. Reuse
     /// and eviction are safe because rendering is synchronous.
     readback_staging: HashMap<(u32, u32, i32), StagingEntry>,
     /// Monotonic tick for [`Self::readback_staging`]'s LRU, bumped once per lookup.
@@ -197,9 +202,10 @@ pub struct VulkanRenderer {
     readback_staging_allocs: usize,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
     /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
-    /// creates a host-side resource, so re-importing per frame churns those resources until the
-    /// guest↔host ring is marked `FATAL` and `vn_ring_submit` aborts (no guest OOM — the guest
-    /// image is freed cleanly each frame). Cache each imported target and reuse it across frames;
+    /// creates a host-side resource, so re-importing per frame churns those resources on the host
+    /// (this used to drive the guest↔host ring to `FATAL` and abort in `vn_ring_submit`; fixed at
+    /// the VMM level 2026-07, so the remaining cost is host time and resource pressure).
+    /// Cache each imported target and reuse it across frames;
     /// entries whose buffer was freed are evicted. Reuse and eviction are safe for the same reason
     /// as the shadow: a deferred frame's record holds what it renders into
     /// ([`InFlightSubmit::_targets`]). Mirrors `GlesRenderer`'s `buffers` bound-dmabuf cache.
@@ -208,9 +214,10 @@ pub struct VulkanRenderer {
     /// per-surface texture on *every* new-buffer commit (even a recycled `wl_buffer`), so an
     /// animating dmabuf client (e.g. a WebGL page) would otherwise re-run the full
     /// `import_dmabuf_sampled` — a fresh `vkAllocateMemory` import +
-    /// image/view/sampler/descriptor set + a fenced acquire barrier — every frame. On Venus
-    /// that per-frame host-resource churn is exactly what pressures the guest↔host ring into
-    /// the `FATAL`/alive-expiry abort (see `DEVMAC-SESSION-confusion.md`). Clients recycle a
+    /// image/view/sampler/descriptor set + a fenced acquire barrier — every frame. That per-frame
+    /// host-resource churn is expensive on the Venus host (and used to pressure the guest↔host
+    /// ring into a `FATAL`/alive-expiry abort — fixed at the VMM level 2026-07; the historical
+    /// analysis is in `DEVMAC-SESSION-confusion.md`). Clients recycle a
     /// small buffer pool, so cache the imported texture per buffer and reuse it; a hit only needs
     /// the acquire barrier (`VkTexture::record_reacquire_dmabuf`) to pick up the freshly produced
     /// content — no allocation. Entries whose buffer was freed are evicted lazily on lookup. This
