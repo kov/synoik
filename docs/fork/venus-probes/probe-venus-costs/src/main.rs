@@ -543,6 +543,68 @@ fn first_touch(gpu: &Gpu, size: usize) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    // The question that decides whether a *reusable* staging buffer is enough: does keeping the
+    // same VkDeviceMemory but re-`vkMapMemory`ing it per write pay the fault again? Our reusable
+    // `Staging` maps and unmaps around every copy, so if a remap re-faults, buffer reuse alone
+    // buys nothing and the mapping has to be held.
+    println!();
+    println!("same buffer, 4 writes: remapped each time vs mapped once");
+    let buffer = unsafe {
+        gpu.device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+            None,
+        )?
+    };
+    let req = unsafe { gpu.device.get_buffer_memory_requirements(buffer) };
+    let mem = unsafe {
+        gpu.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(gpu.mem_type),
+            None,
+        )?
+    };
+    unsafe { gpu.device.bind_buffer_memory(buffer, mem, 0)? };
+
+    for i in 0..4 {
+        let t = Instant::now();
+        let ptr = unsafe {
+            gpu.device
+                .map_memory(mem, 0, size as u64, vk::MemoryMapFlags::empty())?
+        } as *mut u8;
+        let map_ms = ms_since(t);
+        let t = Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), ptr, size) };
+        let write_ms = ms_since(t);
+        unsafe { gpu.device.unmap_memory(mem) };
+        println!(
+            "  remapped  write {i}: map {map_ms:>6.3} ms   write {write_ms:>7.3} ms ({:>6.2} GB/s)",
+            size as f64 / (write_ms / 1000.0) / 1e9
+        );
+    }
+
+    let ptr = unsafe {
+        gpu.device
+            .map_memory(mem, 0, size as u64, vk::MemoryMapFlags::empty())?
+    } as *mut u8;
+    for i in 0..4 {
+        let t = Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), ptr, size) };
+        let write_ms = ms_since(t);
+        println!(
+            "  held      write {i}:                  write {write_ms:>7.3} ms ({:>6.2} GB/s)",
+            size as f64 / (write_ms / 1000.0) / 1e9
+        );
+    }
+    unsafe {
+        gpu.device.unmap_memory(mem);
+        gpu.device.destroy_buffer(buffer, None);
+        gpu.device.free_memory(mem, None);
+    }
+    println!();
+
     // The control: an ordinary guest allocation of the same size, also untouched. `vec![0u8; n]`
     // gets zero pages from the kernel, so this pays guest first-touch faults and nothing else.
     let t = Instant::now();
