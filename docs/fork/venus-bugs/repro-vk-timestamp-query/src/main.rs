@@ -222,7 +222,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //                 for — it serves the guest from a feedback buffer) vs
     //                 vkCmdCopyQueryPoolResults into a buffer, in the same command buffer or a
     //                 separate one (the shape the host side's own native probe passed on).
-    println!("\n--- which shape resolves? -------------------------------------------------");
+    // Repeated, because the defect is **intermittent**. The host side measured it at 94% failure
+    // bare and 18% with their first workaround — so one sample per shape cannot tell a fixed shape
+    // from a broken one, and would report a working stack as broken 18% of the time. What matters
+    // is the *rate*. Override with `TIMESTAMP_REPS`.
+    let reps: usize = std::env::var("TIMESTAMP_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    println!("\n--- which shape resolves? ({reps} reps each) ------------------------------");
     for &use_sync2 in &[false, true] {
         for &resolve in &[Resolve::Host, Resolve::CopySameCbuf, Resolve::CopyOtherCbuf] {
             let label = format!(
@@ -238,19 +246,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Resolve::CopyOtherCbuf => "Copy (separate cbuf)",
                 },
             );
-            match run_shape(&device, queue, queue_family, phys, &instance, use_sync2, resolve) {
-                Ok([a, b]) if a != 0 || b != 0 => {
-                    println!("  {label} -> [{a}, {b}]  delta {}  WORKS", b.wrapping_sub(a))
+
+            let mut deltas = Vec::new();
+            let mut zeros = 0usize;
+            let mut err = None;
+            for _ in 0..reps {
+                match run_shape(&device, queue, queue_family, phys, &instance, use_sync2, resolve) {
+                    // A lost sample reads as 0 *and still reports available*, so a zero is
+                    // indistinguishable from a real result except by being zero. Count it, never
+                    // average it in — see `venus-cost.md` §11.
+                    Ok([a, b]) if a != 0 || b != 0 => deltas.push(b.wrapping_sub(a)),
+                    Ok(_) => zeros += 1,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
                 }
-                Ok([_, _]) => println!("  {label} -> [0, 0]  zero"),
-                Err(e) => println!("  {label} -> error: {e:?}"),
+            }
+
+            if let Some(e) = err {
+                println!("  {label} -> error: {e:?}");
+                continue;
+            }
+            let ok = deltas.len();
+            let pct = 100.0 * ok as f64 / reps as f64;
+            if ok == 0 {
+                println!("  {label} -> 0/{reps} usable ({pct:.0}%)  all zero");
+            } else {
+                deltas.sort_unstable();
+                println!(
+                    "  {label} -> {ok}/{reps} usable ({pct:.0}%)  median delta {} ns  [{} zeros]",
+                    deltas[ok / 2],
+                    zeros,
+                );
             }
         }
     }
     println!(
-        "\nA shape reported WORKS is a usable GPU clock: the renderer's `NIRI_FRAME_LOG=gpu` path\n\
-         can be moved onto it. All-zero means the gap is still open for every combination this\n\
-         stack offers."
+        "\nRead the RATE, not a pass/fail. The defect is intermittent, a lost sample comes back as\n\
+         a zero that still reports `available`, and 100% is the only rate that needs no handling:\n\
+         anything less means every consumer must discard zeros rather than average them in, or its\n\
+         statistics skew silently toward zero."
     );
 
     unsafe {

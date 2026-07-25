@@ -911,6 +911,14 @@ called the 1.0 entry point — two independent axes, so both are tested:
 (`VK_DRIVER_FILES=…/lvp_icd.aarch64.json`) reports **WORKS on all six**, with sane deltas
 (45–130 µs). So the matrix exercises each combination correctly and the zero is venus-specific.
 
+> **Now measured as a rate, not a pass/fail** (2026-07-25, after the §11 update below reported the
+> defect is intermittent — 94% failure bare, 18% with the first workaround). One sample per shape
+> would call a working stack broken 18% of the time. The reproducer repeats each shape 50× and
+> reports usable/total (`TIMESTAMP_REPS` to override). On the build carrying that first workaround
+> this guest measured **0/50 on all six shapes**, with lavapipe at 10/10 on all six for control —
+> i.e. this boot is the "detection sampled once and defaulted to unaffected" case, where the
+> workaround never applied at all, rather than the 18% case.
+
 We cannot see your build metadata from in here, so we cannot tell whether this VM is missing the
 fix or the fix does not cover these shapes. The reproducer is the discriminator either way — a
 shape that starts reporting `WORKS` is one we can move `NIRI_FRAME_LOG=gpu` onto.
