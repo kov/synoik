@@ -1,5 +1,5 @@
-//! Process-wide counters for the two things a frame can do too many of: GPU
-//! round trips and draw calls.
+//! Per-thread counters for the two things a frame can do too many of: GPU round
+//! trips and draw calls.
 //!
 //! A "submit" here is `vkQueueSubmit`; a "retire" is the fence wait that follows
 //! it. Together they are one full CPU↔GPU round trip, and on a virtualized stack
@@ -22,24 +22,49 @@
 //! upload, layout transition and blur chain goes through, and it cannot reach
 //! back into the `niri` crate. The frame log reads these across a frame.
 //!
-//! Counting is unconditional and lock-free (two relaxed atomic adds); the timing
-//! is gated on [`set_enabled`] so an unlogged session does not pay an
-//! `Instant::now()` per submit.
+//! **Per thread, not per process.** Every counter here is fed by a thread holding
+//! `&mut` to a renderer and read by that same thread — the compositor's, in a
+//! session; the test's own, under libtest. As process-wide atomics they were a
+//! flake generator: a test asserting "this repaint cost no submit" could count a
+//! *parallel* test's submit and fail, rarely enough to look like whatever change
+//! was in front of you. Thread-local, each reader sees exactly the work it caused.
+//! Nothing needs a cross-thread total, and a thread that never renders contributes
+//! nothing to read.
+//!
+//! Counting is unconditional and lock-free (a `Cell` bump); the timing is gated on
+//! [`set_enabled`] so an unlogged session does not pay an `Instant::now()` per
+//! submit.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
-static SUBMITS: AtomicU64 = AtomicU64::new(0);
-static SUBMIT_NANOS: AtomicU64 = AtomicU64::new(0);
-static RETIRE_NANOS: AtomicU64 = AtomicU64::new(0);
-static SCANOUT_SUBMITS: AtomicU64 = AtomicU64::new(0);
-static SCANOUT_NANOS: AtomicU64 = AtomicU64::new(0);
-static SCANOUT_RETIRE_NANOS: AtomicU64 = AtomicU64::new(0);
-static DRAWS: AtomicU64 = AtomicU64::new(0);
-static SHADED: AtomicU64 = AtomicU64::new(0);
-static SHAPES: AtomicU64 = AtomicU64::new(0);
-static SHAPE_NANOS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static SUBMITS: Cell<u64> = const { Cell::new(0) };
+    static SUBMIT_NANOS: Cell<u64> = const { Cell::new(0) };
+    static RETIRE_NANOS: Cell<u64> = const { Cell::new(0) };
+    static SCANOUT_SUBMITS: Cell<u64> = const { Cell::new(0) };
+    static SCANOUT_NANOS: Cell<u64> = const { Cell::new(0) };
+    static SCANOUT_RETIRE_NANOS: Cell<u64> = const { Cell::new(0) };
+    static DRAWS: Cell<u64> = const { Cell::new(0) };
+    static SHADED: Cell<u64> = const { Cell::new(0) };
+    static SHAPES: Cell<u64> = const { Cell::new(0) };
+    static SHAPE_NANOS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Whether timing is on. Process-wide, unlike the counters: it is configuration,
+/// read once from the environment and true for every thread or none.
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Saturating, so a counter cannot wrap a delta into a nonsense number.
+fn add(counter: &'static LocalKey<Cell<u64>>, n: u64) {
+    counter.with(|c| c.set(c.get().saturating_add(n)));
+}
+
+fn take(counter: &'static LocalKey<Cell<u64>>) -> Duration {
+    Duration::from_nanos(counter.with(|c| c.replace(0)))
+}
 
 /// Whether to time submits as well as count them. Set once, by the frame log.
 pub fn set_enabled(enabled: bool) {
@@ -61,23 +86,27 @@ pub enum SubmitKind {
 /// well. Inert when timing is off, so call sites can be unconditional.
 pub struct SubmitTimer {
     started: Option<Instant>,
-    total: &'static AtomicU64,
-    scanout: Option<&'static AtomicU64>,
+    total: &'static LocalKey<Cell<u64>>,
+    scanout: Option<&'static LocalKey<Cell<u64>>>,
 }
 
 impl Drop for SubmitTimer {
     fn drop(&mut self) {
         if let Some(started) = self.started {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.total.fetch_add(nanos, Ordering::Relaxed);
+            add(self.total, nanos);
             if let Some(scanout) = self.scanout {
-                scanout.fetch_add(nanos, Ordering::Relaxed);
+                add(scanout, nanos);
             }
         }
     }
 }
 
-fn timer(kind: SubmitKind, total: &'static AtomicU64, scanout: &'static AtomicU64) -> SubmitTimer {
+fn timer(
+    kind: SubmitKind,
+    total: &'static LocalKey<Cell<u64>>,
+    scanout: &'static LocalKey<Cell<u64>>,
+) -> SubmitTimer {
     SubmitTimer {
         started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
         total,
@@ -89,9 +118,9 @@ fn timer(kind: SubmitKind, total: &'static AtomicU64, scanout: &'static AtomicU6
 /// wait belongs to [`retire`]. Counted even when timing is off, so the count is
 /// always meaningful; only the clock reads are gated.
 pub fn submit(kind: SubmitKind) -> SubmitTimer {
-    SUBMITS.fetch_add(1, Ordering::Relaxed);
+    add(&SUBMITS, 1);
     if kind == SubmitKind::Scanout {
-        SCANOUT_SUBMITS.fetch_add(1, Ordering::Relaxed);
+        add(&SCANOUT_SUBMITS, 1);
     }
     timer(kind, &SUBMIT_NANOS, &SCANOUT_NANOS)
 }
@@ -105,20 +134,20 @@ pub fn retire(kind: SubmitKind) -> SubmitTimer {
     timer(kind, &RETIRE_NANOS, &SCANOUT_RETIRE_NANOS)
 }
 
-/// Scanout submits since process start. The caller takes a delta across a frame.
+/// Scanout submits on this thread. The caller takes a delta across a frame.
 pub fn scanout_submits() -> u64 {
-    SCANOUT_SUBMITS.load(Ordering::Relaxed)
+    SCANOUT_SUBMITS.with(Cell::get)
 }
 
 /// Time spent enqueueing scanout submits since the last call, clearing the counter.
 pub fn take_scanout_submit_time() -> Duration {
-    Duration::from_nanos(SCANOUT_NANOS.swap(0, Ordering::Relaxed))
+    take(&SCANOUT_NANOS)
 }
 
 /// Time spent waiting for scanout work to complete since the last call, clearing
 /// the counter.
 pub fn take_scanout_retire_time() -> Duration {
-    Duration::from_nanos(SCANOUT_RETIRE_NANOS.swap(0, Ordering::Relaxed))
+    take(&SCANOUT_RETIRE_NANOS)
 }
 
 /// Times one text shaping run — layout *or* measurement. Both matter: a measure
@@ -130,25 +159,25 @@ impl Drop for ShapeTimer {
     fn drop(&mut self) {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            SHAPE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+            add(&SHAPE_NANOS, nanos);
         }
     }
 }
 
 /// Record one shaping run. Hold the guard for the shape.
 pub fn shape() -> ShapeTimer {
-    SHAPES.fetch_add(1, Ordering::Relaxed);
+    add(&SHAPES, 1);
     ShapeTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
 }
 
-/// Shaping runs since process start. The caller takes a delta across a frame.
+/// Shaping runs on this thread. The caller takes a delta across a frame.
 pub fn shapes() -> u64 {
-    SHAPES.load(Ordering::Relaxed)
+    SHAPES.with(Cell::get)
 }
 
 /// Time spent shaping since the last call, clearing the counter.
 pub fn take_shape_time() -> Duration {
-    Duration::from_nanos(SHAPE_NANOS.swap(0, Ordering::Relaxed))
+    take(&SHAPE_NANOS)
 }
 
 /// Record one `vkCmdDraw` covering `pixels` shaded fragments (the drawn quad clipped to its
@@ -159,32 +188,67 @@ pub fn take_shape_time() -> Duration {
 /// what a frame costs is how many fragments it shades, not how many draws it issues. Reported as
 /// an overdraw multiple of the output area, because that is the form you can act on.
 pub fn draw(pixels: u64) {
-    DRAWS.fetch_add(1, Ordering::Relaxed);
-    SHADED.fetch_add(pixels, Ordering::Relaxed);
+    add(&DRAWS, 1);
+    add(&SHADED, pixels);
 }
 
-/// Fragments shaded since process start. The caller takes a delta across a frame.
+/// Fragments shaded on this thread. The caller takes a delta across a frame.
 pub fn shaded() -> u64 {
-    SHADED.load(Ordering::Relaxed)
+    SHADED.with(Cell::get)
 }
 
-/// Submits since process start. The caller takes a delta across a frame.
+/// Submits on this thread. The caller takes a delta across a frame.
 pub fn submits() -> u64 {
-    SUBMITS.load(Ordering::Relaxed)
+    SUBMITS.with(Cell::get)
 }
 
-/// Draws since process start. The caller takes a delta across a frame.
+/// Draws on this thread. The caller takes a delta across a frame.
 pub fn draws() -> u64 {
-    DRAWS.load(Ordering::Relaxed)
+    DRAWS.with(Cell::get)
 }
 
 /// Time spent enqueueing submits since the last call, clearing the counter.
 pub fn take_submit_time() -> Duration {
-    Duration::from_nanos(SUBMIT_NANOS.swap(0, Ordering::Relaxed))
+    take(&SUBMIT_NANOS)
 }
 
 /// Time spent waiting for submitted work to complete since the last call,
 /// clearing the counter.
 pub fn take_retire_time() -> Duration {
-    Duration::from_nanos(RETIRE_NANOS.swap(0, Ordering::Relaxed))
+    take(&RETIRE_NANOS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A counter must not see work another thread did. This is what makes an
+    /// assertion like "this repaint cost no submit" trustworthy under libtest,
+    /// which runs tests in parallel against their own renderers — as process-wide
+    /// atomics these counters made such tests fail on a neighbour's work.
+    #[test]
+    fn a_counter_does_not_see_another_threads_work() {
+        let before = (submits(), shapes(), draws());
+
+        std::thread::spawn(|| {
+            let _submit = submit(SubmitKind::Scanout);
+            let _shape = shape();
+            draw(1234);
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            (submits(), shapes(), draws()),
+            before,
+            "another thread's work landed in this thread's counters"
+        );
+
+        let _submit = submit(SubmitKind::Scanout);
+        assert_eq!(
+            submits(),
+            before.0 + 1,
+            "this thread's own submit is counted"
+        );
+    }
 }

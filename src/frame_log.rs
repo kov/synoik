@@ -51,19 +51,44 @@
 //! forced full, how many widget bakes ran (an uncached bake is a full GPU
 //! round-trip), and the overview/animation state.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Number of widget bakes that have run since the process started. A bake is an
-/// uncached rasterization into its own GPU texture — a render pass, a submit and
-/// a fence wait each — so a frame doing several is a prime stutter suspect.
-///
-/// A free-standing counter rather than a field because bakes happen deep inside
-/// widget code that has no reason to know about frame logging; the frame log
-/// samples the delta across a frame.
-static BAKES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Number of widget bakes this thread has run. A bake is an uncached
+    /// rasterization into its own GPU texture — a render pass, a submit and a
+    /// fence wait each — so a frame doing several is a prime stutter suspect.
+    ///
+    /// A free-standing counter rather than a field because bakes happen deep
+    /// inside widget code that has no reason to know about frame logging; the
+    /// frame log samples the delta across a frame.
+    ///
+    /// Per-thread rather than process-wide, because a bake runs on whichever
+    /// thread owns the `VulkanRenderer` that pays for it
+    /// (`ui::widget::bake_uncached_sized` takes `&mut VulkanRenderer`), and each
+    /// reader wants only its own thread's: the frame log samples the compositor
+    /// thread, and a test samples its own. As a process-wide count it was a
+    /// flake — libtest runs tests in parallel, so a test asserting "this repaint
+    /// re-baked nothing" could read a *different* test's bake and fail. Rare
+    /// enough to survive many green runs and then be blamed on whatever change
+    /// is in front of you; it surfaced under `NIRI_VK_VALIDATION=1`, which
+    /// perturbs timing enough to lose the race about one run in five.
+    static BAKES: Cell<u64> = const { Cell::new(0) };
+
+    /// Nanoseconds this thread spent baking during the frame being built.
+    ///
+    /// This lives *inside* the `collect` phase, which is where the live seat put
+    /// 22ms of a 31ms frame with only 18 elements on screen. A phase total says a
+    /// frame was slow; this says which part of the widget path it was in. Shaping
+    /// — the other half — is counted by [`niri_vk::stats`], because it happens on
+    /// both the draw and the measure path and only the renderer crate sees both.
+    ///
+    /// Per-thread for the same reason as [`BAKES`].
+    static BAKE_NANOS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Whether GPU timing was requested, sampled once. The renderer reads this at
 /// construction to decide whether to allocate a timestamp query pool, so it must
@@ -74,56 +99,43 @@ static GPU_TIMING: AtomicBool = AtomicBool::new(false);
 /// nanoseconds. The renderer adds each submit's measured duration; the frame log
 /// takes and clears it when the frame ends.
 ///
-/// Shared through a static for the same reason as [`BAKES`]: a `VulkanFrame` is
+/// A free-standing counter for the same reason as [`BAKES`]: a `VulkanFrame` is
 /// created in a dozen places that would otherwise all have to carry a handle to
-/// the log, and this is debug instrumentation, not a data path.
+/// the log, and this is debug instrumentation, not a data path. Process-wide
+/// rather than per-thread because nothing asserts on it.
 static GPU_NANOS: AtomicU64 = AtomicU64::new(0);
-
-/// Nanoseconds spent baking during the frame being built.
-///
-/// This lives *inside* the `collect` phase, which is where the live seat put 22ms
-/// of a 31ms frame with only 18 elements on screen. A phase total says a frame was
-/// slow; this says which part of the widget path it was in. Shaping — the other
-/// half — is counted by [`niri_vk::stats`], because it happens on both the draw
-/// and the measure path and only the renderer crate sees both.
-static BAKE_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether anything is listening. Sampled by the scoped timers so an unlogged
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Accumulates its lifetime into a counter when dropped. Inert when frame logging
-/// is off, so call sites can be unconditional.
-pub struct Timed(Option<Instant>, &'static AtomicU64);
+/// Accumulates its lifetime into this thread's bake time when dropped. Inert when
+/// frame logging is off, so call sites can be unconditional.
+pub struct Timed(Option<Instant>);
 
 impl Drop for Timed {
     fn drop(&mut self) {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.1.fetch_add(nanos, Ordering::Relaxed);
+            BAKE_NANOS.with(|c| c.set(c.get().saturating_add(nanos)));
         }
     }
-}
-
-fn timed(counter: &'static AtomicU64) -> Timed {
-    Timed(ENABLED.load(Ordering::Relaxed).then(Instant::now), counter)
 }
 
 /// Time a widget bake — an uncached rasterization into its own GPU texture. Hold
 /// the returned guard for the operation.
 pub fn time_bake() -> Timed {
-    // Relaxed throughout: these counters are read on the same thread that writes
-    // them in the common case, and a torn count in a debug log is not a problem
-    // worth an ordering for.
-    BAKES.fetch_add(1, Ordering::Relaxed);
-    timed(&BAKE_NANOS)
+    BAKES.with(|c| c.set(c.get().saturating_add(1)));
+    Timed(ENABLED.load(Ordering::Relaxed).then(Instant::now))
 }
 
-/// Widget bakes since process start. Exposed so a test can assert that a repaint did
-/// **not** re-bake — a bake is a GPU round trip, so "did this stay cached?" is a
-/// correctness question about frame cost that pixels cannot answer.
+/// Widget bakes **this thread** has run since it started. Exposed so a test can
+/// assert that a repaint did **not** re-bake — a bake is a GPU round trip, so "did
+/// this stay cached?" is a correctness question about frame cost that pixels
+/// cannot answer. A test owns its renderer, so its own thread's count is exactly
+/// the bakes it caused; see [`BAKES`].
 pub fn bakes() -> u64 {
-    BAKES.load(Ordering::Relaxed)
+    BAKES.with(Cell::get)
 }
 
 /// Whether the renderer should measure GPU pass durations. See [`FrameLog::from_env`].
@@ -418,7 +430,7 @@ impl FrameLog {
             phase_started: now,
             phase: None,
             spans: Vec::with_capacity(Phase::ALL.len()),
-            bakes_at_start: BAKES.load(Ordering::Relaxed),
+            bakes_at_start: bakes(),
             shapes_at_start: niri_vk::stats::shapes(),
             submits_at_start: niri_vk::stats::submits(),
             scanout_at_start: niri_vk::stats::scanout_submits(),
@@ -469,8 +481,8 @@ impl FrameLog {
         let total = now - frame.started;
         let totals = Totals {
             gpu: take_gpu_time(),
-            bakes: BAKES.load(Ordering::Relaxed) - frame.bakes_at_start,
-            baking: Duration::from_nanos(BAKE_NANOS.swap(0, Ordering::Relaxed)),
+            bakes: bakes() - frame.bakes_at_start,
+            baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
             shapes: niri_vk::stats::shapes() - frame.shapes_at_start,
             shaping: niri_vk::stats::take_shape_time(),
             submits: niri_vk::stats::submits() - frame.submits_at_start,
@@ -833,6 +845,23 @@ mod tests {
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
         assert!(line.contains("waiting 8.00ms on earlier work"), "{line}");
+    }
+
+    /// The bake counter must not see another thread's bakes, or a test asserting
+    /// "this repaint re-baked nothing" fails on a neighbour's work — which it did,
+    /// rarely, while the counter was process-wide. See [`BAKES`].
+    #[test]
+    fn a_bake_on_another_thread_is_not_counted_here() {
+        let before = bakes();
+        std::thread::spawn(|| drop(time_bake())).join().unwrap();
+        assert_eq!(
+            bakes(),
+            before,
+            "another thread's bake landed in this thread's count"
+        );
+
+        let _bake = time_bake();
+        assert_eq!(bakes(), before + 1, "this thread's own bake is counted");
     }
 
     /// Phase marks name the work that *follows* them, and the totals add up.
