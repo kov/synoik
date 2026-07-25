@@ -52,19 +52,25 @@ frame prints:
 ```
 frame on Virtual-1 took 17.54ms (budget 16.67ms) — elements 0.15ms collect 3.16ms submit 14.15ms
 queue 0.05ms callbacks 0.01ms captures 0.01ms; 98 elements, 138 draws covering 2.0x the output,
-2 submits in 0.09ms, waiting 14.97ms (1 to scanout in 0.05ms, waiting 12.69ms),
+2 submits in 0.09ms, waiting 14.97ms (1 scanout in 12.69ms, 1 upload in 2.28ms),
 1 bakes in 2.57ms, animating, overview 0.56
 ```
 
-(This frame was captured before enqueue and wait were timed apart, so its two
-enqueue figures are reconstructed; everything else is as logged.)
+(Captured before enqueue and wait were timed apart and before submits were attributed
+by site, so the parenthetical is reconstructed; everything else is as logged.)
 
 Each field exists because an earlier guess was wrong without it:
 
 - **phases** in run order (elements / collect / submit / queue / callbacks / captures).
 - **elements** — the *collected* list, not a redraw count. Damage tracking culls before recording.
 - **draws** and **covering N.Nx the output** — shaded fragments as a multiple of output area.
-- **submits, and how many were to scanout** — the two are different by an order of magnitude.
+- **submits, and where each came from** — the parenthetical is one entry per submit *site*
+  (scanout / dmabuf / offscreen / capture / upload / transition / blur / readback), worst wait
+  first. Added once the scanout wait was gone and the remaining 7–27 round trips per frame became
+  the cost: a bake, an upload and a blur chain are three different fixes, and until this the line
+  could only say how many. The site is the **caller**, not the target — keying on the target
+  counted every screencast render and every mid-frame capture flush as "scanout", which is why
+  "1 to scanout" used to be an unreliable name for the one submit that costs a refresh interval.
 - **enqueue time vs `waiting`** — `vkQueueSubmit` against the fence wait after it. Split because
   the fix under consideration moves the wait rather than removing it, and one number cannot tell
   those apart (`7b5f016d`). A frame that waits for work it did not submit says so.

@@ -106,7 +106,7 @@ impl BackdropBlur {
         };
         let (w, h) = self.size;
         let gpu = &self.gpu;
-        gpu.run_commands(self.pool, |cbuf| {
+        gpu.run_commands(self.pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
             bs.chain.record(gpu, cbuf, offset);
             bs.chain.copy_output_to(gpu, cbuf, bs.output.image(), w, h);
         })?;

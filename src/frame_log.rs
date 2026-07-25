@@ -285,7 +285,6 @@ struct InFlight {
     bakes_at_start: u64,
     shapes_at_start: u64,
     submits_at_start: u64,
-    scanout_at_start: u64,
     draws_at_start: u64,
     shaded_at_start: u64,
     context: FrameContext,
@@ -313,11 +312,10 @@ struct Totals {
     /// shows up in that frame's retire. Carries no count, because a retire need not
     /// belong to the frame that issued its submit.
     retiring: Duration,
-    /// Of those, the ones rendering into the scanout buffer. Called out separately because on
-    /// this stack they cost a different order of magnitude from every other submit.
-    scanout_submits: u64,
-    scanout_submitting: Duration,
-    scanout_retiring: Duration,
+    /// The same submits, broken down by where they came from. Without this the line says a
+    /// frame made fifteen round trips and nothing about which fifteen — and the fix for a bake
+    /// is not the fix for an upload. Indexed by `SubmitSite::ALL`'s order.
+    sites: [niri_vk::stats::SiteTotals; niri_vk::stats::SubmitSite::ALL.len()],
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -433,7 +431,6 @@ impl FrameLog {
             bakes_at_start: bakes(),
             shapes_at_start: niri_vk::stats::shapes(),
             submits_at_start: niri_vk::stats::submits(),
-            scanout_at_start: niri_vk::stats::scanout_submits(),
             draws_at_start: niri_vk::stats::draws(),
             shaded_at_start: niri_vk::stats::shaded(),
             context: FrameContext::default(),
@@ -488,9 +485,7 @@ impl FrameLog {
             submits: niri_vk::stats::submits() - frame.submits_at_start,
             submitting: niri_vk::stats::take_submit_time(),
             retiring: niri_vk::stats::take_retire_time(),
-            scanout_submits: niri_vk::stats::scanout_submits() - frame.scanout_at_start,
-            scanout_submitting: niri_vk::stats::take_scanout_submit_time(),
-            scanout_retiring: niri_vk::stats::take_scanout_retire_time(),
+            sites: niri_vk::stats::take_sites(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -572,15 +567,24 @@ impl FrameLog {
             if !totals.retiring.is_zero() {
                 let _ = write!(line, ", waiting {}", ms(totals.retiring));
             }
-            if totals.scanout_submits > 0 {
-                let _ = write!(
-                    line,
-                    " ({} to scanout in {}",
-                    totals.scanout_submits,
-                    ms(totals.scanout_submitting)
-                );
-                if !totals.scanout_retiring.is_zero() {
-                    let _ = write!(line, ", waiting {}", ms(totals.scanout_retiring));
+            // Where they came from, worst wait first. A frame's round trips used to be one
+            // undifferentiated number, which said a frame made fifteen of them and nothing about
+            // which — and a bake, an upload and a blur chain are three different fixes. Sites that
+            // submitted nothing are omitted; a site that submitted and waited for nothing prints
+            // `0.00ms`, which is the whole point on a deferred scanout.
+            let mut by_site: Vec<_> = niri_vk::stats::SubmitSite::ALL
+                .iter()
+                .zip(&totals.sites)
+                .filter(|(_, t)| t.submits > 0)
+                .collect();
+            by_site.sort_by_key(|(_, t)| std::cmp::Reverse(t.retiring));
+            if !by_site.is_empty() {
+                line.push_str(" (");
+                for (i, (site, t)) in by_site.iter().enumerate() {
+                    if i > 0 {
+                        line.push_str(", ");
+                    }
+                    let _ = write!(line, "{} {} in {}", t.submits, site.label(), ms(t.retiring));
                 }
                 line.push(')');
             }
@@ -730,6 +734,8 @@ fn ms(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use niri_vk::stats::SubmitSite;
+
     use super::*;
 
     /// The env-var grammar, since it is the only interface this has.
@@ -774,6 +780,24 @@ mod tests {
         assert!(FrameLog::parse("all,off").is_none());
     }
 
+    /// Per-site totals from `(site, submits, waited)` triples, for the log-line tests. The
+    /// submit-enqueue time is left at zero: the line reports the *wait* per site, since that is
+    /// where a frame's budget goes.
+    fn sites(
+        entries: &[(SubmitSite, u64, Duration)],
+    ) -> [niri_vk::stats::SiteTotals; SubmitSite::ALL.len()] {
+        let mut out = [niri_vk::stats::SiteTotals::default(); SubmitSite::ALL.len()];
+        for (site, submits, retiring) in entries {
+            let i = SubmitSite::ALL.iter().position(|s| s == site).unwrap();
+            out[i] = niri_vk::stats::SiteTotals {
+                submits: *submits,
+                submitting: Duration::ZERO,
+                retiring: *retiring,
+            };
+        }
+        out
+    }
+
     /// A frame that submitted nothing but paid a wait, for the log line below.
     fn empty_frame() -> InFlight {
         let now = Instant::now();
@@ -786,7 +810,6 @@ mod tests {
             bakes_at_start: 0,
             shapes_at_start: 0,
             submits_at_start: 0,
-            scanout_at_start: 0,
             draws_at_start: 0,
             shaded_at_start: 0,
             context: FrameContext::default(),
@@ -808,31 +831,33 @@ mod tests {
             submits: 2,
             submitting: Duration::from_micros(90),
             retiring: Duration::from_millis(14),
-            scanout_submits: 1,
-            scanout_submitting: Duration::from_micros(50),
-            scanout_retiring: Duration::from_micros(12690),
+            sites: sites(&[
+                (SubmitSite::KmsFrame, 1, Duration::from_micros(12690)),
+                (SubmitSite::Upload, 1, Duration::from_micros(1310)),
+            ]),
             ..Totals::default()
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
         assert!(
             line.contains(
-                "2 submits in 0.09ms, waiting 14.00ms (1 to scanout in 0.05ms, waiting 12.69ms)"
+                "2 submits in 0.09ms, waiting 14.00ms (1 scanout in 12.69ms, 1 upload in 1.31ms)"
             ),
             "{line}"
         );
 
-        // The shape the fix is aiming for: the submit stays, its wait is gone.
-        // Nothing is printed in its place, so the absence is what you read.
+        // The shape the fix is aiming for: the submit stays, its wait is gone. The site still
+        // reports — with a zero — because "the scanout submit waited for nothing" is the result,
+        // and a site that vanished from the line would be indistinguishable from one that never
+        // submitted.
         let totals = Totals {
             submits: 1,
             submitting: Duration::from_micros(90),
-            scanout_submits: 1,
-            scanout_submitting: Duration::from_micros(50),
+            sites: sites(&[(SubmitSite::KmsFrame, 1, Duration::ZERO)]),
             ..Totals::default()
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(4), &totals, None);
         assert!(
-            line.contains("1 submits in 0.09ms (1 to scanout in 0.05ms)"),
+            line.contains("1 submits in 0.09ms (1 scanout in 0.00ms)"),
             "{line}"
         );
         assert!(!line.contains("waiting"), "{line}");

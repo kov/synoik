@@ -391,7 +391,7 @@ impl RenderTarget {
         let buf_mem = unsafe { device.allocate_memory(&alloc, None) }.context("readback memory")?;
         unsafe { device.bind_buffer_memory(buffer, buf_mem, 0)? };
 
-        gpu.run_commands(pool, |cbuf| unsafe {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Readback, |cbuf| unsafe {
             let region = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,

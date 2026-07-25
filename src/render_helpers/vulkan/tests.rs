@@ -3362,6 +3362,131 @@ fn every_submit_is_chained_on_the_queue_timeline() {
     );
 }
 
+/// **A submit is counted where it came from, not by what it renders into.**
+///
+/// A frame on the live seat makes 7–27 round trips and, until this split, the log could say only
+/// how many. That is not enough to act on: a widget bake, a glyph upload and a blur chain are
+/// three different fixes, and the one submit that costs a refresh interval was lumped in with
+/// every screencast render because the counter keyed on `fb.offscreen`.
+///
+/// Asserting the counts is the only option — a misattributed submit renders identically.
+#[test]
+fn a_submit_is_counted_at_the_site_that_made_it() {
+    use niri_vk::stats::SubmitSite;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_submit_is_counted_at_the_site_that_made_it: no device ({e})");
+            return;
+        }
+    };
+    let at = |sites: &[niri_vk::stats::SiteTotals], site: SubmitSite| {
+        sites[SubmitSite::ALL.iter().position(|s| *s == site).unwrap()].submits
+    };
+
+    // Clear whatever this thread has accumulated (renderer construction submits).
+    let _ = niri_vk::stats::take_sites();
+
+    // A glyph upload: host memory into the atlas, through `run_commands`.
+    vk.build_glyph_run("sited", 20.0).expect("glyph run");
+    let sites = niri_vk::stats::take_sites();
+    assert!(
+        at(&sites, SubmitSite::Upload) > 0,
+        "a glyph upload was not counted as an upload"
+    );
+    assert_eq!(
+        at(&sites, SubmitSite::OffscreenFrame),
+        0,
+        "an upload was counted as a rendered frame"
+    );
+
+    // An offscreen render: a frame, but not one anybody scans out.
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .expect("target");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk
+            .render(&mut fb, Size::from((16, 16)), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(1., 0., 0., 1.),
+                &[Rectangle::from_size((16, 16).into())],
+            )
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    let sites = niri_vk::stats::take_sites();
+    assert_eq!(
+        at(&sites, SubmitSite::OffscreenFrame),
+        1,
+        "an offscreen frame's finish was not counted as an offscreen frame"
+    );
+    assert_eq!(
+        at(&sites, SubmitSite::KmsFrame),
+        0,
+        "an offscreen render was counted as the frame going to KMS — the count that is supposed \
+         to name the one expensive submit"
+    );
+
+    // The case the old counter got wrong. A screencast or screencopy render targets a dmabuf too,
+    // and keying on the target alone counted it as scanout — so "N to scanout" meant "N
+    // non-offscreen frames", and the one submit worth naming was buried among them. What tells
+    // them apart is whether the tty backend is asking for this frame, which it is not here.
+    let Some(mut dmabuf) = gbm_scanout_dmabuf(Fourcc::Abgr8888) else {
+        eprintln!("a_submit_is_counted_at_the_site_that_made_it: no GBM, skipping the dmabuf half");
+        return;
+    };
+    {
+        let mut fb = vk.bind(&mut dmabuf).expect("bind dmabuf");
+        let mut frame = vk
+            .render(&mut fb, Size::from((64, 64)), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 0., 1., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    let sites = niri_vk::stats::take_sites();
+    assert_eq!(
+        at(&sites, SubmitSite::DmabufFrame),
+        1,
+        "a dmabuf render outside the tty's frame was not counted as one"
+    );
+    assert_eq!(
+        at(&sites, SubmitSite::KmsFrame),
+        0,
+        "a render into a dmabuf nobody scans out was counted as the scanout submit"
+    );
+}
+
+/// A 64×64 LINEAR scanout dmabuf, or `None` where GBM cannot provide one (no render node, no
+/// GBM, or the format is unsupported) so the caller can skip that half of its assertions.
+fn gbm_scanout_dmabuf(fourcc: Fourcc) -> Option<smithay::backend::allocator::dmabuf::Dmabuf> {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+        .ok()?;
+    let gbm = GbmDevice::new(file).ok()?;
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let bo = alloc
+        .create_buffer(64, 64, fourcc, &[Modifier::Linear])
+        .ok()?;
+    bo.export().ok()
+}
+
 /// **A deferred scanout finish hands back a real fence, and everything after it still sees a
 /// finished frame.**
 ///

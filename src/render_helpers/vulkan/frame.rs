@@ -1011,14 +1011,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.end_command_buffer(old_cbuf)?;
             let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
             {
-                let _timed = niri_vk::stats::submit(self.submit_kind());
+                let _timed = niri_vk::stats::submit(niri_vk::stats::SubmitSite::CaptureFlush);
                 self.renderer
                     .gpu
                     .submit(std::slice::from_ref(&old_cbuf), fence)
                     .map_err(VulkanError::from)?;
             }
             {
-                let _timed = niri_vk::stats::retire(self.submit_kind());
+                let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitSite::CaptureFlush);
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             }
             dev.destroy_fence(fence, None);
@@ -1453,13 +1453,19 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         present.set_layout(vk::ImageLayout::GENERAL);
     }
 
-    /// Whether this frame is drawing into a scanout buffer or an offscreen. See
-    /// [`niri_vk::stats::SubmitKind`].
-    fn submit_kind(&self) -> niri_vk::stats::SubmitKind {
+    /// Which submit this frame's `finish` is. See [`niri_vk::stats::SubmitSite`].
+    ///
+    /// The target alone does not answer it: a screencast or screencopy render is a dmabuf too, and
+    /// counting those as scanout is what made "N to scanout" mean "N non-offscreen frames" instead
+    /// of the one submit that costs a refresh interval. What separates them is whether the tty
+    /// backend is asking for this frame — the same permission the deferred finish rides on.
+    fn submit_site(&self) -> niri_vk::stats::SubmitSite {
         if self.fb.offscreen {
-            niri_vk::stats::SubmitKind::Offscreen
+            niri_vk::stats::SubmitSite::OffscreenFrame
+        } else if self.renderer.finish_is_for_kms() {
+            niri_vk::stats::SubmitSite::KmsFrame
         } else {
-            niri_vk::stats::SubmitKind::Scanout
+            niri_vk::stats::SubmitSite::DmabufFrame
         }
     }
 
@@ -1514,7 +1520,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             };
 
             let timeline = {
-                let _timed = niri_vk::stats::submit(self.submit_kind());
+                let _timed = niri_vk::stats::submit(self.submit_site());
                 self.renderer
                     .gpu
                     .submit(std::slice::from_ref(&self.cbuf), fence)
@@ -1549,7 +1555,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // 12–14 ms of its budget, and it is the one this renderer means to stop paying on
             // the compositor thread. See `docs/fork/renderer-synchronous-submits.md`.
             {
-                let _timed = niri_vk::stats::retire(self.submit_kind());
+                let _timed = niri_vk::stats::retire(self.submit_site());
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             }
             dev.destroy_fence(fence, None);

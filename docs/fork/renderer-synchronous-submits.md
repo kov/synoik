@@ -324,7 +324,8 @@ as scanout, and so does every mid-frame capture flush of the KMS frame. `N to sc
 not "the frame that went to KMS", and the frame line's `N bakes` counts only *widget* bakes, while
 window previews, snapshots, `ClosingWindow`, xray and effect buffers submit without being bakes.
 A frame from the seat reads `36 elements, 67 draws covering 0.3x the output, 15 submits, waiting
-15.58ms, 1 bakes in 1.13ms`: **fourteen submits attributable to nothing.**
+15.58ms, 1 bakes in 1.13ms`: **fourteen submits attributable to nothing.** (Fixed by slice 0
+below; the numbers in this section are what the counters said before it.)
 
 The leading code-grounded hypothesis, from the review: **N xray/translucent surfaces × 2 submits
 each** — one offscreen re-render of the effect buffer (`effect_buffer.rs:288`) plus one
@@ -406,11 +407,14 @@ and the first draft of this section said none of this:
 
 ### Proposed slices
 
-0. **Attribute the submits. No behaviour change.** Give a submit a label of where it came from —
-   and note the label must *not* key on `fb.offscreen`, which is what makes today's counters
-   misleading — then print the top few in the frame line. It decides everything below: if the
-   fourteen are effect-buffer re-renders and blurs, slices 1–2 are the whole fix and 3–4 are not
-   worth building.
+0. ~~**Attribute the submits. No behaviour change.**~~ **Done.** `SubmitKind` (offscreen/scanout,
+   keyed on the target) became `SubmitSite`, keyed on the caller: scanout / dmabuf / offscreen /
+   capture / upload / transition / blur / readback. The frame line now ends its submit clause with
+   one entry per site, worst wait first. Two things fall out immediately: a screencast render and
+   a mid-frame capture flush are no longer counted as scanout, and the fourteen unattributed
+   submits will name themselves on the next seat run. Pinned by
+   `a_submit_is_counted_at_the_site_that_made_it`, whose dmabuf half fails against the old
+   target-keyed logic.
 1. **Let offscreen frames defer.** Two things the first draft got wrong: this is *not* removing
    the `!fb.offscreen` clause (`frame.rs:1502`), because `finish_may_defer` is only true inside the
    tty bracket around `render_frame` (`tty.rs:2892`) and every offscreen finish happens earlier,

@@ -157,7 +157,7 @@ fn render_scene(gpu: &Gpu) -> Result<Vec<u8>> {
     let rounded_quad = column(144.0, GREEN, 26.0);
     let textured_quad = column(272.0, WHITE, 0.0);
 
-    gpu.run_commands(pool, |cbuf| {
+    gpu.run_commands(pool, niri_vk::stats::SubmitSite::OffscreenFrame, |cbuf| {
         target.begin(gpu, cbuf, unorm(CLEAR));
         solid.draw(gpu, cbuf, &solid_quad, None);
         rounded.draw(gpu, cbuf, &rounded_quad, None);
@@ -231,7 +231,9 @@ fn render_blur(gpu: &Gpu) -> Result<Vec<u8>> {
     let source = Texture::from_rgba(gpu, pool, SRC_W, SRC_H, &src, vk::Filter::LINEAR)?;
     let chain = BlurChain::new(gpu, &source, BLUR_PASSES)?;
 
-    gpu.run_commands(pool, |cbuf| chain.record(gpu, cbuf, BLUR_OFFSET))?;
+    gpu.run_commands(pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
+        chain.record(gpu, cbuf, BLUR_OFFSET)
+    })?;
     let (ow, oh) = chain.output_size();
     anyhow::ensure!(
         (ow, oh) == (SRC_W, SRC_H),
@@ -326,7 +328,7 @@ fn render_text(gpu: &Gpu) -> Result<Vec<u8>> {
     unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
 
     let dims = [TW as f32, TH as f32];
-    gpu.run_commands(pool, |cbuf| {
+    gpu.run_commands(pool, niri_vk::stats::SubmitSite::OffscreenFrame, |cbuf| {
         target.begin(gpu, cbuf, unorm(TEXT_BG));
         renderer.draw(
             gpu,
@@ -437,7 +439,7 @@ fn render_dmabuf(gpu: &Gpu) -> Result<Option<Vec<u8>>> {
         target: dims,
         ..Default::default()
     };
-    gpu.run_commands(pool, |cbuf| {
+    gpu.run_commands(pool, niri_vk::stats::SubmitSite::OffscreenFrame, |cbuf| {
         target.begin(gpu, cbuf, unorm(CLEAR));
         textured.draw(gpu, cbuf, &quad, Some(set));
         unsafe { gpu.device.cmd_end_render_pass(cbuf) };

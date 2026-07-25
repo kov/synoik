@@ -44,9 +44,6 @@ thread_local! {
     static SUBMITS: Cell<u64> = const { Cell::new(0) };
     static SUBMIT_NANOS: Cell<u64> = const { Cell::new(0) };
     static RETIRE_NANOS: Cell<u64> = const { Cell::new(0) };
-    static SCANOUT_SUBMITS: Cell<u64> = const { Cell::new(0) };
-    static SCANOUT_NANOS: Cell<u64> = const { Cell::new(0) };
-    static SCANOUT_RETIRE_NANOS: Cell<u64> = const { Cell::new(0) };
     static DRAWS: Cell<u64> = const { Cell::new(0) };
     static SHADED: Cell<u64> = const { Cell::new(0) };
     static SHAPES: Cell<u64> = const { Cell::new(0) };
@@ -71,23 +68,117 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// What a submit renders into. Worth telling apart: on this stack a submit into an
-/// offscreen costs a fraction of a millisecond, while one into the KMS scanout buffer
-/// costs most of a refresh interval — which is a different problem with a different fix.
+/// Where a submit came from.
+///
+/// The renderer has exactly two places that call `vkQueueSubmit` — a frame's `finish` and
+/// `Gpu::run_commands` — so without a label every round trip a frame makes outside the one going
+/// to KMS is indistinguishable from every other. On the live seat a frame issues 7–27 of them and
+/// they are now what puts it over budget, and "which ones" is not answerable from the counters.
+///
+/// The split that matters is **not** what the submit renders into: a screencast render and a
+/// mid-frame capture flush both target a non-offscreen buffer, and neither costs what the scanout
+/// submit costs. Naming the *caller* is what makes the frame line say something.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SubmitKind {
-    /// An offscreen texture, an upload, a transition, a blur chain, a readback.
-    Offscreen,
-    /// The dmabuf a display controller scans out.
-    Scanout,
+pub enum SubmitSite {
+    /// The frame a display controller scans out. The expensive one, and the only one whose fence
+    /// has somewhere to go.
+    KmsFrame,
+    /// A frame rendered into a dmabuf that is not a scanout target: a screencast or screencopy
+    /// buffer, whose consumer expects it finished.
+    DmabufFrame,
+    /// A frame rendered into an offscreen texture: a widget bake, a window preview, a snapshot,
+    /// an xray or effect buffer.
+    OffscreenFrame,
+    /// A frame cut in half mid-record, so a captured region is complete before the separately
+    /// submitted blur that samples it.
+    CaptureFlush,
+    /// Host memory into a texture: an icon, an shm client buffer, glyph coverage.
+    Upload,
+    /// A layout transition or queue-family acquire on a command buffer of its own.
+    Transition,
+    /// A dual-Kawase blur chain.
+    Blur,
+    /// Pixels back to the CPU. Always synchronous by definition.
+    Readback,
 }
 
-/// Banks its lifetime into a total and, for a scanout, into that kind's total as
-/// well. Inert when timing is off, so call sites can be unconditional.
+impl SubmitSite {
+    /// Every site, in the order they are reported. Keep this exhaustive — a site missing here is
+    /// simply invisible, which is the problem this type exists to fix.
+    pub const ALL: [SubmitSite; 8] = [
+        SubmitSite::KmsFrame,
+        SubmitSite::DmabufFrame,
+        SubmitSite::OffscreenFrame,
+        SubmitSite::CaptureFlush,
+        SubmitSite::Upload,
+        SubmitSite::Transition,
+        SubmitSite::Blur,
+        SubmitSite::Readback,
+    ];
+
+    /// How it appears in the frame line. Short: several of these share one line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SubmitSite::KmsFrame => "scanout",
+            SubmitSite::DmabufFrame => "dmabuf",
+            SubmitSite::OffscreenFrame => "offscreen",
+            SubmitSite::CaptureFlush => "capture",
+            SubmitSite::Upload => "upload",
+            SubmitSite::Transition => "transition",
+            SubmitSite::Blur => "blur",
+            SubmitSite::Readback => "readback",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// One site's share of a frame. Times are gated on [`set_enabled`]; the count never is.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SiteTotals {
+    pub submits: u64,
+    /// `vkQueueSubmit` alone.
+    pub submitting: Duration,
+    /// Waiting for it. Carries no count of its own — see [`retire`].
+    pub retiring: Duration,
+}
+
+impl SiteTotals {
+    const ZERO: SiteTotals = SiteTotals {
+        submits: 0,
+        submitting: Duration::ZERO,
+        retiring: Duration::ZERO,
+    };
+}
+
+thread_local! {
+    /// Per-site totals since the last [`take_sites`]. Take-and-clear rather than cumulative
+    /// (unlike [`submits`]) because a caller wants a frame's breakdown, never a running one.
+    static SITES: Cell<[SiteTotals; SubmitSite::ALL.len()]> =
+        const { Cell::new([SiteTotals::ZERO; SubmitSite::ALL.len()]) };
+}
+
+fn bank(site: SubmitSite, nanos: u64, retire: bool) {
+    let mut sites = SITES.with(Cell::get);
+    let slot = &mut sites[site.index()];
+    let d = Duration::from_nanos(nanos);
+    if retire {
+        slot.retiring = slot.retiring.saturating_add(d);
+    } else {
+        slot.submitting = slot.submitting.saturating_add(d);
+    }
+    SITES.set(sites);
+}
+
+/// Banks its lifetime into the running total and into its site's. Inert when timing
+/// is off, so call sites can be unconditional.
 pub struct SubmitTimer {
     started: Option<Instant>,
+    site: SubmitSite,
     total: &'static LocalKey<Cell<u64>>,
-    scanout: Option<&'static LocalKey<Cell<u64>>>,
+    retire: bool,
 }
 
 impl Drop for SubmitTimer {
@@ -95,34 +186,30 @@ impl Drop for SubmitTimer {
         if let Some(started) = self.started {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(self.total, nanos);
-            if let Some(scanout) = self.scanout {
-                add(scanout, nanos);
-            }
+            bank(self.site, nanos, self.retire);
         }
     }
 }
 
-fn timer(
-    kind: SubmitKind,
-    total: &'static LocalKey<Cell<u64>>,
-    scanout: &'static LocalKey<Cell<u64>>,
-) -> SubmitTimer {
+fn timer(site: SubmitSite, total: &'static LocalKey<Cell<u64>>, retire: bool) -> SubmitTimer {
     SubmitTimer {
         started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+        site,
         total,
-        scanout: (kind == SubmitKind::Scanout).then_some(scanout),
+        retire,
     }
 }
 
 /// Record one GPU round trip. Hold the guard across `vkQueueSubmit` only — the
 /// wait belongs to [`retire`]. Counted even when timing is off, so the count is
 /// always meaningful; only the clock reads are gated.
-pub fn submit(kind: SubmitKind) -> SubmitTimer {
+pub fn submit(site: SubmitSite) -> SubmitTimer {
     add(&SUBMITS, 1);
-    if kind == SubmitKind::Scanout {
-        add(&SCANOUT_SUBMITS, 1);
-    }
-    timer(kind, &SUBMIT_NANOS, &SCANOUT_NANOS)
+    let mut sites = SITES.with(Cell::get);
+    let slot = &mut sites[site.index()];
+    slot.submits = slot.submits.saturating_add(1);
+    SITES.set(sites);
+    timer(site, &SUBMIT_NANOS, false)
 }
 
 /// Time a wait for already-submitted work to complete. Hold the guard across the
@@ -130,24 +217,14 @@ pub fn submit(kind: SubmitKind) -> SubmitTimer {
 ///
 /// Uncounted on purpose: a retire is not a round trip of its own, and the frame
 /// that pays for one need not be the frame that issued the submit.
-pub fn retire(kind: SubmitKind) -> SubmitTimer {
-    timer(kind, &RETIRE_NANOS, &SCANOUT_RETIRE_NANOS)
+pub fn retire(site: SubmitSite) -> SubmitTimer {
+    timer(site, &RETIRE_NANOS, true)
 }
 
-/// Scanout submits on this thread. The caller takes a delta across a frame.
-pub fn scanout_submits() -> u64 {
-    SCANOUT_SUBMITS.with(Cell::get)
-}
-
-/// Time spent enqueueing scanout submits since the last call, clearing the counter.
-pub fn take_scanout_submit_time() -> Duration {
-    take(&SCANOUT_NANOS)
-}
-
-/// Time spent waiting for scanout work to complete since the last call, clearing
-/// the counter.
-pub fn take_scanout_retire_time() -> Duration {
-    take(&SCANOUT_RETIRE_NANOS)
+/// Every site's share since the last call, clearing them. Indexed by
+/// [`SubmitSite::ALL`]'s order.
+pub fn take_sites() -> [SiteTotals; SubmitSite::ALL.len()] {
+    SITES.replace([SiteTotals::ZERO; SubmitSite::ALL.len()])
 }
 
 /// Times one text shaping run — layout *or* measurement. Both matter: a measure
@@ -231,7 +308,7 @@ mod tests {
         let before = (submits(), shapes(), draws());
 
         std::thread::spawn(|| {
-            let _submit = submit(SubmitKind::Scanout);
+            let _submit = submit(SubmitSite::KmsFrame);
             let _shape = shape();
             draw(1234);
         })
@@ -244,7 +321,7 @@ mod tests {
             "another thread's work landed in this thread's counters"
         );
 
-        let _submit = submit(SubmitKind::Scanout);
+        let _submit = submit(SubmitSite::KmsFrame);
         assert_eq!(
             submits(),
             before.0 + 1,

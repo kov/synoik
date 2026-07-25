@@ -301,7 +301,7 @@ impl ImportedImage {
         } else {
             (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
         };
-        gpu.run_commands(pool, |cbuf| unsafe {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| unsafe {
             let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)

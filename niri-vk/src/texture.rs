@@ -203,18 +203,20 @@ impl<'a> TextureBatch<'a> {
             return Ok(Vec::new());
         }
 
-        let result = self.gpu.run_commands(self.pool, |cbuf| unsafe {
-            for p in &pending {
-                record_upload_copy(
-                    device,
-                    cbuf,
-                    p.texture.image,
-                    p.staging,
-                    p.texture.width,
-                    p.texture.height,
-                );
-            }
-        });
+        let result =
+            self.gpu
+                .run_commands(self.pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
+                    for p in &pending {
+                        record_upload_copy(
+                            device,
+                            cbuf,
+                            p.texture.image,
+                            p.staging,
+                            p.texture.width,
+                            p.texture.height,
+                        );
+                    }
+                });
 
         // The staging buffers have served their purpose (or the submit failed — `run_commands`
         // already drained the device on a wait error, so this can't race an in-flight copy).
@@ -724,7 +726,7 @@ impl Texture {
         } else {
             (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
         };
-        gpu.run_commands(pool, |cbuf| unsafe {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| unsafe {
             let barrier = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -858,7 +860,7 @@ impl Texture {
         pool: vk::CommandPool,
         old_layout: vk::ImageLayout,
     ) -> Result<()> {
-        gpu.run_commands(pool, |cbuf| {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| {
             self.record_reacquire_dmabuf_sampled(gpu, cbuf, old_layout)
         })
         .context("re-acquire imported sampled image")
@@ -886,7 +888,7 @@ impl Texture {
             texture,
         } = Self::build_pending(gpu, width, height, data, format, bpp, components, filter)?;
         let device = &gpu.device;
-        let result = gpu.run_commands(pool, |cbuf| unsafe {
+        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
             record_upload_copy(device, cbuf, texture.image, staging, width, height);
         });
         // The staging buffer has served its purpose either way; on a submit/wait error also
@@ -1088,7 +1090,7 @@ impl Texture {
         let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
         guard.sampler = sampler;
 
-        let result = gpu.run_commands(pool, |cbuf| unsafe {
+        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| unsafe {
             transition(
                 device,
                 cbuf,
@@ -1225,7 +1227,7 @@ impl Texture {
         }
 
         let image = self.image;
-        let result = gpu.run_commands(pool, |cbuf| unsafe {
+        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
             // Preserve what is already in the atlas: transition FROM the sampleable layout the
             // image is left in, not from UNDEFINED (which would license discarding it).
             transition(
@@ -1275,7 +1277,7 @@ impl Texture {
     /// in place instead of allocating a fresh image + staging buffer every commit.
     pub fn reupload_full(&self, gpu: &Gpu, pool: vk::CommandPool, staging: &Staging) -> Result<()> {
         let device = &gpu.device;
-        gpu.run_commands(pool, |cbuf| unsafe {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
             transition(
                 device,
                 cbuf,

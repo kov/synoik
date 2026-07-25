@@ -1010,113 +1010,117 @@ impl VulkanRenderer {
             Some(staging) => (staging.image(), 0, 0),
         };
 
-        self.gpu.run_commands(self.command_pool, |cbuf| unsafe {
-            if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                transition_image(
-                    dev,
+        self.gpu.run_commands(
+            self.command_pool,
+            niri_vk::stats::SubmitSite::Readback,
+            |cbuf| unsafe {
+                if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+                    transition_image(
+                        dev,
+                        cbuf,
+                        image,
+                        old_layout,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                }
+
+                if let Some(staging) = via {
+                    transition_image(
+                        dev,
+                        cbuf,
+                        staging.image(),
+                        staging.layout(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+
+                    let layers = vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    let blit = vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D { x, y, z: 0 },
+                            vk::Offset3D {
+                                x: x + w as i32,
+                                y: y + h as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: w as i32,
+                                y: h as i32,
+                                z: 1,
+                            },
+                        ]);
+                    dev.cmd_blit_image(
+                        cbuf,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        staging.image(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[blit],
+                        vk::Filter::NEAREST,
+                    );
+
+                    transition_image(
+                        dev,
+                        cbuf,
+                        staging.image(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                    );
+                }
+
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_offset(vk::Offset3D {
+                        x: copy_x,
+                        y: copy_y,
+                        z: 0,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    });
+                dev.cmd_copy_image_to_buffer(
                     cbuf,
-                    image,
-                    old_layout,
+                    copy_from,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
+                    buffer,
+                    &[region],
                 );
-            }
-
-            if let Some(staging) = via {
-                transition_image(
-                    dev,
+                let host = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ);
+                dev.cmd_pipeline_barrier(
                     cbuf,
-                    staging.image(),
-                    staging.layout(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_WRITE,
                     vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[host],
+                    &[],
+                    &[],
                 );
-
-                let layers = vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                let blit = vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D { x, y, z: 0 },
-                        vk::Offset3D {
-                            x: x + w as i32,
-                            y: y + h as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_subresource(layers)
-                    .dst_offsets([
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D {
-                            x: w as i32,
-                            y: h as i32,
-                            z: 1,
-                        },
-                    ]);
-                dev.cmd_blit_image(
-                    cbuf,
-                    image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    staging.image(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[blit],
-                    vk::Filter::NEAREST,
-                );
-
-                transition_image(
-                    dev,
-                    cbuf,
-                    staging.image(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
-                );
-            }
-
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D {
-                    x: copy_x,
-                    y: copy_y,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                });
-            dev.cmd_copy_image_to_buffer(
-                cbuf,
-                copy_from,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                buffer,
-                &[region],
-            );
-            let host = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ);
-            dev.cmd_pipeline_barrier(
-                cbuf,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[host],
-                &[],
-                &[],
-            );
-        })?;
+            },
+        )?;
         tex.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         if let Some(staging) = via {
             staging.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -1144,17 +1148,21 @@ impl VulkanRenderer {
             return Ok(());
         }
         let image = tex.image();
-        self.gpu.run_commands(self.command_pool, |cbuf| unsafe {
-            transition_image(
-                &self.gpu.device,
-                cbuf,
-                image,
-                old_layout,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            );
-        })?;
+        self.gpu.run_commands(
+            self.command_pool,
+            niri_vk::stats::SubmitSite::Transition,
+            |cbuf| unsafe {
+                transition_image(
+                    &self.gpu.device,
+                    cbuf,
+                    image,
+                    old_layout,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                );
+            },
+        )?;
         tex.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
     }
@@ -1182,7 +1190,7 @@ impl VulkanRenderer {
         let pool = self.command_pool;
         let passes = (options.passes as usize).clamp(1, 31);
         let chain = BlurChain::new(&gpu, source.niri_texture(), passes)?;
-        let recorded = gpu.run_commands(pool, |cbuf| {
+        let recorded = gpu.run_commands(pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
             chain.record(&gpu, cbuf, options.offset as f32);
             chain.copy_output_to(&gpu, cbuf, output.image(), w, h);
         });
@@ -1364,7 +1372,7 @@ impl VulkanRenderer {
         if self.in_flight.is_empty() {
             return;
         }
-        let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitKind::Scanout);
+        let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitSite::KmsFrame);
         unsafe { self.gpu.device.device_wait_idle() }.ok();
         self.retire_completed();
         // A device that cannot report its timeline leaves the records unretired above; the wait
@@ -1395,6 +1403,14 @@ impl VulkanRenderer {
             _held: held,
             _targets: targets,
         });
+    }
+
+    /// Whether the frame being finished is the one going to KMS — the tty backend's bracket, read
+    /// for what it says rather than for the permission it grants. Used to label the submit
+    /// ([`VulkanFrame::submit_site`]); unlike `should_defer_finish` it does not care whether the
+    /// session opted into deferring, because a frame is the KMS frame either way.
+    pub(super) fn finish_is_for_kms(&self) -> bool {
+        self.finish_may_defer
     }
 
     /// Tell the renderer whether the frame it is about to finish is the one going to KMS. The tty

@@ -93,7 +93,7 @@ impl EffectBlur {
     pub(crate) fn run(&mut self, offset: f32) -> Result<(), VulkanError> {
         let (w, h) = self.output.extent();
         let gpu = &self.gpu;
-        gpu.run_commands(self.pool, |cbuf| {
+        gpu.run_commands(self.pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
             self.chain.record(gpu, cbuf, offset);
             self.chain
                 .copy_output_to(gpu, cbuf, self.output.image(), w, h);

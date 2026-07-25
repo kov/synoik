@@ -355,7 +355,7 @@ impl BlurChain {
         )?;
         unsafe { device.bind_buffer_memory(buffer, mem, 0)? };
 
-        gpu.run_commands(pool, |cbuf| unsafe {
+        gpu.run_commands(pool, crate::stats::SubmitSite::Blur, |cbuf| unsafe {
             // SHADER_READ_ONLY (render pass final layout) → TRANSFER_SRC. The producing access is
             // the final upsample pass's color-attachment write (L0 is never fragment-sampled), so
             // the source scope must name that — otherwise the transition is only ordered by the

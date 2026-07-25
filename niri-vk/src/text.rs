@@ -972,7 +972,7 @@ mod tests {
         unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
 
         let dims = [tw as f32, th as f32];
-        gpu.run_commands(pool, |cbuf| {
+        gpu.run_commands(pool, crate::stats::SubmitSite::OffscreenFrame, |cbuf| {
             target.begin(gpu, cbuf, unorm(BG));
             renderer.draw(gpu, cbuf, set, run, atlas.side, origin, dims, unorm(FG));
             unsafe { gpu.device.cmd_end_render_pass(cbuf) };
