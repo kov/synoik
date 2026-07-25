@@ -150,7 +150,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind?;
 
     // --- 6. Verdict. --------------------------------------------------------------------------
-    println!("CONCLUSION: query=INVALID_EXTERNAL_HANDLE but import=SUCCESS → inconsistent");
+    //
+    // Conditional, because this reproducer outlived the bug: the host-side fix landed in our
+    // `virglrenderer` fork on 2026-07-04 (`patches/virglrenderer/0024`), and on a stack carrying it
+    // the query agrees with the import. Printing the failure verdict unconditionally meant a
+    // *passing* run reported itself as broken — which matters now that this run is the gate for
+    // dropping the guest-side fallback (see `../README.md`, "What the guest does when it lands").
+    match query {
+        Err(e) => println!(
+            "CONCLUSION: query={e:?} but import=SUCCESS → inconsistent (the reported bug \
+             reproduces on this stack)"
+        ),
+        Ok(()) => println!(
+            "CONCLUSION: query and import agree → FIXED on this stack. The \
+             `image_bits & fd_props_bits` masking pattern is safe here."
+        ),
+    }
 
     unsafe {
         device.free_memory(mem, None);

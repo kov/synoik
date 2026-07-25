@@ -252,6 +252,10 @@ impl ImportedImage {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
+        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
+        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
+        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
+        // makes every dmabuf import fail on an older VMM.
         // Prefer the memory types the driver says are valid for importing this fd, but treat the
         // query as best-effort — on Venus it can reject a perfectly importable dmabuf, so fall back
         // to the image's own requirements and let vkAllocateMemory be the real test.

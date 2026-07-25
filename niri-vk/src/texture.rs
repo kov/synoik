@@ -783,6 +783,10 @@ impl Texture {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
+        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
+        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
+        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
+        // makes every dmabuf import fail on an older VMM.
         // Prefer the memory types the driver reports valid for this fd, but treat the query as
         // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
         let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
@@ -944,6 +948,10 @@ impl Texture {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
+        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
+        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
+        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
+        // makes every dmabuf import fail on an older VMM.
         // Prefer the memory types the driver reports valid for this fd, but treat the query as
         // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
         let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);

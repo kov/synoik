@@ -241,3 +241,48 @@ meaning into it — that is also worth reporting upstream on its own.
 The path down to the driver is otherwise unremarkable: `dri_create_image_with_modifiers` only
 rejects a list that is *entirely* `DRM_FORMAT_MOD_INVALID` and otherwise forwards straight to
 `dri_create_image`, including with `modifiers = NULL, count = 0`.
+
+---
+
+## What the guest does when it lands — queued, blocked on a VMM deploy (2026-07-25)
+
+Issue 1's fix is in the `virglrenderer` fork, **not yet in the deployed VMM**. So the guest-side
+cleanup below is written down rather than done: dropping the fallback against a VMM that predates
+`patches/virglrenderer/0024` would turn every dmabuf import into "no importable memory type for the
+dmabuf" — i.e. every client window black, and the compositor's own scanout target failing to bind.
+Sequenced, not urgent: the fallback costs nothing while it waits.
+
+**The gate.** Run the reproducer on the target stack:
+
+```
+cd docs/fork/venus-bugs/repro-vk-getmemfdprops && cargo run --release
+```
+
+Its verdict line is now conditional, so it answers the question directly — `→ FIXED on this stack`
+means the masking pattern is safe, `→ inconsistent` means it is not. It must pass on **every**
+machine the fork runs on, not just the dev VM. (On this dev VM, 2026-07-25: it already passes.)
+
+**Then remove the fallback at all three import sites.** Each currently starts from the image's own
+`memory_type_bits` and only *narrows* by the query when it succeeds:
+
+| file | function |
+|---|---|
+| `niri-vk/src/texture.rs` | `Texture::import_dmabuf_render_target` |
+| `niri-vk/src/texture.rs` | `Texture::import_dmabuf_sampled` |
+| `niri-vk/src/dmabuf.rs` | `ImportedImage::import` (test-only `ForeignBuffer` path) |
+
+The replacement is the ordinary pattern the workaround exists to avoid: query, and treat a failure
+as fatal rather than shrugging and using the unmasked bits.
+
+**Why bother removing it at all**, given it is harmless today: the fallback silently accepts a
+memory type the driver never blessed. It is harmless *here* only because this device exposes
+exactly **one** memory type (`docs/fork/venus-cost.md` §9.2), so whenever the query succeeds its
+mask can only be `0b1` and the masking is a no-op — there is nothing for the fallback to get wrong.
+On a stack with several memory types — a different host driver, a real GPU passthrough — a query
+that failed for some unrelated reason would leave `trailing_zeros()` picking the lowest bit of an
+*unfiltered* mask, which need not be importable at all. It is a latent bug that this VM's single
+memory type is hiding, the same shape as the `renderer-gaps.md` entries.
+
+**Also worth doing in the same pass:** re-check whether `Gpu::check_modifier_features`' `Unlisted`
+best-effort path (`niri-vk/src/gpu.rs`) is still needed, since it was added under the same
+"the query lies here" assumption.
