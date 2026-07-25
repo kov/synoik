@@ -1,6 +1,14 @@
 # Reusable widget helpers — design (descoped after review)
 
-**Status:** design settled after an adversarial review; not yet sliced into commits.
+**Status (2026-07-25):** H4/H1/H2/H3 are **built and shipped** (slices A–C, §5); D+ ports are
+ongoing. Sections §1–§4 below are the *design intent* written before implementation and are kept
+for the reasoning; where the built code differs, **§9 is authoritative**.
+
+> **Looking for how the bake actually works?** Read **§9 — The bake as built**. It covers the
+> API family, the cache key and what each term is scar tissue for, the invalidations, why
+> `prepare`/`paint` are split, and the measured cost model. §4/H1 is the older sketch and its
+> signature and "makes it sampleable" step are both stale.
+
 **Decision (2026-07-22):** build the **narrow, St-aware** fix — four focused, reusable helpers
 that close the three recurring bug classes and de-duplicate the layer, shaped so they do **not**
 foreclose a future St API for extensions, but **without** a retained widget tree, an allocate/paint
@@ -254,3 +262,132 @@ scales; mru/hotkey caches with no content revision (a new mutable field wouldn't
   API closes the bug class without it.
 - **Byte-identical port gate** — won't hold across rounding changes and tests the un-broken scale-1
   case; replaced by cross-scale behavioral invariants (§6).
+
+## 9. The bake as built (2026-07-25)
+
+Authoritative description of the shipped helper. §4/H1 is the pre-implementation sketch; two of
+its details did not survive contact (the `paint` signature, and a `make_offscreen_sampleable`
+step that turned out to be unnecessary).
+
+### 9.1 What a bake is
+
+A **bake** renders a widget's chrome once into its own private GPU texture; every later frame
+composites that texture as a single quad. `bake_uncached_sized` (`src/ui/widget.rs`) is the whole
+operation:
+
+```rust
+let mut target = renderer.create_buffer(Abgr8888, phys)?;   // an offscreen texture
+let mut fb     = renderer.bind(&mut target)?;
+let mut frame  = renderer.render(&mut fb, phys, Normal)?;    // a VulkanFrame over it
+paint(&mut frame)?;                                          // the caller draws
+let _sync = frame.finish()?;                                 // submit + fence wait
+```
+
+**Why bake at all.** GNOME's chrome is expensive to draw and almost never changes. A quick-settings
+popover is dozens of rounded rects, hairlines and shaped text runs whose pixels are identical frame
+after frame. Redrawing per frame re-runs every draw call and re-shapes every string. Baking pays
+that on a cache miss and reduces the steady state to one textured quad.
+
+There is deliberately **no `make_offscreen_sampleable` call** afterwards: finishing a frame that
+targets an offscreen already leaves it in `SHADER_READ_ONLY_OPTIMAL`, with the layout transition
+riding that submit. The separate transition used to cost its own command buffer, submit and fence
+wait — and as §9.5 shows, round trips are essentially the entire cost of a bake.
+
+### 9.2 The family, and which widget uses which
+
+Every entry point funnels into `bake_uncached_sized`, so the counter and timer
+(`frame_log::time_bake`) live there and catch all of them.
+
+| entry point | cache | used by |
+|---|---|---|
+| `bake` | `BakeCache`, key `(scale, phys_w, phys_h)` | app_grid, end_session_dialog, input_source_menu, overview_search, dash, window_preview |
+| `bake_content` | `ContentCache`, key `(scale)` | run_dialog, config_error_notification, exit_confirm_dialog, hotkey_overlay |
+| `bake_uncached` | none | notification_card |
+| `bake_uncached_sized` | caller's own | calendar, screenshot_ui, mru, quick_settings, panel |
+| `bake_card_shadow` / `_border` / `_fill` | `BakeCache` | popover, notification_banner |
+
+`bake_content` exists because a dialog's size is **derived from its shaped text** and is not known
+until `prepare` has run — so size cannot be part of its key, and the revision carries the whole
+content identity instead. `bake_uncached` exists because some animations re-bake every frame by
+design (the panel workspace-dot morph, the QS pill fill-fade); a cache would only be overhead.
+
+### 9.3 The cache key, and what each term is scar tissue for
+
+`bake`'s key is `(scale, physical_width, physical_height)`, with the stored value carrying
+`(revision, texture)` — so a revision change **overwrites** its entry rather than accreting one.
+
+- **`scale`** — a texture baked at scale 1 is simply wrong at scale 2.
+- **physical size** — this term is the fix for `128d112e`. The calendar popover's background keyed
+  on content shape alone, so when notifications arrived while it was open the background stayed
+  frozen at its open-time height and the new cards drew *below* it. Folding the physical size in
+  makes that class structurally impossible: a size change cannot hit a stale entry. It also means a
+  broken `revision` is partly masked, which is why a revision should be *derived* from everything
+  that affects the bake rather than hand-bumped.
+- **`revision`** — content changes the size does not capture (hover state, text, counts).
+
+### 9.4 The two invalidations that are not in the key
+
+Both live on the cache, checked on every call, and both are bug scars:
+
+- **`context: ContextId`** — textures belong to a renderer. A recreated renderer invalidates every
+  one of them, and handing out the old handle samples an image destroyed with its device. Every
+  texture cache in the tree carries this guard (`Wallpaper` was the last exception; fixed
+  `b555d52f`).
+- **`text_epoch`** — if a glyph upload fails, the atlas residency index is thrown away and
+  re-rasterized. Anything baked *before* that holds **blank text**, under a key its widget has no
+  reason to change — so a dialog title would stay blank for the life of the cache entry. The epoch
+  moves on that recovery and drops the lot. See `VulkanRenderer::invalidate_glyphs`.
+
+### 9.5 Why `prepare` and `paint` are separate
+
+```rust
+prepare: impl FnOnce(&mut VulkanRenderer)               -> Result<P>,
+paint:   impl FnOnce(&mut VulkanFrame, Size<Physical>, &P) -> Result<()>,
+```
+
+Text shaping needs `&mut VulkanRenderer`, and a live `VulkanFrame` holds exactly that borrow
+(`renderer: &'frame mut VulkanRenderer`). So all shaping must complete **before** the frame opens.
+Rather than leave that as a rule to remember, the signature enforces it: `prepare` gets the
+renderer, `paint` never sees it, and the borrow checker rejects the mistake. The same borrow is
+what makes several other things safe by construction — nothing anywhere can upload a texture or
+shape a run while any frame is open.
+
+The same constraint means **a bake cannot nest**: a sub-bake also needs `&mut renderer`, so it
+cannot open inside a live parent frame. Widgets that need a sub-texture (the calendar's scrolled
+list) bake it as a **sibling** first and composite it with a clip — never as a child draw. This is
+why the layer is not a Painter-walks-a-tree model; that shape breaks at the first clipping
+container.
+
+### 9.6 The cost model — a bake is round trips, not drawing
+
+Measured on the seat, 2026-07-25 (`NIRI_FRAME_LOG`; see
+[`frame-cost-investigation.md`](./frame-cost-investigation.md)). `time_bake()` wraps all of
+`bake_uncached_sized`, which contains **two synchronous GPU round trips**:
+
+1. `renderer.render(...)` → `VulkanFrame::begin` → `flush_glyph_uploads()` — a standalone submit
+   **and fence wait** putting newly-shaped glyphs into the atlas.
+2. `frame.finish()` — the offscreen submit, which CPU-waits.
+
+| overview frame | bake total | glyph flush | offscreen submit | remainder (real CPU) |
+|---|---|---|---|---|
+| 13:45:00 | 23.32 ms | 10.71 | 10.77 | ~1.8 ms |
+| 13:45:06 | 7.96 ms | 3.43 | 2.46 | ~2.1 ms |
+| 13:45:07 | 7.78 ms | 3.57 | 2.04 | ~2.2 ms |
+
+**A bake does ~2 ms of work and spends 6–21 ms waiting.** The 13:45:06/07 pair are one second
+apart on an otherwise idle GPU, so their ~2–3.5 ms per round trip is Venus submit overhead with no
+queued work behind it — that is the floor. Both frames land over the 16.67 ms budget *entirely* on
+round trips.
+
+Consequences worth knowing before optimising anything here:
+
+- **Making `paint` cheaper is close to pointless.** The drawing is ~8% of a bake.
+- **Cache hits are what matter**, because a hit costs zero round trips. This is why
+  `hover_does_not_bump_the_bake_revision` (`c5336421`, `d396bd30`) mattered so much: hover was
+  invalidating label bakes and re-shaping ~24 strings per pointer motion.
+- **The remaining fix is structural, not local** — eliminate or defer the two submits. The glyph
+  copy can ride the frame's own command buffer the way `record_pending_dmabuf_acquires` already
+  does (zero submits instead of one); the offscreen fence wait is slice 1 in
+  [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md). Note the bake runs during
+  element *collection*, so its wait sits at the **start** of building a frame — the same pipelining
+  the scanout deferral bought back at the end.
