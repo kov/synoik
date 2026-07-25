@@ -1,7 +1,7 @@
 //! A sampled texture: device-local image uploaded from host RGBA via a staging buffer, plus a
 //! view and sampler. This is the infrastructure both the blur passes and the glyph atlas reuse.
 
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -783,28 +783,7 @@ impl Texture {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
-        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
-        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
-        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
-        // makes every dmabuf import fail on an older VMM.
-        // Prefer the memory types the driver reports valid for this fd, but treat the query as
-        // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
-        let mut type_bits = mem_req.memory_type_bits;
-        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        if let Ok(()) = unsafe {
-            // The query borrows the fd; it does NOT consume it (unlike the import below), so pass a
-            // plain borrow — duping here would leak one fd per call (and this runs per bind).
-            ext_fd.get_memory_fd_properties(
-                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                fd.as_raw_fd(),
-                &mut fd_props,
-            )
-        } {
-            type_bits &= fd_props.memory_type_bits;
-        }
-        anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
-        let mem_type = type_bits.trailing_zeros();
+        let mem_type = gpu.dmabuf_memory_type(fd, mem_req)?;
 
         // Import consumes the fd on success; hand Vulkan a fresh dup and let the caller keep
         // theirs.
@@ -948,26 +927,7 @@ impl Texture {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
-        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
-        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
-        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
-        // makes every dmabuf import fail on an older VMM.
-        // Prefer the memory types the driver reports valid for this fd, but treat the query as
-        // best-effort — on Venus it can reject a perfectly importable dmabuf (see `dmabuf.rs`).
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
-        let mut type_bits = mem_req.memory_type_bits;
-        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        if let Ok(()) = unsafe {
-            ext_fd.get_memory_fd_properties(
-                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                fd.as_raw_fd(),
-                &mut fd_props,
-            )
-        } {
-            type_bits &= fd_props.memory_type_bits;
-        }
-        anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
-        let mem_type = type_bits.trailing_zeros();
+        let mem_type = gpu.dmabuf_memory_type(fd, mem_req)?;
 
         // Import consumes the fd on success; hand Vulkan a fresh dup and let the caller keep
         // theirs.

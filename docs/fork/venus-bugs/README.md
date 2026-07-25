@@ -244,15 +244,17 @@ rejects a list that is *entirely* `DRM_FORMAT_MOD_INVALID` and otherwise forward
 
 ---
 
-## What the guest does when it lands — queued, blocked on a VMM deploy (2026-07-25)
+## What the guest did when it landed — DONE (2026-07-25)
 
-Issue 1's fix is in the `virglrenderer` fork, **not yet in the deployed VMM**. So the guest-side
-cleanup below is written down rather than done: dropping the fallback against a VMM that predates
-`patches/virglrenderer/0024` would turn every dmabuf import into "no importable memory type for the
-dmabuf" — i.e. every client window black, and the compositor's own scanout target failing to bind.
-Sequenced, not urgent: the fallback costs nothing while it waits.
+Issue 1's fix reached the deployed VMM the same day this was queued, the gate below passed, and the
+fallback is gone. Kept as the record of what was removed and why.
 
-**The gate.** Run the reproducer on the target stack:
+Dropping it against a VMM that predates `patches/virglrenderer/0024` would have turned every dmabuf
+import into "no importable memory type for the dmabuf" — every client window black, and the
+compositor's own scanout target failing to bind. Hence the gate.
+
+**The gate**, which passed on the new VMM (`query and import agree → FIXED on this stack`). Run
+the reproducer on the target stack:
 
 ```
 cd docs/fork/venus-bugs/repro-vk-getmemfdprops && cargo run --release
@@ -262,19 +264,21 @@ Its verdict line is now conditional, so it answers the question directly — `�
 means the masking pattern is safe, `→ inconsistent` means it is not. It must pass on **every**
 machine the fork runs on, not just the dev VM. (On this dev VM, 2026-07-25: it already passes.)
 
-**Then remove the fallback at all three import sites.** Each currently starts from the image's own
-`memory_type_bits` and only *narrows* by the query when it succeeds:
+**The fallback was at three import sites**, each starting from the image's own `memory_type_bits`
+and only *narrowing* by the query when it happened to succeed:
 
 | file | function |
 |---|---|
 | `niri-vk/src/texture.rs` | `Texture::import_dmabuf_render_target` |
 | `niri-vk/src/texture.rs` | `Texture::import_dmabuf_sampled` |
-| `niri-vk/src/dmabuf.rs` | `ImportedImage::import` (test-only `ForeignBuffer` path) |
+| `niri-vk/src/dmabuf.rs` | `ImportedImage::import` (the `ForeignBuffer` path) |
 
-The replacement is the ordinary pattern the workaround exists to avoid: query, and treat a failure
-as fatal rather than shrugging and using the unmasked bits.
+All three now call one helper, `Gpu::dmabuf_memory_type` — query, treat a failure as fatal, mask,
+and fail loudly if nothing survives (reporting both masks, so a future disagreement says which side
+rejected what). Three copies of the same fifteen lines became one; the rationale lives on the
+helper, where the next reader of an import site will find it.
 
-**Why bother removing it at all**, given it is harmless today: the fallback silently accepts a
+**Why it was worth removing at all**, given it was harmless today: the fallback silently accepts a
 memory type the driver never blessed. It is harmless *here* only because this device exposes
 exactly **one** memory type (`docs/fork/venus-cost.md` §9.2), so whenever the query succeeds its
 mask can only be `0b1` and the masking is a no-op — there is nothing for the fallback to get wrong.
@@ -283,6 +287,13 @@ that failed for some unrelated reason would leave `trailing_zeros()` picking the
 *unfiltered* mask, which need not be importable at all. It is a latent bug that this VM's single
 memory type is hiding, the same shape as the `renderer-gaps.md` entries.
 
-**Also worth doing in the same pass:** re-check whether `Gpu::check_modifier_features`' `Unlisted`
-best-effort path (`niri-vk/src/gpu.rs`) is still needed, since it was added under the same
-"the query lies here" assumption.
+**Verified, not just compiled.** All three sites run in the suite with the query fatal: the client
+sampled-import and scanout-target tests (`vulkan_dmabuf_import_cache_*`,
+`vulkan_composites_a_scene_into_a_scanout_dmabuf`, …) pass without skipping, and `cargo run -p
+niri-vk` reports `OK — foreign dmabuf import (GBM, LINEAR modifier) verified` with correct quadrant
+colours. 845 green, `NIRI_VK_VALIDATION=1` clean.
+
+**Still open from the same pass:** `Gpu::check_modifier_features`' `Unlisted` best-effort path
+(`niri-vk/src/gpu.rs`) was added under the same "the query lies here" assumption and has *not* been
+re-checked. It is a different query (`vkGetPhysicalDeviceFormatProperties2` modifier enumeration),
+so issue 1's fix says nothing about it either way — it needs its own look.

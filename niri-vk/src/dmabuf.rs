@@ -14,7 +14,7 @@
 //! back and matching the pattern proves the path end-to-end.
 
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
@@ -252,30 +252,7 @@ impl ImportedImage {
 
         let mem_req = unsafe { device.get_image_memory_requirements(image) };
 
-        // TODO(venus): drop the fallback once the deployed VMM carries the virglrenderer fix for
-        // this (`patches/virglrenderer/0024`) — gate, sites and rationale in
-        // `docs/fork/venus-bugs/README.md`, "What the guest does when it lands". Removing it early
-        // makes every dmabuf import fail on an older VMM.
-        // Prefer the memory types the driver says are valid for importing this fd, but treat the
-        // query as best-effort — on Venus it can reject a perfectly importable dmabuf, so fall back
-        // to the image's own requirements and let vkAllocateMemory be the real test.
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, &gpu.device);
-        let mut type_bits = mem_req.memory_type_bits;
-        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        match unsafe {
-            ext_fd.get_memory_fd_properties(
-                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                buf.fd.as_raw_fd(),
-                &mut fd_props,
-            )
-        } {
-            Ok(()) => type_bits &= fd_props.memory_type_bits,
-            Err(e) => eprintln!(
-                "niri-vk: vkGetMemoryFdPropertiesKHR failed ({e:?}); using image memory_type_bits"
-            ),
-        }
-        anyhow::ensure!(type_bits != 0, "no importable memory type for the dmabuf");
-        let mem_type = type_bits.trailing_zeros();
+        let mem_type = gpu.dmabuf_memory_type(buf.fd.as_fd(), mem_req)?;
 
         // Import consumes the fd on success, so hand Vulkan a fresh dup and keep ours in `buf`.
         let raw_fd = buf

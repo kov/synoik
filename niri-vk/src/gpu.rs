@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -576,6 +576,48 @@ impl Gpu {
                         .contains(flags)
             })
             .ok_or_else(|| anyhow!("no memory type for bits {type_bits:#x} flags {flags:?}"))
+    }
+
+    /// The memory type index to import a dmabuf into: the image's own requirements, narrowed by
+    /// the driver's answer for this specific fd.
+    ///
+    /// The narrowing is the whole point — `vkGetMemoryFdPropertiesKHR` is what says which heaps can
+    /// actually back *this* handle, and an image's `memory_type_bits` alone does not know the
+    /// memory came from outside. A failed query is fatal here, deliberately.
+    ///
+    /// It did not use to be. Venus answered `memoryTypeBits = 0` for every dmabuf, while
+    /// `vkAllocateMemory` imported the same handle happily, so all three import sites treated the
+    /// query as best-effort and fell back to the unmasked bits. That was fixed host-side
+    /// (`docs/fork/venus-bugs/README.md` issue 1) and the fallback removed — it was only ever safe
+    /// because this device exposes exactly one memory type, which makes the mask a no-op. With
+    /// several types, falling back would take `trailing_zeros()` of an unfiltered mask and pick a
+    /// heap the driver never said could hold this handle.
+    pub fn dmabuf_memory_type(
+        &self,
+        fd: BorrowedFd<'_>,
+        req: vk::MemoryRequirements,
+    ) -> Result<u32> {
+        let ext_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // The query borrows the fd; it does NOT consume it (unlike the import that follows), so
+        // pass a plain borrow — duping here would leak one fd per call, and this runs per bind.
+        unsafe {
+            ext_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            )
+        }
+        .context("vkGetMemoryFdPropertiesKHR")?;
+
+        let type_bits = req.memory_type_bits & fd_props.memory_type_bits;
+        anyhow::ensure!(
+            type_bits != 0,
+            "no importable memory type for the dmabuf: image accepts {:#x}, fd accepts {:#x}",
+            req.memory_type_bits,
+            fd_props.memory_type_bits,
+        );
+        Ok(type_bits.trailing_zeros())
     }
 
     /// Allocate device memory sized/typed for `req` with the given property `flags`.
