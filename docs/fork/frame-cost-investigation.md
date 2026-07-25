@@ -153,8 +153,11 @@ remaining slow frame is an overview animation or first-time startup work.
 ## 7. Picking this back up
 
 1. `NIRI_FRAME_LOG=1` is set for the gsrs session via
-   `/home/gsrs/.config/environment.d/91-frame-log.conf`. `systemd --user` only reads
-   `environment.d` at start or `daemon-reload`, so a plain logout/login may not pick up a change.
+   `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `NIRI_VK_ASYNC_SCANOUT=1` via
+   `92-async-scanout.conf` (the deferred scanout submit —
+   [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md)). `systemd --user` only
+   reads `environment.d` at start or `daemon-reload`, so a plain logout/login may not pick up a
+   change.
 2. Read frames with `journalctl _UID=$(id -u gsrs)`; filter on `frame on`. Sessions are
    delimited by the `frame logging on:` line.
 3. `cargo test` does **not** rebuild `target/debug/niri`. After a code change,
