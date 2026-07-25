@@ -231,6 +231,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
     println!("\n--- which shape resolves? ({reps} reps each) ------------------------------");
+    // `work` is a third axis, added because both this reproducer and the host side's native probe
+    // stamp an otherwise **empty** command buffer, while the only consumer that matters — a
+    // compositor timing a frame — brackets real GPU work. If the sample lands at completion rather
+    // than execution (§11), an empty buffer is precisely the degenerate case, so it is worth
+    // knowing whether the shape we would actually use behaves differently.
+    for &work in &[false, true] {
+    println!("  -- {} --", if work { "with a 16 MiB fill between the stamps" } else { "empty command buffer" });
     for &use_sync2 in &[false, true] {
         for &resolve in &[Resolve::Host, Resolve::CopySameCbuf, Resolve::CopyOtherCbuf] {
             let label = format!(
@@ -251,7 +258,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut zeros = 0usize;
             let mut err = None;
             for _ in 0..reps {
-                match run_shape(&device, queue, queue_family, phys, &instance, use_sync2, resolve) {
+                match run_shape(
+                    &device, queue, queue_family, phys, &instance, use_sync2, resolve, work,
+                ) {
                     // A lost sample reads as 0 *and still reports available*, so a zero is
                     // indistinguishable from a real result except by being zero. Count it, never
                     // average it in — see `venus-cost.md` §11.
@@ -281,6 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
     }
     println!(
         "\nRead the RATE, not a pass/fail. The defect is intermittent, a lost sample comes back as\n\
@@ -323,6 +333,7 @@ fn run_shape(
     instance: &ash::Instance,
     use_sync2: bool,
     resolve: Resolve,
+    work: bool,
 ) -> Result<[u64; 2], vk::Result> {
     unsafe {
         let pool = device.create_query_pool(
@@ -387,9 +398,31 @@ fn run_shape(
             }
         };
 
+        // Something for the GPU to actually do between the two stamps, when asked for. A buffer
+        // fill needs no shader, no render pass and no layout dance, and 16 MiB is comfortably
+        // measurable against a timestamp tick of 1 ns.
+        const WORK_SIZE: u64 = 16 * 1024 * 1024;
+        let work_buf = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(WORK_SIZE)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        )?;
+        let work_req = device.get_buffer_memory_requirements(work_buf);
+        let work_mem = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(work_req.size)
+                .memory_type_index(mem_type),
+            None,
+        )?;
+        device.bind_buffer_memory(work_buf, work_mem, 0)?;
+
         device.begin_command_buffer(cbufs[0], &vk::CommandBufferBeginInfo::default())?;
         device.cmd_reset_query_pool(cbufs[0], pool, 0, 2);
         write(cbufs[0], 0, false);
+        if work {
+            device.cmd_fill_buffer(cbufs[0], work_buf, 0, WORK_SIZE, 0xA5A5A5A5);
+        }
         write(cbufs[0], 1, true);
         if resolve == Resolve::CopySameCbuf {
             device.cmd_copy_query_pool_results(
@@ -448,6 +481,8 @@ fn run_shape(
         };
 
         device.destroy_fence(fence, None);
+        device.destroy_buffer(work_buf, None);
+        device.free_memory(work_mem, None);
         device.destroy_buffer(buffer, None);
         device.free_memory(memory, None);
         device.destroy_command_pool(cmd_pool, None);

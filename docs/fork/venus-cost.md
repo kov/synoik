@@ -911,6 +911,22 @@ called the 1.0 entry point — two independent axes, so both are tested:
 (`VK_DRIVER_FILES=…/lvp_icd.aarch64.json`) reports **WORKS on all six**, with sane deltas
 (45–130 µs). So the matrix exercises each combination correctly and the zero is venus-specific.
 
+> **Second VMM, still 0% (2026-07-25).** On the build meant to make the workaround hold, this
+> guest measures **0 usable out of 720 samples** — 30 reps × 6 shapes × 2 work variants — plus
+> 0/120 with `VN_PERF=no_query_feedback` forcing the synchronous host round trip instead of
+> venus's feedback buffer. Not a sampling artefact: at the hoped-for 82% we would expect ~590
+> usable. The device clock is live throughout (`DEVICE` advances 100 200 416 ticks per 100 ms,
+> `timestampPeriod = 1`, `timestampValidBits = 64`).
+>
+> A third axis was added for this run, because both this reproducer and the host side's native
+> probe had only ever stamped an **empty** command buffer, while the consumer that matters brackets
+> real work — and §11's diagnosis is that the sample lands at completion rather than execution, for
+> which an empty buffer is the degenerate case. A 16 MiB `vkCmdFillBuffer` between the stamps
+> changes nothing on venus. The same run on lavapipe is **60/60 usable on all twelve combinations**,
+> and the work axis is meaningfully exercised there: the delta moves from ~45 µs empty to ~1.35 ms
+> with the fill. So the harness measures real GPU time on both axes, and the venus zero is neither
+> the shape, nor the resolve path, nor the absence of work.
+>
 > **Now measured as a rate, not a pass/fail** (2026-07-25, after the §11 update below reported the
 > defect is intermittent — 94% failure bare, 18% with the first workaround). One sample per shape
 > would call a working stack broken 18% of the time. The reproducer repeats each shape 50× and
