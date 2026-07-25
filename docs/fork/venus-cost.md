@@ -285,9 +285,17 @@ A/B — session-to-session frame counts are dominated by how much the desktop wa
 same build reported 0.8 and 12.3 over-budget frames per minute depending on the session. Across a
 reboot that caveat is unavoidable, so:
 
-- **Keep the guest binary identical.** `target/debug/niri` currently corresponds to `4504c5b5`
-  (`2ca2e164` is docs-only and does not change it). If the guest is rebuilt as well, nothing in a
-  before/after is attributable.
+- **Keep the guest binary identical.** `target/debug/niri` corresponded to `4504c5b5` when this
+  was written (`2ca2e164` is docs-only and does not change it). If the guest is rebuilt as well,
+  nothing in a before/after is attributable.
+
+  > **The guest has since moved — read this before comparing (2026-07-25).** `target/debug/niri` is
+  > now `v26.04-597-g63189b0c-modified`, and the tree carries `01dc9384`, which stops texture
+  > uploads submitting at all. That changes *precisely* what §3.1 measures, so a naive
+  > before/after across the VMM deploy would credit the host with a guest change. To attribute the
+  > VMM honestly, either rebuild at `4504c5b5` and run that binary on both sides, or re-baseline on
+  > the new VMM and treat §6 as the old-VMM record only. The `01dc9384` win is separately
+  > measurable: `upload` submits per frame, which should now be ~0 either way.
 - **Compare per-submit and per-resource numbers, not per-session totals.** The two rate columns in
   the table above are the ones that mean something; "frames over budget" is not, on its own.
 - The most sensitive single number is **cost per created resource** (§3.3): it is large, it is
