@@ -37,7 +37,9 @@
 //! - **Frame cost**, phase by phase ([`Phase`]), measured on the compositor thread. Note the render
 //!   phase *includes* GPU execution: the Vulkan renderer submits and fence-waits synchronously, so
 //!   `finish` does not return until the GPU is done. A slow `submit` is therefore ambiguous between
-//!   CPU and GPU until the `gpu` option splits it out.
+//!   CPU and GPU until the `gpu` option splits it out. The submit counters do say which side of the
+//!   round trip it went to: `N submits in X, waiting Y` separates enqueueing the work from parking
+//!   on its fence, and today essentially all of it is the parking.
 //! - **Missed deadlines**, from comparing when a frame actually reached the screen against the
 //!   presentation time it was built for. That is what a user perceives as a stutter, and it can
 //!   happen with every frame cost looking healthy. Deliberately *not* the gap in the DRM vblank
@@ -291,11 +293,19 @@ struct Totals {
     /// virtualized stack, where each one costs milliseconds no matter how little
     /// work it carries.
     submits: u64,
+    /// Just the `vkQueueSubmit` calls. Near zero — the round trip is paid below.
     submitting: Duration,
+    /// Waiting for submitted work to finish. Timed apart from the enqueue so that
+    /// deferring a wait can be told from removing one: a wait handed to KMS leaves
+    /// here and does not reappear, while a wait merely moved to the next frame
+    /// shows up in that frame's retire. Carries no count, because a retire need not
+    /// belong to the frame that issued its submit.
+    retiring: Duration,
     /// Of those, the ones rendering into the scanout buffer. Called out separately because on
     /// this stack they cost a different order of magnitude from every other submit.
     scanout_submits: u64,
     scanout_submitting: Duration,
+    scanout_retiring: Duration,
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -465,8 +475,10 @@ impl FrameLog {
             shaping: niri_vk::stats::take_shape_time(),
             submits: niri_vk::stats::submits() - frame.submits_at_start,
             submitting: niri_vk::stats::take_submit_time(),
+            retiring: niri_vk::stats::take_retire_time(),
             scanout_submits: niri_vk::stats::scanout_submits() - frame.scanout_at_start,
             scanout_submitting: niri_vk::stats::take_scanout_submit_time(),
+            scanout_retiring: niri_vk::stats::take_scanout_retire_time(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -535,6 +547,9 @@ impl FrameLog {
         }
         // Submits before bakes and shaping: on a virtualized GPU the round-trip
         // count is usually the headline, and both of those are ways of spending it.
+        // Enqueue and wait are printed apart because they move apart: a wait handed
+        // to KMS leaves the line, a wait deferred to the next frame reappears there.
+        // A zero wait is omitted rather than printed, so its absence is visible.
         if totals.submits > 0 {
             let _ = write!(
                 line,
@@ -542,14 +557,25 @@ impl FrameLog {
                 totals.submits,
                 ms(totals.submitting)
             );
+            if !totals.retiring.is_zero() {
+                let _ = write!(line, ", waiting {}", ms(totals.retiring));
+            }
             if totals.scanout_submits > 0 {
                 let _ = write!(
                     line,
-                    " ({} to scanout in {})",
+                    " ({} to scanout in {}",
                     totals.scanout_submits,
                     ms(totals.scanout_submitting)
                 );
+                if !totals.scanout_retiring.is_zero() {
+                    let _ = write!(line, ", waiting {}", ms(totals.scanout_retiring));
+                }
+                line.push(')');
             }
+        } else if !totals.retiring.is_zero() {
+            // A frame can pay a wait for work it did not submit: retiring a previous
+            // frame's in-flight submit. Report it, so that time is never invisible.
+            let _ = write!(line, ", waiting {} on earlier work", ms(totals.retiring));
         }
         if totals.bakes > 0 {
             let _ = write!(line, ", {} bakes in {}", totals.bakes, ms(totals.baking));
@@ -734,6 +760,79 @@ mod tests {
         // An explicit off anywhere wins, so a session file can disable an
         // inherited setting by appending to it.
         assert!(FrameLog::parse("all,off").is_none());
+    }
+
+    /// A frame that submitted nothing but paid a wait, for the log line below.
+    fn empty_frame() -> InFlight {
+        let now = Instant::now();
+        InFlight {
+            output: "out".to_owned(),
+            started: now,
+            phase_started: now,
+            phase: None,
+            spans: Vec::new(),
+            bakes_at_start: 0,
+            shapes_at_start: 0,
+            submits_at_start: 0,
+            scanout_at_start: 0,
+            draws_at_start: 0,
+            shaded_at_start: 0,
+            context: FrameContext::default(),
+        }
+    }
+
+    /// Enqueueing work and waiting for it are reported apart, and a wait is never
+    /// dropped from the line just because this frame did not submit it.
+    ///
+    /// This is the property that lets the synchronous-submit work be measured at
+    /// all (`docs/fork/renderer-synchronous-submits.md`). With one number, handing
+    /// the scanout fence to KMS and deferring the same wait to the next frame look
+    /// identical: both collapse "submits in 14ms" to nothing. Only a wait that
+    /// leaves the line *and does not reappear on the next frame* is a real saving.
+    #[test]
+    fn a_wait_is_told_apart_from_the_submit_that_caused_it() {
+        let frame = empty_frame();
+        let totals = Totals {
+            submits: 2,
+            submitting: Duration::from_micros(90),
+            retiring: Duration::from_millis(14),
+            scanout_submits: 1,
+            scanout_submitting: Duration::from_micros(50),
+            scanout_retiring: Duration::from_micros(12690),
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(
+            line.contains(
+                "2 submits in 0.09ms, waiting 14.00ms (1 to scanout in 0.05ms, waiting 12.69ms)"
+            ),
+            "{line}"
+        );
+
+        // The shape the fix is aiming for: the submit stays, its wait is gone.
+        // Nothing is printed in its place, so the absence is what you read.
+        let totals = Totals {
+            submits: 1,
+            submitting: Duration::from_micros(90),
+            scanout_submits: 1,
+            scanout_submitting: Duration::from_micros(50),
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(4), &totals, None);
+        assert!(
+            line.contains("1 submits in 0.09ms (1 to scanout in 0.05ms)"),
+            "{line}"
+        );
+        assert!(!line.contains("waiting"), "{line}");
+
+        // And the shape that would mean the wait merely moved: a frame paying for
+        // work it never submitted. It must still show up.
+        let totals = Totals {
+            retiring: Duration::from_millis(8),
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(line.contains("waiting 8.00ms on earlier work"), "{line}");
     }
 
     /// Phase marks name the work that *follows* them, and the totals add up.

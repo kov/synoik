@@ -1012,6 +1012,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     std::slice::from_ref(&submit),
                     fence,
                 )?;
+            }
+            {
+                let _timed = niri_vk::stats::retire(self.submit_kind());
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             }
             dev.destroy_fence(fence, None);
@@ -1498,6 +1501,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     std::slice::from_ref(&submit),
                     fence,
                 )?;
+            }
+            // Timed apart from the submit above: this park is where a scanout frame spends
+            // 12–14 ms of its budget, and it is the one this renderer means to stop paying on
+            // the compositor thread. See `docs/fork/renderer-synchronous-submits.md`.
+            {
+                let _timed = niri_vk::stats::retire(self.submit_kind());
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             }
             dev.destroy_fence(fence, None);

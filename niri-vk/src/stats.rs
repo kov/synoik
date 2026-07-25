@@ -1,11 +1,21 @@
 //! Process-wide counters for the two things a frame can do too many of: GPU
 //! round trips and draw calls.
 //!
-//! A "submit" here means `vkQueueSubmit` followed by a fence wait — the only
-//! shape this renderer uses. Each one is a full CPU↔GPU round trip, and on a
-//! virtualized stack (Venus over virtio-gpu) that round trip costs milliseconds
-//! regardless of how much work it carries, so *how many* a frame does is a more
-//! useful number than how much it drew.
+//! A "submit" here is `vkQueueSubmit`; a "retire" is the fence wait that follows
+//! it. Together they are one full CPU↔GPU round trip, and on a virtualized stack
+//! (Venus over virtio-gpu) that round trip costs milliseconds regardless of how
+//! much work it carries, so *how many* a frame does is a more useful number than
+//! how much it drew.
+//!
+//! The two are timed **separately** even though today every submit in this
+//! renderer is immediately retired by its own caller. The cost lives almost
+//! entirely in the retire — a scanout submit enqueues in microseconds and then
+//! parks for 12–14 ms — so a change that stops blocking on the fence and hands it
+//! to KMS instead (`docs/fork/renderer-synchronous-submits.md`) would collapse the
+//! submit time to nothing and read as a saving, when the wait had only moved. Two
+//! numbers make a removed wait tell itself apart from a moved one, and a retire
+//! deliberately carries no count: once waits are deferred, the retire that a frame
+//! pays for need not be the submit that frame issued.
 //!
 //! These live in `niri-vk` rather than in the compositor's `frame_log` because
 //! the submit path itself does — `Gpu::run_commands` is the one-shot submit every
@@ -21,8 +31,10 @@ use std::time::{Duration, Instant};
 
 static SUBMITS: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+static RETIRE_NANOS: AtomicU64 = AtomicU64::new(0);
 static SCANOUT_SUBMITS: AtomicU64 = AtomicU64::new(0);
 static SCANOUT_NANOS: AtomicU64 = AtomicU64::new(0);
+static SCANOUT_RETIRE_NANOS: AtomicU64 = AtomicU64::new(0);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static SHADED: AtomicU64 = AtomicU64::new(0);
 static SHAPES: AtomicU64 = AtomicU64::new(0);
@@ -45,31 +57,52 @@ pub enum SubmitKind {
     Scanout,
 }
 
-/// Times a submit + fence wait, counting it immediately and banking its duration
-/// on drop. Hold across `vkQueueSubmit` *and* the wait: the wait is where the
-/// round trip actually costs.
-pub struct SubmitTimer(Option<Instant>, SubmitKind);
+/// Banks its lifetime into a total and, for a scanout, into that kind's total as
+/// well. Inert when timing is off, so call sites can be unconditional.
+pub struct SubmitTimer {
+    started: Option<Instant>,
+    total: &'static AtomicU64,
+    scanout: Option<&'static AtomicU64>,
+}
 
 impl Drop for SubmitTimer {
     fn drop(&mut self) {
-        if let Some(started) = self.0 {
+        if let Some(started) = self.started {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            SUBMIT_NANOS.fetch_add(nanos, Ordering::Relaxed);
-            if self.1 == SubmitKind::Scanout {
-                SCANOUT_NANOS.fetch_add(nanos, Ordering::Relaxed);
+            self.total.fetch_add(nanos, Ordering::Relaxed);
+            if let Some(scanout) = self.scanout {
+                scanout.fetch_add(nanos, Ordering::Relaxed);
             }
         }
     }
 }
 
-/// Record one GPU round trip. Counted even when timing is off, so the count is
+fn timer(kind: SubmitKind, total: &'static AtomicU64, scanout: &'static AtomicU64) -> SubmitTimer {
+    SubmitTimer {
+        started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+        total,
+        scanout: (kind == SubmitKind::Scanout).then_some(scanout),
+    }
+}
+
+/// Record one GPU round trip. Hold the guard across `vkQueueSubmit` only — the
+/// wait belongs to [`retire`]. Counted even when timing is off, so the count is
 /// always meaningful; only the clock reads are gated.
 pub fn submit(kind: SubmitKind) -> SubmitTimer {
     SUBMITS.fetch_add(1, Ordering::Relaxed);
     if kind == SubmitKind::Scanout {
         SCANOUT_SUBMITS.fetch_add(1, Ordering::Relaxed);
     }
-    SubmitTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now), kind)
+    timer(kind, &SUBMIT_NANOS, &SCANOUT_NANOS)
+}
+
+/// Time a wait for already-submitted work to complete. Hold the guard across the
+/// fence wait.
+///
+/// Uncounted on purpose: a retire is not a round trip of its own, and the frame
+/// that pays for one need not be the frame that issued the submit.
+pub fn retire(kind: SubmitKind) -> SubmitTimer {
+    timer(kind, &RETIRE_NANOS, &SCANOUT_RETIRE_NANOS)
 }
 
 /// Scanout submits since process start. The caller takes a delta across a frame.
@@ -77,9 +110,15 @@ pub fn scanout_submits() -> u64 {
     SCANOUT_SUBMITS.load(Ordering::Relaxed)
 }
 
-/// Time spent in scanout submits since the last call, clearing the counter.
+/// Time spent enqueueing scanout submits since the last call, clearing the counter.
 pub fn take_scanout_submit_time() -> Duration {
     Duration::from_nanos(SCANOUT_NANOS.swap(0, Ordering::Relaxed))
+}
+
+/// Time spent waiting for scanout work to complete since the last call, clearing
+/// the counter.
+pub fn take_scanout_retire_time() -> Duration {
+    Duration::from_nanos(SCANOUT_RETIRE_NANOS.swap(0, Ordering::Relaxed))
 }
 
 /// Times one text shaping run — layout *or* measurement. Both matter: a measure
@@ -139,7 +178,13 @@ pub fn draws() -> u64 {
     DRAWS.load(Ordering::Relaxed)
 }
 
-/// Time spent in submits since the last call, clearing the counter.
+/// Time spent enqueueing submits since the last call, clearing the counter.
 pub fn take_submit_time() -> Duration {
     Duration::from_nanos(SUBMIT_NANOS.swap(0, Ordering::Relaxed))
+}
+
+/// Time spent waiting for submitted work to complete since the last call,
+/// clearing the counter.
+pub fn take_retire_time() -> Duration {
+    Duration::from_nanos(RETIRE_NANOS.swap(0, Ordering::Relaxed))
 }

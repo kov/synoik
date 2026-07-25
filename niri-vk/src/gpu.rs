@@ -561,11 +561,14 @@ impl Gpu {
         };
         guard.fence = fence;
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cbuf));
-        let _timed = crate::stats::submit(crate::stats::SubmitKind::Offscreen);
         unsafe {
-            self.device
-                .queue_submit(self.queue, &[submit], fence)
-                .context("vkQueueSubmit")?;
+            {
+                let _timed = crate::stats::submit(crate::stats::SubmitKind::Offscreen);
+                self.device
+                    .queue_submit(self.queue, &[submit], fence)
+                    .context("vkQueueSubmit")?;
+            }
+            let _timed = crate::stats::retire(crate::stats::SubmitKind::Offscreen);
             if let Err(e) = self.device.wait_for_fences(&[fence], true, u64::MAX) {
                 // The submit already succeeded, so the command buffer and the copy's source/dest
                 // (staging/image, freed by the caller's UploadGuard) may still be in flight. Drain
