@@ -993,3 +993,81 @@ found the cost is guest-side.
 **`vkGetMemoryFdPropertiesKHR` (§8.6) is confirmed fixed here** — `repro-vk-getmemfdprops` reports
 `query and import agree → FIXED on this stack`, which is the gate in `venus-bugs/README.md`. The
 guest-side fallback removal is unblocked.
+
+---
+
+## 11. Timestamp queries on M4 Pro: partially fixed — **discard zero samples, do not average them**
+
+Written 2026-07-25, after the fix from §8.3 was deployed to couve and **did not work**. Read this
+before trusting any GPU timing the compositor collects on that machine.
+
+### The short version
+
+If you read a timestamp query and get **0**, it is not a fast GPU — it is a **lost sample**.
+Treat `0` as "no data" and drop it. Do not average it in, do not feed it to a min/max, do not let
+it into a percentile. On an M4 Pro roughly **1 in 5 samples is lost** even with the fix in place,
+and because the lost value is `0` rather than an error, every statistic silently skews toward
+zero. A frame time that reads suspiciously good is the failure mode to watch for.
+
+Two queries bracketing a region can each be lost independently, so guard the pair: if either end
+is `0`, discard the interval rather than reporting a nonsensical (possibly negative, possibly
+huge) delta.
+
+`vkGetQueryPoolResults` still reports `avail = 1` for a lost sample, so **availability is not a
+validity check here**. The value itself is the only signal.
+
+### Why it is only partial
+
+The original diagnosis in §8.3 — "an M4 Pro cannot resolve a counter sample from the command
+buffer that took it" — was written from a single probe run and was over-fitted. Repeating the
+Metal probe 50 times on couve:
+
+| shape | ok | zero | failure |
+|---|---|---|---|
+| resolve in the same command buffer (before the fix) | 3 | 47 | **94%** |
+| **resolve in a separate command buffer — what shipped** | 41 | 9 | **18%** |
+| separate command buffer **+ wait for completion** | 50 | 0 | **0%** |
+| **CPU** `resolveCounterRange` | 50 | 0 | **0%** |
+
+So the defect is **intermittent, not deterministic**, and the shipped fix improves it from 94% to
+18% rather than curing it. The reasoning it rested on — that command buffers run in commit order
+— is the wrong guarantee: the sample becomes visible at command-buffer **completion**, not at
+execution.
+
+A second bug made it worse in practice. The runtime detection that decides whether to apply the
+workaround took **one** sample and defaulted to "unaffected" — and its own probe shape passes 4%
+of the time, so a few percent of boots cached "this GPU is fine" for the whole session and never
+applied the fix at all. That is what you were hitting: 8/8 guest runs read `[0, 0]`, which is
+~1e-6 at an 18% rate but entirely expected if the workaround was never active. Fixed by starting
+at "affected" and requiring an unbroken run of 8 clean samples to clear it.
+
+### What comes next
+
+The real fix is to resolve the counter on the **CPU at command-buffer completion** (0/50 failures,
+and unlike waiting for completion it does not stall the pipeline). It is a design change rather
+than a patch — it moves the report write out of GPU command order, so it has to be reconciled with
+an in-stream `CmdResetQueryPool` / `CmdCopyQueryPoolResults` — so it is deliberately not bundled
+with this build. Shipping a second workaround validated against the wrong shape is the mistake
+this section exists to avoid repeating.
+
+When that lands, this section goes away and timestamps become trustworthy without filtering. If
+the ~18% loss rate makes the data unusable for you in the meantime, say so and we will report
+`timestampValidBits = 0` on affected devices instead — the conforming answer, which you already
+handle silently, and honest in a way that returning zeros is not.
+
+### Also in this build: outlier attribution on the host side
+
+The wake-chain probes from §10 found two windows in the first 20 minutes of dogfood where a
+single virtio-gpu control-queue drain took **25.0 ms** and **18.7 ms**, against a 0.012 ms median
+in those same windows — long enough to drop frames, on our side of the boundary. The 5 s
+aggregates could not say what stalled, so this build times every command and prints one line
+whenever a drain exceeds 5 ms:
+
+```
+[GPUWAKE OUTLIER] realtime=<sec>.<nsec> idle=<bucket> total N ms | kick->wake … wake->drained … drained->signal … | N cmds, worst SUBMIT_3D N ms
+```
+
+The stamp is **CLOCK_REALTIME**, and your guest clock is anchored to the host's, so these line up
+directly against your frame log. **If you catch a dropped frame, note its wall-clock time** — if
+an OUTLIER line sits at the same instant, the hitch is ours and now has a named command attached
+to it.
