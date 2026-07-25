@@ -175,6 +175,9 @@ thread_local! {
     static FIRST_WAIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     static FIRST_SITE: Cell<Option<SubmitSite>> = const { Cell::new(None) };
     static UPLOADED_BYTES: Cell<u64> = const { Cell::new(0) };
+    /// Wall time inside GPU resource creation this frame, and how many creations. See [`creating`].
+    static CREATE_NANOS: Cell<u64> = const { Cell::new(0) };
+    static CREATES: Cell<u64> = const { Cell::new(0) };
 }
 
 fn bank(site: SubmitSite, nanos: u64, retire: bool) {
@@ -258,6 +261,42 @@ pub fn take_uploaded_bytes() -> u64 {
 /// takes; unlike the timers this is never gated, since it costs an add.
 pub fn uploaded(bytes: u64) {
     add(&UPLOADED_BYTES, bytes);
+}
+
+/// Times the creation of a GPU resource — an image plus its memory, a descriptor set, a
+/// framebuffer, a pipeline.
+///
+/// Worth its own bucket because on a virtualized driver these are **not** free and **not**
+/// submits: every `vkCreateImage`/`vkAllocateMemory` is a synchronous round trip to the host, so a
+/// frame that allocates can spend milliseconds somewhere the submit accounting cannot see. That is
+/// exactly the shape of the unattributed CPU on the seat's worst frames — collect time that is
+/// neither a fence wait nor a bake — and this is the counter that says whether it is this or
+/// something else.
+///
+/// Counted even when timing is off, so the count stays meaningful on its own; the clock reads are
+/// gated like every other timer here.
+pub fn creating() -> CreateTimer {
+    add(&CREATES, 1);
+    CreateTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+}
+
+pub struct CreateTimer(Option<Instant>);
+
+impl Drop for CreateTimer {
+    fn drop(&mut self) {
+        if let Some(started) = self.0 {
+            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            add(&CREATE_NANOS, nanos);
+        }
+    }
+}
+
+/// GPU resource creations since the last call and the wall time they took, clearing both.
+pub fn take_creates() -> (u64, Duration) {
+    (
+        CREATES.with(|c| c.replace(0)),
+        Duration::from_nanos(CREATE_NANOS.with(|c| c.replace(0))),
+    )
 }
 
 /// Record one GPU round trip. Hold the guard across `vkQueueSubmit` only — the

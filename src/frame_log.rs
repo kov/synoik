@@ -324,6 +324,11 @@ struct Totals {
     /// Bytes staged into GPU images. Separates a frame that made many small round trips from one
     /// that moved a wallpaper — different costs, different fixes.
     uploaded: u64,
+    /// GPU resources created, and the wall time it took. Not a submit and not free: on a
+    /// virtualized driver every `vkCreateImage`/`vkAllocateMemory` is a synchronous round trip to
+    /// the host, so this is collect time that the submit breakdown structurally cannot see. Added
+    /// because the seat's worst frames had ~50ms that was neither a fence wait nor a bake.
+    creates: (u64, Duration),
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -500,6 +505,7 @@ impl FrameLog {
             sites: niri_vk::stats::take_sites(),
             first_wait: niri_vk::stats::take_first_wait(),
             uploaded: niri_vk::stats::take_uploaded_bytes(),
+            creates: niri_vk::stats::take_creates(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -613,6 +619,14 @@ impl FrameLog {
                     line,
                     ", {:.1}MiB uploaded",
                     totals.uploaded as f64 / (1 << 20) as f64
+                );
+            }
+            if totals.creates.0 > 0 {
+                let _ = write!(
+                    line,
+                    ", {} created in {}",
+                    totals.creates.0,
+                    ms(totals.creates.1)
                 );
             }
         } else if !totals.retiring.is_zero() {
@@ -885,6 +899,7 @@ mod tests {
                 (SubmitSite::Upload, 1, Duration::from_millis(14)),
             ]),
             uploaded: 3 << 20,
+            creates: (7, Duration::from_micros(4300)),
             ..Totals::default()
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
@@ -893,6 +908,9 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("3.0MiB uploaded"), "{line}");
+        // Resource creation is neither a submit nor a bake, so it has to say so itself or it is
+        // invisible — which is exactly how ~50ms hid on the seat's worst frames.
+        assert!(line.contains("7 created in 4.30ms"), "{line}");
 
         // The shape the fix is aiming for: the submit stays, its wait is gone. The site still
         // reports — with a zero — because "the scanout submit waited for nothing" is the result,

@@ -136,6 +136,7 @@ impl BlurChain {
     /// Build the chain to blur `source` (which stays owned by the caller). `passes` is clamped to
     /// at least 1; `source` must be full-size (matches level 0).
     pub fn new(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
         let passes = passes.max(1);
         let (width, height) = (source.width, source.height);

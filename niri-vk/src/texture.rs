@@ -926,6 +926,7 @@ impl Texture {
         components: vk::ComponentMapping,
         filter: vk::Filter,
     ) -> Result<PendingUpload> {
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
         let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * bpp;
         crate::stats::uploaded(size);
@@ -1049,6 +1050,7 @@ impl Texture {
     /// allocated (2048² would be a 4 MiB mappable blob, the allocation type that pressures the
     /// Venus host).
     pub fn new_coverage_atlas(gpu: &Gpu, pool: vk::CommandPool, side: u32) -> Result<Self> {
+        let _timed = crate::stats::creating();
         let device = &gpu.device;
         let mut guard = UploadGuard::new(device);
 

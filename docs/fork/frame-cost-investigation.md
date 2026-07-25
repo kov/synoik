@@ -76,6 +76,12 @@ Each field exists because an earlier guess was wrong without it:
   the fix under consideration moves the wait rather than removing it, and one number cannot tell
   those apart (`7b5f016d`). A frame that waits for work it did not submit says so.
 - **bakes / shaped runs** — the widget path, which used to dominate `collect` and no longer does.
+- **N created in X.XXms** — GPU resources built this frame (offscreen render targets, upload
+  images, blur chains, dmabuf imports, atlas growth). Neither a submit nor a bake, so nothing else
+  in the line can see it — and on Venus every `vkCreateImage`/`vkAllocateMemory` is a synchronous
+  host round trip, not local bookkeeping. Added 2026-07-25 because the worst seat frames carried
+  ~50ms of `collect` that was neither a fence wait nor a bake. A *reused* resource does not count,
+  so this distinguishes "allocates every frame" from "allocated once".
 - **missed vblanks** — a frame that arrived a refresh later than the one it was built for, *not*
   a gap in the DRM vblank sequence (see §5).
 

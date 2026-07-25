@@ -4002,3 +4002,47 @@ fn a_deferred_frames_glyph_staging_outlives_it() {
          freed before its submit completed looks like"
     );
 }
+
+/// Creating a GPU resource is neither a submit nor a bake, so nothing in the frame log could see
+/// it — and on a virtualized driver it is a synchronous host round trip, not a cheap local
+/// bookkeeping call. This pins that the counter actually fires on the path that matters (an
+/// offscreen render target, the site the seat makes three of per overview frame) and, just as
+/// importantly, that *reusing* one does not count — otherwise the number could never distinguish
+/// "we allocate every frame" from "we allocate once".
+#[test]
+fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping creating_a_render_target_counts...: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let size = Size::<i32, BufferCoord>::from((32, 32));
+
+    let _ = niri_vk::stats::take_creates();
+    let mut target = vk.create_buffer(Fourcc::Abgr8888, size).expect("target");
+    let (n, _) = niri_vk::stats::take_creates();
+    assert_eq!(n, 1, "creating an offscreen render target went uncounted");
+
+    // Binding and rendering into the one we already have allocates nothing.
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk
+            .render(&mut fb, Size::from((32, 32)), Transform::Normal)
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 0., 1., 1.),
+                &[Rectangle::from_size((32, 32).into())],
+            )
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    let (n, _) = niri_vk::stats::take_creates();
+    assert_eq!(
+        n, 0,
+        "rendering into an existing target counted {n} creations — the counter cannot then tell \
+         per-frame allocation apart from allocate-once"
+    );
+}
