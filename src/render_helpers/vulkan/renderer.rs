@@ -86,6 +86,9 @@ pub struct VulkanRenderer {
     /// The long-lived text stack (font system + scaler cache) behind [`Self::build_glyph_run`], so
     /// chrome redraws reshape a string without rescanning the system fonts each time.
     text_ctx: niri_vk::text::TextContext,
+    /// Shaped, rasterized single-line runs, keyed by `(text, px bits, bold)`. See
+    /// [`Self::build_glyph_run_weighted`].
+    glyph_runs: HashMap<(String, u32, bool), GlyphRun>,
     /// Runtime-compiled user animation shaders (niri's `custom_{resize,close,open}`), each built
     /// from a config GLSL snippet by [`Self::set_custom_shader`] and `None` until one is set.
     custom_resize: Option<Pipeline>,
@@ -219,6 +222,12 @@ const MAX_PRESENT_BLIT_SHADOWS: usize = 8;
 /// screencopy, and the small cursor bitmap), so this is generous. See
 /// [`VulkanRenderer::readback_staging`].
 const MAX_READBACK_STAGING: usize = 4;
+
+/// Cap on cached glyph runs. Each pins its own R8 coverage atlas (a few tens of KB
+/// at panel/label sizes), and the live set is the strings actually on screen — every
+/// panel label, dash tooltip and app name at once is well under this. See
+/// [`VulkanRenderer::build_glyph_run_weighted`].
+const GLYPH_RUN_CACHE_CAP: usize = 256;
 
 /// A cached present-blit shadow plus the tick it was last used on (for LRU eviction).
 #[derive(Debug)]
@@ -375,6 +384,7 @@ impl VulkanRenderer {
             resize_pipeline,
             text_pipeline,
             text_ctx: niri_vk::text::TextContext::new(),
+            glyph_runs: HashMap::new(),
             custom_resize: None,
             custom_close: None,
             custom_open: None,
@@ -658,12 +668,25 @@ impl VulkanRenderer {
 
     /// Like [`Self::build_glyph_run`], but rasterizes bold when `bold` — the panel clock draws
     /// `font-weight: bold` to match GNOME's `panel_button`.
+    ///
+    /// Cached by `(text, px, bold)`: a [`GlyphRun`] is immutable and cheap to clone
+    /// (ref-counted atlas), and an identical string re-shaped at the same size can
+    /// only produce an identical run. Building one costs a shape, a fresh atlas
+    /// image and the upload submit behind it, so the labels that do not change
+    /// between frames — every one but the clock — should pay that once.
     pub(crate) fn build_glyph_run_weighted(
         &mut self,
         text: &str,
         px: f32,
         bold: bool,
     ) -> Result<GlyphRun, VulkanError> {
+        // `px` by bits: it is a float only because font sizes scale, and two sizes
+        // that compare equal rasterize identically.
+        let key = (text.to_owned(), px.to_bits(), bold);
+        if let Some(run) = self.glyph_runs.get(&key) {
+            return Ok(run.clone());
+        }
+
         // Split the disjoint borrows: `build_atlas` needs `&mut text_ctx` + `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
@@ -686,13 +709,17 @@ impl VulkanRenderer {
             Fourcc::R8,
             false,
         );
-        Ok(GlyphRun::new(
-            vk_tex,
-            atlas.glyphs,
-            atlas.spans,
-            side,
-            line_box,
-        ))
+        let run = GlyphRun::new(vk_tex, atlas.glyphs, atlas.spans, side, line_box);
+
+        // Bounded by clearing wholesale: each entry pins an atlas image, and a clock
+        // showing seconds mints one never-reused key per second. Dropping the lot
+        // costs a rebuild of the live labels — which is what no cache at all paid on
+        // every frame.
+        if self.glyph_runs.len() >= GLYPH_RUN_CACHE_CAP {
+            self.glyph_runs.clear();
+        }
+        self.glyph_runs.insert(key, run.clone());
+        Ok(run)
     }
 
     /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)

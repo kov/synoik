@@ -3150,3 +3150,53 @@ fn timestamp_ticks_masks_and_wraps() {
     // read as 0 at the top of the pass still reported a real end.
     assert_eq!(timestamp_ticks([0, 500], 64), Some(500));
 }
+
+/// Re-shaping the same string at the same size must not touch the GPU again: a
+/// cached [`GlyphRun`] is handed back, so no shape and no upload submit happen.
+///
+/// This is the frame-cost fix, so the assertion is on the *counters*, not on the
+/// pixels — a run rebuilt every frame renders identically and costs an atlas
+/// image plus a fence wait each time, which is exactly the regression that would
+/// otherwise slip back in unnoticed.
+#[test]
+fn a_repeated_glyph_run_is_cached() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping a_repeated_glyph_run_is_cached: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let first = vk.build_glyph_run("cached", 20.0).expect("glyph run");
+    assert!(!first.glyphs().is_empty(), "no glyphs were shaped");
+
+    let shapes = niri_vk::stats::shapes();
+    let submits = niri_vk::stats::submits();
+    let again = vk.build_glyph_run("cached", 20.0).expect("glyph run");
+    assert_eq!(
+        (niri_vk::stats::shapes(), niri_vk::stats::submits()),
+        (shapes, submits),
+        "re-shaping an identical run did work instead of hitting the cache"
+    );
+    assert_eq!(
+        again.glyphs().len(),
+        first.glyphs().len(),
+        "the cached run does not match the run it replaced"
+    );
+
+    // A different string, size or weight is a different run and must still build.
+    for (text, px, bold) in [
+        ("other", 20.0, false),
+        ("cached", 21.0, false),
+        ("cached", 20.0, true),
+    ] {
+        let submits = niri_vk::stats::submits();
+        vk.build_glyph_run_weighted(text, px, bold)
+            .expect("glyph run");
+        assert!(
+            niri_vk::stats::submits() > submits,
+            "{text:?} at {px}px bold={bold} wrongly reused the cached run"
+        );
+    }
+}

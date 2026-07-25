@@ -81,10 +81,51 @@ pub fn measure_line_width(text: &str, px: f32) -> f64 {
     measure_line_width_weighted(text, px, false)
 }
 
+/// Cache for [`measure_line_width_weighted`], keyed by the whole argument list.
+///
+/// A measurement is a full cosmic-text shape whose only output is one `f64`, and
+/// layout code calls it the way it would call a getter — the panel alone measures
+/// its clock four times per frame (`ui/panel.rs`, `date_menu_rect` via the role,
+/// hit-test and element paths). Memoizing turns a repeat call into a hash lookup.
+///
+/// Bounded by clearing wholesale at [`MEASURE_CACHE_CAP`]: with seconds shown, the
+/// clock contributes one never-reused key per second, so this must not grow
+/// forever. Dropping everything costs a re-measure of the live labels, which is
+/// what an unbounded cache was paying every frame anyway.
+fn measure_cache() -> &'static Mutex<MeasureCache> {
+    static CACHE: OnceLock<Mutex<MeasureCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Measured line widths keyed by `(text, px bits, bold)`.
+type MeasureCache = HashMap<(String, u32, bool), f64>;
+
+const MEASURE_CACHE_CAP: usize = 1024;
+
 /// Like [`measure_line_width`], but shapes at [`Weight::BOLD`] when `bold` — the width a bold run
 /// (e.g. the panel clock, which draws `font-weight: bold` like GNOME's `panel_button`) lays out to,
 /// so its hit rectangle and centering match the glyphs `build_glyph_run_weighted` rasterizes.
+///
+/// Memoized (see [`measure_cache`]); a hit does no shaping at all.
 pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
+    // `px` is a float only because font sizes scale; its bits key exactly, and
+    // two sizes that differ below representable precision are the same size.
+    let key = (text.to_owned(), px.to_bits(), bold);
+    if let Some(width) = measure_cache().lock().unwrap().get(&key) {
+        return *width;
+    }
+
+    let width = measure_line_width_uncached(text, px, bold);
+
+    let mut cache = measure_cache().lock().unwrap();
+    if cache.len() >= MEASURE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, width);
+    width
+}
+
+fn measure_line_width_uncached(text: &str, px: f32, bold: bool) -> f64 {
     let _timed = crate::stats::shape();
     let mut fonts = measure_fonts().lock().unwrap();
     let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
@@ -1167,5 +1208,37 @@ mod tests {
 
         atlas.texture.destroy(&gpu);
         unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+    /// A repeated measurement must not re-shape: the same width comes back with the
+    /// shape counter untouched. Layout code calls this like a getter (the panel
+    /// measures its clock several times per frame), so a miss-every-time cache is a
+    /// full cosmic-text shape per call.
+    #[test]
+    fn a_repeated_measurement_is_cached() {
+        let first = measure_line_width_weighted("cached measurement", 16.0, false);
+        assert!(first > 0., "an empty width means nothing was shaped");
+
+        let shapes = crate::stats::shapes();
+        let again = measure_line_width_weighted("cached measurement", 16.0, false);
+        assert_eq!(
+            again, first,
+            "the cached width differs from the measured one"
+        );
+        assert_eq!(
+            crate::stats::shapes(),
+            shapes,
+            "a repeated measurement re-shaped instead of hitting the cache"
+        );
+
+        // Weight and size are part of the key: bold is wider at the same size.
+        let bold = measure_line_width_weighted("cached measurement", 16.0, true);
+        assert!(
+            bold > first,
+            "bold measured {bold} vs regular {first} — the weight is not in the key"
+        );
+        assert!(
+            crate::stats::shapes() > shapes,
+            "the bold variant was not shaped"
+        );
     }
 }
