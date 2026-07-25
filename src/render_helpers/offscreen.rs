@@ -168,8 +168,10 @@ impl OffscreenBuffer {
                 .context("error rendering")?
         };
 
-        // Make the just-rendered offscreen sampleable by the returned element's draw (a no-op on
-        // GLES; the owned Vulkan renderer inserts the layout barrier its images need).
+        // Make the just-rendered offscreen sampleable by the returned element's draw. Normally a
+        // no-op on both renderers now — the owned renderer's frames leave an offscreen target
+        // sampleable, and GLES never needed a transition — but the render above may have been
+        // skipped for want of damage, leaving whatever layout the texture already had.
         renderer
             .make_offscreen_sampleable(&inner.texture)
             .context("error preparing offscreen for sampling")?;

@@ -75,10 +75,6 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// nothing) falls back to a whole-frame blit. See [`Self::record_present_blit`].
     present_damage: Vec<vk::Rect2D>,
     finished: bool,
-    /// Leave the target in `SHADER_READ_ONLY_OPTIMAL` when the frame finishes, by
-    /// recording the transition into *this* command buffer. See
-    /// [`finish_sampleable`](Self::finish_sampleable).
-    sampleable_on_finish: bool,
 }
 
 impl fmt::Debug for VulkanFrame<'_, '_> {
@@ -198,7 +194,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             clip_override: None,
             present_damage: Vec::new(),
             finished: false,
-            sampleable_on_finish: false,
         })
     }
 
@@ -1448,24 +1443,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         present.set_layout(vk::ImageLayout::GENERAL);
     }
 
-    /// Finish this frame, leaving its target ready to be sampled by a later draw.
-    ///
-    /// The transition to `SHADER_READ_ONLY_OPTIMAL` is recorded into the frame's
-    /// own command buffer, so it rides the submit that was happening anyway.
-    /// [`VulkanRenderer::make_sampleable`] does the same transition through
-    /// `run_commands` — a second command buffer, submit and fence wait — which for
-    /// an offscreen bake doubles the round trips for what is one pipeline barrier.
-    /// A bake's GPU work is negligible and measurably pixel-independent (a
-    /// 1920x1080 bake costs the same as a 220x32 one), so those round trips *are*
-    /// the cost.
-    ///
-    /// Offscreen targets only. A scanout frame must stay in `TRANSFER_SRC_OPTIMAL`
-    /// for the present blit, so it uses plain `finish`.
-    pub fn finish_sampleable(mut self) -> Result<SyncPoint, VulkanError> {
-        self.sampleable_on_finish = true;
-        self.finish_internal()
-    }
-
     fn finish_internal(&mut self) -> Result<SyncPoint, VulkanError> {
         if self.finished {
             return Ok(SyncPoint::signaled());
@@ -1485,7 +1462,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // The render pass's `final_layout` left the target in
             // TRANSFER_SRC_OPTIMAL; take it the rest of the way here rather than
             // in a command buffer of its own.
-            if self.sampleable_on_finish {
+            if self.fb.offscreen {
                 transition_image(
                     dev,
                     self.cbuf,
@@ -1519,7 +1496,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // The render pass's `final_layout` leaves the target in TRANSFER_SRC_OPTIMAL (see
         // `create_render_pass`); record it so readback is a no-op and `make_sampleable` knows the
         // source layout for its barrier. Unless we just took it further, above.
-        self.fb.buffer.set_layout(if self.sampleable_on_finish {
+        self.fb.buffer.set_layout(if self.fb.offscreen {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
         } else {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL

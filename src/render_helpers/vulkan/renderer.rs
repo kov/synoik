@@ -1048,10 +1048,15 @@ impl VulkanRenderer {
 
     /// Transition an offscreen [`VkTexture`] into `SHADER_READ_ONLY_OPTIMAL` so it can be sampled
     /// after being rendered into (the offscreen-snapshot / blur / clipped-surface bridge). No-op if
-    /// it is already sampleable. Runs as its own fence-waited submission, matching this renderer's
-    /// synchronous per-submit model; call it once, between finishing the offscreen render and using
-    /// the texture as a draw source. Reached generically via
+    /// it is already sampleable. Reached generically via
     /// [`crate::render_helpers::renderer::OffscreenRenderer::make_offscreen_sampleable`].
+    ///
+    /// **Usually a no-op now**: a [`VulkanFrame`](super::VulkanFrame) targeting an offscreen
+    /// already finishes it sampleable, riding the submit it was making anyway. This remains for
+    /// textures that reach a sampled state by some other route (e.g. a transfer), where it is
+    /// the only option — and it is expensive, a whole command buffer, submit and fence wait for
+    /// one pipeline barrier, which is why the frame path stopped using it. Keep it a fallback,
+    /// not a step.
     pub(crate) fn make_sampleable(&self, tex: &VkTexture) -> Result<(), VulkanError> {
         let old_layout = tex.layout();
         if old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
@@ -1434,7 +1439,7 @@ impl Bind<VkTexture> for VulkanRenderer {
                 "binding an imported (non-renderable) texture as a target",
             ));
         }
-        Ok(VkFramebuffer::new(target.clone()))
+        Ok(VkFramebuffer::new_offscreen(target.clone()))
     }
 }
 

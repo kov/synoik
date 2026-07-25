@@ -420,6 +420,11 @@ impl GlyphRun {
 /// rendering through the clone writes the same image the caller (offscreen) or dmabuf reads back.
 pub struct VkFramebuffer<'a> {
     pub(super) buffer: VkTexture,
+    /// Whether `buffer` is an offscreen texture (bound via `Bind<VkTexture>`) rather
+    /// than a scanout dmabuf. An offscreen exists to be sampled afterwards, so a
+    /// frame targeting one finishes it in `SHADER_READ_ONLY_OPTIMAL`; a scanout
+    /// target must stay in `TRANSFER_SRC_OPTIMAL` for the present blit.
+    pub(super) offscreen: bool,
     /// Set on the **present-blit** scanout path (KMS planes that want `Argb8888`/`Xrgb8888`, whose
     /// byte order differs from the renderer's RGBA render pass): `buffer` is then an R8G8B8A8
     /// shadow rendered into as usual, and this is the imported dmabuf that
@@ -431,9 +436,22 @@ pub struct VkFramebuffer<'a> {
 }
 
 impl VkFramebuffer<'_> {
+    /// An offscreen framebuffer: `buffer` is a renderable [`VkTexture`] that exists
+    /// to be sampled once rendered. See [`Self::offscreen`].
+    pub(super) fn new_offscreen(buffer: VkTexture) -> Self {
+        VkFramebuffer {
+            buffer,
+            offscreen: true,
+            present: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// A scanout framebuffer rendered into directly (an RGBA-order dmabuf).
     pub(super) fn new(buffer: VkTexture) -> Self {
         VkFramebuffer {
             buffer,
+            offscreen: false,
             present: None,
             _marker: std::marker::PhantomData,
         }
@@ -444,6 +462,7 @@ impl VkFramebuffer<'_> {
     pub(super) fn new_with_present(buffer: VkTexture, present: VkTexture) -> Self {
         VkFramebuffer {
             buffer,
+            offscreen: false,
             present: Some(present),
             _marker: std::marker::PhantomData,
         }

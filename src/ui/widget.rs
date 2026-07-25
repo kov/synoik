@@ -732,11 +732,12 @@ pub fn bake_uncached_sized(
         let mut fb = renderer.bind(&mut target)?;
         let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
         paint(&mut frame)?;
-        // `finish_sampleable`, not `finish` + `make_offscreen_sampleable`: the
-        // layout transition rides this submit instead of costing a second command
-        // buffer, submit and fence wait of its own. A bake's GPU work is
-        // negligible, so the round trips were most of what a bake cost.
-        let _sync = frame.finish_sampleable()?;
+        // No `make_offscreen_sampleable` afterwards: finishing a frame that targets
+        // an offscreen leaves it sampleable, with the layout transition riding this
+        // submit instead of costing a command buffer, submit and fence wait of its
+        // own. A bake's GPU work is negligible, so the round trips were most of what
+        // a bake cost.
+        let _sync = frame.finish()?;
     }
     Ok(target)
 }
