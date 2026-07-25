@@ -8,12 +8,13 @@ seat, because the thing this buys can only be read there. Full evidence in
 Landed: `6bef18ac` (chain every submit on a queue timeline), `6f645bd8` (the scanout frame hands
 its fence to KMS), on top of `7b5f016d` (time the wait apart from the submit).
 
-**One-line summary:** every `vkQueueSubmit` in the owned renderer is immediately followed by
-`wait_for_fences(…, u64::MAX)`. The CPU blocks until the GPU drains, every time. On the scanout
-submit that wait is 12–14 ms of a 16.67 ms frame, it does not depend on anything we draw, and we
-never overlap it with anything.
+**One-line summary:** every `vkQueueSubmit` in the owned renderer was immediately followed by
+`wait_for_fences(…, u64::MAX)`. The CPU blocked until the GPU drained, every time. On the scanout
+submit that wait is 12–14 ms of a 16.67 ms frame, it does not depend on anything we draw, and
+nothing overlaps it. The scanout submit can now skip that wait and hand its fence to KMS instead;
+every other submit still waits, and so does that one unless the session opts in.
 
-## What the code does today
+## What the code did, and still does by default
 
 `VulkanFrame::finish_internal` (`src/render_helpers/vulkan/frame.rs`) ends the command buffer,
 submits it, waits on the fence, then frees the buffer. `Gpu::run_commands`
@@ -51,7 +52,12 @@ Two consequences worth writing down:
   is to stop *blocking the CPU* on one, so a frame's remaining budget is not spent staring at a
   fence.
 
-## What fixing it involves
+## What fixing it involved
+
+*Written before the work; kept because the estimate is worth comparing against
+[what was built](#what-was-built). Items 1 and 2 landed, item 3 turned out to be unnecessary and
+item 4 was not a prerequisite — but the estimate missed submit **ordering** entirely, which is
+the part with the real correctness risk.*
 
 Not a local change. Removing the fence wait means the renderer must track work in flight:
 
