@@ -830,7 +830,7 @@ impl TextRenderer {
                     as_bytes(&push),
                 );
                 device.cmd_draw(cbuf, 6, 1, 0, 0);
-                crate::stats::draw();
+                crate::stats::draw(u64::from(g.w) * u64::from(g.h));
             }
         }
     }

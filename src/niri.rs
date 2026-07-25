@@ -6433,6 +6433,9 @@ impl Niri {
                     .layout
                     .monitor_for_output(output)
                     .and_then(|mon| mon.overview_state_value()),
+                output_px: output.current_mode().map_or(0, |m| {
+                    u64::from(m.size.w.max(0) as u32) * u64::from(m.size.h.max(0) as u32)
+                }),
             });
         }
         self.frame_log.end(refresh_interval);

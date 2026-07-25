@@ -331,7 +331,8 @@ impl BlurChain {
                 as_bytes(&push),
             );
             device.cmd_draw(cbuf, 3, 1, 0, 0);
-            crate::stats::draw();
+            // A blur pass shades its whole destination level.
+            crate::stats::draw(u64::from(extent.width) * u64::from(extent.height));
             device.cmd_end_render_pass(cbuf);
         }
     }

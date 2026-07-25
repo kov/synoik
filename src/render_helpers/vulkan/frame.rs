@@ -264,7 +264,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         for s in scissors {
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(s));
             dev.cmd_draw(cbuf, 6, 1, 0, 0);
-            niri_vk::stats::draw();
+            // The quad covers the element, so the scissor IS the shaded area.
+            niri_vk::stats::draw(u64::from(s.extent.width) * u64::from(s.extent.height));
         }
     }
 
@@ -647,7 +648,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 for s in &scissors {
                     dev.cmd_set_scissor(self.cbuf, 0, std::slice::from_ref(s));
                     dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
-                    niri_vk::stats::draw();
+                    // A glyph quad is far smaller than its scissor (which spans the whole run), so
+                    // the glyph's own area is what gets shaded.
+                    niri_vk::stats::draw(u64::from(g.w) * u64::from(g.h));
                 }
             }
         }

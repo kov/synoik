@@ -192,6 +192,8 @@ pub struct FrameContext {
     pub animating: bool,
     /// Where the overview sits on its 0..2 state axis, if it is open at all.
     pub overview_state: Option<f64>,
+    /// The output's physical area in pixels, to express shading as an overdraw multiple.
+    pub output_px: u64,
 }
 
 /// What to log, parsed from the environment.
@@ -263,6 +265,7 @@ struct InFlight {
     shapes_at_start: u64,
     submits_at_start: u64,
     draws_at_start: u64,
+    shaded_at_start: u64,
     context: FrameContext,
 }
 
@@ -282,6 +285,9 @@ struct Totals {
     submits: u64,
     submitting: Duration,
     draws: u64,
+    /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
+    /// and shrinking the damage rect collapses a frame to its bare submit overhead.
+    shaded: u64,
 }
 
 /// See the [module docs](self).
@@ -394,6 +400,7 @@ impl FrameLog {
             shapes_at_start: niri_vk::stats::shapes(),
             submits_at_start: niri_vk::stats::submits(),
             draws_at_start: niri_vk::stats::draws(),
+            shaded_at_start: niri_vk::stats::shaded(),
             context: FrameContext::default(),
         });
     }
@@ -446,6 +453,7 @@ impl FrameLog {
             submits: niri_vk::stats::submits() - frame.submits_at_start,
             submitting: niri_vk::stats::take_submit_time(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
+            shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
 
         // The budget: an explicit threshold if given, else the refresh interval.
@@ -503,6 +511,13 @@ impl FrameLog {
         let ctx = &frame.context;
         let _ = write!(line, "; {} elements", ctx.elements);
         let _ = write!(line, ", {} draws", totals.draws);
+        if ctx.output_px > 0 && totals.shaded > 0 {
+            let _ = write!(
+                line,
+                " covering {:.1}x the output",
+                totals.shaded as f64 / ctx.output_px as f64
+            );
+        }
         // Submits before bakes and shaping: on a virtualized GPU the round-trip
         // count is usually the headline, and both of those are ways of spending it.
         if totals.submits > 0 {

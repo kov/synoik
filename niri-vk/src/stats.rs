@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 static SUBMITS: AtomicU64 = AtomicU64::new(0);
 static SUBMIT_NANOS: AtomicU64 = AtomicU64::new(0);
 static DRAWS: AtomicU64 = AtomicU64::new(0);
+static SHADED: AtomicU64 = AtomicU64::new(0);
 static SHAPES: AtomicU64 = AtomicU64::new(0);
 static SHAPE_NANOS: AtomicU64 = AtomicU64::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -82,9 +83,21 @@ pub fn take_shape_time() -> Duration {
     Duration::from_nanos(SHAPE_NANOS.swap(0, Ordering::Relaxed))
 }
 
-/// Record one `vkCmdDraw`.
-pub fn draw() {
+/// Record one `vkCmdDraw` covering `pixels` shaded fragments (the drawn quad clipped to its
+/// scissor).
+///
+/// The pixel count is the number that matters. Measured on this stack, holding the draw count
+/// fixed and shrinking the damage rect collapses a frame's cost to the bare submit overhead — so
+/// what a frame costs is how many fragments it shades, not how many draws it issues. Reported as
+/// an overdraw multiple of the output area, because that is the form you can act on.
+pub fn draw(pixels: u64) {
     DRAWS.fetch_add(1, Ordering::Relaxed);
+    SHADED.fetch_add(pixels, Ordering::Relaxed);
+}
+
+/// Fragments shaded since process start. The caller takes a delta across a frame.
+pub fn shaded() -> u64 {
+    SHADED.load(Ordering::Relaxed)
 }
 
 /// Submits since process start. The caller takes a delta across a frame.
