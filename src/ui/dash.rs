@@ -40,9 +40,7 @@
 //! `_drawing.scss`, `_colors.scss`); see the constants below.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
-use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
@@ -183,8 +181,6 @@ struct DashCache {
     dots: widget::BakeCache,
     /// Full-color favorite icon uploads.
     icons: AppIconUploads,
-    /// The show-apps symbolic glyph upload (keyed by scale).
-    show_apps: HashMap<NotNan<f64>, TextureBuffer<VkTexture>>,
 }
 
 /// The overview dash. Owned on `Niri`; fed by `sync_dash_apps`.
@@ -264,7 +260,6 @@ impl Dash {
     pub fn clear_icon_uploads(&self) {
         let mut cache = self.cache.borrow_mut();
         cache.icons.clear();
-        cache.show_apps.clear();
     }
 
     /// Lay out the dash within its allocated `box` (logical, output coords;
@@ -456,9 +451,6 @@ impl Dash {
         progress: f64,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
-        let Some(scale_key) = NotNan::new(scale).ok() else {
-            return Vec::new();
-        };
         let layout = self.layout(area);
         let alpha = progress as f32;
 
@@ -467,7 +459,6 @@ impl Dash {
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
             cache.icons.clear();
-            cache.show_apps.clear();
             cache.context = Some(context);
         }
 
@@ -544,24 +535,17 @@ impl Dash {
             }
         }
 
-        // The show-apps symbolic glyph (its own small upload cache so it fades with
-        // `progress` — `icon_element` hardcodes alpha 1).
-        if let Some(buffer) = sym_icons.buffer(SHOW_APPS_ICON, ICON_PX, scale, SHOW_APPS_FG) {
-            #[allow(clippy::map_entry)]
-            if !cache.show_apps.contains_key(&scale_key) {
-                match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                    Ok(tb) => {
-                        cache.show_apps.insert(scale_key, tb);
-                    }
-                    Err(err) => tracing::error!("error uploading show-apps icon: {err:#}"),
-                }
-            }
-            if let Some(tb) = cache.show_apps.get(&scale_key) {
+        // The show-apps symbolic glyph. Built by hand rather than via `icon_element`
+        // because it fades with `progress` and `icon_element` hardcodes alpha 1.
+        {
+            if let Some(tb) =
+                sym_icons.texture(renderer, SHOW_APPS_ICON, ICON_PX, scale, SHOW_APPS_FG)
+            {
                 let logical = tb.logical_size();
                 let center = layout.icon_center(layout.n_items);
                 let loc = center - Point::from((logical.w / 2., logical.h / 2.));
                 elements.push(TextureRenderElement::from_texture_buffer(
-                    tb.clone(),
+                    tb,
                     loc,
                     alpha,
                     None,

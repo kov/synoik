@@ -274,16 +274,6 @@ const QS_MIC_MUTED_ICONS: &[&str] = &[
 /// app is recording (a muted mic drops the tint — no privacy concern).
 const PRIVACY_ORANGE: [f32; 4] = [1., 0x78 as f32 / 255., 0., 1.];
 
-/// Pack an RGBA tint into a hashable key byte-quad for the `qs_icons` upload cache.
-fn color_key(c: [f32; 4]) -> [u8; 4] {
-    [
-        (c[0] * 255.) as u8,
-        (c[1] * 255.) as u8,
-        (c[2] * 255.) as u8,
-        (c[3] * 255.) as u8,
-    ]
-}
-
 /// The mic privacy indicator's icon candidates + tint, or `None` when nothing is recording. Shown
 /// (tinted orange) while an unmuted app captures; muted → the muted glyph, untinted.
 fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
@@ -456,10 +446,6 @@ struct BarCache {
     /// here — it is a separate element ([`bar_bg`]), which is what lets one cached bake
     /// serve the whole overview fade.
     textures: HashMap<(NotNan<f64>, i32, usize, usize), VkTexture>,
-    /// Uploaded quick-settings indicator icons, keyed by (scale, resolved name, tint). The tint is
-    /// part of the key because the mic privacy icon uploads orange while the rest are white — the
-    /// same name at two colors must not collide.
-    qs_icons: HashMap<(NotNan<f64>, String, [u8; 4]), TextureBuffer<VkTexture>>,
     /// The bar background. A buffer rather than a bare colour so its commit counter
     /// bumps when the colour or width changes — that is what tells damage tracking the
     /// background moved, now that it is no longer part of the chrome bake.
@@ -474,21 +460,14 @@ impl BarCache {
         Self {
             context: None,
             textures: HashMap::new(),
-            qs_icons: HashMap::new(),
             bg: SolidColorBuffer::default(),
         }
     }
 
-    /// Drop everything cached (content or renderer changed).
+    /// Drop the cached bar chrome (content or renderer changed). The composited status
+    /// icons are not in here — they live in the shared [`IconCache`], which outlives any
+    /// bar re-bake, so a hover that redraws the bar never re-uploads an icon.
     fn clear(&mut self) {
-        self.textures.clear();
-        self.qs_icons.clear();
-    }
-
-    /// Drop only the bar chrome, keeping the uploaded status icons. Used when just
-    /// the button container state (hover/active) changes, which redraws the bar but
-    /// leaves the composited icons untouched — hover moves must not re-upload icons.
-    fn clear_bars(&mut self) {
         self.textures.clear();
     }
 }
@@ -674,7 +653,7 @@ impl Panel {
         // Bars only: the label is drawn into the bar, but the composited status-icon
         // uploads are keyed by name and tint and do not depend on it. This ticks once
         // a second while recording, so re-uploading every icon here is pure waste.
-        self.cache.borrow_mut().clear_bars();
+        self.cache.borrow_mut().clear();
         true
     }
 
@@ -722,7 +701,7 @@ impl Panel {
             self.clock_text = text;
             // Bars only — see `update_recording_label`. With seconds shown this fires
             // every second, and the status icons have nothing to do with the time.
-            self.cache.borrow_mut().clear_bars();
+            self.cache.borrow_mut().clear();
             true
         } else {
             false
@@ -829,7 +808,7 @@ impl Panel {
             changed = true;
         }
         if changed {
-            self.cache.borrow_mut().clear_bars();
+            self.cache.borrow_mut().clear();
         }
     }
 
@@ -1145,91 +1124,57 @@ impl Panel {
         // The right-box status icons sit on top of the bar. Elements are pushed
         // first-topmost (the list is consumed in reverse). The workspace dots are now
         // drawn into the bar texture itself (rounded rects), not composited separately.
-        self.qs_indicator_elements(
-            renderer,
-            &mut cache,
-            scale,
-            scale_key,
-            width,
-            &mut elements,
-            icons,
-        );
+        self.qs_indicator_elements(renderer, scale, width, &mut elements, icons);
 
         // The screen-recording indicator's stop glyph, composited on top of its red pill
         // (which is drawn into the bar below). Same upload/caching as the QS cluster icons.
         if self.is_recording() {
             let r1 = self.screen_recording_rect(width);
             let icon_x = r1.loc.x + r1.size.w - INDICATOR_H_PADDING - R1_ICON;
-            if let Some((name, buffer)) = SCREENCAST_STOP_ICONS
+            if let Some(tb) = SCREENCAST_STOP_ICONS
                 .iter()
-                .find_map(|n| icons.buffer(n, R1_ICON, scale, TEXT).map(|b| (*n, b)))
+                .find_map(|n| icons.texture(renderer, n, R1_ICON, scale, TEXT))
             {
-                let key = (scale_key, name.to_string(), color_key(TEXT));
-                #[allow(clippy::map_entry)]
-                if !cache.qs_icons.contains_key(&key) {
-                    if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                        cache.qs_icons.insert(key.clone(), tb);
-                    } else {
-                        tracing::error!("error uploading the screen-recording stop icon");
-                    }
-                }
-                if let Some(tb) = cache.qs_icons.get(&key) {
-                    let logical = tb.logical_size();
-                    let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
-                    elements.push(PanelElement::Texture(
-                        TextureRenderElement::from_texture_buffer(
-                            tb.clone(),
-                            location,
-                            1.,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
+                let logical = tb.logical_size();
+                let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
+                elements.push(PanelElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb,
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
+                ));
             }
         }
 
         // The dateMenu messages-indicator dot (`message-indicator-symbolic`),
-        // composited on top of the bar after the clock, in the panel fg. Same
-        // upload/caching as the recording stop glyph and the QS cluster icons.
+        // composited on top of the bar after the clock, in the panel fg.
         if let Some(rect) = self.messages_indicator_rect(width) {
-            if let Some(buffer) = icons.buffer(
+            if let Some(tb) = icons.texture(
+                renderer,
                 "message-indicator-symbolic",
                 MESSAGES_INDICATOR_ICON,
                 scale,
                 TEXT,
             ) {
-                let key = (
-                    scale_key,
-                    "message-indicator-symbolic".to_string(),
-                    color_key(TEXT),
-                );
-                #[allow(clippy::map_entry)]
-                if !cache.qs_icons.contains_key(&key) {
-                    if let Ok(tb) = TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                        cache.qs_icons.insert(key.clone(), tb);
-                    } else {
-                        tracing::error!("error uploading the messages-indicator icon");
-                    }
-                }
-                if let Some(tb) = cache.qs_icons.get(&key) {
-                    let logical = tb.logical_size();
-                    let location = Point::from((
-                        rect.loc.x + (rect.size.w - logical.w) / 2.,
-                        (PANEL_HEIGHT - logical.h) / 2.,
-                    ));
-                    elements.push(PanelElement::Texture(
-                        TextureRenderElement::from_texture_buffer(
-                            tb.clone(),
-                            location,
-                            1.,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
+                let logical = tb.logical_size();
+                let location = Point::from((
+                    rect.loc.x + (rect.size.w - logical.w) / 2.,
+                    (PANEL_HEIGHT - logical.h) / 2.,
+                ));
+                elements.push(PanelElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb,
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
+                ));
             }
         }
 
@@ -1354,14 +1299,11 @@ impl Panel {
 
     /// Push the right-box quick-settings status icons onto `elements`, laid out in
     /// a right-anchored cluster and composited on top of the bar. Each icon is
-    /// resolved from its candidate list and uploaded once per (scale, name).
-    #[allow(clippy::too_many_arguments)]
+    /// resolved from its candidate list; the upload itself is the [`IconCache`]'s.
     fn qs_indicator_elements(
         &self,
         renderer: &mut VulkanRenderer,
-        cache: &mut BarCache,
         scale: f64,
-        scale_key: NotNan<f64>,
         output_width: f64,
         elements: &mut Vec<PanelElement>,
         icons: &IconCache,
@@ -1372,35 +1314,20 @@ impl Panel {
         for (candidates, color) in
             qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
         {
-            // Resolve the first candidate that rasterizes (in its tint), then cache its upload.
-            let Some((name, buffer)) = candidates.iter().find_map(|name| {
-                icons
-                    .buffer(name, QS_ICON, scale, color)
-                    .map(|b| (name.to_string(), b))
-            }) else {
+            // The first candidate that resolves, in its tint.
+            let Some(tb) = candidates
+                .iter()
+                .find_map(|name| icons.texture(renderer, name, QS_ICON, scale, color))
+            else {
                 x += QS_ICON + QS_ICON_GAP;
                 continue;
             };
-            let key = (scale_key, name, color_key(color));
-            #[allow(clippy::map_entry)]
-            if !cache.qs_icons.contains_key(&key) {
-                match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                    Ok(tb) => {
-                        cache.qs_icons.insert(key.clone(), tb);
-                    }
-                    Err(err) => {
-                        tracing::error!("error uploading a quick-settings indicator icon: {err:#}");
-                        x += QS_ICON + QS_ICON_GAP;
-                        continue;
-                    }
-                }
-            }
-            if let Some(tb) = cache.qs_icons.get(&key) {
+            {
                 let logical = tb.logical_size();
                 let location = Point::from((x, (PANEL_HEIGHT - logical.h) / 2.));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
-                        tb.clone(),
+                        tb,
                         location,
                         1.,
                         None,

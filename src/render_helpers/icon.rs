@@ -55,20 +55,23 @@ const CATEGORIES: &[&str] = &[
     "mimetypes",
 ];
 
-/// Resolves + rasterizes symbolic icons on demand, caching both the resolved
-/// paths and the rendered (recolored) buffers.
+/// Resolves + rasterizes symbolic icons on demand, caching the resolved paths and
+/// the uploaded textures.
 pub struct IconCache {
     /// Themes to search, in order (e.g. the configured theme, then Adwaita/hicolor).
     themes: Vec<String>,
     resolved: RefCell<HashMap<String, Option<PathBuf>>>,
-    buffers: RefCell<HashMap<(String, u32, u32), MemoryBuffer>>,
-    /// The GPU uploads of `buffers`, keyed identically ([`icon_key`]). Symbolic icons
-    /// are *elements*, rebuilt from scratch on every frame that draws them, and each
-    /// upload is a synchronous submit + fence-wait — measured at ~1.7ms apiece on the
-    /// Venus queue, independent of size. One quick-settings popover frame asks for
-    /// nine, so an open popover paid ~13ms a frame to re-upload identical pixels.
-    /// Caching the texture makes a redraw free; the CPU raster above was already
-    /// cached, so only this half was recurring.
+    /// Uploaded icons, keyed by [`icon_key`]. Symbolic icons are *elements*, rebuilt
+    /// from scratch on every frame that draws them, and each upload is a synchronous
+    /// submit + fence-wait — ~1.7ms apiece on the Venus queue, independent of size.
+    /// One quick-settings popover frame asks for nine, so an open popover paid ~13ms
+    /// a frame to re-upload identical pixels. Caching the texture makes a redraw free.
+    ///
+    /// The rasterized pixels are deliberately **not** cached alongside: this map is
+    /// invalidated strictly more often than a raster cache would be (only by `context`
+    /// below; everything else — an icon-theme change — replaces the whole `IconCache`),
+    /// so a raster cache could only ever save work after a renderer recreation. That is
+    /// device loss, and re-rasterizing a few symbolic SVGs is the least of it.
     textures: RefCell<HashMap<(String, u32, u32), TextureBuffer<VkTexture>>>,
     /// Identifies the renderer `textures` were uploaded to; a mismatch drops them all
     /// (they belong to a device that is gone). Same guard the widget bake caches use.
@@ -87,7 +90,6 @@ impl IconCache {
         Self {
             themes,
             resolved: RefCell::new(HashMap::new()),
-            buffers: RefCell::new(HashMap::new()),
             textures: RefCell::new(HashMap::new()),
             context: RefCell::new(None),
         }
@@ -109,44 +111,28 @@ impl IconCache {
         path
     }
 
-    /// A recolored icon buffer for `name` at `logical_px` (square), rendered at the
-    /// output `scale` and tinted to straight-RGBA `color`. `None` if unresolved.
-    /// Cached by (name, physical size, color).
-    pub fn buffer(
-        &self,
-        name: &str,
-        logical_px: f64,
-        scale: f64,
-        color: [f32; 4],
-    ) -> Option<MemoryBuffer> {
-        let key = icon_key(name, logical_px, scale, color);
-        let px = key.1;
-        if let Some(buf) = self.buffers.borrow().get(&key) {
-            return Some(buf.clone());
-        }
+    /// Rasterize a recolored icon: `name` at `px` physical pixels (square), tinted to
+    /// straight-RGBA `color`. `None` if the theme doesn't provide it.
+    ///
+    /// Uncached by design — see the note on [`textures`](Self::textures). The only
+    /// caller is [`texture`](Self::texture), on a miss, so an icon already on the GPU
+    /// never reaches here.
+    fn rasterize(&self, name: &str, px: u32, scale: f64, color: [f32; 4]) -> Option<MemoryBuffer> {
         let result = if let Some(bytes) = embedded_icon(name) {
             rasterize_symbolic_bytes(bytes, px, color, scale)
         } else {
             let path = self.resolve(name)?;
             rasterize_symbolic(&path, px, color, scale)
         };
-        match result {
-            Ok(buf) => {
-                self.buffers.borrow_mut().insert(key, buf.clone());
-                Some(buf)
-            }
-            Err(err) => {
-                tracing::warn!("failed to rasterize icon {name:?}: {err:#}");
-                None
-            }
-        }
+        result
+            .map_err(|err| tracing::warn!("failed to rasterize icon {name:?}: {err:#}"))
+            .ok()
     }
 
-    /// The uploaded texture for what [`buffer`](Self::buffer) would rasterize — the
-    /// form every caller actually wants, since a symbolic icon is only ever
-    /// composited. Cached by the same key, so drawing the same icon on a later frame
-    /// costs no submit at all. `None` if it can't be resolved or the upload fails
-    /// (never cached, so the next frame retries).
+    /// The uploaded texture for a symbolic icon — the form every caller wants, since
+    /// a symbolic icon is only ever composited. Cached, so drawing the same icon on a
+    /// later frame costs no submit at all. `None` if it can't be resolved or the
+    /// upload fails (never cached, so the next frame retries).
     pub fn texture(
         &self,
         renderer: &mut VulkanRenderer,
@@ -166,7 +152,7 @@ impl IconCache {
             return Some(tb.clone());
         }
 
-        let buffer = self.buffer(name, logical_px, scale, color)?;
+        let buffer = self.rasterize(name, key.1, scale, color)?;
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
                 self.textures.borrow_mut().insert(key, tb.clone());
@@ -180,9 +166,8 @@ impl IconCache {
     }
 }
 
-/// The cache key shared by [`IconCache::buffer`] and [`IconCache::texture`]: the
-/// name, the *physical* pixel size (so scale is folded in), and the quantized tint.
-/// One function so the two maps can never key differently on the same request.
+/// [`IconCache::textures`]'s key: the name, the *physical* pixel size (so scale is
+/// folded in), and the quantized tint — the three things that change the pixels.
 fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> (String, u32, u32) {
     let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
     (name.to_string(), px, color_key(color))
@@ -772,7 +757,7 @@ mod tests {
             .resolve("definitely-not-an-icon-xyz-symbolic")
             .is_none());
         assert!(cache
-            .buffer("definitely-not-an-icon-xyz-symbolic", 16., 1., [1.; 4])
+            .rasterize("definitely-not-an-icon-xyz-symbolic", 16, 1., [1.; 4])
             .is_none());
     }
 

@@ -40,9 +40,7 @@
 //! hit-testing is still per-output.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
-use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::input::keyboard::Keysym;
@@ -159,10 +157,6 @@ struct SearchCache {
     results_bake: widget::BakeCache,
     /// Full-color result-icon uploads (shared key space with the dash's).
     icons: AppIconUploads,
-    /// The entry's symbolic glyph uploads, keyed by `(scale, icon name)` — uploaded at
-    /// full tint so the overview fade rides on the element alpha instead of the tint
-    /// (which would thrash the `IconCache`; see `render`).
-    glyphs: HashMap<(NotNan<f64>, &'static str), TextureBuffer<VkTexture>>,
 }
 
 /// The overview search model. Owned on `Niri`; fed results by `sync_overview_search`.
@@ -351,7 +345,6 @@ impl OverviewSearch {
     pub fn clear_icon_uploads(&self) {
         let mut cache = self.cache.borrow_mut();
         cache.icons.clear();
-        cache.glyphs.clear();
     }
 
     /// Lay out the entry pill + (when active) the results card + tiles inside the
@@ -494,7 +487,6 @@ impl OverviewSearch {
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
             cache.icons.clear();
-            cache.glyphs.clear();
             cache.context = Some(context);
         }
 
@@ -502,57 +494,40 @@ impl OverviewSearch {
         let active = self.is_active();
 
         // --- Entry glyphs (topmost): the find icon, and the clear icon when active. ---
-        // Rasterized + uploaded ONCE per scale at full tint, with `progress` applied as
-        // the element alpha. Folding the fade into the tint instead would miss the
-        // `IconCache` key (`(name, px, color)`) on every animation frame, re-rasterizing
-        // the SVG and accreting a cached buffer per alpha step — the trap the dash's
-        // show-apps glyph documents.
-        if let Ok(scale_key) = NotNan::new(scale) {
-            for (name, color, center, want) in [
-                (
-                    "edit-find-symbolic",
-                    style::MUTED,
-                    layout.entry.primary_icon,
-                    true,
-                ),
-                (
-                    "edit-clear-symbolic",
-                    style::TEXT,
-                    layout.entry.secondary_icon,
-                    active,
-                ),
-            ] {
-                if !want {
-                    continue;
-                }
-                let key = (scale_key, name);
-                if let std::collections::hash_map::Entry::Vacant(slot) = cache.glyphs.entry(key) {
-                    let Some(buffer) = sym_icons.buffer(name, Entry::ICON_PX, scale, color) else {
-                        continue;
-                    };
-                    match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                        Ok(tb) => {
-                            slot.insert(tb);
-                        }
-                        Err(err) => {
-                            tracing::error!("error uploading search entry glyph: {err:#}");
-                            continue;
-                        }
-                    }
-                }
-                if let Some(tb) = cache.glyphs.get(&key) {
-                    let logical = tb.logical_size();
-                    let loc = center - Point::from((logical.w / 2., logical.h / 2.));
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        tb.clone(),
-                        loc,
-                        alpha,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ));
-                }
+        // Asked for at FULL tint, with `progress` applied as the element alpha. Folding
+        // the fade into the tint instead would miss the `IconCache` key
+        // (`(name, px, color)`) on every animation frame — re-rasterizing the SVG *and*
+        // re-uploading it, and accreting a cached entry per alpha step.
+        for (name, color, center, want) in [
+            (
+                "edit-find-symbolic",
+                style::MUTED,
+                layout.entry.primary_icon,
+                true,
+            ),
+            (
+                "edit-clear-symbolic",
+                style::TEXT,
+                layout.entry.secondary_icon,
+                active,
+            ),
+        ] {
+            if !want {
+                continue;
             }
+            let Some(tb) = sym_icons.texture(renderer, name, Entry::ICON_PX, scale, color) else {
+                continue;
+            };
+            let logical = tb.logical_size();
+            let loc = center - Point::from((logical.w / 2., logical.h / 2.));
+            elements.push(TextureRenderElement::from_texture_buffer(
+                tb,
+                loc,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
         }
 
         // --- Result app icons (topmost, over their tiles). ---

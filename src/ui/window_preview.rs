@@ -21,7 +21,6 @@
 
 use std::cell::RefCell;
 
-use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
@@ -72,14 +71,13 @@ pub struct PreviewOverlay {
     pub hovered: bool,
 }
 
-/// The picker chrome's GPU caches. Two disc bakes (normal + hover) so a frame
+/// The picker chrome's GPU caches: two disc bakes (normal + hover) so a frame
 /// that draws one hovered and one fading-out button doesn't thrash a single
-/// cache, and one upload of the glyph per scale.
+/// cache. The close glyph is not here — it comes from the shared [`IconCache`].
 #[derive(Default)]
 pub struct PreviewChrome {
     disc: RefCell<BakeCache>,
     disc_hover: RefCell<BakeCache>,
-    icon: RefCell<Option<(NotNan<f64>, TextureBuffer<VkTexture>)>>,
 }
 
 impl PreviewChrome {
@@ -101,25 +99,14 @@ impl PreviewChrome {
             return elements;
         }
 
-        // The glyph, uploaded once per scale (white — `color: $system_fg_color`).
-        let scale_key = NotNan::new(scale).ok();
-        if let Some(scale_key) = scale_key {
-            let stale = self.icon.borrow().as_ref().map(|(s, _)| *s) != Some(scale_key);
-            if stale {
-                let uploaded = icons
-                    .buffer("preview-close-symbolic", CLOSE_ICON_PX, scale, style::TEXT)
-                    .and_then(|buffer| {
-                        match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                            Ok(tb) => Some(tb),
-                            Err(err) => {
-                                tracing::error!("error uploading the preview close icon: {err:#}");
-                                None
-                            }
-                        }
-                    });
-                *self.icon.borrow_mut() = uploaded.map(|tb| (scale_key, tb));
-            }
-        }
+        // The glyph (white — `color: $system_fg_color`), cached by the icon cache.
+        let icon = icons.texture(
+            renderer,
+            "preview-close-symbolic",
+            CLOSE_ICON_PX,
+            scale,
+            style::TEXT,
+        );
 
         for overlay in overlays {
             let rect = close_rect(overlay.preview);
@@ -135,7 +122,7 @@ impl PreviewChrome {
             };
 
             // The glyph goes on top of the disc, so it is pushed first.
-            if let Some((_, tb)) = self.icon.borrow().as_ref() {
+            if let Some(tb) = icon.as_ref() {
                 let logical = tb.logical_size();
                 let center = rect.loc + rect.size.downscale(2.).to_point();
                 elements.push(TextureRenderElement::from_texture_buffer(

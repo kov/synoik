@@ -41,7 +41,6 @@
 //! it on the primary only); hit-testing stays per-output.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
@@ -127,8 +126,6 @@ struct GridCache {
     hover_bake: widget::BakeCache,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
-    /// Recolored arrow-chevron uploads, keyed by (output scale, is-next).
-    arrow_icons: HashMap<(NotNan<f64>, bool), TextureBuffer<VkTexture>>,
     /// Full-color icon uploads (shared key space with the dash's and search's).
     icons: AppIconUploads,
 }
@@ -835,7 +832,6 @@ impl AppGrid {
 
         // --- The page-navigation arrows (flat circular buttons in the side gutters). A
         //     hovered arrow gets the standard wash disc beneath its chevron. ---
-        let scale_key = NotNan::new(scale).ok();
         for (is_next, disc) in [(false, layout.prev_arrow), (true, layout.next_arrow)] {
             let Some(disc) = disc else { continue };
             // The chevron glyph (topmost — pushed before its wash), its own upload cache.
@@ -844,27 +840,16 @@ impl AppGrid {
             } else {
                 "carousel-arrow-previous-symbolic"
             };
-            if let (Some(scale_key), Some(buffer)) = (
-                scale_key,
-                sym_icons.buffer(name, ARROW_ICON_PX, scale, style::TEXT),
-            ) {
-                let key = (scale_key, is_next);
-                #[allow(clippy::map_entry)]
-                if !cache.arrow_icons.contains_key(&key) {
-                    match TextureBuffer::from_memory_buffer(renderer, &buffer) {
-                        Ok(tb) => {
-                            cache.arrow_icons.insert(key, tb);
-                        }
-                        Err(err) => tracing::error!("error uploading nav arrow: {err:#}"),
-                    }
-                }
-                if let Some(tb) = cache.arrow_icons.get(&key) {
+            {
+                if let Some(tb) =
+                    sym_icons.texture(renderer, name, ARROW_ICON_PX, scale, style::TEXT)
+                {
                     let logical = tb.logical_size();
                     let center =
                         Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
                     let loc = center - Point::from((logical.w / 2., logical.h / 2.));
                     elements.push(TextureRenderElement::from_texture_buffer(
-                        tb.clone(),
+                        tb,
                         loc,
                         alpha,
                         None,
