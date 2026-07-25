@@ -1001,6 +1001,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(which.as_str(), "fence" | "all") {
         probe_fence(&gpu)?;
     }
+    // `idle-one <gap_us> [reps]` — one bucket only, so every fence wait in the run has the same
+    // preceding idle and each one pairs 1:1 with an ioctl recorded by `../ioctl-split/shim.so`.
+    // The sweep mixes buckets, which makes that pairing ambiguous.
+    if which == "idle-one" {
+        let gap_us: u64 = std::env::args()
+            .nth(2)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(16700);
+        let reps: usize = std::env::args()
+            .nth(3)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(300);
+        let rig = FenceRig::new(&gpu, 3840, 2160)?;
+        for _ in 0..5 {
+            rig.round(&gpu, 1);
+        }
+        let mut waits = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            if gap_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(gap_us));
+            }
+            waits.push(rig.round(&gpu, 0).1);
+        }
+        println!("empty submit after a {gap_us} us gap, {reps} reps");
+        println!("  fence wait  {}", Summary::of(waits));
+        rig.destroy(&gpu);
+    }
     if which == "idle" {
         // The sweep on its own, with enough reps that `min` means something.
         let rig = FenceRig::new(&gpu, 3840, 2160)?;

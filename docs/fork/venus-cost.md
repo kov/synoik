@@ -878,3 +878,118 @@ when a notify raced in behind an already-woken ring thread.
 | 3. §9.4 idle tax | **answered**: ~0.08 ms host, ~90% guest; the remaining split is a guest-side stamp |
 | 4. blob first-touch | **closed**: fault cost, not count; staging reuse is the fix |
 | 5. dmabuf/gbm | **closed** in §8.6 |
+
+---
+
+## 11. Guest-side reply to §10: the split you asked for does not exist
+
+Written 2026-07-25, on the deployed VMM, right after the reboot. Three results: one of §10.5's
+"fixed" items does not reproduce as fixed, the §10.1 measurement you asked us for turned out to be
+measuring the wrong boundary, and the cost picture is otherwise unchanged.
+
+New probe: [`venus-probes/ioctl-split/`](./venus-probes/ioctl-split) — an `LD_PRELOAD` shim that
+stamps `ioctl` and `clock_nanosleep`. Built for §10.1's request and repurposed when it found
+nothing to stamp.
+
+### 11.1 Timestamp queries still resolve to zero on this build
+
+§10.5 lists them as *root-caused and fixed, this build carries it*. On this guest, after the
+reboot, they do not. `repro-vk-timestamp-query` now sweeps the whole matrix, because the fix was
+described against `kk_CmdWriteTimestamp2` while the reproducer (and our renderer) had only ever
+called the 1.0 entry point — two independent axes, so both are tested:
+
+```
+  vkCmdWriteTimestamp      GetQueryPoolResults    -> [0, 0]  zero
+  vkCmdWriteTimestamp      CopyQueryPoolResults   -> [0, 0]  zero
+  vkCmdWriteTimestamp      Copy (separate cbuf)   -> [0, 0]  zero
+  vkCmdWriteTimestamp2     GetQueryPoolResults    -> [0, 0]  zero
+  vkCmdWriteTimestamp2     CopyQueryPoolResults   -> [0, 0]  zero
+  vkCmdWriteTimestamp2     Copy (separate cbuf)   -> [0, 0]  zero
+```
+
+**The harness is not the problem.** The same binary, on the same guest, against lavapipe
+(`VK_DRIVER_FILES=…/lvp_icd.aarch64.json`) reports **WORKS on all six**, with sane deltas
+(45–130 µs). So the matrix exercises each combination correctly and the zero is venus-specific.
+
+We cannot see your build metadata from in here, so we cannot tell whether this VM is missing the
+fix or the fix does not cover these shapes. The reproducer is the discriminator either way — a
+shape that starts reporting `WORKS` is one we can move `NIRI_FRAME_LOG=gpu` onto.
+
+### 11.2 There is no ioctl to stamp: the wait never enters the kernel
+
+§10.1 asked for "a stamp at ioctl entry and one at return, paired against our `kick` and
+`irq->ack`". We built exactly that. It recorded **nothing**, and the reason is the finding.
+
+Every ioctl a 20-round run makes, by DRM `nr` (type `'d'`):
+
+```
+  23 × 0x42 EXECBUFFER   6 × 0x43 GETPARAM   3 × 0x4a RESOURCE_CREATE_BLOB
+   3 × 0x41 MAP          3 × 0x09 GEM_CLOSE  1 × 0x49 GET_CAPS  1 × 0x4b CONTEXT_INIT
+```
+
+**No `DRM_IOCTL_SYNCOBJ_WAIT`, no `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`, no `DRM_VIRTGPU_WAIT`** —
+across any run we have made. A guest fence wait on this stack does not block in the kernel at all.
+So the entry-side/exit-side split does not exist: there is no ioctl entry, no virtio descriptor
+setup, no used-queue IRQ waking a blocked task, and no scheduler putting it back on a CPU. That
+whole half of §10.1's guest-side theory space is empty.
+
+What it does instead, measured with the same shim over 200 waits at a 16.7 ms idle gap:
+
+| | |
+|---|---|
+| `clock_nanosleep` calls | **576** — ~2.9 per fence wait |
+| requested, every single call | **0.160 ms** |
+| actually slept, median | **0.291 ms** (0.131 ms overshoot) |
+| → time inside `clock_nanosleep` | ~**0.85 ms** of a 1.23 ms median wait |
+
+**The guest is polling, and its polling quantum is coarser than your entire round trip.** 160 µs is
+`vn_relax`'s `base_sleep_us` (`vn_common.c:180-222`), the first rung of its backoff, and the only
+rung these waits reach. Your complete host round trip is 0.076 ms. So the answer is ready at
+roughly half a quantum, and the guest sleeps through it — twice more, on average, before looking.
+
+That is consistent with everything both sides measured, and it explains the two results that
+looked contradictory:
+
+- **~90% guest-side (§10.1) — confirmed**, and now located: not driver or interrupt latency,
+  but `~2.9 × 291 µs` of deliberate sleeping in mesa's userspace poll loop.
+- **Spin and sleep gaps behave identically (§9.4) — explained.** Keeping our thread hot cannot
+  help, because the delay is not the scheduler failing to run us. It is mesa choosing not to look.
+
+Two caveats we would rather state than have you discover:
+
+- **The exact `vn_relax` call site is not pinned.** There is no `VN_RELAX_REASON_FENCE`, and the
+  yield:sleep ratio we observe (~5 yields per wait) does not cleanly match either profile's
+  `busy_wait_order`. We are also reading mesa `26.2-branchpoint` source against a guest running
+  **26.1.4**. The 160 µs constant and the absence of a wait ioctl are measured facts; which loop
+  issues them is inference.
+- **The 131 µs overshoot on a 160 µs sleep is ours to chase** — guest-kernel timer slack, not
+  yours. It roughly doubles the cost of every rung.
+
+### 11.3 What follows
+
+Nothing here needs the host, which is the useful part:
+
+1. **The lever is mesa's poll granularity**, and it is at least 2× off the hardware. A first rung
+   near your 76 µs round trip — or a blocking wait through the syncobj path that already exists in
+   `virtgpu_wait` but is not being taken — would remove most of the ~1 ms. That is a guest-stack
+   change (mesa, or a `vn_relax` tunable), not a compositor one.
+2. **Timestamp queries stay open** on our side, with the matrix above as the check.
+3. **Our own fix stands regardless**: `01dc9384` stops texture uploads waiting at all, so the
+   frames that paid 9 of these waits now pay none. The cheapest wait is the one not taken.
+
+### 11.4 The cost probes on the new VMM: unchanged
+
+Re-run of `probe-venus-costs`, for the record — nothing here moved, which is expected given §10.1
+found the cost is guest-side.
+
+| measure | pre-deploy | on this build |
+|---|---|---|
+| empty submit + fence wait, back-to-back | 0.017 / 0.029 ms (min/median) | 0.020 / 0.031 |
+| graded-work fit | 0.094 ms + 0.283 ms/copy (235 GB/s) | **0.108 ms + 0.284 ms/copy (234 GB/s)** |
+| plain `vkCreateImage`, cache miss | 0.0032 ms | 0.0038 |
+| dmabuf-shaped miss | 0.06–0.31 ms | 0.0596 |
+| idle-gap 16.7 ms, empty submit | 0.046 / 0.965 ms | 0.041 / 0.928 |
+
+**`vkGetMemoryFdPropertiesKHR` (§8.6) is confirmed fixed here** — `repro-vk-getmemfdprops` reports
+`query and import agree → FIXED on this stack`, which is the gate in `venus-bugs/README.md`. The
+guest-side fallback removal is unblocked.

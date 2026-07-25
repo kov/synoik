@@ -77,9 +77,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_ci = vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family)
         .queue_priorities(&priorities);
+    // `synchronization2` so the matrix in §7 can exercise `vkCmdWriteTimestamp2` as well as the
+    // 1.0 entry point — the host-side fix was described against `kk_CmdWriteTimestamp2`, and this
+    // reproducer (like our renderer) had only ever called the 1.0 one.
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
     let device_ci = vk::DeviceCreateInfo::default()
         .queue_create_infos(std::slice::from_ref(&queue_ci))
-        .enabled_extension_names(&wanted);
+        .enabled_extension_names(&wanted)
+        .push_next(&mut sync2);
     let device = unsafe { instance.create_device(phys, &device_ci, None)? };
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
@@ -204,6 +209,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          advancing tick values (see the lavapipe run on this same guest)."
     );
 
+    // --- 7. Which SHAPE is broken? -----------------------------------------------------------
+    //
+    // Added 2026-07-25, after a VMM carrying a host-side fix still reproduced the zero above. The
+    // fix was described against `kk_CmdWriteTimestamp2` and a "split command buffer" case, while
+    // this reproducer — and our compositor — had only ever called the **1.0** `vkCmdWriteTimestamp`
+    // and read back with `vkGetQueryPoolResults`. Those are two independent axes, so test the
+    // matrix rather than argue about which one the fix covered:
+    //
+    //   write path:   vkCmdWriteTimestamp (1.0)   vs  vkCmdWriteTimestamp2 (sync2)
+    //   resolve path: vkGetQueryPoolResults (host readback, which mesa venus never asks the host
+    //                 for — it serves the guest from a feedback buffer) vs
+    //                 vkCmdCopyQueryPoolResults into a buffer, in the same command buffer or a
+    //                 separate one (the shape the host side's own native probe passed on).
+    println!("\n--- which shape resolves? -------------------------------------------------");
+    for &use_sync2 in &[false, true] {
+        for &resolve in &[Resolve::Host, Resolve::CopySameCbuf, Resolve::CopyOtherCbuf] {
+            let label = format!(
+                "{:<24} {:<22}",
+                if use_sync2 {
+                    "vkCmdWriteTimestamp2"
+                } else {
+                    "vkCmdWriteTimestamp"
+                },
+                match resolve {
+                    Resolve::Host => "GetQueryPoolResults",
+                    Resolve::CopySameCbuf => "CopyQueryPoolResults",
+                    Resolve::CopyOtherCbuf => "Copy (separate cbuf)",
+                },
+            );
+            match run_shape(&device, queue, queue_family, phys, &instance, use_sync2, resolve) {
+                Ok([a, b]) if a != 0 || b != 0 => {
+                    println!("  {label} -> [{a}, {b}]  delta {}  WORKS", b.wrapping_sub(a))
+                }
+                Ok([_, _]) => println!("  {label} -> [0, 0]  zero"),
+                Err(e) => println!("  {label} -> error: {e:?}"),
+            }
+        }
+    }
+    println!(
+        "\nA shape reported WORKS is a usable GPU clock: the renderer's `NIRI_FRAME_LOG=gpu` path\n\
+         can be moved onto it. All-zero means the gap is still open for every combination this\n\
+         stack offers."
+    );
+
     unsafe {
         device.destroy_command_pool(cmd_pool, None);
         device.destroy_query_pool(pool, None);
@@ -211,4 +260,162 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         instance.destroy_instance(None);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Resolve {
+    /// `vkGetQueryPoolResults` — what a profiler reaches for, and what venus answers from its own
+    /// feedback buffer rather than by asking the host.
+    Host,
+    /// `vkCmdCopyQueryPoolResults` recorded into the same command buffer as the writes.
+    CopySameCbuf,
+    /// The same copy, recorded into a *second* command buffer submitted alongside the first —
+    /// the shape venus's feedback path actually produces, and the one the host side reported
+    /// passing natively.
+    CopyOtherCbuf,
+}
+
+/// Run one (write path × resolve path) combination end to end on fresh objects and return the two
+/// timestamps. Everything is created and destroyed per call so no shape can be contaminated by a
+/// previous one's pool state.
+#[allow(clippy::too_many_arguments)]
+fn run_shape(
+    device: &ash::Device,
+    queue: vk::Queue,
+    queue_family: u32,
+    phys: vk::PhysicalDevice,
+    instance: &ash::Instance,
+    use_sync2: bool,
+    resolve: Resolve,
+) -> Result<[u64; 2], vk::Result> {
+    unsafe {
+        let pool = device.create_query_pool(
+            &vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2),
+            None,
+        )?;
+        let cmd_pool = device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default().queue_family_index(queue_family),
+            None,
+        )?;
+        let cbufs = device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(2),
+        )?;
+
+        // Destination for the copy shapes: a host-visible buffer holding two u64s.
+        let size = 16u64;
+        let buffer = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        )?;
+        let req = device.get_buffer_memory_requirements(buffer);
+        let props = instance.get_physical_device_memory_properties(phys);
+        let mem_type = (0..props.memory_type_count)
+            .find(|&i| {
+                req.memory_type_bits & (1 << i) != 0
+                    && props.memory_types[i as usize].property_flags.contains(
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+            })
+            .expect("a host-visible memory type");
+        let memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type),
+            None,
+        )?;
+        device.bind_buffer_memory(buffer, memory, 0)?;
+
+        let write = |cbuf: vk::CommandBuffer, query: u32, last: bool| {
+            if use_sync2 {
+                let stage = if last {
+                    vk::PipelineStageFlags2::ALL_COMMANDS
+                } else {
+                    vk::PipelineStageFlags2::TOP_OF_PIPE
+                };
+                device.cmd_write_timestamp2(cbuf, stage, pool, query);
+            } else {
+                let stage = if last {
+                    vk::PipelineStageFlags::ALL_COMMANDS
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                };
+                device.cmd_write_timestamp(cbuf, stage, pool, query);
+            }
+        };
+
+        device.begin_command_buffer(cbufs[0], &vk::CommandBufferBeginInfo::default())?;
+        device.cmd_reset_query_pool(cbufs[0], pool, 0, 2);
+        write(cbufs[0], 0, false);
+        write(cbufs[0], 1, true);
+        if resolve == Resolve::CopySameCbuf {
+            device.cmd_copy_query_pool_results(
+                cbufs[0],
+                pool,
+                0,
+                2,
+                buffer,
+                0,
+                8,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            );
+        }
+        device.end_command_buffer(cbufs[0])?;
+
+        let mut submit_count = 1;
+        if resolve == Resolve::CopyOtherCbuf {
+            device.begin_command_buffer(cbufs[1], &vk::CommandBufferBeginInfo::default())?;
+            device.cmd_copy_query_pool_results(
+                cbufs[1],
+                pool,
+                0,
+                2,
+                buffer,
+                0,
+                8,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            );
+            device.end_command_buffer(cbufs[1])?;
+            submit_count = 2;
+        }
+
+        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+        let submit = vk::SubmitInfo::default().command_buffers(&cbufs[..submit_count]);
+        device.queue_submit(queue, std::slice::from_ref(&submit), fence)?;
+        device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+
+        let out = match resolve {
+            Resolve::Host => {
+                let mut vals = [0u64; 2];
+                device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut vals,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )?;
+                vals
+            }
+            _ => {
+                let ptr =
+                    device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *const u64;
+                let vals = [ptr.read_unaligned(), ptr.add(1).read_unaligned()];
+                device.unmap_memory(memory);
+                vals
+            }
+        };
+
+        device.destroy_fence(fence, None);
+        device.destroy_buffer(buffer, None);
+        device.free_memory(memory, None);
+        device.destroy_command_pool(cmd_pool, None);
+        device.destroy_query_pool(pool, None);
+        Ok(out)
+    }
 }
