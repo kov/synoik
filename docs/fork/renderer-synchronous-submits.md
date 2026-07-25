@@ -77,6 +77,39 @@ Revisit this document when a frame's remaining submits are all load-bearing. The
 submit counter (`niri_vk::stats`, reported as `N submits in Xms`) is how to tell: when that
 count stops falling and the time stays high, the waits are what is left.
 
+### Where the live seat stands (2026-07-25, gsrs, Virtual-1 @ 60Hz, budget 16.67ms)
+
+Measured before and after `6da5f9a4`…`bdec0c84`, overview open. The clock shows seconds, so the
+idle case is a genuine 1Hz repaint, not an artefact.
+
+| overview, idle (clock tick) | before | after |
+|---|---|---|
+| total | 31.3 ms | ~19 ms |
+| `collect` | 23.4 ms | ~8.6 ms |
+| `submit` phase | 7.3 ms | ~10 ms |
+| shaped runs | (uncounted) | 2 in ~4.2 ms |
+| submits | (uncounted) | 3 in ~10.4 ms |
+| vblanks missed per hitch | 1.60 | 1.14 |
+
+The diagnosis inverted. `collect` — the CPU widget path — went from most of the frame to a
+minor part of it, and **submit is now essentially the whole cost**. On an overview *animation*
+frame the split is starker still: `collect` ~2 ms, and 2 submits accounting for ~15 ms of a
+17–19 ms frame, with ~159 draws.
+
+Two numbers to read off that:
+
+- **~3.5 ms per round trip** on the idle frame (3 submits, ~10.4 ms), against ~0.7–2 ms measured
+  headless. Real scene, real scanout target, same order.
+- **~30–60 µs per draw**, from the idle/animating pair (53 draws vs 159, ~3.5 vs ~7.5 ms per
+  submit). That is not GPU shading cost; on Venus every draw is encoded into the ring and
+  replayed host-side. Batching quads into instanced draws is the lever there, and it is a
+  separate piece of work from this document — but it lands in the same place: fewer, fatter
+  submissions.
+
+So the remaining contained win is *not* here: it is a persistent glyph atlas, which would
+retire the per-tick atlas upload submit and the ~4.2 ms of re-shaping. After that, the idle
+frame is ~13 ms and under budget, and what is left over is this document.
+
 ## Related
 
 - `src/frame_log.rs` — the `NIRI_FRAME_LOG` grammar and what each phase covers.
