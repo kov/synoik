@@ -92,8 +92,14 @@ pub enum SubmitSite {
     /// A frame cut in half mid-record, so a captured region is complete before the separately
     /// submitted blur that samples it.
     CaptureFlush,
-    /// Host memory into a texture: an icon, an shm client buffer, glyph coverage.
+    /// Host memory into one texture, on its own submit.
     Upload,
+    /// Several textures staged and copied in a single submit ([`crate::texture::TextureBatch`]).
+    UploadBatch,
+    /// New glyph coverage into the persistent atlas.
+    UploadGlyphs,
+    /// An shm client's buffer into its cached image, through the renderer's shared staging.
+    UploadShm,
     /// A layout transition or queue-family acquire on a command buffer of its own.
     Transition,
     /// A dual-Kawase blur chain.
@@ -105,12 +111,15 @@ pub enum SubmitSite {
 impl SubmitSite {
     /// Every site, in the order they are reported. Keep this exhaustive — a site missing here is
     /// simply invisible, which is the problem this type exists to fix.
-    pub const ALL: [SubmitSite; 8] = [
+    pub const ALL: [SubmitSite; 11] = [
         SubmitSite::KmsFrame,
         SubmitSite::DmabufFrame,
         SubmitSite::OffscreenFrame,
         SubmitSite::CaptureFlush,
         SubmitSite::Upload,
+        SubmitSite::UploadBatch,
+        SubmitSite::UploadGlyphs,
+        SubmitSite::UploadShm,
         SubmitSite::Transition,
         SubmitSite::Blur,
         SubmitSite::Readback,
@@ -124,6 +133,9 @@ impl SubmitSite {
             SubmitSite::OffscreenFrame => "offscreen",
             SubmitSite::CaptureFlush => "capture",
             SubmitSite::Upload => "upload",
+            SubmitSite::UploadBatch => "upload-batch",
+            SubmitSite::UploadGlyphs => "glyphs",
+            SubmitSite::UploadShm => "shm",
             SubmitSite::Transition => "transition",
             SubmitSite::Blur => "blur",
             SubmitSite::Readback => "readback",
@@ -158,6 +170,11 @@ thread_local! {
     /// (unlike [`submits`]) because a caller wants a frame's breakdown, never a running one.
     static SITES: Cell<[SiteTotals; SubmitSite::ALL.len()]> =
         const { Cell::new([SiteTotals::ZERO; SubmitSite::ALL.len()]) };
+    /// Waits so far this frame — only whether it is zero matters. See [`begin_frame`].
+    static WAITS: Cell<u64> = const { Cell::new(0) };
+    static FIRST_WAIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    static FIRST_SITE: Cell<Option<SubmitSite>> = const { Cell::new(None) };
+    static UPLOADED_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
 fn bank(site: SubmitSite, nanos: u64, retire: bool) {
@@ -166,6 +183,15 @@ fn bank(site: SubmitSite, nanos: u64, retire: bool) {
     let d = Duration::from_nanos(nanos);
     if retire {
         slot.retiring = slot.retiring.saturating_add(d);
+        // The frame's first wait, kept apart — see `begin_frame` for why it is not comparable to
+        // the others. Recorded on the wait rather than the submit because a deferred submit never
+        // waits at all, and it is the first *wait* that inherits the previous frame's tail.
+        let waits = WAITS.with(Cell::get);
+        WAITS.set(waits.saturating_add(1));
+        if waits == 0 {
+            FIRST_WAIT.set(d);
+            FIRST_SITE.set(Some(site));
+        }
     } else {
         slot.submitting = slot.submitting.saturating_add(d);
     }
@@ -198,6 +224,40 @@ fn timer(site: SubmitSite, total: &'static LocalKey<Cell<u64>>, retire: bool) ->
         total,
         retire,
     }
+}
+
+/// Begin a frame's accounting: the next wait is that frame's first.
+///
+/// The first wait is worth knowing apart from every other. Every submit is chained on the queue
+/// timeline, so the frame's *first* one cannot start until the previous frame's work — including
+/// the scanout submit the CPU walked away from — has finished on the GPU. Whichever site happens
+/// to go first therefore absorbs the tail of the last frame, and its per-site figure reads as
+/// though that site were expensive. Without this split, "1 upload in 20.45 ms" and "the previous
+/// frame had 20 ms left to run" are the same number.
+pub fn begin_frame() {
+    FIRST_WAIT.set(Duration::ZERO);
+    FIRST_SITE.set(None);
+    WAITS.set(0);
+}
+
+/// The first wait of the frame and where it was paid, or `None` if the frame waited for nothing.
+/// Clears, like [`take_sites`].
+pub fn take_first_wait() -> Option<(SubmitSite, Duration)> {
+    let site = FIRST_SITE.replace(None)?;
+    Some((site, FIRST_WAIT.replace(Duration::ZERO)))
+}
+
+/// Bytes staged into GPU images since the last call, clearing the counter. Distinguishes a frame
+/// that made many small round trips from one that moved a wallpaper: the first wants fewer
+/// submits, the second wants to not be on the frame at all.
+pub fn take_uploaded_bytes() -> u64 {
+    UPLOADED_BYTES.with(|c| c.replace(0))
+}
+
+/// Record `bytes` of host memory staged for a GPU image. Call once per upload, whatever shape it
+/// takes; unlike the timers this is never gated, since it costs an add.
+pub fn uploaded(bytes: u64) {
+    add(&UPLOADED_BYTES, bytes);
 }
 
 /// Record one GPU round trip. Hold the guard across `vkQueueSubmit` only — the
@@ -327,5 +387,44 @@ mod tests {
             before.0 + 1,
             "this thread's own submit is counted"
         );
+    }
+
+    /// The frame's **first** wait is kept apart, and it is the first — not the longest.
+    ///
+    /// Every submit is chained on the queue timeline, so a frame's first wait also drains whatever
+    /// the previous frame left running. Whichever site happens to go first therefore reads as
+    /// expensive. Reporting the longest instead would defeat the whole purpose: the point is to
+    /// find out whether the big number is the site's own cost or the previous frame's tail.
+    #[test]
+    fn the_frames_first_wait_is_reported_apart_from_the_rest() {
+        set_enabled(true);
+        begin_frame();
+
+        // A short wait first, a long one after. The short one is the answer.
+        drop(retire(SubmitSite::UploadShm));
+        {
+            let _slow = retire(SubmitSite::Blur);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let (site, _wait) = take_first_wait().expect("the frame waited, so there is a first wait");
+        assert_eq!(
+            site,
+            SubmitSite::UploadShm,
+            "the first wait was reported as the longest one instead of the first"
+        );
+        assert!(
+            take_first_wait().is_none(),
+            "taking the first wait did not clear it, so the next frame inherits this one"
+        );
+
+        // A frame that never waits has no first wait to report.
+        begin_frame();
+        drop(submit(SubmitSite::KmsFrame));
+        assert!(
+            take_first_wait().is_none(),
+            "a frame that only submitted, and never waited, reported a wait"
+        );
+        set_enabled(false);
     }
 }

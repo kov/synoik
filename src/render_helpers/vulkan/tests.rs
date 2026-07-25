@@ -3388,12 +3388,19 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
     // Clear whatever this thread has accumulated (renderer construction submits).
     let _ = niri_vk::stats::take_sites();
 
-    // A glyph upload: host memory into the atlas, through `run_commands`.
+    // A glyph upload: host memory into the atlas, through `run_commands`. It gets its own site
+    // rather than a generic "upload", because the four upload paths want four different fixes —
+    // the atlas grows rarely, an shm client re-uploads every commit, icons arrive in bursts.
     vk.build_glyph_run("sited", 20.0).expect("glyph run");
     let sites = niri_vk::stats::take_sites();
     assert!(
-        at(&sites, SubmitSite::Upload) > 0,
-        "a glyph upload was not counted as an upload"
+        at(&sites, SubmitSite::UploadGlyphs) > 0,
+        "a glyph upload was not counted against the atlas"
+    );
+    assert_eq!(
+        at(&sites, SubmitSite::Upload),
+        0,
+        "a glyph upload landed in the generic upload bucket, which cannot be acted on"
     );
     assert_eq!(
         at(&sites, SubmitSite::OffscreenFrame),

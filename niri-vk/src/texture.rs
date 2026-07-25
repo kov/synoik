@@ -203,20 +203,22 @@ impl<'a> TextureBatch<'a> {
             return Ok(Vec::new());
         }
 
-        let result =
-            self.gpu
-                .run_commands(self.pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
-                    for p in &pending {
-                        record_upload_copy(
-                            device,
-                            cbuf,
-                            p.texture.image,
-                            p.staging,
-                            p.texture.width,
-                            p.texture.height,
-                        );
-                    }
-                });
+        let result = self.gpu.run_commands(
+            self.pool,
+            crate::stats::SubmitSite::UploadBatch,
+            |cbuf| unsafe {
+                for p in &pending {
+                    record_upload_copy(
+                        device,
+                        cbuf,
+                        p.texture.image,
+                        p.staging,
+                        p.texture.width,
+                        p.texture.height,
+                    );
+                }
+            },
+        );
 
         // The staging buffers have served their purpose (or the submit failed — `run_commands`
         // already drained the device on a wait error, so this can't race an in-flight copy).
@@ -925,6 +927,7 @@ impl Texture {
     ) -> Result<PendingUpload> {
         let device = &gpu.device;
         let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * bpp;
+        crate::stats::uploaded(size);
         assert_eq!(
             data.len() as vk::DeviceSize,
             size,
@@ -1166,6 +1169,7 @@ impl Texture {
 
         // One staging buffer for every region, concatenated; `buffer_offset` picks each out.
         let total: vk::DeviceSize = regions.iter().map(|r| r.coverage.len() as u64).sum();
+        crate::stats::uploaded(total);
         let mut guard = UploadGuard::new(device);
         let staging_ci = vk::BufferCreateInfo::default()
             .size(total)
@@ -1227,39 +1231,43 @@ impl Texture {
         }
 
         let image = self.image;
-        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
-            // Preserve what is already in the atlas: transition FROM the sampleable layout the
-            // image is left in, not from UNDEFINED (which would license discarding it).
-            transition(
-                device,
-                cbuf,
-                image,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::SHADER_READ,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-            );
-            device.cmd_copy_buffer_to_image(
-                cbuf,
-                staging,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &copies,
-            );
-            transition(
-                device,
-                cbuf,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            );
-        });
+        let result = gpu.run_commands(
+            pool,
+            crate::stats::SubmitSite::UploadGlyphs,
+            |cbuf| unsafe {
+                // Preserve what is already in the atlas: transition FROM the sampleable layout the
+                // image is left in, not from UNDEFINED (which would license discarding it).
+                transition(
+                    device,
+                    cbuf,
+                    image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+                device.cmd_copy_buffer_to_image(
+                    cbuf,
+                    staging,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &copies,
+                );
+                transition(
+                    device,
+                    cbuf,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                );
+            },
+        );
         unsafe {
             device.destroy_buffer(staging, None);
             device.free_memory(smem, None);
@@ -1277,7 +1285,9 @@ impl Texture {
     /// in place instead of allocating a fresh image + staging buffer every commit.
     pub fn reupload_full(&self, gpu: &Gpu, pool: vk::CommandPool, staging: &Staging) -> Result<()> {
         let device = &gpu.device;
-        gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
+        // A full overwrite of the image's extent; the caller wrote exactly that into `staging`.
+        crate::stats::uploaded((self.width as u64) * (self.height as u64) * 4);
+        gpu.run_commands(pool, crate::stats::SubmitSite::UploadShm, |cbuf| unsafe {
             transition(
                 device,
                 cbuf,

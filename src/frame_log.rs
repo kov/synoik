@@ -316,6 +316,14 @@ struct Totals {
     /// frame made fifteen round trips and nothing about which fifteen — and the fix for a bake
     /// is not the fix for an upload. Indexed by `SubmitSite::ALL`'s order.
     sites: [niri_vk::stats::SiteTotals; niri_vk::stats::SubmitSite::ALL.len()],
+    /// The frame's *first* wait and where it was paid. Not comparable to the others: every submit
+    /// is chained on the queue timeline, so the first one cannot begin until the previous frame —
+    /// including the scanout submit the CPU walked away from — has finished on the GPU. Whichever
+    /// site goes first absorbs that tail and reads as expensive.
+    first_wait: Option<(niri_vk::stats::SubmitSite, Duration)>,
+    /// Bytes staged into GPU images. Separates a frame that made many small round trips from one
+    /// that moved a wallpaper — different costs, different fixes.
+    uploaded: u64,
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -421,6 +429,10 @@ impl FrameLog {
             return;
         }
 
+        // The frame's first wait is measured apart from the rest; tell the counters where the
+        // frame starts. See `niri_vk::stats::begin_frame`.
+        niri_vk::stats::begin_frame();
+
         let now = Instant::now();
         self.in_flight = Some(InFlight {
             output: output.to_owned(),
@@ -486,6 +498,8 @@ impl FrameLog {
             submitting: niri_vk::stats::take_submit_time(),
             retiring: niri_vk::stats::take_retire_time(),
             sites: niri_vk::stats::take_sites(),
+            first_wait: niri_vk::stats::take_first_wait(),
+            uploaded: niri_vk::stats::take_uploaded_bytes(),
             draws: niri_vk::stats::draws() - frame.draws_at_start,
             shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
         };
@@ -580,6 +594,12 @@ impl FrameLog {
             by_site.sort_by_key(|(_, t)| std::cmp::Reverse(t.retiring));
             if !by_site.is_empty() {
                 line.push_str(" (");
+                // The first wait leads, because the rest cannot be read without it: it carries
+                // whatever was left of the previous frame, so the site that happens to go first
+                // looks expensive whether or not it is.
+                if let Some((site, wait)) = totals.first_wait {
+                    let _ = write!(line, "first {} {}; ", site.label(), ms(wait));
+                }
                 for (i, (site, t)) in by_site.iter().enumerate() {
                     if i > 0 {
                         line.push_str(", ");
@@ -587,6 +607,13 @@ impl FrameLog {
                     let _ = write!(line, "{} {} in {}", t.submits, site.label(), ms(t.retiring));
                 }
                 line.push(')');
+            }
+            if totals.uploaded > 0 {
+                let _ = write!(
+                    line,
+                    ", {:.1}MiB uploaded",
+                    totals.uploaded as f64 / (1 << 20) as f64
+                );
             }
         } else if !totals.retiring.is_zero() {
             // A frame can pay a wait for work it did not submit: retiring a previous
@@ -844,6 +871,28 @@ mod tests {
             ),
             "{line}"
         );
+
+        // The frame's first wait leads the breakdown, because without it the rest cannot be read:
+        // it carries whatever the previous frame left running, so the site that happens to go
+        // first looks expensive whether or not it is.
+        let totals = Totals {
+            submits: 2,
+            submitting: Duration::from_micros(90),
+            retiring: Duration::from_millis(14),
+            first_wait: Some((SubmitSite::Upload, Duration::from_micros(13420))),
+            sites: sites(&[
+                (SubmitSite::KmsFrame, 1, Duration::ZERO),
+                (SubmitSite::Upload, 1, Duration::from_millis(14)),
+            ]),
+            uploaded: 3 << 20,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(
+            line.contains("(first upload 13.42ms; 1 upload in 14.00ms, 1 scanout in 0.00ms)"),
+            "{line}"
+        );
+        assert!(line.contains("3.0MiB uploaded"), "{line}");
 
         // The shape the fix is aiming for: the submit stays, its wait is gone. The site still
         // reports — with a zero — because "the scanout submit waited for nothing" is the result,
