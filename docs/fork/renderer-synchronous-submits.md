@@ -131,15 +131,57 @@ sampled immediately and there is nothing to hand the fence to.
    `NIRI_FRAME_LOG=gpu` is set (one query pool is reused per frame, so `gpu_timer_begin`'s
    `cmd_reset_query_pool` would race an in-flight frame).
 
+### Client buffer release ordering — settled, not a blocker
+
+Smithay refcounts the client buffer: `renderer::utils::Buffer` is an `Arc<InnerBuffer>` whose
+`Drop` does *both* `wl_buffer.release()` and the `linux-drm-syncobj-v1` release-point signal
+(`backend/renderer/utils/wayland.rs:68`). The only holder is `RendererSurfaceState.buffer`, so
+today the release fires on the client's **next commit** — not on our GPU completion. Our fence
+wait is what makes that safe: by the time the frame returns, every read of that buffer is done.
+
+The question was whether removing the wait breaks it. It does open a window — a client that
+commits again inside our in-flight frame can be told to reuse a buffer we are still sampling —
+but **that window is upstream Smithay's status quo, not something this change introduces.**
+`GlesFrame::finish_internal` returns a real unsignalled EGL fence whenever `export_sync_point()`
+succeeds (`backend/renderer/gles/mod.rs:2514`), falling back to `glFinish` only when it cannot;
+every Smithay compositor on the GLES path — including this one, before the owned renderer — has
+always released client buffers on their next commit while a frame was still in flight. Our
+synchronous renderer is *stricter* than upstream here, not correcting an upstream bug.
+Implicit-sync clients are additionally covered by the dmabuf's `dma_resv` where the driver
+participates; explicit-sync clients are the exposed ones, and are equally exposed on GLES.
+
+So: match upstream, do not build for it. If it ever bites, the mitigation is known and small —
+hold a `Buffer` clone (`RendererSurfaceState::buffer()` is public) on the imported texture, so
+the existing `held` list defers the release to retirement along with everything else.
+
 ### What must be settled before it ships
 
-- **Client buffer release ordering.** Smithay signals a `linux-drm-syncobj-v1` release point
-  when the buffer's cached state is replaced (`wayland/drm_syncobj/mod.rs:110`), i.e. on the
-  client's *next commit* — not on our GPU completion. Today the wait makes that safe for free.
-  Without it, a client can be told a buffer is free while the GPU still samples it. `held`
-  already keeps our import alive, so the fix is to gate the release (and arguably the frame
-  callback) on retirement rather than on the frame returning. Implicit-sync clients are covered
-  by the dmabuf's `dma_resv`; explicit-sync ones are not. **Decide this before landing.**
+- **Nothing may execute alongside an in-flight frame unless proven disjoint.** This is the real
+  weight of item 1, and lifetime is only half of it. The present-blit shadow is *one image per
+  size* (`renderer.rs:140`), shared by consecutive frames: the moment two scanout submits can
+  overlap, frame N+1's render pass writes the shadow that frame N's present blit is still
+  reading. The glyph atlas is the same shape — an upload issued while a frame samples it. Both
+  are impossible today only because the frame completed before we returned.
+
+  The fix that keeps today's semantics exactly: **order every submit on the queue after the
+  previous one**, with a timeline semaphore chained across all three submit sites (the frame
+  finish, the mid-frame capture flush, `Gpu::run_commands`). GPU execution order then equals
+  submission order, as now, and the only thing that changes is that the CPU stops blocking —
+  which is the entire goal. It is uniform, it needs no per-frame resource pools, and it costs
+  nothing on a stack where the GPU is not the bottleneck. `timelineSemaphore` is available here
+  (Venus reports Vulkan 1.3 and the feature true) but is **not currently enabled** — the device
+  is created with no feature struct at all (`niri-vk/src/gpu.rs:355`).
+- **The frame log must not report a fake win.** Done — `7b5f016d` times the enqueue apart from
+  the wait, and a frame that waits for work it did not submit says so.
+- **It may trade CPU time for a frame of latency.** If our fence signals ~13 ms after submit and
+  we commit immediately, the kernel's commit worker may miss the upcoming vblank and flip on the
+  next one. The CPU stops blocking either way — that is the stated goal — but the thing to
+  measure is *presentation* time, not main-loop time, or we will have smoothed the loop and
+  added a frame of latency without noticing.
+- **Retirement must not become the wait by another name.** Draining the previous frame at the
+  top of the next one is where GLES puts it (`renderer.cleanup()` in its `finish_internal`), but
+  it has to *poll* — a blocking drain one frame later, with frames back-to-back, moves the 13 ms
+  rather than removing it, and the split counters above are what would show that.
 - **The frame log must not report a fake win.** `stats::submit` currently times the submit *and*
   the wait. Remove the wait and that number collapses to the cost of `vkQueueSubmit` alone, which
   would read as a 12 ms saving that merely moved. The retirement wait needs its own counter, or
