@@ -593,10 +593,13 @@ So:
 - **Nothing is asked of the host here, and item #4 on the §8.5 list can be closed.** The residual
   is whether a blob VMA can fault as fast as an anonymous one at its best; that is the guest-kernel
   question you predicted, and it is worth at most ~2×.
-- **The real fix is ours and it is 8×.** `HostStaging` creates, maps, fills and destroys a buffer
-  per upload batch (`niri-vk/src/staging.rs`), so we pay first-touch on every byte we ever stage. A
-  reused, size-bucketed staging pool turns 9 ms into 1.1 ms for a 4K wallpaper. That is now the
-  largest single guest-side win on the list.
+- **The 8× is real but narrower than it first looked, and the correction is ours.** First touch is
+  paid per *allocation*, not per mapping: unmapping and re-`vkMapMemory`ing the same
+  `VkDeviceMemory` costs 0.001–0.003 ms and its next write runs at full speed, because venus keeps
+  the bo's mapping alive underneath. So our already-reusable `Staging` (the shm path) was never
+  paying it, and a staging **pool** only helps paths that allocate a fresh buffer per upload. The
+  wallpaper is the one that does, at 48 MiB — worth 9 ms → 1.1 ms there, and nothing on the small
+  per-frame uploads, whose first touch is ~15 µs.
 - One correction to §3.4's own arithmetic: of the "five host round trips" to build a staging
   buffer, only `vkMapMemory` costs anything measurable (0.20 ms for 64 MiB — it is where the bo
   gets created, per `vn_device_memory.c:471`); the create, allocate, bind and unmap are
@@ -697,8 +700,12 @@ which is every compositor.
 
 ### 9.5 Revised ranking, with the mover named
 
-1. **Reuse staging buffers instead of allocating per batch (§9.2).** Ours. 8× on every upload we
-   make, no host change, and it retires §3.4 and §8.5 #4 together.
+1. **Stop paying a submit and a fence wait per texture upload.** Ours, and **done** — an
+   `import_memory` now stages its pixels and lets the next frame's command buffer carry the copy,
+   the same way glyph uploads and deferred dmabuf acquires already did. That is what the seat's
+   `9 upload in 16.22ms` frames were spending, and it removes the §9.4 wake tax those waits were
+   buying for each other. Not yet live-validated. (Staging *reuse* is a separate, smaller item —
+   see the correction in §9.2.)
 2. **The ring idle/wake tax (§9.4).** Shared. We stop blocking per submit; you look at the relax
    and notify policy. This is what §3.1 and §3.2 were both circling.
 3. **Cheapen a dmabuf/DRM-modifier `vkCreateImage` miss (§9.1).** Yours, with a reproducer. 20–100×
