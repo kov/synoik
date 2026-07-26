@@ -7630,3 +7630,148 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
     .expect("sampling the queued-barrier offscreen must not fail");
     assert_eq!(out.len(), (w * h * 4) as usize, "unexpected readback size");
 }
+
+// ---------------------------------------------------------------------------
+// Animation bake guardrails
+// ---------------------------------------------------------------------------
+//
+// A widget bake is an uncached rasterization into its own texture: a render pass,
+// a submit and a fence wait. On this stack that round trip has a fat tail, so a
+// widget that re-bakes on *every* frame of an animation is a stutter generator
+// even when its median cost looks negligible — the panel's was 1.39ms at the
+// median and produced 18 of the 19 over-budget frames it appeared in.
+//
+// The trap is that this is invisible from every direction that usually catches
+// things. Pixels are identical, since a bake and its cache produce the same image.
+// Frame *counts* are identical. End-state tests never sample a running animation
+// at all. And it arrives by accident: the panel's bake was deliberately excluded
+// from the overview animation, then silently re-included when opening the overview
+// started a fill fade that put `are_animations_ongoing()` back to true.
+//
+// So the invariant is asserted directly, on a real render of a running animation:
+// **no widget may bake on more than one frame of it.** One bake is fine and
+// expected — content appearing for the first time. Every frame is the bug.
+
+/// Render `frames` frames of whatever animation is currently running, stepping the
+/// clock by `step` between them, and return each frame's bake sites.
+///
+/// The clock is driven explicitly rather than through `niri_complete_animations`,
+/// which settles an animation instead of sampling it — the whole point here is to
+/// look *at* the frames in between.
+fn bake_sites_per_frame(
+    f: &mut Fixture,
+    output: &Output,
+    frames: usize,
+    step: Duration,
+) -> Vec<Vec<crate::frame_log::BakeSite>> {
+    let mut per_frame = Vec::with_capacity(frames);
+    for _ in 0..frames {
+        let mut clock = f.niri().clock.clone();
+        let now = clock.now_unadjusted();
+        clock.set_unadjusted(now + step);
+        f.niri().advance_animations();
+        // Drop whatever the step itself banked, so each entry is one frame's own.
+        let _ = crate::frame_log::take_bake_sites();
+        let _ = render_output_vulkan(f, output);
+        per_frame.push(crate::frame_log::take_bake_sites());
+    }
+    per_frame
+}
+
+/// Sites that baked on more than one of the sampled frames, as `("ui/panel.rs:1540",
+/// frames)`, worst first.
+fn sites_baking_repeatedly(per_frame: &[Vec<crate::frame_log::BakeSite>]) -> Vec<(String, usize)> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for frame in per_frame {
+        for site in frame {
+            let file = site.file.strip_prefix("src/").unwrap_or(site.file);
+            *seen.entry(format!("{file}:{}", site.line)).or_default() += 1;
+        }
+    }
+    let mut repeats: Vec<(String, usize)> = seen.into_iter().filter(|&(_, n)| n > 1).collect();
+    repeats.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    repeats
+}
+
+/// Open the overview and sample the frames of its opening animation.
+fn overview_open_bake_sites(
+    f: &mut Fixture,
+    output: &Output,
+) -> Vec<Vec<crate::frame_log::BakeSite>> {
+    // One render before the animation, so anything that bakes merely because it is
+    // being composited for the first time in this process does it now and does not
+    // land on the first animation frame.
+    let _ = render_output_vulkan(f, output);
+    let _ = crate::frame_log::take_bake_sites();
+
+    f.niri().layout.toggle_overview();
+    bake_sites_per_frame(f, output, 6, Duration::from_millis(40))
+}
+
+/// Nothing may re-bake on every frame of the overview animation.
+///
+/// This is the case that was live on the seat: `ui/panel.rs` baked the whole panel
+/// bar — clock, workspace dots, button pills — once per frame for the length of the
+/// animation, because opening the overview checks the Activities button and the
+/// resulting fill fade made the bar look like it was animating.
+#[test]
+fn the_overview_animation_rebakes_nothing_per_frame() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("overview bake probe")) else {
+        return;
+    };
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+
+    let per_frame = overview_open_bake_sites(&mut f, &output);
+    let repeats = sites_baking_repeatedly(&per_frame);
+
+    assert!(
+        repeats.is_empty(),
+        "these widgets re-baked across {} frames of the overview animation: {repeats:?}\n\
+         A bake is a GPU round trip; one per frame of an animation is a stutter. Either \
+         cache it across the animation, or split the animating part out as its own \
+         element the way the panel background and button pills are.",
+        per_frame.len(),
+    );
+}
+
+/// The workspace-switch animation, which has one **known** per-frame bake: the panel
+/// dot morph.
+///
+/// The dots' geometry interpolates every frame (`draw_workspace_dots` scales each
+/// dot by its distance from the fractional position), so unlike the button pills —
+/// whose only animated property is alpha, now carried by a cached texture composited
+/// at that alpha — they cannot be served by a cached bake. Fixing it needs a rounded
+/// rect that can be a *render element* rather than a `Painter` verb; today
+/// `render_rounded_rect` is only reachable inside a bake.
+///
+/// Pinned rather than skipped, so the exception stays a known one: when the dots stop
+/// baking this test fails and says so, and if anything *else* joins them it fails too.
+#[test]
+fn the_workspace_switch_bakes_only_the_panel_dot_morph() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("workspace bake probe")) else {
+        return;
+    };
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+
+    let _ = render_output_vulkan(&mut f, &output);
+    let _ = crate::frame_log::take_bake_sites();
+
+    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(30));
+    let repeats = sites_baking_repeatedly(&per_frame);
+
+    let unexpected: Vec<&(String, usize)> = repeats
+        .iter()
+        .filter(|(site, _)| !site.starts_with("ui/panel.rs:"))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "only the panel dot morph may re-bake during a workspace switch, but: {unexpected:?}",
+    );
+    assert!(
+        !repeats.is_empty(),
+        "the panel dot morph is expected to still re-bake per frame here — if it no longer \
+         does, delete this test's exception and fold the workspace switch into \
+         `the_overview_animation_rebakes_nothing_per_frame`'s rule",
+    );
+}

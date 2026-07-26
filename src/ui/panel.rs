@@ -453,6 +453,17 @@ struct BarCache {
     /// Not dropped by `clear`/`clear_bars`: a fresh one would carry a new `Id` and force
     /// a full-panel redraw for nothing.
     bg: SolidColorBuffer,
+    /// The button-container pills, keyed by `(scale, size)` with the colour in the
+    /// revision — [`widget::bake`]'s own cache, so a pill is rasterized once per
+    /// shape and reused.
+    ///
+    /// They are separate from the chrome bake for the same reason [`Self::bg`] is:
+    /// their only animated property is alpha, and folding an animated alpha into a
+    /// bake makes the bake miss on every frame of the fade. A pill's *shape* changes
+    /// rarely (the clock's width once a minute, the indicator's with the workspace
+    /// count), so the cache holds a handful of entries and is stable across a whole
+    /// animation.
+    pills: widget::BakeCache,
 }
 
 impl BarCache {
@@ -461,6 +472,7 @@ impl BarCache {
             context: None,
             textures: HashMap::new(),
             bg: SolidColorBuffer::default(),
+            pills: widget::BakeCache::new(),
         }
     }
 
@@ -1200,24 +1212,27 @@ impl Panel {
             .map(|(label, kb)| (label.clone(), kb.loc.x + INDICATOR_H_PADDING));
 
         // While a workspace switch animates, `position` is fractional and the dots morph
-        // every frame; while a button-container fill fades, the pill alpha changes every
-        // frame — in either case draw the bar fresh and skip the cache (keyed on the
-        // integer active index, not the animated state). The switch / fill animations
-        // already drive the per-frame redraws. At rest, cache as usual, drawing with the
-        // exact integer index so the cached texture always matches its key.
+        // every frame, so draw the bar fresh and skip the cache (which is keyed on the
+        // integer active index, not the animated state). The switch animation already
+        // drives the per-frame redraws. At rest, cache as usual, drawing with the exact
+        // integer index so the cached texture always matches its key.
         //
-        // The overview opening is deliberately NOT in that list any more. It changes only
-        // the background alpha, which is now its own element below — so the chrome bake
-        // stays cached for the whole animation instead of costing a GPU round trip on
-        // every frame of it.
-        let animating = (position - position.round()).abs() > 1e-6 || self.are_animations_ongoing();
+        // Nothing else belongs in this condition, and two things have been taken out of
+        // it. The overview fade is the bar *background*'s alpha, now its own element
+        // below. The button-container fills are the pills' alpha, now their own elements
+        // too ([`pill_element`]) — until then, opening the overview checked the
+        // Activities button, whose fill fade made `are_animations_ongoing()` true, and
+        // the bar re-baked on every frame of the animation. `is_animating` is deliberately
+        // *not* consulted here any more; adding an animated property back into this bake
+        // means a GPU round trip per frame for as long as it runs.
+        // `the_overview_animation_rebakes_nothing_per_frame` is the guard.
+        let animating = (position - position.round()).abs() > 1e-6;
         let bar_texture = if animating {
             match draw_bar_texture(
                 renderer,
                 scale,
                 width_px,
                 &self.clock_text,
-                &containers,
                 ws.count,
                 position,
                 recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
@@ -1238,7 +1253,6 @@ impl Panel {
                     scale,
                     width_px,
                     &self.clock_text,
-                    &containers,
                     ws.count,
                     ws.active() as f64,
                     recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
@@ -1276,6 +1290,17 @@ impl Panel {
                     Kind::Unspecified,
                 ),
             ));
+        }
+
+        // The button-container pills, after the chrome so they composite *under* it
+        // (this list is front-to-back) and before the background so they sit over it —
+        // the same place they occupied when they were painted at the bottom of the
+        // chrome bake. Each is a cached stadium drawn at its current fade alpha.
+        for (rect, color) in &containers {
+            match pill_element(renderer, &mut cache.pills, scale, *rect, *color) {
+                Ok(element) => elements.push(element),
+                Err(err) => tracing::error!("error drawing a panel button container: {err:#}"),
+            }
         }
 
         // The bar background, last so it composites *under* everything pushed above
@@ -1477,13 +1502,87 @@ fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::
 /// animation. The background alpha changes every frame while the overview opens
 /// ([`bar_bg`]); the chrome does not, and a bake is a GPU round trip — the single
 /// most expensive thing a frame can do on this stack.
+/// The cached stadium behind [`pill_element`]: `size` filled with `color`'s RGB at
+/// **full alpha**, whatever alpha `color` carries. The fade lives on the element.
+fn pill_texture(
+    renderer: &mut VulkanRenderer,
+    cache: &mut widget::BakeCache,
+    scale: f64,
+    size: Size<f64, Logical>,
+    color: [f32; 4],
+) -> anyhow::Result<VkTexture> {
+    let opaque = [color[0], color[1], color[2], 1.];
+    // `widget::bake` keys on (scale, physical size), so the colour has to ride in the
+    // revision or two pills of the same shape in different colours would alias.
+    let revision = u64::from(color[0].to_bits())
+        ^ (u64::from(color[1].to_bits()) << 21)
+        ^ (u64::from(color[2].to_bits()) << 42);
+    // The bake buffer *is* the pill, so its local box sits at the origin.
+    let local = Rectangle::new(Point::from((0., 0.)), size);
+    widget::bake(
+        renderer,
+        cache,
+        scale,
+        size,
+        revision,
+        |_| Ok(()),
+        |frame, phys, ()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear([0., 0., 0., 0.])?;
+            // Half the height clamps the SDF to a stadium (fully rounded pill).
+            p.fill_rounded(local, local.size.h / 2., opaque)?;
+            Ok(())
+        },
+    )
+}
+
+/// Bake (once per shape) one button-container pill — a stadium in `color`'s RGB at
+/// full alpha — and return it as an element placed at `rect`, composited at
+/// `color`'s alpha.
+///
+/// The alpha rides on the element rather than the texture on purpose: it is the only
+/// thing that animates (a hover fade, the Activities button's checked fade when the
+/// overview opens), and a composite-time alpha costs nothing while an alpha baked
+/// into the texture costs a full GPU round trip on every frame of the fade. That was
+/// the panel's per-frame bake through the whole overview animation.
+///
+/// The colour is in the bake revision, not the alpha: `widget::bake` keys on
+/// `(scale, size)`, and the two colours in use (the white hover/checked fill and the
+/// screen-recording pill's red) are constant.
+fn pill_element(
+    renderer: &mut VulkanRenderer,
+    cache: &mut widget::BakeCache,
+    scale: f64,
+    rect: Rectangle<f64, Logical>,
+    color: [f32; 4],
+) -> anyhow::Result<PanelElement> {
+    let texture = pill_texture(renderer, cache, scale, rect.size, color)?;
+    let buffer = TextureBuffer::from_texture(
+        renderer,
+        texture,
+        scale,
+        Transform::Normal,
+        // Translucent (and rounded), so it never occludes what is under it.
+        Vec::new(),
+    );
+    Ok(PanelElement::Texture(
+        TextureRenderElement::from_texture_buffer(
+            buffer,
+            rect.loc,
+            color[3],
+            None,
+            None,
+            Kind::Unspecified,
+        ),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
-    containers: &[(Rectangle<f64, Logical>, [f32; 4])],
     count: usize,
     position: f64,
     recording_label: Option<(&str, f64)>,
@@ -1541,11 +1640,10 @@ fn draw_bar_texture(
         let mut p = Painter::new(frame, scale, size);
 
         p.clear([0., 0., 0., 0.])?;
-        // The rounded button containers (hover/active), behind the button content.
-        // Half the height clamps the SDF to a stadium (fully rounded pill).
-        for (rect, color) in containers {
-            p.fill_rounded(*rect, rect.size.h / 2., *color)?;
-        }
+        // The button containers are NOT here: they are their own elements, composited
+        // under this texture ([`pill_element`]). Their only animated property is alpha,
+        // and alpha is free at composite time — in here it made the whole bar
+        // uncacheable for the length of every hover and every overview open.
         draw_workspace_dots(&mut p, count, position)?;
         p.text_px(&clock_run, c_origin, TEXT)?;
         // The screen-recording pill's M:SS label, over its red container.
@@ -1942,18 +2040,8 @@ mod tests {
         };
         let scale = 2.0;
         let width_px = to_physical_precise_round::<i32>(scale, 400.);
-        let mut tex = draw_bar_texture(
-            &mut vk,
-            scale,
-            width_px,
-            "12:34",
-            &[],
-            ws.count,
-            1.,
-            None,
-            None,
-        )
-        .expect("bar texture");
+        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", ws.count, 1., None, None)
+            .expect("bar texture");
         let size = tex.size();
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -2035,9 +2123,8 @@ mod tests {
 
         // Peak red over the band row across just the two-dot region (far from the clock).
         let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex =
-                draw_bar_texture(vk, scale, width_px, "12:34", &[], 2, position, None, None)
-                    .expect("bar texture");
+            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", 2, position, None, None)
+                .expect("bar texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -2218,13 +2305,16 @@ mod tests {
         let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
         panel.set_overview_open(true);
         clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
-        let containers = panel.button_containers(width_px as f64, ws);
+        assert!(
+            !panel.button_containers(width_px as f64, ws).is_empty(),
+            "the open overview must light the Activities pill, or the assertion below \
+             that the bake does not contain it proves nothing",
+        );
         let mut tex = draw_bar_texture(
             &mut vk,
             1.,
             width_px,
             "12:34",
-            &containers,
             ws.count,
             ws.active as f64,
             None,
@@ -2252,13 +2342,15 @@ mod tests {
             "the chrome bake must be transparent where the background element goes, got {bg:?}",
         );
 
-        // The active Activities container fills the left pill with white at α0.28,
-        // premultiplied over transparency. Sampled above the dot band, inside the inset
-        // pill, so it's container fill, not a workspace dot and not the screen-edge margin.
-        let hl = px_at(17, 6);
-        assert!(
-            hl[3] > 45 && hl[3] < 100 && hl[0] == hl[1] && hl[1] == hl[2],
-            "expected the active container fill inside the pill, got {hl:?}",
+        // …and the same for the container pills, for the same reason. The active
+        // Activities fill used to be painted right here (white at α0.28, sampled above
+        // the dot band and inside the inset pill); it is its own element now, because
+        // its alpha animates and an animated alpha in this bake costs a GPU round trip
+        // on every frame of the fade. See `pill_element`.
+        let pill = px_at(17, 6);
+        assert_eq!(
+            pill[3], 0,
+            "the chrome bake must be transparent where the container pill goes, got {pill:?}",
         );
 
         // Bright glyph ink somewhere (the clock text).
@@ -2578,10 +2670,12 @@ mod tests {
         assert!(!has_kb_pill(&panel), "closed menu clears the pill");
     }
 
-    /// The recording pill draws red (`#c01c28`) with its white `M:SS` label on top.
+    /// The recording pill draws red (`#c01c28`) with its white `M:SS` label on top —
+    /// and the two now live in different textures, so this checks both halves line up:
+    /// the pill comes from [`pill_texture`], the label from the chrome bake.
     /// Skips with no device.
     #[test]
-    fn draw_bar_texture_paints_the_recording_pill() {
+    fn the_recording_pill_is_red_under_its_label() {
         use smithay::backend::renderer::{ExportMem, Texture as _};
 
         let mut vk = match VulkanRenderer::new() {
@@ -2598,13 +2692,37 @@ mod tests {
 
         // A red pill on the right with a label just inside its left padding.
         let pill = Rectangle::new(Point::from((300., 3.)), Size::from((90., 26.)));
-        let containers = [(pill, R1_BG)];
+
+        // The pill itself, baked at full alpha into its own texture.
+        let mut cache = widget::BakeCache::new();
+        let mut pill_tex =
+            pill_texture(&mut vk, &mut cache, scale, pill.size, R1_BG).expect("pill texture");
+        let pill_size = pill_tex.size();
+        let fb = vk.bind(&mut pill_tex).expect("bind pill for readback");
+        let mapping = vk
+            .copy_framebuffer(
+                &fb,
+                Rectangle::<i32, BufferCoord>::from_size(pill_size),
+                Fourcc::Abgr8888,
+            )
+            .expect("copy_framebuffer");
+        let pill_px = vk.map_texture(&mapping).expect("map_texture").to_vec();
+        let red = pill_px
+            .chunks_exact(4)
+            .filter(|p| p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200)
+            .count();
+        assert!(red > 50, "expected a red recording pill, got {red} red px");
+        // A stadium, not a rectangle: the corner is outside the rounding.
+        let corner = &pill_px[0..4];
+        assert_eq!(corner[3], 0, "the pill must be rounded, got {corner:?}");
+        drop(fb);
+
+        // The label, which stays in the chrome bake and draws over the pill.
         let mut tex = draw_bar_texture(
             &mut vk,
             scale,
             width_px,
             "12:34",
-            &containers,
             3,
             1.,
             Some(("0:05", 306.)),
@@ -2624,23 +2742,185 @@ mod tests {
         let w = size.w as usize;
         let x0 = to_physical_precise_round::<i32>(scale, 300.).max(0) as usize;
         let x1 = (to_physical_precise_round::<i32>(scale, 390.) as usize).min(w);
-        let mut red = 0usize;
         let mut ink = 0usize;
+        let mut bar_red = 0usize;
         for y in 0..size.h as usize {
             for x in x0..x1 {
                 let p = &pixels[(y * w + x) * 4..(y * w + x) * 4 + 4];
                 if p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200 {
-                    red += 1;
+                    bar_red += 1;
                 }
                 if p[0] > 200 && p[1] > 200 && p[2] > 200 {
                     ink += 1;
                 }
             }
         }
-        assert!(red > 50, "expected a red recording pill, got {red} red px");
         assert!(
             ink > 5,
-            "expected white M:SS label ink over the pill, got {ink} px"
+            "expected white M:SS label ink where the pill goes, got {ink} px"
+        );
+        assert_eq!(
+            bar_red, 0,
+            "the pill is its own element now; the chrome bake must not paint it",
+        );
+    }
+
+    /// **A container fade must not re-bake the pill.** The whole point of moving the
+    /// button containers out of the chrome is that their alpha is a composite-time
+    /// property: one bake per shape has to serve an entire fade.
+    ///
+    /// This is the assertion that would have caught the panel's per-frame bake at the
+    /// unit level. Like [`an_overview_fade_reuses_one_bar_bake`], it has to be made on
+    /// the bake counter — a pill re-baked every frame renders identically to a cached
+    /// one.
+    #[test]
+    fn a_container_fade_reuses_one_pill_bake() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping a_container_fade_reuses_one_pill_bake: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        let mut cache = widget::BakeCache::new();
+        let rect = Rectangle::new(Point::from((0., 3.)), Size::from((90., 26.)));
+
+        // Warm the cache, and pay the one bake this shape is allowed.
+        let _ = pill_element(&mut vk, &mut cache, 1., rect, [1., 1., 1., 0.]).expect("pill");
+
+        let before = crate::frame_log::bakes();
+        for step in 0..=10 {
+            let alpha = step as f32 / 10.;
+            pill_element(&mut vk, &mut cache, 1., rect, [1., 1., 1., alpha]).expect("pill");
+        }
+        assert_eq!(
+            crate::frame_log::bakes(),
+            before,
+            "sweeping a container fade re-baked the pill instead of compositing it at alpha",
+        );
+
+        // A different *shape* must still bake — otherwise the assertion above would
+        // hold for the trivial reason that nothing is being cached by shape at all.
+        let wider = Rectangle::new(rect.loc, Size::from((120., 26.)));
+        pill_element(&mut vk, &mut cache, 1., wider, [1., 1., 1., 1.]).expect("pill");
+        assert_eq!(
+            crate::frame_log::bakes(),
+            before + 1,
+            "a pill of a new shape has to be baked",
+        );
+    }
+
+    /// The container pill still lands where it did, at the alpha it did, once the
+    /// panel's elements are composited.
+    ///
+    /// Moving the pill out of the chrome bake moved it from being *painted* at exact
+    /// physical coordinates inside one texture to being *placed* as its own element at
+    /// a logical location — which is where a fractional scale could shift it by a
+    /// half-pixel or drop it entirely. The unit tests around it check the pill texture
+    /// and its caching; only compositing checks that it is in the right place, and at a
+    /// non-integer scale where a placement bug actually shows.
+    #[test]
+    fn the_composited_container_pill_keeps_its_place_and_alpha() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping the_composited_container_pill_keeps_its_place_and_alpha: {e}");
+                return;
+            }
+        };
+
+        let scale = 2.25;
+        let (w, h) = (600., PANEL_HEIGHT);
+        let output = Output::new(
+            "pill-test".to_owned(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "niri".to_owned(),
+                model: "test".to_owned(),
+                serial_number: "0".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: Size::from((to_physical_precise_round(scale, w), 1080)),
+                refresh: 60_000,
+            }),
+            None,
+            Some(smithay::output::Scale::Fractional(scale)),
+            None,
+        );
+
+        let ws = WorkspaceState {
+            count: 3,
+            active: 0,
+        };
+        let mut clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
+        // Overview open → the Activities pill is checked; settle past the 150ms fade so
+        // it sits at its full target alpha rather than somewhere mid-ramp.
+        panel.set_overview_open(true);
+        clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
+
+        let icons = IconCache::new("Adwaita");
+        let elements = panel.render(&mut vk, &output, ws, 0., 0., &icons);
+        assert!(
+            elements
+                .iter()
+                .any(|e| matches!(e, PanelElement::Texture(_))),
+            "expected the panel to contribute textures",
+        );
+
+        let size = Size::<i32, Physical>::from((
+            to_physical_precise_round(scale, w),
+            to_physical_precise_round(scale, h),
+        ));
+        let pixels = crate::render_helpers::render_to_vec(
+            &mut vk,
+            size,
+            smithay::utils::Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            // `render_elements` draws in iterator order, i.e. back-to-front, while a
+            // panel element list is front-to-back (index 0 topmost) — hence the reverse.
+            // Feeding it unreversed paints the opaque bar background over everything and
+            // reads as "the pill did not draw".
+            elements.into_iter().rev(),
+        )
+        .expect("composite the panel");
+
+        let px_at = |x: i32, y: i32| -> [u8; 4] {
+            let i = ((y * size.w + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        // Inside the Activities pill and above the dot band — the same spot the bake
+        // test used to sample, in physical pixels at this scale.
+        let inside = px_at(
+            to_physical_precise_round(scale, 17.),
+            to_physical_precise_round(scale, 6.),
+        );
+        // The bar background is opaque here (`overview_fade` 0), so the fill shows as a
+        // grey *level*, not as alpha: white at α0.28 over black is 0.28·255 ≈ 71.
+        assert!(
+            inside[3] == 255
+                && inside[0] == inside[1]
+                && inside[1] == inside[2]
+                && (60..=85).contains(&inside[0]),
+            "expected the checked Activities pill fill (grey ~71 over the opaque bar) at \
+             17,6, got {inside:?}",
+        );
+
+        // Outside the pill's right edge the bar is bare again — so the assertion above is
+        // about a pill, not about something that filled the whole bar.
+        let beyond = px_at(
+            to_physical_precise_round(scale, w - 8.),
+            to_physical_precise_round(scale, 6.),
+        );
+        assert_eq!(
+            [beyond[0], beyond[1], beyond[2]],
+            [0, 0, 0],
+            "the pill must not extend past the Activities button, got {beyond:?}",
         );
     }
 }
