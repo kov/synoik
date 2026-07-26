@@ -386,6 +386,7 @@ impl Entry {
     /// `text` is empty the `placeholder` shows muted with no caret (an unfocused hint);
     /// once typing starts the text shows in full white with a caret bar. Long text is
     /// clipped at the trailing-icon inset (no horizontal scroll yet — MVP).
+    #[track_caller]
     pub fn bake(
         renderer: &mut VulkanRenderer,
         cache: &mut BakeCache,
@@ -472,6 +473,7 @@ pub fn physical_size(scale: f64, logical: Size<f64, Logical>) -> Size<i32, Physi
 /// - `paint(frame, phys, prepared)` clears + draws everything into the bound [`VulkanFrame`] (the
 ///   full-buffer rect is `Rectangle::from_size(phys)`). Widgets clear with their own color —
 ///   transparent for rounded popovers, a border color for square dialogs.
+#[track_caller]
 pub fn bake<P>(
     renderer: &mut VulkanRenderer,
     cache: &mut BakeCache,
@@ -525,6 +527,7 @@ pub struct DropShadowSpec {
 /// GNOME `box-shadow`. The buffer pads the card by the blur reach (~3σ) + `spread` all round (plus
 /// the downward `offset` at the bottom), so the fringe never clips. The reusable form of the
 /// screenshot-panel / notification-banner shadow — draws through [`Painter::drop_shadow`].
+#[track_caller]
 pub fn bake_card_shadow(
     renderer: &mut VulkanRenderer,
     cache: &mut BakeCache,
@@ -579,6 +582,7 @@ pub fn bake_card_shadow(
 /// (at the card's own origin, no offset). The `.popup-menu-content` border counterpart to
 /// [`bake_card_shadow`]; a top overlay so it works for a multi-texture card (the calendar popover
 /// stacks a column over its background box) without a seam. Width is GNOME's fixed 1px.
+#[track_caller]
 pub fn bake_card_border(
     renderer: &mut VulkanRenderer,
     cache: &mut BakeCache,
@@ -610,6 +614,7 @@ pub fn bake_card_border(
 /// three popovers (QS / date / input-source) can't drift: each content bakes with a transparent
 /// bg and the shared popover chrome draws this one cited fill. Counterpart to [`bake_card_border`]
 /// and [`bake_card_shadow`].
+#[track_caller]
 pub fn bake_card_fill(
     renderer: &mut VulkanRenderer,
     cache: &mut BakeCache,
@@ -687,6 +692,7 @@ impl ContentCache {
 /// layout value `P`; `paint(frame, phys, prepared)` draws it. Both run only on a
 /// cache miss. The caller reads the returned texture's own size to place it (these
 /// widgets center themselves on screen from the baked size).
+#[track_caller]
 pub fn bake_content<P>(
     renderer: &mut VulkanRenderer,
     cache: &mut ContentCache,
@@ -725,6 +731,7 @@ pub fn bake_content<P>(
 /// step). Shared by [`bake_content`] and [`bake_uncached`]; also for a
 /// content-sized widget with its own owner-driven cache that has already computed
 /// its physical size (the screenshot help panel).
+#[track_caller]
 pub fn bake_uncached_sized(
     renderer: &mut VulkanRenderer,
     phys: Size<i32, Physical>,
@@ -734,6 +741,12 @@ pub fn bake_uncached_sized(
     // a submit and a fence wait. Counting and timing them here (rather than at
     // each caller) is what lets a slow frame say how much of itself was
     // re-rasterization.
+    //
+    // `time_bake` is `#[track_caller]`, and so is every helper in this file between
+    // a widget and this line, so the site it records is the *widget's* — not
+    // whichever of `bake`/`bake_content`/`bake_uncached` it came through. Dropping
+    // the attribute from any one of them collapses every widget that routes through
+    // it onto a single line in this file, which reads like one very busy widget.
     let _timed = crate::frame_log::time_bake();
 
     let (w, h) = (phys.w.max(1), phys.h.max(1));
@@ -756,6 +769,7 @@ pub fn bake_uncached_sized(
 /// Bake once with no caching — for widgets that re-draw every frame while
 /// animating and bypass their cache (the panel workspace-dot morph, the QS pill
 /// fill-fade). Same contract as [`bake`]'s `paint`.
+#[track_caller]
 pub fn bake_uncached(
     renderer: &mut VulkanRenderer,
     scale: f64,
@@ -1630,5 +1644,68 @@ mod tests {
             "fringe just outside the box should be mid-grey (blur falloff): \
              center {center}, fringe {fringe}, corner {corner}",
         );
+    }
+
+    /// The bake-attribution chain: a bake must be recorded against the *widget's*
+    /// line, not against whichever helper in this file it travelled through.
+    ///
+    /// This is the load-bearing half of `frame_log`'s bake reporting, and it
+    /// degrades silently: drop `#[track_caller]` from one helper and every widget
+    /// routing through it collapses onto a single line in `widget.rs`, which reads
+    /// like one very busy widget rather than a broken instrument. Nothing else
+    /// notices — the counts and the timings stay right.
+    ///
+    /// Each helper here is entered from a distinct line of *this* test, so a
+    /// collapsed chain shows up as a site in `widget.rs` instead.
+    #[test]
+    fn bake_sites_name_the_widget_not_the_helper() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(vk) => vk,
+            Err(e) => {
+                eprintln!("skipping bake_sites_name_the_widget_not_the_helper: no device ({e})");
+                return;
+            }
+        };
+
+        let size = Size::<i32, Physical>::from((8, 8));
+        let logical = Size::<f64, Logical>::from((8., 8.));
+        let paint_px = |_: &mut crate::render_helpers::vulkan::VulkanFrame| Ok(());
+
+        let _ = crate::frame_log::take_bake_sites();
+
+        let sized_line = line!() + 1;
+        bake_uncached_sized(&mut vk, size, paint_px).expect("bake_uncached_sized");
+        let uncached_line = line!() + 1;
+        super::bake_uncached(&mut vk, 1.0, logical, |_, _| Ok(())).expect("bake_uncached");
+        let cached_line = line!() + 2;
+        let mut cache = super::BakeCache::default();
+        super::bake(
+            &mut vk,
+            &mut cache,
+            1.0,
+            logical,
+            0,
+            |_| Ok(()),
+            |_, _, _| Ok(()),
+        )
+        .expect("bake");
+
+        let sites = crate::frame_log::take_bake_sites();
+        let here = file!();
+        for (what, line) in [
+            ("bake_uncached_sized", sized_line),
+            ("bake_uncached", uncached_line),
+            ("bake", cached_line),
+        ] {
+            assert!(
+                sites.iter().any(|s| s.file == here && s.line == line),
+                "{what} was attributed to {:?}, not to its caller {here}:{line} — \
+                 a #[track_caller] is missing from the chain in widget.rs",
+                sites
+                    .iter()
+                    .map(|s| format!("{}:{}", s.file, s.line))
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 }

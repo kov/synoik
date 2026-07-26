@@ -60,7 +60,7 @@
 //! forced full, how many widget bakes ran (an uncached bake is a full GPU
 //! round-trip), and the overview/animation state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,6 +98,83 @@ thread_local! {
     ///
     /// Per-thread for the same reason as [`BAKES`].
     static BAKE_NANOS: Cell<u64> = const { Cell::new(0) };
+
+    /// Which widget baked, keyed by the `#[track_caller]` location of the call into
+    /// [`time_bake`] — i.e. the widget's own line, not the toolkit helper it went
+    /// through.
+    ///
+    /// A count alone says a frame paid for a re-rasterization; it does not say
+    /// *whose*, and the answer decides what to fix. Finding that the panel re-baked
+    /// on every frame of the overview animation took a throwaway `track_caller`
+    /// patch and a bespoke test run, all of which this replaces.
+    ///
+    /// Recorded even when frame logging is off, like [`BAKES`] and unlike
+    /// [`BAKE_NANOS`], because the guardrail tests read it without a log. A hash
+    /// insert against a GPU round trip is not a cost worth gating.
+    static BAKE_SITES: RefCell<HashMap<SiteKey, SiteTally>> = RefCell::new(HashMap::new());
+}
+
+/// Where a bake came from: `(file, line)` of the widget's call, from
+/// `#[track_caller]`. `Location` itself is not hashable, and the pair is what a
+/// reader wants anyway.
+type SiteKey = (&'static str, u32);
+
+/// What one site did: `(bakes, nanoseconds)`. Nanoseconds stay zero unless frame
+/// logging is on — see [`BAKE_SITES`].
+type SiteTally = (u64, u64);
+
+/// One widget's bakes over some window of time. See [`take_bake_sites`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BakeSite {
+    /// Source file of the widget that baked, workspace-relative (`src/ui/panel.rs`).
+    pub file: &'static str,
+    pub line: u32,
+    /// How many times it baked.
+    pub bakes: u64,
+    /// How long those bakes took in total. Zero unless frame logging is on — the
+    /// count is always recorded, the timing is not.
+    pub time: Duration,
+}
+
+impl std::fmt::Display for BakeSite {
+    /// `ui/panel.rs:1540 ×3 4.20ms` — the leading `src/` is dropped, since every
+    /// site has it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = self.file.strip_prefix("src/").unwrap_or(self.file);
+        write!(f, "{file}:{} ×{}", self.line, self.bakes)?;
+        if !self.time.is_zero() {
+            write!(f, " {}", ms(self.time))?;
+        }
+        Ok(())
+    }
+}
+
+/// Take and clear this thread's per-site bake tallies, most expensive first (ties
+/// broken by count, then location, so the order is stable for tests).
+///
+/// Draining rather than accumulating, so a caller measures a window it defines: the
+/// frame log takes them per frame, and a test takes them per rendered frame of an
+/// animation. See [`BAKE_SITES`].
+pub fn take_bake_sites() -> Vec<BakeSite> {
+    let mut sites: Vec<BakeSite> = BAKE_SITES.with(|s| {
+        s.borrow_mut()
+            .drain()
+            .map(|((file, line), (bakes, nanos))| BakeSite {
+                file,
+                line,
+                bakes,
+                time: Duration::from_nanos(nanos),
+            })
+            .collect()
+    });
+    sites.sort_by(|a, b| {
+        b.time
+            .cmp(&a.time)
+            .then(b.bakes.cmp(&a.bakes))
+            .then(a.file.cmp(b.file))
+            .then(a.line.cmp(&b.line))
+    });
+    sites
 }
 
 /// Whether GPU timing was requested, sampled once from the environment on the
@@ -131,24 +208,49 @@ static GPU_LOST: AtomicU64 = AtomicU64::new(0);
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Accumulates its lifetime into this thread's bake time when dropped. Inert when
-/// frame logging is off, so call sites can be unconditional.
-pub struct Timed(Option<Instant>);
+/// Accumulates its lifetime into this thread's bake time — and its originating
+/// widget's — when dropped. The timing is inert when frame logging is off, so call
+/// sites can be unconditional; the site's *count* is recorded either way.
+pub struct Timed {
+    started: Option<Instant>,
+    site: (&'static str, u32),
+}
 
 impl Drop for Timed {
     fn drop(&mut self) {
-        if let Some(started) = self.0 {
-            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let nanos = self.started.map_or(0, |started| {
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        });
+        if nanos > 0 {
             BAKE_NANOS.with(|c| c.set(c.get().saturating_add(nanos)));
         }
+        BAKE_SITES.with(|s| {
+            let mut s = s.borrow_mut();
+            let entry = s.entry(self.site).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(nanos);
+        });
     }
 }
 
 /// Time a widget bake — an uncached rasterization into its own GPU texture. Hold
 /// the returned guard for the operation.
+///
+/// `#[track_caller]`, and every toolkit helper between a widget and here carries it
+/// too, so the recorded site is the widget's own line rather than the last hop
+/// inside `ui::widget`. That chain is what makes [`take_bake_sites`] name something
+/// actionable; a break anywhere in it silently collapses every widget onto one
+/// helper line. [`bake_sites_name_the_widget_not_the_helper`] pins it.
+///
+/// [`bake_sites_name_the_widget_not_the_helper`]: crate::ui::widget::tests
+#[track_caller]
 pub fn time_bake() -> Timed {
     BAKES.with(|c| c.set(c.get().saturating_add(1)));
-    Timed(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+    let caller = std::panic::Location::caller();
+    Timed {
+        started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+        site: (caller.file(), caller.line()),
+    }
 }
 
 /// Widget bakes **this thread** has run since it started. Exposed so a test can
@@ -374,6 +476,9 @@ struct Totals {
     gpu_lost: u64,
     bakes: u64,
     baking: Duration,
+    /// Which widgets those bakes belong to. A bake count says a frame paid for a
+    /// re-rasterization; only this says what to go and fix.
+    bake_sites: Vec<BakeSite>,
     shapes: u64,
     shaping: Duration,
     /// GPU round trips (`vkQueueSubmit` + fence wait). The number to watch on a
@@ -590,6 +695,7 @@ impl FrameLog {
             gpu_lost: take_gpu_lost(),
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
+            bake_sites: take_bake_sites(),
             shapes: niri_vk::stats::shapes() - frame.shapes_at_start,
             shaping: niri_vk::stats::take_shape_time(),
             submits: niri_vk::stats::submits() - frame.submits_at_start,
@@ -739,6 +845,18 @@ impl FrameLog {
         }
         if totals.bakes > 0 {
             let _ = write!(line, ", {} bakes in {}", totals.bakes, ms(totals.baking));
+            // Name them. Capped, because a pathological frame should not push the
+            // rest of the line out of a journal entry — the tail is the long pole
+            // and the list is sorted by time, so the cap only ever drops the cheap
+            // ones. It still says how many it dropped.
+            if let Some((shown, rest)) = split_at_most(&totals.bake_sites, BAKE_SITES_SHOWN) {
+                let names: Vec<String> = shown.iter().map(BakeSite::to_string).collect();
+                let _ = write!(line, " ({}", names.join(", "));
+                if rest > 0 {
+                    let _ = write!(line, ", +{rest} more");
+                }
+                let _ = write!(line, ")");
+            }
         }
         if totals.shapes > 0 {
             let _ = write!(
@@ -967,6 +1085,20 @@ impl FrameLog {
             *stats = Stats::default();
         }
     }
+}
+
+/// How many bake sites a frame line names before it starts counting the rest.
+const BAKE_SITES_SHOWN: usize = 3;
+
+/// `(the first `n`, how many were left over)`, or `None` when there is nothing to
+/// show. Split out so the "+N more" arithmetic is pinned by a test rather than done
+/// inline in a format string.
+fn split_at_most<T>(all: &[T], n: usize) -> Option<(&[T], usize)> {
+    if all.is_empty() {
+        return None;
+    }
+    let shown = all.len().min(n);
+    Some((&all[..shown], all.len() - shown))
 }
 
 /// Milliseconds with two decimals — the resolution that matters against a 16.7ms
@@ -1211,6 +1343,72 @@ mod tests {
         let line =
             FrameLog::format_frame(&frame, Duration::from_millis(9), &Totals::default(), None);
         assert!(!line.contains("gpu"), "{line}");
+    }
+
+    /// A bake count says a frame paid for a re-rasterization; the line has to say
+    /// *whose*, because that is the only part that tells you what to fix. The panel
+    /// baking on every frame of the overview animation was invisible for as long as
+    /// the line only counted.
+    #[test]
+    fn bakes_are_named_and_the_long_pole_survives_the_cap() {
+        let frame = empty_frame();
+        let site = |file, line, bakes, us| BakeSite {
+            file,
+            line,
+            bakes,
+            time: Duration::from_micros(us),
+        };
+
+        let totals = Totals {
+            bakes: 3,
+            baking: Duration::from_micros(4200),
+            bake_sites: vec![site("src/ui/panel.rs", 1540, 3, 4200)],
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(
+            line.contains("3 bakes in 4.20ms (ui/panel.rs:1540 ×3 4.20ms)"),
+            "{line}"
+        );
+
+        // Over the cap: the expensive ones are named (the list arrives sorted) and
+        // the rest are counted, never silently dropped.
+        let totals = Totals {
+            bakes: 5,
+            baking: Duration::from_micros(5000),
+            bake_sites: vec![
+                site("src/ui/panel.rs", 10, 1, 3000),
+                site("src/ui/dash.rs", 20, 1, 1000),
+                site("src/ui/calendar.rs", 30, 1, 600),
+                site("src/ui/mru.rs", 40, 1, 300),
+                site("src/ui/app_grid.rs", 50, 1, 100),
+            ],
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(line.contains("ui/panel.rs:10 ×1 3.00ms"), "{line}");
+        assert!(line.contains("ui/calendar.rs:30 ×1 0.60ms"), "{line}");
+        assert!(line.contains("+2 more"), "{line}");
+        assert!(
+            !line.contains("app_grid"),
+            "the cheapest sites are the ones to drop: {line}"
+        );
+
+        // No bakes, no parenthetical.
+        let line =
+            FrameLog::format_frame(&frame, Duration::from_millis(9), &Totals::default(), None);
+        assert!(!line.contains("bakes"), "{line}");
+    }
+
+    /// `split_at_most` is the "+N more" arithmetic, where an off-by-one turns a
+    /// truncated list into one that reads complete.
+    #[test]
+    fn split_at_most_counts_what_it_drops() {
+        assert_eq!(split_at_most::<u8>(&[], 3), None);
+        let all = [1, 2, 3, 4, 5];
+        assert_eq!(split_at_most(&all, 3), Some((&all[..3], 2)));
+        assert_eq!(split_at_most(&all, 5), Some((&all[..], 0)));
+        assert_eq!(split_at_most(&all, 9), Some((&all[..], 0)));
     }
 
     /// The bake counter must not see another thread's bakes, or a test asserting
