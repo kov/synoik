@@ -242,6 +242,40 @@ fn expose_tile_render(
     (pos, tile_scale * hover_scale)
 }
 
+/// Everything about where one exposé preview goes: the position its elements draw
+/// at, the factor they are then rescaled by about that position, **and** the xray
+/// position that matches — from one computation, so the backdrop cannot disagree
+/// with the geometry.
+///
+/// The two used to be derived separately, and drifted: the xray got the offset but
+/// not the scale, so it sampled the backdrop for a full-size window that was then
+/// squeezed into the slot. That put the backdrop at the wrong scale, and wherever
+/// the full-size rect overhung the workspace, [`Xray::render`]'s crop dropped that
+/// part outright — a band across the preview's bottom drawing no backdrop at all.
+/// Pinned by `the_expose_xray_covers_exactly_the_drawn_preview`.
+///
+/// [`Xray::render`]: crate::render_helpers::xray::Xray::render
+fn expose_tile_placement(
+    xray_pos: XrayPos,
+    rect: Rectangle<f64, Logical>,
+    slot: Rectangle<f64, Logical>,
+    hover: f64,
+    progress: f64,
+    zoom: f64,
+    scale: f64,
+) -> (Point<f64, Logical>, f64, XrayPos) {
+    let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+
+    // Round to physical pixels.
+    let pos = pos.to_physical_precise_round(scale).to_logical(scale);
+
+    // Offset to the slot, then scale about that same origin — the origin the
+    // caller's `RescaleRenderElement` uses.
+    let xray_pos = xray_pos.offset(pos).scale(tile_scale);
+
+    (pos, tile_scale, xray_pos)
+}
+
 niri_render_elements! {
     WorkspaceRenderElement => {
         Scrolling = ScrollingSpaceRenderElement,
@@ -2057,13 +2091,10 @@ impl<W: LayoutElement> Workspace<W> {
 
         for (tile, rect, slot) in layout {
             let hover = self.expose_hover_value(tile.window().id());
-            let (pos, tile_scale) = expose_tile_render(rect, slot, hover, progress, zoom);
+            let (pos, tile_scale, tile_xray_pos) =
+                expose_tile_placement(xray_pos, rect, slot, hover, progress, zoom, scale);
 
-            // Round to physical pixels.
-            let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-
-            let xray_pos = xray_pos.offset(pos);
-            tile.render(ctx.r(), pos, xray_pos, false, &mut |elem| {
+            tile.render(ctx.r(), pos, tile_xray_pos, false, &mut |elem| {
                 push(
                     RescaleRenderElement::from_element(
                         elem,
@@ -2599,4 +2630,107 @@ fn compute_workspace_shadow_config(
     config.offset.y.0 *= norm;
 
     config
+}
+
+#[cfg(test)]
+mod expose_xray_tests {
+    use super::*;
+
+    /// The exposé preview's xray must cover **exactly** the preview, no more and no
+    /// less.
+    ///
+    /// This is the invariant that broke, and it is invisible from every angle that
+    /// normally catches things. The compositor draws something either way, the
+    /// element counts are identical, and no end-state assertion changes — the
+    /// backdrop simply shows the wrong part of the wallpaper at the wrong scale, and
+    /// silently draws nothing over a band at the bottom.
+    ///
+    /// Expressed in backdrop coordinates, where both sides are comparable: the rect
+    /// the xray samples for (position from `XrayPos`, size from the tile's own
+    /// unscaled geometry through the same zoom) against the rect the preview
+    /// actually occupies (`expose_tile_render`'s position and scaled size). Before
+    /// the fix the xray's size was too big by `1/tile_scale`.
+    #[test]
+    fn the_expose_xray_covers_exactly_the_drawn_preview() {
+        // A workspace preview shrunk into the overview, and a window whose slot sits
+        // low in it — the case where the unscaled rect overhangs the bottom, which is
+        // where the dead band came from.
+        let ws_zoom = 0.779;
+        let ws_origin = Point::<f64, Logical>::from((212., 108.));
+        let base = XrayPos::new(ws_origin, ws_zoom);
+
+        let tile =
+            Rectangle::<f64, Logical>::new(Point::from((58., 193.)), Size::from((901., 571.)));
+
+        for (name, slot, hover, progress) in [
+            (
+                "settled, low slot",
+                Rectangle::new(Point::from((40., 560.)), Size::from((740., 469.))),
+                0.,
+                1.,
+            ),
+            (
+                "mid-animation",
+                Rectangle::new(Point::from((40., 560.)), Size::from((740., 469.))),
+                0.,
+                0.4,
+            ),
+            (
+                "hovered",
+                Rectangle::new(Point::from((40., 560.)), Size::from((740., 469.))),
+                1.,
+                1.,
+            ),
+            (
+                "not started",
+                Rectangle::new(Point::from((40., 560.)), Size::from((740., 469.))),
+                0.,
+                0.,
+            ),
+        ] {
+            let (pos, tile_scale, xray) =
+                expose_tile_placement(base, tile, slot, hover, progress, ws_zoom, 1.);
+
+            // What the xray samples for, in backdrop coordinates.
+            let xray_origin = xray.pos_in_backdrop.upscale(xray.zoom);
+            let xray_size = tile.size.upscale(xray.zoom);
+
+            // What the preview actually occupies, in the same coordinates.
+            let drawn_origin = ws_origin + pos.upscale(ws_zoom);
+            let drawn_size = tile.size.upscale(tile_scale).upscale(ws_zoom);
+
+            let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+            assert!(
+                close(xray_origin.x, drawn_origin.x) && close(xray_origin.y, drawn_origin.y),
+                "{name}: xray origin {xray_origin:?} != drawn origin {drawn_origin:?}",
+            );
+            assert!(
+                close(xray_size.w, drawn_size.w) && close(xray_size.h, drawn_size.h),
+                "{name}: xray covers {xray_size:?} but the preview is {drawn_size:?} \
+                 (tile_scale {tile_scale}) — the backdrop will be at the wrong scale, \
+                 and cropped away wherever it overhangs the workspace",
+            );
+        }
+    }
+
+    /// A degenerate slot must not put an infinity into the position. It cannot
+    /// produce a visible preview either way; the requirement is only that it stays
+    /// finite, since these numbers reach the renderer as push constants.
+    #[test]
+    fn a_zero_width_slot_leaves_the_xray_finite() {
+        let base = XrayPos::new(Point::from((10., 20.)), 0.8);
+        let tile = Rectangle::<f64, Logical>::new(Point::from((0., 0.)), Size::from((100., 100.)));
+        let slot = Rectangle::new(Point::from((0., 0.)), Size::from((0., 0.)));
+        let (_, _, xray) = expose_tile_placement(base, tile, slot, 0., 1., 0.8, 1.);
+        assert!(
+            xray.zoom.is_finite() && xray.zoom > 0.,
+            "zoom {}",
+            xray.zoom
+        );
+        assert!(
+            xray.pos_in_backdrop.x.is_finite() && xray.pos_in_backdrop.y.is_finite(),
+            "position {:?}",
+            xray.pos_in_backdrop,
+        );
+    }
 }

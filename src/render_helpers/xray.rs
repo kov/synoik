@@ -50,6 +50,31 @@ impl XrayPos {
         self.pos_in_backdrop += offset;
         self
     }
+
+    /// Scale the geometry this describes by `factor` **about its own origin**, which
+    /// stays put in backdrop coordinates.
+    ///
+    /// For a caller that draws an element and then wraps it in a
+    /// `RescaleRenderElement` anchored at the same origin — the overview's window
+    /// picker does exactly that, per preview. Without this the xray samples the
+    /// backdrop for the element's *unscaled* size: the backdrop then shows at the
+    /// wrong scale, and where the unscaled rect overhangs the workspace,
+    /// [`Xray::render`]'s crop drops that part entirely and the element draws no
+    /// backdrop at all there.
+    ///
+    /// A non-positive or non-finite factor would put an infinity into the position,
+    /// so it is left alone: that only arises from a zero-width slot, whose preview
+    /// has nothing to draw anyway.
+    pub fn scale(mut self, factor: f64) -> Self {
+        let zoom = self.zoom * factor;
+        if !zoom.is_finite() || zoom <= 0. {
+            return self;
+        }
+        // Hold the origin fixed in backdrop coordinates while the zoom changes.
+        self.pos_in_backdrop = self.pos_in_backdrop.upscale(self.zoom).downscale(zoom);
+        self.zoom = zoom;
+        self
+    }
 }
 
 impl Default for XrayPos {
