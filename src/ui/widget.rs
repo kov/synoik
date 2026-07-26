@@ -452,6 +452,100 @@ impl BakeCache {
     }
 }
 
+/// A bake's `revision`, **derived from the values its paint closure reads** instead of maintained
+/// beside them.
+///
+/// ```ignore
+/// let revision = Revision::new()
+///     .of(self.entries.len())
+///     .of(&self.title)
+///     .of(self.expanded)
+///     .px(self.height)
+///     .color(self.accent)
+///     .done();
+/// ```
+///
+/// # Why this exists
+///
+/// A hand-bumped `u64` is a *proxy* for "what this bake reads", kept somewhere else, with nothing
+/// checking that the two agree. Every cache bug this codebase has had is that disagreement, in one
+/// direction or the other:
+///
+/// - **Bumped when nothing baked changed** → a full GPU round trip on every frame of an animation.
+///   The panel re-baked its whole bar for the length of every overview animation because opening
+///   the overview checks the Activities button, whose *fade* made `are_animations_ongoing()` true
+///   (`009213dd`); the app grid and the overview search re-shaped every label on every pointer move
+///   because hover bumped `content_rev` (`c5336421`, `d396bd30`).
+/// - **Not bumped when something did** → a stale texture that survives as long as the content does.
+///   The calendar popover's background froze at its open-time height while the list kept growing,
+///   because the height was not in the key (`128d112e`).
+///
+/// Deriving the key does not make either impossible, but it moves the mistake to where it can be
+/// seen: the inputs are listed at the call site, immediately above the closure that reads them, so
+/// adding one to the paint and adding one to the key are the same edit.
+/// `docs/fork/widget-layer-design.md` §H1 prescribed this when `bake()` landed — "revision should
+/// be **derived** … rather than hand-bumped, so it is correct on its own and size is pure
+/// insurance".
+///
+/// Hashing, not equality, because `bake`'s cache key is a `u64`. A collision would serve a stale
+/// texture, which at 64 bits over a handful of live variants is not a risk worth structuring
+/// against — but it *is* the reason to prefer a signature tuple where a widget already has one
+/// (`end_session`'s `Sig`), rather than converting it to this.
+#[derive(Debug, Clone)]
+pub struct Revision(std::collections::hash_map::DefaultHasher);
+
+impl Default for Revision {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Revision {
+    pub fn new() -> Self {
+        Self(std::collections::hash_map::DefaultHasher::new())
+    }
+
+    /// Fold in any hashable input. Order matters, which is what keeps `("a", "bc")` apart from
+    /// `("ab", "c")`.
+    #[must_use]
+    pub fn of(mut self, value: impl std::hash::Hash) -> Self {
+        std::hash::Hash::hash(&value, &mut self.0);
+        self
+    }
+
+    /// Fold in a float — a size, a position, an animation progress. Floats are not `Hash`, and the
+    /// two values that would otherwise misbehave are normalized: every NaN folds to one bit
+    /// pattern (or a NaN input would miss the cache on **every** frame, which is the expensive
+    /// failure this whole type exists to prevent), and `-0.0` folds to `0.0`, which is what the
+    /// bake would draw anyway.
+    #[must_use]
+    pub fn px(self, value: f64) -> Self {
+        let value = if value.is_nan() {
+            f64::NAN
+        } else {
+            value + 0.0
+        };
+        self.of(value.to_bits())
+    }
+
+    /// Fold in a premultiplied or straight RGBA color.
+    #[must_use]
+    pub fn color(self, rgba: [f32; 4]) -> Self {
+        rgba.iter().fold(self, |rev, c| rev.px(f64::from(*c)))
+    }
+
+    /// Fold in each item of an iterator, in order.
+    #[must_use]
+    pub fn each<T: std::hash::Hash>(self, items: impl IntoIterator<Item = T>) -> Self {
+        items.into_iter().fold(self, Self::of)
+    }
+
+    /// The `revision` to hand [`bake`].
+    pub fn done(&self) -> u64 {
+        std::hash::Hasher::finish(&self.0)
+    }
+}
+
 /// Convert a widget's logical size to the physical buffer size at `scale`
 /// (clamped to at least 1×1). The single home for that rounding.
 pub fn physical_size(scale: f64, logical: Size<f64, Logical>) -> Size<i32, Physical> {
@@ -1585,7 +1679,7 @@ mod tests {
     use smithay::backend::renderer::{Bind, ExportMem, Texture};
     use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
 
-    use super::{bake_uncached_sized, Painter};
+    use super::{bake_uncached_sized, Painter, Revision};
     use crate::render_helpers::vulkan::VulkanRenderer;
 
     /// The gaussian drop-shadow verb: a black shadow over a white buffer must darken the
@@ -1708,4 +1802,113 @@ mod tests {
             );
         }
     }
+
+    /// Every input the paint closure reads has to move the key, or the widget serves a stale
+    /// texture for as long as its content lives — the `128d112e` calendar freeze.
+    #[test]
+    fn a_changed_input_changes_the_revision() {
+        let base = Revision::new()
+            .of(3usize)
+            .of("title")
+            .px(120.)
+            .color(ACCENT);
+        assert_ne!(
+            base.done(),
+            Revision::new()
+                .of(4usize)
+                .of("title")
+                .px(120.)
+                .color(ACCENT)
+                .done(),
+            "a count change did not invalidate"
+        );
+        assert_ne!(
+            base.done(),
+            Revision::new()
+                .of(3usize)
+                .of("other")
+                .px(120.)
+                .color(ACCENT)
+                .done(),
+            "a text change did not invalidate"
+        );
+        assert_ne!(
+            base.done(),
+            Revision::new()
+                .of(3usize)
+                .of("title")
+                .px(121.)
+                .color(ACCENT)
+                .done(),
+            "a size change did not invalidate"
+        );
+        assert_ne!(
+            base.done(),
+            Revision::new()
+                .of(3usize)
+                .of("title")
+                .px(120.)
+                .color(RED)
+                .done(),
+            "a color change did not invalidate"
+        );
+        assert_eq!(
+            base.done(),
+            Revision::new()
+                .of(3usize)
+                .of("title")
+                .px(120.)
+                .color(ACCENT)
+                .done(),
+            "the same inputs must hit the cache"
+        );
+    }
+
+    /// Order is part of the key, so two fields cannot swap their contributions and cancel out.
+    #[test]
+    fn the_order_of_the_inputs_is_part_of_the_revision() {
+        assert_ne!(
+            Revision::new().of("ab").of("c").done(),
+            Revision::new().of("a").of("bc").done(),
+            "adjacent inputs ran together, so a boundary shift is invisible"
+        );
+    }
+
+    /// A NaN that hashed as itself would miss the cache on **every** frame — a full GPU round trip
+    /// per frame, which is the exact failure this type exists to prevent, arriving silently.
+    #[test]
+    fn a_nan_input_still_hits_its_own_cache_entry() {
+        assert_eq!(
+            Revision::new().px(f64::NAN).done(),
+            Revision::new().px(f64::NAN).done(),
+            "a NaN input re-bakes forever"
+        );
+        assert_eq!(
+            Revision::new().px(-0.0).done(),
+            Revision::new().px(0.0).done(),
+            "-0.0 and 0.0 paint the same and must share an entry"
+        );
+        assert_ne!(
+            Revision::new().px(f64::NAN).done(),
+            Revision::new().px(0.0).done()
+        );
+    }
+
+    /// `each` folds a sequence, and a reordering of that sequence is a different bake.
+    #[test]
+    fn a_reordered_sequence_is_a_different_revision() {
+        assert_ne!(
+            Revision::new().each(["one", "two"]).done(),
+            Revision::new().each(["two", "one"]).done(),
+            "reordering the entries did not invalidate — a list that only reorders serves stale"
+        );
+        assert_eq!(
+            Revision::new().each(["one", "two"]).done(),
+            Revision::new().of("one").of("two").done(),
+            "`each` must be the same as folding the items by hand"
+        );
+    }
+
+    const ACCENT: [f32; 4] = [0.21, 0.52, 0.89, 1.];
+    const RED: [f32; 4] = [0.89, 0.21, 0.21, 1.];
 }

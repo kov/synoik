@@ -1513,10 +1513,10 @@ fn pill_texture(
 ) -> anyhow::Result<VkTexture> {
     let opaque = [color[0], color[1], color[2], 1.];
     // `widget::bake` keys on (scale, physical size), so the colour has to ride in the
-    // revision or two pills of the same shape in different colours would alias.
-    let revision = u64::from(color[0].to_bits())
-        ^ (u64::from(color[1].to_bits()) << 21)
-        ^ (u64::from(color[2].to_bits()) << 42);
+    // revision or two pills of the same shape in different colours would alias. Alpha is
+    // deliberately absent: the bake is opaque and the fade rides the element
+    // (`pill_element`), which is what keeps a container fade from re-baking per frame.
+    let revision = widget::Revision::new().color(opaque).done();
     // The bake buffer *is* the pill, so its local box sits at the origin.
     let local = Rectangle::new(Point::from((0., 0.)), size);
     widget::bake(

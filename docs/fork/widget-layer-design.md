@@ -107,6 +107,11 @@ fn bake_uncached(renderer, scale, logical_size, paint: impl FnOnce(&mut Painter)
   auto-invalidates (the `128d112e` freeze cannot recur). The review noted this can mask a broken
   `revision`; mitigation: `revision` should be **derived** (a hash/counter over every input that
   affects the bake) rather than hand-bumped, so it is correct on its own and size is pure insurance.
+  **Landed 2026-07-26 as `widget::Revision`** — a builder (`.of()` / `.px()` / `.color()` /
+  `.each()`) that folds the values the paint closure reads into the `u64`, so adding an input to the
+  paint and adding it to the key are one edit at one place. Migrate opportunistically, starting with
+  the sites that hand-pack bits; leave `end_session`'s `Sig` alone, since an equality tuple is
+  strictly stronger than a hash where a widget already has one.
   Widgets that pre-bake variants (mru's 3 scope panels `:1729`, screenshot's show/hide `:109`) keep
   their own path — `bake()` does not force a single-variant model on them.
 - **`uncached()`** covers the panel/QS per-frame animation bypass (§3) as a first-class mode.

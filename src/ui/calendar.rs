@@ -2624,9 +2624,11 @@ impl DateMenu {
         // open-time height stays frozen while the list keeps growing, and the
         // extra cards render below the (stale, too-short) background.
         let height_key = to_physical_precise_round::<i64>(scale, self.logical_size().h).max(0);
-        let revision = u64::from(!self.list.is_empty())
-            | (u64::from(clear_hover) << 1)
-            | ((height_key as u64) << 2);
+        let revision = widget::Revision::new()
+            .of(!self.list.is_empty())
+            .of(clear_hover)
+            .of(height_key)
+            .done();
         let mut cache = self.bg_cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
