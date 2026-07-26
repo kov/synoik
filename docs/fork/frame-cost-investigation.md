@@ -168,11 +168,13 @@ remaining slow frame is an overview animation or first-time startup work.
 
 ## 6. Open items
 
-> **The submit-side items below are largely done, and what came out of them is a rule:**
+> **The submit-side items below are done, and what came out of them is a rule:**
 > [`frame-submit-discipline.md`](./frame-submit-discipline.md) — share the frame's submit, never
-> give frame-path work a submit of its own. It also carries the remaining follow-ups (folding the
-> two blur paths into the frame's command buffer, and what that would unlock for
-> `make_sampleable`). Read it before adding anything that submits.
+> give frame-path work a submit of its own. Read it before adding anything that submits. As of
+> 2026-07-26 a frame is **one submit**: the uploads (including the wallpaper's and the app grid's),
+> the dmabuf acquires, the glyph copies, the fresh-offscreen layout barriers and both blur paths
+> all ride it, sharing one grow-only staging buffer. The only thing left that waits on the frame
+> path is CPU readback.
 
 1. **The other submits — measured 2026-07-25, and they are three problems, not one.** Attributed
    by site on the live seat, with the frame's first wait separated out. What the data killed and
@@ -191,7 +193,7 @@ remaining slow frame is an overview animation or first-time startup work.
    |---|---|---|---|
    | ~~blur execution~~ **wrong — see below** | `2 blur in 42.38ms` + `7 offscreen in 28.81ms` on a 132 ms frame covering **8.2× the output** | ~~fill rate, not round trips — ~21 ms per blur submit~~ | ~~fewer/cheaper passes, or cache the blurred result~~ |
    | one huge upload | `first upload 18.62ms`, **48.0 MiB uploaded** in one frame | payload. The wallpaper. Deferring the fence moves it, it does not remove it | off the frame entirely — the async-decode pattern (`e7a1c2ed`) extended through the *upload* |
-   | uncoalesced round trips | `13 glyphs in 13.43ms`, `10 shm in 15.85ms`, `9 upload in 14.67ms` — all in single frames | ~1 ms each, and they go into the **same image** | coalesce at the call site. `absorb_glyphs` (`renderer.rs:792`) uploads per *shaped line*, though `upload_coverage_regions` already takes a slice of regions |
+   | uncoalesced round trips | `13 glyphs in 13.43ms`, `10 shm in 15.85ms`, `9 upload in 14.67ms` — all in single frames | ~1 ms each, and they go into the **same image** | **done** — all three queue into the frame's command buffer, and the shm/import staging shares one pooled buffer |
 
    **The blur row was wrong, and it was wrong in an instructive way (2026-07-25).** Measured
    directly — `cargo test -p niri-vk blur_cost -- --ignored --nocapture`, seven source sizes from
@@ -220,8 +222,9 @@ remaining slow frame is an overview animation or first-time startup work.
    overview toggles Activities to checked, so the fill fade covers the same window. That bake
    is a genuine content change and is correct; `f2300f36` bought nothing on the seat, though it
    is a correct layer separation and is tested.
-3. **First app-grid entry** is ~20 submits of icon uploads. One-time, cached after; batching
-   them into one submit would be a real but narrow win.
+3. ~~**First app-grid entry** is ~20 submits of icon uploads.~~ **Done** — first batched into one
+   submit, then (2026-07-26) into none: a page of icons is N ordinary imports, which stage into the
+   shared pool and queue their copies for the next frame.
 4. **Idle `collect` outliers.** One idle frame showed `2 shaped runs in 26.39 ms` where every
    other was 3.9–5.1 ms. One sample, no pattern. Watch, don't chase.
 

@@ -44,31 +44,38 @@ throughout this code. That is not sloppiness; it is the invariant.
 It is also why **submission stays on the renderer's thread**. The order counter is `Relaxed`
 precisely because one thread hands out the numbers. See "Not the answer" below.
 
-## The three slots
+## The two slots
 
 1. **`VulkanFrame::begin`** — drains the pending queues into the frame's command buffer *before*
-   the render pass opens. Barriers, buffer→image copies, anything that must be outside a render
-   pass. This is where new work should go by default. Today it carries `pending_glyphs`,
-   `pending_dmabuf_acquires` (fresh imports and recommits alike) and `pending_texture_uploads`
-   (host imports and shm re-uploads).
+   the render pass opens. Barriers, buffer→image copies, whole render-pass sequences, anything that
+   must be outside a render pass. This is where new work goes by default. Today it carries
+   `pending_glyphs`, `pending_dmabuf_acquires` (fresh imports and recommits alike),
+   `pending_texture_uploads` (host imports, shm re-uploads and the wallpaper), `pending_sampleable`
+   (the layout barrier a never-rendered offscreen needs) and `pending_blurs` (the xray blur chain).
+   The order within `begin` is the order of dependencies: barriers before the blurs that sample
+   them, and everything before the render pass.
 
-2. **The mid-frame gap in `capture_region`** — it ends the frame's render pass, records a blit,
-   flushes, and opens a continuation pass. Work that has to run *between* the frame's own passes
-   belongs in that gap, where it rides a submit that was happening anyway.
+2. **The mid-frame gap in `capture_region`** — it ends the frame's render pass, records a blit, and
+   opens a continuation pass. Work that has to run *between* the frame's own passes belongs in that
+   gap, via its `record_gap` closure; the backdrop blur is what it exists for. It used to submit
+   and fence-wait there so that a separately-submitted blur could see the blit — recording the blur
+   in the gap removed both.
 
-3. **`VulkanRenderer::run_commands_deferred`** — the fallback when the work genuinely cannot be
-   folded into someone else's command buffer: its own buffer, submitted, *not* waited on, with its
-   resources handed to the in-flight list. Second best — it removes the wait but keeps the submit.
-   Falls back to a synchronous `run_commands` where the device cannot order submits.
+There used to be a third: `run_commands_deferred`, a submit of its own that the CPU walked away
+from. It was second best (it removed the wait and kept the round trip), and once both blurs folded
+into a frame it had no callers left, so it is gone. If something genuinely cannot fold, it is in
+the history.
 
 Adding a queue is cheap: a `Vec` on the renderer, a `record_pending_*` drained by `begin`, and the
-staging/resources kept alive until retirement.
+resources kept alive until retirement.
 
 ## The counter-rule: out-of-frame consumers
 
 Queueing work only helps if nothing looks at the result before the queue drains. Anything that
 samples, reads or overwrites a queued resource **outside** a frame must drain first — that is what
-`VulkanRenderer::flush_pending_texture_uploads` is for, and its doc lists the callers.
+`VulkanRenderer::flush_pending_texture_uploads`, `flush_pending_blurs` and
+`flush_pending_sampleable` are for. Between them the callers are two readbacks; each is a wait that
+was already happening.
 
 **Every out-of-frame consumer is the reason some flush exists.** Adding one adds a stall, usually
 somewhere else than where you wrote it. Removing one is how a flush goes away — the shm re-upload
@@ -107,12 +114,12 @@ Pixel comparisons cannot see any of this — the image survives whenever the cac
 
 - **CPU readback** (`download_region`, screenshots, screencopy) — has to wait; the CPU is the
   consumer.
-- **`flush_pending_texture_uploads`** — it *is* the drain.
-- **`TextureBatch::finish`** — already one submit for N textures (the app grid's ~24 icons).
-- **`from_host_staging`** — one per wallpaper change, not per frame.
+- **the `flush_pending_*` drains** — they *are* the drain, and they only run for a readback.
 - **`new_coverage_atlas`** — once per atlas.
-- **`make_sampleable`** — usually a no-op (a frame targeting an offscreen finishes it sampleable
-  itself), and the one barrier that cannot simply be queued: see the follow-ups.
+- **`make_sampleable` on an image that holds contents** — a texture that reached a sampled state by
+  some route other than a frame. Rare, and the barrier is not a discard, so it cannot be queued the
+  way the `UNDEFINED` case is. Watch the `transition` site in the frame log: it should now be
+  quiet.
 
 ## Not the answer: a worker thread, or a second queue
 
@@ -131,24 +138,38 @@ A dedicated **transfer queue** with cross-queue semaphores is the honest version
 it means giving up the single-timeline model for explicit inter-queue sync, and on Venus every
 submit is a host round trip regardless. Wait for a measurement that demands it.
 
-## Follow-ups, roughly in value order
+## The third rule: share the staging too
 
-Not urgent — the measured wins are taken. Do these after the remaining cheaper work.
+A deferred copy has to keep its source bytes until the submit, and the obvious way to guarantee
+that — a staging buffer per upload — is a bug on this stack. A `HOST_VISIBLE` buffer is a
+virtio-gpu blob, an shm re-upload happens on every commit of every shm surface, and the host ran
+out of blobs two minutes into a live session, after which every `vkAllocateMemory` failed and the
+session did not recover.
 
-1. **Fold `BackdropBlur::run_blur` into the frame's command buffer.** It is already called inside a
-   `VulkanFrame`, and `capture_region` already ends the render pass, blits and flushes — recording
-   the blur's passes in that gap costs **zero** extra submits. Today it only skips the wait.
-2. **Fold `EffectBlur::run` in too**, via the pending-queue shape. The obstacle is ownership, not
-   ordering: `BlurChain` is not refcounted and has no `Drop`, so a queued entry must keep it alive
-   from `prepare_blur_vulkan` to `begin`. Probably means an `Arc` handle around the chain. (The
-   rebuild hazard is already handled — both blur `Drop`s drain the device — but that only covers
-   *destruction*, not a live reference across the frame boundary.)
-3. **Then `make_sampleable` can be queued like everything else**, because (1) and (2) remove the
-   only consumers that sample outside a frame. Until then it needs a consumer-side flush, not a
-   queue: a queued barrier would be recorded at the next `begin`, i.e. *after* the blur's read.
-   **Check the frame log first** — it early-returns on the offscreen path, so it may never fire; a
-   `transition` in the log could equally be a coverage-atlas creation, which is not worth
-   restructuring anything for.
+So staged pixels go into `niri_vk::staging::StagingPool`: one grow-only, persistently mapped
+buffer, N offsets, rewound per frame. What decides when it can be rewound is the **reference
+count**, not a fence — an upload holds its chunk from staging until its command buffer retires, so
+a chunk nobody else holds is one the GPU cannot be reading. Sharing means the pool only ever learns
+that *all* of a frame's uploads are done, which is exactly what rewinding a whole chunk needs.
 
-The endgame those three point at: on the frame path, the only thing that still waits is CPU
-readback.
+It removes four host round trips per upload as a side effect (create, allocate, bind, map), leaving
+a `memcpy` into a mapping that has been warm since the first frame.
+
+Two deliberate exceptions: an upload larger than 16 MiB gets a chunk of its own that dies with it
+(pooling a 48 MiB wallpaper would pin its peak for the session), and pixels a worker already wrote
+into device-visible memory (`HostStaging`) are staged where they lie — the copy just names that
+buffer and holds it by `Arc`.
+
+## Where this got to
+
+All three follow-ups this document used to carry are done: both blurs fold into a frame's command
+buffer, and `make_sampleable` queues its barrier for the fresh-offscreen case that turned out to be
+the one firing (the note said to check the frame log first, and it was right to — the culprit was
+the effect buffer's *no-redraw* branch making a brand-new offscreen sampleable, not the blur's
+source).
+
+**On the frame path, the only thing that still waits is CPU readback.** A frame is one submit: the
+uploads, the acquires, the glyph copies, the layout barriers and the blurs all ride it. What to
+watch instead, now that the round trips are gone: the `created` clause of the frame log, since on
+Venus every `vkCreateImage`/`vkAllocateMemory` is still a synchronous host round trip and that is
+where the remaining per-frame host cost lives.
