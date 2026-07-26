@@ -183,16 +183,31 @@ remaining slow frame is an overview animation or first-time startup work.
 
    | what | evidence | why it costs | the fix |
    |---|---|---|---|
-   | blur execution | `2 blur in 42.38ms` + `7 offscreen in 28.81ms` on a 132 ms frame covering **8.2× the output** | fill rate, not round trips — ~21 ms per blur submit | fewer/cheaper passes, or cache the blurred result; a separate investigation |
+   | ~~blur execution~~ **wrong — see below** | `2 blur in 42.38ms` + `7 offscreen in 28.81ms` on a 132 ms frame covering **8.2× the output** | ~~fill rate, not round trips — ~21 ms per blur submit~~ | ~~fewer/cheaper passes, or cache the blurred result~~ |
    | one huge upload | `first upload 18.62ms`, **48.0 MiB uploaded** in one frame | payload. The wallpaper. Deferring the fence moves it, it does not remove it | off the frame entirely — the async-decode pattern (`e7a1c2ed`) extended through the *upload* |
    | uncoalesced round trips | `13 glyphs in 13.43ms`, `10 shm in 15.85ms`, `9 upload in 14.67ms` — all in single frames | ~1 ms each, and they go into the **same image** | coalesce at the call site. `absorb_glyphs` (`renderer.rs:792`) uploads per *shaped line*, though `upload_coverage_regions` already takes a slice of regions |
+
+   **The blur row was wrong, and it was wrong in an instructive way (2026-07-25).** Measured
+   directly — `cargo test -p niri-vk blur_cost -- --ignored --nocapture`, seven source sizes from
+   2.07 to 43.9 Mpx — the default 3-pass chain costs **0.16 ms + 0.092 ms per megapixel**, linear
+   across a 21× range. That frame shaded 8.2× the output in total and a blur shades 1.66× its own
+   source, so two blurs at a combined 3.3× the output puts each source at roughly output size:
+   ~0.92 ms of work, charged 21 ms. Even at 43.9 Mpx a blur is 4.20 ms.
+
+   What the row actually measured is a **fence wait**, which on this stack is not a cost
+   attribution: it carries everything queued ahead of it on an in-order queue, plus milliseconds of
+   the guest's polling tax (`venus-cost.md` §9.4, §11.2). Run the same benchmark at one blur per
+   submit and the readings stop being monotonic in source size — that is the noise, made visible.
+   Before attributing a cost to a site because its wait is long, price the work directly.
 
    The glyph one is the clearest: a frame that shapes 13 new strings makes 13 submits into one
    atlas. Flushing once per frame instead is a call-site change, not a scheduling change.
 
    Deferring these submits — [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md)
    slices 1–4 — is therefore **not** the top lever any more. Coalescing removes the round trips
-   outright, and the two big costs are real GPU work that no amount of scheduling makes cheaper.
+   outright. (The original sentence ended "and the two big costs are real GPU work that no amount
+   of scheduling makes cheaper". With blur withdrawn, only the wallpaper upload is left standing —
+   and that one is payload, which is why it moved off the frame rather than being made cheaper.)
 
 2. **The panel still bakes during an overview animation** — but not for the reason we fixed.
    `are_animations_ongoing()` (`ui/panel.rs:848`) is the button-fill fades, and opening the

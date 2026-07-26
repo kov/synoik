@@ -205,11 +205,42 @@ Both reproduce deterministically, both have standalone reproducer crates, both a
 
 ### 3.8 One thing that is *not* Venus's fault
 
-Blur is real GPU work. On an overview frame covering 5.3× the output, `1 blur in 13.63ms` is the
-entire wait, and earlier measurements put a blur submit at ~21 ms on an 8.2× frame. That cost
-scales with fill rate, tracks content, and is ours to fix (fewer/cheaper passes, or caching the
-blurred result). We mention it so the ratio in this document is not read as "everything is the
-VMM" — it is not.
+> **Superseded 2026-07-25 — the number was wrong by ~20×, and the correction is about
+> measurement, not about blur.** Kept because the mistake is instructive and because we
+> quoted it to you.
+
+**What this section said.** Blur is real GPU work: on an overview frame covering 5.3× the output,
+`1 blur in 13.63ms` was the entire wait, and earlier measurements put a blur submit at ~21 ms on an
+8.2× frame. We offered it so the ratio in this document would not read as "everything is the VMM".
+
+**What blur actually costs.** Measured directly, sweeping seven source sizes from 2.07 to 43.9 Mpx
+(`cargo test -p niri-vk blur_cost -- --ignored --nocapture`), the default 3-pass dual-Kawase chain
+costs, on this device:
+
+| variant | cost |
+|---|---|
+| what ships (pyramid + the full-size copy that lifts level 0 into a sampleable texture) | **0.16 ms + 0.092 ms per megapixel** |
+| without that copy | 0.12 ms + 0.076 ms/Mpx |
+| stopping the upsample at quarter size | 0.09 ms + 0.035 ms/Mpx |
+
+Linear across a 21× range of sizes. At 43.9 Mpx — 5.3× a 4K output, the largest reading in the
+sweep — a blur is **4.20 ms**. At an output-sized source on 4K it is **0.92 ms**.
+
+**So the 21 ms was not blur execution.** That frame shaded 8.2× the output in total; a blur shades
+1.66× its own source, so two blurs accounting for a combined 3.3× the output puts each blur's
+source at roughly output size — where the measurement says 0.92 ms, not 21. The waits we quoted are
+~23× the work they were charged with.
+
+**The lesson is the one this document keeps re-learning.** `N blur in Xms` is a *fence wait*, and on
+this stack a fence wait is not a cost attribution: it carries whatever is queued ahead of it (the
+queue is in-order, and we have since deferred several submits' waits precisely so they *don't*
+block — which moves their cost onto the next thing that does wait), plus several milliseconds of
+the guest-side polling tax and its 291 µs quantization (§9.4, §11.2). The same benchmark run at one
+blur per submit stops being monotonic in source size, which is that noise made visible.
+
+We are not withdrawing the spirit of this section — some of our cost is ours. But we no longer have
+a measured example of it here, and blur is not it. Blur is worth about 1 ms a frame, and the only
+part of it worth removing is the copy (0.016 ms/Mpx, no visual change).
 
 ---
 
@@ -239,9 +270,9 @@ these removes host round trips or moves them off the frame-critical path.
 7. **One persistent glyph atlas** instead of one image per string; memoized shaped runs and
    measured widths.
 
-Still on our side, and being worked: coalescing the remaining per-frame uploads, blur cost (§3.8),
-and text shaping/rasterization (one cold paragraph measured 19.42 ms — a debug-build CPU cost, not
-a Venus one).
+Still on our side, and being worked: coalescing the remaining per-frame uploads and text
+shaping/rasterization (one cold paragraph measured 19.42 ms — a debug-build CPU cost, not a Venus
+one). Blur *was* on this list; it came off when we measured it (§3.8) — it is ~1 ms a frame.
 
 ---
 
@@ -470,7 +501,10 @@ guest tolerate zeros" — is the right call and the all-zero heuristic should st
 
 The innocent explanation you cannot presently exclude: at 3840×2160 with 1.7–2.0× overdraw and
 138–173 draws, **the frame's GPU work really is ~13 ms**, and the scanout submit is last, so it
-waits behind all of it. §3.8 already reports a single blur at 13.63 ms. The sparse frames at
+waits behind all of it. §3.8 already reports a single blur at 13.63 ms. [Guest note, 2026-07-25:
+that blur figure has since been withdrawn — see the superseded block in §3.8. It does not sink this
+paragraph, whose point is that a late submit waits behind the frame's work, but the blur is no
+longer an example of a single expensive submit.] The sparse frames at
 3.71–5.45 ms are then simply an idle GPU with nothing queued ahead. That fits the data at least as
 well as the vsync reading — and note 13 ms is not 16.67 ms.
 
