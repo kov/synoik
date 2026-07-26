@@ -1129,3 +1129,81 @@ The stamp is **CLOCK_REALTIME**, and your guest clock is anchored to the host's,
 directly against your frame log. **If you catch a dropped frame, note its wall-clock time** — if
 an OUTLIER line sits at the same instant, the hitch is ours and now has a named command attached
 to it.
+
+---
+
+## 12. `VN_PERF=no_fence_feedback` has been set on this guest since the beginning — and it costs us
+
+Found 2026-07-25. This guest's session environment has carried `VN_PERF=no_fence_feedback` since
+before any of the numbers in this document were taken. It was a workaround for the MoltenVK-era
+host stack and has outlived it — the host has been KosmicKrisp for some time. **Every measurement
+in §3 and §9–§11 was taken with it set**, which does not invalidate them (it is the configuration
+we have been running, and the one the frame logs came from) but does mean one of the guest's
+biggest per-submit costs was self-inflicted and unexamined.
+
+The option is not upstream any more. Mesa's `venus: deprecate fence feedback` (4c1938c8adb,
+2026-07-12) removed the mechanism and the flag, "back to synchronous driver<->renderer polling
+temporarily". The limina 26.1.4 build we run still has both.
+
+### 12.1 What it costs, measured
+
+Two shapes, both A/B'd in alternating runs *and* with the order reversed, because the first pass
+had an ordering confound.
+
+**Submits carrying real GPU work, back to back** — the compositor's actual shape. Eight blurs, each
+in its own submit with its own fence wait, against the same eight in one command buffer
+(`cargo test -p niri-vk blur_submit_overhead -- --ignored --nocapture`; the per-submit column is
+the difference divided by eight):
+
+| source | per-submit, feedback ON | per-submit, `no_fence_feedback` |
+|---|---|---|
+| 8.29 Mpx | 0.86 / 0.78 / 0.80 ms | 1.13 / 1.24 / 1.53 ms |
+| 11.29 Mpx | 0.66 / 0.42 / 0.54 ms | 1.53 / 1.22 / 1.34 ms |
+| 18.66 Mpx | 0.28 / 0.23 / 0.40 ms | 1.16 / 1.25 / 1.23 ms |
+
+Three runs each way, every one in the same direction. On the totals, eight blur submits cost
+13.6–15.3 ms with feedback and 17.7–22.1 ms without: **~25–30% of the wall clock, ~0.5–1.0 ms per
+submit**. The batched control (one submit, one wait) is identical either way at 7.4–8.6 ms, which
+is the check that this is the *wait*, not the work.
+
+**Empty submits — the reverse, and just as consistent.** `probe-venus-costs fence`, the
+`K=1 submit+…+wait` line, six runs each way in both orders:
+
+| | median | mean | p95 |
+|---|---|---|---|
+| `no_fence_feedback` | 0.06–0.19 ms | 0.13–0.45 ms | 0.73–2.04 ms |
+| feedback ON | 0.88–1.06 ms | 0.92–1.04 ms | 1.24–1.50 ms |
+
+A trivial fence wait costs **~7× more** with feedback on, and it does so at a suspiciously flat
+~1.0 ms — the same figure as `VN_RING_IDLE_TIMEOUT_NS` (§9.4). Feedback also has the tighter tail
+in both shapes, which is its own kind of win for a compositor.
+
+(The `1 copy, sparse fence wait` line in the same probe splits the difference and is pure noise
+run to run — n=40 with a deliberate 20 ms idle gap, i.e. exactly the regime where the ring parks.
+We are not quoting it either way.)
+
+### 12.2 The question for you
+
+We can explain the halves separately but not together, and the mechanism decides whether this is
+worth fixing rather than just worth flipping:
+
+- With real work in flight the win is what feedback is *for*: completion is a guest memory read
+  instead of a driver↔renderer round trip.
+- On an empty submit, feedback loses by ~0.9 ms of something that looks like a **parked-ring wake**
+  — which fits, in that the synchronous poll pokes the ring and the feedback path deliberately does
+  not. If that is right, then feedback is paying §9.4's idle tax *because* it stopped generating
+  traffic, and the ring's 1 ms park is once again the thing underneath.
+
+If the ~1 ms on the empty path is the ring wake, the two results stop being a trade-off and become
+the same finding twice.
+
+### 12.3 What we are doing about it
+
+Dropping the variable from the session environment, since our submits carry real work. Flagging
+two things:
+
+1. **It goes away on a mesa bump.** 26.2 has no fence feedback at all, so a rebase silently puts us
+   on the slower path with no flag to turn it back on. If the ~25–30% holds up on a real frame,
+   that regression is worth knowing about before it lands.
+2. **Nothing in §3 or §9–§11 has been re-measured without it yet.** The per-submit figures in those
+   sections are all from the slow path.
