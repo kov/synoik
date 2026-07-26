@@ -718,15 +718,17 @@ impl VulkanRenderer {
 
     /// Import a texture whose pixels a **worker thread already wrote into device-visible memory**
     /// ([`niri_vk::staging::HostStaging`]). The counterpart of `import_memory`, minus the part that
-    /// costs: the multi-megabyte host write happened on the producer's thread, so all that is left
-    /// here is creating the image, recording the copy and submitting it.
+    /// costs: the multi-megabyte host write happened on the producer's thread, and the copy is
+    /// queued for the next frame's command buffer rather than submitted here — a live frame
+    /// carried `first upload 18.62ms` for 48 MiB of wallpaper, all of it a round trip nobody
+    /// needed to be in.
     ///
     /// Errors if the staging belongs to a *different* device — a renderer recreated under a decode
     /// in flight. That is not recoverable here (there is no host copy left to fall back to), so the
     /// caller re-requests the decode.
     pub fn import_host_staging(
         &mut self,
-        staging: &niri_vk::staging::HostStaging,
+        staging: &Arc<niri_vk::staging::HostStaging>,
         format: Fourcc,
         size: Size<i32, BufferCoord>,
     ) -> Result<VkTexture, VulkanError> {
@@ -748,15 +750,8 @@ impl VulkanRenderer {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
-        let tex = NiriTexture::from_host_staging(
-            &self.gpu,
-            self.command_pool,
-            staging,
-            w,
-            h,
-            vk_format,
-            alpha_one,
-            filter,
+        let (tex, staged) = NiriTexture::stage_from_host_staging(
+            &self.gpu, staging, w, h, vk_format, alpha_one, filter,
         )
         .map_err(|e| VulkanError::Other(format!("staged upload: {e:#}")))?;
         // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches
@@ -768,16 +763,11 @@ impl VulkanRenderer {
                 return Err(err);
             }
         };
-        Ok(VkTexture::new(
-            self.gpu.clone(),
-            tex,
-            desc_pool,
-            set,
-            w,
-            h,
-            format,
-            false,
-        ))
+        let tex = VkTexture::new(self.gpu.clone(), tex, desc_pool, set, w, h, format, false);
+        // Queued only now that there is a refcounted texture to hold, exactly as `import_memory`
+        // does: the queue keeps both the image and the staging alive until the copy is submitted.
+        self.queue_texture_upload(&tex, staged);
+        Ok(tex)
     }
 
     /// Import many host-memory buffers as textures at once — the overview app grid's ~24 icons on

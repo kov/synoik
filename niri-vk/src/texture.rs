@@ -168,12 +168,39 @@ struct PendingUpload {
 /// destination image, by contrast, is named by raw handle and *not* kept alive here; whoever
 /// queues one is responsible for that (see `PendingTextureUpload` in the compositor).
 pub struct StagedTexture {
-    chunk: Arc<StagingChunk>,
-    offset: vk::DeviceSize,
+    source: StagedSource,
     /// The destination. Borrowed by handle, not owned — see the type docs.
     image: vk::Image,
     width: u32,
     height: u32,
+}
+
+/// Where a staged upload's pixels sit, and what keeps them there until the copy has been
+/// submitted.
+enum StagedSource {
+    /// A slice of the renderer's shared arena, at an offset ([`StagingPool`]). Every ordinary
+    /// import and shm re-upload.
+    Pool(Arc<StagingChunk>, vk::DeviceSize),
+    /// A whole buffer filled off the render thread by whoever produced the pixels — the wallpaper
+    /// decoder, whose bytes are tens of megabytes and never wanted a copy through the pool at all
+    /// ([`HostStaging`]).
+    Host(Arc<HostStaging>),
+}
+
+impl StagedSource {
+    fn buffer_and_offset(&self) -> (vk::Buffer, vk::DeviceSize) {
+        match self {
+            StagedSource::Pool(chunk, offset) => (chunk.buffer(), *offset),
+            StagedSource::Host(staging) => (staging.buffer(), 0),
+        }
+    }
+
+    fn device(&self) -> &ash::Device {
+        match self {
+            StagedSource::Pool(chunk, _) => chunk.device(),
+            StagedSource::Host(staging) => staging.device(),
+        }
+    }
 }
 
 impl StagedTexture {
@@ -184,13 +211,14 @@ impl StagedTexture {
     /// Must be called **outside a render pass** (copies and layout transitions both are), which is
     /// the same slot the glyph uploads and the deferred dmabuf acquires use.
     pub fn record(&self, cbuf: vk::CommandBuffer) {
+        let (buffer, offset) = self.source.buffer_and_offset();
         unsafe {
             record_upload_copy_at(
-                self.chunk.device(),
+                self.source.device(),
                 cbuf,
                 self.image,
-                self.chunk.buffer(),
-                self.offset,
+                buffer,
+                offset,
                 self.width,
                 self.height,
             );
@@ -272,8 +300,7 @@ impl StagedTexture {
         crate::stats::uploaded(size);
         let (chunk, offset) = pool.stage(gpu, data)?;
         Ok(StagedTexture {
-            chunk,
-            offset,
+            source: StagedSource::Pool(chunk, offset),
             image,
             width,
             height,
@@ -304,29 +331,30 @@ impl Texture {
         )
     }
 
-    /// Upload a texture whose pixels are **already in device-visible memory**, written there by
-    /// whichever thread produced them ([`HostStaging`]). The render thread is left with the image
-    /// creation, the copy command and the submit — the multi-megabyte host write, which is the
-    /// whole cost of a wallpaper upload and has no GPU work in it, has already happened elsewhere.
+    /// Stage a texture whose pixels are **already in device-visible memory**, written there by
+    /// whichever thread produced them ([`HostStaging`]) — the wallpaper. The render thread is left
+    /// with the image creation and a copy for the next frame to record: the multi-megabyte host
+    /// write, which is the whole cost of a wallpaper upload and has no GPU work in it, happened on
+    /// the decode worker, and the copy itself no longer costs a submit and a fence wait (a live
+    /// frame carried `first upload 18.62ms` for 48 MiB).
     ///
-    /// Byte-for-byte the same result as any other upload — same image, same barriers (via
-    /// [`record_upload_copy`]), same submit site. Only where the copy's *source* came from
-    /// differs.
+    /// The staging is `Arc`-held by the returned [`StagedTexture`] for the usual reason: a
+    /// wallpaper can change the moment after it is staged, and the copy reads that buffer long
+    /// after this returns.
     ///
     /// `staging` must hold exactly `width * height * 4` bytes, and must belong to `gpu` — see
     /// [`HostStaging::belongs_to`], which the caller checks, because a device mismatch is a wasted
     /// decode rather than something this can recover from.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_host_staging(
+    pub fn stage_from_host_staging(
         gpu: &Gpu,
-        pool: vk::CommandPool,
-        staging: &HostStaging,
+        staging: &Arc<HostStaging>,
         width: u32,
         height: u32,
         format: vk::Format,
         alpha_one: bool,
         filter: vk::Filter,
-    ) -> Result<Self> {
+    ) -> Result<(Self, StagedTexture)> {
         let size = (width as usize) * (height as usize) * 4;
         anyhow::ensure!(
             staging.len() == size,
@@ -341,21 +369,13 @@ impl Texture {
             vk::ComponentMapping::default()
         };
         let texture = Self::new_sampled_image_raw(gpu, width, height, format, components, filter)?;
-
-        let device = &gpu.device;
-        let buffer = staging.buffer();
-        let result = gpu.run_commands(pool, crate::stats::SubmitSite::Upload, |cbuf| unsafe {
-            record_upload_copy(device, cbuf, texture.image, buffer, width, height);
-        });
-        match result {
-            Ok(()) => Ok(texture),
-            Err(err) => {
-                // `run_commands` drains the device on a wait error, so the copy that never ran
-                // cannot still be reading this image.
-                texture.destroy(gpu);
-                Err(err)
-            }
-        }
+        let staged = StagedTexture {
+            source: StagedSource::Host(staging.clone()),
+            image: texture.image,
+            width,
+            height,
+        };
+        Ok((texture, staged))
     }
 
     /// Upload tight `width*height` single-channel coverage (R8) — the glyph atlas format.
@@ -951,8 +971,7 @@ impl Texture {
         let (chunk, offset) = pool.stage(gpu, data)?;
         let texture = Self::new_sampled_image_raw(gpu, width, height, format, components, filter)?;
         let staged = StagedTexture {
-            chunk,
-            offset,
+            source: StagedSource::Pool(chunk, offset),
             image: texture.image,
             width,
             height,

@@ -4571,7 +4571,11 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
     for px in staging.as_mut_slice().chunks_exact_mut(4) {
         px.copy_from_slice(&want);
     }
+    // Held by an `Arc` from here on, as the wallpaper holds it: the copy is queued for the next
+    // frame, so the bytes have to outlive this scope.
+    let staging = std::sync::Arc::new(staging);
 
+    let submits_before = niri_vk::stats::submits();
     let tex = vk
         .import_host_staging(
             &staging,
@@ -4579,6 +4583,14 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
             Size::<i32, BufferCoord>::from((W, H)),
         )
         .expect("import staged texture");
+    // The pixels are already in device memory, so what was left was a submit and a fence wait for
+    // the copy — `first upload 18.62ms` for 48 MiB of wallpaper on a live frame. It rides the next
+    // frame's command buffer now.
+    assert_eq!(
+        niri_vk::stats::submits() - submits_before,
+        0,
+        "importing already-staged pixels submitted a command buffer of its own",
+    );
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
@@ -4627,7 +4639,9 @@ fn staged_pixels_are_refused_by_a_renderer_that_did_not_allocate_them() {
         }
     };
 
-    let staging = niri_vk::staging::HostStaging::new(vk_a.gpu(), 4 * 4 * 4).expect("staging");
+    let staging = std::sync::Arc::new(
+        niri_vk::staging::HostStaging::new(vk_a.gpu(), 4 * 4 * 4).expect("staging"),
+    );
     assert!(staging.belongs_to(vk_a.gpu()));
     assert!(!staging.belongs_to(vk_b.gpu()));
 

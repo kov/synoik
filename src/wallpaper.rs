@@ -15,9 +15,11 @@
 //! multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a staging
 //! buffer, measured at 7–9 ms for a 4K picture — first-touch page faults on a freshly mapped
 //! buffer, no GPU work in it at all (`docs/fork/venus-cost.md` §9.2). Staging on the worker leaves
-//! the render thread with only the image creation, the copy command and the submit. Without a
-//! device (headless tests, or before the renderer exists) it falls back to a plain `Vec` and the
-//! old upload path.
+//! the render thread with only the image creation and a copy queued for the next frame's command
+//! buffer — no submit of its own, which on a live frame was `first upload 18.62ms` for 48 MiB.
+//! Without a device (headless tests, or before the renderer exists) it falls back to a plain `Vec`
+//! and the ordinary import, which stages into the renderer's pool and queues its copy just the
+//! same.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -93,8 +95,9 @@ enum Pixels {
     /// module exists to keep off the render thread, kept for when there is no device to stage on.
     Host(Vec<u8>),
     /// Already in mapped device-visible memory, written by the decode worker. The upload only has
-    /// to record a copy.
-    Staged(HostStaging),
+    /// to queue a copy — and the `Arc` is what keeps the bytes alive until a frame records it,
+    /// since the wallpaper can change the moment after.
+    Staged(Arc<HostStaging>),
 }
 
 impl Pixels {
@@ -396,7 +399,7 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let pixels = match gpu.map(|gpu| HostStaging::new(gpu, data.len())) {
         Some(Ok(mut staging)) => {
             staging.as_mut_slice().copy_from_slice(&data);
-            Pixels::Staged(staging)
+            Pixels::Staged(Arc::new(staging))
         }
         Some(Err(err)) => {
             warn!("could not stage the wallpaper on the GPU ({err:#}); uploading from the heap");
@@ -609,7 +612,7 @@ mod tests {
         let wp = Wallpaper {
             picture: Some(path.clone()),
             image: Some(Image {
-                pixels: Pixels::Staged(staging),
+                pixels: Pixels::Staged(Arc::new(staging)),
                 size: Size::from((8, 8)),
                 opaque: true,
             }),

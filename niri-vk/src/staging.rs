@@ -48,6 +48,10 @@ pub struct HostStaging {
 // `vkFreeMemory`) all take `VkDevice` as their externally-synchronized-free parameter, so they are
 // safe to make from a thread other than the renderer's. It deliberately provides no way to submit.
 unsafe impl Send for HostStaging {}
+// SAFETY: shared access only ever reads `buffer` (a handle) and `size`; the mapping is written
+// through `&mut self`, which a shared reference excludes. Needed because a staged upload holds the
+// buffer in an `Arc` until its copy has been submitted, and that `Arc` travels with the frame.
+unsafe impl Sync for HostStaging {}
 
 impl HostStaging {
     /// Allocate `size` bytes of `HOST_VISIBLE | HOST_COHERENT` memory bound to a `TRANSFER_SRC`
@@ -124,6 +128,11 @@ impl HostStaging {
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
         self.buffer
+    }
+
+    /// The device this buffer belongs to, for recording the copy that reads it.
+    pub(crate) fn device(&self) -> &ash::Device {
+        &self.gpu.device
     }
 
     /// Whether this buffer was allocated on `gpu`. A device that has been replaced (device loss,
