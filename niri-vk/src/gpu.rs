@@ -117,6 +117,11 @@ pub struct Gpu {
     /// [`Self::timestamps_supported`].
     pub timestamp_period_ns: f32,
     pub timestamp_valid_bits: u32,
+    /// Alignment for a `VkBufferImageCopy`'s `bufferOffset`, for staging that packs several
+    /// uploads into one buffer ([`crate::staging::StagingPool`]). The spec *requires* a multiple
+    /// of the texel block size (4 for every 32-bpp format we upload); `optimalBufferCopyOffset-
+    /// Alignment` is what the driver would rather have, so this is the larger of the two.
+    pub buffer_copy_offset_alignment: vk::DeviceSize,
     pub device_name: String,
     // CPU vs a real GPU — the dmabuf demo needs a hardware device tied to the DRM node, so it
     // skips on CPU devices (lavapipe).
@@ -442,6 +447,7 @@ impl Gpu {
             mem_props,
             timestamp_period_ns: props.limits.timestamp_period,
             timestamp_valid_bits,
+            buffer_copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment.max(4),
             device_name,
             device_type: props.device_type,
             drm_render_node: drm_render_node(&instance, phys),

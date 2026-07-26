@@ -2800,6 +2800,9 @@ fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
     // Rendered at the module's W×H so `px` can index the readback.
     let red = [255u8, 0, 0, 255].repeat((W * H) as usize);
 
+    // The shared staging chunk is created on the first upload and reused for the session; this
+    // test is about what *one texture* costs, so warm it out of the measured window.
+    vk.warm_staging_pool();
     let _ = upload_submits(());
     let _ = niri_vk::stats::take_creates();
 
@@ -3034,6 +3037,67 @@ fn vulkan_repeated_shm_reuploads_supersede_in_the_queue() {
     assert!(
         close_px(center, BLUE, 3),
         "the last commit must be what lands, got {center:?}",
+    );
+}
+
+/// An updating client must not cost an allocation per commit, however long it runs.
+///
+/// This is the invariant whose absence took the live seat down: deferring the copy into the
+/// frame's command buffer means the staging has to outlive the submit, the first version gave
+/// every re-upload a staging buffer of its own, and on Venus a `HOST_VISIBLE` buffer is a
+/// virtio-gpu blob. One blob per commit per shm surface exhausted the host's pool two minutes in,
+/// after which every allocation failed and the session did not recover.
+///
+/// So the renderer stages into a shared pool that reuses its buffer once a frame's submit has
+/// retired. The rounds here move 10 MiB in 256 KiB commits — more than twice a chunk — and what
+/// makes that reuse possible is the frame *releasing* its staging when it retires. That is what
+/// this pins at the integration level: hold the staging past the frame (the shape a deferred
+/// submit would take if it never freed its record) and the count goes to 3. The pool's own tests
+/// cover its two reuse paths separately.
+#[test]
+fn vulkan_repeated_commits_do_not_grow_the_staging_pool() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_repeated_commits_staging_pool: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    // 256x256x4 = 256 KiB a commit, against a 4 MiB chunk.
+    const SIDE: i32 = 256;
+    let texels = |round: u8| [round, 200, 90, 255].repeat((SIDE * SIDE) as usize);
+
+    let tex = vk
+        .import_memory(
+            &texels(10),
+            Fourcc::Abgr8888,
+            Size::from((SIDE, SIDE)),
+            false,
+        )
+        .expect("import");
+
+    let size = Size::<i32, Physical>::from((SIDE, SIDE));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((SIDE, SIDE)))
+        .expect("offscreen");
+    for round in 0..40u8 {
+        // A client commit: new pixels into the image it already has.
+        vk.reupload_shm(&tex, &texels(round)).expect("reupload");
+        // And the frame that records the copy, after which the staging is free again.
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    assert_eq!(
+        vk.staging_chunk_count(),
+        1,
+        "forty commits must share one staging buffer — a buffer per commit is what ran the Venus \
+         host out of blobs",
     );
 }
 
@@ -3626,6 +3690,9 @@ fn a_repeated_symbolic_icon_uploads_once() {
     // real upload, which is what the cache is here to avoid.
     let uploads = |_: ()| niri_vk::stats::take_creates().0;
 
+    // The shared staging chunk is created once per renderer and counts as a resource; warm it so
+    // the counts below are the icons' own.
+    vk.warm_staging_pool();
     let _ = uploads(());
     assert!(
         icons.texture(&mut vk, NAME, 16., 1., WHITE).is_some(),

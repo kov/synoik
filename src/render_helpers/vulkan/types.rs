@@ -284,10 +284,12 @@ impl VkTexture {
     /// everything else in that queue: the copy is ordered before any later sample.
     pub(super) fn stage_reupload_shm(
         &self,
+        pool: &mut niri_vk::staging::StagingPool,
         data: &[u8],
     ) -> anyhow::Result<niri_vk::texture::StagedTexture> {
         let staged = niri_vk::texture::StagedTexture::reupload_32bpp(
             &self.0.gpu,
+            pool,
             self.image(),
             self.0.width,
             self.0.height,

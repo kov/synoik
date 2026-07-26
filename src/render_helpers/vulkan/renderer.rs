@@ -272,6 +272,12 @@ pub struct VulkanRenderer {
     /// their staging and leave a blank image behind — never an invalid one. It cannot grow without
     /// bound while undrained either — see [`PendingTextureUpload`].
     pending_texture_uploads: Vec<PendingTextureUpload>,
+
+    /// The staging every queued upload's pixels are written into: one shared, grow-only buffer
+    /// rewound per frame, rather than a mappable blob per upload. See
+    /// [`niri_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of blobs
+    /// two minutes into a live session.
+    staging_pool: niri_vk::staging::StagingPool,
 }
 
 /// One staged texture upload waiting for a frame to record its copy, **with its destination held
@@ -457,6 +463,7 @@ impl VulkanRenderer {
         };
 
         let gpu_for_timer = Arc::clone(&gpu);
+        let staging_pool = niri_vk::staging::StagingPool::new(&gpu);
         Ok(VulkanRenderer {
             gpu,
             context_id: ContextId::new(),
@@ -507,6 +514,7 @@ impl VulkanRenderer {
             warned_modifiers: HashSet::new(),
             pending_dmabuf_acquires: Vec::new(),
             pending_texture_uploads: Vec::new(),
+            staging_pool,
         })
     }
 
@@ -2514,6 +2522,25 @@ impl VulkanRenderer {
         self.pending_texture_uploads.len()
     }
 
+    /// Staging buffers the pool owns (test-only): the count that must not grow with the number of
+    /// client commits. See [`niri_vk::staging::StagingPool`].
+    #[cfg(test)]
+    pub(super) fn staging_chunk_count(&self) -> usize {
+        self.staging_pool.chunk_count()
+    }
+
+    /// Force the staging pool's first chunk into existence (test-only).
+    ///
+    /// That chunk is a created resource like any other and `niri_vk::stats::take_creates` counts
+    /// it, but it is allocated once per renderer and reused for the rest of the session — so any
+    /// test measuring "how many resources did this upload cost" wants it out of the window rather
+    /// than folded into the first measurement. Touches no cache: it stages four bytes and drops
+    /// them, leaving only the chunk behind.
+    #[cfg(test)]
+    pub(crate) fn warm_staging_pool(&mut self) {
+        let _ = self.staging_pool.stage(&self.gpu, &[0u8; 4]);
+    }
+
     /// Count of client-dmabuf imports awaiting a deferred re-acquire barrier (test-only: asserts a
     /// frame drained them). See [`Self::pending_dmabuf_acquires`].
     #[cfg(test)]
@@ -2762,7 +2789,7 @@ impl VulkanRenderer {
         // used to buy, and the queue gives it for free: a full-extent copy queued later replaces
         // the earlier one outright (`queue_texture_upload`), which is what "re-upload" means. A
         // client committing several times between two frames therefore uploads once.
-        let staged = tex.stage_reupload_shm(data)?;
+        let staged = tex.stage_reupload_shm(&mut self.staging_pool, data)?;
         self.queue_texture_upload(tex, staged);
         Ok(())
     }
@@ -2797,6 +2824,7 @@ impl ImportMem for VulkanRenderer {
         // (`pending_texture_uploads`) instead of costing a submit and a blocking fence wait here.
         let (tex, staged) = NiriTexture::stage_32bpp(
             &self.gpu,
+            &mut self.staging_pool,
             w,
             h,
             &data[..expected],

@@ -9,7 +9,7 @@ use ash::vk;
 
 use crate::gpu::Gpu;
 use crate::render::{COLOR_RANGE, FORMAT};
-use crate::staging::HostStaging;
+use crate::staging::{HostStaging, StagingChunk, StagingPool};
 
 pub struct Texture {
     pub image: vk::Image,
@@ -152,23 +152,24 @@ struct PendingUpload {
 /// yet** — produced by [`Texture::stage_32bpp`], recorded by [`StagedTexture::record`] into a
 /// command buffer the caller is already submitting.
 ///
-/// Owns its staging buffer + memory and frees them on drop, holding an `Arc<Gpu>` to guarantee the
-/// device outlives them — deliberately the same shape as [`GlyphStaging`], so a frame can decide
+/// Its pixels live in a slice of a shared [`StagingChunk`] ([`StagingPool`]), which it keeps alive
+/// by holding a reference — deliberately the same shape as [`GlyphStaging`], so a frame can decide
 /// at submit time whether this lives on in an in-flight record or dies with a fence wait, and no
 /// retirement path has to know it exists.
 ///
 /// **It must outlive the submit of the command buffer its copy was recorded into.** Dropping it
-/// earlier leaves the GPU copying from freed memory — which no validation layer will call, and
-/// which shows up as a texture of garbage.
+/// earlier lets the pool rewind the chunk and write over bytes the GPU has not read yet — which no
+/// validation layer will call, and which shows up as a texture of garbage.
 ///
-/// It owns **only** the staging half: the [`Texture`] went to the caller of
+/// It carries **only** the staging half: the [`Texture`] went to the caller of
 /// [`Texture::stage_32bpp`] and is destroyed the usual way. So a staged upload dropped without
 /// ever being recorded costs nothing but the pixels' journey — the image is blank, not invalid,
-/// which is what makes it safe for a frame that never happens to simply drop the queue.
+/// which is what makes it safe for a frame that never happens to simply drop the queue. Its
+/// destination image, by contrast, is named by raw handle and *not* kept alive here; whoever
+/// queues one is responsible for that (see `PendingTextureUpload` in the compositor).
 pub struct StagedTexture {
-    gpu: Arc<Gpu>,
-    staging: vk::Buffer,
-    smem: vk::DeviceMemory,
+    chunk: Arc<StagingChunk>,
+    offset: vk::DeviceSize,
     /// The destination. Borrowed by handle, not owned — see the type docs.
     image: vk::Image,
     width: u32,
@@ -184,23 +185,15 @@ impl StagedTexture {
     /// the same slot the glyph uploads and the deferred dmabuf acquires use.
     pub fn record(&self, cbuf: vk::CommandBuffer) {
         unsafe {
-            record_upload_copy(
-                &self.gpu.device,
+            record_upload_copy_at(
+                self.chunk.device(),
                 cbuf,
                 self.image,
-                self.staging,
+                self.chunk.buffer(),
+                self.offset,
                 self.width,
                 self.height,
             );
-        }
-    }
-}
-
-impl Drop for StagedTexture {
-    fn drop(&mut self) {
-        unsafe {
-            self.gpu.device.destroy_buffer(self.staging, None);
-            self.gpu.device.free_memory(self.smem, None);
         }
     }
 }
@@ -254,16 +247,17 @@ impl StagedTexture {
     /// wait of its own: a live seat frame showed `11 shm in 19.38ms` moving 4.5 MiB, where the
     /// bytes were 0.33 ms and the rest was eleven round trips.
     ///
-    /// Each re-upload gets its own staging buffer rather than sharing one, and that is the point:
-    /// a shared buffer is only safe because each transfer is fence-waited before the next writes
-    /// over it, which is exactly the wait being removed. The allocation is the same one every
-    /// deferred `import_memory` already makes.
+    /// The pixels go into the renderer's shared [`StagingPool`] rather than a buffer of their own.
+    /// A buffer per re-upload is what the deferral first shipped, and on Venus that is a fresh
+    /// mappable blob on every commit of every shm surface: it ran the host out of them two minutes
+    /// into a live session. The pool keeps one buffer and rewinds it per frame.
     ///
     /// `image` must be a `TRANSFER_DST` image of `width`×`height`; `data` must be its tightly
     /// packed `width*height*4` extent. As with any [`StagedTexture`], it must outlive the submit
     /// of the command buffer its copy is recorded into.
     pub fn reupload_32bpp(
         gpu: &Arc<Gpu>,
+        pool: &mut StagingPool,
         image: vk::Image,
         width: u32,
         height: u32,
@@ -276,11 +270,10 @@ impl StagedTexture {
             data.len(),
         );
         crate::stats::uploaded(size);
-        let (staging, smem) = create_filled_staging(gpu, data)?;
+        let (chunk, offset) = pool.stage(gpu, data)?;
         Ok(StagedTexture {
-            gpu: gpu.clone(),
-            staging,
-            smem,
+            chunk,
+            offset,
             image,
             width,
             height,
@@ -1208,6 +1201,7 @@ impl Texture {
     #[allow(clippy::too_many_arguments)]
     pub fn stage_32bpp(
         gpu: &Arc<Gpu>,
+        pool: &mut StagingPool,
         width: u32,
         height: u32,
         data: &[u8],
@@ -1220,15 +1214,20 @@ impl Texture {
         } else {
             vk::ComponentMapping::default()
         };
-        let PendingUpload {
-            staging,
-            smem,
-            texture,
-        } = Self::build_pending(gpu, width, height, data, format, 4, components, filter)?;
+        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+        assert_eq!(
+            data.len() as vk::DeviceSize,
+            size,
+            "texture data size mismatch"
+        );
+        crate::stats::uploaded(size);
+        // The pixels first, so a staging failure costs no image: the pool shares one buffer across
+        // every import and re-upload in the frame, instead of a mappable blob per upload.
+        let (chunk, offset) = pool.stage(gpu, data)?;
+        let texture = Self::new_sampled_image_raw(gpu, width, height, format, components, filter)?;
         let staged = StagedTexture {
-            gpu: gpu.clone(),
-            staging,
-            smem,
+            chunk,
+            offset,
             image: texture.image,
             width,
             height,

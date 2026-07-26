@@ -565,6 +565,10 @@ mod tests {
             wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
         };
 
+        // The shared staging chunk is created once per renderer and counts as a resource; warm
+        // both so the counts below are the wallpaper's own.
+        vk_a.warm_staging_pool();
+        vk_b.warm_staging_pool();
         let _ = uploads(());
         assert!(render(&wp, &mut vk_a).is_some());
         assert_eq!(uploads(()), 1, "the first frame must upload");
