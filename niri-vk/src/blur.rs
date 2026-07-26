@@ -897,6 +897,80 @@ mod tests {
         unsafe { gpu.device.destroy_command_pool(pool, None) };
     }
 
+    /// What the blur's *own submit* costs, as against riding a command buffer
+    /// that was going to be submitted anyway.
+    ///
+    /// The compositor gives every blur its own fence-waited submission
+    /// (`EffectBlur::run`, `BackdropBlur::run_blur`). That is a round trip, and
+    /// on this stack a round trip is not free even when the work is: the wait
+    /// polls in ~291us steps (`venus-cost.md` §11.2), so a wait rounds up. This
+    /// prices the same total GPU work delivered both ways — N blurs in one
+    /// submit, versus N blurs in N submits — which is exactly the choice between
+    /// folding the blur into the frame's command buffer and leaving it standing
+    /// alone.
+    ///
+    /// Run with `cargo test -p niri-vk blur_submit_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measures blur cost on the real device; run explicitly"]
+    fn blur_submit_overhead() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping blur_submit_overhead: no Vulkan device");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.expect("pool");
+        const N: u32 = 8;
+
+        println!(
+            "{:<12} {:>10} {:>12} {:>12} {:>12}",
+            "size", "px", "1 submit", "N submits", "per-submit"
+        );
+        for &(w, h) in SIZES {
+            let src = noise(w, h);
+            let source =
+                Texture::from_rgba(&gpu, pool, w, h, &src, vk::Filter::LINEAR).expect("source");
+            let dst = Texture::new_color_target(&gpu, w, h, vk::Filter::LINEAR).expect("dst");
+            let chain = BlurChain::new(&gpu, &source, PASSES).expect("chain");
+
+            let one = |cbuf| {
+                chain.record(&gpu, cbuf, OFFSET);
+                chain.copy_output_to(&gpu, cbuf, dst.image, w, h);
+            };
+            // All N in one command buffer: the round trip paid once.
+            let batched = time_submit(&gpu, pool, |cbuf| {
+                for _ in 0..N {
+                    one(cbuf);
+                }
+            });
+            // The same N blurs, each with its own submit and fence wait — what
+            // the compositor does today.
+            let mut separate = Duration::MAX;
+            for _ in 0..3 {
+                let started = Instant::now();
+                for _ in 0..N {
+                    gpu.run_commands(pool, crate::stats::SubmitSite::Blur, one)
+                        .expect("submit");
+                }
+                separate = separate.min(started.elapsed());
+            }
+
+            println!(
+                "{:<12} {:>10.2} {:>10.3}ms {:>10.3}ms {:>10.3}ms",
+                format!("{w}x{h}"),
+                (w as f64) * (h as f64) / 1e6,
+                ms(batched),
+                ms(separate),
+                ms(separate.saturating_sub(batched)) / f64::from(N),
+            );
+
+            chain.destroy(&gpu);
+            dst.destroy(&gpu);
+            source.destroy(&gpu);
+        }
+
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+
     fn time_submit(
         gpu: &Gpu,
         pool: vk::CommandPool,
