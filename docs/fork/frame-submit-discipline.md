@@ -78,6 +78,31 @@ The failure this catches is silent: a consumer that reads before the drain sees 
 gets overwritten *afterwards* when the frame finally records the stale copy. That is exactly how it
 was found — an shm re-upload to green came out **red**.
 
+## The other counter-rule: what you record, you keep alive
+
+> Anything a queued command buffer names — an image, a buffer — must outlive **the submit**, not the
+> recording.
+
+Recording a barrier or a copy stores the *handle*. Destroy the object before the submit and Vulkan
+invalidates the whole command buffer: every command recorded after it becomes invalid usage, and the
+submit carries a poisoned buffer. So a queue that hands its entries to a command buffer cannot just
+drop them when it drains — it hands them to whoever owns that submit.
+
+That is why `record_pending_texture_uploads` returns its staging batch instead of dropping it, why
+`record_pending_dmabuf_acquires` is `#[must_use]` and its batch goes into `VulkanFrame::held`, and
+why `run_commands_deferred` takes `held`/`targets` at all. All the same rule.
+
+The trap is that dropping is only fatal when it is the **last** reference, so a cache one layer away
+decides whether you have a bug. Client dmabuf imports are cached weakly and swept on every lookup,
+so a client that reallocates buffers (anything resizing — our own open animation forces it every
+frame) leaves the queue holding the sole reference. Queue a texture the cache still holds and
+nothing happens; queue one it has dropped and the compositor dies. It shipped, and the seat came
+down on a client that did nothing wrong.
+
+Pixel comparisons cannot see any of this — the image survives whenever the cache happens to hold it.
+`NIRI_VK_VALIDATION=1` names it exactly (`VkImage … was destroyed`), which is why it belongs at the
+*start* of an investigation, on the live session if that is where the misbehavior is.
+
 ## What still blocks, and why each is fine
 
 - **CPU readback** (`download_region`, screenshots, screencopy) — has to wait; the CPU is the

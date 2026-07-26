@@ -32,6 +32,14 @@ way" vs. a capability worth keeping, ask.
   Note the layer never fails a test by itself, so libtest still prints `test result: ok` — trust the
   exit status, not that line. To find the culprit, re-run with `--test-threads=1`: parallel output
   interleaves, so the test name printed near a `VULKAN ERROR` means nothing.
+- **Turn the layer on FIRST when the compositor misbehaves around the renderer** — before profiling,
+  bisecting or theorising. `NIRI_VK_VALIDATION` is a plain env var read in `Gpu::with_selector`, so
+  the **live session** honors it too: add a systemd drop-in with `Environment=NIRI_VK_VALIDATION=1`
+  for the seat user, reproduce, and read the `VULKAN ERROR` lines out of the journal. Undefined
+  behavior surfaces as whatever the driver felt like doing — a wedge that presented as
+  `ERROR_OUT_OF_HOST_MEMORY` from every allocation was a destroyed `VkImage` inside a still-recording
+  command buffer, and the allocation failures were the corpse, not the cause. Hours went into
+  falsifying memory-pressure theories that the layer named in one run.
 - Live validation needs the real binary: `cargo test` does NOT rebuild `target/debug/niri`
   (only the test harness). After code changes, always `cargo build --bin niri` and restart the
   session, or the running compositor keeps running stale code.
