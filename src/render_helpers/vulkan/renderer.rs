@@ -517,7 +517,8 @@ impl VulkanRenderer {
             custom_open: None,
             sampler_set_layout,
             command_pool,
-            gpu_timer: GpuTimer::if_requested(&gpu_for_timer)?,
+            gpu_timer: GpuTimer::if_requested(&gpu_for_timer)
+                .inspect(|timer| warn_if_timing_costs_deferral(timer.is_some()))?,
             in_flight: Vec::new(),
             finish_may_defer: false,
             defer_scanout: deferred_scanout_requested(),
@@ -2098,6 +2099,23 @@ fn deferred_scanout_requested() -> bool {
         std::env::var("NIRI_VK_ASYNC_SCANOUT")
             .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
     })
+}
+
+/// Say so when GPU timing and async scanout are both asked for, because only one of
+/// them happens: `should_defer_finish` requires no query pool, so turning on `gpu`
+/// silently puts the session back on the synchronous finish. That is a different
+/// frame path, not just a different log line — frame times get bigger because the
+/// GPU wait moves back onto the compositor thread, which reads like a regression if
+/// you don't know. Both are opt-in debug switches and the seat sets both from
+/// `environment.d`, so the combination is easy to reach by accident.
+fn warn_if_timing_costs_deferral(timing: bool) {
+    if timing && deferred_scanout_requested() {
+        tracing::warn!(
+            "GPU timing is on, so the async scanout submit is disabled for this session \
+             (one query pool per renderer cannot be reset under an in-flight frame). Frame \
+             times will include the GPU wait; unset NIRI_FRAME_LOG's `gpu` to get it back."
+        );
+    }
 }
 
 impl Drop for VulkanRenderer {
