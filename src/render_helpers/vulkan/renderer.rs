@@ -130,9 +130,6 @@ pub struct VulkanRenderer {
     /// Whether this renderer defers at all, defaulting to what the session asked for. A field
     /// rather than a bare environment read so a test can exercise the path.
     defer_scanout: bool,
-    /// Reused staging buffer for shm-client texture uploads (grown on demand), so the shm cache's
-    /// hit path refreshes a client buffer every commit without churning a mappable allocation.
-    shm_staging: niri_vk::texture::Staging,
     /// The host-visible buffer every readback copies into, grown on demand and reused.
     ///
     /// This used to be a fresh `VkBuffer` + `HOST_VISIBLE` allocation per call. On Venus
@@ -471,7 +468,6 @@ impl VulkanRenderer {
             in_flight: Vec::new(),
             finish_may_defer: false,
             defer_scanout: deferred_scanout_requested(),
-            shm_staging: niri_vk::texture::Staging::new(),
             readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
             #[cfg(test)]
             readback_buffer_allocs: 0,
@@ -2042,7 +2038,6 @@ impl Drop for VulkanRenderer {
             if let Some(timer) = self.gpu_timer.take() {
                 dev.destroy_query_pool(timer.pool, None);
             }
-            self.shm_staging.destroy(dev);
             self.readback_staging_buffer.destroy(dev);
             self.solid_pipeline.destroy(dev);
             self.sdf_rect_pipeline.destroy(dev);
@@ -2673,26 +2668,27 @@ pub fn dmabuf_formats() -> FormatSet {
 
 impl VulkanRenderer {
     /// The shm-cache hit path: re-upload `data` (tightly-packed `w*h*4` bytes) into `tex`'s
-    /// existing image, reusing the renderer's staging buffer — no image or staging allocation.
-    /// Safe against a concurrent sample because every VulkanRenderer submit is immediately
-    /// fence-waited (the renderer is fully synchronous), so no in-flight frame can be sampling
-    /// `tex` here; if async submission is ever added this needs per-texture fence tracking.
+    /// existing image — no image allocation, and no submit of its own.
     pub(super) fn reupload_shm(&mut self, tex: &VkTexture, data: &[u8]) -> Result<(), VulkanError> {
-        // `reupload_full` copies the image's full w*h extent out of the staging, so short data
-        // would be an out-of-bounds staging read. The sole caller only reaches here on a
-        // size-matched cache hit with a 32bpp shm buffer; this pins that contract rather
-        // than guarding at runtime.
+        // The copy covers the image's full w*h extent, so short data would be an out-of-bounds
+        // staging read. The sole caller only reaches here on a size-matched cache hit with a 32bpp
+        // shm buffer; this pins that contract rather than guarding at runtime. (`reupload_32bpp`
+        // checks it again and errors, but a debug build should name the caller.)
         debug_assert_eq!(
             data.len(),
             (tex.size().w as usize) * (tex.size().h as usize) * 4,
             "reupload_shm data must be the texture's w*h*4 (32bpp) extent",
         );
-        // This overwrites the image *now*. A staged copy still queued for this same texture would
-        // otherwise land afterwards, at the next `begin`, and undo it.
-        self.flush_pending_texture_uploads()?;
-        self.shm_staging.ensure(&self.gpu, data.len() as u64)?;
-        self.shm_staging.write(&self.gpu, data)?;
-        tex.reupload_shm(self.command_pool, &self.shm_staging)?;
+        // Queued, not submitted: the copy rides the next frame's command buffer alongside the
+        // imports and the dmabuf acquires. A live seat frame showed `11 shm in 19.38ms` moving
+        // 4.5 MiB — 0.33 ms of bytes behind eleven round trips — and forced the queued imports to
+        // flush on top of it (`1 upload in 1.89ms` beside it in the same line).
+        //
+        // Ordering against a staged copy already queued for this same texture is what the flush
+        // used to buy, and the queue gives it for free: copies are recorded in push order, so the
+        // later one wins, which is what "re-upload" means.
+        let staged = tex.stage_reupload_shm(data)?;
+        self.pending_texture_uploads.push(staged);
         Ok(())
     }
 }

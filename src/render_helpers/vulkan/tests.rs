@@ -2872,12 +2872,17 @@ fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
 // --- shm per-surface cache: an in-place re-upload overwrites the reused VkImage ------------------
 
 /// The shm cache (`import_shm_buffer`) keeps a client's `VkTexture` across commits and re-uploads
-/// the new contents *in place* via `reupload_shm` — grow-only staging feeding `Texture::
-/// reupload_full`'s layout dance (UNDEFINED→TRANSFER_DST, full buffer→image copy, →SHADER_READ) —
-/// instead of allocating a fresh image every frame. Pin that the in-place re-upload actually lands
-/// the new pixels *and* leaves the same image sampleable: import an opaque-red source, re-upload it
-/// green into the very same `VkTexture`, then sample it 1:1 into an offscreen and read back green.
-/// A no-op or stale re-upload (or a botched layout transition) would read back the original red.
+/// the new contents *in place* — its own staging buffer feeding the usual layout dance
+/// (UNDEFINED→TRANSFER_DST, full buffer→image copy, →SHADER_READ) — instead of allocating a fresh
+/// image every frame. Pin that the in-place re-upload actually lands the new pixels *and* leaves
+/// the same image sampleable: import an opaque-red source, re-upload it green into the very same
+/// `VkTexture`, then sample it 1:1 into an offscreen and read back green. A no-op or stale
+/// re-upload (or a botched layout transition) would read back the original red.
+///
+/// It also covers the ordering the re-upload's *queue* has to preserve. The copy is no longer
+/// submitted on the spot: it is queued behind the import's copy for the same image, and the render
+/// below is what records both. Reverse them and this reads back red — which is exactly how the
+/// deferred-upload work found its own bug.
 #[test]
 fn vulkan_shm_reupload_overwrites_in_place() {
     let mut vk = match VulkanRenderer::new() {

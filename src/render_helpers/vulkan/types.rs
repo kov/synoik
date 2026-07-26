@@ -273,17 +273,28 @@ impl VkTexture {
         self.0.layout.store(layout.as_raw(), Ordering::Release);
     }
 
-    /// Re-upload a full frame of tightly-packed pixels into this texture's existing image, reusing
-    /// `staging` (the caller must have written the data into it). The shm-cache hit path: refresh a
-    /// cached texture in place with no allocation. The image ends in `SHADER_READ_ONLY_OPTIMAL`.
-    pub(super) fn reupload_shm(
+    /// Stage a full frame of tightly-packed pixels for this texture's existing image — the shm
+    /// cache hit, refreshing a cached texture in place with no image allocation.
+    ///
+    /// **Stages only.** The returned [`StagedTexture`] carries the copy; the caller queues it so it
+    /// rides a frame's command buffer
+    /// ([`VulkanRenderer::pending_texture_uploads`](super::renderer::VulkanRenderer)) instead of
+    /// costing a submit and a fence wait per commit. The tracked layout is advanced to
+    /// `SHADER_READ_ONLY_OPTIMAL` here, on the same recorded-is-as-good-as-submitted basis as
+    /// everything else in that queue: the copy is ordered before any later sample.
+    pub(super) fn stage_reupload_shm(
         &self,
-        pool: vk::CommandPool,
-        staging: &niri_vk::texture::Staging,
-    ) -> anyhow::Result<()> {
-        self.0.tex.reupload_full(&self.0.gpu, pool, staging)?;
+        data: &[u8],
+    ) -> anyhow::Result<niri_vk::texture::StagedTexture> {
+        let staged = niri_vk::texture::StagedTexture::reupload_32bpp(
+            &self.0.gpu,
+            self.image(),
+            self.0.width,
+            self.0.height,
+            data,
+        )?;
         self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        Ok(())
+        Ok(staged)
     }
 
     /// Whether two handles refer to the *same* underlying texture (ref-counted inner). Used by the

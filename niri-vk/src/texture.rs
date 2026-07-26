@@ -205,6 +205,89 @@ impl Drop for StagedTexture {
     }
 }
 
+/// A `TRANSFER_SRC` staging buffer holding `data`, mapped and written and unmapped. Frees both
+/// handles if anything after the create fails. Shared by [`Texture::build_pending`], which pairs it
+/// with a freshly created image, and [`StagedTexture::reupload_32bpp`], which points it at one that
+/// already exists.
+fn create_filled_staging(gpu: &Gpu, data: &[u8]) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let device = &gpu.device;
+    let size = data.len() as vk::DeviceSize;
+    let staging_ci = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let staging = unsafe { device.create_buffer(&staging_ci, None) }.context("staging buffer")?;
+    let mut guard = UploadGuard::new(device);
+    guard.staging = staging;
+    let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
+    let smem = gpu.allocate(
+        sreq,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    guard.smem = smem;
+    unsafe {
+        device.bind_buffer_memory(staging, smem, 0)?;
+        let ptr = device
+            .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
+            .context("map staging")? as *mut u8;
+        {
+            // Timed apart from creation: this is a host write into a never-touched mapping,
+            // not a round trip, and it is the entire cost of a wallpaper upload. Conflating the
+            // two made `created` read as 9.96ms on a frame that created almost nothing.
+            let _timed = crate::stats::staging_write();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+        device.unmap_memory(smem);
+    }
+    // Success: both handles belong to the caller now.
+    guard.staging = vk::Buffer::null();
+    guard.smem = vk::DeviceMemory::null();
+    Ok((staging, smem))
+}
+
+impl StagedTexture {
+    /// Stage a full-extent 32bpp re-upload into an image that **already exists** — the shm cache
+    /// hit, where a client recommits new pixels for a texture we keep.
+    ///
+    /// The sibling of [`Texture::stage_32bpp`], which stages into an image it also creates. Both
+    /// exist so the copy can ride a frame's command buffer instead of costing a submit and a fence
+    /// wait of its own: a live seat frame showed `11 shm in 19.38ms` moving 4.5 MiB, where the
+    /// bytes were 0.33 ms and the rest was eleven round trips.
+    ///
+    /// Each re-upload gets its own staging buffer rather than sharing one, and that is the point:
+    /// a shared buffer is only safe because each transfer is fence-waited before the next writes
+    /// over it, which is exactly the wait being removed. The allocation is the same one every
+    /// deferred `import_memory` already makes.
+    ///
+    /// `image` must be a `TRANSFER_DST` image of `width`×`height`; `data` must be its tightly
+    /// packed `width*height*4` extent. As with any [`StagedTexture`], it must outlive the submit
+    /// of the command buffer its copy is recorded into.
+    pub fn reupload_32bpp(
+        gpu: &Arc<Gpu>,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<Self> {
+        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
+        anyhow::ensure!(
+            data.len() as vk::DeviceSize == size,
+            "re-upload data is {} bytes for {width}x{height}, need {size}",
+            data.len(),
+        );
+        crate::stats::uploaded(size);
+        let (staging, smem) = create_filled_staging(gpu, data)?;
+        Ok(StagedTexture {
+            gpu: gpu.clone(),
+            staging,
+            smem,
+            image,
+            width,
+            height,
+        })
+    }
+}
+
 /// Uploads many textures with a single submit + fence-wait instead of one per texture — the
 /// overview app grid decodes ~24 icons and would otherwise pay ~24 serialized queue round-trips on
 /// first open (a real stutter on virtualized/Venus queues). Usage: [`TextureBatch::new`], then
@@ -1269,33 +1352,9 @@ impl Texture {
         let mut guard = UploadGuard::new(device);
 
         // --- staging buffer with the pixel data ---
-        let staging_ci = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging =
-            unsafe { device.create_buffer(&staging_ci, None) }.context("staging buffer")?;
+        let (staging, smem) = create_filled_staging(gpu, data)?;
         guard.staging = staging;
-        let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
-        let smem = gpu.allocate(
-            sreq,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
         guard.smem = smem;
-        unsafe {
-            device.bind_buffer_memory(staging, smem, 0)?;
-            let ptr = device
-                .map_memory(smem, 0, size, vk::MemoryMapFlags::empty())
-                .context("map staging")? as *mut u8;
-            {
-                // Timed apart from creation: this is a host write into a never-touched mapping,
-                // not a round trip, and it is the entire cost of a wallpaper upload. Conflating the
-                // two made `created` read as 9.96ms on a frame that created almost nothing.
-                let _timed = crate::stats::staging_write();
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
-            device.unmap_memory(smem);
-        }
 
         // --- device-local sampled image ---
         let image_ci = vk::ImageCreateInfo::default()
@@ -1603,61 +1662,6 @@ impl Texture {
             memory: smem,
             copies,
         }))
-    }
-
-    /// Re-upload a full `width*height` frame of tightly-packed pixels into this already-allocated
-    /// image, reusing `staging` (the caller must have `ensure`d capacity and `write`n the data).
-    /// It's a full overwrite, so the barrier discards the old contents (`UNDEFINED` old layout,
-    /// valid regardless of the image's current layout) and leaves the image in
-    /// `SHADER_READ_ONLY_OPTIMAL`. Used by the shm-client texture cache to refresh a cached texture
-    /// in place instead of allocating a fresh image + staging buffer every commit.
-    pub fn reupload_full(&self, gpu: &Gpu, pool: vk::CommandPool, staging: &Staging) -> Result<()> {
-        let device = &gpu.device;
-        // A full overwrite of the image's extent; the caller wrote exactly that into `staging`.
-        crate::stats::uploaded((self.width as u64) * (self.height as u64) * 4);
-        gpu.run_commands(pool, crate::stats::SubmitSite::UploadShm, |cbuf| unsafe {
-            transition(
-                device,
-                cbuf,
-                self.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-            );
-            let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: self.width,
-                    height: self.height,
-                    depth: 1,
-                });
-            device.cmd_copy_buffer_to_image(
-                cbuf,
-                staging.buffer,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-            transition(
-                device,
-                cbuf,
-                self.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            );
-        })
     }
 }
 
