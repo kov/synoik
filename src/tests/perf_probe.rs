@@ -33,18 +33,42 @@
 //! Sweep 1-4's "draw count is nearly free" rested on 23 → 34 draws, which is inside this probe's
 //! noise; a regression over 1123 live frames pointed the other way, at 41 µs/draw. Sweep 7 is the
 //! controlled version — the same output tiled by 1 to 256 cells, so **shaded fragments are held
-//! fixed while draws move 256x** — and it is unambiguous: **~0.6 µs/draw**, the same for solid
-//! quads, for textured quads sharing one descriptor set, and for a distinct texture per draw.
-//! Rebinding costs nothing measurable either. The live regression's draw coefficient is confounded:
-//! in that session, "many draws" and "the overview is open" are the same frames.
+//! fixed while draws move 256x**. Point estimate ~0.6 µs/draw, the same for solid quads, for
+//! textured quads sharing one descriptor set, and for a distinct texture per draw. Read that as a
+//! **bound, not a value**: the sweep's spread is ~±0.1 ms over a 255-draw lever, so it cannot
+//! exclude anything under ~1.5 µs/draw, and the slope is dominated by the 256 point. What it does
+//! exclude is 41 µs/draw, by about 30x — that would put the 256-draw row at 10.6 ms.
 //!
-//! Which leaves the content gap, now measured directly instead of inferred. At 2048x1330 this probe
-//! renders a settled overview in **0.70 ms of GPU for 2.56x the output**; the live seat's worst
-//! frames are **10.9 ms for 2.0x**. Same renderer, same device, same resolution, *more* fragments
-//! here — and 15x cheaper. Those live frames upload nothing, create nothing and bake nothing, so
-//! the difference is entirely in what they sample. The untested ingredient is still the one sweep 4
-//! could not build: real client dmabufs on a LINEAR modifier, minified into thumbnails. The probe
-//! attaches shm, which lands in an OPTIMAL tiled image.
+//! Two things the sweep deliberately does not vary, so do not generalize past them: every variant
+//! draws one pipeline (a live frame interleaves solid/texture/glyph/rounded), and its textures are
+//! 64x64 and magnified — cache-resident by construction, where a live draw minifies a mip-less
+//! full-window source. "A draw is free" means its *fixed* cost is; its marginal sampling cost is
+//! exactly what was held out. The live regression's coefficient is also confounded: in that session
+//! draws, coverage, damage extent, client-commit rate and load all flip together when the overview
+//! opens.
+//!
+//! Which leaves a content gap, and it is **much smaller than the first writeup of this claimed**.
+//! Compare like with like — the probe's minimum against the live *minimum* of a draw bucket, and a
+//! probe scene carrying the seat's ingredients rather than `Scene::default()`:
+//!
+//! | | gpu |
+//! |---|---|
+//! | probe, bare | 0.70 ms |
+//! | probe, + wallpaper | 0.89 ms |
+//! | probe, + wallpaper + xray/blur | **1.13 ms** |
+//! | live seat, >=150 draws, **minimum** | **2.71 ms** |
+//! | live seat, >=150 draws, median | 9.30 ms |
+//!
+//! So the like-for-like residue is **2.4x**, not the 15x that came from holding a probe minimum
+//! against a live median on a bare scene. Candidates for the 1.6 ms: the full-damage present blit
+//! into the LINEAR scanout dmabuf (inside the timestamp bracket, `frame.rs:1560`, and **not counted
+//! by `shaded`** — blits are not draws), per-commit client-dmabuf acquire barriers (also bracketed,
+//! also absent here), and real LINEAR client buffers minified into thumbnails.
+//!
+//! The bigger question this leaves is the **spread**, not the mean. In the same live bucket, frames
+//! with *identical counters* — 134 vs 137 draws, 2.30x vs 2.40x — cost under 4 ms and over 9 ms,
+//! interleaved within the same seconds. Nothing the frame log records distinguishes them. Until
+//! that is explained, a single live number is not a workload measurement.
 //!
 //! Read GPU time, not wall clock, for any of this: [`render_once_gpu`] and [`best_gpu_of`] exist
 //! because the wall-clock figures in sweeps 1-6 fold in the host round trip, which on this stack is
@@ -644,13 +668,39 @@ fn perf_probe_what_does_a_draw_call_cost() {
     }
     println!("    live regression over 6-204 draws said 41.4 µs/draw");
 
-    // The comparison that matters: the same *shape* as a live overview frame, priced in GPU time
-    // rather than the wall clock sweeps 1-4 used. The seat's worst frames are ~200 draws over 2.0x
-    // the output for 10.9 ms. Whatever this probe pays for the same counters is the part explained
-    // by shape; the rest is content, and the probe does not have the seat's content.
-    println!("\n  == overview frame, GPU time, for comparison with the live seat ==");
-    for windows in [1usize, 4] {
-        let Some(mut f) = build(OUT, windows) else {
+    // The comparison that matters: a settled overview frame priced in GPU time, **with the live
+    // seat's scene ingredients added one at a time**. The first version of this ran
+    // `Scene::default()` — no wallpaper, no blur, no xray — against a seat that has all three, and
+    // then attributed the whole difference to client-dmabuf sampling. Half the "content" hypothesis
+    // was testable with flags already in this file.
+    //
+    // Compare **minima with minima**: the live figure to hold this against is the *minimum* of a
+    // draw bucket, not its median. A loaded session's median carries contention with the previous
+    // frame's tail and with the host compositing the guest window, which an idle probe cannot
+    // reproduce; on the 2026-07-26 seat capture that spread alone is 2.71 ms vs 9.30 ms inside one
+    // bucket.
+    println!("\n  == settled overview, GPU time, live ingredients added one at a time ==");
+    println!("     (live seat, >=150 draws: min 2.71ms  median 9.30ms  max 13.13ms, ~2.2x out)");
+    let scenes = [
+        ("bare", Scene::default()),
+        (
+            "+ wallpaper",
+            Scene {
+                wallpaper: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "+ wallpaper + xray/blur",
+            Scene {
+                wallpaper: true,
+                blur: true,
+                xray: true,
+            },
+        ),
+    ];
+    for (label, scene) in scenes {
+        let Some(mut f) = build_scene(OUT, 4, scene) else {
             return;
         };
         let timed = f
@@ -664,22 +714,24 @@ fn perf_probe_what_does_a_draw_call_cost() {
         }
         f.niri_state().do_action(Action::OpenOverview, false);
         f.settle_animations();
-        let mut best: Option<(Duration, u64, u64)> = None;
+        let mut samples: Vec<(Duration, u64, u64)> = Vec::new();
         for _ in 0..REPEATS {
             if let Some(s) = render_once_gpu(&mut f) {
-                if best.is_none_or(|(b, _, _)| s.0 < b) {
-                    best = Some(s);
-                }
+                samples.push(s);
             }
         }
-        match best {
-            Some((gpu, draws, shaded)) => println!(
-                "     {windows} window(s)  gpu {:6.3}ms  {draws:4} draws  {:4.2}x out",
-                gpu.as_secs_f64() * 1000.,
-                shaded as f64 / (f64::from(OUT.0) * f64::from(OUT.1)),
-            ),
-            None => println!("     {windows} window(s): every pair came back unusable"),
+        if samples.is_empty() {
+            println!("     {label:<24}: every pair came back unusable");
+            continue;
         }
+        samples.sort_by_key(|(gpu, _, _)| *gpu);
+        let (draws, shaded) = (samples[0].1, samples[0].2);
+        println!(
+            "     {label:<24} gpu min {:6.3}ms  median {:6.3}ms  {draws:4} draws  {:4.2}x out",
+            samples[0].0.as_secs_f64() * 1000.,
+            samples[samples.len() / 2].0.as_secs_f64() * 1000.,
+            shaded as f64 / (f64::from(OUT.0) * f64::from(OUT.1)),
+        );
     }
     println!();
 }
@@ -716,7 +768,8 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
                 elements.iter().rev(),
             )?;
             let samples = crate::frame_log::take_gpu_samples();
-            Ok((samples.lost == 0 && samples.count > 0).then_some((
+            // Exactly one, for the reason in `best_gpu_of`.
+            Ok((samples.lost == 0 && samples.count == 1).then_some((
                 samples.time,
                 niri_vk::stats::draws() - d0,
                 niri_vk::stats::shaded() - s0,
@@ -836,7 +889,10 @@ where
                     elements.iter(),
                 )?;
                 let samples = crate::frame_log::take_gpu_samples();
-                Ok((samples.lost == 0 && samples.count > 0).then_some((
+                // Exactly one: with `NIRI_VK_ASYNC_SCANOUT` set in the environment an offscreen
+                // finish defers, its pair resolves during the *next* iteration's retire, and one
+                // window would then hold two renders' summed time.
+                Ok((samples.lost == 0 && samples.count == 1).then_some((
                     samples.time,
                     niri_vk::stats::draws() - d0,
                     niri_vk::stats::shaded() - s0,
