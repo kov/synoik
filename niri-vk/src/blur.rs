@@ -248,6 +248,17 @@ impl BlurChain {
     /// Record the full down+up chain into `cbuf`. Afterwards level 0 holds the blurred output in
     /// `SHADER_READ_ONLY_OPTIMAL`.
     pub fn record(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, offset: f32) {
+        self.record_to_level(gpu, cbuf, offset, 0);
+    }
+
+    /// As [`Self::record`], but stop the upsample once `stop` holds the result instead of carrying
+    /// it all the way to level 0.
+    ///
+    /// Level 0 is the only full-size level, so it alone costs more than the whole rest of the
+    /// pyramid; stopping at level 1 leaves a quarter-size result for the consumer's linear sampler
+    /// to finish. Exposed for the cost measurement in this module's tests, which is what decides
+    /// whether that trade is worth taking.
+    pub fn record_to_level(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, offset: f32, stop: usize) {
         // Downsample: source → L1, L1 → L2, …, L_{passes-1} → L_passes.
         for i in 1..=self.passes {
             let dst = &self.levels[i];
@@ -261,8 +272,8 @@ impl BlurChain {
             self.pass(gpu, cbuf, self.down, dst, src_set, half_pixel, offset);
         }
 
-        // Upsample: L_passes → L_{passes-1}, …, L1 → L0.
-        for i in (1..=self.passes).rev() {
+        // Upsample: L_passes → L_{passes-1}, …, L_{stop+1} → L_stop.
+        for i in (stop + 1..=self.passes).rev() {
             let src = &self.levels[i];
             let dst = &self.levels[i - 1];
             // half_pixel = half a source pixel.
@@ -758,4 +769,177 @@ fn build_pipeline(
             .map_err(|(_, e)| e)
             .context("blur pipeline")?[0];
     Ok(pipeline)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::texture::Texture;
+
+    /// How many times each variant is recorded into a single command buffer. One
+    /// submit for the lot, so the per-submit round trip (§9.3 of
+    /// `docs/fork/venus-cost.md`: ~1.2ms of guest-side polling, most of it
+    /// `clock_nanosleep`) is paid once and divided away instead of landing on
+    /// every sample.
+    ///
+    /// Override with `BLUR_COST_REPS=1` to measure the live shape instead — one
+    /// blur per submit. Worth doing once to see *why* the default batches: at 1
+    /// the readings stop being monotonic in size (a 8.3Mpx blur "costing" more
+    /// than a 18.7Mpx one), because a lone wait carries several milliseconds of
+    /// the polling tax and its 291us quantization. That noise is the reason a
+    /// single live `N blur in Xms` line cannot be read as the blur's GPU cost.
+    fn reps() -> u32 {
+        std::env::var("BLUR_COST_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    }
+
+    /// Passes the compositor actually configures (`niri_config::Blur::default`).
+    const PASSES: usize = 3;
+    const OFFSET: f32 = 3.0;
+
+    /// Sizes to sweep. The last is roughly the 5.3x-output overview frame that
+    /// §3.8 of `docs/fork/venus-cost.md` measured at `1 blur in 13.63ms`.
+    const SIZES: &[(u32, u32)] = &[
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+        (4480, 2520),
+        (5760, 3240),
+        (7680, 4320),
+        (8832, 4968),
+    ];
+
+    /// Where the blur's cost actually goes, so the optimization is chosen from
+    /// measurement rather than from the pass count.
+    ///
+    /// Ignored because it needs the real device and takes seconds; run it with
+    /// `cargo test -p niri-vk blur_cost -- --ignored --nocapture`.
+    ///
+    /// The three variants isolate the two candidate savings:
+    ///
+    /// - `record+copy` is what ships: the whole pyramid, then a full-size image copy lifting level
+    ///   0 into the caller's sampleable texture.
+    /// - `record` drops that copy — what rendering the last upsample *directly* into the caller's
+    ///   texture would cost.
+    /// - `record→L1` also stops the upsample one level short, leaving the result at quarter size
+    ///   for the consumer's sampler to finish. It skips the single most expensive pass in the chain
+    ///   (level 0 is the only full-size one) and would shrink the copy to a quarter if the copy
+    ///   stayed.
+    #[test]
+    #[ignore = "measures blur cost on the real device; run explicitly"]
+    fn blur_cost_by_variant_and_size() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping blur_cost_by_variant_and_size: no Vulkan device");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.expect("pool");
+
+        // An empty submit, to subtract the round trip from every reading below.
+        let empty = time_submit(&gpu, pool, |_| {});
+        println!("empty submit (subtracted below): {:.3}ms", ms(empty));
+        println!(
+            "{:<12} {:>10} {:>10} {:>10} {:>10}",
+            "size", "px", "record+copy", "record", "record→L1"
+        );
+
+        for &(w, h) in SIZES {
+            let src = noise(w, h);
+            let source =
+                Texture::from_rgba(&gpu, pool, w, h, &src, vk::Filter::LINEAR).expect("source");
+            let dst = Texture::new_color_target(&gpu, w, h, vk::Filter::LINEAR).expect("dst");
+            let chain = BlurChain::new(&gpu, &source, PASSES).expect("chain");
+
+            let full = per_rep(
+                time_submit(&gpu, pool, |cbuf| {
+                    for _ in 0..reps() {
+                        chain.record(&gpu, cbuf, OFFSET);
+                        chain.copy_output_to(&gpu, cbuf, dst.image, w, h);
+                    }
+                }),
+                empty,
+            );
+            let no_copy = per_rep(
+                time_submit(&gpu, pool, |cbuf| {
+                    for _ in 0..reps() {
+                        chain.record(&gpu, cbuf, OFFSET);
+                    }
+                }),
+                empty,
+            );
+            let to_l1 = per_rep(
+                time_submit(&gpu, pool, |cbuf| {
+                    for _ in 0..reps() {
+                        chain.record_to_level(&gpu, cbuf, OFFSET, 1);
+                    }
+                }),
+                empty,
+            );
+
+            println!(
+                "{:<12} {:>10.2} {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+                format!("{w}x{h}"),
+                (w as f64) * (h as f64) / 1e6,
+                ms(full),
+                ms(no_copy),
+                ms(to_l1),
+            );
+
+            chain.destroy(&gpu);
+            dst.destroy(&gpu);
+            source.destroy(&gpu);
+        }
+
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
+
+    fn time_submit(
+        gpu: &Gpu,
+        pool: vk::CommandPool,
+        record: impl Fn(vk::CommandBuffer),
+    ) -> Duration {
+        // One warm-up submit: the first use of a pipeline/image pays host-side
+        // costs that say nothing about the steady-state frame.
+        gpu.run_commands(pool, crate::stats::SubmitSite::Blur, &record)
+            .expect("warm-up");
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            gpu.run_commands(pool, crate::stats::SubmitSite::Blur, &record)
+                .expect("submit");
+            best = best.min(started.elapsed());
+        }
+        best
+    }
+
+    /// A high-entropy source, because a flat one is not a fair test: this GPU
+    /// compresses render targets losslessly, so a uniform image moves a fraction
+    /// of the memory a real desktop scene does and the blur comes out looking
+    /// several times cheaper than it is.
+    fn noise(w: u32, h: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for px in out.chunks_exact_mut(4) {
+            // xorshift64* — cheap, deterministic, and white enough that nothing
+            // downstream can compress it.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes();
+            px.copy_from_slice(&[v[0], v[1], v[2], 0xff]);
+        }
+        out
+    }
+
+    fn per_rep(total: Duration, empty: Duration) -> Duration {
+        total.saturating_sub(empty) / reps()
+    }
+
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1000.
+    }
 }
