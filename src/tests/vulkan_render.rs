@@ -7665,16 +7665,30 @@ fn bake_sites_per_frame(
     step: Duration,
 ) -> Vec<Vec<crate::frame_log::BakeSite>> {
     let mut per_frame = Vec::with_capacity(frames);
+    let mut animated = 0usize;
     for _ in 0..frames {
         let mut clock = f.niri().clock.clone();
         let now = clock.now_unadjusted();
         clock.set_unadjusted(now + step);
         f.niri().advance_animations();
+        if f.niri().layout.are_animations_ongoing(Some(output))
+            || f.niri().panel_popover.are_animations_ongoing()
+        {
+            animated += 1;
+        }
         // Drop whatever the step itself banked, so each entry is one frame's own.
         let _ = crate::frame_log::take_bake_sites();
         let _ = render_output_vulkan(f, output);
         per_frame.push(crate::frame_log::take_bake_sites());
     }
+    // Anti-vacuity, and it is not hypothetical: every caller here asserts that *nothing* re-baked,
+    // which a run of six static frames satisfies perfectly. A `step` larger than the animation, or
+    // a toggle that did not start one, would make the whole family of tests green forever. See
+    // [[headless-animation-clock-trap]] — the clock has to be driven, and then checked.
+    assert!(
+        animated >= 2,
+        "only {animated} of {frames} sampled frames had an animation running — this samples          static frames, so an assertion about per-frame re-baking proves nothing. Shorten `step`          or check that the action actually started an animation."
+    );
     per_frame
 }
 
@@ -7775,3 +7789,126 @@ fn the_workspace_switch_bakes_only_the_panel_dot_morph() {
          `the_overview_animation_rebakes_nothing_per_frame`'s rule",
     );
 }
+
+/// Open the quick-settings popover on `output`, exactly as the panel indicator does.
+fn open_quick_settings(f: &mut Fixture, output: &Output) {
+    let output_w = output_size(output).w;
+    let toggles = f.niri().gnome_settings.quick_toggles;
+    let anchor = f.niri().panel.quick_settings_rect(output_w);
+    let network = f.niri().system_status.network;
+    let airplane = f.niri().system_status.airplane;
+    let power = f.niri().system_status.power.clone();
+    let battery = f.niri().system_status.battery.clone();
+    let audio = f.niri().audio;
+    let sink_list = f.niri().sink_list.clone();
+    let mic = f.niri().mic;
+    let source_list = f.niri().source_list.clone();
+    let accent = f.niri().gnome_settings.accent_color;
+    f.niri().panel_popover.toggle_quick_settings(
+        output.clone(),
+        anchor,
+        toggles,
+        network,
+        airplane,
+        power,
+        battery,
+        audio,
+        sink_list,
+        mic,
+        source_list,
+        accent,
+    );
+}
+
+/// Open the calendar popover on `output`, exactly as the clock does.
+fn open_calendar(f: &mut Fixture, output: &Output) {
+    let anchor = f.niri().panel.date_menu_rect(output_size(output).w);
+    let cal = f.niri().gnome_settings.calendar;
+    let accent = f.niri().gnome_settings.accent_color;
+    f.niri().panel_popover.toggle_calendar(
+        output.clone(),
+        anchor,
+        cal.week_start,
+        cal.show_week_numbers,
+        accent,
+        Vec::new(),
+    );
+}
+
+/// A popover's open fade must not re-bake its contents on every frame.
+///
+/// The generalization of the panel bug (`009213dd`): a popover fades in by *alpha*, and alpha is
+/// free at composite time — `TextureRenderElement` carries it. A widget whose bake key moves with
+/// the fade instead pays a full GPU round trip per frame for a picture that never changes, and
+/// nothing about the result looks wrong, so only this kind of test can see it.
+///
+/// Both popovers in one test because they share `PanelPopover`'s fade; if the fade itself ever
+/// starts feeding bake keys, both fail together and the shared cause is obvious.
+#[test]
+fn a_popover_open_fade_rebakes_nothing_per_frame() {
+    for (name, subject, open) in [
+        (
+            "quick settings",
+            "quick_settings.rs",
+            open_quick_settings as fn(&mut Fixture, &Output),
+        ),
+        ("calendar", "calendar.rs", open_calendar),
+    ] {
+        let Some(mut f) = window_fixture_settled(GREEN, false, Some("popover bake probe")) else {
+            return;
+        };
+        let output = f.niri_output(1);
+
+        // Everything that bakes merely because it is being composited for the first time in this
+        // process does it now, so it cannot land on an animation frame below.
+        open(&mut f, &output);
+        f.settle_animations();
+        let _ = crate::frame_log::take_bake_sites();
+        let _ = render_output_vulkan(&mut f, &output);
+        let warm = crate::frame_log::take_bake_sites();
+        // The other vacuity mode, and the one that killed the app-grid version of this test: a
+        // widget that never renders re-bakes nothing on every frame, perfectly. Prove the subject
+        // is live before asserting anything about how often it bakes.
+        assert!(
+            warm.iter().any(|s| s.file.contains(subject)),
+            "no {subject} bake while the {name} popover was open and settled, so this test cannot              observe the thing it asserts about. Sites seen: {warm:?}"
+        );
+
+        f.niri().panel_popover.close();
+        f.settle_animations();
+        let _ = render_output_vulkan(&mut f, &output);
+        let _ = crate::frame_log::take_bake_sites();
+
+        open(&mut f, &output);
+        assert!(f.niri().panel_popover.is_open(), "{name} did not open");
+        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(20));
+        let repeats = sites_baking_repeatedly(&per_frame);
+
+        assert!(
+            repeats.is_empty(),
+            "these widgets re-baked across {} frames of the {name} popover's open fade: \
+             {repeats:?}\nA bake is a GPU round trip. The fade is alpha, and alpha is free on the \
+             element — keep it out of the bake key.",
+            per_frame.len(),
+        );
+    }
+}
+
+// **Gap, deliberately not a test.** The app grid is the worst case for this bug class — ~24 tiles,
+// each with a shaped label — and it has been fixed for it once already (`c5336421`: hover bumped
+// `content_rev`, so a pointer moving during the open animation re-shaped every label every frame;
+// the tell was that *closing* stayed smooth, because the grid is not reactive then).
+//
+// A guardrail for it was written and then removed, because it could not fail. In this fixture the
+// grid bakes **nothing**: with the overview open, `toggle_app_grid()` returning true,
+// `is_app_grid_open()` true, 24 apps in a `FakeCatalog`, animations settled, and an output at both
+// 1280x720 and 1920x1080, no `ui/app_grid.rs` site appears in the bake sites — and a mutation that
+// changed the label bake key on *every call* still passed. So some precondition of the grid's
+// render path is unmet here and was not found; a green test asserting "nothing re-baked" over a
+// widget that never draws is worse than no test, because it reads as coverage.
+//
+// To finish this: find why `AppGrid::render` contributes no bake (icons? the page layout coming
+// out empty? the dash's band geometry?), then bring back the test — the helpers it needs
+// (`bake_sites_per_frame`, `sites_baking_repeatedly`) are right here, and
+// `a_popover_open_fade_rebakes_nothing_per_frame` is the shape to copy, including its
+// baked-at-least-once guard.
