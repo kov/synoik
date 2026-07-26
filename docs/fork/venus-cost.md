@@ -161,6 +161,13 @@ is why §4.4 collapsed N of them into one, and §4.6 moved the write to another 
 
 ### 3.5 We are blind to GPU time
 
+> **RESOLVED 2026-07-26, host-side.** Two stacked bugs in the host Vulkan driver (KosmicKrisp), not
+> Venus: an elided Metal sampling encoder meant the sample was never taken, and the GPU counter
+> resolve could not see a sample until its command buffer completed, so it wrote a silent zero.
+> Root cause, validation (100/100 on this VM's own host GPU) and the ~0.4%-of-a-frame cost are in
+> [`venus-timestamp-gap.md` §7](./venus-timestamp-gap.md). Arrives with the next `limina.app`
+> deploy on this host. **The rest of this section is the original finding.**
+
 Timestamp queries are advertised in full (`timestampPeriod = 1`, `timestampComputeAndGraphics`,
 64 valid bits on the graphics queue) and **resolve every query to zero, with the availability word
 set to 1**. So nothing in the API distinguishes "this pass took no measurable time" from "not
@@ -286,7 +293,7 @@ one). Blur *was* on this list; it came off when we measured it (§3.8) — it is
    0.7–2.1 ms each is now our largest remaining in-frame cost, and it is irreducible from the guest
    because the resources are genuinely new. Even a batched "create N images" round trip would help;
    an asynchronous one would help more.
-3. **Fix timestamp queries (§3.5).** Cheap relative to the others, has a reproducer, and it is what
+3. **Fix timestamp queries (§3.5).** ~~Open~~ — **done 2026-07-26, host-side**; see §3.5. Cheap relative to the others, has a reproducer, and it is what
    would let the *next* round of this work distinguish host scheduling from GPU execution instead
    of inferring it. Every number above would get sharper.
 4. **Host-visible write bandwidth (§3.4)**, if there is anything to be had — ~6 GB/s is survivable
@@ -520,7 +527,9 @@ contending with itself, not other tenants.
 ### 8.5 Revised ranking
 
 1. **Fix timestamp queries.** Not a second-order tool — it gates the biggest item on the list.
-   Host-side work, in progress; nothing needed from the compositor.
+   ~~Host-side work, in progress~~ — **landed 2026-07-26** (`patches/kosmickrisp/0013`); still
+   nothing needed from the compositor, and it arrives with the next `limina.app` deploy. Item 3
+   below is now unblocked.
 2. **Bucket image extents (§8.1).** Guest-side, no host change, ~100× on what is currently the
    largest remaining in-frame cost. Verify with `VN_PERF=no_async_image_create` first.
 3. **Re-measure §3.2 with GPU time in hand.** It may evaporate; if it does not, the residue will
