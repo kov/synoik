@@ -16,7 +16,7 @@ use super::blur_chain::SharedBlurChain;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::fence::VkSubmitFence;
-use super::renderer::{transition_image, VulkanRenderer};
+use super::renderer::{transition_image, GpuTimerSlot, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
 
 /// The clip a [`ClippedSurfaceRenderElement`](crate::render_helpers::clipped_surface) wants applied
@@ -92,6 +92,11 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// recording binds, so destroying it before the submit invalidates the *whole* frame, not just
     /// the blur. See [`SharedBlurChain`].
     blur_chains: Vec<Arc<SharedBlurChain>>,
+    /// The timestamp pair this frame's command buffer stamped, if GPU timing is on and the ring
+    /// had a slot. Carried from `begin` to `finish` because the pair is per-*submit*, and it is
+    /// `finish` that decides whether the read happens here (after the fence wait) or at
+    /// retirement (when nobody waited).
+    gpu_slot: Option<GpuTimerSlot>,
     finished: bool,
 }
 
@@ -178,7 +183,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // `VulkanRenderer::pending_dmabuf_acquires`.
         // Outside the render pass, before any work: `vkCmdResetQueryPool` is not
         // allowed inside one, and this must precede the acquires so they count.
-        renderer.gpu_timer_begin(cbuf);
+        let gpu_slot = renderer.gpu_timer_begin(cbuf);
 
         // Kept alive by the frame (`held`) until its submit retires: the barriers above are
         // recorded against these images, and destroying one mid-recording invalidates this whole
@@ -250,6 +255,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             glyph_staging,
             texture_staging,
             blur_chains,
+            gpu_slot,
             finished: false,
         })
     }
@@ -1567,7 +1573,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                 );
             }
-            self.renderer.gpu_timer_end(self.cbuf);
+            self.renderer.gpu_timer_end(self.cbuf, self.gpu_slot);
             dev.end_command_buffer(self.cbuf)?;
 
             // A *scanout* frame we intend to walk away from needs an **exportable** fence, because
@@ -1624,6 +1630,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 self.renderer.add_in_flight(
                     timeline,
                     self.cbuf,
+                    self.gpu_slot,
                     fence.clone(),
                     held,
                     targets,
@@ -1658,9 +1665,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // The wait above proves our recorded glyph copy has executed; the staging can go.
             self.glyph_staging = None;
         }
-        // The fence is signalled, so the queries are resolved and this does not
-        // block.
-        self.renderer.gpu_timer_collect();
+        // Reached only on the synchronous branch (the deferred one returned above): the fence is
+        // signalled, so the queries are resolved and this does not block. A deferred frame's pair
+        // is read at retirement instead — see `VulkanRenderer::retire_completed`.
+        if let Some(slot) = self.gpu_slot {
+            self.renderer.gpu_timer_collect_through(slot);
+        }
         // The render pass's `final_layout` leaves the target in TRANSFER_SRC_OPTIMAL (see
         // `create_render_pass`); record it so readback is a no-op and `make_sampleable` knows the
         // source layout for its barrier. Unless we just took it further, above.

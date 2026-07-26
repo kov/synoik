@@ -3455,8 +3455,7 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
 
     // Clear whatever an earlier test in this process banked, so the reading below
     // is this render's alone.
-    let _ = crate::frame_log::take_gpu_time();
-    let _ = crate::frame_log::take_gpu_lost();
+    let _ = crate::frame_log::take_gpu_samples();
 
     let elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
@@ -3467,8 +3466,8 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
         .expect("vulkan offscreen");
     let _ = render_elements_into(&mut vk, &mut target, &elements);
 
-    let gpu = crate::frame_log::take_gpu_time();
-    let lost = crate::frame_log::take_gpu_lost();
+    let samples = crate::frame_log::take_gpu_samples();
+    let (gpu, lost) = (samples.time, samples.lost);
 
     // A device that advertises timestamps and then writes none banks nothing but
     // losses. This VM's virtio-gpu/Venus did exactly that until the host-side fix
@@ -4737,6 +4736,172 @@ fn an_offscreen_finish_defers_without_the_kms_bracket() {
 
     drop(fb);
     vk.drain_in_flight();
+}
+
+/// Measuring the renderer must not change what it measures.
+///
+/// GPU timing and deferral used to be mutually exclusive: a single timestamp pair per renderer
+/// would have been reset by the next command buffer while an in-flight submit was still writing
+/// it, so both deferral predicates required `gpu_timer.is_none()`. The cost was not the missing
+/// number — it was that `NIRI_FRAME_LOG=…,gpu` silently pushed the live seat back onto the
+/// synchronous path, so every reading taken with it described a configuration the seat does not
+/// run. A whole session's worth of "async scanout does not gain much" was measured that way.
+///
+/// So the assertion is both halves at once: the finish still walks away, *and* the pair still
+/// comes back. Either alone is the bug.
+#[test]
+fn gpu_timing_does_not_push_the_frame_back_onto_the_synchronous_path() {
+    let skip = |why: &str| eprintln!("skipping gpu_timing_does_not_push_the_frame_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    if !vk.enable_gpu_timing() {
+        return skip("the device declines to timestamp");
+    }
+    vk.set_defer_scanout(true);
+    // This thread's own samples only — `GPU_SAMPLES` is thread-local for exactly this reason.
+    let _ = crate::frame_log::take_gpu_samples();
+
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .expect("offscreen target");
+    let mut fb = vk.bind(&mut target).expect("bind offscreen");
+    let sync = {
+        let mut frame = vk
+            .render(
+                &mut fb,
+                Size::<i32, Physical>::from((64, 64)),
+                Transform::Normal,
+            )
+            .expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 1., 0., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        frame.finish().expect("finish")
+    };
+
+    assert!(
+        sync.contains_fence(),
+        "the finish waited on its fence with GPU timing on — measuring put the round trip back"
+    );
+    assert_eq!(
+        vk.in_flight_len(),
+        1,
+        "the submit was not deferred, so the query pool is still gating the frame path"
+    );
+    assert_eq!(
+        crate::frame_log::take_gpu_samples().count,
+        0,
+        "a deferred submit's pair was read before anything proved it complete"
+    );
+
+    // Retirement is where a deferred pair is read: the timeline has passed the submit, so the
+    // queries have resolved and the read cannot block.
+    drop(fb);
+    vk.drain_in_flight();
+
+    let samples = crate::frame_log::take_gpu_samples();
+    assert_eq!(
+        samples.count, 1,
+        "the deferred submit's timestamp pair was never collected — the slot leaked, and after \
+         {} more the ring stops handing them out",
+        7
+    );
+    if samples.lost > 0 {
+        eprintln!("note: the device wrote no usable pair for this submit ({samples:?})");
+        return;
+    }
+    assert!(
+        samples.time > Duration::ZERO,
+        "a deferred submit reported a zero-length GPU pass"
+    );
+}
+
+/// The ring is what makes the above possible, so pin its two invariants over a burst of deferred
+/// submits: it never has more pairs outstanding than it owns, and every pair it hands out comes
+/// back exactly once.
+///
+/// Together those are the clobber guard. Without the cap in `gpu_timer_begin`, a submit would reset
+/// a pair the GPU is still writing — undefined behavior that no pixel comparison can see, and that
+/// the validation layer cannot see either, since resetting a query is legal Vulkan. Without the
+/// FIFO drain, a slot would leak and the ring would quietly stop timing after eight frames.
+///
+/// Whether the ring actually *saturates* here is data-dependent — every `render` retires first, so
+/// a GPU that keeps up frees a slot per round — which is why the bound is asserted rather than the
+/// exhaustion. Refusing a slot costs the frame log one line's `gpu` figure and costs the frame path
+/// nothing, so an untimed frame is the correct outcome either way.
+#[test]
+fn the_timestamp_ring_runs_out_of_slots_rather_than_clobbering_one() {
+    let skip = |why: &str| eprintln!("skipping the_timestamp_ring_runs_out_of_slots_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    if !vk.enable_gpu_timing() {
+        return skip("the device declines to timestamp");
+    }
+    vk.set_defer_scanout(true);
+    let _ = crate::frame_log::take_gpu_samples();
+
+    // Comfortably more renders than the ring has slots.
+    let rounds = vk.gpu_timer_slots() * 3;
+    let mut collected = 0;
+    let mut targets = Vec::new();
+    for _ in 0..rounds {
+        let mut target = vk
+            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((32, 32)))
+            .expect("offscreen target");
+        {
+            let mut fb = vk.bind(&mut target).expect("bind offscreen");
+            let mut frame = vk
+                .render(
+                    &mut fb,
+                    Size::<i32, Physical>::from((32, 32)),
+                    Transform::Normal,
+                )
+                .expect("render");
+            frame
+                .clear(
+                    Color32F::new(0., 0., 1., 1.),
+                    &[Rectangle::from_size((32, 32).into())],
+                )
+                .expect("clear");
+            drop(frame.finish().expect("finish"));
+        }
+        targets.push(target);
+        assert!(
+            vk.gpu_timer_pending() <= vk.gpu_timer_slots(),
+            "the ring handed out more pairs than it owns, so a submit reset one still in use"
+        );
+        // Renders retire earlier submits as they go, so some pairs come back mid-burst.
+        collected += crate::frame_log::take_gpu_samples().count;
+    }
+
+    let issued = vk.gpu_timer_issued();
+    assert!(
+        issued >= vk.gpu_timer_slots(),
+        "the burst never used the whole ring ({issued} pairs), so it proves nothing about reuse"
+    );
+
+    vk.drain_in_flight();
+    collected += crate::frame_log::take_gpu_samples().count;
+    assert_eq!(
+        collected,
+        issued,
+        "every pair the ring handed out must come back exactly once — a leaked slot silently \
+         retires the instrument after {} frames",
+        vk.gpu_timer_slots()
+    );
 }
 
 /// The trap that comes with deferring an offscreen finish, and it costs more than it saves if it

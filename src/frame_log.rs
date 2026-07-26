@@ -61,7 +61,7 @@
 //! round-trip), and the overview/animation state.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -112,7 +112,36 @@ thread_local! {
     /// [`BAKE_NANOS`], because the guardrail tests read it without a log. A hash
     /// insert against a GPU round trip is not a cost worth gating.
     static BAKE_SITES: RefCell<HashMap<SiteKey, SiteTally>> = RefCell::new(HashMap::new());
+
+    /// Timestamp pairs the renderer has read back, tagged with the frame they
+    /// belong to: `(sequence, Some(duration) | None for a pair that came back
+    /// unusable)`.
+    ///
+    /// Tagged rather than summed into one counter because a deferred submit is
+    /// measured *after* the frame that issued it has already finished on the CPU
+    /// — the sample surfaces one or two frames later, when the queue timeline
+    /// passes it. Summing would silently move an overview frame's 11ms onto the
+    /// idle frame that happened to retire it, which is exactly the attribution
+    /// the instrument exists to provide. [`FrameLog::end`] parks a frame's line
+    /// until its samples land; see [`FrameLog::parked`].
+    ///
+    /// Per-thread for the same reason as [`BAKES`], and it fixes the same latent
+    /// flake: samples were a process-wide counter that the timing test drained
+    /// first to compensate, which only works while no other test renders at the
+    /// same moment.
+    static GPU_SAMPLES: RefCell<Vec<(u64, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
+
+    /// How many samples the renderer has promised for the frame being built —
+    /// one per submit it stamped. [`FrameLog::end`] waits for exactly this many
+    /// before emitting the line, so a frame is never reported with a partial GPU
+    /// total that reads like a complete one.
+    static GPU_EXPECTED: Cell<u64> = const { Cell::new(0) };
 }
+
+/// Samples to keep before dropping the oldest. Only reached when something
+/// promised a sample and never delivered it — a submit that failed, or a render
+/// outside any logged frame — so the cap is a leak guard, not a working limit.
+const MAX_PENDING_SAMPLES: usize = 64;
 
 /// Where a bake came from: `(file, line)` of the widget's call, from
 /// `#[track_caller]`. `Location` itself is not hashable, and the pair is what a
@@ -187,22 +216,24 @@ pub fn take_bake_sites() -> Vec<BakeSite> {
 /// equivalent. See [`gpu_timing`].
 static GPU_TIMING: OnceLock<bool> = OnceLock::new();
 
-/// Accumulated GPU time reported by the renderer for the frame being built, in
-/// nanoseconds. The renderer adds each submit's measured duration; the frame log
-/// takes and clears it when the frame ends.
+/// Numbers the frames the log has begun, so a GPU sample read back later can say
+/// which frame it belongs to.
 ///
-/// A free-standing counter for the same reason as [`BAKES`]: a `VulkanFrame` is
-/// created in a dozen places that would otherwise all have to carry a handle to
-/// the log, and this is debug instrumentation, not a data path. Process-wide
-/// rather than per-thread because nothing asserts on it.
-static GPU_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Process-wide rather than per-thread only so the numbers never collide between
+/// a test's renderer and the compositor's; the samples themselves are per-thread.
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Timestamp pairs the renderer read back and could not use, for the frame being
-/// built. Counted, not silently dropped: a stack that writes only some of its
-/// timestamps would otherwise make [`GPU_NANOS`] a sum over an unknown subset of
-/// the frame's passes, i.e. a number that reads like a total and is a floor.
-/// With the loss count beside it the reader can tell the two apart.
-static GPU_LOST: AtomicU64 = AtomicU64::new(0);
+/// The frame currently being built, or **0** for "no frame is". Read by the
+/// renderer through [`current_frame_seq`] when it stamps a command buffer.
+///
+/// The zero matters. Rendering also happens *between* frames — screenshots,
+/// screencast, a test's own renderer — and tagging those samples with the last
+/// frame's number would credit its line with GPU time it never spent, or park a
+/// frame waiting for a sample that had already been spent elsewhere. Sequences
+/// start at 1, so a sample tagged 0 matches no frame and ages out of
+/// [`GPU_SAMPLES`], which is what should happen to a measurement with no line to
+/// go on.
+static CURRENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Whether anything is listening. Sampled by the scoped timers so an unlogged
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
@@ -286,29 +317,95 @@ fn wants_gpu_timing(raw: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case("gpu"))
 }
 
-/// Report a submit's measured GPU duration. Called by the renderer after it
-/// reads back its timestamp queries.
-pub fn add_gpu_time(duration: Duration) {
-    GPU_NANOS.fetch_add(
-        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
+/// Which frame the log is building, or 0 outside one. See [`CURRENT_SEQ`].
+pub fn current_frame_seq() -> u64 {
+    CURRENT_SEQ.load(Ordering::Relaxed)
 }
 
-/// Report a timestamp pair that came back unusable. See [`GPU_LOST`].
-pub fn add_gpu_lost() {
-    GPU_LOST.fetch_add(1, Ordering::Relaxed);
+/// Promise one GPU sample for the frame being built, so [`FrameLog::end`] knows
+/// how many to wait for. Called by the renderer when it stamps a command buffer.
+///
+/// A no-op outside a frame: that submit's sample has no line to land on, so
+/// promising it would park the *next* frame forever.
+pub fn expect_gpu_sample() {
+    if current_frame_seq() == 0 {
+        return;
+    }
+    GPU_EXPECTED.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-/// Take the GPU time banked since the last call. The frame log calls this when a
-/// frame ends; tests use it to check that the renderer's timestamps arrive at all.
-pub fn take_gpu_time() -> Duration {
-    Duration::from_nanos(GPU_NANOS.swap(0, Ordering::Relaxed))
+/// Report a submit's measured GPU duration against the frame that issued it.
+pub fn add_gpu_time(seq: u64, duration: Duration) {
+    push_gpu_sample(seq, Some(duration));
 }
 
-/// Take the count of unusable timestamp pairs banked since the last call.
-pub fn take_gpu_lost() -> u64 {
-    GPU_LOST.swap(0, Ordering::Relaxed)
+/// Report a timestamp pair that came back unusable. Counted, not silently
+/// dropped: a stack that writes only some of its timestamps would otherwise make
+/// the reported total a sum over an unknown subset of the frame's passes, i.e. a
+/// number that reads like a total and is a floor. With the loss count beside it
+/// the reader can tell the two apart.
+pub fn add_gpu_lost(seq: u64) {
+    push_gpu_sample(seq, None);
+}
+
+fn push_gpu_sample(seq: u64, sample: Option<Duration>) {
+    GPU_SAMPLES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() >= MAX_PENDING_SAMPLES {
+            s.remove(0);
+        }
+        s.push((seq, sample));
+    });
+}
+
+/// What the renderer measured for one frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GpuSamples {
+    /// Summed duration of the pairs that came back usable.
+    pub time: Duration,
+    /// Pairs that came back unusable.
+    pub lost: u64,
+    /// Pairs of either kind, i.e. how many of the promised samples have landed.
+    pub count: u64,
+}
+
+impl GpuSamples {
+    fn add(&mut self, sample: Option<Duration>) {
+        self.count += 1;
+        match sample {
+            Some(time) => self.time += time,
+            None => self.lost += 1,
+        }
+    }
+}
+
+/// Take every sample belonging to `seq`, leaving the rest.
+fn take_gpu_samples_for(seq: u64) -> GpuSamples {
+    GPU_SAMPLES.with(|s| {
+        let mut s = s.borrow_mut();
+        let mut out = GpuSamples::default();
+        s.retain(|&(at, sample)| {
+            if at == seq {
+                out.add(sample);
+                false
+            } else {
+                true
+            }
+        });
+        out
+    })
+}
+
+/// Take every sample this thread has banked, whatever frame it belongs to. For
+/// tests, which render without a frame log and so have no sequence to match.
+pub fn take_gpu_samples() -> GpuSamples {
+    GPU_SAMPLES.with(|s| {
+        let mut out = GpuSamples::default();
+        for (_, sample) in s.borrow_mut().drain(..) {
+            out.add(sample);
+        }
+        out
+    })
 }
 
 /// One measured stretch of a frame. In the order they run.
@@ -452,6 +549,9 @@ impl Stats {
 #[derive(Debug)]
 struct InFlight {
     output: String,
+    /// This frame's number, so a GPU sample read back after the frame has ended
+    /// can still find it. See [`FRAME_SEQ`].
+    seq: u64,
     started: Instant,
     /// When the current phase began — every mark closes one span and opens the next.
     phase_started: Instant,
@@ -523,11 +623,40 @@ struct Totals {
     shaded: u64,
 }
 
+/// A finished frame waiting for the GPU samples it was promised. See
+/// [`FrameLog::parked`].
+#[derive(Debug)]
+struct Parked {
+    frame: InFlight,
+    total: Duration,
+    totals: Totals,
+    budget: Option<Duration>,
+    /// Samples the renderer promised, and how many have arrived.
+    expected: u64,
+    arrived: u64,
+}
+
+/// How many finished frames to hold for their samples before giving up on the
+/// oldest and emitting it with what it has.
+///
+/// Deferral keeps at most a couple of submits outstanding, so reaching this means
+/// a promised sample is never coming — a submit that errored out, or a device
+/// that stopped signalling. Emitting is the right failure: a late line with a
+/// short GPU total beats a frame that never appears in the log at all.
+const MAX_PARKED_FRAMES: usize = 4;
+
 /// See the [module docs](self).
 #[derive(Debug)]
 pub struct FrameLog {
     settings: Option<Settings>,
     in_flight: Option<InFlight>,
+    /// Frames whose CPU work is done but whose GPU samples have not all landed —
+    /// the renderer walked away from the submit, so the measurement arrives a
+    /// frame or two later. Their lines are held back rather than emitted with a
+    /// partial total, which is what keeps `gpu` honest once deferral is on.
+    /// Bounded by [`MAX_PARKED_FRAMES`]; empty whenever GPU timing is off, since
+    /// nothing promises a sample then.
+    parked: VecDeque<Parked>,
     stats: HashMap<String, Stats>,
     /// Per output, the last frame handed to KMS: what it aimed at and when we let
     /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
@@ -574,6 +703,7 @@ impl FrameLog {
         Self {
             settings,
             in_flight: None,
+            parked: VecDeque::new(),
             stats: HashMap::new(),
             queued: HashMap::new(),
             last_presented: HashMap::new(),
@@ -635,9 +765,17 @@ impl FrameLog {
         // frame starts. See `niri_vk::stats::begin_frame`.
         niri_vk::stats::begin_frame();
 
+        // Anything the last frame promised and never delivered is not this frame's;
+        // clear it so a failed submit cannot park the next line forever.
+        GPU_EXPECTED.with(|c| c.set(0));
+
+        let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        CURRENT_SEQ.store(seq, Ordering::Relaxed);
+
         let now = Instant::now();
         self.in_flight = Some(InFlight {
             output: output.to_owned(),
+            seq,
             started: now,
             phase_started: now,
             phase: None,
@@ -684,15 +822,20 @@ impl FrameLog {
         let Some(mut frame) = self.in_flight.take() else {
             return;
         };
+        // Whatever renders next — a screenshot, a screencast, the next frame's own bakes before
+        // its `begin` — is not this frame's. See `CURRENT_SEQ`.
+        CURRENT_SEQ.store(0, Ordering::Relaxed);
 
         let now = Instant::now();
         if let Some(last) = frame.phase.take() {
             frame.spans.push((last, now - frame.phase_started));
         }
         let total = now - frame.started;
+        let expected = GPU_EXPECTED.with(|c| c.replace(0));
+        let samples = take_gpu_samples_for(frame.seq);
         let totals = Totals {
-            gpu: take_gpu_time(),
-            gpu_lost: take_gpu_lost(),
+            gpu: samples.time,
+            gpu_lost: samples.lost,
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
             bake_sites: take_bake_sites(),
@@ -714,6 +857,57 @@ impl FrameLog {
         // With neither (a headless output with no refresh) nothing is "too long",
         // so only `all` logs.
         let budget = settings.threshold.or(refresh);
+
+        self.parked.push_back(Parked {
+            frame,
+            total,
+            totals,
+            budget,
+            expected,
+            arrived: samples.count,
+        });
+        self.flush_parked(settings);
+
+        self.maybe_summarize(now);
+    }
+
+    /// Emit every parked frame whose samples have all landed, oldest first, plus
+    /// the oldest unconditionally if the queue has outgrown [`MAX_PARKED_FRAMES`].
+    ///
+    /// Order matters more than promptness here: frames are emitted in the order
+    /// they ran, so a run of lines still reads as a timeline even though each one
+    /// now appears a frame or two after the work it describes. With GPU timing
+    /// off nothing is ever promised, so every frame is complete on arrival and
+    /// this is the same synchronous emit it always was.
+    fn flush_parked(&mut self, settings: Settings) {
+        // Top up every parked frame, not just the front: samples arrive in submit
+        // order, but a synchronous frame can complete behind a deferred one.
+        for parked in &mut self.parked {
+            if parked.arrived < parked.expected {
+                let late = take_gpu_samples_for(parked.frame.seq);
+                parked.totals.gpu += late.time;
+                parked.totals.gpu_lost += late.lost;
+                parked.arrived += late.count;
+            }
+        }
+
+        while let Some(front) = self.parked.front() {
+            if front.arrived < front.expected && self.parked.len() <= MAX_PARKED_FRAMES {
+                break;
+            }
+            let parked = self.parked.pop_front().expect("front exists");
+            self.emit(parked, settings);
+        }
+    }
+
+    fn emit(&mut self, parked: Parked, settings: Settings) {
+        let Parked {
+            frame,
+            total,
+            totals,
+            budget,
+            ..
+        } = parked;
         let over = budget.is_some_and(|budget| total > budget);
 
         if over || settings.log_all {
@@ -731,8 +925,6 @@ impl FrameLog {
             totals.gpu,
             totals.gpu_lost,
         );
-
-        self.maybe_summarize(now);
     }
 
     fn format_frame(
@@ -918,9 +1110,14 @@ impl FrameLog {
         actual: Duration,
         refresh: Option<Duration>,
     ) {
-        if self.settings.is_none() {
+        let Some(settings) = self.settings else {
             return;
-        }
+        };
+
+        // A frame parked for its GPU samples is emitted by whatever happens next, and on an idle
+        // output the next `end` can be a second away. The flip is the other thing that happens, and
+        // it happens *after* the submit it waited on — so by here the samples have landed.
+        self.flush_parked(settings);
 
         // Only the frame that was built for this target: on a miss the next
         // frame's queue overwrites the entry, and pairing a late presentation
@@ -1209,6 +1406,7 @@ mod tests {
     fn empty_frame() -> InFlight {
         let now = Instant::now();
         InFlight {
+            seq: 1,
             output: "out".to_owned(),
             started: now,
             phase_started: now,
@@ -1428,17 +1626,123 @@ mod tests {
         assert_eq!(bakes(), before + 1, "this thread's own bake is counted");
     }
 
-    /// Phase marks name the work that *follows* them, and the totals add up.
-    #[test]
-    fn phases_attribute_the_span_after_the_mark() {
-        let mut log = FrameLog {
+    fn test_log() -> FrameLog {
+        FrameLog {
+            parked: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
-        };
+        }
+    }
+
+    /// Promise `n` samples for the frame the log is building.
+    ///
+    /// Writes the thread-local directly rather than calling [`expect_gpu_sample`],
+    /// which reads the process-wide [`CURRENT_SEQ`]: libtest runs these in
+    /// parallel, so another test's `end` can zero it between this test's `begin`
+    /// and its promise, and the flake would look like the parking logic. The
+    /// sequence a sample is *tagged* with is read from the frame itself, and
+    /// [`FRAME_SEQ`] only ever hands out unique numbers, so nothing else here is
+    /// shared.
+    fn promise_gpu_samples(n: u64) {
+        GPU_EXPECTED.with(|c| c.set(c.get() + n));
+    }
+
+    /// A sample belongs to the frame that *issued* it, not the one that happened
+    /// to read it back.
+    ///
+    /// The distinction only exists because a deferred submit is measured after its
+    /// frame has finished on the CPU. Summing into one counter — which is what
+    /// this replaced — silently moves an overview frame's 11ms of GPU time onto
+    /// the idle frame behind it, i.e. reports the expensive frame as cheap and the
+    /// cheap one as expensive. That is worse than no number.
+    #[test]
+    fn a_sample_belongs_to_the_frame_that_issued_it() {
+        let _ = take_gpu_samples();
+
+        add_gpu_time(7, Duration::from_millis(5));
+        add_gpu_time(9, Duration::from_millis(2));
+        add_gpu_lost(7);
+
+        let seven = take_gpu_samples_for(7);
+        assert_eq!(seven.time, Duration::from_millis(5), "wrong frame's time");
+        assert_eq!(seven.lost, 1, "the lost pair went to the wrong frame");
+        assert_eq!(seven.count, 2, "a promised sample was not accounted for");
+
+        let nine = take_gpu_samples_for(9);
+        assert_eq!(nine.time, Duration::from_millis(2));
+        assert_eq!(nine.count, 1, "frame 9 took a sample that was not its own");
+
+        assert_eq!(take_gpu_samples().count, 0, "samples outlived their frame");
+    }
+
+    /// A frame whose submit was deferred holds its line until the measurement
+    /// lands — and the frames behind it wait their turn rather than overtaking.
+    #[test]
+    fn a_frame_waits_for_the_gpu_samples_it_was_promised() {
+        let _ = take_gpu_samples();
+        let mut log = test_log();
+
+        log.begin("out");
+        promise_gpu_samples(1);
+        let deferred = log.in_flight.as_ref().unwrap().seq;
+        log.end(Some(Duration::from_millis(16)));
+        assert!(
+            !log.stats.contains_key("out"),
+            "the line was emitted with no GPU time, which reads as a frame that used none"
+        );
+
+        // A later frame that promised nothing is still held: lines come out in the
+        // order the frames ran, or a run of them stops being a timeline.
+        log.begin("out");
+        log.end(Some(Duration::from_millis(16)));
+        assert_eq!(
+            log.parked.len(),
+            2,
+            "a complete frame overtook a parked one"
+        );
+
+        add_gpu_time(deferred, Duration::from_millis(9));
+        log.flush_parked(log.settings.unwrap());
+
+        assert!(log.parked.is_empty(), "the sample landed and nothing moved");
+        let stats = &log.stats["out"];
+        assert_eq!(stats.frames, 2);
+        assert_eq!(
+            stats.gpu_total,
+            Duration::from_millis(9),
+            "the deferred frame's GPU time never reached its line"
+        );
+    }
+
+    /// A promise that is never kept must not park the log forever. A submit can
+    /// fail after it stamped its command buffer, and the frame it belonged to
+    /// still has everything else worth reporting.
+    #[test]
+    fn a_sample_that_never_arrives_releases_its_frame() {
+        let _ = take_gpu_samples();
+        let mut log = test_log();
+
+        for _ in 0..MAX_PARKED_FRAMES + 1 {
+            log.begin("out");
+            promise_gpu_samples(1);
+            log.end(Some(Duration::from_millis(16)));
+        }
+
+        assert_eq!(
+            log.stats["out"].frames, 1,
+            "the cap released the wrong number of frames — it must give up on the oldest only"
+        );
+        assert_eq!(log.parked.len(), MAX_PARKED_FRAMES);
+    }
+
+    /// Phase marks name the work that *follows* them, and the totals add up.
+    #[test]
+    fn phases_attribute_the_span_after_the_mark() {
+        let mut log = test_log();
 
         log.begin("test-output");
         log.phase(Phase::Elements);
@@ -1460,6 +1764,7 @@ mod tests {
     fn only_a_late_presentation_counts_as_missed() {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
+            parked: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -1501,6 +1806,7 @@ mod tests {
         // on the gap between presentations would call this 59 dropped frames every
         // second; it is a compositor with nothing to draw.
         let mut log = FrameLog {
+            parked: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -1529,6 +1835,7 @@ mod tests {
     fn cadence_counts_the_gaps_between_presentations() {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
+            parked: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -1564,6 +1871,7 @@ mod tests {
     fn headroom_belongs_to_the_frame_that_was_queued() {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
+            parked: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),

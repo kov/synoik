@@ -148,7 +148,13 @@ sampled immediately and there is nothing to hand the fence to.
    `DrmCompositor::render_frame` with `set_finish_may_defer`, because a screencopy or screencast
    render into a dmabuf is indistinguishable from inside the renderer and hands its buffer to a
    consumer that expects it finished. Deferral additionally requires the device to order submits,
-   GPU timing to be off (its query pool is per-frame), and the session to have asked.
+   and the session to have asked. **GPU timing used to be a third condition** — a single timestamp
+   pair per renderer would have been reset by the next command buffer while an in-flight submit was
+   still writing it. That made measuring the renderer change the renderer: `NIRI_FRAME_LOG=…,gpu`
+   silently put the live seat back on the synchronous finish for the whole session, so every
+   reading taken with it described a configuration the seat does not run. `GpuTimer` now keeps a
+   ring of pairs, one per outstanding submit, read at retirement instead of after the wait
+   (2026-07-26). Neither has to give way.
 
 ## Measured on the seat (2026-07-25)
 
@@ -424,7 +430,7 @@ and the first draft of this section said none of this:
    the tty bracket around `render_frame` (`tty.rs:2892`) and every offscreen finish happens earlier,
    during element collection — dropping the clause defers nothing. Offscreen had to become its own
    eligibility rule (`VulkanRenderer::should_defer_offscreen_finish`): the same two device
-   requirements as scanout — a total order on submits, and no per-frame query pool — minus the tty
+   requirements as scanout — a total order on submits (the query-pool clause is gone, see above) — minus the tty
    bracket, and minus the *exportable* fence, since nothing outside the process ever takes an
    offscreen's completion. That last point also means an offscreen finish can never be pushed back
    onto the synchronous path by an export failure, the way a scanout frame can.

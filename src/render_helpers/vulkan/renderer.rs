@@ -1,5 +1,5 @@
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -517,8 +517,7 @@ impl VulkanRenderer {
             custom_open: None,
             sampler_set_layout,
             command_pool,
-            gpu_timer: GpuTimer::if_requested(&gpu_for_timer)
-                .inspect(|timer| warn_if_timing_costs_deferral(timer.is_some()))?,
+            gpu_timer: GpuTimer::if_requested(&gpu_for_timer)?,
             in_flight: Vec::new(),
             finish_may_defer: false,
             defer_scanout: deferred_scanout_requested(),
@@ -1660,22 +1659,34 @@ pub(super) unsafe fn transition_image(
     );
 }
 
-/// GPU-side timing for one submit: a two-slot timestamp query pool, written at
-/// the top and bottom of each command buffer and read back right after the fence
-/// wait the renderer already does.
+/// GPU-side timing: a ring of timestamp query *pairs*, one taken per submit,
+/// written at the top and bottom of that submit's command buffer and read back
+/// once the queue timeline proves the submit has completed.
 ///
-/// Two slots is enough precisely *because* the renderer is synchronous — every
-/// submit is fence-waited before the next command buffer is recorded, so the
-/// results are always collected before the pool is reset. An asynchronous
-/// renderer would need a pool per frame in flight.
+/// A ring rather than a single pair because a submit the CPU walked away from is
+/// still executing when the next command buffer is recorded, and
+/// `vkCmdResetQueryPool` on the pair it is writing would race it. That race is
+/// the whole reason GPU timing and deferral used to be mutually exclusive — the
+/// deferral predicates required `gpu_timer.is_none()`, so measuring the renderer
+/// changed the thing it measured, and the live seat silently ran synchronously
+/// whenever `NIRI_FRAME_LOG=…,gpu` was set. With a slot per outstanding submit
+/// neither has to give way.
 ///
 /// Only built when `NIRI_FRAME_LOG` asked for `gpu` timing, so the query writes
 /// are absent (not merely unread) in a normal session.
 struct GpuTimer {
     pool: vk::QueryPool,
+    /// The next ring index to hand out. Monotonic; the pair lives at
+    /// `index % SLOTS`.
+    next: Cell<u64>,
+    /// Slots stamped but not yet read, oldest first — submission order, which is
+    /// also completion order (`Gpu::submit` chains every submit on the queue
+    /// timeline). Its length is what bounds the ring: a submit that would take a
+    /// slot still in here goes untimed rather than clobbering it.
+    pending: RefCell<VecDeque<GpuTimerSlot>>,
     /// Set when the device turns out not to write timestamps despite advertising
     /// them, after which the whole thing goes quiet. See
-    /// [`VulkanRenderer::gpu_timer_collect`].
+    /// [`VulkanRenderer::gpu_timer_collect_through`].
     unusable: Cell<bool>,
     /// Consecutive collections that came back entirely unwritten. Reset by any
     /// collection that carried a value, so only a device that never writes
@@ -1686,6 +1697,26 @@ struct GpuTimer {
     /// answers ("does this device implement timestamps at all?") has been
     /// answered, and no length of dry spell re-opens it.
     ever_written: Cell<bool>,
+}
+
+/// One submit's timestamp pair: where it lives in the ring, and which frame log
+/// line it belongs to.
+///
+/// The sequence travels with the slot because a deferred submit is read back
+/// *after* the frame that issued it has finished on the CPU — without it the
+/// sample would land on whichever frame happened to retire it, quietly moving an
+/// overview frame's GPU time onto the idle frame behind it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GpuTimerSlot {
+    index: u64,
+    seq: u64,
+}
+
+impl GpuTimer {
+    /// Timestamp pairs in the ring. Deferral keeps one or two submits
+    /// outstanding, so this is slack rather than a working limit; the cost is 16
+    /// queries in a session that asked to be measured.
+    const SLOTS: u64 = 8;
 }
 
 impl GpuTimer {
@@ -1721,14 +1752,21 @@ impl GpuTimer {
 
         let ci = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(2);
+            .query_count(u32::try_from(Self::SLOTS * 2).expect("small"));
         let pool = unsafe { gpu.device.create_query_pool(&ci, None) }?;
         Ok(Some(Self {
             pool,
+            next: Cell::new(0),
+            pending: RefCell::new(VecDeque::new()),
             unusable: Cell::new(false),
             unwritten_run: Cell::new(0),
             ever_written: Cell::new(false),
         }))
+    }
+
+    /// The first of the two queries belonging to ring index `index`.
+    fn query(&self, index: u64) -> u32 {
+        u32::try_from((index % Self::SLOTS) * 2).expect("small")
     }
 
     /// The pool only if the session asked for GPU timing.
@@ -1752,6 +1790,10 @@ struct InFlightSubmit {
     /// covering every outstanding submit at once.
     timeline: u64,
     cbuf: vk::CommandBuffer,
+    /// The timestamp pair this submit stamped, if it was measured. Read at retirement rather
+    /// than at `finish`: the queries only resolve when the submit completes, and the whole point
+    /// of this record is that nobody waited for that.
+    gpu_slot: Option<GpuTimerSlot>,
     /// Shared with the sync point handed to KMS; the fence outlives whichever lets go last.
     _fence: VkSubmitFence,
     /// Every texture the command buffer samples, held for exactly the reason `VulkanFrame::held`
@@ -1798,12 +1840,21 @@ impl VulkanRenderer {
             .iter()
             .take_while(|f| f.timeline <= completed)
             .count();
+        let mut measured = None;
         for frame in self.in_flight.drain(..done) {
             unsafe {
                 self.gpu
                     .device
                     .free_command_buffers(self.command_pool, std::slice::from_ref(&frame.cbuf));
             }
+            measured = frame.gpu_slot.or(measured);
+        }
+        // The timeline has passed every submit we just freed, so their queries have resolved and
+        // reading them cannot block. One call: collecting *through* the newest drains the older
+        // ones with it. Done after the loop because the read borrows the timer while `in_flight`
+        // is borrowed mutably above.
+        if let Some(slot) = measured {
+            self.gpu_timer_collect_through(slot);
         }
     }
 
@@ -1818,12 +1869,17 @@ impl VulkanRenderer {
         self.retire_completed();
         // A device that cannot report its timeline leaves the records unretired above; the wait
         // above already proved them complete, so free them here rather than leak.
+        let mut measured = None;
         for frame in std::mem::take(&mut self.in_flight) {
             unsafe {
                 self.gpu
                     .device
                     .free_command_buffers(self.command_pool, std::slice::from_ref(&frame.cbuf));
             }
+            measured = frame.gpu_slot.or(measured);
+        }
+        if let Some(slot) = measured {
+            self.gpu_timer_collect_through(slot);
         }
     }
 
@@ -1834,6 +1890,7 @@ impl VulkanRenderer {
         &mut self,
         timeline: u64,
         cbuf: vk::CommandBuffer,
+        gpu_slot: Option<GpuTimerSlot>,
         fence: VkSubmitFence,
         held: Vec<VkTexture>,
         targets: Vec<VkTexture>,
@@ -1843,6 +1900,7 @@ impl VulkanRenderer {
     ) {
         self.in_flight.push(InFlightSubmit {
             timeline,
+            gpu_slot,
             cbuf,
             _fence: fence,
             _held: held,
@@ -1874,14 +1932,14 @@ impl VulkanRenderer {
     /// - the caller must have somewhere to put the fence (`finish_may_defer`);
     /// - the device must order submits, or work issued next could execute alongside this one and
     ///   race it on the images the renderer reuses across frames (`Gpu::submit`);
-    /// - GPU timing reuses a single query pool per frame, whose reset would race an in-flight
-    ///   frame's queries;
     /// - and the session must have asked, until this has run on a real seat.
+    ///
+    /// GPU timing used to be a fourth condition, because a single query pair per renderer would
+    /// have been reset while an in-flight frame was still writing it. [`GpuTimer`] now keeps a
+    /// slot per outstanding submit, so measuring no longer forces the frame path back onto the
+    /// synchronous branch — which it silently did on the live seat for every `gpu` session.
     pub(super) fn should_defer_finish(&self) -> bool {
-        self.finish_may_defer
-            && self.defer_scanout
-            && self.gpu.orders_submits()
-            && self.gpu_timer.is_none()
+        self.finish_may_defer && self.defer_scanout && self.gpu.orders_submits()
     }
 
     /// Whether a finish that targets an **offscreen** should hand its completion to the in-flight
@@ -1894,12 +1952,11 @@ impl VulkanRenderer {
     /// defer at all, which is how it came to be the largest block of blocked time in the frame log.
     ///
     /// It also needs no *exportable* fence: nothing outside this process ever takes an offscreen's
-    /// completion, so a plain fence in the record is enough. What is left is the two device
-    /// requirements that make walking away sound at all — a total order on submits, so nothing
-    /// issued afterwards can execute alongside this one, and no per-frame query pool whose reset
-    /// would race an in-flight frame.
+    /// completion, so a plain fence in the record is enough. What is left is the one device
+    /// requirement that makes walking away sound at all — a total order on submits, so nothing
+    /// issued afterwards can execute alongside this one.
     pub(super) fn should_defer_offscreen_finish(&self) -> bool {
-        self.defer_scanout && self.gpu.orders_submits() && self.gpu_timer.is_none()
+        self.defer_scanout && self.gpu.orders_submits()
     }
 
     /// Override the session's opt-in for this renderer alone. Tests only: headless there is no KMS
@@ -1945,23 +2002,60 @@ impl VulkanRenderer {
         self.gpu_timer.is_some()
     }
 
-    /// Reset the query pool and stamp the start of `cbuf`. Must be called with
-    /// `cbuf` recording and **outside** a render pass (`vkCmdResetQueryPool` is
-    /// not allowed inside one).
-    pub(super) fn gpu_timer_begin(&self, cbuf: vk::CommandBuffer) {
-        let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
-            return;
+    /// How many timestamp pairs the ring holds. See [`GpuTimer::SLOTS`].
+    #[cfg(test)]
+    pub(crate) fn gpu_timer_slots(&self) -> u64 {
+        GpuTimer::SLOTS
+    }
+
+    /// Slots handed out over this renderer's life.
+    #[cfg(test)]
+    pub(crate) fn gpu_timer_issued(&self) -> u64 {
+        self.gpu_timer.as_ref().map_or(0, |t| t.next.get())
+    }
+
+    /// Slots stamped but not yet read back.
+    #[cfg(test)]
+    pub(crate) fn gpu_timer_pending(&self) -> u64 {
+        self.gpu_timer
+            .as_ref()
+            .map_or(0, |t| t.pending.borrow().len() as u64)
+    }
+
+    /// Take a ring slot, reset its pair and stamp the start of `cbuf`. Must be
+    /// called with `cbuf` recording and **outside** a render pass
+    /// (`vkCmdResetQueryPool` is not allowed inside one).
+    ///
+    /// `None` when timing is off, the device turned out not to write timestamps,
+    /// or every slot is still outstanding — an untimed submit, which costs the
+    /// frame log one line's `gpu` figure and costs the frame path nothing.
+    pub(super) fn gpu_timer_begin(&self, cbuf: vk::CommandBuffer) -> Option<GpuTimerSlot> {
+        let timer = self.gpu_timer.as_ref().filter(|t| !t.unusable.get())?;
+        if timer.pending.borrow().len() as u64 >= GpuTimer::SLOTS {
+            return None;
+        }
+
+        let index = timer.next.get();
+        timer.next.set(index + 1);
+        let slot = GpuTimerSlot {
+            index,
+            seq: crate::frame_log::current_frame_seq(),
         };
+        timer.pending.borrow_mut().push_back(slot);
+        crate::frame_log::expect_gpu_sample();
+
+        let first = timer.query(index);
         unsafe {
             let dev = &self.gpu.device;
-            dev.cmd_reset_query_pool(cbuf, timer.pool, 0, 2);
-            dev.cmd_write_timestamp(cbuf, vk::PipelineStageFlags::TOP_OF_PIPE, timer.pool, 0);
+            dev.cmd_reset_query_pool(cbuf, timer.pool, first, 2);
+            dev.cmd_write_timestamp(cbuf, vk::PipelineStageFlags::TOP_OF_PIPE, timer.pool, first);
         }
+        Some(slot)
     }
 
     /// Stamp the end of `cbuf`, just before it is ended and submitted.
-    pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer) {
-        let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
+    pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer, slot: Option<GpuTimerSlot>) {
+        let (Some(timer), Some(slot)) = (self.gpu_timer.as_ref(), slot) else {
             return;
         };
         unsafe {
@@ -1969,29 +2063,52 @@ impl VulkanRenderer {
                 cbuf,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 timer.pool,
-                1,
+                timer.query(slot.index) + 1,
             );
         }
     }
 
-    /// Read the pair back and report it to the frame log. Call after the submit's
-    /// fence wait, so the results are available without blocking further.
-    pub(super) fn gpu_timer_collect(&self) {
+    /// Read back every pending pair up to and including `slot`, reporting each to
+    /// the frame log against the frame that issued it.
+    ///
+    /// Through, not just this one, because a synchronous submit can complete
+    /// while an earlier deferred one is still pending — and its fence wait proves
+    /// that earlier submit finished too, since every submit is chained on the
+    /// queue timeline. Draining in order keeps the ring FIFO and stops a stale
+    /// slot pinning the ring.
+    ///
+    /// Only sound once `slot`'s submit is known complete: the read waits on
+    /// availability, so calling it early would put back the very park this
+    /// renderer is trying to stop paying.
+    pub(super) fn gpu_timer_collect_through(&self, slot: GpuTimerSlot) {
         let Some(timer) = self.gpu_timer.as_ref().filter(|t| !t.unusable.get()) else {
             return;
         };
+        loop {
+            let Some(next) = timer.pending.borrow().front().copied() else {
+                return;
+            };
+            if next.index > slot.index {
+                return;
+            }
+            timer.pending.borrow_mut().pop_front();
+            self.gpu_timer_read(timer, next);
+        }
+    }
 
+    fn gpu_timer_read(&self, timer: &GpuTimer, slot: GpuTimerSlot) {
         let mut ticks = [0u64; 2];
         let res = unsafe {
             self.gpu.device.get_query_pool_results(
                 timer.pool,
-                0,
+                timer.query(slot.index),
                 &mut ticks,
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )
         };
         if let Err(err) = res {
             warn!("error reading GPU timestamps: {err}");
+            crate::frame_log::add_gpu_lost(slot.seq);
             return;
         }
 
@@ -2003,9 +2120,9 @@ impl VulkanRenderer {
                 // Above the sane limit the pair is from some other clock domain,
                 // so it is a lost sample too, not a very slow pass.
                 if duration <= GpuTimer::SANE_LIMIT {
-                    crate::frame_log::add_gpu_time(duration);
+                    crate::frame_log::add_gpu_time(slot.seq, duration);
                 } else {
-                    crate::frame_log::add_gpu_lost();
+                    crate::frame_log::add_gpu_lost(slot.seq);
                 }
             }
             TimestampSample::Lost => {
@@ -2013,10 +2130,10 @@ impl VulkanRenderer {
                 // this particular pair just isn't a pass we can report.
                 timer.unwritten_run.set(0);
                 timer.ever_written.set(true);
-                crate::frame_log::add_gpu_lost();
+                crate::frame_log::add_gpu_lost(slot.seq);
             }
             TimestampSample::NotWritten => {
-                crate::frame_log::add_gpu_lost();
+                crate::frame_log::add_gpu_lost(slot.seq);
                 let run = timer.unwritten_run.get() + 1;
                 timer.unwritten_run.set(run);
                 // A device that has written before is not broken, however long
@@ -2099,23 +2216,6 @@ fn deferred_scanout_requested() -> bool {
         std::env::var("NIRI_VK_ASYNC_SCANOUT")
             .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
     })
-}
-
-/// Say so when GPU timing and async scanout are both asked for, because only one of
-/// them happens: `should_defer_finish` requires no query pool, so turning on `gpu`
-/// silently puts the session back on the synchronous finish. That is a different
-/// frame path, not just a different log line — frame times get bigger because the
-/// GPU wait moves back onto the compositor thread, which reads like a regression if
-/// you don't know. Both are opt-in debug switches and the seat sets both from
-/// `environment.d`, so the combination is easy to reach by accident.
-fn warn_if_timing_costs_deferral(timing: bool) {
-    if timing && deferred_scanout_requested() {
-        tracing::warn!(
-            "GPU timing is on, so the async scanout submit is disabled for this session \
-             (one query pool per renderer cannot be reset under an in-flight frame). Frame \
-             times will include the GPU wait; unset NIRI_FRAME_LOG's `gpu` to get it back."
-        );
-    }
 }
 
 impl Drop for VulkanRenderer {
