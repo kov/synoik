@@ -726,6 +726,48 @@ impl Gpu {
         site: crate::stats::SubmitSite,
         record: impl FnOnce(vk::CommandBuffer),
     ) -> Result<()> {
+        let submitted = self.submit_commands(pool, site, record)?;
+        // Everything below this point is the *wait* — the only difference from
+        // [`Self::submit_commands`]'s caller-owned form. A guard re-takes ownership so the command
+        // buffer and fence are freed on every exit, including the error path.
+        let _guard = RunGuard {
+            device: &self.device,
+            pool,
+            cbufs: vec![submitted.cbuf],
+            fence: submitted.fence,
+        };
+        unsafe {
+            let _timed = crate::stats::retire(site);
+            if let Err(e) = self
+                .device
+                .wait_for_fences(&[submitted.fence], true, u64::MAX)
+            {
+                // The submit already succeeded, so the command buffer and the copy's source/dest
+                // (staging/image, freed by the caller's UploadGuard) may still be in flight. Drain
+                // the device — or confirm it is lost — before any guard frees those resources on
+                // unwind, so we never free memory an outstanding submission still references. (A
+                // successful wait is the common case; this only runs on a wait error, ~always
+                // DEVICE_LOST, where a drain returns immediately.)
+                let _ = self.device.device_wait_idle();
+                return Err(e).context("vkWaitForFences");
+            }
+        }
+        Ok(())
+    }
+
+    /// As [`Self::run_commands`], but stop at the submit and hand the caller the pieces.
+    ///
+    /// The caller then owns the command buffer and the fence and **must** free both once the GPU
+    /// is done with them — normally by putting the [`Submitted`] into a list retired against
+    /// [`Self::submit_order_value`]. Only sound when the device orders submits
+    /// ([`Self::orders_submits`]); a caller that cannot guarantee that should use `run_commands`
+    /// and wait.
+    pub fn submit_commands(
+        &self,
+        pool: vk::CommandPool,
+        site: crate::stats::SubmitSite,
+        record: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<Submitted> {
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -757,29 +799,35 @@ impl Gpu {
                 .create_fence(&vk::FenceCreateInfo::default(), None)?
         };
         guard.fence = fence;
-        {
+        let timeline = {
             let _timed = crate::stats::submit(site);
-            self.submit(std::slice::from_ref(&cbuf), fence)?;
-        }
-        unsafe {
-            let _timed = crate::stats::retire(site);
-            if let Err(e) = self.device.wait_for_fences(&[fence], true, u64::MAX) {
-                // The submit already succeeded, so the command buffer and the copy's source/dest
-                // (staging/image, freed by the caller's UploadGuard) may still be in flight. Drain
-                // the device — or confirm it is lost — before any guard frees those resources on
-                // unwind, so we never free memory an outstanding submission still references. (A
-                // successful wait is the common case; this only runs on a wait error, ~always
-                // DEVICE_LOST, where a drain returns immediately.)
-                let _ = self.device.device_wait_idle();
-                return Err(e).context("vkWaitForFences");
-            }
-        }
-        Ok(())
+            self.submit(std::slice::from_ref(&cbuf), fence)?
+        };
+
+        // Submitted: the handles are the caller's problem now, so the guard must not free them.
+        guard.cbufs.clear();
+        guard.fence = vk::Fence::null();
+        Ok(Submitted {
+            cbuf,
+            fence,
+            timeline,
+        })
     }
 }
 
-/// Frees the one-shot command buffer + fence that [`Gpu::run_commands`] allocates, on every exit
-/// path (so an error between allocate and the final wait doesn't leak them). `free_command_buffers`
+/// A submitted one-shot command buffer whose completion nobody is waiting on yet. See
+/// [`Gpu::submit_commands`] — the handles are the caller's to free.
+#[derive(Debug, Clone, Copy)]
+pub struct Submitted {
+    pub cbuf: vk::CommandBuffer,
+    pub fence: vk::Fence,
+    /// The queue-timeline value this submit signals, or `None` on a device that cannot order
+    /// submits — in which case there is nothing to retire against and the caller must wait.
+    pub timeline: Option<u64>,
+}
+
+/// Frees the one-shot command buffer + fence that [`Gpu::submit_commands`] allocates, on every exit
+/// path (so an error between allocate and the submit doesn't leak them). `free_command_buffers`
 /// is valid for a cbuf in any state; the fence is skipped while still null.
 struct RunGuard<'a> {
     device: &'a ash::Device,
@@ -794,7 +842,12 @@ impl Drop for RunGuard<'_> {
             if self.fence != vk::Fence::null() {
                 self.device.destroy_fence(self.fence, None);
             }
-            self.device.free_command_buffers(self.pool, &self.cbufs);
+            // Empty is how [`Gpu::submit_commands`] disarms the guard on success, and
+            // `commandBufferCount` must be greater than zero — an empty call is invalid usage, not
+            // a no-op.
+            if !self.cbufs.is_empty() {
+                self.device.free_command_buffers(self.pool, &self.cbufs);
+            }
         }
     }
 }

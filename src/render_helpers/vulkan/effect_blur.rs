@@ -27,13 +27,6 @@ pub(crate) struct EffectBlur {
     /// Kept so [`Drop`] can free the (Drop-less) [`BlurChain`]; an `Arc` clone keeps the device
     /// alive regardless of renderer/cache drop order.
     gpu: Arc<Gpu>,
-    /// The renderer's command pool. Dereferenced only by [`Self::run`], which the effect buffer
-    /// calls exclusively from `prepare_blur_vulkan` — immediately after the offscreen's context-id
-    /// recreation check, with the renderer borrowed — so the pool outlives every use even though
-    /// an `EffectBuffer` in `OutputState` can outlive a `VulkanRenderer` (device reset).
-    /// Assumes a single renderer owns this cache (true today), as
-    /// [`BackdropBlur`](super::backdrop_blur) does.
-    pool: vk::CommandPool,
     passes: usize,
     /// Samples the source offscreen (its descriptor set was bound to the source's stable view at
     /// [`BlurChain::new`]); the owner rebuilds this whole `EffectBlur` when the source is
@@ -59,7 +52,6 @@ impl EffectBlur {
         let output = renderer.create_buffer(Fourcc::Abgr8888, source.size())?;
         Ok(Self {
             gpu: renderer.gpu.clone(),
-            pool: renderer.command_pool,
             passes,
             chain,
             output,
@@ -83,23 +75,42 @@ impl EffectBlur {
         &self.output
     }
 
-    /// Run the dual-Kawase chain over the source's current contents into `output`, on its own
-    /// fence-waited submission (like [`BackdropBlur::run_blur`](super::backdrop_blur)). Safe mid
-    /// element-build: the offscreen render already flushed and [`make_offscreen_sampleable`] left
-    /// the source `SHADER_READ_ONLY`, and this renderer is synchronous (each submit fence-waits),
-    /// so the source is fully written before the chain samples it.
+    /// Run the dual-Kawase chain over `source`'s current contents into `output`, on its own
+    /// submission (like [`BackdropBlur::run_blur`](super::backdrop_blur)) — which the CPU walks
+    /// away from where the device allows it ([`VulkanRenderer::run_commands_deferred`]).
+    ///
+    /// Safe mid element-build: the offscreen render already flushed and
+    /// [`make_offscreen_sampleable`] left the source `SHADER_READ_ONLY`, so the source is fully
+    /// written before the chain samples it. That used to rest on every submit fence-waiting; it now
+    /// rests on submits being *ordered*, which is the condition the deferral is gated on and which
+    /// holds whether or not anyone waits.
+    ///
+    /// `source` is passed back in rather than stored because the record has to hold it alive: this
+    /// command buffer samples it long after `prepare_blur_vulkan` returns.
     ///
     /// [`make_offscreen_sampleable`]: crate::render_helpers::renderer::OffscreenRenderer::make_offscreen_sampleable
-    pub(crate) fn run(&mut self, offset: f32) -> Result<(), VulkanError> {
+    pub(crate) fn run(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        source: &VkTexture,
+        offset: f32,
+    ) -> Result<(), VulkanError> {
         let (w, h) = self.output.extent();
-        let gpu = &self.gpu;
-        gpu.run_commands(self.pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
-            self.chain.record(gpu, cbuf, offset);
-            self.chain
-                .copy_output_to(gpu, cbuf, self.output.image(), w, h);
-        })?;
+        let gpu = self.gpu.clone();
+        let chain = &self.chain;
+        let output = &self.output;
+        renderer.run_commands_deferred(
+            niri_vk::stats::SubmitSite::Blur,
+            vec![source.clone()],
+            vec![output.clone()],
+            |cbuf| {
+                chain.record(&gpu, cbuf, offset);
+                chain.copy_output_to(&gpu, cbuf, output.image(), w, h);
+            },
+        )?;
         // copy_output_to barriers `output` to SHADER_READ_ONLY; record the tracked layout so a
-        // later sample/readback knows it.
+        // later sample/readback knows it. True as soon as it is recorded — every later command is
+        // ordered after this submit.
         self.output
             .set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         self.valid = true;
@@ -109,6 +120,18 @@ impl EffectBlur {
 
 impl Drop for EffectBlur {
     fn drop(&mut self) {
+        // The chain's images and framebuffers are not refcounted and its teardown does not wait, so
+        // a blur submit the CPU walked away from ([`Self::run`]) could still be reading them. Every
+        // *texture* in that submit is held by the renderer's in-flight record; the chain is not,
+        // and cannot be — it is destroyed from here, which has no renderer. So drain the
+        // device first.
+        //
+        // Cheap in practice because this only runs when the chain is rebuilt (pass count changed,
+        // or the source offscreen was recreated — i.e. a resize or a config change) or at teardown,
+        // never per frame.
+        unsafe {
+            let _ = self.gpu.device.device_wait_idle();
+        }
         // BlurChain has no Drop (teardown needs a &Gpu); the VkTexture output frees itself.
         self.chain.destroy(&self.gpu);
     }

@@ -31,11 +31,6 @@ pub(crate) struct BackdropBlur {
     /// Kept so [`Drop`] can free the (Drop-less) [`BlurChain`] and to record the blur; an `Arc`
     /// clone keeps the device alive regardless of renderer/cache drop order.
     gpu: Arc<Gpu>,
-    /// The renderer's command pool. Only ever dereferenced by [`Self::run_blur`], which is
-    /// reachable only through a live `VulkanFrame` that borrows the renderer — so the pool
-    /// outlives every use. Assumes a single renderer owns this cache (true today); a second
-    /// `VulkanRenderer` sharing the element cache would mix pools/devices.
-    pool: vk::CommandPool,
     size: (u32, u32),
     /// The captured backdrop, filled each frame by [`VulkanFrame::capture_region`] and left
     /// `SHADER_READ_ONLY_OPTIMAL` (sampleable by the chain or, unblurred, by the postprocess
@@ -75,7 +70,6 @@ impl BackdropBlur {
         };
         Ok(Self {
             gpu: renderer.gpu.clone(),
-            pool: renderer.command_pool,
             size: dims,
             capture,
             blur,
@@ -95,23 +89,37 @@ impl BackdropBlur {
         &self.capture
     }
 
-    /// Record the blur (down/up chain + copy into `output`) on its own fence-waited submission,
-    /// sampling the just-captured `self.capture`. A no-op when blur is disabled. Runs on a separate
-    /// one-shot command buffer (like `render_blur`) — safe mid-frame because `capture_region`
-    /// already flushed the capture, and the caller's postprocess draw only samples `output` after
-    /// this returns.
-    pub(crate) fn run_blur(&self, offset: f32) -> Result<(), VulkanError> {
+    /// Record the blur (down/up chain + copy into `output`) on its own submission, sampling the
+    /// just-captured `self.capture`. A no-op when blur is disabled. Runs on a separate one-shot
+    /// command buffer (like `render_blur`) that the CPU walks away from where the device allows it
+    /// ([`VulkanRenderer::run_commands_deferred`]).
+    ///
+    /// Safe mid-frame because `capture_region` already flushed the capture and submits are ordered,
+    /// so the caller's postprocess draw — recorded after this — samples `output` only once the blur
+    /// has run. That used to rest on this submit fence-waiting; ordering is what it rests on now,
+    /// and ordering is the condition the deferral is gated on.
+    pub(crate) fn run_blur(
+        &self,
+        renderer: &mut VulkanRenderer,
+        offset: f32,
+    ) -> Result<(), VulkanError> {
         let Some(bs) = &self.blur else {
             return Ok(());
         };
         let (w, h) = self.size;
-        let gpu = &self.gpu;
-        gpu.run_commands(self.pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
-            bs.chain.record(gpu, cbuf, offset);
-            bs.chain.copy_output_to(gpu, cbuf, bs.output.image(), w, h);
-        })?;
+        let gpu = self.gpu.clone();
+        renderer.run_commands_deferred(
+            niri_vk::stats::SubmitSite::Blur,
+            vec![self.capture.clone()],
+            vec![bs.output.clone()],
+            |cbuf| {
+                bs.chain.record(&gpu, cbuf, offset);
+                bs.chain.copy_output_to(&gpu, cbuf, bs.output.image(), w, h);
+            },
+        )?;
         // copy_output_to leaves `output` in SHADER_READ_ONLY (with a barrier); record the tracked
-        // layout so a later readback/sample knows it.
+        // layout so a later readback/sample knows it. True as soon as it is recorded — every later
+        // command is ordered after this submit.
         bs.output
             .set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(())
@@ -128,6 +136,14 @@ impl Drop for BackdropBlur {
         // BlurChain has no Drop (manual teardown, matching the rest of niri-vk); free its GPU
         // resources. The VkTextures free themselves via their own Drop.
         if let Some(bs) = &self.blur {
+            // The chain is not refcounted and its teardown does not wait, while `run_blur` leaves a
+            // submit reading it in flight. The renderer's in-flight record holds that submit's
+            // *textures*, but nothing can hold the chain — this is where it dies, and there is no
+            // renderer here. Drain first. Only runs when the cache misses on size/pass count, or at
+            // teardown; never per frame. Same reasoning as `EffectBlur`'s `Drop`.
+            unsafe {
+                let _ = self.gpu.device.device_wait_idle();
+            }
             bs.chain.destroy(&self.gpu);
         }
     }

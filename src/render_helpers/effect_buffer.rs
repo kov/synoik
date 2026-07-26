@@ -333,9 +333,12 @@ impl EffectBuffer {
             offscreen.blur = Some(EffectBlur::new(renderer, &offscreen.texture, passes)?);
         }
 
-        let blur = offscreen.blur.as_mut().expect("just populated");
+        // Split the borrow: `run` records a submit nobody waits for, so it has to hand the source
+        // texture to the renderer's in-flight record alongside the blur's own output.
+        let OffscreenVk { texture, blur, .. } = offscreen;
+        let blur = blur.as_mut().expect("just populated");
         if !blur.is_valid() {
-            blur.run(offset)?;
+            blur.run(renderer, texture, offset)?;
         }
 
         Ok(())

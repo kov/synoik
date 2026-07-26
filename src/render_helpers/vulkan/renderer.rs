@@ -1713,6 +1713,68 @@ impl VulkanRenderer {
         });
     }
 
+    /// Run `record` on its own one-shot command buffer **without parking on its fence**, holding
+    /// `held` (what it reads) and `targets` (what it writes) until the queue timeline passes it.
+    ///
+    /// For work whose only consumer is later GPU work. The blur is the case this exists for: it is
+    /// recorded during element collection, its result is sampled by the frame that follows, and
+    /// submits are ordered — so the CPU has no reason to be in the loop. Measured on this stack, a
+    /// blur's own round trip costs as much as the blur (`docs/fork/venus-cost.md` §3.8, §12), so
+    /// the wait was most of what a blur cost.
+    ///
+    /// Falls back to a synchronous [`Gpu::run_commands`] when the device cannot order submits or a
+    /// query pool is live — [`Self::should_defer_offscreen_finish`] is the same rule offscreen
+    /// finishes use, and for the same reasons.
+    ///
+    /// **The caller must keep the recorded-against GPU objects alive too.** `held`/`targets` cover
+    /// textures; anything else the command buffer references — a [`niri_vk::blur::BlurChain`]'s
+    /// levels, say — is destroyed explicitly by its owner, and that owner has to drain first. See
+    /// [`Self::drain_in_flight`].
+    pub(super) fn run_commands_deferred(
+        &mut self,
+        site: niri_vk::stats::SubmitSite,
+        held: Vec<VkTexture>,
+        targets: Vec<VkTexture>,
+        record: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<(), VulkanError> {
+        if !self.should_defer_offscreen_finish() {
+            return self
+                .gpu
+                .run_commands(self.command_pool, site, record)
+                .map_err(VulkanError::from);
+        }
+
+        let submitted = self
+            .gpu
+            .submit_commands(self.command_pool, site, record)
+            .map_err(VulkanError::from)?;
+        let Some(timeline) = submitted.timeline else {
+            // `should_defer_offscreen_finish` required `orders_submits`, so this is unreachable —
+            // but the handles are already ours and a leak here would be silent. Wait it out and
+            // free them rather than trust the invariant.
+            unsafe {
+                let _ = self.gpu.device.device_wait_idle();
+                self.gpu.device.destroy_fence(submitted.fence, None);
+                self.gpu
+                    .device
+                    .free_command_buffers(self.command_pool, &[submitted.cbuf]);
+            }
+            return Ok(());
+        };
+
+        let fence = VkSubmitFence::new(self.gpu.clone(), submitted.fence);
+        self.add_in_flight(
+            timeline,
+            submitted.cbuf,
+            fence,
+            held,
+            targets,
+            None,
+            Vec::new(),
+        );
+        Ok(())
+    }
+
     /// Whether the frame being finished is the one going to KMS — the tty backend's bracket, read
     /// for what it says rather than for the permission it grants. Used to label the submit
     /// ([`VulkanFrame::submit_site`]); unlike `should_defer_finish` it does not care whether the
@@ -1766,13 +1828,13 @@ impl VulkanRenderer {
     /// plane to take the fence, so the deferred path has to be asked for explicitly to be covered
     /// at all.
     #[cfg(test)]
-    pub(super) fn set_defer_scanout(&mut self, on: bool) {
+    pub(crate) fn set_defer_scanout(&mut self, on: bool) {
         self.defer_scanout = on;
     }
 
     /// How many submits the CPU has walked away from and not yet retired.
     #[cfg(test)]
-    pub(super) fn in_flight_len(&self) -> usize {
+    pub(crate) fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }
 

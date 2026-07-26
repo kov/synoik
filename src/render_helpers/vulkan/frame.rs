@@ -1146,7 +1146,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         }
         let bb = slot.as_mut().expect("just populated");
         self.capture_region(src_region, bb.capture())?;
-        bb.run_blur(offset)?;
+        bb.run_blur(self.renderer, offset)?;
         Ok(())
     }
 

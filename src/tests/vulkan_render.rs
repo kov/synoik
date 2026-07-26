@@ -7295,3 +7295,137 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
         );
     }
 }
+
+/// The blur submit is one the CPU walks away from, and the pixels still come out right.
+///
+/// A blur's own round trip costs about as much as the blur (`docs/fork/venus-cost.md` §3.8, §12),
+/// so `EffectBlur::run` hands its completion to the renderer's in-flight list instead of parking on
+/// the fence. Two things have to hold for that to be safe, and neither is visible in a frame that
+/// merely looks correct:
+///
+///   (a) the blurred output is still fully written before anything samples it — ordering replaces
+///       the wait, so a regression here shows up as a *stale or blank* blur, not a torn one;
+///   (b) the blur chain outlives the submit that reads it. The chain is not refcounted and its
+///       teardown does not wait, so rebuilding it (a resize) while a blur is in flight would free
+///       images the GPU is still reading. `EffectBlur::drop` drains for exactly this, and the
+///       resize below is what exercises it — under `NIRI_VK_VALIDATION=1` a missing drain is a
+///       use-after-free, not a wrong pixel.
+///
+/// [`vulkan_effect_buffer_renders_offscreen_and_blur`] covers the same path on the *synchronous*
+/// arm; deferring is opt-in (`NIRI_VK_ASYNC_SCANOUT=1`), so without this test the whole deferred
+/// blur path ships untested.
+#[test]
+fn vulkan_a_deferred_blur_is_not_waited_on_and_still_lands() {
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::effect_buffer::EffectBuffer;
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+
+    let skip = |why: &str| eprintln!("skipping vulkan_a_deferred_blur_is_not_waited_on: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu().orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    // Headless there is no KMS plane to take a fence, so the session opt-in has to be forced.
+    vk.set_defer_scanout(true);
+
+    let scale = Scale::from(1.0);
+    let fill_edge = |buffer: &mut EffectBuffer, s: i32| {
+        let red =
+            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [1.0, 0.0, 0.0, 1.0]);
+        let green =
+            SolidColorBuffer::new(Size::from((s as f64 / 2.0, s as f64)), [0.0, 1.0, 0.0, 1.0]);
+        let elements = buffer.elements_vulkan();
+        elements.clear();
+        elements.push(
+            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
+        );
+        elements.push(
+            SolidColorRenderElement::from_buffer(
+                &green,
+                (s as f64 / 2.0, 0.0),
+                1.0,
+                Kind::Unspecified,
+            )
+            .into(),
+        );
+    };
+
+    // Read the blurred output back and return the strongest blend along the mid scanline. A hard
+    // red|green edge has min(R,G) == 0 everywhere; blurring it mixes the two.
+    let edge_blend = |vk: &mut VulkanRenderer, buffer: &EffectBuffer, s: i32| -> u8 {
+        let mut tex = buffer.texture_vulkan(true).expect("blurred texture");
+        let fb = vk.bind(&mut tex).expect("bind blurred");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((s, s)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy");
+        let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+        let y = s / 2;
+        (0..s).fold(0u8, |best, x| {
+            let p = px(&pixels, s, x, y);
+            best.max(p[0].min(p[1]))
+        })
+    };
+
+    const S: i32 = 64;
+    let mut buffer = EffectBuffer::new();
+    buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
+    buffer.update_blur_options(BlurOptions {
+        passes: 3,
+        offset: 2.0,
+    });
+    fill_edge(&mut buffer, S);
+
+    let before = vk.in_flight_len();
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "prepare_vulkan (blur) failed"
+    );
+
+    // Exactly two, and the exactness is the test. This prepare makes two submits — the offscreen
+    // render that fills the source, and the blur — and the offscreen one already deferred before
+    // this change. So `> before` passes just as happily with the blur back on the synchronous
+    // path, where it retires inside `run_commands` and is never recorded here; only the count
+    // tells the two apart. (Mutation-checked: 2 deferred, 1 with the blur forced synchronous.)
+    //
+    // The obvious assertion — that the `Blur` site's `retiring` is zero, the number the frame log
+    // prints as `1 blur in Xms` — cannot be used here: `niri_vk::stats`' timers are gated on
+    // `set_enabled`, which only the frame log turns on, so every duration reads zero under test
+    // whether or not anything waited.
+    assert_eq!(
+        vk.in_flight_len() - before,
+        2,
+        "expected the offscreen render *and* the blur to be left in flight; one of them still \
+         parked the thread on its fence, so the round trip this change exists to remove is still \
+         being paid"
+    );
+
+    // Rebuild the chain **with that blur still in flight** — the `Drop` hazard. A resize drops the
+    // old offscreen and its `EffectBlur`, and the outstanding submit is reading that chain's images
+    // and framebuffers.
+    //
+    // Nothing may read pixels back before this point, and that is the whole design of the test: a
+    // readback waits, a wait drains the queue, and a drained queue makes the hazard unreachable.
+    // (Checked by removing `EffectBlur::drop`'s drain: with a readback here the mutant passes
+    // validation clean; without one the layer reports the use-after-free.)
+    const S2: i32 = 96;
+    buffer.update_size(Size::<i32, Physical>::from((S2, S2)), scale);
+    fill_edge(&mut buffer, S2);
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "prepare_vulkan after resize failed"
+    );
+
+    // Only now read back — proving the deferred blur lands at all, and that the rebuild did not
+    // corrupt it. A blank or stale output here means ordering did not stand in for the wait.
+    let blend = edge_blend(&mut vk, &buffer, S2);
+    assert!(
+        blend > 40,
+        "the deferred blur did not land: the edge is still hard (max min(R,G) = {blend})"
+    );
+}
