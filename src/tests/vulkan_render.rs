@@ -7894,21 +7894,70 @@ fn a_popover_open_fade_rebakes_nothing_per_frame() {
     }
 }
 
-// **Gap, deliberately not a test.** The app grid is the worst case for this bug class — ~24 tiles,
-// each with a shaped label — and it has been fixed for it once already (`c5336421`: hover bumped
-// `content_rev`, so a pointer moving during the open animation re-shaped every label every frame;
-// the tell was that *closing* stayed smooth, because the grid is not reactive then).
-//
-// A guardrail for it was written and then removed, because it could not fail. In this fixture the
-// grid bakes **nothing**: with the overview open, `toggle_app_grid()` returning true,
-// `is_app_grid_open()` true, 24 apps in a `FakeCatalog`, animations settled, and an output at both
-// 1280x720 and 1920x1080, no `ui/app_grid.rs` site appears in the bake sites — and a mutation that
-// changed the label bake key on *every call* still passed. So some precondition of the grid's
-// render path is unmet here and was not found; a green test asserting "nothing re-baked" over a
-// widget that never draws is worse than no test, because it reads as coverage.
-//
-// To finish this: find why `AppGrid::render` contributes no bake (icons? the page layout coming
-// out empty? the dash's band geometry?), then bring back the test — the helpers it needs
-// (`bake_sites_per_frame`, `sites_baking_repeatedly`) are right here, and
-// `a_popover_open_fade_rebakes_nothing_per_frame` is the shape to copy, including its
-// baked-at-least-once guard.
+/// The app grid slides up out of the dash; nothing in it may re-bake per frame.
+///
+/// The grid is the worst case for this class — a page of tiles, each with its own shaped label —
+/// and it has been fixed for it once already (`c5336421`: hover bumped `content_rev`, so a pointer
+/// moving during the *open* animation re-shaped every label every frame; the tell was that closing
+/// stayed smooth, because the grid is not reactive then). That fix is one field on one widget,
+/// which nothing but this kind of test protects.
+///
+/// The precondition worth knowing, because it silently made an earlier version of this test assert
+/// nothing at all: `AppGrid`'s entries do not come from `app_system` on demand. `sync_app_grid()`
+/// copies them across and is driven by app-system *change events* — so installing a catalog
+/// straight onto `Niri` leaves the grid empty, rendering nothing, re-baking nothing, and passing.
+/// The "subject baked at least once" assertion below is what makes that failure loud.
+#[test]
+fn the_app_grid_open_rebakes_nothing_per_frame() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("app grid bake probe")) else {
+        return;
+    };
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+
+    // Enough tiles to fill a page, each with a distinct name so every label is its own shaped run.
+    let apps: Vec<AppEntry> = (0..24)
+        .map(|i| AppEntry::fake(&format!("app{i}.desktop"), &format!("Application {i:02}")))
+        .collect();
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(apps)),
+        Box::new(RecordingLauncher::default()),
+    );
+    assert!(f.niri().sync_app_grid(), "the grid took no entries");
+
+    // Settle into the open overview first: this test is about the grid's own animation, not the
+    // overview's, which `the_overview_animation_rebakes_nothing_per_frame` already owns.
+    f.niri().layout.toggle_overview();
+    f.settle_animations();
+    assert!(
+        f.niri().layout.toggle_app_grid(),
+        "the app grid did not open, so this test proves nothing"
+    );
+    f.settle_animations();
+    let _ = crate::frame_log::take_bake_sites();
+    let _ = render_output_vulkan(&mut f, &output);
+    let warm = crate::frame_log::take_bake_sites();
+    assert!(
+        warm.iter().any(|s| s.file.contains("app_grid.rs")),
+        "no app_grid.rs bake with the grid open and settled, so this test cannot observe the \
+         thing it asserts about. Sites seen: {warm:?}"
+    );
+
+    // Close and reopen, so the sampled frames are a real open animation from a warm cache.
+    assert!(f.niri().layout.toggle_app_grid());
+    f.settle_animations();
+    let _ = render_output_vulkan(&mut f, &output);
+    let _ = crate::frame_log::take_bake_sites();
+
+    assert!(f.niri().layout.toggle_app_grid());
+    let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
+    let repeats = sites_baking_repeatedly(&per_frame);
+
+    assert!(
+        repeats.is_empty(),
+        "these widgets re-baked across {} frames of the app-grid open: {repeats:?}\n\
+         Every tile label is a shaped run; re-shaping them per frame is the `c5336421` stutter.",
+        per_frame.len(),
+    );
+}
