@@ -1482,6 +1482,32 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    /// Whether `texture` is unowned *once our own queued references are discounted* — the reuse
+    /// question `OffscreenRenderer::offscreen_is_reusable` asks.
+    ///
+    /// Every pending queue holds its textures precisely so they outlive the submit that will name
+    /// them; none of that work has been recorded yet, so nothing is reading the image and
+    /// re-rendering into it is safe. Answering "owned" on our own keep-alive tells the caller to
+    /// discard a perfectly good offscreen and allocate a replacement, every frame.
+    pub(super) fn discount_pending_holds(&self, texture: &VkTexture) -> bool {
+        let image = texture.image();
+        let mut ours = self
+            .pending_sampleable
+            .iter()
+            .filter(|t| t.image() == image)
+            .count();
+        ours += self
+            .pending_texture_uploads
+            .iter()
+            .filter(|u| u.tex.image() == image)
+            .count();
+        for blur in &self.pending_blurs {
+            ours += usize::from(blur.source.image() == image);
+            ours += usize::from(blur.output.image() == image);
+        }
+        texture.reference_count() <= 1 + ours
+    }
+
     /// Record every queued make-sampleable barrier into `cbuf`, and hand back the images so they
     /// outlive the submit. Must run **before** anything in the same command buffer that samples
     /// them — the queued blurs, and every draw in the frame.

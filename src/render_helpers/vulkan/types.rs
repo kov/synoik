@@ -231,6 +231,13 @@ impl VkTexture {
         self.0.flipped
     }
 
+    /// How many handles to the underlying GPU resources are live, this one included. The renderer
+    /// uses it to answer the reuse question while discounting the references *it* holds — a
+    /// keep-alive queue is not a foreign owner.
+    pub(super) fn reference_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
     /// Whether this is the only handle to the underlying GPU resources (no other clone is live) —
     /// used by `OffscreenBuffer` to decide whether a cached offscreen texture can be reused.
     pub fn is_unique_reference(&mut self) -> bool {

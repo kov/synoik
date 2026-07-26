@@ -306,6 +306,65 @@ fn row(label: &str, out: (u16, u16), (ms, draws, shaded): (Duration, u64, u64)) 
     );
 }
 
+/// The backdrop blur is **shared**: one output-sized effect buffer per frame, sampled by every
+/// window that asks for it. So adding blurred windows must not add blurs.
+///
+/// It did. Each window's `Xray::render` re-prepared the shared buffer, and the reuse check
+/// answered "someone else owns this texture" about the renderer's *own* pending queues — so every
+/// window threw the offscreen away, allocated a replacement with a fresh blur chain, and queued
+/// the blur again. Four blurred windows meant four full-output blur chains in a frame that needed
+/// one: 79.83 Mpx instead of 25.40, and 21.4 ms instead of 2.7 (`perf_probe`, sweeps 5-6).
+///
+/// Asserted on shaded fragments rather than time: the counter is exact and reproducible, and it is
+/// the quantity that was wrong. The first assertion is the anti-vacuity guard — a blur that never
+/// runs would pass the second one trivially.
+#[test]
+fn a_blurred_frame_does_not_pay_per_blurred_window() {
+    let blur = Scene {
+        blur: true,
+        ..Default::default()
+    };
+
+    let measure = |out, scene, windows| {
+        build_scene(out, windows, scene).map(|mut f| {
+            best_of(&mut f, 1);
+            best_of(&mut f, 2).2
+        })
+    };
+
+    // What an extra blurred window costs, at two output sizes. A window's own drawing does not
+    // care how big the screen is; a re-run of the *shared, output-sized* backdrop blur cares about
+    // nothing else. So the tell is not the magnitude, it is whether the per-window cost tracks the
+    // output — which needs no threshold pulled out of the air.
+    let per_window = |out| {
+        let one = measure(out, blur, 1)?;
+        let four = measure(out, blur, 4)?;
+        let plain = measure(out, Scene::default(), 4)?;
+        assert!(
+            four > plain,
+            "the blur shaded nothing at {out:?} ({four} vs {plain} fragments): this test is not \
+             exercising it, so its real assertion is vacuous"
+        );
+        Some((four.saturating_sub(one)) as f64 / 3.)
+    };
+
+    let (Some(small), Some(large)) = (per_window((1920u16, 1080u16)), per_window((3840, 2160)))
+    else {
+        return; // no Vulkan device
+    };
+
+    // Quadrupling the output must not multiply what a blurred window costs. Before the fix each
+    // window shaded ~2.57x the output, so this ratio was 4.0; with the backdrop blur shared as
+    // intended it is ~1.0. Anything under 2 is unambiguously the shared side of that gap.
+    let ratio = large / small.max(1.);
+    assert!(
+        ratio < 2.0,
+        "an extra blurred window cost {small:.0} fragments at 1080p and {large:.0} at 4K \
+         ({ratio:.1}x): the per-window cost is tracking the output, so the shared backdrop blur \
+         is being re-run per window"
+    );
+}
+
 #[test]
 #[ignore = "timings, not a guard; run explicitly"]
 fn perf_probe_what_does_the_overview_frame_scale_with() {

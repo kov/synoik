@@ -43,7 +43,17 @@ impl OffscreenRenderer for VulkanRenderer {
         // says yes only once the GPU is genuinely done with the previous render, which is also
         // the condition for overwriting it to be safe.
         self.retire_completed();
-        texture.is_unique_reference()
+
+        // …and discount the queues, for exactly the same reason. A pending blur and a pending
+        // layout transition each hold the texture so it outlives the submit that will name it —
+        // our keep-alive, not a foreign owner. Counting them is answering "not unique" about
+        // ourselves again, and the caller's answer to "not unique" is to throw the texture away
+        // and allocate a new one: per frame, per blurred window, along with its blur chain. That
+        // is the virtio-gpu blob churn this path exists to avoid, and it re-queues the blur on the
+        // fresh chain each time — four full-output blurs in a frame that needed one. Re-rendering
+        // into the texture first is safe: a queued blur has not been recorded yet, so it simply
+        // blurs the new contents.
+        self.discount_pending_holds(texture)
     }
 }
 
