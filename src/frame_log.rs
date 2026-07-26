@@ -29,11 +29,12 @@
 //! Two independent things, because they fail independently:
 //!
 //! **The `gpu` option works on the dev VM as of 2026-07-26.** It used to produce
-//! nothing: the virtio-gpu/Venus stack advertised timestamp queries and resolved
-//! every one to zero. That was fixed host-side (`docs/fork/venus-timestamp-gap.md`,
-//! and §11.1 of `docs/fork/venus-cost.md` for the guest-side confirmation); this
-//! VMM measures 100% usable pairs, both in the standalone reproducer and through
-//! the renderer's own path.
+//! nothing, for two independent reasons that looked identical from the log. The
+//! virtio-gpu/Venus stack advertised timestamp queries and resolved every one to
+//! zero — fixed host-side (`docs/fork/venus-timestamp-gap.md`, §13 of
+//! `docs/fork/venus-cost.md`), and this VMM now measures 100% usable pairs. And
+//! the flag was set too late for the renderer to see it (see [`gpu_timing`]), so
+//! the query pool was never allocated in the first place.
 //!
 //! A pair that comes back unusable is still counted (`N lost`) instead of quietly
 //! averaged in as zero, because the failure mode was a *rate*, not all-or-nothing:
@@ -63,6 +64,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 thread_local! {
@@ -98,10 +100,15 @@ thread_local! {
     static BAKE_NANOS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Whether GPU timing was requested, sampled once. The renderer reads this at
-/// construction to decide whether to allocate a timestamp query pool, so it must
-/// answer the same way for the whole process.
-static GPU_TIMING: AtomicBool = AtomicBool::new(false);
+/// Whether GPU timing was requested, sampled once from the environment on the
+/// first read. The renderer reads this at construction to decide whether to
+/// allocate a timestamp query pool, so it must answer the same way for the whole
+/// process — and, crucially, it must answer *correctly* before
+/// [`FrameLog::from_env`] has run: the tty backend builds its renderer while
+/// bringing up the device, which is earlier. Deriving it from the environment on
+/// demand rather than having `from_env` push it is what makes the two orders
+/// equivalent. See [`gpu_timing`].
+static GPU_TIMING: OnceLock<bool> = OnceLock::new();
 
 /// Accumulated GPU time reported by the renderer for the frame being built, in
 /// nanoseconds. The renderer adds each submit's measured duration; the frame log
@@ -153,9 +160,28 @@ pub fn bakes() -> u64 {
     BAKES.with(Cell::get)
 }
 
-/// Whether the renderer should measure GPU pass durations. See [`FrameLog::from_env`].
+/// Whether the renderer should measure GPU pass durations, i.e. whether
+/// `NIRI_FRAME_LOG` carries the `gpu` option. See [`FrameLog::from_env`].
+///
+/// Reads the environment itself instead of waiting to be told, because the first
+/// caller is the renderer's constructor and on the tty backend that runs *before*
+/// the frame log exists (the device, and its renderer, come up while the backend
+/// is being built). Pushing the flag from `from_env` left the query pool
+/// unallocated for the whole session, so `gpu` logged nothing — no samples and no
+/// losses, which reads exactly like a device that cannot timestamp.
 pub fn gpu_timing() -> bool {
-    GPU_TIMING.load(Ordering::Relaxed)
+    *GPU_TIMING
+        .get_or_init(|| std::env::var("NIRI_FRAME_LOG").is_ok_and(|raw| wants_gpu_timing(&raw)))
+}
+
+/// Does this `NIRI_FRAME_LOG` value ask for GPU timing? Split out from
+/// [`gpu_timing`] so the token matching is testable: the flag itself is a
+/// process-wide [`OnceLock`] read from the real environment, which a test cannot
+/// set without racing every other test in the binary.
+fn wants_gpu_timing(raw: &str) -> bool {
+    raw.split(',')
+        .map(str::trim)
+        .any(|part| part.eq_ignore_ascii_case("gpu"))
 }
 
 /// Report a submit's measured GPU duration. Called by the renderer after it
@@ -467,10 +493,10 @@ impl FrameLog {
                     enabled = true;
                     settings.log_all = true;
                 }
-                ("gpu", None) => {
-                    enabled = true;
-                    GPU_TIMING.store(true, Ordering::Relaxed);
-                }
+                // The flag itself comes from the environment, in `gpu_timing` — by
+                // now the renderer has almost certainly already read it. All this
+                // arm does is keep `gpu` alone a valid way to turn logging on.
+                ("gpu", None) => enabled = true,
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
                     Ok(secs) => settings.summary_every = Some(Duration::from_secs(secs)),
@@ -1001,6 +1027,32 @@ mod tests {
         // An explicit off anywhere wins, so a session file can disable an
         // inherited setting by appending to it.
         assert!(FrameLog::parse("all,off").is_none());
+
+        // `gpu` turns logging on by itself, but it does *not* carry the GPU-timing
+        // flag — see `wants_gpu_timing` and the test below for why that is split.
+        assert!(FrameLog::parse("gpu").is_some());
+    }
+
+    /// GPU timing is decided by reading `NIRI_FRAME_LOG` directly, not by
+    /// `FrameLog::parse` setting a flag, because the renderer asks before the frame
+    /// log is built. The whole option was silently dead for a session over exactly
+    /// that ordering: the tty backend brings up the device — and its renderer, which
+    /// allocates the query pool or does not — while constructing the backend, and
+    /// `FrameLog::from_env` runs after. So the query pool was never allocated,
+    /// nothing was ever collected, and the log showed no GPU time *and* no losses,
+    /// which is indistinguishable from a device that cannot timestamp at all.
+    #[test]
+    fn gpu_timing_is_read_from_the_variable_not_pushed_by_the_parser() {
+        assert!(wants_gpu_timing("gpu"));
+        assert!(wants_gpu_timing("1,gpu"));
+        assert!(wants_gpu_timing("8ms, gpu ,summary=5"));
+        assert!(wants_gpu_timing("1,GPU"));
+
+        assert!(!wants_gpu_timing(""));
+        assert!(!wants_gpu_timing("1"));
+        assert!(!wants_gpu_timing("all,summary=5"));
+        // Substrings must not count: these are whole tokens.
+        assert!(!wants_gpu_timing("1,gpuish"));
     }
 
     /// Per-site totals from `(site, submits, waited)` triples, for the log-line tests. The
