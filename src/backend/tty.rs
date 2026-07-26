@@ -2920,6 +2920,12 @@ fn render_surface_with(
                 niri.frame_log.phase(Phase::Queue);
                 match drm_compositor.queue_frame(data) {
                     Ok(()) => {
+                        niri.frame_log.queued(
+                            &output.name(),
+                            target_presentation_time,
+                            get_monotonic_time(),
+                        );
+
                         let output_state = niri.output_state.get_mut(output).unwrap();
                         let new_state = RedrawState::WaitingForVBlank {
                             redraw_needed: false,

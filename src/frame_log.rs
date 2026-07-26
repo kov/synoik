@@ -49,7 +49,9 @@
 //!   presentation time it was built for. That is what a user perceives as a stutter, and it can
 //!   happen with every frame cost looking healthy. Deliberately *not* the gap in the DRM vblank
 //!   sequence — see [`FrameLog::presented`] for why that measures idleness on a damage-driven
-//!   compositor.
+//!   compositor. A miss comes with the frame's *headroom* — how much of the cycle was left when we
+//!   handed it to KMS ([`FrameLog::queued`]) — because "late with 8ms of slack" and "late because
+//!   we handed it over late" are different bugs and the lateness alone cannot tell them apart.
 //!
 //! Neither is much use without knowing what the frame was *doing*, so a logged
 //! frame carries its [`FrameContext`]: element count, whether the damage was
@@ -275,6 +277,10 @@ struct Stats {
     gpu_total: Duration,
     /// Unusable timestamp pairs over the same window. See [`GPU_LOST`].
     gpu_lost: u64,
+    /// Microseconds left in the cycle when each presented frame was handed to
+    /// KMS, signed — negative means we handed it over past its own deadline.
+    /// See [`FrameLog::queued`].
+    headroom_us: Vec<i64>,
 }
 
 impl Stats {
@@ -376,6 +382,10 @@ pub struct FrameLog {
     settings: Option<Settings>,
     in_flight: Option<InFlight>,
     stats: HashMap<String, Stats>,
+    /// Per output, the last frame handed to KMS: what it aimed at and when we let
+    /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
+    /// even though we were done in time" or "late because we were late".
+    queued: HashMap<String, (Duration, Duration)>,
     last_summary: Instant,
 }
 
@@ -415,6 +425,7 @@ impl FrameLog {
             settings,
             in_flight: None,
             stats: HashMap::new(),
+            queued: HashMap::new(),
             last_summary: Instant::now(),
         }
     }
@@ -703,6 +714,23 @@ impl FrameLog {
         line
     }
 
+    /// Record the moment a finished frame was handed to KMS, against the
+    /// presentation time it was built for.
+    ///
+    /// The gap between the two is the frame's *headroom*: how much of the cycle
+    /// was left for the kernel's commit worker and the display hardware once we
+    /// were out of the way. A missed vblank with healthy headroom and one with
+    /// none are different bugs — the first is downstream of us (a fence that
+    /// signals late, a host compositor on its own clock), the second is ours.
+    /// Without this the log can only say "late", which is true of both.
+    pub fn queued(&mut self, output: &str, target: Duration, at: Duration) {
+        if self.settings.is_none() {
+            return;
+        }
+
+        self.queued.insert(output.to_owned(), (target, at));
+    }
+
     /// Record a presented frame: how late it landed against the presentation time
     /// the compositor aimed for when it built it.
     ///
@@ -728,6 +756,23 @@ impl FrameLog {
     ) {
         if self.settings.is_none() {
             return;
+        }
+
+        // Only the frame that was built for this target: on a miss the next
+        // frame's queue overwrites the entry, and pairing a late presentation
+        // with a *later* frame's headroom would read as healthy every time.
+        let headroom = self
+            .queued
+            .get(output)
+            .filter(|(queued_target, _)| *queued_target == target)
+            .map(|(target, at)| target.as_micros() as i64 - at.as_micros() as i64);
+
+        if let Some(headroom) = headroom {
+            self.stats
+                .entry(output.to_owned())
+                .or_default()
+                .headroom_us
+                .push(headroom);
         }
 
         // No hardware clock (`DrmEventTime::Realtime`, or the debug knob that
@@ -756,8 +801,14 @@ impl FrameLog {
 
         self.stats.entry(output.to_owned()).or_default().dropped += missed;
 
+        let queued = match headroom {
+            Some(us) if us >= 0 => format!(", queued {} early", ms_us(us)),
+            Some(us) => format!(", queued {} LATE", ms_us(-us)),
+            None => String::new(),
+        };
+
         tracing::warn!(
-            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}",
+            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}{queued}",
             ms(late),
             ms(refresh),
         );
@@ -803,9 +854,30 @@ impl FrameLog {
                 ),
             };
 
+            // Headroom's tail of interest is the *low* one: the median says
+            // whether the cadence has slack at all, p5 says how close the worst
+            // frames came to handing over past their own deadline.
+            let headroom = if stats.headroom_us.is_empty() {
+                String::new()
+            } else {
+                let mut sorted = std::mem::take(&mut stats.headroom_us);
+                sorted.sort_unstable();
+                let at = |p: f64| {
+                    let rank =
+                        ((p / 100. * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+                    ms_us(sorted[rank - 1])
+                };
+                format!(
+                    ", headroom p50 {}, p5 {}, min {}",
+                    at(50.),
+                    at(5.),
+                    ms_us(sorted[0])
+                )
+            };
+
             tracing::info!(
                 "{output}: {:.1} fps over {}, p50 {}, p95 {}, worst {}, {} over budget, \
-                 {} dropped{gpu}",
+                 {} dropped{gpu}{headroom}",
                 fps,
                 ms(elapsed),
                 ms(p50),
@@ -824,6 +896,12 @@ impl FrameLog {
 /// budget, without the noise of `Duration`'s own formatting.
 fn ms(duration: Duration) -> String {
     format!("{:.2}ms", duration.as_secs_f64() * 1000.)
+}
+
+/// The same, for a signed microsecond count — headroom can be negative, which is
+/// the whole point of measuring it.
+fn ms_us(us: i64) -> String {
+    format!("{:.2}ms", us as f64 / 1000.)
 }
 
 #[cfg(test)]
@@ -1056,6 +1134,7 @@ mod tests {
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
+            queued: HashMap::new(),
             last_summary: Instant::now(),
         };
 
@@ -1082,6 +1161,7 @@ mod tests {
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
+            queued: HashMap::new(),
             last_summary: Instant::now(),
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
@@ -1121,6 +1201,7 @@ mod tests {
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
+            queued: HashMap::new(),
             last_summary: Instant::now(),
         };
         for i in 0..5 {
@@ -1133,5 +1214,48 @@ mod tests {
         log.presented("out", target, Duration::ZERO, Some(refresh));
         log.presented("out", target, target + refresh * 5, None);
         assert_eq!(dropped(&log), 0);
+    }
+
+    /// Headroom is only meaningful paired with the frame it was measured on. The
+    /// queue slot holds *one* entry per output, so a miss followed by another
+    /// frame leaves the later frame's handover sitting there — reading it against
+    /// the earlier target would report the healthy headroom of a frame that is
+    /// not the one that missed, i.e. exactly the wrong answer, every time.
+    #[test]
+    fn headroom_belongs_to_the_frame_that_was_queued() {
+        let refresh = Duration::from_micros(16667);
+        let mut log = FrameLog {
+            settings: Some(Settings::default()),
+            in_flight: None,
+            stats: HashMap::new(),
+            queued: HashMap::new(),
+            last_summary: Instant::now(),
+        };
+        let headroom = |log: &FrameLog| {
+            log.stats
+                .get("out")
+                .map_or(Vec::new(), |s| s.headroom_us.clone())
+        };
+
+        let target = Duration::from_secs(100);
+        log.queued("out", target, target - Duration::from_millis(4));
+        log.presented("out", target, target, Some(refresh));
+        assert_eq!(headroom(&log), [4000], "queued 4ms before its own deadline");
+
+        // The next frame's handover, while the previous target is presented late.
+        let next = target + refresh;
+        log.queued("out", next, next - Duration::from_millis(9));
+        log.presented("out", target, target + refresh, Some(refresh));
+        assert_eq!(
+            headroom(&log),
+            [4000],
+            "a mismatched target contributes no headroom"
+        );
+
+        // Handed over past its own deadline: negative, and it must stay signed.
+        let late = next + refresh;
+        log.queued("out", late, late + Duration::from_millis(2));
+        log.presented("out", late, late + refresh, Some(refresh));
+        assert_eq!(headroom(&log), [4000, -2000]);
     }
 }
