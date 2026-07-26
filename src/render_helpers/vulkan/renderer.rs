@@ -1216,7 +1216,6 @@ impl VulkanRenderer {
         )?;
         let tex = NiriTexture::import_dmabuf_sampled(
             &self.gpu,
-            self.command_pool,
             w,
             h,
             fd,
@@ -1228,7 +1227,7 @@ impl VulkanRenderer {
             filter,
         )?;
         let (desc_pool, set) = self.make_texture_set(&tex)?;
-        let tex = VkTexture::new(
+        let tex = VkTexture::new_unacquired_dmabuf(
             self.gpu.clone(),
             tex,
             desc_pool,
@@ -1236,8 +1235,14 @@ impl VulkanRenderer {
             w,
             h,
             format.code,
-            false,
         );
+        // The import left the image `UNDEFINED`; queue its acquire onto the same list the cache-hit
+        // path uses, so the barrier rides the next frame's command buffer instead of a submit and
+        // fence-wait of its own. A live overview frame showed two of those standalone barriers
+        // costing ~3 ms each (`docs/fork/frame-cost-investigation.md`). No de-dupe check needed
+        // that the hit path needs: this image did not exist a moment ago, so it cannot be queued
+        // already.
+        self.pending_dmabuf_acquires.push(tex.clone());
         self.dmabuf_import_cache.insert(dmabuf.weak(), tex.clone());
         Ok(tex)
     }
@@ -1419,6 +1424,15 @@ impl VulkanRenderer {
     /// the only option — and it is expensive, a whole command buffer, submit and fence wait for
     /// one pipeline barrier, which is why the frame path stopped using it. Keep it a fallback,
     /// not a step.
+    ///
+    /// **And it is the one barrier here that cannot simply be queued for the next frame**, unlike
+    /// the dmabuf acquires ([`Self::pending_dmabuf_acquires`]) or the uploads. Its whole purpose is
+    /// to make a texture sampleable for a consumer that may sample it *before* any frame begins —
+    /// `EffectBlur::run` submits outside a frame and samples the offscreen it was called on. A
+    /// queued barrier would be recorded at the next `begin`, i.e. *after* that read. So if the
+    /// frame log ever shows a `transition` wait again, this is one of only two live sources (the
+    /// other being a coverage-atlas creation), and the fix is to give it a consumer-side flush like
+    /// [`Self::flush_pending_texture_uploads`], not a queue.
     pub(crate) fn make_sampleable(&self, tex: &VkTexture) -> Result<(), VulkanError> {
         let old_layout = tex.layout();
         if old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
@@ -1844,6 +1858,15 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn in_flight_targets_len(&self) -> usize {
         self.in_flight.iter().map(|f| f._targets.len()).sum()
+    }
+
+    /// How many sampled textures the in-flight records are keeping alive — the frame's `held`,
+    /// which carries the images its command buffer recorded barriers and draws against. Same
+    /// reasoning as [`Self::in_flight_targets_len`]: a missing keep-alive shows up as a destroyed
+    /// image inside a recorded command buffer, which no pixel comparison can see.
+    #[cfg(test)]
+    pub(super) fn in_flight_held_len(&self) -> usize {
+        self.in_flight.iter().map(|f| f._held.len()).sum()
     }
 
     /// Turn GPU timing on for this renderer alone, without touching the
@@ -2339,10 +2362,30 @@ impl VulkanRenderer {
     /// (barriers must be recorded outside a render pass). Each barrier rides the frame's single
     /// submit, so the acquire is no longer a standalone submit + fence-wait. See
     /// [`Self::pending_dmabuf_acquires`].
-    pub(super) fn record_pending_dmabuf_acquires(&mut self, cbuf: vk::CommandBuffer) {
-        for tex in self.pending_dmabuf_acquires.drain(..) {
+    /// **Hands the drained textures back rather than dropping them**, for the caller to keep alive
+    /// until this command buffer's submit has retired — the same contract, for the same reason, as
+    /// [`Self::record_pending_texture_uploads`].
+    ///
+    /// Dropping them here destroys the `VkImage` a barrier was just recorded against, while the
+    /// command buffer is still recording and unsubmitted. Vulkan invalidates a command buffer whose
+    /// bound objects are destroyed, so every later command on it — the whole frame — is invalid
+    /// usage, and the submit that follows is a submit of a poisoned buffer.
+    ///
+    /// It took a live session and the validation layer to see it, because the drop is only the
+    /// *last* reference when the client has already released the buffer: `cached_dmabuf_import`
+    /// evicts dead entries on every lookup, so a client cycling buffers (any GPU client that
+    /// reallocates, e.g. on resize) leaves this queue holding the only reference. While only cache
+    /// *hits* were queued the bug was unreachable — a hit means the cache still holds one.
+    #[must_use = "the recorded-against images must outlive the submit"]
+    pub(super) fn record_pending_dmabuf_acquires(
+        &mut self,
+        cbuf: vk::CommandBuffer,
+    ) -> Vec<VkTexture> {
+        let queued = std::mem::take(&mut self.pending_dmabuf_acquires);
+        for tex in &queued {
             tex.record_reacquire_dmabuf(cbuf);
         }
+        queued
     }
 
     /// Record every staged texture upload into `cbuf` and hand the staging buffers back, for the

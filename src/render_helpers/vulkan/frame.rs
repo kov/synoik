@@ -173,7 +173,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // allowed inside one, and this must precede the acquires so they count.
         renderer.gpu_timer_begin(cbuf);
 
-        renderer.record_pending_dmabuf_acquires(cbuf);
+        // Kept alive by the frame (`held`) until its submit retires: the barriers above are
+        // recorded against these images, and destroying one mid-recording invalidates this whole
+        // command buffer. See `record_pending_dmabuf_acquires`.
+        let acquired = renderer.record_pending_dmabuf_acquires(cbuf);
 
         // Glyphs shaped since the last frame are still only in host memory; they must reach the
         // atlas before anything samples it, and this is the one place that has to happen (nothing
@@ -221,7 +224,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             transform,
             logical_size: transform.transform_size(output_size),
             proj: ndc_transform(transform),
-            held: Vec::new(),
+            held: acquired,
             clip_override: None,
             present_damage: Vec::new(),
             glyph_staging,

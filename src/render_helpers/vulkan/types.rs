@@ -107,6 +107,41 @@ impl VkTexture {
         }))
     }
 
+    /// A freshly imported client dmabuf, **before** its acquire barrier: no framebuffer, and
+    /// `UNDEFINED` layout because nothing has transitioned it yet.
+    ///
+    /// [`niri_vk::texture::Texture::import_dmabuf_sampled`] deliberately does not acquire — that
+    /// cost a command buffer, a submit and a fence wait for one pipeline barrier. The caller
+    /// queues this texture on
+    /// [`VulkanRenderer::pending_dmabuf_acquires`](super::renderer::VulkanRenderer) so the next
+    /// frame records it, exactly like a recommit's re-acquire. Tracking the layout honestly is
+    /// load-bearing: [`Self::record_reacquire_dmabuf`] passes the tracked layout as the barrier's
+    /// `old_layout`, so claiming `SHADER_READ_ONLY_OPTIMAL` here would emit a barrier out of an
+    /// layout the image was never in.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_unacquired_dmabuf(
+        gpu: Arc<Gpu>,
+        tex: NiriTexture,
+        desc_pool: vk::DescriptorPool,
+        set: vk::DescriptorSet,
+        width: u32,
+        height: u32,
+        format: Fourcc,
+    ) -> Self {
+        VkTexture(Arc::new(VkTextureInner {
+            gpu,
+            tex,
+            desc_pool,
+            set,
+            framebuffer: None,
+            layout: AtomicI32::new(vk::ImageLayout::UNDEFINED.as_raw()),
+            width,
+            height,
+            format,
+            flipped: false,
+        }))
+    }
+
     /// An offscreen render target that is also sampleable: carries a render-pass `framebuffer` and
     /// starts in `UNDEFINED` layout (the render pass performs the first transition).
     #[allow(clippy::too_many_arguments)]

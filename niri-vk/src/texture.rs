@@ -862,11 +862,18 @@ impl Texture {
     /// and a sampler. This is the client-buffer dual of [`Self::import_dmabuf_render_target`]: the
     /// compositor samples it when compositing the window.
     ///
-    /// Unlike the render-target import, the producer is outside Vulkan, so an explicit acquire
-    /// barrier transitions `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL`, transferring ownership from the
-    /// `FOREIGN` queue family when `VK_EXT_queue_family_foreign` is present. For the LINEAR
-    /// modifier the bytes survive the `UNDEFINED` old layout (nothing to detile). Single plane
-    /// only.
+    /// Unlike the render-target import, the producer is outside Vulkan, so the image needs an
+    /// explicit acquire barrier — `UNDEFINED`→`SHADER_READ_ONLY_OPTIMAL`, transferring ownership
+    /// from the `FOREIGN` queue family when `VK_EXT_queue_family_foreign` is present — before
+    /// anything samples it. For the LINEAR modifier the bytes survive the `UNDEFINED` old layout
+    /// (nothing to detile). Single plane only.
+    ///
+    /// **This does not perform that acquire**, and the returned image is left in `UNDEFINED`. It
+    /// used to, on a command buffer and fence-wait of its own, which a live overview frame showed
+    /// costing ~3 ms for a single pipeline barrier. The caller records it instead — with
+    /// [`Self::record_reacquire_dmabuf_sampled`] and an `old_layout` of `UNDEFINED`, which emits
+    /// exactly the same barrier — so it rides a submit that was happening anyway. A cached import
+    /// already went through that path on every recommit; this makes the first commit take it too.
     ///
     /// `fd` is duplicated internally (Vulkan consumes the dup on success; the caller keeps the
     /// original). `format` must match `fourcc`'s byte order (e.g. `B8G8R8A8_UNORM` for
@@ -874,7 +881,6 @@ impl Texture {
     #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf_sampled(
         gpu: &Gpu,
-        pool: vk::CommandPool,
         width: u32,
         height: u32,
         fd: BorrowedFd<'_>,
@@ -953,35 +959,9 @@ impl Texture {
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported sampled memory")?;
 
-        // Acquire the content from the outside-Vulkan producer and transition it for sampling.
-        // Transfer ownership from the FOREIGN queue family when that extension is present, else a
-        // plain layout transition. For the LINEAR modifier the bytes survive `UNDEFINED`.
-        let (src_qf, dst_qf) = if gpu.supports("VK_EXT_queue_family_foreign") {
-            (vk::QUEUE_FAMILY_FOREIGN_EXT, gpu.queue_family)
-        } else {
-            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
-        };
-        gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| unsafe {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(src_qf)
-                .dst_queue_family_index(dst_qf)
-                .image(image)
-                .subresource_range(COLOR_RANGE);
-            device.cmd_pipeline_barrier(
-                cbuf,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        })
-        .context("acquire imported sampled image")?;
+        // The acquire barrier is deliberately NOT recorded here — see this function's docs. The
+        // image stays `UNDEFINED` and the caller records the acquire into a command buffer it was
+        // already submitting.
 
         let components = if alpha_one {
             vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
@@ -1019,11 +999,13 @@ impl Texture {
         })
     }
 
-    /// Record the re-acquire barrier for an already-imported sampled dmabuf into an existing
-    /// `cbuf` — the caller owns the submit. This is the barrier-recording half of
-    /// [`Self::reacquire_dmabuf_sampled`]; the compositor records it directly into a frame's
-    /// command buffer (before that frame's render pass) so the acquire rides the frame's single
-    /// submit instead of a per-commit standalone submit + fence-wait.
+    /// Record the acquire barrier for an imported sampled dmabuf into an existing `cbuf` — the
+    /// caller owns the submit, and records it before that command buffer's render pass. The
+    /// acquire therefore rides a submit that was happening anyway, instead of costing a standalone
+    /// command buffer, submit and fence-wait per commit.
+    ///
+    /// Serves both the first acquire after [`Self::import_dmabuf_sampled`] (pass `UNDEFINED`) and
+    /// every recommit's re-acquire (pass the tracked layout) — the same barrier either way.
     ///
     /// The client renders new content into the *same* underlying dmabuf every frame (this image's
     /// memory IS that shared dmabuf), so a cache that reuses the [`Self::import_dmabuf_sampled`]
@@ -1083,22 +1065,6 @@ impl Texture {
                 &[barrier],
             );
         }
-    }
-
-    /// Standalone variant of [`Self::record_reacquire_dmabuf_sampled`]: records the acquire barrier
-    /// on its own command buffer and submits it. Kept as a self-contained niri-vk API for callers
-    /// that re-acquire outside a frame; the compositor's hot path uses the `record_*` variant to
-    /// fold the barrier into the frame submit. See that method for the full rationale.
-    pub fn reacquire_dmabuf_sampled(
-        &self,
-        gpu: &Gpu,
-        pool: vk::CommandPool,
-        old_layout: vk::ImageLayout,
-    ) -> Result<()> {
-        gpu.run_commands(pool, crate::stats::SubmitSite::Transition, |cbuf| {
-            self.record_reacquire_dmabuf_sampled(gpu, cbuf, old_layout)
-        })
-        .context("re-acquire imported sampled image")
     }
 
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.

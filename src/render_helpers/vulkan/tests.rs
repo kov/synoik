@@ -2637,7 +2637,9 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
         .expect("render client dmabuf")
     }
 
-    // MISS: the full import populates the cache and runs its OWN acquire barrier — nothing queued.
+    // MISS: the full import populates the cache and queues its acquire like a hit does. It used to
+    // run that barrier on a command buffer, submit and fence-wait of its own — ~3 ms for one
+    // pipeline barrier on the live seat, where an overview frame paid it twice.
     let t1 = vk.import_dmabuf_as_texture(&dmabuf).expect("import (miss)");
     let cached = t1.clone();
     assert_eq!(
@@ -2647,8 +2649,8 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
     );
     assert_eq!(
         vk.pending_dmabuf_acquires_len(),
-        0,
-        "a miss runs its own import barrier and queues no deferred acquire",
+        1,
+        "a miss must queue its import acquire, not submit one of its own",
     );
 
     // Frame 1 samples the imported buffer → green.
@@ -4574,4 +4576,91 @@ fn retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated() {
          texture gets rendered over"
     );
     drop(displayed);
+}
+
+/// A deferred acquire's image must outlive the frame that records its barrier.
+///
+/// `record_pending_dmabuf_acquires` used to `drain(..)` the queue and drop each `VkTexture` as soon
+/// as it had recorded that texture's barrier — destroying the `VkImage` while the frame's command
+/// buffer was still recording and unsubmitted. Vulkan invalidates a command buffer whose bound
+/// objects are destroyed, so the rest of the frame is invalid usage and the submit carries a
+/// poisoned buffer. On the live seat that took the Venus context down, after which every
+/// allocation returned `ERROR_OUT_OF_HOST_MEMORY` — the failures looked like a memory leak and
+/// were nothing of the kind.
+///
+/// The drop is only the *last* reference once the client has released the buffer:
+/// `cached_dmabuf_import` evicts dead entries on every lookup, so a client that reallocates
+/// buffers leaves this queue holding the sole reference. That is why only fresh imports could
+/// reach it — a cache *hit* means the cache still holds one — and why it appeared the moment fresh
+/// imports started queueing.
+///
+/// So: import, drop the producer, force the cache eviction, then render a deferred frame and
+/// require the frame to be keeping the image alive. Needs a Venus + GBM stack; skips without.
+#[test]
+fn vulkan_a_deferred_acquire_outlives_the_frame_that_records_it() {
+    use niri_vk::dmabuf::ForeignBuffer;
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::Modifier;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_a_deferred_acquire_outlives_the_frame: no device ({e})");
+            return;
+        }
+    };
+    // Headless has no KMS plane to take the fence, so the deferred path must be asked for.
+    vk.set_defer_scanout(true);
+
+    let make = |vk: &mut VulkanRenderer| -> Option<()> {
+        let fb = ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 255, 0, 255]; 4]).ok()?;
+        let mut builder = Dmabuf::builder(
+            (W, H),
+            Fourcc::Argb8888,
+            Modifier::Linear,
+            DmabufFlags::empty(),
+        );
+        assert!(builder.add_plane(fb.fd().try_clone_to_owned().ok()?, 0, fb.offset, fb.stride));
+        let dmabuf = builder.build()?;
+        vk.import_dmabuf_as_texture(&dmabuf).ok()?;
+        // The producer goes away immediately, exactly like a client cycling its buffer pool. The
+        // renderer's cache entry is now dead, so only the pending queue still refers to the image.
+        drop((dmabuf, fb));
+        Some(())
+    };
+    if make(&mut vk).is_none() {
+        eprintln!("skipping vulkan_a_deferred_acquire_outlives_the_frame: GBM cannot allocate");
+        return;
+    }
+    // Any lookup sweeps dead entries out of the import cache — this is what makes the pending
+    // queue the *last* holder, and it is what a real second commit would do anyway.
+    let _ = make(&mut vk);
+
+    assert!(
+        vk.pending_dmabuf_acquires_len() > 0,
+        "the imports must be queued for a deferred acquire, or this proves nothing",
+    );
+
+    // One frame: `begin` records the queued barriers into its command buffer.
+    let size = Size::<i32, Physical>::from((W, H));
+    let _ = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::empty::<TextureRenderElement<VkTexture>>(),
+    );
+
+    assert_eq!(
+        vk.pending_dmabuf_acquires_len(),
+        0,
+        "the frame must have drained the queue",
+    );
+    assert!(
+        vk.in_flight_held_len() > 0,
+        "the frame must keep the images it recorded barriers against alive until its submit \
+         retires; dropping them at record time destroys a VkImage inside a recording command \
+         buffer",
+    );
 }
