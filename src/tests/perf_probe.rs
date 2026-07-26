@@ -27,6 +27,28 @@
 //! stamp overview thumbnail**: the chain runs at output resolution per blurred window, ignoring the
 //! destination geometry. The shader is not slow (0.092 ms/Mpx stands); we ask it for ten screens of
 //! fragments.
+//!
+//! # Sweep 7, and what it settled (2026-07-26, with working GPU timestamps)
+//!
+//! Sweep 1-4's "draw count is nearly free" rested on 23 → 34 draws, which is inside this probe's
+//! noise; a regression over 1123 live frames pointed the other way, at 41 µs/draw. Sweep 7 is the
+//! controlled version — the same output tiled by 1 to 256 cells, so **shaded fragments are held
+//! fixed while draws move 256x** — and it is unambiguous: **~0.6 µs/draw**, the same for solid
+//! quads, for textured quads sharing one descriptor set, and for a distinct texture per draw.
+//! Rebinding costs nothing measurable either. The live regression's draw coefficient is confounded:
+//! in that session, "many draws" and "the overview is open" are the same frames.
+//!
+//! Which leaves the content gap, now measured directly instead of inferred. At 2048x1330 this probe
+//! renders a settled overview in **0.70 ms of GPU for 2.56x the output**; the live seat's worst
+//! frames are **10.9 ms for 2.0x**. Same renderer, same device, same resolution, *more* fragments
+//! here — and 15x cheaper. Those live frames upload nothing, create nothing and bake nothing, so
+//! the difference is entirely in what they sample. The untested ingredient is still the one sweep 4
+//! could not build: real client dmabufs on a LINEAR modifier, minified into thumbnails. The probe
+//! attaches shm, which lands in an OPTIMAL tiled image.
+//!
+//! Read GPU time, not wall clock, for any of this: [`render_once_gpu`] and [`best_gpu_of`] exist
+//! because the wall-clock figures in sweeps 1-6 fold in the host round trip, which on this stack is
+//! ~2.6 ms of mesa's userspace fence poll and has nothing to do with the frame.
 
 use std::time::{Duration, Instant};
 
@@ -35,7 +57,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::utils::{Physical, Scale, Size, Transform};
 
 use super::fixture::Fixture;
-use crate::render_helpers::vulkan::VulkanRenderer;
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::{render_to_texture, RenderCtx, RenderTarget};
 
 /// A window big enough that its texture must be minified hard to fit an overview thumbnail.
@@ -502,4 +524,331 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
         }
     }
     println!();
+}
+
+/// Sweep 7: **what does a draw call cost?** — the one thing sweeps 1-4 measured badly, and the one
+/// thing the live regression measured misleadingly.
+///
+/// This file's header says "draw count is nearly free (23 → 34 draws moved nothing)". Eleven draws
+/// is the whole evidence. Against that, regressing 1123 single-submit live frames on draws and
+/// coverage gives `0.05 ms + 41 µs/draw + 0.125 ms/Mpx` (R² 0.766, against 0.687 for draws alone
+/// and **0.261 for coverage alone**) — which would put 8.4 of an overview frame's 10.9 ms into draw
+/// calls. Both cannot be right, and neither is a controlled measurement: the live one cannot hold
+/// anything fixed, and 11 draws is inside this probe's noise.
+///
+/// So: tile the same output with an N-cell grid, 1 to 256 cells, and **hold the shaded-fragment
+/// count fixed** while the draw count moves 256x. Three variants, because "a draw" is not one
+/// thing:
+///
+/// - **solid** — one pipeline, no descriptor, no sampling. The floor.
+/// - **one texture** — the texture pipeline, but every cell samples the *same* image, so the
+///   descriptor set is bound once and the draws differ only in geometry.
+/// - **N textures** — a distinct image per cell, i.e. a descriptor-set bind per draw. This is the
+///   shape of an overview frame, where every thumbnail is its own window's texture.
+///
+/// The spread between the last two is the cost of *rebinding*, which on a paravirtualized driver is
+/// ring traffic rather than GPU work. Measured on GPU timestamps, so the host round trip and the
+/// CPU-side element loop are excluded by construction.
+#[test]
+#[ignore]
+fn perf_probe_what_does_a_draw_call_cost() {
+    use smithay::backend::renderer::element::Kind;
+    use smithay::utils::Point;
+
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+
+    // The internal panel's shape, i.e. the resolution the live regression was taken at.
+    const OUT: (u16, u16) = (2048, 1330);
+    /// Square grids, so no cell is a sliver: sweeping strip *shapes* over 256x would confound
+    /// per-draw cost with whatever the rasterizer does to thin quads.
+    const SIDES: [u32; 7] = [1, 2, 4, 6, 8, 12, 16];
+    const REPEATS: usize = 9;
+
+    let Some(mut f) = build(OUT, 0) else { return };
+    let timed = f
+        .niri_state()
+        .backend
+        .headless()
+        .with_vulkan_renderer(VulkanRenderer::enable_gpu_timing)
+        .unwrap_or(false);
+    if !timed {
+        println!("skipping: the device declines to timestamp, so only wall clock is available");
+        return;
+    }
+
+    println!(
+        "\n== draw-call sweep, {}x{}, constant coverage ==",
+        OUT.0, OUT.1
+    );
+    let mut fits: Vec<(&str, f64, f64)> = Vec::new();
+    for variant in ["solid", "one texture", "N textures"] {
+        println!("  -- {variant} --");
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for side in SIDES {
+            let cells = side * side;
+            let cell = (
+                f64::from(OUT.0) / f64::from(side),
+                f64::from(OUT.1) / f64::from(side),
+            );
+            let at = |i: u32| {
+                Point::<f64, _>::from((f64::from(i % side) * cell.0, f64::from(i / side) * cell.1))
+            };
+
+            let sample = if variant == "solid" {
+                // Built once and held: `from_buffer` borrows its buffer.
+                let buffers: Vec<SolidColorBuffer> = (0..cells)
+                    .map(|i| {
+                        let shade = 0.2 + 0.15 * f32::from(u8::try_from(i % 5).expect("small"));
+                        SolidColorBuffer::new(Size::<f64, _>::from(cell), [shade, 0.4, 0.7, 1.])
+                    })
+                    .collect();
+                let elements: Vec<SolidColorRenderElement> = buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, buffer)| {
+                        let i = u32::try_from(i).expect("small");
+                        SolidColorRenderElement::from_buffer(buffer, at(i), 1., Kind::Unspecified)
+                    })
+                    .collect();
+                best_gpu_of(&mut f, &elements, REPEATS)
+            } else {
+                let distinct = if variant == "N textures" { cells } else { 1 };
+                let elements = textured_grid(&mut f, distinct, cells, cell, at);
+                best_gpu_of(&mut f, &elements, REPEATS)
+            };
+
+            let Some((gpu, draws, shaded)) = sample else {
+                println!("     {cells:4} draws: every pair came back unusable");
+                continue;
+            };
+            let ms = gpu.as_secs_f64() * 1000.;
+            println!(
+                "     {draws:4} draws  gpu {ms:6.3}ms  {:5.2} Mpx ({:4.2}x out)  {:7.1} µs/draw",
+                shaded as f64 / 1e6,
+                shaded as f64 / (f64::from(OUT.0) * f64::from(OUT.1)),
+                ms * 1000. / draws.max(1) as f64,
+            );
+            points.push((draws as f64, ms));
+        }
+        if let Some(fit) = line_fit(&points) {
+            fits.push((variant, fit.0, fit.1));
+        }
+    }
+
+    println!("\n  fits (gpu = intercept + slope × draws, coverage held at 1.00x out):");
+    for (variant, intercept, slope) in fits {
+        println!(
+            "    {variant:<12} {intercept:6.3} ms + {:6.2} µs/draw",
+            slope * 1000.
+        );
+    }
+    println!("    live regression over 6-204 draws said 41.4 µs/draw");
+
+    // The comparison that matters: the same *shape* as a live overview frame, priced in GPU time
+    // rather than the wall clock sweeps 1-4 used. The seat's worst frames are ~200 draws over 2.0x
+    // the output for 10.9 ms. Whatever this probe pays for the same counters is the part explained
+    // by shape; the rest is content, and the probe does not have the seat's content.
+    println!("\n  == overview frame, GPU time, for comparison with the live seat ==");
+    for windows in [1usize, 4] {
+        let Some(mut f) = build(OUT, windows) else {
+            return;
+        };
+        let timed = f
+            .niri_state()
+            .backend
+            .headless()
+            .with_vulkan_renderer(VulkanRenderer::enable_gpu_timing)
+            .unwrap_or(false);
+        if !timed {
+            break;
+        }
+        f.niri_state().do_action(Action::OpenOverview, false);
+        f.settle_animations();
+        let mut best: Option<(Duration, u64, u64)> = None;
+        for _ in 0..REPEATS {
+            if let Some(s) = render_once_gpu(&mut f) {
+                if best.is_none_or(|(b, _, _)| s.0 < b) {
+                    best = Some(s);
+                }
+            }
+        }
+        match best {
+            Some((gpu, draws, shaded)) => println!(
+                "     {windows} window(s)  gpu {:6.3}ms  {draws:4} draws  {:4.2}x out",
+                gpu.as_secs_f64() * 1000.,
+                shaded as f64 / (f64::from(OUT.0) * f64::from(OUT.1)),
+            ),
+            None => println!("     {windows} window(s): every pair came back unusable"),
+        }
+    }
+    println!();
+}
+
+/// [`render_once`], measured on GPU timestamps instead of wall clock. `None` if the pair came back
+/// unusable. Requires `enable_gpu_timing` on the fixture's renderer.
+fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
+    let output = f.niri_output(1);
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<Option<(Duration, u64, u64)>> {
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(&output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements = niri.render_to_vec(ctx, &output, false);
+
+            let _ = crate::frame_log::take_gpu_samples();
+            let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+            let (_tex, _sync) = render_to_texture(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            let samples = crate::frame_log::take_gpu_samples();
+            Ok((samples.lost == 0 && samples.count > 0).then_some((
+                samples.time,
+                niri_vk::stats::draws() - d0,
+                niri_vk::stats::shaded() - s0,
+            )))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("rendering must not error")
+}
+
+/// `cells` textured quads tiling the output, sampling `distinct` separate images (`1` to share one
+/// descriptor set across every draw, `cells` to rebind per draw).
+fn textured_grid(
+    f: &mut Fixture,
+    distinct: u32,
+    cells: u32,
+    cell: (f64, f64),
+    at: impl Fn(u32) -> smithay::utils::Point<f64, smithay::utils::Logical>,
+) -> Vec<crate::render_helpers::texture::TextureRenderElement<VkTexture>> {
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    /// Small enough that N of them cost nothing to upload, big enough to be a real sampled image
+    /// rather than a degenerate 1x1.
+    const TEX: i32 = 64;
+
+    let buffers: Vec<TextureBuffer<_>> = f
+        .niri_state()
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            (0..distinct)
+                .map(|i| {
+                    let tint = u8::try_from(40 + i % 200).expect("small");
+                    let texels: Vec<u8> = (0..TEX * TEX)
+                        .flat_map(|p| [tint, u8::try_from(p % 256).expect("mod"), 90, 255])
+                        .collect();
+                    TextureBuffer::from_memory(
+                        vk,
+                        &texels,
+                        Fourcc::Abgr8888,
+                        (TEX, TEX),
+                        false,
+                        1.,
+                        Transform::Normal,
+                        Vec::new(),
+                    )
+                    .expect("import texture")
+                })
+                .collect()
+        })
+        .expect("headless backend must hold a Vulkan renderer");
+
+    (0..cells)
+        .map(|i| {
+            let buffer = buffers[(i % distinct) as usize].clone();
+            let mut element = TextureRenderElement::from_texture_buffer(
+                buffer,
+                at(i),
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            );
+            // Stretch the 64x64 source over the whole cell, so coverage stays at one output
+            // whatever the grid is — the control this whole sweep rests on.
+            element.set_size(Size::<f64, _>::from(cell));
+            element
+        })
+        .collect()
+}
+
+/// Least-squares `(intercept, slope)` through `points`, or `None` with fewer than two.
+fn line_fit(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if points.len() < 2 {
+        return None;
+    }
+    let n = points.len() as f64;
+    let (sx, sy): (f64, f64) = points.iter().fold((0., 0.), |a, p| (a.0 + p.0, a.1 + p.1));
+    let (mx, my) = (sx / n, sy / n);
+    let num: f64 = points.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let den: f64 = points.iter().map(|(x, _)| (x - mx).powi(2)).sum();
+    let slope = num / den;
+    Some((my - slope * mx, slope))
+}
+
+/// Render `elements` `n` times and return the cheapest **GPU** sample, with the draw and fragment
+/// counts of that render.
+///
+/// Cheapest rather than mean for the same reason as [`best_of`], and GPU rather than wall clock
+/// because the question is what the device did, not what the host round trip cost. Samples are read
+/// through the frame log's per-thread store; the fixture renders on this thread, so nothing else
+/// can contribute one.
+fn best_gpu_of<E>(f: &mut Fixture, elements: &[E], n: usize) -> Option<(Duration, u64, u64)>
+where
+    E: smithay::backend::renderer::element::RenderElement<VulkanRenderer>,
+{
+    let output = f.niri_output(1);
+    let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    let mut best: Option<(Duration, u64, u64)> = None;
+    for _ in 0..n {
+        let sample = f
+            .niri_state()
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<Option<(Duration, u64, u64)>> {
+                let _ = crate::frame_log::take_gpu_samples();
+                let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+                let (_tex, _sync) = render_to_texture(
+                    vk,
+                    size,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter(),
+                )?;
+                let samples = crate::frame_log::take_gpu_samples();
+                Ok((samples.lost == 0 && samples.count > 0).then_some((
+                    samples.time,
+                    niri_vk::stats::draws() - d0,
+                    niri_vk::stats::shaded() - s0,
+                )))
+            })
+            .expect("headless backend must hold a Vulkan renderer")
+            .expect("rendering must not error");
+        if let Some(sample) = sample {
+            if best.is_none_or(|(b, _, _)| sample.0 < b) {
+                best = Some(sample);
+            }
+        }
+    }
+    best
 }
