@@ -274,6 +274,11 @@ pub struct VulkanRenderer {
     /// bound while undrained either — see [`PendingTextureUpload`].
     pending_texture_uploads: Vec<PendingTextureUpload>,
 
+    /// Freshly created offscreens waiting for the barrier that makes them sampleable, drained into
+    /// the next frame's command buffer by [`super::VulkanFrame::begin`]. See
+    /// [`Self::make_sampleable`], which is where the "fresh" qualifier is decided and defended.
+    pending_sampleable: Vec<VkTexture>,
+
     /// Blurs queued while collecting elements, drained into the next frame's command buffer by
     /// [`super::VulkanFrame::begin`]. Same slot, same invariant and same reason as
     /// [`Self::pending_texture_uploads`]: the frame is submitting anyway, and on this stack a
@@ -536,6 +541,7 @@ impl VulkanRenderer {
             pending_dmabuf_acquires: Vec::new(),
             pending_texture_uploads: Vec::new(),
             pending_blurs: Vec::new(),
+            pending_sampleable: Vec::new(),
             staging_pool,
         })
     }
@@ -1318,6 +1324,7 @@ impl VulkanRenderer {
         // surface) is exactly that consumer.
         self.flush_pending_texture_uploads()?;
         self.flush_pending_blurs()?;
+        self.flush_pending_sampleable()?;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
         let image = tex.image();
         let old_layout = tex.layout();
@@ -1467,24 +1474,44 @@ impl VulkanRenderer {
     /// it is already sampleable. Reached generically via
     /// [`crate::render_helpers::renderer::OffscreenRenderer::make_offscreen_sampleable`].
     ///
-    /// **Usually a no-op now**: a [`VulkanFrame`](super::VulkanFrame) targeting an offscreen
-    /// already finishes it sampleable, riding the submit it was making anyway. This remains for
-    /// textures that reach a sampled state by some other route (e.g. a transfer), where it is
-    /// the only option — and it is expensive, a whole command buffer, submit and fence wait for
-    /// one pipeline barrier, which is why the frame path stopped using it. Keep it a fallback,
-    /// not a step.
+    /// **Usually a no-op**: a [`VulkanFrame`](super::VulkanFrame) targeting an offscreen already
+    /// finishes it sampleable, riding the submit it was making anyway.
     ///
-    /// **And it is the one barrier here that cannot simply be queued for the next frame**, unlike
-    /// the dmabuf acquires ([`Self::pending_dmabuf_acquires`]) or the uploads. Its whole purpose is
-    /// to make a texture sampleable for a consumer that may sample it *before* any frame begins —
-    /// `EffectBlur::run` submits outside a frame and samples the offscreen it was called on. A
-    /// queued barrier would be recorded at the next `begin`, i.e. *after* that read. So if the
-    /// frame log ever shows a `transition` wait again, this is one of only two live sources (the
-    /// other being a coverage-atlas creation), and the fix is to give it a consumer-side flush like
-    /// [`Self::flush_pending_texture_uploads`], not a queue.
-    pub(crate) fn make_sampleable(&self, tex: &VkTexture) -> Result<(), VulkanError> {
+    /// When it is not a no-op it is almost always a **fresh** offscreen — created this frame and
+    /// not yet rendered into, because the effect buffer's elements did not change and its texture
+    /// had just been recreated (a size change, an overview zoom). Measured: every other path
+    /// through an effect-buffer prepare costs zero transitions and that one costs one, which on a
+    /// live overview frame was `2 transition in 3.03ms`, the only wait left in the line.
+    ///
+    /// So an `UNDEFINED` image is **queued** rather than submitted. It is the one layout where
+    /// that is unconditionally safe: the barrier's source layout says the contents may be
+    /// discarded, and there are none — nothing has been rendered into it yet. The two hazards a
+    /// queue has to answer:
+    ///
+    /// - *Something samples it before the drain.* It cannot: the only consumers are draws in a
+    ///   frame, a queued blur (recorded after this queue, in the same `begin`), and the
+    ///   out-of-frame readbacks, which drain explicitly ([`Self::flush_pending_sampleable`]).
+    /// - *Something renders into it before the drain,* which would leave a stale `UNDEFINED ->
+    ///   SHADER_READ` barrier to discard the new contents. [`Self::bind`] drops the queued entry
+    ///   for exactly this reason — and the render pass then leaves the image sampleable itself, so
+    ///   nothing is lost.
+    ///
+    /// Any other layout still submits. Those carry real contents (a texture that reached a sampled
+    /// state by some other route, e.g. a transfer), so the barrier is not a discard and this stays
+    /// what it always was: a whole command buffer, submit and fence wait for one pipeline barrier.
+    pub(crate) fn make_sampleable(&mut self, tex: &VkTexture) -> Result<(), VulkanError> {
         let old_layout = tex.layout();
         if old_layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return Ok(());
+        }
+        if old_layout == vk::ImageLayout::UNDEFINED {
+            // Nothing to preserve, so this is bookkeeping the frame can do for free. De-duped by
+            // image: a fresh offscreen prepared twice before a frame needs one barrier.
+            let image = tex.image();
+            if !self.pending_sampleable.iter().any(|t| t.image() == image) {
+                self.pending_sampleable.push(tex.clone());
+            }
+            tex.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             return Ok(());
         }
         let image = tex.image();
@@ -1507,6 +1534,59 @@ impl VulkanRenderer {
         Ok(())
     }
 
+    /// Record every queued make-sampleable barrier into `cbuf`, and hand back the images so they
+    /// outlive the submit. Must run **before** anything in the same command buffer that samples
+    /// them — the queued blurs, and every draw in the frame.
+    #[must_use = "the images the barriers name must outlive the submit"]
+    pub(super) fn record_pending_sampleable(&mut self, cbuf: vk::CommandBuffer) -> Vec<VkTexture> {
+        let queued = std::mem::take(&mut self.pending_sampleable);
+        for tex in &queued {
+            unsafe {
+                transition_image(
+                    &self.gpu.device,
+                    cbuf,
+                    tex.image(),
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                );
+            }
+        }
+        queued
+    }
+
+    /// Submit the queued barriers on their own — the consumer-side drain for anything that touches
+    /// one of those images outside a frame. Same shape and same warning as
+    /// [`Self::flush_pending_texture_uploads`].
+    fn flush_pending_sampleable(&mut self) -> Result<(), VulkanError> {
+        if self.pending_sampleable.is_empty() {
+            return Ok(());
+        }
+        let queued = std::mem::take(&mut self.pending_sampleable);
+        let gpu = self.gpu.clone();
+        gpu.run_commands(
+            self.command_pool,
+            niri_vk::stats::SubmitSite::Transition,
+            |cbuf| {
+                for tex in &queued {
+                    unsafe {
+                        transition_image(
+                            &gpu.device,
+                            cbuf,
+                            tex.image(),
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::AccessFlags::SHADER_READ,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        );
+                    }
+                }
+            },
+        )
+        .map_err(|e| VulkanError::Other(format!("flushing queued layout barriers: {e:#}")))
+    }
+
     /// Blur `source` with the dual-kawase [`BlurChain`] and return the result as a fresh,
     /// sampleable offscreen [`VkTexture`] the same size as `source` — the owned-renderer
     /// equivalent of niri's GLES `Blur` (the `FramebufferEffectElement` backdrop blur).
@@ -1526,6 +1606,7 @@ impl VulkanRenderer {
         // The chain samples `source` on a submit of its own, ahead of any frame.
         self.flush_pending_texture_uploads()?;
         self.flush_pending_blurs()?;
+        self.flush_pending_sampleable()?;
         let (w, h) = source.extent();
         let output = self.create_buffer(Fourcc::Abgr8888, Size::from((w as i32, h as i32)))?;
 
@@ -2149,6 +2230,12 @@ impl Bind<VkTexture> for VulkanRenderer {
                 "binding an imported (non-renderable) texture as a target",
             ));
         }
+        // Rendering into it makes any queued make-sampleable barrier both unnecessary and wrong:
+        // the render pass discards from UNDEFINED and leaves the image sampleable itself, while a
+        // barrier still queued would be recorded *after* that, discarding what was just drawn.
+        // See `make_sampleable`.
+        let image = target.image();
+        self.pending_sampleable.retain(|tex| tex.image() != image);
         Ok(VkFramebuffer::new_offscreen(target.clone()))
     }
 }
@@ -2461,6 +2548,8 @@ impl VulkanRenderer {
         if self.pending_blurs.is_empty() {
             return Ok(());
         }
+        // The chains sample images whose barrier may still be queued.
+        self.flush_pending_sampleable()?;
         let queued = std::mem::take(&mut self.pending_blurs);
         let gpu = self.gpu.clone();
         // `run_commands` waits, so `queued` — the chains and the images it holds — outlives the

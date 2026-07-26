@@ -4,6 +4,13 @@
 `virglrenderer` fork's Venus backend, the VMM's virtio-gpu device, the host Vulkan driver).
 Written from inside the guest (`gnome-shell-rs` dev VM) on 2026-07-24.
 
+> **RESOLVED 2026-07-26 — fixed host-side, in the host Vulkan driver (KosmicKrisp), not in Venus.**
+> Two stacked bugs; see §7 for the root cause, the validation (100/100 on this VM's own host GPU,
+> where it was 0/100), the ~0.4%-of-a-frame cost, and how to tell a deployed build has it.
+> **Everything between here and §7 is the original handoff, written while the cause was unknown —
+> read it as the investigation, not as current state.** The one correction it needs inline: the
+> partial hit rate it anticipates is gone, and every pair should now be written.
+
 **One-line summary:** this stack advertises Vulkan timestamp queries in full and then **silently
 resolves every one of them to zero** — the queries come back *available*, not *unavailable*, so
 nothing in the API distinguishes "the GPU pass took no measurable time" from "the driver does not
@@ -142,6 +149,10 @@ guest uptime), which is consistent with it being the host GPU's clock forwarded 
 executing. On a slow frame you learn that submit took 12 ms, but not whether the GPU was busy for
 11 of them or for 1.
 
+> **Superseded by §7.** This section sized the loss to help decide whether the VMM work was worth
+> doing. It was done, and the attribution below is no longer lost — keep reading §4 for what the
+> gap *was*, not for what it costs now.
+
 That is worth having but it is a second-order tool, so weigh the VMM work accordingly. Note also
 that the compositor's `submit` includes an unavoidable full pipeline stall (the synchronous
 fence wait), so the GPU number would mostly answer "is the GPU or the CPU the bottleneck" rather
@@ -187,7 +198,141 @@ way to say so is `timestampValidBits = 0` on the queue family. The guest already
 "GPU timing unavailable" and stays quiet about it — no zero-valued measurements, no warning, no
 heuristic.
 
-## 7. Related
+## 7. Resolved (2026-07-26) — two bugs in the host Vulkan driver
+
+§5 asked for one experiment before anything else: *does the host driver pass the same reproducer
+natively?* That was the right call and it split the problem exactly in half — the answer was no,
+and one run exonerated everything above the host driver. What follows is what it turned out to be.
+
+**Not Venus, not our virglrenderer fork, not the VMM, not the guest.** Reproduced natively on the
+host with no VM running at all. It is **KosmicKrisp**, the host Vulkan-on-Metal driver, and it is
+**machine-dependent**: an M1 Max passes the same binary, the M4 Pro this VM runs on fails. That is
+why the advertised surface was honest rather than a stub — the driver does implement timestamp
+queries, and on other hardware they work.
+
+Two independent bugs, stacked, which is why the first fix only half-helped:
+
+1. **The sample was never taken.** The driver built a counter-sampling blit encoder that encoded no
+   data movement. **Metal elides a blit encoder that encodes nothing**, and an elided encoder never
+   takes its counter sample. Fixed by giving that encoder real work (`patches/kosmickrisp/0012`,
+   deployed here 2026-07-25 — the change that moved the hit rate from nothing to the ~7% of pairs
+   your `UNWRITTEN_LIMIT` comment records).
+
+2. **The GPU resolve could not see the sample.** A Metal counter sample only materialises when the
+   command buffer that took it **completes**. A `resolveCounters:` encoded before that writes
+   **zero, silently** — not `MTLCounterErrorValue`, not a failure. On the M4 Pro that is 94% of the
+   time from the same command buffer, and still 18% from a later one. And because KosmicKrisp's
+   availability test for a timestamp pool is `value != UINT64_MAX`, that zero read back as *a query
+   that resolved to zero*.
+
+That second one is exactly the `avail = 1, value 0` your §3.2 pinned down, and it is worth stating
+plainly: **the driver did consider the query resolved, because as far as it could tell, it was.**
+The two bugs are also indistinguishable from the guest — one wrote nothing and the other wrote
+zero, and both arrive as a well-formed available zero. Only a CPU-side read of the Metal sample
+buffer, from inside the driver, separated them. Your §3.2 was right that there is nothing in the
+API to branch on; there was nothing on the host side either until the driver was instrumented.
+
+Fixed in `patches/kosmickrisp/0013`: the resolve moved off the GPU entirely and onto the CPU, in
+the command buffer's completion handler, which is the first moment the sample is readable. That
+moves the report write out of GPU command order, so the ordering it used to get for free is now
+explicit — the sampling encoder marks the report unavailable in command order, and an in-stream
+`vkCmdResetQueryPool` or `vkCmdCopyQueryPoolResults` waits on an event the completion handler
+signals. (Venus's query-feedback command buffer rides in the *same* submission as the frame, so
+that wait is on the common path, not a corner case. It is costed below.)
+
+### Validation
+
+The reproducer's shapes, run natively on **this VM's host** — the same M4 Pro, no VM involved:
+
+| | before | after |
+|---|---|---|
+| `vkGetQueryPoolResults` | `0 / avail=1`, every run | **100/100 real advancing timestamps** |
+| `vkCmdCopyQueryPoolResults` | `0 / avail=1`, every run | **100/100** |
+| …the same, in a separate command buffer submitted alongside — **what Venus actually produces** | `0 / avail=1`, every run | **100/100** |
+
+Zero occurrences of a zero-presented-as-available in 300 samples. Also checked: a full enhanced
+desktop boots and renders normally on the fixed driver, and the host's own GL timer-query path
+(zink-on-KosmicKrisp `glQueryCounter` / `GL_TIME_ELAPSED`) still returns sane monotonic
+nanoseconds, so nothing regressed to buy this.
+
+**Not yet measured: this reproducer, in this guest, on the fixed driver.** That is the run that
+closes it out from your side, and it needs the deploy in §7.4.
+
+### 7.1 Expected hit rate: all of them
+
+**The partial-hit-rate expectation is retracted.** The ~7% of pairs you measured on 2026-07-25 was
+bug #2 doing the dropping — and the host-side guess that preceded it ("~82% per timestamp, so about
+two thirds of pairs") was wrong in the same direction. Your 7% was a measurement and that 82% was
+never more than an extrapolation from an isolated Metal probe; the measurement wins. With the
+resolve off the GPU there is no drop mechanism left: every sample that is taken is read back.
+**Expect every pair written.**
+
+That is not an argument for ripping out the defences. `UNWRITTEN_LIMIT = 256`, the all-zero
+heuristic, and `SANE_LIMIT` cost nothing and should simply stop firing — which is the right posture
+for a paravirtualised device that has surprised you twice. But the premise recorded in that
+constant's doc comment — *"the host-side fixes for our Venus VM are aiming at a partial hit rate"* —
+is obsolete, and if the constant is ever retuned, note that 256 was sized against a dry-spell
+distribution that should no longer exist.
+
+### 7.2 What it costs
+
+Moving the resolve to the CPU is not free: a timestamp followed by an in-stream consumer now ends
+the sampling command buffer and makes the next one wait, on the GPU, for an event the CPU signals.
+That is a GPU→CPU→GPU hop inside the frame. Measured on this host (median of 3000 submits, two
+runs, stable to the digit shown):
+
+| per submission | before | after |
+|---|---|---|
+| no timestamps at all | 0.156 ms | 0.158 ms |
+| 2 timestamps, read after the fence | 0.206 ms | **0.199 ms** |
+| 2 timestamps + in-stream copy — **the Venus shape** | 0.221 ms | **0.286 ms** |
+
+The first row is the control: work that does not use timestamp queries is untouched. The second got
+slightly *faster* (two GPU resolve encoders per frame deleted, no barrier needed when nothing reads
+the report early). The third is the real cost: **~0.065 ms per submission** that carries both a
+timestamp and a consumer.
+
+For this compositor that is **one barrier per frame** — both timestamps share one batch, and the
+cost is per submission rather than per timestamp — so **~0.4% of a 16.7 ms frame at 60 Hz**, ~0.8%
+at 120 Hz. It lands inside the `submit` phase your frame log already measures. Worth knowing that
+the number you are about to be able to measure costs a little to measure; not worth restructuring
+anything over.
+
+(Caveat on reading the "before" column: on this machine that driver returned zeros, so those are
+"fast but wrong" numbers. The delta is the price of getting an answer at all.)
+
+### 7.3 One guest-side note
+
+`gpu_timer_collect` passing `vk::QueryResultFlags::WAIT` is the right call and stays right. A bare
+`vkGetQueryPoolResults` **without** `WAIT` can now legitimately return `VK_NOT_READY` when issued
+the instant the queue goes idle, because the value is written by a completion handler that runs
+just after the fence signal rather than by the GPU in command order. The driver publishes any
+already-resolved sample on such a poll, which closes that window in almost every run, but `WAIT`
+sidesteps the question entirely and costs nothing here — by the time you ask, the value is normally
+already in the report. No change needed; this is only recorded so a future refactor does not drop
+the flag thinking it is free.
+
+Nothing else changes on the guest side. No Mesa change, no kernel change, and
+`timestampValidBits` stays 64 — it was never dishonest, the driver really can timestamp.
+
+### 7.4 Getting it
+
+Host-side only. It lands with the next `limina.app` deploy on this host. Check the deployed
+artifact rather than the commit — the app bundles the driver directly, so an unrebuilt one ships
+stale and silent:
+
+```sh
+# on the host, not in the guest
+nm -a /Applications/limina.app/Contents/Frameworks/libvulkan_kosmickrisp.dylib \
+  | grep -c mtl_device_needs_split_counter_resolve
+# 0 = has the fix; nonzero = an older build (that symbol only exists pre-0013)
+```
+
+Then §6's own test applies unchanged: the reproducer should look like the lavapipe output in §3.3 —
+both queries available, two large advancing values, a plausible delta — and `NIRI_FRAME_LOG=1,gpu`
+should log `(gpu N.NNms)` with the warning never firing.
+
+## 8. Related
 
 - [`venus-explicit-sync-gap.md`](./venus-explicit-sync-gap.md) — the other place a Venus capability
   question shaped a compositor decision; also the source of the "probe it, do not assume the

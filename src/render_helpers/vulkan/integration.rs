@@ -29,7 +29,7 @@ use super::VulkanRenderer;
 use crate::render_helpers::renderer::OffscreenRenderer;
 
 impl OffscreenRenderer for VulkanRenderer {
-    fn make_offscreen_sampleable(&self, texture: &VkTexture) -> anyhow::Result<()> {
+    fn make_offscreen_sampleable(&mut self, texture: &VkTexture) -> anyhow::Result<()> {
         // Transition the just-rendered offscreen from TRANSFER_SRC_OPTIMAL to SHADER_READ_ONLY so a
         // later draw can sample it (the sampleable-offscreen bridge).
         self.make_sampleable(texture).map_err(Into::into)

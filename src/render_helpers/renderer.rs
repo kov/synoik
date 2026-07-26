@@ -8,7 +8,11 @@ use smithay::backend::renderer::Renderer;
 pub trait OffscreenRenderer: Renderer {
     /// Prepare a just-rendered offscreen `texture` to be sampled: the Vulkan renderer transitions
     /// the image layout.
-    fn make_offscreen_sampleable(&self, _texture: &Self::TextureId) -> anyhow::Result<()> {
+    ///
+    /// Takes `&mut self` because that transition need not be a submit — a texture that has never
+    /// been rendered into has nothing to preserve, so the owned renderer queues the barrier for
+    /// the next frame's command buffer instead of paying a round trip for it here.
+    fn make_offscreen_sampleable(&mut self, _texture: &Self::TextureId) -> anyhow::Result<()> {
         Ok(())
     }
 

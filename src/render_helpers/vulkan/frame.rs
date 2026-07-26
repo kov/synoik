@@ -202,6 +202,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let (texture_staging, upload_targets) = renderer.record_pending_texture_uploads(cbuf);
         acquired.extend(upload_targets);
 
+        // Barriers for offscreens created but never rendered into, before anything that samples
+        // them — the blurs below, and every draw in this frame. See
+        // `VulkanRenderer::make_sampleable`.
+        acquired.extend(renderer.record_pending_sampleable(cbuf));
+
         // Blurs queued while collecting elements (the xray effect buffer). Recorded here for the
         // same reason and into the same slot — outside the render pass, riding this frame's
         // submit. Their chains and images must outlive it, exactly as the staging must.

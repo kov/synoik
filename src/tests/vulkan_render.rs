@@ -7520,3 +7520,113 @@ fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
         "the deferred blur did not land: the edge is still hard (max min(R,G) = {blend})"
     );
 }
+
+/// A fresh offscreen must not cost a submit to become sampleable.
+///
+/// `make_offscreen_sampleable` is a no-op for a texture a frame just rendered into — the frame
+/// leaves it sampleable on the submit it was making anyway. The path that is *not* a no-op is the
+/// effect buffer's no-redraw branch: when its elements have not changed but its texture has just
+/// been recreated (a size change — an overview zoom does that every frame), it makes a brand-new
+/// `UNDEFINED` image sampleable without rendering into it, and that cost a whole command buffer,
+/// submit and fence wait for one pipeline barrier. On the live seat it was `2 transition in
+/// 3.03ms`, the only wait left in the frame line.
+///
+/// Measured here rather than assumed: every redraw round must cost zero transition submits (it
+/// always did), and so must the no-redraw round (it used to cost one). The barrier is queued for
+/// the next frame's command buffer instead — which is safe for exactly this layout, because
+/// `UNDEFINED` means there are no contents to discard.
+#[test]
+fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
+    use smithay::backend::renderer::element::Kind;
+    use smithay::backend::renderer::Texture as _;
+
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::effect_buffer::EffectBuffer;
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_a_fresh_offscreen_costs_no_transition_submit: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+    let site = niri_vk::stats::SubmitSite::ALL
+        .iter()
+        .position(|s| *s == niri_vk::stats::SubmitSite::Transition)
+        .expect("transition site");
+    let transitions = |_: ()| niri_vk::stats::take_sites()[site].submits;
+
+    let scale = Scale::from(1.0);
+    let mut buffer = EffectBuffer::new();
+    buffer.update_blur_options(BlurOptions {
+        passes: 3,
+        offset: 2.0,
+    });
+
+    // Redraw rounds, including the size changes that recreate the texture.
+    for s in [64i32, 96, 96, 128] {
+        buffer.update_size(Size::<i32, Physical>::from((s, s)), scale);
+        let red = SolidColorBuffer::new(Size::from((s as f64, s as f64)), [1.0, 0.0, 0.0, 1.0]);
+        let elements = buffer.elements_vulkan();
+        elements.clear();
+        elements.push(
+            SolidColorRenderElement::from_buffer(&red, (0.0, 0.0), 1.0, Kind::Unspecified).into(),
+        );
+        let _ = transitions(());
+        assert!(
+            buffer.prepare_vulkan(&mut vk, true),
+            "prepare failed at {s}"
+        );
+        assert_eq!(
+            transitions(()),
+            0,
+            "a rendered offscreen is left sampleable by its own frame; nothing may submit a \
+             barrier for it",
+        );
+    }
+
+    // The no-redraw round: elements unchanged, so nothing renders and the texture is made
+    // sampleable on its own. This is the one that used to submit.
+    let _ = transitions(());
+    assert!(
+        buffer.prepare_vulkan(&mut vk, true),
+        "no-redraw prepare failed"
+    );
+    assert_eq!(
+        transitions(()),
+        0,
+        "making a fresh offscreen sampleable submitted a command buffer for one barrier — it must \
+         ride the next frame's instead",
+    );
+
+    // And the barrier still lands. Sampling an image whose *tracked* layout says
+    // SHADER_READ_ONLY while the image is really still UNDEFINED is a layout violation — invisible
+    // in the pixels (this texture is legitimately blank: its elements never re-rendered into the
+    // recreated image), which is why the assertion here is the readback completing at all. Under
+    // `NIRI_VK_VALIDATION=1` a barrier that never got recorded is reported on this draw.
+    let tex = buffer.texture_vulkan(true).expect("blurred texture");
+    let (w, h) = (tex.size().w, tex.size().h);
+    let buf = TextureBuffer::from_texture(&vk, tex, 1.0, Transform::Normal, Vec::new());
+    let element = TextureRenderElement::from_texture_buffer(
+        buf,
+        Point::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let out = render_to_vec(
+        &mut vk,
+        Size::<i32, Physical>::from((w, h)),
+        scale,
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(element),
+    )
+    .expect("sampling the queued-barrier offscreen must not fail");
+    assert_eq!(out.len(), (w * h * 4) as usize, "unexpected readback size");
+}
