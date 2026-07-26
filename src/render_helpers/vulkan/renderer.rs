@@ -1571,6 +1571,11 @@ struct GpuTimer {
     /// collection that carried a value, so only a device that never writes
     /// trips [`GpuTimer::UNWRITTEN_LIMIT`].
     unwritten_run: Cell<u32>,
+    /// Whether this device has *ever* handed back a written pair. Once it has,
+    /// [`GpuTimer::UNWRITTEN_LIMIT`] stops applying: the question that limit
+    /// answers ("does this device implement timestamps at all?") has been
+    /// answered, and no length of dry spell re-opens it.
+    ever_written: Cell<bool>,
 }
 
 impl GpuTimer {
@@ -1581,14 +1586,21 @@ impl GpuTimer {
     const SANE_LIMIT: Duration = Duration::from_secs(1);
 
     /// How many all-zero collections in a row it takes to call the device broken
-    /// and go quiet.
+    /// and go quiet — **before it has ever written one**. After that it no
+    /// longer applies at all; see [`GpuTimer::ever_written`].
     ///
     /// Not one: a stack can implement timestamps and still *drop* them — the
     /// host-side fixes for our Venus VM are aiming at a partial hit rate, and
     /// with a limit of one, the first dropped pair would silence timing for the
     /// rest of the session. A device that implements nothing hits this within a
     /// few frames anyway.
-    const UNWRITTEN_LIMIT: u32 = 16;
+    ///
+    /// Measured on this VM 2026-07-25, and the reason it is not 16: Venus writes
+    /// about 7% of pairs, in bursts. At 256×256 the dry spells ran to 15 — one
+    /// short of the old limit — and at 1920×1080 the *first* 16 collections were
+    /// all unwritten, so timing latched off before it ever produced a sample.
+    /// The old value was measuring the dry spell, not the device.
+    const UNWRITTEN_LIMIT: u32 = 256;
 
     /// The pool, if this device can answer timestamp queries at all.
     fn create(gpu: &Gpu) -> Result<Option<Self>, VulkanError> {
@@ -1605,6 +1617,7 @@ impl GpuTimer {
             pool,
             unusable: Cell::new(false),
             unwritten_run: Cell::new(0),
+            ever_written: Cell::new(false),
         }))
     }
 
@@ -1930,6 +1943,7 @@ impl VulkanRenderer {
         match timestamp_ticks(ticks, self.gpu.timestamp_valid_bits) {
             TimestampSample::Delta(delta) => {
                 timer.unwritten_run.set(0);
+                timer.ever_written.set(true);
                 let duration = self.gpu.timestamp_delta(delta);
                 // Above the sane limit the pair is from some other clock domain,
                 // so it is a lost sample too, not a very slow pass.
@@ -1943,13 +1957,16 @@ impl VulkanRenderer {
                 // Something was written, so the device does implement the query;
                 // this particular pair just isn't a pass we can report.
                 timer.unwritten_run.set(0);
+                timer.ever_written.set(true);
                 crate::frame_log::add_gpu_lost();
             }
             TimestampSample::NotWritten => {
                 crate::frame_log::add_gpu_lost();
                 let run = timer.unwritten_run.get() + 1;
                 timer.unwritten_run.set(run);
-                if run >= GpuTimer::UNWRITTEN_LIMIT {
+                // A device that has written before is not broken, however long
+                // this dry spell gets — Venus writes ~7% of pairs, in bursts.
+                if run >= GpuTimer::UNWRITTEN_LIMIT && !timer.ever_written.get() {
                     warn!(
                         "this device advertises timestamp queries but wrote none in \
                          {run} collections; GPU timing is unavailable (CPU-side frame \
