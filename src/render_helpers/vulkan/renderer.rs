@@ -269,8 +269,28 @@ pub struct VulkanRenderer {
     ///
     /// A queue left undrained (elements built, then damage tracking skips the frame) is harmless:
     /// the entries simply wait for the next `begin`, and if the renderer dies first they free
-    /// their staging and leave a blank image behind — never an invalid one.
-    pending_texture_uploads: Vec<niri_vk::texture::StagedTexture>,
+    /// their staging and leave a blank image behind — never an invalid one. It cannot grow without
+    /// bound while undrained either — see [`PendingTextureUpload`].
+    pending_texture_uploads: Vec<PendingTextureUpload>,
+}
+
+/// One staged texture upload waiting for a frame to record its copy, **with its destination held
+/// alive**.
+///
+/// The `VkTexture` is here for the reason `record_pending_dmabuf_acquires` returns its images:
+/// recording stores a handle, so the destination has to outlive the *submit*, not the recording
+/// (`docs/fork/frame-submit-discipline.md`). [`niri_vk::texture::StagedTexture`] deliberately
+/// borrows its image by handle and owns only the staging half, so without this reference the only
+/// thing keeping the image alive is whoever else happens to hold the texture — the shm cache in
+/// the surface's `data_map`, or the element being drawn. A client that commits and then destroys
+/// its surface before the next frame drops both, and `begin` then records a copy into a destroyed
+/// `VkImage`, which poisons the whole frame's command buffer. That is undefined behavior, so it
+/// surfaces as whatever the driver felt like doing: on the live seat it came back as
+/// `ERROR_OUT_OF_HOST_MEMORY` from every later allocation, and only the validation layer named it.
+struct PendingTextureUpload {
+    /// The destination, held strongly. See the type docs — this reference is the invariant.
+    tex: VkTexture,
+    staged: niri_vk::texture::StagedTexture,
 }
 
 /// How many differently-sized present-blit shadows to keep. Comfortably covers what a live session
@@ -2400,21 +2420,58 @@ impl VulkanRenderer {
         queued
     }
 
-    /// Record every staged texture upload into `cbuf` and hand the staging buffers back, for the
-    /// caller to keep alive until that command buffer's submit has retired. Same slot, same
-    /// contract and same reason as [`Self::record_pending_glyph_uploads`].
+    /// Queue `staged`'s copy into `tex`'s image for the next frame to record, holding `tex` alive
+    /// until then and past the submit ([`PendingTextureUpload`]).
     ///
-    /// Returns them as a batch rather than dropping them here precisely because dropping frees the
-    /// staging: the GPU reads it long after this returns.
+    /// An upload already queued for the *same image* is **replaced**, not appended to. Every entry
+    /// in this queue covers its image's full extent (both producers, `stage_32bpp` and
+    /// `reupload_32bpp`, write `w*h*4` bytes), so an earlier copy to the same image is dead the
+    /// moment a later one is queued: recording it would only write pixels the next command
+    /// overwrites, and its staging is bytes we already paid to fill.
+    ///
+    /// That also bounds the queue. A frame that fails before it can drain leaves everything
+    /// queued for the next one — correct for a transient failure, but the live wedge was a
+    /// *permanent* one, where clients kept committing into a queue that would never drain again.
+    /// Superseding caps it at one entry per live image instead of one per commit, so the failure
+    /// stops feeding itself.
+    fn queue_texture_upload(&mut self, tex: &VkTexture, staged: niri_vk::texture::StagedTexture) {
+        let entry = PendingTextureUpload {
+            tex: tex.clone(),
+            staged,
+        };
+        let image = tex.image();
+        match self
+            .pending_texture_uploads
+            .iter_mut()
+            .find(|queued| queued.tex.image() == image)
+        {
+            Some(superseded) => *superseded = entry,
+            None => self.pending_texture_uploads.push(entry),
+        }
+    }
+
+    /// Record every staged texture upload into `cbuf` and hand back what must outlive that command
+    /// buffer's submit: the staging buffers the copies read from, and the destination textures the
+    /// copies name. Same slot, same contract and same reason as
+    /// [`Self::record_pending_glyph_uploads`].
+    ///
+    /// Returns them rather than dropping them here precisely because dropping is what breaks it:
+    /// the staging would be freed while the GPU still reads it, and the image destroyed while the
+    /// command buffer that names it is still recording.
+    #[must_use = "the staging and the recorded-into images must outlive the submit"]
     pub(super) fn record_pending_texture_uploads(
         &mut self,
         cbuf: vk::CommandBuffer,
-    ) -> Vec<niri_vk::texture::StagedTexture> {
-        let staged = std::mem::take(&mut self.pending_texture_uploads);
-        for upload in &staged {
-            upload.record(cbuf);
+    ) -> (Vec<niri_vk::texture::StagedTexture>, Vec<VkTexture>) {
+        let queued = std::mem::take(&mut self.pending_texture_uploads);
+        let mut staging = Vec::with_capacity(queued.len());
+        let mut textures = Vec::with_capacity(queued.len());
+        for upload in queued {
+            upload.staged.record(cbuf);
+            staging.push(upload.staged);
+            textures.push(upload.tex);
         }
-        staged
+        (staging, textures)
     }
 
     /// Record and submit the queued texture copies on their own, blocking until they land.
@@ -2434,16 +2491,16 @@ impl VulkanRenderer {
         if self.pending_texture_uploads.is_empty() {
             return Ok(());
         }
-        let staged = std::mem::take(&mut self.pending_texture_uploads);
+        let queued = std::mem::take(&mut self.pending_texture_uploads);
         let gpu = self.gpu.clone();
-        // `run_commands` waits, so `staged` — and the staging buffers it frees on drop — outlives
-        // the copy it carries.
+        // `run_commands` waits, so `queued` — the staging buffers it frees on drop, and the
+        // destination images it holds references to — outlives the copies it carries.
         gpu.run_commands(
             self.command_pool,
             niri_vk::stats::SubmitSite::Upload,
             |cbuf| {
-                for upload in &staged {
-                    upload.record(cbuf);
+                for upload in &queued {
+                    upload.staged.record(cbuf);
                 }
             },
         )
@@ -2702,10 +2759,11 @@ impl VulkanRenderer {
         // flush on top of it (`1 upload in 1.89ms` beside it in the same line).
         //
         // Ordering against a staged copy already queued for this same texture is what the flush
-        // used to buy, and the queue gives it for free: copies are recorded in push order, so the
-        // later one wins, which is what "re-upload" means.
+        // used to buy, and the queue gives it for free: a full-extent copy queued later replaces
+        // the earlier one outright (`queue_texture_upload`), which is what "re-upload" means. A
+        // client committing several times between two frames therefore uploads once.
         let staged = tex.stage_reupload_shm(data)?;
-        self.pending_texture_uploads.push(staged);
+        self.queue_texture_upload(tex, staged);
         Ok(())
     }
 }
@@ -2746,9 +2804,9 @@ impl ImportMem for VulkanRenderer {
             alpha_one,
             filter,
         )?;
-        self.pending_texture_uploads.push(staged);
         // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches the batch
-        // path's cleanup on the same failure).
+        // path's cleanup on the same failure). `staged` drops with it, unqueued: its pixels never
+        // reach an image, which is exactly what a failed import means.
         let (desc_pool, set) = match self.make_texture_set(&tex) {
             Ok(v) => v,
             Err(err) => {
@@ -2756,16 +2814,12 @@ impl ImportMem for VulkanRenderer {
                 return Err(err);
             }
         };
-        Ok(VkTexture::new(
-            self.gpu.clone(),
-            tex,
-            desc_pool,
-            set,
-            w,
-            h,
-            format,
-            flipped,
-        ))
+        let tex = VkTexture::new(self.gpu.clone(), tex, desc_pool, set, w, h, format, flipped);
+        // Queued only now that there is a refcounted texture to hold: the queue keeps the image
+        // alive until the copy has been submitted, and the caller dropping its handle before the
+        // next frame must not destroy the image out from under the recording.
+        self.queue_texture_upload(&tex, staged);
+        Ok(tex)
     }
 
     fn update_memory(

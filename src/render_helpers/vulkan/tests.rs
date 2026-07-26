@@ -2957,6 +2957,143 @@ fn vulkan_shm_reupload_overwrites_in_place() {
     );
 }
 
+/// Several commits of the same surface between two frames must cost **one** upload, not one per
+/// commit: every entry in the queue covers its image's full extent, so a copy that is followed by
+/// another copy into the same image is dead before it is ever recorded.
+///
+/// Pin both halves — the queue holds one entry however many times the client commits, and the
+/// pixels are the *last* commit's, not the first's. The count is what bounds the queue when a
+/// frame fails and cannot drain it (the live wedge kept clients committing into a queue that would
+/// never drain again); the readback is what proves superseding kept the right one.
+#[test]
+fn vulkan_repeated_shm_reuploads_supersede_in_the_queue() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_repeated_shm_reuploads_supersede: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const RED: [u8; 4] = [220, 30, 30, 255];
+    const GREEN: [u8; 4] = [30, 200, 60, 255];
+    const BLUE: [u8; 4] = [40, 60, 210, 255];
+
+    let tex = vk
+        .import_memory(
+            &solid_texels(RED),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import red source");
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        1,
+        "the import's own copy is queued",
+    );
+
+    // Two more commits of the same surface, still with no frame in between.
+    vk.reupload_shm(&tex, &solid_texels(GREEN))
+        .expect("reupload green");
+    vk.reupload_shm(&tex, &solid_texels(BLUE))
+        .expect("reupload blue");
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        1,
+        "three full-extent copies into one image must collapse to the last one, not queue three",
+    );
+
+    // Draw the texture 1:1 into an offscreen and read it back: the surviving copy must be the last.
+    let size = Size::<i32, Physical>::from((W, H));
+    let buffer = TextureBuffer::from_texture(&vk, tex.clone(), 1.0, Transform::Normal, Vec::new());
+    let element = TextureRenderElement::from_texture_buffer(
+        buffer,
+        Point::from((0.0, 0.0)),
+        1.0,
+        None,
+        None,
+        Kind::Unspecified,
+    );
+    let out = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        [element].into_iter(),
+    )
+    .expect("render");
+
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        0,
+        "VulkanFrame::begin must drain the queue",
+    );
+    let center = px(&out, W / 2, H / 2);
+    assert!(
+        close_px(center, BLUE, 3),
+        "the last commit must be what lands, got {center:?}",
+    );
+}
+
+/// A queued upload has to keep its **destination image** alive on its own.
+///
+/// `StagedTexture` owns only the staging half and names its image by raw handle, so between
+/// staging and the next `VulkanFrame::begin` the only reason the image still exists is whoever
+/// else holds the texture — the shm cache in the surface's `data_map`, or the element being drawn.
+/// A client that commits and then goes away drops both, and `begin` then records a copy into a
+/// destroyed `VkImage`, poisoning the entire frame's command buffer. So the queue holds its own
+/// reference; this drops every *other* one and renders a frame.
+///
+/// **This is a validation-layer test.** Recording against a destroyed image is undefined behavior,
+/// not an error return: nothing here can observe it, and the pixels are fine either way (the image
+/// survives whenever some cache happens to hold it). Run it under `NIRI_VK_VALIDATION=1` — that is
+/// what named this class of bug on the live seat after it had presented as
+/// `ERROR_OUT_OF_HOST_MEMORY` from every later allocation.
+#[test]
+fn vulkan_queued_upload_holds_its_destination_alive() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_queued_upload_holds_destination: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let tex = vk
+        .import_memory(
+            &solid_texels([10, 200, 90, 255]),
+            Fourcc::Abgr8888,
+            Size::from((W, H)),
+            false,
+        )
+        .expect("import");
+    assert_eq!(vk.pending_texture_uploads_len(), 1, "the copy is queued");
+
+    // The client is gone: nothing outside the renderer references the texture any more.
+    drop(tex);
+
+    // A frame that draws nothing still drains the queue — and that is where the copy is recorded.
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("offscreen");
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    assert_eq!(
+        vk.pending_texture_uploads_len(),
+        0,
+        "the frame must have recorded the copy into the image the queue kept alive",
+    );
+}
+
 /// Binding two **differently-sized** `Argb8888` targets in the same frame must not reallocate the
 /// present-blit shadow each time. Argb/Xrgb targets do not match the R8G8B8A8 render pass, so they
 /// render into a shadow that is blitted into the dmabuf on `finish`; the shadow used to live in a

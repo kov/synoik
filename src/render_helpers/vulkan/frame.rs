@@ -176,7 +176,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // Kept alive by the frame (`held`) until its submit retires: the barriers above are
         // recorded against these images, and destroying one mid-recording invalidates this whole
         // command buffer. See `record_pending_dmabuf_acquires`.
-        let acquired = renderer.record_pending_dmabuf_acquires(cbuf);
+        let mut acquired = renderer.record_pending_dmabuf_acquires(cbuf);
 
         // Glyphs shaped since the last frame are still only in host memory; they must reach the
         // atlas before anything samples it, and this is the one place that has to happen (nothing
@@ -190,8 +190,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // their images. Same slot and same reason as the two above: the copies ride this frame's
         // submit instead of costing one round trip *and one blocking fence wait* apiece. The
         // staging buffers must outlive this submit, so they travel with the frame exactly as
-        // `glyph_staging` does.
-        let texture_staging = renderer.record_pending_texture_uploads(cbuf);
+        // `glyph_staging` does — and so must the images the copies were just recorded against,
+        // which join the acquires in `held` for the same reason they are there.
+        let (texture_staging, upload_targets) = renderer.record_pending_texture_uploads(cbuf);
+        acquired.extend(upload_targets);
 
         {
             let dev = &renderer.gpu.device;
