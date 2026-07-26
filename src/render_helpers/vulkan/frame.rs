@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use ash::vk;
 use glam::{Mat3, Vec2, Vec3};
@@ -11,6 +12,7 @@ use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
 
 use super::backdrop_blur::BackdropBlur;
+use super::blur_chain::SharedBlurChain;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
 use super::fence::VkSubmitFence;
@@ -85,6 +87,11 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// same reason as `glyph_staging`: the GPU reads the staging buffers long after `begin`
     /// returned, so they must survive to the submit's retirement.
     texture_staging: Vec<niri_vk::texture::StagedTexture>,
+    /// Blur chains this frame's command buffer has recorded. Held for the same reason as the two
+    /// above, and it is the one that bites hardest: a chain owns the render pass and pipelines the
+    /// recording binds, so destroying it before the submit invalidates the *whole* frame, not just
+    /// the blur. See [`SharedBlurChain`].
+    blur_chains: Vec<Arc<SharedBlurChain>>,
     finished: bool,
 }
 
@@ -231,6 +238,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             present_damage: Vec::new(),
             glyph_staging,
             texture_staging,
+            blur_chains: Vec::new(),
             finished: false,
         })
     }
@@ -888,14 +896,24 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// A render pass can't be a transfer source while it's active, so this **ends** the in-progress
     /// pass (leaving the target in `TRANSFER_SRC_OPTIMAL`), scaled-blits the `src_region` sub-rect
     /// of the target into the whole of `dest` (`LINEAR`, mirroring the GLES blit — the size may
-    /// differ, e.g. the overview zoom trick), leaves `dest` in `SHADER_READ_ONLY_OPTIMAL`, then
-    /// **flushes** (submits + fence-waits) and re-opens a fresh command buffer on the LOAD-variant
+    /// differ, e.g. the overview zoom trick), leaves `dest` in `SHADER_READ_ONLY_OPTIMAL`, and
+    /// re-opens the LOAD-variant
     /// [`continuation pass`](VulkanRenderer::continuation_render_pass) so the preserved scene can
-    /// be drawn over. Flushing (rather than a same-cbuf barrier) keeps `dest` fully written
-    /// before the caller's blur — which runs on its own one-shot submission (`render_blur`) —
-    /// samples it, matching this renderer's synchronous per-submit model. `dest` must be a
-    /// `SAMPLED | TRANSFER_DST` offscreen (i.e. from [`Offscreen::create_buffer`]); its whole
-    /// extent is filled.
+    /// be drawn over. `dest` must be a `SAMPLED | TRANSFER_DST` offscreen (i.e. from
+    /// [`Offscreen::create_buffer`]); its whole extent is filled.
+    ///
+    /// **`record_gap` is where work that needs the capture belongs.** Between the two passes the
+    /// command buffer is outside any render pass, which is the one slot a blur chain (or any other
+    /// copy/barrier/pass sequence) can be recorded into — and it rides the frame's own submit, so
+    /// it costs nothing. This used to end the command buffer here and submit + fence-wait it, for
+    /// exactly one reason: the caller's blur ran on a submission of its own and had to see a
+    /// finished capture. Recording it in the gap instead is what removed both the flush and the
+    /// blur's submit; the `to_read` barrier below is what orders the two now, and it orders them
+    /// inside one command buffer, which is stronger than what the flush bought.
+    ///
+    /// The invariant that replaces the flush: **whatever consumes `dest` must be recorded into
+    /// this frame** (in `record_gap`, or in a later draw), not submitted separately before it. A
+    /// separate submit made before this frame's would read an unwritten capture.
     // Consumed by the live FramebufferEffectElement wiring (Stage 3); exercised now by the
     // render-pass-split test.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -903,6 +921,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         &mut self,
         src_region: Rectangle<i32, Physical>,
         dest: &VkTexture,
+        record_gap: impl FnOnce(vk::CommandBuffer),
     ) -> Result<(), VulkanError> {
         let (fb_w, fb_h) = self.fb.buffer.extent();
         // Clamp the blit source to the target bounds (a framebuffer effect near an edge can have a
@@ -957,15 +976,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .base_array_layer(0)
             .layer_count(1);
 
-        let old_cbuf = self.cbuf;
-        // Poison the frame across the flush + re-open: after `cmd_end_render_pass` (and especially
-        // after `free_command_buffers`) `old_cbuf` is no longer a valid recording target, so if any
-        // fallible step below returns early, `Drop`/`finish` must NOT try to end a pass on it.
-        // Cleared once `new_cbuf` is installed, making the frame live again.
-        self.finished = true;
+        let cbuf = self.cbuf;
         let dev = &self.renderer.gpu.device;
-        let new_cbuf = unsafe {
-            dev.cmd_end_render_pass(old_cbuf);
+        unsafe {
+            dev.cmd_end_render_pass(cbuf);
 
             // Capture destination: contents are fully overwritten by the blit, so discard from
             // UNDEFINED. (Reused across frames — safe because `finish` fence-waits, so the previous
@@ -980,7 +994,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .image(dest_image)
                 .subresource_range(range);
             dev.cmd_pipeline_barrier(
-                old_cbuf,
+                cbuf,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
@@ -1016,7 +1030,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     },
                 ]);
             dev.cmd_blit_image(
-                old_cbuf,
+                cbuf,
                 src_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 dest_image,
@@ -1036,7 +1050,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .image(dest_image)
                 .subresource_range(range);
             dev.cmd_pipeline_barrier(
-                old_cbuf,
+                cbuf,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
@@ -1045,56 +1059,25 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 std::slice::from_ref(&to_read),
             );
 
-            // Flush the capture so `dest` is fully written before the caller's separately-submitted
-            // blur samples it, then re-open a fresh command buffer on the continuation pass.
-            self.renderer.gpu_timer_end(old_cbuf);
-            dev.end_command_buffer(old_cbuf)?;
-            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            {
-                let _timed = niri_vk::stats::submit(niri_vk::stats::SubmitSite::CaptureFlush);
-                self.renderer
-                    .gpu
-                    .submit(std::slice::from_ref(&old_cbuf), fence)
-                    .map_err(VulkanError::from)?;
-            }
-            {
-                let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitSite::CaptureFlush);
-                dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
-            }
-            dev.destroy_fence(fence, None);
-            dev.free_command_buffers(self.renderer.command_pool, std::slice::from_ref(&old_cbuf));
-            // This flush submitted and waited on `old_cbuf` — the command buffer our glyph copy
-            // was recorded into. It has run, so the staging can go and, crucially, a later failure
-            // finishing this frame must NOT be read as "the copy never happened".
-            self.glyph_staging = None;
-            // Bank this segment's GPU time *before* re-arming: the pool has only
-            // two slots, and the continuation buffer's reset would otherwise
-            // discard this submit's pair unread.
-            self.renderer.gpu_timer_collect();
+            // Whatever needs the capture goes here, outside any render pass and inside the
+            // frame's own command buffer: a blur chain records its passes and its copy-out, and
+            // the barrier above orders them after the blit. No submit, no wait, no second command
+            // buffer — this is the gap the doc comment is about.
+            record_gap(cbuf);
 
-            let alloc = vk::CommandBufferAllocateInfo::default()
-                .command_pool(self.renderer.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let new_cbuf = dev.allocate_command_buffers(&alloc)?[0];
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            // Re-open on the LOAD-variant continuation pass so the preserved scene can be drawn
+            // over. Same command buffer: ending a pass and beginning another is ordinary
+            // recording, and the split into two submits only ever existed to make a
+            // separately-submitted blur see a finished capture.
             let pass_begin = vk::RenderPassBeginInfo::default()
                 .render_pass(continuation)
                 .framebuffer(framebuffer)
                 .render_area(render_area);
-            dev.begin_command_buffer(new_cbuf, &begin_info)?;
-            // Re-arm for the continuation buffer, still outside its render pass.
-            self.renderer.gpu_timer_begin(new_cbuf);
-            dev.cmd_begin_render_pass(new_cbuf, &pass_begin, vk::SubpassContents::INLINE);
-            dev.cmd_set_viewport(new_cbuf, 0, std::slice::from_ref(&viewport));
-            dev.cmd_set_scissor(new_cbuf, 0, std::slice::from_ref(&render_area));
-            new_cbuf
+            dev.cmd_begin_render_pass(cbuf, &pass_begin, vk::SubpassContents::INLINE);
+            dev.cmd_set_viewport(cbuf, 0, std::slice::from_ref(&viewport));
+            dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(&render_area));
         };
 
-        self.cbuf = new_cbuf;
-        // The frame is live again on the fresh command buffer.
-        self.finished = false;
         // The ended base pass left the target in TRANSFER_SRC; the blit left `dest` sampleable.
         // (The continuation pass restores the target to TRANSFER_SRC again at `finish`.)
         self.fb
@@ -1149,9 +1132,20 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         if !reuse {
             *slot = Some(BackdropBlur::new(self.renderer, size, passes)?);
         }
-        let bb = slot.as_mut().expect("just populated");
-        self.capture_region(src_region, bb.capture())?;
-        bb.run_blur(self.renderer, offset)?;
+        let bb = slot.as_ref().expect("just populated");
+        // The blur rides the capture's own command buffer, recorded in the gap between the two
+        // render passes — no submit of its own, and no flush to make one visible to it.
+        self.capture_region(src_region, bb.capture(), |cbuf| {
+            bb.record_blur(cbuf, offset)
+        })?;
+        // The chain's images and the output are read by a submit that has not happened yet (this
+        // frame's), so they must outlive it exactly as a queued upload's destination does. The
+        // textures go in `held`; the chain has no reference count and is drained by
+        // `BackdropBlur::drop` instead.
+        let (capture, intermediate) = (bb.capture().clone(), bb.intermediate().clone());
+        self.held.push(capture);
+        self.held.push(intermediate);
+        self.blur_chains.extend(bb.chain());
         Ok(())
     }
 
@@ -1613,6 +1607,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 // synchronous path below they simply drop after the fence wait; here they have to
                 // outlive a submit nobody is waiting for.
                 let texture_staging = std::mem::take(&mut self.texture_staging);
+                // Same reason, one level up: the chain's render pass and pipelines are bound to
+                // this command buffer, and nobody is going to wait for it here.
+                let blur_chains = std::mem::take(&mut self.blur_chains);
                 self.renderer.add_in_flight(
                     timeline,
                     self.cbuf,
@@ -1621,6 +1618,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     targets,
                     glyph_staging,
                     texture_staging,
+                    blur_chains,
                 );
                 // Same bookkeeping as the synchronous path below: the render pass's `final_layout`
                 // leaves a scanout target in TRANSFER_SRC_OPTIMAL, and an offscreen was taken the

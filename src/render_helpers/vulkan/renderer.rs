@@ -28,6 +28,7 @@ use smithay::backend::renderer::{
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
 use tracing::warn;
 
+use super::blur_chain::SharedBlurChain;
 use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
 use super::fence::VkSubmitFence;
@@ -1693,6 +1694,11 @@ struct InFlightSubmit {
     /// ([`VulkanRenderer::record_pending_texture_uploads`]). Held for the same reason and freed
     /// the same way as `_glyph_staging`.
     _texture_staging: Vec<niri_vk::texture::StagedTexture>,
+    /// The blur chains this command buffer recorded. The widest of these: a chain owns the render
+    /// pass, pipelines and descriptor sets the recording *binds*, so letting it go early does not
+    /// corrupt the blur — it invalidates the command buffer, and every draw in it. See
+    /// [`SharedBlurChain`].
+    _blur_chains: Vec<Arc<SharedBlurChain>>,
 }
 
 impl VulkanRenderer {
@@ -1752,6 +1758,7 @@ impl VulkanRenderer {
         targets: Vec<VkTexture>,
         glyph_staging: Option<niri_vk::texture::GlyphStaging>,
         texture_staging: Vec<niri_vk::texture::StagedTexture>,
+        blur_chains: Vec<Arc<SharedBlurChain>>,
     ) {
         self.in_flight.push(InFlightSubmit {
             timeline,
@@ -1761,6 +1768,7 @@ impl VulkanRenderer {
             _targets: targets,
             _glyph_staging: glyph_staging,
             _texture_staging: texture_staging,
+            _blur_chains: blur_chains,
         });
     }
 
@@ -1821,6 +1829,7 @@ impl VulkanRenderer {
             held,
             targets,
             None,
+            Vec::new(),
             Vec::new(),
         );
         Ok(())

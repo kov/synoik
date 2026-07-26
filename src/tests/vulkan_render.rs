@@ -4084,6 +4084,94 @@ fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
     );
 }
 
+/// A blurred frame must cost the **same number of submits** as an unblurred one.
+///
+/// The backdrop blur used to cost two round trips of its own on top of the frame: the capture ended
+/// the command buffer and submitted + fence-waited it, so that the blur — running on a submission
+/// of its own — would see a finished blit. Both are gone. The blur is recorded into the gap the
+/// capture opens between the frame's two render passes, and the barrier already there is what
+/// orders it.
+///
+/// Counted as a differential against the same scene without the effect, so the assertion does not
+/// depend on how many submits a plain frame happens to take (the readback alone is one). On this
+/// path the difference used to be exactly 2.
+#[test]
+fn vulkan_a_blurred_frame_adds_no_submits() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_a_blurred_frame_adds_no_submits: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    let size = Size::<i32, Physical>::from((256, 256));
+    let submits = |_: ()| -> u64 {
+        niri_vk::stats::take_sites()
+            .iter()
+            .map(|site| site.submits)
+            .sum()
+    };
+    let blurred_element = |passes: u8| {
+        let fbe = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
+        let params = crate::render_helpers::background_effect::RenderParams {
+            geometry: Rectangle::from_size(Size::from((200., 200.))),
+            subregion: None,
+            clip: None,
+            scale: 1.0,
+        };
+        let blur = crate::render_helpers::blur::BlurOptions {
+            passes,
+            offset: 5.0,
+        };
+        fbe.render(None, params, Some(blur), 0.0, 1.0)
+    };
+
+    // Warm every cache a first frame would build (pipelines are lazy, the pool's staging chunk is
+    // not yet allocated), so the two measured renders differ only in the effect.
+    let _ = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(blurred_element(3)),
+    )
+    .expect("warmup render");
+
+    let _ = submits(());
+    let _ = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::empty::<crate::render_helpers::framebuffer_effect::FramebufferEffectElement>(),
+    )
+    .expect("plain render");
+    let plain = submits(());
+
+    let _ = render_to_vec(
+        &mut vk,
+        size,
+        Scale::from(1.0),
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        std::iter::once(blurred_element(3)),
+    )
+    .expect("blurred render");
+    let blurred = submits(());
+
+    eprintln!("vulkan_a_blurred_frame_adds_no_submits: plain={plain} blurred={blurred}");
+    assert_eq!(
+        blurred,
+        plain,
+        "a backdrop blur cost {} extra submit(s) — it must ride the frame's own command buffer, \
+         in the gap `capture_region` opens",
+        blurred as i64 - plain as i64,
+    );
+}
+
 /// Import a **CPU-filled client dmabuf** (a GBM `Argb8888` LINEAR buffer painted with four known
 /// quadrant colors) through `ImportDma::import_dmabuf` — the path real GPU app windows take — then
 /// sample it 1:1 into an offscreen and read it back, proving the owned renderer imports client
@@ -4341,7 +4429,9 @@ fn vulkan_capture_region_splits_the_render_pass() {
                     &[Rectangle::from_size(size)],
                 )
                 .expect("clear red");
-            frame.capture_region(phys_region, &dest).expect("capture");
+            frame
+                .capture_region(phys_region, &dest, |_| {})
+                .expect("capture");
             // Draw (not clear) over the whole target so a real graphics pipeline binds *inside* the
             // continuation pass — this is what proves the continuation pass is render-pass
             // *compatible* with the pipelines (built against the base pass), which Phase 2's

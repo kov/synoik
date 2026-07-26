@@ -14,6 +14,7 @@
 //! method-for-method on Smithay's `PixmanRenderer`.
 
 mod backdrop_blur;
+mod blur_chain;
 mod custom;
 mod effect_blur;
 mod error;
