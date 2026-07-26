@@ -263,6 +263,10 @@ impl Default for Settings {
     }
 }
 
+/// Largest presentation gap [`Stats::cadence`] counts on its own; anything longer
+/// lands in this bucket. Four cycles is 67ms at 60Hz — well past "a hitch".
+const CADENCE_MAX: usize = 4;
+
 /// Rolling per-output tallies, reset every time a summary is emitted.
 #[derive(Debug, Default)]
 struct Stats {
@@ -281,6 +285,17 @@ struct Stats {
     /// KMS, signed — negative means we handed it over past its own deadline.
     /// See [`FrameLog::queued`].
     headroom_us: Vec<i64>,
+    /// How many refresh cycles apart consecutive presentations landed, capped at
+    /// [`CADENCE_MAX`]. Index 0 counts same-cycle (two flips reported in one
+    /// refresh, which should not happen), 1 counts every-cycle, 2 counts
+    /// every-other, and the last bucket is "that or worse".
+    ///
+    /// The other numbers say what a *frame* did; this says what the *screen*
+    /// did, which is the thing a person actually perceives. A run of misses can
+    /// be a smooth half rate — visually fine, just 30fps — or a 60fps stream
+    /// with a 2-cycle hole punched in it every second, which reads as a hitch.
+    /// "22 dropped" cannot tell those apart and they want opposite fixes.
+    cadence: [u64; CADENCE_MAX + 1],
 }
 
 impl Stats {
@@ -386,6 +401,9 @@ pub struct FrameLog {
     /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
     /// even though we were done in time" or "late because we were late".
     queued: HashMap<String, (Duration, Duration)>,
+    /// Per output, when the last frame reached the screen — the other end of a
+    /// presentation interval. See [`Stats::cadence`].
+    last_presented: HashMap<String, Duration>,
     last_summary: Instant,
 }
 
@@ -426,6 +444,7 @@ impl FrameLog {
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
+            last_presented: HashMap::new(),
             last_summary: Instant::now(),
         }
     }
@@ -786,6 +805,18 @@ impl FrameLog {
             return;
         };
 
+        // What the screen did, independent of what any one frame aimed at: the gap
+        // to the previous presentation, in whole cycles. Recorded before the
+        // early-outs below, because a frame presented *early* still lands on some
+        // vblank and still contributes an interval.
+        if let Some(prev) = self.last_presented.insert(output.to_owned(), actual) {
+            if let Some(gap) = actual.checked_sub(prev) {
+                let cycles = (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize;
+                self.stats.entry(output.to_owned()).or_default().cadence
+                    [cycles.min(CADENCE_MAX)] += 1;
+            }
+        }
+
         let Some(late) = actual.checked_sub(target) else {
             // Presented early. That is the frame clock mispredicting downward,
             // not a drop.
@@ -875,9 +906,28 @@ impl FrameLog {
                 )
             };
 
+            // Only the intervals that say something: an idle desktop's gaps are
+            // all "4+" and would drown the run of 1s and 2s that a stutter is.
+            let cadence: String = (1..=CADENCE_MAX)
+                .filter(|i| stats.cadence[*i] > 0)
+                .map(|i| {
+                    let label = if i == CADENCE_MAX {
+                        format!("{i}+")
+                    } else {
+                        i.to_string()
+                    };
+                    format!(" {label}×{}", stats.cadence[i])
+                })
+                .collect();
+            let cadence = if cadence.is_empty() {
+                String::new()
+            } else {
+                format!(", cadence{cadence}")
+            };
+
             tracing::info!(
                 "{output}: {:.1} fps over {}, p50 {}, p95 {}, worst {}, {} over budget, \
-                 {} dropped{gpu}{headroom}",
+                 {} dropped{gpu}{headroom}{cadence}",
                 fps,
                 ms(elapsed),
                 ms(p50),
@@ -1135,6 +1185,7 @@ mod tests {
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
+            last_presented: HashMap::new(),
             last_summary: Instant::now(),
         };
 
@@ -1162,6 +1213,7 @@ mod tests {
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
+            last_presented: HashMap::new(),
             last_summary: Instant::now(),
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
@@ -1202,6 +1254,7 @@ mod tests {
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
+            last_presented: HashMap::new(),
             last_summary: Instant::now(),
         };
         for i in 0..5 {
@@ -1214,6 +1267,41 @@ mod tests {
         log.presented("out", target, Duration::ZERO, Some(refresh));
         log.presented("out", target, target + refresh * 5, None);
         assert_eq!(dropped(&log), 0);
+    }
+
+    /// The cadence histogram counts gaps *between presentations*, which is the one
+    /// thing here measured on the screen rather than on a frame — and the only one
+    /// that distinguishes a smooth 30fps (every gap 2) from 60fps with holes in it
+    /// (mostly 1, occasionally 3), which feel completely different and read as the
+    /// same "N dropped".
+    #[test]
+    fn cadence_counts_the_gaps_between_presentations() {
+        let refresh = Duration::from_micros(16667);
+        let mut log = FrameLog {
+            settings: Some(Settings::default()),
+            in_flight: None,
+            stats: HashMap::new(),
+            queued: HashMap::new(),
+            last_presented: HashMap::new(),
+            last_summary: Instant::now(),
+        };
+
+        let base = Duration::from_secs(100);
+        // Gaps of 1, 1, 2 then 6 cycles. The first presentation opens the interval
+        // and is not itself a gap.
+        for cycles in [0, 1, 2, 4, 10] {
+            let at = base + refresh * cycles;
+            log.presented("out", at, at, Some(refresh));
+        }
+
+        let cadence = log.stats["out"].cadence;
+        assert_eq!(cadence[1], 2, "two consecutive-cycle presentations");
+        assert_eq!(cadence[2], 1, "one two-cycle gap");
+        assert_eq!(
+            cadence[CADENCE_MAX], 1,
+            "a six-cycle gap saturates into the last bucket rather than being lost"
+        );
+        assert_eq!(cadence[0], 0, "nothing landed inside a single cycle");
     }
 
     /// Headroom is only meaningful paired with the frame it was measured on. The
@@ -1229,6 +1317,7 @@ mod tests {
             in_flight: None,
             stats: HashMap::new(),
             queued: HashMap::new(),
+            last_presented: HashMap::new(),
             last_summary: Instant::now(),
         };
         let headroom = |log: &FrameLog| {
