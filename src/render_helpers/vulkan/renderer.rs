@@ -1557,6 +1557,10 @@ struct GpuTimer {
     /// them, after which the whole thing goes quiet. See
     /// [`VulkanRenderer::gpu_timer_collect`].
     unusable: Cell<bool>,
+    /// Consecutive collections that came back entirely unwritten. Reset by any
+    /// collection that carried a value, so only a device that never writes
+    /// trips [`GpuTimer::UNWRITTEN_LIMIT`].
+    unwritten_run: Cell<u32>,
 }
 
 impl GpuTimer {
@@ -1565,6 +1569,16 @@ impl GpuTimer {
     /// unrelated clock domain, and a "4200ms GPU pass" in the log is worse than
     /// no number at all.
     const SANE_LIMIT: Duration = Duration::from_secs(1);
+
+    /// How many all-zero collections in a row it takes to call the device broken
+    /// and go quiet.
+    ///
+    /// Not one: a stack can implement timestamps and still *drop* them — the
+    /// host-side fixes for our Venus VM are aiming at a partial hit rate, and
+    /// with a limit of one, the first dropped pair would silence timing for the
+    /// rest of the session. A device that implements nothing hits this within a
+    /// few frames anyway.
+    const UNWRITTEN_LIMIT: u32 = 16;
 
     /// The pool, if this device can answer timestamp queries at all.
     fn create(gpu: &Gpu) -> Result<Option<Self>, VulkanError> {
@@ -1580,6 +1594,7 @@ impl GpuTimer {
         Ok(Some(Self {
             pool,
             unusable: Cell::new(false),
+            unwritten_run: Cell::new(0),
         }))
     }
 
@@ -1781,13 +1796,6 @@ impl VulkanRenderer {
         self.gpu_timer.is_some()
     }
 
-    /// Whether GPU timing is still live: `false` once a device has been caught
-    /// advertising timestamps it does not write.
-    #[cfg(test)]
-    pub(crate) fn gpu_timing_usable(&self) -> bool {
-        self.gpu_timer.as_ref().is_some_and(|t| !t.unusable.get())
-    }
-
     /// Reset the query pool and stamp the start of `cbuf`. Must be called with
     /// `cbuf` recording and **outside** a render pass (`vkCmdResetQueryPool` is
     /// not allowed inside one).
@@ -1838,45 +1846,89 @@ impl VulkanRenderer {
             return;
         }
 
-        let Some(delta) = timestamp_ticks(ticks, self.gpu.timestamp_valid_bits) else {
-            warn!(
-                "this device advertises timestamp queries but does not write them; \
-                 GPU timing is unavailable (CPU-side frame timing is unaffected)"
-            );
-            timer.unusable.set(true);
-            return;
-        };
-
-        let duration = self.gpu.timestamp_delta(delta);
-        if duration <= GpuTimer::SANE_LIMIT {
-            crate::frame_log::add_gpu_time(duration);
+        match timestamp_ticks(ticks, self.gpu.timestamp_valid_bits) {
+            TimestampSample::Delta(delta) => {
+                timer.unwritten_run.set(0);
+                let duration = self.gpu.timestamp_delta(delta);
+                // Above the sane limit the pair is from some other clock domain,
+                // so it is a lost sample too, not a very slow pass.
+                if duration <= GpuTimer::SANE_LIMIT {
+                    crate::frame_log::add_gpu_time(duration);
+                } else {
+                    crate::frame_log::add_gpu_lost();
+                }
+            }
+            TimestampSample::Lost => {
+                // Something was written, so the device does implement the query;
+                // this particular pair just isn't a pass we can report.
+                timer.unwritten_run.set(0);
+                crate::frame_log::add_gpu_lost();
+            }
+            TimestampSample::NotWritten => {
+                crate::frame_log::add_gpu_lost();
+                let run = timer.unwritten_run.get() + 1;
+                timer.unwritten_run.set(run);
+                if run >= GpuTimer::UNWRITTEN_LIMIT {
+                    warn!(
+                        "this device advertises timestamp queries but wrote none in \
+                         {run} collections; GPU timing is unavailable (CPU-side frame \
+                         timing is unaffected)"
+                    );
+                    timer.unusable.set(true);
+                }
+            }
         }
     }
 }
 
-/// Turn a start/end timestamp pair into a tick delta, or `None` if the device
-/// did not write them.
+/// What one collection of a start/end timestamp pair yielded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimestampSample {
+    /// A usable tick delta.
+    Delta(u64),
+    /// The device wrote something, but not a pass we can report: one end
+    /// missing, or a zero-tick delta. Discard the sample; the device itself is
+    /// fine.
+    Lost,
+    /// Neither end was written. Once in a while this is a dropped pair; forever
+    /// means the device does not implement the query at all.
+    NotWritten,
+}
+
+/// Turn a start/end timestamp pair into a tick delta.
 ///
 /// Only the low `valid_bits` of a timestamp are defined, so the pair is masked
 /// before subtracting; a counter that wrapped inside the pass then still yields
 /// the right delta, since the subtraction is modulo the same width.
 ///
-/// `None` means "both raw values are zero", which no device that actually wrote
-/// timestamps can produce: the GPU clock is free-running, so a real pass has a
-/// large absolute value at each end. Devices that advertise the feature and
-/// implement nothing (virtio-gpu/Venus, at least here) are the reason this is
-/// checked rather than assumed.
-pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> Option<u64> {
-    if ticks == [0, 0] {
-        return None;
-    }
-
+/// A zero at *either* end is a value the device did not write, not a clock that
+/// read zero: the GPU clock is free-running, so both ends of a real pass have a
+/// large absolute value, and a genuine zero has probability 2^-`valid_bits`.
+/// Taking a half-written pair at face value is how a lost sample turns into a
+/// bogus duration — either the raw end value, or a near-wrap delta. Likewise a
+/// delta of exactly zero: no real pass takes no ticks.
+///
+/// Devices that advertise the feature and implement nothing (virtio-gpu/Venus,
+/// at least here) are the reason any of this is checked rather than assumed.
+pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> TimestampSample {
     let mask = if valid_bits >= 64 {
         u64::MAX
     } else {
         (1u64 << valid_bits) - 1
     };
-    Some((ticks[1] & mask).wrapping_sub(ticks[0] & mask) & mask)
+    let [start, end] = [ticks[0] & mask, ticks[1] & mask];
+
+    if start == 0 && end == 0 {
+        return TimestampSample::NotWritten;
+    }
+    if start == 0 || end == 0 {
+        return TimestampSample::Lost;
+    }
+
+    match end.wrapping_sub(start) & mask {
+        0 => TimestampSample::Lost,
+        delta => TimestampSample::Delta(delta),
+    }
 }
 
 /// Whether the session asked for the scanout submit to be left in flight, via

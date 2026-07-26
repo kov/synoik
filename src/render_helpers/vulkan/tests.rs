@@ -3248,6 +3248,7 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
     // Clear whatever an earlier test in this process banked, so the reading below
     // is this render's alone.
     let _ = crate::frame_log::take_gpu_time();
+    let _ = crate::frame_log::take_gpu_lost();
 
     let elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
@@ -3258,19 +3259,24 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
         .expect("vulkan offscreen");
     let _ = render_elements_into(&mut vk, &mut target, &elements);
 
-    // A device that advertises timestamps and then writes none disables itself on
-    // the first read (this VM's virtio-gpu/Venus does exactly that). That is a
-    // legitimate outcome to skip on — but only *after* a real submit has proven
-    // it, which is why the check is here rather than up front.
-    if !vk.gpu_timing_usable() {
+    let gpu = crate::frame_log::take_gpu_time();
+    let lost = crate::frame_log::take_gpu_lost();
+
+    // A device that advertises timestamps and then writes none banks nothing but
+    // losses (this VM's virtio-gpu/Venus does exactly that). That is a legitimate
+    // outcome to skip on — but only *after* a real submit has proven it, which is
+    // why the check is here rather than up front. Note the skip has to be this
+    // frame's own tally, not the timer's "device is broken" verdict: that only
+    // trips after a run of empty reads, so a stack writing *some* of its
+    // timestamps stays live while this particular render comes back empty.
+    if gpu.is_zero() && lost > 0 {
         eprintln!(
             "skipping vulkan_gpu_timing_reports_a_plausible_duration: \
-             the device advertises timestamps but writes none"
+             the device advertises timestamps but wrote none of this frame's ({lost} lost)"
         );
         return;
     }
 
-    let gpu = crate::frame_log::take_gpu_time();
     assert!(
         gpu > Duration::ZERO,
         "a submitted frame must report some GPU time"
@@ -3290,29 +3296,39 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
 /// would otherwise ship untested.
 #[test]
 fn timestamp_ticks_masks_and_wraps() {
-    use super::renderer::timestamp_ticks;
+    use super::renderer::{timestamp_ticks, TimestampSample};
+
+    let delta = |ticks, bits| timestamp_ticks(ticks, bits);
 
     // The ordinary case, at full width.
-    assert_eq!(timestamp_ticks([1_000, 4_500], 64), Some(3_500));
+    assert_eq!(delta([1_000, 4_500], 64), TimestampSample::Delta(3_500));
 
     // Bits above `valid_bits` are undefined and must not reach the delta: the
     // same low bits with different garbage on top give the same answer.
-    assert_eq!(timestamp_ticks([1_000, 4_500], 32), Some(3_500));
+    assert_eq!(delta([1_000, 4_500], 32), TimestampSample::Delta(3_500));
     assert_eq!(
-        timestamp_ticks([(1 << 40) | 1_000, (1 << 41) | 4_500], 32),
-        Some(3_500)
+        delta([(1 << 40) | 1_000, (1 << 41) | 4_500], 32),
+        TimestampSample::Delta(3_500)
     );
 
     // A counter that wrapped within the pass still yields the true delta,
     // because the subtraction is modulo the same width.
-    assert_eq!(timestamp_ticks([u32::MAX as u64 - 99, 100], 32), Some(200));
+    assert_eq!(
+        delta([u32::MAX as u64 - 99, 100], 32),
+        TimestampSample::Delta(200)
+    );
 
     // Not written at all.
-    assert_eq!(timestamp_ticks([0, 0], 64), None);
+    assert_eq!(delta([0, 0], 64), TimestampSample::NotWritten);
 
-    // A zero *start* is not the same thing — a device whose clock happens to be
-    // read as 0 at the top of the pass still reported a real end.
-    assert_eq!(timestamp_ticks([0, 500], 64), Some(500));
+    // Half-written is a *lost sample*, not a pass that started at tick zero.
+    // Taking either of these at face value is how a dropped timestamp turns
+    // into a bogus duration: 500ns of GPU work, or a near-wrap eternity.
+    assert_eq!(delta([0, 500], 64), TimestampSample::Lost);
+    assert_eq!(delta([500, 0], 64), TimestampSample::Lost);
+
+    // So is a pass that took no time at all.
+    assert_eq!(delta([4_500, 4_500], 64), TimestampSample::Lost);
 }
 
 /// Re-shaping the same string at the same size must not touch the GPU again: a

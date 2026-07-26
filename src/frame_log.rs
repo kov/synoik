@@ -34,6 +34,11 @@
 //! evidence and the handoff for fixing it host-side are in
 //! `docs/fork/venus-timestamp-gap.md`.
 //!
+//! Because the host-side fix is expected to land as a *partial* hit rate rather
+//! than all-or-nothing, a pair that comes back unusable is counted (`N lost`)
+//! instead of quietly averaged in as zero: a GPU time with samples missing is a
+//! floor, and the line says so.
+//!
 //! - **Frame cost**, phase by phase ([`Phase`]), measured on the compositor thread. Note the render
 //!   phase *includes* GPU execution: the Vulkan renderer submits and fence-waits synchronously, so
 //!   `finish` does not return until the GPU is done. A slow `submit` is therefore ambiguous between
@@ -105,6 +110,13 @@ static GPU_TIMING: AtomicBool = AtomicBool::new(false);
 /// rather than per-thread because nothing asserts on it.
 static GPU_NANOS: AtomicU64 = AtomicU64::new(0);
 
+/// Timestamp pairs the renderer read back and could not use, for the frame being
+/// built. Counted, not silently dropped: a stack that writes only some of its
+/// timestamps would otherwise make [`GPU_NANOS`] a sum over an unknown subset of
+/// the frame's passes, i.e. a number that reads like a total and is a floor.
+/// With the loss count beside it the reader can tell the two apart.
+static GPU_LOST: AtomicU64 = AtomicU64::new(0);
+
 /// Whether anything is listening. Sampled by the scoped timers so an unlogged
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -152,10 +164,20 @@ pub fn add_gpu_time(duration: Duration) {
     );
 }
 
+/// Report a timestamp pair that came back unusable. See [`GPU_LOST`].
+pub fn add_gpu_lost() {
+    GPU_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Take the GPU time banked since the last call. The frame log calls this when a
 /// frame ends; tests use it to check that the renderer's timestamps arrive at all.
 pub fn take_gpu_time() -> Duration {
     Duration::from_nanos(GPU_NANOS.swap(0, Ordering::Relaxed))
+}
+
+/// Take the count of unusable timestamp pairs banked since the last call.
+pub fn take_gpu_lost() -> u64 {
+    GPU_LOST.swap(0, Ordering::Relaxed)
 }
 
 /// One measured stretch of a frame. In the order they run.
@@ -251,15 +273,18 @@ struct Stats {
     /// Frames the display never got: gaps in the DRM vblank sequence.
     dropped: u64,
     gpu_total: Duration,
+    /// Unusable timestamp pairs over the same window. See [`GPU_LOST`].
+    gpu_lost: u64,
 }
 
 impl Stats {
-    fn record(&mut self, total: Duration, over: bool, gpu: Duration) {
+    fn record(&mut self, total: Duration, over: bool, gpu: Duration, gpu_lost: u64) {
         self.frames += 1;
         self.totals.push(total);
         self.worst = self.worst.max(total);
         self.over_budget += u64::from(over);
         self.gpu_total += gpu;
+        self.gpu_lost += gpu_lost;
     }
 
     /// The `p`th percentile by nearest-rank, on a copy sorted in place. Only
@@ -296,6 +321,9 @@ struct InFlight {
 #[derive(Debug, Default)]
 struct Totals {
     gpu: Duration,
+    /// Timestamp pairs the renderer could not use. Nonzero means `gpu` is a
+    /// floor, not a total. See [`GPU_LOST`].
+    gpu_lost: u64,
     bakes: u64,
     baking: Duration,
     shapes: u64,
@@ -502,6 +530,7 @@ impl FrameLog {
         let total = now - frame.started;
         let totals = Totals {
             gpu: take_gpu_time(),
+            gpu_lost: take_gpu_lost(),
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
             shapes: niri_vk::stats::shapes() - frame.shapes_at_start,
@@ -533,10 +562,12 @@ impl FrameLog {
             }
         }
 
-        self.stats
-            .entry(frame.output)
-            .or_default()
-            .record(total, over, totals.gpu);
+        self.stats.entry(frame.output).or_default().record(
+            total,
+            over,
+            totals.gpu,
+            totals.gpu_lost,
+        );
 
         self.maybe_summarize(now);
     }
@@ -567,7 +598,13 @@ impl FrameLog {
             }
         }
         if !totals.gpu.is_zero() {
-            let _ = write!(line, " (gpu {})", ms(totals.gpu));
+            let _ = write!(line, " (gpu {}", ms(totals.gpu));
+            if totals.gpu_lost > 0 {
+                let _ = write!(line, ", {} lost", totals.gpu_lost);
+            }
+            line.push(')');
+        } else if totals.gpu_lost > 0 {
+            let _ = write!(line, " (gpu unmeasured, {} lost)", totals.gpu_lost);
         }
 
         let ctx = &frame.context;
@@ -753,10 +790,17 @@ impl FrameLog {
             let p95 = Stats::percentile(&sorted, 95.);
             let fps = stats.frames as f64 / elapsed.as_secs_f64();
 
-            let gpu = if stats.gpu_total.is_zero() {
-                String::new()
-            } else {
-                format!(", gpu avg {}", ms(stats.gpu_total / stats.frames as u32))
+            let gpu = match (stats.gpu_total.is_zero(), stats.gpu_lost) {
+                (true, 0) => String::new(),
+                (true, lost) => format!(", gpu unmeasured ({lost} lost)"),
+                (false, 0) => format!(", gpu avg {}", ms(stats.gpu_total / stats.frames as u32)),
+                // The average is over every frame either way, so with samples
+                // missing it is a floor — say so rather than let it read as the
+                // GPU getting cheaper.
+                (false, lost) => format!(
+                    ", gpu avg ≥{} ({lost} lost)",
+                    ms(stats.gpu_total / stats.frames as u32)
+                ),
             };
 
             tracing::info!(
@@ -947,6 +991,45 @@ mod tests {
         };
         let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
         assert!(line.contains("waiting 8.00ms on earlier work"), "{line}");
+    }
+
+    /// A GPU time with samples missing is a floor, and must not read as a total.
+    ///
+    /// The dev VM's stack is expected to come back writing *some* of its
+    /// timestamps. Averaging a lost pair in as zero would then move the number in
+    /// the direction of "the GPU got cheaper" — the exact conclusion the log
+    /// exists to support — so the loss has to be visible next to it.
+    #[test]
+    fn a_lost_timestamp_is_reported_next_to_the_gpu_time() {
+        let frame = empty_frame();
+
+        let totals = Totals {
+            gpu: Duration::from_micros(2500),
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(line.contains("(gpu 2.50ms)"), "{line}");
+
+        let totals = Totals {
+            gpu: Duration::from_micros(2500),
+            gpu_lost: 3,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(line.contains("(gpu 2.50ms, 3 lost)"), "{line}");
+
+        // And a frame whose every pair was lost must still say something: an
+        // absent `gpu` reads as "GPU timing is off", which is a different fact.
+        let totals = Totals {
+            gpu_lost: 2,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(9), &totals, None);
+        assert!(line.contains("(gpu unmeasured, 2 lost)"), "{line}");
+
+        let line =
+            FrameLog::format_frame(&frame, Duration::from_millis(9), &Totals::default(), None);
+        assert!(!line.contains("gpu"), "{line}");
     }
 
     /// The bake counter must not see another thread's bakes, or a test asserting
