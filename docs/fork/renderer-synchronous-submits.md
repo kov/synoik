@@ -8,6 +8,10 @@ context in [`frame-cost-investigation.md`](./frame-cost-investigation.md).
 Landed: `6bef18ac` (chain every submit on a queue timeline), `6f645bd8` (the scanout frame hands
 its fence to KMS), on top of `7b5f016d` (time the wait apart from the submit).
 
+> **Writing renderer code?** This document is the history and the measurements. The *rule* that
+> came out of them — share the frame's submit, never give frame-path work a submit of its own — is
+> [`frame-submit-discipline.md`](./frame-submit-discipline.md), which is the one to read first.
+
 **One-line summary:** every `vkQueueSubmit` in the owned renderer was immediately followed by
 `wait_for_fences(…, u64::MAX)`. The CPU blocked until the GPU drained, every time. On the scanout
 submit that wait is 12–14 ms of a 16.67 ms frame, it does not depend on anything we draw, and
@@ -494,6 +498,8 @@ Two smaller things to write down rather than discover:
 
 ## Related
 
+- [`frame-submit-discipline.md`](./frame-submit-discipline.md) — the forward-facing rule this all
+  turned into, plus the follow-ups still open.
 - [`frame-cost-investigation.md`](./frame-cost-investigation.md) — how this was arrived at, and
   every hypothesis measured and rejected on the way.
 - `src/frame_log.rs` — the `NIRI_FRAME_LOG` grammar and what each phase covers.

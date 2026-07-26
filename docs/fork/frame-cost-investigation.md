@@ -168,6 +168,12 @@ remaining slow frame is an overview animation or first-time startup work.
 
 ## 6. Open items
 
+> **The submit-side items below are largely done, and what came out of them is a rule:**
+> [`frame-submit-discipline.md`](./frame-submit-discipline.md) — share the frame's submit, never
+> give frame-path work a submit of its own. It also carries the remaining follow-ups (folding the
+> two blur paths into the frame's command buffer, and what that would unlock for
+> `make_sampleable`). Read it before adding anything that submits.
+
 1. **The other submits — measured 2026-07-25, and they are three problems, not one.** Attributed
    by site on the live seat, with the frame's first wait separated out. What the data killed and
    what it found:

@@ -53,6 +53,15 @@ way" vs. a capability worth keeping, ask.
   fake-border smell: it can't round and duplicates behavior; use `Painter::stroke_rounded`. Shared
   controls become a `widget::` primitive so hover/focus/geometry stay consistent (see `widget::Button`,
   the inset-accent focus ring). Grow the toolkit as the port surfaces new interface, don't paint around it.
+- **Share the frame's submit — never add a `run_commands` to the frame path.** On this stack a
+  submit+fence-wait is a round trip whose cost is unrelated to its payload (a *barrier* on its own
+  submit measured 2.5–3.5 ms; 11 shm re-uploads cost 19.38 ms to move 0.33 ms of bytes). Work whose
+  only consumer is later GPU work gets **recorded** into a command buffer that is already being
+  submitted — submits are totally ordered on one timeline semaphore, so recorded is as good as
+  waited-for. Queue it for `VulkanFrame::begin`, or use `run_commands_deferred` when it truly can't
+  fold. The catch is the other side: anything sampling a queued resource *outside* a frame must
+  drain first (`flush_pending_texture_uploads`), so each such consumer is a stall you are adding.
+  Read `docs/fork/frame-submit-discipline.md` before touching this.
 
 ## Git
 **Hard fork (2026-07):** `main` is the only living branch (ours, to push later). We no longer
