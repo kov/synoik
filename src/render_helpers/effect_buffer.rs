@@ -164,11 +164,11 @@ impl EffectBuffer {
     /// (Re)render the offscreen and, when `blur`, its blurred version. Returns `false` on error
     /// (the caller skips drawing the effect).
     ///
-    /// The blur is run **eagerly** here rather than lazily at draw time: the owned renderer's blur
-    /// runs on its own fenced submission, and keeping it in `prepare` matches the offscreen
-    /// render's synchronous model. Both are damage-gated ([`Self::prepare_blur_vulkan`] only
-    /// runs the blur when the offscreen actually re-rendered), so a steady frame does no work
-    /// here.
+    /// The blur is prepared **eagerly** here rather than lazily at draw time, which keeps it in the
+    /// same place as the offscreen render it follows. It no longer costs a submission: it is queued
+    /// for the next frame's command buffer ([`EffectBlur::queue`]). Both are damage-gated
+    /// ([`Self::prepare_blur_vulkan`] only queues the blur when the offscreen actually
+    /// re-rendered), so a steady frame does no work here.
     pub fn prepare_vulkan(&mut self, renderer: &mut VulkanRenderer, blur: bool) -> bool {
         if let Err(err) = self.prepare_offscreen_vulkan(renderer) {
             warn!("error preparing Vulkan offscreen: {err:?}");
@@ -333,12 +333,12 @@ impl EffectBuffer {
             offscreen.blur = Some(EffectBlur::new(renderer, &offscreen.texture, passes)?);
         }
 
-        // Split the borrow: `run` records a submit nobody waits for, so it has to hand the source
-        // texture to the renderer's in-flight record alongside the blur's own output.
+        // Split the borrow: queueing hands the source texture to the renderer alongside the blur's
+        // own output, both held until the frame that records it retires.
         let OffscreenVk { texture, blur, .. } = offscreen;
         let blur = blur.as_mut().expect("just populated");
         if !blur.is_valid() {
-            blur.run(renderer, texture, offset)?;
+            blur.queue(renderer, texture, offset);
         }
 
         Ok(())

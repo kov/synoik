@@ -7386,33 +7386,34 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     }
 }
 
-/// The blur submit is one the CPU walks away from, and the pixels still come out right.
+/// The xray blur costs no submit of its own, and the pixels still come out right.
 ///
 /// A blur's own round trip costs about as much as the blur (`docs/fork/venus-cost.md` §3.8, §12),
-/// so `EffectBlur::run` hands its completion to the renderer's in-flight list instead of parking on
-/// the fence. Two things have to hold for that to be safe, and neither is visible in a frame that
-/// merely looks correct:
+/// so `EffectBlur::queue` does not make one: the chain is recorded into the next frame's command
+/// buffer, alongside the uploads and the dmabuf acquires. Two things have to hold for that to be
+/// safe, and neither is visible in a frame that merely looks correct:
 ///
-///   (a) the blurred output is still fully written before anything samples it — ordering replaces
-///       the wait, so a regression here shows up as a *stale or blank* blur, not a torn one;
-///   (b) the blur chain outlives the submit that reads it. The chain is not refcounted and its
-///       teardown does not wait, so rebuilding it (a resize) while a blur is in flight would free
-///       images the GPU is still reading. `EffectBlur::drop` drains for exactly this, and the
-///       resize below is what exercises it — under `NIRI_VK_VALIDATION=1` a missing drain is a
-///       use-after-free, not a wrong pixel.
+///   (a) the blurred output is still fully written before anything samples it. Ordering replaces
+///       the wait *inside* a frame, and outside one the consumer has to drain the queue itself
+///       (`flush_pending_blurs`) — a regression here shows up as a *stale or blank* blur, not a
+///       torn one;
+///   (b) the blur chain outlives the recording that names it. It owns the render pass, pipelines
+///       and descriptor sets a queued blur binds, so rebuilding it (a resize) while one is queued
+///       would free objects the command buffer still refers to. `SharedBlurChain`'s reference
+///       count is what holds it; under `NIRI_VK_VALIDATION=1` a missing one is a use-after-free,
+///       not a wrong pixel.
 ///
-/// [`vulkan_effect_buffer_renders_offscreen_and_blur`] covers the same path on the *synchronous*
-/// arm; deferring is opt-in (`NIRI_VK_ASYNC_SCANOUT=1`), so without this test the whole deferred
-/// blur path ships untested.
+/// [`vulkan_effect_buffer_renders_offscreen_and_blur`] covers the same path through a real frame;
+/// this one drives the queue directly, so the accounting is visible.
 #[test]
-fn vulkan_a_deferred_blur_is_not_waited_on_and_still_lands() {
+fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
     use smithay::backend::renderer::element::Kind;
 
     use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
-    let skip = |why: &str| eprintln!("skipping vulkan_a_deferred_blur_is_not_waited_on: {why}");
+    let skip = |why: &str| eprintln!("skipping vulkan_the_xray_blur_costs_no_submit: {why}");
     let mut vk = match VulkanRenderer::new() {
         Ok(vk) => vk,
         Err(e) => return skip(&format!("no Vulkan device ({e})")),
@@ -7477,11 +7478,10 @@ fn vulkan_a_deferred_blur_is_not_waited_on_and_still_lands() {
         "prepare_vulkan (blur) failed"
     );
 
-    // Exactly two, and the exactness is the test. This prepare makes two submits — the offscreen
-    // render that fills the source, and the blur — and the offscreen one already deferred before
-    // this change. So `> before` passes just as happily with the blur back on the synchronous
-    // path, where it retires inside `run_commands` and is never recorded here; only the count
-    // tells the two apart. (Mutation-checked: 2 deferred, 1 with the blur forced synchronous.)
+    // Exactly one, and the exactness is the test. This prepare used to make two submits — the
+    // offscreen render that fills the source, and the blur — and only the offscreen one is left;
+    // the blur is queued for the next frame's command buffer instead. A blur that went back to a
+    // submit of its own would read 2 here whether or not anyone waited for it.
     //
     // The obvious assertion — that the `Blur` site's `retiring` is zero, the number the frame log
     // prints as `1 blur in Xms` — cannot be used here: `niri_vk::stats`' timers are gated on
@@ -7489,20 +7489,21 @@ fn vulkan_a_deferred_blur_is_not_waited_on_and_still_lands() {
     // whether or not anything waited.
     assert_eq!(
         vk.in_flight_len() - before,
-        2,
-        "expected the offscreen render *and* the blur to be left in flight; one of them still \
-         parked the thread on its fence, so the round trip this change exists to remove is still \
-         being paid"
+        1,
+        "the offscreen render is the only submit this prepare may make; the blur must be queued,          not submitted"
+    );
+    assert_eq!(
+        vk.pending_blurs_len(),
+        1,
+        "and it must actually be queued — an empty queue with no submit means no blur at all"
     );
 
-    // Rebuild the chain **with that blur still in flight** — the `Drop` hazard. A resize drops the
-    // old offscreen and its `EffectBlur`, and the outstanding submit is reading that chain's images
-    // and framebuffers.
+    // Rebuild the chain **with that blur still queued** — the lifetime hazard. A resize drops the
+    // old offscreen and its `EffectBlur`, while the queue still holds a blur naming that chain's
+    // images, framebuffers and pipelines.
     //
     // Nothing may read pixels back before this point, and that is the whole design of the test: a
-    // readback waits, a wait drains the queue, and a drained queue makes the hazard unreachable.
-    // (Checked by removing `EffectBlur::drop`'s drain: with a readback here the mutant passes
-    // validation clean; without one the layer reports the use-after-free.)
+    // readback drains the queue, and a drained queue makes the hazard unreachable.
     const S2: i32 = 96;
     buffer.update_size(Size::<i32, Physical>::from((S2, S2)), scale);
     fill_edge(&mut buffer, S2);

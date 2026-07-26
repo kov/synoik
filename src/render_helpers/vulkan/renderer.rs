@@ -274,11 +274,31 @@ pub struct VulkanRenderer {
     /// bound while undrained either — see [`PendingTextureUpload`].
     pending_texture_uploads: Vec<PendingTextureUpload>,
 
+    /// Blurs queued while collecting elements, drained into the next frame's command buffer by
+    /// [`super::VulkanFrame::begin`]. Same slot, same invariant and same reason as
+    /// [`Self::pending_texture_uploads`]: the frame is submitting anyway, and on this stack a
+    /// submit costs a host round trip whatever it carries.
+    pending_blurs: Vec<PendingBlur>,
+
     /// The staging every queued upload's pixels are written into: one shared, grow-only buffer
     /// rewound per frame, rather than a mappable blob per upload. See
     /// [`niri_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of blobs
     /// two minutes into a live session.
     staging_pool: niri_vk::staging::StagingPool,
+}
+
+/// A blur waiting for a frame to record it, with everything it names held alive.
+///
+/// The xray effect buffer builds its blur while collecting elements, where no command buffer is
+/// open — so unlike the backdrop blur (which is invoked mid-frame and records straight into the
+/// gap `capture_region` opens) it has to be queued. See [`VulkanRenderer::queue_blur`].
+struct PendingBlur {
+    chain: Arc<SharedBlurChain>,
+    /// What the chain samples, and what it writes. Both held for the usual reason: the copy and
+    /// the passes name these images, and the submit that runs them has not happened yet.
+    source: VkTexture,
+    output: VkTexture,
+    offset: f32,
 }
 
 /// One staged texture upload waiting for a frame to record its copy, **with its destination held
@@ -515,6 +535,7 @@ impl VulkanRenderer {
             warned_modifiers: HashSet::new(),
             pending_dmabuf_acquires: Vec::new(),
             pending_texture_uploads: Vec::new(),
+            pending_blurs: Vec::new(),
             staging_pool,
         })
     }
@@ -1292,8 +1313,11 @@ impl VulkanRenderer {
         h: u32,
         via: Option<&VkTexture>,
     ) -> Result<Vec<u8>, VulkanError> {
-        // Reading an image whose staged copy has not landed would read a blank one.
+        // Reading an image whose staged copy — or queued blur — has not landed would read a blank
+        // or stale one. A readback of a blurred offscreen (a test, a screenshot of an xray
+        // surface) is exactly that consumer.
         self.flush_pending_texture_uploads()?;
+        self.flush_pending_blurs()?;
         let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * 4;
         let image = tex.image();
         let old_layout = tex.layout();
@@ -1501,6 +1525,7 @@ impl VulkanRenderer {
     ) -> Result<VkTexture, VulkanError> {
         // The chain samples `source` on a submit of its own, ahead of any frame.
         self.flush_pending_texture_uploads()?;
+        self.flush_pending_blurs()?;
         let (w, h) = source.extent();
         let output = self.create_buffer(Fourcc::Abgr8888, Size::from((w as i32, h as i32)))?;
 
@@ -1770,69 +1795,6 @@ impl VulkanRenderer {
             _texture_staging: texture_staging,
             _blur_chains: blur_chains,
         });
-    }
-
-    /// Run `record` on its own one-shot command buffer **without parking on its fence**, holding
-    /// `held` (what it reads) and `targets` (what it writes) until the queue timeline passes it.
-    ///
-    /// For work whose only consumer is later GPU work. The blur is the case this exists for: it is
-    /// recorded during element collection, its result is sampled by the frame that follows, and
-    /// submits are ordered — so the CPU has no reason to be in the loop. Measured on this stack, a
-    /// blur's own round trip costs as much as the blur (`docs/fork/venus-cost.md` §3.8, §12), so
-    /// the wait was most of what a blur cost.
-    ///
-    /// Falls back to a synchronous [`Gpu::run_commands`] when the device cannot order submits or a
-    /// query pool is live — [`Self::should_defer_offscreen_finish`] is the same rule offscreen
-    /// finishes use, and for the same reasons.
-    ///
-    /// **The caller must keep the recorded-against GPU objects alive too.** `held`/`targets` cover
-    /// textures; anything else the command buffer references — a [`niri_vk::blur::BlurChain`]'s
-    /// levels, say — is destroyed explicitly by its owner, and that owner has to drain first. See
-    /// [`Self::drain_in_flight`].
-    pub(super) fn run_commands_deferred(
-        &mut self,
-        site: niri_vk::stats::SubmitSite,
-        held: Vec<VkTexture>,
-        targets: Vec<VkTexture>,
-        record: impl FnOnce(vk::CommandBuffer),
-    ) -> Result<(), VulkanError> {
-        if !self.should_defer_offscreen_finish() {
-            return self
-                .gpu
-                .run_commands(self.command_pool, site, record)
-                .map_err(VulkanError::from);
-        }
-
-        let submitted = self
-            .gpu
-            .submit_commands(self.command_pool, site, record)
-            .map_err(VulkanError::from)?;
-        let Some(timeline) = submitted.timeline else {
-            // `should_defer_offscreen_finish` required `orders_submits`, so this is unreachable —
-            // but the handles are already ours and a leak here would be silent. Wait it out and
-            // free them rather than trust the invariant.
-            unsafe {
-                let _ = self.gpu.device.device_wait_idle();
-                self.gpu.device.destroy_fence(submitted.fence, None);
-                self.gpu
-                    .device
-                    .free_command_buffers(self.command_pool, &[submitted.cbuf]);
-            }
-            return Ok(());
-        };
-
-        let fence = VkSubmitFence::new(self.gpu.clone(), submitted.fence);
-        self.add_in_flight(
-            timeline,
-            submitted.cbuf,
-            fence,
-            held,
-            targets,
-            None,
-            Vec::new(),
-            Vec::new(),
-        );
-        Ok(())
     }
 
     /// Whether the frame being finished is the one going to KMS — the tty backend's bracket, read
@@ -2437,6 +2399,86 @@ impl VulkanRenderer {
         queued
     }
 
+    /// Queue a blur of `source` into `output` for the next frame to record.
+    ///
+    /// A blur already queued for the same `output` is **replaced**: the second one exists because
+    /// the source was re-rendered, which makes the first one's result stale before it was ever
+    /// recorded. Same rule, and same reason, as [`Self::queue_texture_upload`].
+    pub(super) fn queue_blur(
+        &mut self,
+        chain: Arc<SharedBlurChain>,
+        source: VkTexture,
+        output: VkTexture,
+        offset: f32,
+    ) {
+        let image = output.image();
+        let entry = PendingBlur {
+            chain,
+            source,
+            output,
+            offset,
+        };
+        match self
+            .pending_blurs
+            .iter_mut()
+            .find(|queued| queued.output.image() == image)
+        {
+            Some(superseded) => *superseded = entry,
+            None => self.pending_blurs.push(entry),
+        }
+    }
+
+    /// Record every queued blur into `cbuf` and hand back what must outlive its submit: the chains
+    /// (whose render pass and pipelines the recording binds) and the images they read and write.
+    ///
+    /// Must be called outside a render pass — the chain begins its own.
+    #[must_use = "the chains and images the passes name must outlive the submit"]
+    pub(super) fn record_pending_blurs(
+        &mut self,
+        cbuf: vk::CommandBuffer,
+    ) -> (Vec<Arc<SharedBlurChain>>, Vec<VkTexture>) {
+        let queued = std::mem::take(&mut self.pending_blurs);
+        let mut chains = Vec::with_capacity(queued.len());
+        let mut textures = Vec::with_capacity(queued.len() * 2);
+        for blur in queued {
+            let (w, h) = blur.output.extent();
+            blur.chain
+                .record_into(cbuf, blur.offset, blur.output.image(), w, h);
+            chains.push(blur.chain);
+            textures.push(blur.source);
+            textures.push(blur.output);
+        }
+        (chains, textures)
+    }
+
+    /// Record and submit the queued blurs on their own, blocking until they land — the
+    /// consumer-side drain for anything that samples a blurred output **outside** a frame.
+    ///
+    /// Same shape and same warning as [`Self::flush_pending_texture_uploads`]: on the render path
+    /// this is empty, because `begin` drained it; every caller of this is a stall being added
+    /// somewhere else.
+    fn flush_pending_blurs(&mut self) -> Result<(), VulkanError> {
+        if self.pending_blurs.is_empty() {
+            return Ok(());
+        }
+        let queued = std::mem::take(&mut self.pending_blurs);
+        let gpu = self.gpu.clone();
+        // `run_commands` waits, so `queued` — the chains and the images it holds — outlives the
+        // passes it carries.
+        gpu.run_commands(
+            self.command_pool,
+            niri_vk::stats::SubmitSite::Blur,
+            |cbuf| {
+                for blur in &queued {
+                    let (w, h) = blur.output.extent();
+                    blur.chain
+                        .record_into(cbuf, blur.offset, blur.output.image(), w, h);
+                }
+            },
+        )
+        .map_err(|e| VulkanError::Other(format!("flushing queued blurs: {e:#}")))
+    }
+
     /// Queue `staged`'s copy into `tex`'s image for the next frame to record, holding `tex` alive
     /// until then and past the submit ([`PendingTextureUpload`]).
     ///
@@ -2529,6 +2571,13 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn pending_texture_uploads_len(&self) -> usize {
         self.pending_texture_uploads.len()
+    }
+
+    /// Count of blurs awaiting a frame's command buffer (test-only: asserts that preparing one
+    /// submitted nothing, and that a frame drained it). See [`Self::pending_blurs`].
+    #[cfg(test)]
+    pub(crate) fn pending_blurs_len(&self) -> usize {
+        self.pending_blurs.len()
     }
 
     /// Staging buffers the pool owns (test-only): the count that must not grow with the number of

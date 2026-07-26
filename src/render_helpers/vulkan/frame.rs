@@ -202,6 +202,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let (texture_staging, upload_targets) = renderer.record_pending_texture_uploads(cbuf);
         acquired.extend(upload_targets);
 
+        // Blurs queued while collecting elements (the xray effect buffer). Recorded here for the
+        // same reason and into the same slot — outside the render pass, riding this frame's
+        // submit. Their chains and images must outlive it, exactly as the staging must.
+        let (blur_chains, blur_targets) = renderer.record_pending_blurs(cbuf);
+        acquired.extend(blur_targets);
+
         {
             let dev = &renderer.gpu.device;
             // `render_pass` is the DONT_CARE base pass (callers clear explicitly) or, when
@@ -238,7 +244,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             present_damage: Vec::new(),
             glyph_staging,
             texture_staging,
-            blur_chains: Vec::new(),
+            blur_chains,
             finished: false,
         })
     }
