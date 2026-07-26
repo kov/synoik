@@ -2019,7 +2019,9 @@ impl VulkanRenderer {
                 let run = timer.unwritten_run.get() + 1;
                 timer.unwritten_run.set(run);
                 // A device that has written before is not broken, however long
-                // this dry spell gets — Venus writes ~7% of pairs, in bursts.
+                // this dry spell gets — the Venus defect this guards was a rate,
+                // not a switch (it wrote ~7% of pairs, in bursts, before the
+                // host-side fix landed on 2026-07-26).
                 if run >= GpuTimer::UNWRITTEN_LIMIT && !timer.ever_written.get() {
                     warn!(
                         "this device advertises timestamp queries but wrote none in \

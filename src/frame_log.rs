@@ -28,16 +28,17 @@
 //!
 //! Two independent things, because they fail independently:
 //!
-//! **Known gap on the dev VM:** the `gpu` option produces nothing here. The
-//! virtio-gpu/Venus stack advertises timestamp queries and resolves every one to
-//! zero, which the renderer detects and reports once before going quiet. The
-//! evidence and the handoff for fixing it host-side are in
-//! `docs/fork/venus-timestamp-gap.md`.
+//! **The `gpu` option works on the dev VM as of 2026-07-26.** It used to produce
+//! nothing: the virtio-gpu/Venus stack advertised timestamp queries and resolved
+//! every one to zero. That was fixed host-side (`docs/fork/venus-timestamp-gap.md`,
+//! and §11.1 of `docs/fork/venus-cost.md` for the guest-side confirmation); this
+//! VMM measures 100% usable pairs, both in the standalone reproducer and through
+//! the renderer's own path.
 //!
-//! Because the host-side fix is expected to land as a *partial* hit rate rather
-//! than all-or-nothing, a pair that comes back unusable is counted (`N lost`)
-//! instead of quietly averaged in as zero: a GPU time with samples missing is a
-//! floor, and the line says so.
+//! A pair that comes back unusable is still counted (`N lost`) instead of quietly
+//! averaged in as zero, because the failure mode was a *rate*, not all-or-nothing:
+//! a GPU time with samples missing is a floor, and the line says so. A nonzero
+//! `lost` on a stack that is supposed to be fixed is itself the finding.
 //!
 //! - **Frame cost**, phase by phase ([`Phase`]), measured on the compositor thread. Note the render
 //!   phase *includes* GPU execution: the Vulkan renderer submits and fence-waits synchronously, so

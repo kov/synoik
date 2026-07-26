@@ -3471,12 +3471,15 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
     let lost = crate::frame_log::take_gpu_lost();
 
     // A device that advertises timestamps and then writes none banks nothing but
-    // losses (this VM's virtio-gpu/Venus does exactly that). That is a legitimate
-    // outcome to skip on — but only *after* a real submit has proven it, which is
-    // why the check is here rather than up front. Note the skip has to be this
-    // frame's own tally, not the timer's "device is broken" verdict: that only
-    // trips after a run of empty reads, so a stack writing *some* of its
-    // timestamps stays live while this particular render comes back empty.
+    // losses. This VM's virtio-gpu/Venus did exactly that until the host-side fix
+    // of 2026-07-26; it now writes 100% of pairs, so reaching this skip here is a
+    // regression worth chasing rather than the expected outcome. It stays a skip
+    // because a driver that declines to write is a driver bug, not ours — but only
+    // *after* a real submit has proven it, which is why the check is here rather
+    // than up front. Note the skip has to be this frame's own tally, not the
+    // timer's "device is broken" verdict: that only trips after a run of empty
+    // reads, so a stack writing *some* of its timestamps stays live while this
+    // particular render comes back empty.
     if gpu.is_zero() && lost > 0 {
         eprintln!(
             "skipping vulkan_gpu_timing_reports_a_plausible_duration: \
@@ -3498,10 +3501,10 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
     );
 }
 
-/// The timestamp arithmetic, which no device on this machine can exercise: the
-/// VM's driver advertises timestamp queries and writes none, so
-/// [`vulkan_gpu_timing_reports_a_plausible_duration`] skips here and the masking
-/// would otherwise ship untested.
+/// The timestamp arithmetic, unit-pinned because no device here can exercise the
+/// interesting cases. [`vulkan_gpu_timing_reports_a_plausible_duration`] covers the
+/// ordinary path now that this VM writes timestamps again, but it runs at 64 valid
+/// bits and nowhere near a wrap, so the masking below would otherwise ship untested.
 #[test]
 fn timestamp_ticks_masks_and_wraps() {
     use super::renderer::{timestamp_ticks, TimestampSample};

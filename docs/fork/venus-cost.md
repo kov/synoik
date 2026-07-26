@@ -18,7 +18,7 @@ Companion documents, all of which this one summarises rather than replaces:
 |---|---|
 | [`frame-cost-investigation.md`](./frame-cost-investigation.md) | the full guest-side investigation: every hypothesis, including the dead ones |
 | [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md) | the design of the guest-side fixes for the round-trip cost |
-| [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) | timestamp queries resolve to zero — with a reproducer |
+| [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) | timestamp queries used to resolve to zero — with a reproducer. **Fixed; see §13** |
 | [`venus-bugs/README.md`](./venus-bugs/README.md) | two dmabuf/gbm findings — with reproducers |
 | [`venus-explicit-sync-gap.md`](./venus-explicit-sync-gap.md) | explicit-sync surface |
 | [`venus-probes/probe-venus-costs/`](./venus-probes/probe-venus-costs) | the standalone probe behind §9 — image-cache, mapping bandwidth, fence cost |
@@ -161,12 +161,13 @@ is why §4.4 collapsed N of them into one, and §4.6 moved the write to another 
 
 ### 3.5 We are blind to GPU time
 
-> **RESOLVED 2026-07-26, host-side.** Two stacked bugs in the host Vulkan driver (KosmicKrisp), not
-> Venus: an elided Metal sampling encoder meant the sample was never taken, and the GPU counter
-> resolve could not see a sample until its command buffer completed, so it wrote a silent zero.
-> Root cause, validation (100/100 on this VM's own host GPU) and the ~0.4%-of-a-frame cost are in
-> [`venus-timestamp-gap.md` §7](./venus-timestamp-gap.md). Arrives with the next `limina.app`
-> deploy on this host. **The rest of this section is the original finding.**
+> **RESOLVED, and confirmed in the guest 2026-07-26 — see [§13](#13-timestamp-queries-work--100-on-the-vmm-deployed-2026-07-26).**
+> Two stacked bugs in the host Vulkan driver (KosmicKrisp), not Venus: an elided Metal sampling
+> encoder meant the sample was never taken, and the GPU counter resolve could not see a sample until
+> its command buffer completed, so it wrote a silent zero. Root cause, validation and the
+> ~0.4%-of-a-frame cost are in [`venus-timestamp-gap.md` §7](./venus-timestamp-gap.md). The VMM
+> deployed on 2026-07-26 carries it: 600/600 usable in the reproducer, 200/200 through our own
+> renderer. `NIRI_FRAME_LOG=1,gpu` works. **The rest of this section is the original finding.**
 
 Timestamp queries are advertised in full (`timestampPeriod = 1`, `timestampComputeAndGraphics`,
 64 valid bits on the graphics queue) and **resolve every query to zero, with the availability word
@@ -936,6 +937,10 @@ nothing to stamp.
 
 ### 11.1 Timestamp queries still resolve to zero on this build
 
+> **Superseded by [§13](#13-timestamp-queries-work--100-on-the-vmm-deployed-2026-07-26)** — the
+> 2026-07-26 VMM measures 100% usable on all twelve combinations below. Kept for the history of
+> which shapes were tested and why.
+
 §10.5 lists them as *root-caused and fixed, this build carries it*. On this guest, after the
 reboot, they do not. `repro-vk-timestamp-query` now sweeps the whole matrix, because the fix was
 described against `kk_CmdWriteTimestamp2` while the reproducer (and our renderer) had only ever
@@ -1064,6 +1069,11 @@ guest-side fallback removal is unblocked.
 ---
 
 ## 11. Timestamp queries on M4 Pro: partially fixed — **discard zero samples, do not average them**
+
+> **Superseded by [§13](#13-timestamp-queries-work--100-on-the-vmm-deployed-2026-07-26).** The
+> 2026-07-26 VMM loses no samples at all. The advice below — never average a zero in — is still how
+> the consumer is written, and is why a regression would show up as a `lost` count instead of as a
+> suspiciously fast frame. (This section is numbered 11 twice; both are kept as written.)
 
 Written 2026-07-25, after the fix from §8.3 was deployed to couve and **did not work**. Read this
 before trusting any GPU timing the compositor collects on that machine.
@@ -1216,3 +1226,47 @@ two things:
    that regression is worth knowing about before it lands.
 2. **Nothing in §3 or §9–§11 has been re-measured without it yet.** The per-submit figures in those
    sections are all from the slow path.
+
+---
+
+## 13. Timestamp queries work — 100%, on the VMM deployed 2026-07-26
+
+Measured in the guest right after the deploy, closing §3.5 / §8.3 / §11.1 and the "partially fixed,
+discard the zeros" §11 above. `repro-vk-timestamp-query`, unchanged, against venus:
+
+```
+  -- empty command buffer --
+  vkCmdWriteTimestamp      GetQueryPoolResults    -> 50/50 usable (100%)  median delta   7666 ns
+  vkCmdWriteTimestamp      CopyQueryPoolResults   -> 50/50 usable (100%)  median delta   6958 ns
+  vkCmdWriteTimestamp      Copy (separate cbuf)   -> 50/50 usable (100%)  median delta   7083 ns
+  vkCmdWriteTimestamp2     GetQueryPoolResults    -> 50/50 usable (100%)  median delta   7250 ns
+  vkCmdWriteTimestamp2     CopyQueryPoolResults   -> 50/50 usable (100%)  median delta   7125 ns
+  vkCmdWriteTimestamp2     Copy (separate cbuf)   -> 50/50 usable (100%)  median delta   6875 ns
+  -- with a 16 MiB fill between the stamps --
+  (the same six)                                  -> 50/50 usable (100%)  median delta ~205 µs
+```
+
+**600/600, zero zeros, on every shape** — both entry points, all three resolve paths, with and
+without work. The work axis moves the way it should (7 µs empty → 205 µs for a 16 MiB fill), so
+these are real GPU intervals and not a constant. Both axes were added precisely because earlier
+"fixed" claims turned out to be shape-specific; neither discriminates any more.
+
+**And through our own renderer, which is what actually matters.** The reproducer proves the driver;
+it does not prove our `GpuTimer` (`gpu_timer_begin`/`_end`/`_collect` in
+`src/render_helpers/vulkan/renderer.rs`), which stamps `TOP_OF_PIPE`/`BOTTOM_OF_PIPE` around a real
+frame's command buffer and resolves after the fence wait. 200 consecutive renders through that path:
+**200/200 usable, 0 lost.**
+
+Consequences, in order of how much they unblock:
+
+- **`NIRI_FRAME_LOG=1,gpu` is live.** The `(gpu X, N lost)` field on a logged frame is now a real
+  measurement rather than a permanently-empty one, and the summary's `gpu avg` follows. This is the
+  instrument the whole §3.5 handoff existed to get back.
+- **Every "we are blind to GPU time" caveat in §3–§12 expires**, including §9.3's differential
+  workaround (same submit shape, graded work) — that stays valid, it is just no longer the only way
+  to see GPU time, and it cannot attribute *within* a frame the way a timestamp can.
+- **The `lost` counter stays.** The defect was a rate, not a switch: 94% failure bare, 18% with the
+  first workaround, 0% now. A nonzero `lost` on a later build is the regression signal, so nothing
+  in the consumer averages a zero in as if it were a fast pass.
+- **Do not delete the reproducer.** It is the discriminator, it is cheap, and it has now reported
+  three different answers on three builds.
