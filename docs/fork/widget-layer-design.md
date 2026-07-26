@@ -396,3 +396,111 @@ Consequences worth knowing before optimising anything here:
   [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md). Note the bake runs during
   element *collection*, so its wait sits at the **start** of building a frame — the same pipelining
   the scanout deferral bought back at the end.
+
+**Update, 2026-07-26 — both structural fixes landed, and the model's "why" was wrong.** Glyph
+uploads now ride the frame's command buffer, and offscreen finishes defer to the in-flight list; on
+a live seat the `offscreen` submit site's *wait* is now 0.00 ms (722 frames, 0.02 s parked in total
+against 7.67 s over a comparable synchronous session). The 2–3.5 ms was never "Venus submit
+overhead" in any GPU sense: a guest `vkWaitForFences` never enters the kernel, it is mesa's
+`vn_relax` userspace poll — 160 µs rungs, ~291 µs actually slept after guest timer slack, against a
+complete host round trip of 0.076 ms (`venus-cost.md` §11.2). So the cost was the *waiting*, not the
+submitting, and not waiting removes it outright.
+
+What survives unchanged is the conclusion that matters here: **a cache hit is the whole game, and
+making `paint` cheaper is close to pointless.** If anything that is now stronger — a controlled
+sweep on 2026-07-26 puts a draw call's fixed GPU cost under ~1.5 µs
+(`perf_probe_what_does_a_draw_call_cost`), so a widget's *drawing* is not where its milliseconds
+are. They are in shaping, in allocation, and in whatever forces a re-bake.
+
+## 10. What the 2026-07-26 session added (challenges, and what they argue for)
+
+A day of frame-cost work on the live seat, most of which turned into widget-layer findings. Recorded
+here because each one is an argument about the *layer*, not about the widget it surfaced in.
+
+### 10.1 A hand-bumped revision is a proxy, kept somewhere else, checked by nothing
+
+§H1 said `revision` should be derived rather than hand-bumped and left it as a mitigation. The
+inventory is worse than that phrasing suggests: **21 revision fields across `src/ui/`, bumped at 36
+call sites**, in the seven schemes §7 catalogues. Every cache bug this project has had is the same
+defect — the counter and the paint disagreeing — and it has now bitten in both directions:
+
+- **Bumped when nothing baked changed** → a full GPU round trip on every frame of an animation. The
+  panel re-baked its entire bar for the length of *every* overview animation, because opening the
+  overview checks the Activities button and its fill fade made `are_animations_ongoing()` true; the
+  code comment still described the intent the code had lost (`009213dd`). The app grid and the
+  overview search re-shaped every visible label on every pointer motion because hover bumped
+  `content_rev` (`c5336421`, `d396bd30`).
+- **Not bumped when something did** → a stale texture living as long as its content. The calendar
+  popover's background froze at open-time height while the list grew under it (`128d112e`).
+
+`widget::Revision` (`df8deb7a`) folds the values the paint closure reads into `bake`'s `u64`:
+
+```rust
+let revision = Revision::new().of(!list.is_empty()).of(hover).of(height_key).done();
+```
+
+It does not make either mistake impossible. It moves the mistake to where it is visible — the inputs
+are listed immediately above the closure that reads them, so adding an input to the paint and adding
+it to the key are one edit in one place. `px()` normalizes NaN (a NaN hashing as itself would miss
+the cache on *every* frame — the expensive failure, arriving silently) and folds `-0.0` to `0.0`.
+Migrate opportunistically; leave `end_session`'s `Sig` alone, since an equality tuple is strictly
+stronger than a hash where a widget already has one.
+
+### 10.2 The per-frame re-bake is a bug *class*, and it is invisible to every ordinary test
+
+Pixels are identical — a bake and its cache produce the same image. Frame counts are identical.
+End-state tests never sample a running animation. The only thing that differs is how many GPU round
+trips ran, so the instrument had to be built before the class could be tested at all
+(`728c2394`: `time_bake` is `#[track_caller]`, so a frame line reads
+`1 bakes in 1.39ms (ui/panel.rs:1540 ×1)`, and sites are recorded even with logging off so tests can
+read them).
+
+Guarded so far: the overview animation, the workspace switch (with the panel dot morph pinned as a
+*known* exception — its geometry interpolates, so no cached texture can serve it), the
+quick-settings and calendar open fades, and the app-grid open. **All are currently clean.** The
+`#[track_caller]` chain through every `ui::widget` helper is load-bearing and degrades silently — a
+break anywhere collapses every widget onto one helper line — which is why
+`bake_sites_name_the_widget_not_the_helper` exists.
+
+### 10.3 Two ways a widget test proves nothing, both of which were live
+
+Both were caught by mutation-testing tests that were already green, and both are now checked inside
+the shared helpers rather than left to each test:
+
+1. **Sampling static frames.** Six frames with no animation running satisfy "nothing re-baked"
+   perfectly. A `step` larger than the animation, or an action that never started one, makes the
+   whole family green forever. `bake_sites_per_frame` now asserts that at least two sampled frames
+   had an animation in flight.
+2. **The subject never renders.** A widget that draws nothing re-bakes nothing on every frame. The
+   app-grid guardrail passed — including against a mutation that changed its label bake key on
+   *every call* — because the grid was empty. Each test now asserts its subject baked at least
+   once while open, and prints the sites it *did* see when it did not.
+
+### 10.4 A data-driven widget has an invisible empty state, and nothing in the render path objects
+
+The grid was empty because **`AppGrid` does not read `app_system`**. `Niri::sync_app_grid()` copies
+the entries across, and it runs from app-system *change events* — so installing a catalog straight
+onto `Niri` leaves the grid holding nothing. An empty grid lays out no tiles, contributes no
+elements, and is indistinguishable from a healthy one that happens not to be on screen.
+
+That is the layer speaking. Three sibling widgets source their content three different ways with
+three different sync triggers (`sync_app_grid`, `sync_dash_favorites`, `sync_overview_search`), and
+there is no shared notion of "this widget has content" that a test, the renderer, or a frame log
+could observe. Every consumer has to know each widget's private wiring to know whether silence means
+*correct* or *broken*.
+
+### 10.5 What this argues about §8
+
+§8 dropped the retained tree and the preferred-size/allocate protocol on the grounds that they
+address none of the three bug classes and would need a dirty-propagation protocol we would have to
+invent. Two of those grounds have moved:
+
+- The **dirty protocol is no longer hypothetical** — 21 hand-rolled revision counters *are* one,
+  written 21 times, and §10.1 is the bill for that.
+- A **fourth bug class** now has evidence behind it (§10.4): content ownership and the empty state
+  are per-widget conventions, which is exactly what a base class exists to remove.
+
+This is recorded as evidence, not as a reversal — the nested-bake constraint in §3 that broke a
+Painter-walks-a-tree model is unchanged, and none of the above is an argument for a CSS cascade, a
+signal system, or an accessibility tree. If the retained tree is argued back in, it should be argued
+on §10.1 and §10.4, and it should say what it does about §3.
