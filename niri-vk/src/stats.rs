@@ -96,8 +96,6 @@ pub enum SubmitSite {
     CaptureFlush,
     /// Host memory into one texture, on its own submit.
     Upload,
-    /// Several textures staged and copied in a single submit ([`crate::texture::TextureBatch`]).
-    UploadBatch,
     /// New glyph coverage into the persistent atlas.
     UploadGlyphs,
     /// An shm client's buffer into its cached image, through the renderer's shared staging.
@@ -113,13 +111,12 @@ pub enum SubmitSite {
 impl SubmitSite {
     /// Every site, in the order they are reported. Keep this exhaustive — a site missing here is
     /// simply invisible, which is the problem this type exists to fix.
-    pub const ALL: [SubmitSite; 11] = [
+    pub const ALL: [SubmitSite; 10] = [
         SubmitSite::KmsFrame,
         SubmitSite::DmabufFrame,
         SubmitSite::OffscreenFrame,
         SubmitSite::CaptureFlush,
         SubmitSite::Upload,
-        SubmitSite::UploadBatch,
         SubmitSite::UploadGlyphs,
         SubmitSite::UploadShm,
         SubmitSite::Transition,
@@ -135,7 +132,6 @@ impl SubmitSite {
             SubmitSite::OffscreenFrame => "offscreen",
             SubmitSite::CaptureFlush => "capture",
             SubmitSite::Upload => "upload",
-            SubmitSite::UploadBatch => "upload-batch",
             SubmitSite::UploadGlyphs => "glyphs",
             SubmitSite::UploadShm => "shm",
             SubmitSite::Transition => "transition",

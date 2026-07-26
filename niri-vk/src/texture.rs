@@ -281,258 +281,6 @@ impl StagedTexture {
     }
 }
 
-/// Uploads many textures with a single submit + fence-wait instead of one per texture — the
-/// overview app grid decodes ~24 icons and would otherwise pay ~24 serialized queue round-trips on
-/// first open (a real stutter on virtualized/Venus queues). Usage: [`TextureBatch::new`], then
-/// [`upload`](Self::upload) per texture (creates its resources, no submit), then
-/// [`finish`](Self::finish) once (records every copy into one command buffer, submits, waits, and
-/// returns the textures). Dropping a batch without `finish` (an error/panic mid-build) frees every
-/// resource staged so far.
-pub struct TextureBatch<'a> {
-    gpu: &'a Gpu,
-    pool: vk::CommandPool,
-    pending: Vec<PendingUpload>,
-}
-
-/// One texture staged into a shared batch staging buffer: its device-local resources, and where
-/// its pixels sit in that buffer. The batched sibling of [`PendingUpload`], which owns a staging
-/// buffer of its own.
-struct BatchedUpload {
-    texture: Texture,
-    buffer_offset: vk::DeviceSize,
-}
-
-/// Build every texture in `items` against **one** staging buffer and one submit.
-///
-/// The per-texture path ([`Texture::build_pending`]) creates a staging buffer, allocates its
-/// memory, binds, maps and unmaps for each texture, on top of the image, its memory, the view, the
-/// sampler, the descriptor pool and the set. Of those calls only `vkMapMemory` reaches the host —
-/// it is where venus creates the bo (`vn_device_memory.c:471`), measured at 0.20 ms for 64 MiB —
-/// but the mapping it hands back is *untouched*, so the fill that follows pays a page fault per
-/// page: 7.5 GB/s cold against 58 GB/s warm (`docs/fork/venus-cost.md` §9.2). Per texture, that
-/// cost repeats. The seat's app-grid open measured
-/// **26 resources created in 28.24 ms** with only 11.32 ms of fence waits, i.e. creation was 65% of
-/// the frame and 2.5× everything spent waiting on the GPU.
-///
-/// [`TextureBatch`] already collapsed N submits into one. This collapses the *staging* half too,
-/// the same way the glyph atlas does it: one buffer, every region concatenated, `buffer_offset`
-/// picking each out. The device-local image and its descriptor set stay per texture.
-///
-/// Each item is `(tight w*h*bpp bytes, width, height, format, bpp, components, filter)`; the
-/// returned textures are in the same order. On any error every resource built so far is freed.
-pub fn upload_batch_shared_staging(
-    gpu: &Gpu,
-    pool: vk::CommandPool,
-    items: &[BatchItem<'_>],
-) -> Result<Vec<Texture>> {
-    if items.is_empty() {
-        return Ok(Vec::new());
-    }
-    let device = &gpu.device;
-    let mut guard = UploadGuard::new(device);
-
-    // --- one staging buffer for every texture's pixels, concatenated ---
-    let total: vk::DeviceSize = items.iter().map(|i| i.data.len() as vk::DeviceSize).sum();
-    crate::stats::uploaded(total);
-    let (staging, smem) = {
-        let _timed = crate::stats::creating();
-        let ci = vk::BufferCreateInfo::default()
-            .size(total)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let staging = unsafe { device.create_buffer(&ci, None) }.context("batch staging")?;
-        guard.staging = staging;
-        let sreq = unsafe { device.get_buffer_memory_requirements(staging) };
-        let smem = gpu.allocate(
-            sreq,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        guard.smem = smem;
-        unsafe { device.bind_buffer_memory(staging, smem, 0) }?;
-        (staging, smem)
-    };
-
-    let mut staged: Vec<BatchedUpload> = Vec::with_capacity(items.len());
-    unsafe {
-        let base = device
-            .map_memory(smem, 0, total, vk::MemoryMapFlags::empty())
-            .context("map batch staging")? as *mut u8;
-        let mut offset: vk::DeviceSize = 0;
-        for item in items {
-            {
-                let _timed = crate::stats::staging_write();
-                std::ptr::copy_nonoverlapping(
-                    item.data.as_ptr(),
-                    base.add(offset as usize),
-                    item.data.len(),
-                );
-            }
-            offset += item.data.len() as vk::DeviceSize;
-        }
-        device.unmap_memory(smem);
-    }
-
-    // --- the device-local image + view + sampler + descriptor-visible resources, per texture ---
-    let mut offset: vk::DeviceSize = 0;
-    for item in items {
-        match Texture::new_sampled_image(gpu, item) {
-            Ok(texture) => {
-                staged.push(BatchedUpload {
-                    texture,
-                    buffer_offset: offset,
-                });
-                offset += item.data.len() as vk::DeviceSize;
-            }
-            Err(err) => {
-                for s in &staged {
-                    s.texture.destroy(gpu);
-                }
-                return Err(err);
-            }
-        }
-    }
-
-    let result = gpu.run_commands(pool, crate::stats::SubmitSite::UploadBatch, |cbuf| unsafe {
-        for s in &staged {
-            record_upload_copy_at(
-                device,
-                cbuf,
-                s.texture.image,
-                staging,
-                s.buffer_offset,
-                s.texture.width,
-                s.texture.height,
-            );
-        }
-    });
-
-    // The staging has served its purpose either way — `run_commands` waited, and drained the
-    // device on a wait error, so nothing can still be reading it.
-    unsafe {
-        device.destroy_buffer(staging, None);
-        device.free_memory(smem, None);
-    }
-    guard.staging = vk::Buffer::null();
-    guard.smem = vk::DeviceMemory::null();
-
-    match result {
-        Ok(()) => Ok(staged.into_iter().map(|s| s.texture).collect()),
-        Err(err) => {
-            for s in &staged {
-                s.texture.destroy(gpu);
-            }
-            Err(err)
-        }
-    }
-}
-
-/// One texture's worth of input to [`upload_batch_shared_staging`].
-pub struct BatchItem<'a> {
-    pub data: &'a [u8],
-    pub width: u32,
-    pub height: u32,
-    pub format: vk::Format,
-    pub components: vk::ComponentMapping,
-    pub filter: vk::Filter,
-}
-
-impl<'a> TextureBatch<'a> {
-    pub fn new(gpu: &'a Gpu, pool: vk::CommandPool) -> Self {
-        Self {
-            gpu,
-            pool,
-            pending: Vec::new(),
-        }
-    }
-
-    /// Stage one texture: create its staging buffer + image/view/sampler and copy the pixels into
-    /// the staging, but record no commands and submit nothing (that happens in `finish`). The data
-    /// must be tight `width*height*bpp` bytes, matching [`Texture::upload`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn upload(
-        &mut self,
-        width: u32,
-        height: u32,
-        data: &[u8],
-        format: vk::Format,
-        bpp: vk::DeviceSize,
-        components: vk::ComponentMapping,
-        filter: vk::Filter,
-    ) -> Result<()> {
-        let pending = Texture::build_pending(
-            self.gpu, width, height, data, format, bpp, components, filter,
-        )?;
-        self.pending.push(pending);
-        Ok(())
-    }
-
-    /// Record every staged copy into one command buffer, submit once, wait once, then free the
-    /// staging buffers and return the finished textures (in `upload` order). On a submit/wait
-    /// failure every staged texture is destroyed and the error is returned.
-    pub fn finish(mut self) -> Result<Vec<Texture>> {
-        let device = &self.gpu.device;
-        // Drain so this batch's `Drop` (which runs when `self` falls out of scope below) sees an
-        // empty list and frees nothing a second time. (A panic between here and the frees below
-        // would leak the drained resources — the ash calls all return `Result`, so the only real
-        // candidate is an allocation abort, which tears the process down anyway.)
-        let pending = std::mem::take(&mut self.pending);
-        if pending.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let result = self.gpu.run_commands(
-            self.pool,
-            crate::stats::SubmitSite::UploadBatch,
-            |cbuf| unsafe {
-                for p in &pending {
-                    record_upload_copy(
-                        device,
-                        cbuf,
-                        p.texture.image,
-                        p.staging,
-                        p.texture.width,
-                        p.texture.height,
-                    );
-                }
-            },
-        );
-
-        // The staging buffers have served their purpose (or the submit failed — `run_commands`
-        // already drained the device on a wait error, so this can't race an in-flight copy).
-        for p in &pending {
-            unsafe {
-                device.destroy_buffer(p.staging, None);
-                device.free_memory(p.smem, None);
-            }
-        }
-
-        match result {
-            Ok(()) => Ok(pending.into_iter().map(|p| p.texture).collect()),
-            Err(err) => {
-                for p in &pending {
-                    p.texture.destroy(self.gpu);
-                }
-                Err(err)
-            }
-        }
-    }
-}
-
-impl Drop for TextureBatch<'_> {
-    fn drop(&mut self) {
-        // Non-empty only when the batch was abandoned before `finish` (an early `?` or a panic);
-        // free every resource staged so far. Nothing was submitted, so no copy is in flight.
-        let device = &self.gpu.device;
-        for p in self.pending.drain(..) {
-            unsafe {
-                device.destroy_buffer(p.staging, None);
-                device.free_memory(p.smem, None);
-            }
-            p.texture.destroy(self.gpu);
-        }
-    }
-}
-
 impl Texture {
     /// Upload tight `width*height` RGBA8 pixels into a shader-readable texture.
     pub fn from_rgba(
@@ -556,39 +304,14 @@ impl Texture {
         )
     }
 
-    /// Upload tight `width*height` 32bpp pixels in an arbitrary byte order, selected by `format`
-    /// (e.g. `B8G8R8A8_UNORM` for wl_shm ARGB, `R8G8B8A8_UNORM` for ABGR). The VkFormat defines the
-    /// channel interpretation, so a sampler returns correct RGBA with no CPU swizzle. `alpha_one`
-    /// forces the sampled alpha to 1.0 via the view (for X-formats whose fourth byte is undefined).
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_bytes_32bpp(
-        gpu: &Gpu,
-        pool: vk::CommandPool,
-        width: u32,
-        height: u32,
-        data: &[u8],
-        format: vk::Format,
-        alpha_one: bool,
-        filter: vk::Filter,
-    ) -> Result<Self> {
-        let components = if alpha_one {
-            vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
-        } else {
-            vk::ComponentMapping::default()
-        };
-        Self::upload(
-            gpu, pool, width, height, data, format, 4, components, filter,
-        )
-    }
-
     /// Upload a texture whose pixels are **already in device-visible memory**, written there by
     /// whichever thread produced them ([`HostStaging`]). The render thread is left with the image
     /// creation, the copy command and the submit — the multi-megabyte host write, which is the
     /// whole cost of a wallpaper upload and has no GPU work in it, has already happened elsewhere.
     ///
-    /// The counterpart of [`from_bytes_32bpp`](Self::from_bytes_32bpp), and byte-for-byte the same
-    /// result: same image, same barriers (via [`record_upload_copy`]), same submit site. Only where
-    /// the copy's *source* came from differs.
+    /// Byte-for-byte the same result as any other upload — same image, same barriers (via
+    /// [`record_upload_copy`]), same submit site. Only where the copy's *source* came from
+    /// differs.
     ///
     /// `staging` must hold exactly `width * height * 4` bytes, and must belong to `gpu` — see
     /// [`HostStaging::belongs_to`], which the caller checks, because a device mismatch is a wasted
@@ -1144,9 +867,11 @@ impl Texture {
     }
 
     /// Upload `data` (tight `width*height*bpp` bytes) into a shader-readable `format` texture.
-    /// One image, one submit, one fence-wait. For uploading many textures at once (the overview
-    /// app grid's ~24 icons on first open), [`TextureBatch`] shares the resource creation but
-    /// records every copy into a single submit — see the module's batch section.
+    /// One image, one submit, one fence-wait.
+    ///
+    /// The compositor does not use this path — it stages into the renderer's pool and lets a frame
+    /// record the copy ([`stage_32bpp`](Self::stage_32bpp)), which costs no submit at all. This is
+    /// for the demo binary and the benchmarks, where a self-contained upload is the point.
     #[allow(clippy::too_many_arguments)]
     fn upload(
         gpu: &Gpu,
@@ -1235,24 +960,10 @@ impl Texture {
         Ok((texture, staged))
     }
 
-    /// The device-local half of an upload: a sampled image, its memory, view and sampler, with no
-    /// staging buffer and no commands. Split out for [`upload_batch_shared_staging`], which shares
-    /// one staging buffer across the batch and so cannot use
-    /// [`build_pending`](Self::build_pending).
-    fn new_sampled_image(gpu: &Gpu, item: &BatchItem<'_>) -> Result<Texture> {
-        Self::new_sampled_image_raw(
-            gpu,
-            item.width,
-            item.height,
-            item.format,
-            item.components,
-            item.filter,
-        )
-    }
-
-    /// [`new_sampled_image`](Self::new_sampled_image) against loose parameters rather than a
-    /// [`BatchItem`], for the callers that have no host slice to point one at
-    /// ([`from_host_staging`](Self::from_host_staging)).
+    /// The device-local half of an upload: a sampled image with its memory, view and sampler, and
+    /// no staging buffer or commands at all. The pixels are somebody else's problem — a slice
+    /// staged into the shared pool ([`stage_32bpp`](Self::stage_32bpp)) or a
+    /// [`HostStaging`] filled off-thread ([`from_host_staging`](Self::from_host_staging)).
     fn new_sampled_image_raw(
         gpu: &Gpu,
         width: u32,

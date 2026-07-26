@@ -780,36 +780,37 @@ impl VulkanRenderer {
         ))
     }
 
-    /// Import many host-memory buffers as textures with a **single** GPU submit + fence-wait
-    /// instead of one per texture (see [`TextureBatch`]). Each item is `(tight w*h*4 bytes, its
-    /// `Fourcc`, size, flipped)`; the returned textures are in the same order. The overview app
-    /// grid uses it to upload its ~24 icons on first open in one round-trip. On any per-item error
-    /// the whole batch fails and every already-built resource is freed.
+    /// Import many host-memory buffers as textures at once — the overview app grid's ~24 icons on
+    /// first open. Each item is `(tight w*h*4 bytes, its `Fourcc`, size, flipped)`; the returned
+    /// textures are in the same order.
+    ///
+    /// **This is N ordinary imports now, and that is the point.** The batch existed because the
+    /// per-texture path cost a submit and a fence wait each, on top of a staging buffer each —
+    /// create, allocate, bind, map, unmap, five host round trips per icon, measured at 65% of the
+    /// app-grid open frame. Both halves are properties of the ordinary path today rather than of a
+    /// batch: [`Self::import_memory`] stages into the shared pool (one buffer, N offsets) and
+    /// queues its copy for the next frame's command buffer, which costs no submit at all. Twenty
+    /// four icons imported one at a time and twenty four imported "as a batch" are the same GPU
+    /// work, so the batch is only a validation-and-order convenience.
+    ///
+    /// Every item is checked before any is imported, so a bad one fails the call rather than
+    /// leaving half a page uploaded.
     pub fn import_memory_batch(
         &mut self,
         items: &[MemImportItem],
     ) -> Result<Vec<VkTexture>, VulkanError> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let filter = match self.upscale_filter {
-            TextureFilter::Linear => vk::Filter::LINEAR,
-            TextureFilter::Nearest => vk::Filter::NEAREST,
-        };
-        let mut batch = Vec::with_capacity(items.len());
         for (data, format, size, _flipped) in items {
-            let Some((vk_format, alpha_one)) = import_format(*format) else {
+            if import_format(*format).is_none() {
                 return Err(VulkanError::UnsupportedFormat(*format));
-            };
+            }
             let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-            // A zero extent would build an invalid (0-size) buffer/image; reject it up front
-            // rather than trip a validation error deep in `build_pending`.
+            // A zero extent would build an invalid (0-size) image; reject it up front rather than
+            // trip a validation error deeper in.
             if w == 0 || h == 0 {
                 return Err(VulkanError::Other(format!(
                     "import_memory_batch: zero extent {w}x{h}"
                 )));
             }
-            // `ImportMem`'s tight `w*h*4` contract (matches `import_memory`).
             let expected = (w as usize) * (h as usize) * 4;
             if data.len() < expected {
                 return Err(VulkanError::Other(format!(
@@ -817,54 +818,11 @@ impl VulkanRenderer {
                     data.len()
                 )));
             }
-            let components = if alpha_one {
-                vk::ComponentMapping::default().a(vk::ComponentSwizzle::ONE)
-            } else {
-                vk::ComponentMapping::default()
-            };
-            batch.push(niri_vk::texture::BatchItem {
-                data: &data[..expected],
-                width: w,
-                height: h,
-                format: vk_format,
-                components,
-                filter,
-            });
         }
-        // One staging buffer for the whole page, not one per icon: on Venus each staging buffer is
-        // a create + allocate + bind + map + unmap, five host round trips, and creation was
-        // measured at 65% of the app-grid open frame. See `upload_batch_shared_staging`.
-        let textures =
-            niri_vk::texture::upload_batch_shared_staging(&self.gpu, self.command_pool, &batch)
-                .map_err(|e| VulkanError::Other(format!("batch upload: {e:#}")))?;
 
-        // Wrap each texture with its descriptor set. If that fails partway, destroy the current
-        // texture and every not-yet-wrapped one; the already-wrapped ones in `out` free via
-        // `VkTexture`'s Drop as it unwinds.
-        let mut out = Vec::with_capacity(textures.len());
-        let mut textures = textures.into_iter();
-        for (_, format, size, flipped) in items {
-            let Some(tex) = textures.next() else { break };
-            let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
-            match self.make_texture_set(&tex) {
-                Ok((desc_pool, set)) => out.push(VkTexture::new(
-                    self.gpu.clone(),
-                    tex,
-                    desc_pool,
-                    set,
-                    w,
-                    h,
-                    *format,
-                    *flipped,
-                )),
-                Err(err) => {
-                    tex.destroy(&self.gpu);
-                    for leftover in textures {
-                        leftover.destroy(&self.gpu);
-                    }
-                    return Err(err);
-                }
-            }
+        let mut out = Vec::with_capacity(items.len());
+        for (data, format, size, flipped) in items {
+            out.push(self.import_memory(data, *format, *size, *flipped)?);
         }
         Ok(out)
     }

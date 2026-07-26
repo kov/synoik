@@ -4439,14 +4439,19 @@ fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
     );
 }
 
-/// The batch now packs every texture's pixels into **one** staging buffer and picks each out with
-/// a `buffer_offset`. That arithmetic is the whole risk of the change, and it is only exercised by
-/// textures of *differing* sizes — equal sizes make every offset a multiple of one stride, so an
-/// off-by-one in the accumulation still lands on a boundary and the pixels come out right anyway.
+/// Every texture's pixels go into **one** staging buffer, picked out by a `buffer_offset` — the
+/// shared pool an ordinary import stages into, so this is now what *all* uploads do rather than
+/// something a batch does. That arithmetic is the whole risk, and it is only exercised by textures
+/// of *differing* sizes: equal sizes make every offset a multiple of one stride, so an off-by-one
+/// in the accumulation still lands on a boundary and the pixels come out right anyway.
 ///
 /// Three textures, three different sizes, three different solid colors. Each must read back its
 /// own color: a wrong offset shows up as one texture wearing its neighbour's pixels, or as a
 /// diagonal smear where the row stride no longer matches.
+///
+/// It also pins what the app grid's first open costs: **no submit**. That page of ~24 icons used
+/// to be one submit and one fence wait (down from 24, which is why the batch existed at all); the
+/// copies now ride the next frame's command buffer like every other import.
 #[test]
 fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
     let mut vk = match VulkanRenderer::new() {
@@ -4486,8 +4491,20 @@ fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
         })
         .collect();
 
+    vk.warm_staging_pool();
+    let submits_before = niri_vk::stats::submits();
     let textures = vk.import_memory_batch(&items).expect("batch import");
     assert_eq!(textures.len(), 3, "batch dropped a texture");
+    assert_eq!(
+        niri_vk::stats::submits() - submits_before,
+        0,
+        "importing a page of icons submitted; the copies must ride the next frame's command buffer",
+    );
+    assert_eq!(
+        vk.staging_chunk_count(),
+        1,
+        "and they must share one staging buffer, not take one each",
+    );
 
     // Draw each into its own target and read the middle pixel back.
     for (i, (tex, (w, h, want))) in textures.iter().zip(specs.iter()).enumerate() {
