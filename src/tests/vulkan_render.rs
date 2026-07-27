@@ -8045,3 +8045,194 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
         per_frame.len(),
     );
 }
+
+/// A wallpaper change must not put the xray effect buffer into a permanent per-frame
+/// recreate-and-reblur.
+///
+/// The frame that *records* a queued blur holds the effect buffer's offscreen alive as
+/// `blur.source` until its submit retires — and under deferred scanout (the live KMS path, where
+/// the fence goes to the plane and the CPU walks away) that record outlives the frame. The reuse
+/// check counted that keep-alive as a foreign owner, so the next frame's prepare threw the
+/// offscreen away, which invalidated the blur, which queued another blur for the next frame to
+/// record and hold: **self-sustaining**. One wallpaper change cost the live seat a full-output blur
+/// plus three image creations on every idle frame — ~15ms of GPU on a 16.67ms budget — until an
+/// unrelated blocking wait (closing a window) drained the in-flight list.
+///
+/// Both halves are load-bearing, and each is invisible without the other:
+///   - **deferral on**, or every submit is waited out and the keep-alive is gone before the next
+///     prepare ever looks (the undeferred path settles after one frame either way — that is what
+///     made this bug live-only);
+///   - **a wallpaper change**, or no blur is ever queued and nothing holds the offscreen at all.
+///
+/// The assertion is on image *creations* per frame rather than pixels: the composite is identical
+/// either way — the recreated offscreen is re-rendered and re-blurred with the same contents — so
+/// no pixel comparison can see this.
+#[test]
+fn a_wallpaper_change_does_not_leave_the_xray_buffer_rebuilding_every_frame() {
+    let Some((mut f, output, red, blue)) = xray_wallpaper_fixture() else {
+        return;
+    };
+
+    set_wallpaper(&mut f, &red);
+    niri_vk::stats::set_enabled(true);
+    let _ = niri_vk::stats::take_creates();
+
+    // Warm: the offscreen, its blur chain and the wallpaper texture all exist and are steady.
+    let steady: Vec<(u64, u64)> = (0..4)
+        .map(|_| render_deferred_once(&mut f, &output))
+        .collect();
+    let baseline = *steady.last().unwrap();
+
+    set_wallpaper(&mut f, &blue);
+    // Frame 1 legitimately re-renders and re-blurs (the wallpaper really did change); every frame
+    // after it must be back to the steady cost.
+    let after: Vec<(u64, u64)> = (0..5)
+        .map(|_| render_deferred_once(&mut f, &output))
+        .collect();
+
+    // `render_to_texture` allocates the frame's own target, and that is the *only* thing a steady
+    // frame may allocate. An absolute bound, not a comparison against the warm frames: under the
+    // bug the warm frames are broken too, so any "same as before" assertion passes.
+    const OWN_TARGET: u64 = 1;
+    let rebuilding: Vec<_> = steady[1..]
+        .iter()
+        .chain(&after[1..])
+        .filter(|&&(_, creates)| creates > OWN_TARGET)
+        .collect();
+    assert!(
+        rebuilding.is_empty(),
+        "the xray effect buffer is being rebuilt on frames that changed nothing: \
+         (draws, creations)/frame were {steady:?} while steady, then {after:?} across a wallpaper \
+         change. The frame that recorded the blur holds its source — our own keep-alive, not a \
+         foreign owner (`VulkanRenderer::discount_pending_holds`)."
+    );
+    assert_ne!(
+        after[0].0, baseline.0,
+        "the wallpaper change cost the xray buffer no extra draws, so this scene never blurs and \
+         the test cannot see the bug it exists for: {steady:?} then {after:?}"
+    );
+}
+
+/// The fixture the xray/wallpaper tests share: the gsrs XRAY rule (translucent, no opaque border
+/// background, `background-effect` blur+xray) over a window, plus two solid wallpapers to swap
+/// between.
+fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std::path::PathBuf)> {
+    use niri_config::BackgroundEffectRule;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return None;
+    }
+
+    let dir = std::env::temp_dir().join("niri-xray-wallpaper-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let red = dir.join("red.png");
+    let blue = dir.join("blue.png");
+    write_solid_png(&red, [255, 0, 0]);
+    write_solid_png(&blue, [0, 0, 255]);
+
+    let mut config = Config::default();
+    config.window_rules.push(WindowRule {
+        opacity: Some(0.25),
+        draw_border_with_background: Some(false),
+        background_effect: BackgroundEffectRule {
+            blur: Some(true),
+            xray: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config(config);
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_shm_buffer(600, 400, 200, 100, 50, 255);
+    window.set_size(600, 400);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    let output = f.niri_output(1);
+    Some((f, output, red, blue))
+}
+
+/// A solid `rgb` PNG — a wallpaper whose contribution through a translucent window is unambiguous.
+fn write_solid_png(path: &std::path::Path, rgb: [u8; 3]) {
+    let mut img = image::RgbaImage::new(256, 256);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([rgb[0], rgb[1], rgb[2], 255]);
+    }
+    img.save(path).expect("write png");
+}
+
+/// Point `org.gnome.desktop.background` at `path` and let the compositor pick it up. Decodes
+/// synchronously — the fixture wires no worker thread.
+fn set_wallpaper(f: &mut Fixture, path: &std::path::Path) {
+    let settings = crate::gnome::BackgroundSettings {
+        picture: Some(path.to_path_buf()),
+        options: crate::gnome::BackgroundOptions::default(),
+    };
+    let gpu = f
+        .niri_state()
+        .backend
+        .with_vulkan_renderer(|r| r.gpu().clone());
+    f.niri().wallpaper.update(&settings, gpu.as_ref());
+}
+
+/// Render one frame the way the live KMS path does: collect elements, render into a target, and
+/// walk away from the submit without waiting for it. Returns the frame's draws and image
+/// creations.
+fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
+    use crate::render_helpers::render_to_texture;
+
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<(u64, u64)> {
+            vk.set_defer_scanout(true);
+            // Retirement is a poll; the live seat routinely reaches the next prepare without
+            // having observed the previous submit complete. Pin that side of the race.
+            vk.set_retire_paused(true);
+            let niri = &mut state.niri;
+            niri.update_render_elements(Some(output));
+
+            let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+            let scale = Scale::from(output.current_scale().fractional_scale());
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            // Reset before *collection*: the xray effect buffer is prepared while elements are
+            // built, so its offscreen and blur allocations land there, not in the render below.
+            let _ = niri_vk::stats::take_creates();
+            let d0 = niri_vk::stats::draws();
+            let elements = niri.render_to_vec(ctx, output, false);
+            let (_tex, _sync) = render_to_texture(
+                vk,
+                size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements.iter().rev(),
+            )?;
+            Ok((
+                niri_vk::stats::draws() - d0,
+                niri_vk::stats::take_creates().0,
+            ))
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("rendering must not error")
+}

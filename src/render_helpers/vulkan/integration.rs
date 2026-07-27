@@ -36,23 +36,23 @@ impl OffscreenRenderer for VulkanRenderer {
     }
 
     fn offscreen_is_reusable(&mut self, texture: &mut VkTexture) -> bool {
-        // Retire first, or this answers "not unique" about ourselves. An offscreen finish hands
-        // its completion to the in-flight list (see `should_defer_offscreen_finish`), and that
-        // record keeps a reference to the render target — so the frame that rendered *into* this
-        // texture is exactly the thing holding the second reference. Retiring is a poll, so this
-        // says yes only once the GPU is genuinely done with the previous render, which is also
-        // the condition for overwriting it to be safe.
+        // Retire first, so a submit the GPU has finished stops holding anything at all. It is only
+        // a poll, and nothing here may depend on it having succeeded — see below.
         self.retire_completed();
 
-        // …and discount the queues, for exactly the same reason. A pending blur and a pending
-        // layout transition each hold the texture so it outlives the submit that will name it —
-        // our keep-alive, not a foreign owner. Counting them is answering "not unique" about
-        // ourselves again, and the caller's answer to "not unique" is to throw the texture away
-        // and allocate a new one: per frame, per blurred window, along with its blur chain. That
-        // is the virtio-gpu blob churn this path exists to avoid, and it re-queues the blur on the
-        // fresh chain each time — four full-output blurs in a frame that needed one. Re-rendering
-        // into the texture first is safe: a queued blur has not been recorded yet, so it simply
-        // blurs the new contents.
+        // Then discount every reference that is ours. A pending blur, a pending layout transition
+        // and an in-flight submit each hold the texture so it outlives the submit that will name
+        // it — our keep-alive, not a foreign owner. Counting them is answering "not unique" about
+        // ourselves, and the caller's answer to "not unique" is to throw the texture away and
+        // allocate a new one: per frame, per blurred window, along with its blur chain. That is
+        // the virtio-gpu blob churn this path exists to avoid, and it re-queues the blur on the
+        // fresh chain each time — four full-output blurs in a frame that needed one.
+        //
+        // Both are safe to re-render into: a queued blur has not been recorded yet, so it simply
+        // blurs the new contents, and a recorded one is ordered ahead of this render on the queue
+        // timeline. Gating on the retire poll instead is what made the xray buffer rebuild itself
+        // forever after a wallpaper change — `VulkanRenderer::discount_pending_holds` has the
+        // whole story.
         self.discount_pending_holds(texture)
     }
 }

@@ -165,7 +165,7 @@ pub struct VulkanRenderer {
     /// sizes (an interactively resized window cast renegotiates its size as it grows) cannot grow
     /// the cache without bound; the sizes actually bound each frame stay resident and never
     /// reallocate. Reuse and eviction are safe because a deferred frame's record holds its target
-    /// ([`InFlightSubmit::_targets`]): evicting a shadow removes it from this map but the image
+    /// ([`InFlightSubmit::targets`]): evicting a shadow removes it from this map but the image
     /// lives until the submit retires. (Before that record existed, the guarantee was that
     /// rendering is synchronous — which stopped being true when the scanout submit learned to
     /// defer.)
@@ -206,7 +206,7 @@ pub struct VulkanRenderer {
     /// Cache each imported target and reuse it across frames;
     /// entries whose buffer was freed are evicted. Reuse and eviction are safe for the same reason
     /// as the shadow: a deferred frame's record holds what it renders into
-    /// ([`InFlightSubmit::_targets`]). Mirrors `GlesRenderer`'s `buffers` bound-dmabuf cache.
+    /// ([`InFlightSubmit::targets`]). Mirrors `GlesRenderer`'s `buffers` bound-dmabuf cache.
     dmabuf_target_cache: HashMap<WeakDmabuf, VkTexture>,
     /// Imported **client** sampled dmabufs, keyed by buffer identity. smithay clears its
     /// per-surface texture on *every* new-buffer commit (even a recycled `wl_buffer`), so an
@@ -222,7 +222,7 @@ pub struct VulkanRenderer {
     /// is the sampled-import dual of [`Self::dmabuf_target_cache`] (which needs no re-acquire
     /// because the compositor, not an external producer, writes the scanout target).
     /// Reuse/eviction is safe because a frame that samples one of these has already retained it
-    /// (`VulkanFrame::retain` → [`InFlightSubmit::_held`]), so dropping the cache entry only
+    /// (`VulkanFrame::retain` → [`InFlightSubmit::held`]), so dropping the cache entry only
     /// releases *our* reference — the image lives until the submit that reads it retires.
     dmabuf_import_cache: HashMap<WeakDmabuf, VkTexture>,
 
@@ -273,6 +273,9 @@ pub struct VulkanRenderer {
     /// their staging and leave a blank image behind — never an invalid one. It cannot grow without
     /// bound while undrained either — see [`PendingTextureUpload`].
     pending_texture_uploads: Vec<PendingTextureUpload>,
+    /// Tests only — see [`Self::set_retire_paused`].
+    #[cfg(test)]
+    retire_paused: bool,
 
     /// Freshly created offscreens waiting for the barrier that makes them sampleable, drained into
     /// the next frame's command buffer by [`super::VulkanFrame::begin`]. See
@@ -540,6 +543,8 @@ impl VulkanRenderer {
             warned_modifiers: HashSet::new(),
             pending_dmabuf_acquires: Vec::new(),
             pending_texture_uploads: Vec::new(),
+            #[cfg(test)]
+            retire_paused: false,
             pending_blurs: Vec::new(),
             pending_sampleable: Vec::new(),
             staging_pool,
@@ -1482,13 +1487,30 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    /// Whether `texture` is unowned *once our own queued references are discounted* — the reuse
-    /// question `OffscreenRenderer::offscreen_is_reusable` asks.
+    /// Whether `texture` is unowned *once our own references are discounted* — the reuse question
+    /// `OffscreenRenderer::offscreen_is_reusable` asks.
     ///
-    /// Every pending queue holds its textures precisely so they outlive the submit that will name
-    /// them; none of that work has been recorded yet, so nothing is reading the image and
-    /// re-rendering into it is safe. Answering "owned" on our own keep-alive tells the caller to
-    /// discard a perfectly good offscreen and allocate a replacement, every frame.
+    /// Two kinds of keep-alive are ours, and neither is a foreign owner:
+    ///
+    /// - **The pending queues.** Each holds its textures precisely so they outlive the submit that
+    ///   will name them; none of that work has been recorded yet, so nothing is reading the image.
+    /// - **The in-flight records.** A frame holds every image its command buffer sampled (`held`)
+    ///   or rendered into (`targets`) until its submit retires, and under deferred scanout that
+    ///   record outlives the frame by design. Re-rendering into such an image is still safe:
+    ///   submits are totally ordered on the one timeline semaphore (the same invariant
+    ///   `retire_completed` drains a prefix by, and `docs/fork/frame-submit-discipline.md` states),
+    ///   so the earlier submit's reads and writes complete before the later one begins. A record
+    ///   only exists on the deferred path, which `should_defer_offscreen_finish` gates on
+    ///   `orders_submits()` — so this branch is never reached without that guarantee.
+    ///
+    /// Answering "owned" about our own keep-alive tells the caller to discard a perfectly good
+    /// offscreen and allocate a replacement, every frame. Missing the in-flight half of that made
+    /// the xray effect buffer **self-sustaining**: the frame that records a queued blur holds the
+    /// effect buffer's offscreen as `blur.source`, so the next frame's prepare called it foreign,
+    /// recreated it, and thereby invalidated the blur — which queued another blur, for the next
+    /// frame to record and hold. One wallpaper change put the seat into a permanent one-recreate-
+    /// plus-one-full-output-blur per idle frame, ~15ms of GPU on a 16.67ms budget, until an
+    /// unrelated blocking wait (closing a window) happened to drain the in-flight list.
     pub(super) fn discount_pending_holds(&self, texture: &VkTexture) -> bool {
         let image = texture.image();
         let mut ours = self
@@ -1504,6 +1526,10 @@ impl VulkanRenderer {
         for blur in &self.pending_blurs {
             ours += usize::from(blur.source.image() == image);
             ours += usize::from(blur.output.image() == image);
+        }
+        for frame in &self.in_flight {
+            ours += frame.held.iter().filter(|t| t.image() == image).count();
+            ours += frame.targets.iter().filter(|t| t.image() == image).count();
         }
         texture.reference_count() <= 1 + ours
     }
@@ -1799,15 +1825,15 @@ struct InFlightSubmit {
     /// Every texture the command buffer samples, held for exactly the reason `VulkanFrame::held`
     /// holds them — the draw records reference the image and descriptor set, and the elements
     /// that own them are dropped long before the GPU is finished.
-    _held: Vec<VkTexture>,
+    held: Vec<VkTexture>,
     /// What the command buffer *renders into*: the bound target, and the present-blit destination
-    /// if there is one. Neither is in `_held` — that list is built from what draws sample — and
+    /// if there is one. Neither is in `held` — that list is built from what draws sample — and
     /// neither belongs to the caller: the target may be a present-blit shadow owned by
     /// [`VulkanRenderer::present_blit_shadows`], which evicts least-recently-used, or an imported
     /// dmabuf owned by `dmabuf_target_cache`, which drops entries whose weak handle is gone. Both
     /// destroy the image on drop with no wait ([`VkTexture`]'s inner `Drop`), so without this the
     /// caches are free to delete an image a submit in flight is still writing.
-    _targets: Vec<VkTexture>,
+    targets: Vec<VkTexture>,
     /// The glyph-atlas staging buffer whose copy this command buffer carries, if any
     /// ([`VulkanRenderer::record_pending_glyph_uploads`]). Held for the same reason as everything
     /// else here — the copy reads it on the GPU long after the CPU has moved on. It frees itself
@@ -1828,6 +1854,10 @@ impl VulkanRenderer {
     /// Free everything belonging to submits the GPU has finished. Polls — it must never block, or
     /// the wait we removed from the end of one frame simply reappears at the start of the next.
     pub(super) fn retire_completed(&mut self) {
+        #[cfg(test)]
+        if self.retire_paused {
+            return;
+        }
         if self.in_flight.is_empty() {
             return;
         }
@@ -1884,7 +1914,7 @@ impl VulkanRenderer {
     }
 
     /// Record a submit the CPU is not going to wait for. `targets` is what the command buffer
-    /// renders into — see [`InFlightSubmit::_targets`], which is why it is separate from `held`.
+    /// renders into — see [`InFlightSubmit::targets`], which is why it is separate from `held`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn add_in_flight(
         &mut self,
@@ -1903,8 +1933,8 @@ impl VulkanRenderer {
             gpu_slot,
             cbuf,
             _fence: fence,
-            _held: held,
-            _targets: targets,
+            held,
+            targets,
             _glyph_staging: glyph_staging,
             _texture_staging: texture_staging,
             _blur_chains: blur_chains,
@@ -1967,6 +1997,17 @@ impl VulkanRenderer {
         self.defer_scanout = on;
     }
 
+    /// Stop [`Self::retire_completed`] from observing completions. Tests only, and the stand-in for
+    /// a real property of the live seat: retirement is a *poll*, so an in-flight record survives
+    /// every prepare that runs before the renderer happens to notice the queue timeline moved (on
+    /// this stack, with `VN_PERF=no_fence_feedback`, that is most of them). Anything whose
+    /// correctness depends on an in-flight record having been freed is a race; pausing makes the
+    /// unfavourable side of it deterministic.
+    #[cfg(test)]
+    pub(crate) fn set_retire_paused(&mut self, on: bool) {
+        self.retire_paused = on;
+    }
+
     /// How many submits the CPU has walked away from and not yet retired.
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
@@ -1978,7 +2019,7 @@ impl VulkanRenderer {
     /// its cache happens not to evict, and corrupts silently when it does.
     #[cfg(test)]
     pub(super) fn in_flight_targets_len(&self) -> usize {
-        self.in_flight.iter().map(|f| f._targets.len()).sum()
+        self.in_flight.iter().map(|f| f.targets.len()).sum()
     }
 
     /// How many sampled textures the in-flight records are keeping alive — the frame's `held`,
@@ -1987,7 +2028,7 @@ impl VulkanRenderer {
     /// image inside a recorded command buffer, which no pixel comparison can see.
     #[cfg(test)]
     pub(super) fn in_flight_held_len(&self) -> usize {
-        self.in_flight.iter().map(|f| f._held.len()).sum()
+        self.in_flight.iter().map(|f| f.held.len()).sum()
     }
 
     /// Turn GPU timing on for this renderer alone, without touching the
