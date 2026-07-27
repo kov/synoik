@@ -106,6 +106,31 @@ the idle deferred-work queue into a `POLICY_FOREVER` cache (`appDisplay.js:1339`
 `st-texture-cache.c:998`), which is why its first grid open never shows a blank tile. Where a site
 resists all three, the fallback is to make it incremental rather than one blocking chunk.
 
+### Nice to have — a font database cache on disk
+
+Not scheduled; the last drop of juice once the named sites are smoothed.
+
+Every launch, `FontSystem::new()` walks the system font directories and parses each face's metadata
+to build the family index. That is the ~250–400 ms cold cost the prewarm currently *hides* rather
+than removes — and hiding it is why `race_to_init` exists (`d4742f8c`): the work is still on some
+thread, still competing for the same startup window, and we pay it in full on every login.
+
+GNOME does not pay it, and not because Pango is faster: **fontconfig keeps the enumeration in an
+on-disk cache** (`fc-cache`, `/var/cache/fontconfig` + `~/.cache/fontconfig`), rebuilt only when a
+font directory's mtime changes. Startup is a cache read, not a scan. `fontdb` has no equivalent —
+it rescans every process.
+
+The shape of the fix: serialize the resolved face index (path, index, family, weight, style,
+stretch — not the font data) into `$XDG_CACHE_HOME/gnome-shell-rs/fonts.<version>.bin`, keyed on
+the font directories' mtimes plus a format version, and load faces lazily by path on first use.
+Invalidate wholesale on any mtime change; a stale-cache bug shows as a missing family, so
+correctness must come from the key, never from patching entries. Worth measuring the split first —
+if most of the cost is the raw file reads rather than the parse, a cache of the index alone buys
+less than it looks and the answer is to load fewer faces instead.
+
+Related: this is also the thing that would make the prewarm thread unnecessary rather than
+load-bearing, which is a simplification worth having on its own.
+
 ## The methodology trap, recorded
 
 Measuring a cold cost twice in one process gives you the **warm** number, and the difference can

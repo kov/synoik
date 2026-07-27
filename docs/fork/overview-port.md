@@ -206,6 +206,45 @@ toolkit, per the CLAUDE.md "toolkit-first, no faked chrome" tenet.
   Faithful systemd-scope wrapping (`app-<id>.scope`) and startup-notification/focus-stealing timestamps
   are a follow-up refinement, not MVP.
 
+  **This deferral has a live consequence: apps we launch die badly on logout.** Observed 2026-07-27 —
+  Firefox aborts every logout, and the core says why:
+
+  ```
+  Error reading events from display: Broken pipe
+  ```
+
+  EPIPE, not a protocol error: the compositor's socket goes away while the client is still running,
+  GTK3 makes that fatal (`gdk/wayland/gdkeventsource.c` `g_error`), and Firefox's `HandleGLibMessage`
+  turns it into a crash. Journal ordering, one logout: niri's last frame `10:26:16.384` →
+  `Stopped target graphical-session.target` `.389` → `ANOM_ABEND comm="firefox"` `10:26:17.405`. The
+  client outlived the compositor by a second.
+
+  Two gaps against GNOME, both confirmed rather than assumed:
+
+  1. **`GioLauncher` passes `AppLaunchContext::NONE`** (`src/app_system.rs:685`), so a launched app
+     gets no scope and stays in the compositor's own cgroup — `org.gnome.Shell@user.service`, which
+     is the unit niri runs as. On logout it is a stray in a stopping service: the 09:52 logout shows
+     `org.gnome.Shell@user.service: Killing process 478236 (firefox) with signal SIGABRT`, i.e. the
+     `TimeoutStopSec=5` + `10-timeout-abort.conf` cleanup. GNOME instead connects the launch
+     context's `launched` signal and calls `gnome_start_systemd_scope(app_name, pid, …)` —
+     `src/shell-global.c:1182-1207`, "Start async request; we don't care about the result".
+  2. **Our own scopes are not part of the session.** `start_systemd_scope`
+     (`src/utils/spawning.rs:403`) does create `app-niri-<name>-<pid>.scope` for niri's spawn path,
+     but `systemctl show` says `PartOf=` empty, where a GNOME-launched scope carries
+     `PartOf=graphical-session.target` — the property that gets the app a SIGTERM at session
+     teardown instead of nothing.
+
+  Natural experiment in the same session: `ghost` and `kitty` had scopes and exited cleanly, Firefox
+  had none and aborted. Suggestive, **not conclusive** — kitty/ghost may simply tolerate EPIPE where
+  GTK3 calls it fatal.
+
+  So (1)+(2) are small, match the reference, and are worth doing on their own merits, but neither is
+  proven to fix the crash: the client still has to be *gone* before the compositor is, and in the
+  trace above the target stopped 5ms after niri's last frame. **The actual fix is shutdown ordering
+  — the compositor outliving its clients** (gnome-session's EndSession phases run before any target
+  stops), which is its own piece of work and wants the session-manager integration designed first.
+  Do not file (1)+(2) as "fixes the Firefox crash".
+
 ---
 
 ## 5. Prioritized backlog (slices toward "launch apps")
