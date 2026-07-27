@@ -46,10 +46,16 @@ Two instruments, then a pass over what they find. The second one is the interest
 writes, uploads and shaped runs. Everything else is a **residual you have to compute by hand**,
 which is how ~11 ms sat unnoticed in the first-overview frame.
 
-- Print the residual explicitly: `collect 15.95ms (11.0ms unattributed)`, so a frame line accuses
-  itself instead of requiring subtraction.
+- ~~Print the residual explicitly~~ — **DONE (`f0a17bb1`)**. Any phase now reports what it cannot
+  explain: `collect 15.95ms (11.00ms unattributed)`. The residual is a **union** of the timed
+  scopes, not a sum of the buckets: the buckets nest (a bake allocates and shapes inside itself),
+  so a sum double-counts and would read zero residual on exactly the frames that have one. A phase
+  with no buckets at all stays quiet. Floor 0.5 ms.
 - Add scoped timers inside `Niri::render_to_vec` at the boundaries that already exist — per UI
-  surface (panel, dash, app grid, search, notifications), and around icon resolution.
+  surface (panel, dash, app grid, search, notifications), and around icon resolution. **Not done**
+  — deliberately waiting for a validation run on the new binary to say *where* a residual actually
+  shows up, rather than instrumenting six surfaces on the strength of one frame from before the
+  residual was measurable.
 
 Deliverable: no frame line with more than ~1 ms of unattributed collect.
 
