@@ -834,17 +834,37 @@ We cannot separate these from in here, and it is the question we would put back 
 wait, so the old numbers flattered the chain by omitting a tail that was always there. That reading
 is fully consistent with the table.
 
-One observation pulls the other way: **peak fps reached while exercising was 46.0 (ON) vs 56.2
-(OFF)**. A pure change in what the fence *reports* should not lower the frame rate the compositor can
-achieve. If the latch wait is also throttling the pipeline — the next frame's fence not completing
+One observation looked like it pulled the other way: **peak fps reached while exercising was 46.0
+(ON) vs 56.2 (OFF)**, and a pure change in what the fence *reports* should not lower the frame rate
+the compositor can achieve.
+
+**That is not independent evidence, and we should not have presented it as though it were.** An
+aim-1 miss *is* a continuation frame slipping a cycle, which is exactly what lowers the frame rate —
+the two are one measurement. The arithmetic closes: a 16.7% slip rate gives a mean interval of 1.167
+cycles → 51 fps, and 8.8% gives 1.088 → 55 fps, against 46 and 56 observed. The fps figure restates
+the miss rate; it does not corroborate it. If the latch wait is also throttling the pipeline — the next frame's fence not completing
 until the host has latched the previous one — then the chain is costing frames, not just counting
 them honestly. But the workload here is human-driven, so the fps difference could equally be that the
 two minutes of poking were not identical, and we would not report it as an effect.
 
-What would settle it, if you want it settled: a fixed-rate synthetic producer (something that submits
-at exactly 60 Hz regardless of completion) run in both arms. If ON still misses ~2× at an identical
-submit cadence, the chain is reporting; if the producer cannot maintain 60 Hz with the chain on, it is
-throttling. We can build that on our side if it is useful to you — say the word.
+We proposed a fixed-rate synthetic producer to settle this. **On reflection it cannot**, and neither
+can anything else we can run from in here, for two reasons:
+
+1. **A fixed-rate flip producer is not constructible.** At the KMS level the next atomic commit
+   cannot be issued until the previous page flip completes. Flip cadence is completion-coupled by
+   the DRM contract, so "submit at 60 Hz regardless of completion" is not a thing a compositor can
+   do. Delayed completion delaying the next commit is structural, not incidental.
+2. **The real ambiguity is whether the OFF arm's completions are honest**, and that is invisible
+   from the guest by construction. With the chain off the completion fires at handoff, so the
+   compositor believes it presented 56 fps — but if the host only latched ~46 of them, then the OFF
+   arm's rate is fictitious, the ON arm's numbers are the true ones all along, and the user saw the
+   same thing either way. A synthetic producer would sit inside exactly the same blind spot.
+
+**The decisive comparison is on your side, with data you say you already keep**: your per-present
+bookkeeping lined up against our journal for the window in this section (arms split at 12:24:10).
+The question is one number per arm — *how many presents did the host actually latch per second?* If
+OFF latched ~46/s while we recorded 56 flips/s, the chain is reporting honestly and we should adopt
+its numbers. If OFF latched ~56/s, the chain is costing ~10 fps and that is a real cost to weigh.
 
 ### 15.3 Scope
 
