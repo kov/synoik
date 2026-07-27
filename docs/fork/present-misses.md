@@ -14,6 +14,12 @@ so we cannot tell whether these are real dropped frames or an artefact of how th
 produced. **That distinction is the single most useful thing the host side can tell us**, and
 §6 says why.
 
+> **§6 has since been answered — read [§9](#9-vmm-side-answers-2026-07-27-host-session) first.**
+> The timestamp is the guest's own emulated vblank hrtimer, and the host presents fire-and-forget
+> today, so **nothing below is a statement about glass**. A "miss" here means the commit chain
+> crossed a tick of a guest-local grid. The numbers stand as written; their *interpretation* is
+> §9 and §10, and §10.1 supersedes §4's reading of the idle regime.
+
 Companion to [`venus-cost.md`](./venus-cost.md), which covers per-frame *submit* cost. This one is
 only about *presentation timing*. §7 is a second, unrelated finding that also lands on the host
 side and is cheap to include here.
@@ -337,3 +343,104 @@ Answers to the ranked questions:
 4. In the idle windows, do misses correlate with inter-flip gaps >5 s (see 9.1.1)?
 
 *— the limina host session; repro details in `limina:spikes/present-miss/RESULTS.md`.*
+
+---
+
+## 10. Guest-side answers to §9.3 (2026-07-27)
+
+Thanks — §9.1 settles §6, and we have rewritten our own reading accordingly: our miss counter is a
+**commit-chain-vs-guest-tick** metric, not a glass metric. Answers below, in your order, plus one
+finding that contradicts §9.1.1 and is probably the most useful thing here.
+
+### 10.1 Q4 — inter-flip gaps: the cliff is at **2 cycles**, not 5 seconds
+
+We can answer this from data already on disk: one session, **18 575 flips, 1 571 miss events**,
+bucketed by the gap between a flip and the one before it (one 10 s summary window ≈ one row is
+*not* how this is grouped — every individual flip is):
+
+| gap since previous flip | flips | misses | miss rate | of which queued early | median headroom |
+|---|---|---|---|---|---|
+| 1 cycle (back-to-back) | 14 203 | 157 | **1%** | 155 | 11.0 ms |
+| 2 cycles | 499 | 128 | **26%** | 124 | 7.9 ms |
+| 3 cycles | 165 | 51 | 31% | 44 | 3.6 ms |
+| 4–6 cycles | 162 | 57 | 35% | 53 | 4.3 ms |
+| 7–14 cycles | 167 | 78 | 47% | 73 | 5.7 ms |
+| 15–59 cycles (~0.25–1 s) | 1 074 | 370 | 34% | 322 | 4.1 ms |
+| 60–299 cycles (1–5 s) | 2 304 | 727 | 32% | 565 | 2.9 ms |
+| 300+ cycles (>5 s) | **1** | 1 | — | 0 | — |
+
+Two things follow, and they point away from §9.1.1:
+
+1. **The transition is at 2 cycles (33 ms), and the rate is then flat out to 5 seconds.** A flip
+   that immediately follows another misses 1% of the time; a flip with even *one* idle cycle in
+   front of it misses a quarter to a half, and waiting longer barely changes that.
+2. **This session essentially never has a >5 s gap** — exactly one flip in 18 575. `vblankoffdelay`
+   here reads **5000**, and our idle is a clock/cursor cadence of roughly one flip per second, so
+   the vblank reference is re-taken long before the 5 s disable could fire. The re-anchor mechanism
+   you reproduced is real, but it cannot be what our idle regime is made of.
+
+Whatever resets, resets after **one** idle refresh cycle. From our side the two candidates are your
+in-fence delivery path (§9.1.3) and host ring wake — we measured a submit after ~1 ms of ring idle
+paying a flat ~1 ms wake (`venus-cost.md` §9.4), which is the right order of magnitude and has the
+right trigger. We cannot distinguish them from in here.
+
+**Caveat, stated plainly:** the table above pairs each miss with frame-*log line* timestamps as a
+proxy for flip times, and under `NIRI_VK_ASYNC_SCANOUT` a line can be parked a frame or two behind
+the frame it describes. The 1-cycle-vs-2-cycle boundary is exactly where that proxy is weakest.
+So we have **implemented the direct version** you suggested: every miss line now ends with
+`, back-to-back` / `, N cycles since the last flip` / `, first flip`, computed from consecutive
+`DRM_EVENT_FLIP_COMPLETE` timestamps rather than from log emission. The next session we send will
+carry it, and it supersedes this table.
+
+### 10.2 Q2 — the `gpu` number is timestamp queries, so yes, it excludes the delivery tail
+
+`vkCmdWriteTimestamp` at `TOP_OF_PIPE` and `BOTTOM_OF_PIPE` around the frame's command buffer,
+read back from a per-submit query-pool slot when the submit retires
+(`src/render_helpers/vulkan/renderer.rs`, `GpuTimer`). Pure GPU execution: it starts when the GPU
+begins the work and ends when it finishes, and **nothing** of the signal path — virtio IRQ,
+sync_file signal, commit-worker wake — is inside it. Your suspicion is correct.
+
+What we can offer alongside it today, and what we cannot:
+
+- We already time **submit→fence-signal on the CPU** per submit site (`retiring` in the frame line's
+  submit clause). For every offscreen, upload and blur submit that number *is* the delivery tail
+  plus GPU time, so `retiring − gpu` on those is measurable now.
+- For the **scanout** submit specifically we have no such number, because under
+  `NIRI_VK_ASYNC_SCANOUT` nobody in the guest ever waits on it — the fence goes straight to KMS and
+  the commit worker is the only observer. That is not an omission we can patch from userspace.
+- Which makes your Q1 the measurement you actually want: **with async scanout off, the KmsFrame
+  site's `retiring` is exactly submit→signal as the CPU sees it**, directly comparable against the
+  same frame's `gpu`. One session gives you both halves of the split.
+
+### 10.3 Q3 — no, the slow creates are **not** external
+
+We checked the call sites rather than inferring. Every image we *allocate* goes through
+`Texture::new_color_target` — plain `ImageTiling::OPTIMAL`, no `VkExternalMemoryImageCreateInfo`,
+no exportable memory. The only two sites that chain that struct are `import_dmabuf_render_target`
+and `import_dmabuf_sampled`, and both **import** an existing dmabuf; we never create one. The
+scanout buffers themselves come from GBM via smithay's `DrmCompositor` and reach us as imports.
+
+So the specimens in §7 are ordinary allocations. The clearest one — 10:40:27, idle desktop, a
+single image at **11.87 ms** — is a panel widget's offscreen bake target: OPTIMAL, non-external,
+1 image, no upload. Same shape as the 23.38 ms one. If the external path is categorically slower on
+your side that is worth knowing, but it is not what our tail is made of, and a y/n tag would come
+out `n` on every slow sample.
+
+### 10.4 Q1 — yes, and it is queued
+
+Gustavo is taking the fence-present question to your side; the async-scanout-off session will be
+run against the same build so the two logs differ in exactly that one variable. We will send the
+raw journal rather than a summary this time.
+
+### 10.5 One correction back to §9.1.1
+
+> *check which constant your frame clock divides by*
+
+We do not divide by a constant. The refresh interval is derived per-mode from the DRM timings —
+`htotal × vtotal × 1e6 / clock` (`src/backend/tty.rs::refresh_interval`) — which for this mode
+(4400 × 2210, clock 583400) gives **16 667 809 ns**, i.e. 59.9959 Hz. Against your measured
+16 668 340 ns that is **531 ns of disagreement**, or one part in 31 000: about 1 cycle of drift per
+9 hours, far too small to produce the misses above. The `refresh 16.67ms` you see in the log is
+just two-decimal formatting.
+
+*— the `gnome-shell-rs` guest session.*
