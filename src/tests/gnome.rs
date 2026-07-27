@@ -6120,18 +6120,32 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
         vec!["a.desktop", "b.desktop", "c.desktop"]
     );
 
-    // Pick up the first favourite and drop it past the last one — over the show-apps
-    // button, which is past the favourites and so clamps back to their end.
+    // Pick up the first favourite and drop it past the last one. That takes two moves:
+    // the strip past the final tile only exists once a gap has widened the box (see
+    // `Dash::drop_slot_at`), so hover a middle tile first and *then* slide right.
     let first = dash_tile_center(&mut f, 0);
+    let past_end = dash_tile_center(&mut f, 3);
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    let past_end = dash_tile_center(&mut f, 3);
-    pointer_motion_to(&mut f, past_end.x, past_end.y);
+    let middle = dash_tile_center(&mut f, 2);
+    pointer_motion_to(&mut f, middle.x, middle.y);
     assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        Some(2),
+        "hovering the third tile opens the gap before it"
+    );
+    // Slightly left of where the show-apps button *was*: opening the gap widened the
+    // pill, and a centered pill grows both ways, so everything slid half a tile left.
+    pointer_motion_to(&mut f, past_end.x - 20., past_end.y);
     assert_eq!(
         f.niri().dash.drop_slot(),
         Some(3),
         "past the last favourite clamps to the end of them, not into the running zone"
+    );
+    assert!(
+        !f.niri().app_drag.as_ref().unwrap().unpin,
+        "the open gap pushed the show-apps button right, so this is the strip, not it"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -6156,6 +6170,99 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
         dash_favorites(&mut f),
         vec!["c.desktop", "b.desktop", "a.desktop"],
         "a drop between two favourites must land between them"
+    );
+}
+
+/// The show-apps button doubles as the unpin target for the duration of a drag:
+/// gnome-shell relabels it and hovers it (`ShowAppsIcon.setDragApp`, `dash.js:236-247`)
+/// and its `acceptDrop` removes the favourite (`dash.js:256-270`). Dropping there is
+/// the only way to unpin by dragging — a drag that merely leaves the dash puts the icon
+/// back.
+#[test]
+fn overview_dropping_a_favorite_on_the_show_apps_button_unpins_it() {
+    use crate::ui::dash::DashHit;
+
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+
+    let first = dash_tile_center(&mut f, 0);
+    let show_apps = dash_tile_center(&mut f, 2);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, show_apps.x, show_apps.y);
+
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(
+        f.niri().app_drag.as_ref().unwrap().unpin,
+        "the show-apps button must arm as the unpin target"
+    );
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        None,
+        "the dash must not offer to pin and to unpin at once (`dash.js:444-445`)"
+    );
+    assert_eq!(
+        f.niri().dash.hovered_for_test(),
+        Some(DashHit::ShowApps),
+        "the armed button lights up, which is the only feedback that it will remove"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["b.desktop"],
+        "the drop must unpin the dragged app"
+    );
+    assert!(
+        (0..3).any(|i| f.niri().app_grid.entry_id(i) == Some("a.desktop")),
+        "and the unpinned app must come back to the grid"
+    );
+}
+
+/// ...but only for an app that is pinned: `_canRemoveApp` requires `isFavorite`
+/// (`dash.js:224-234`), so dragging a fresh app from the grid onto the button neither
+/// arms it nor does anything on drop.
+#[test]
+fn overview_dropping_a_grid_app_on_the_show_apps_button_does_nothing() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+    let before = dash_favorites(&mut f);
+
+    let grid_area = overview_controls(&mut f).app_display;
+    let from = f
+        .niri()
+        .app_grid
+        .entry_center(0, grid_area)
+        .expect("grid tile 0");
+    let show_apps = dash_tile_center(&mut f, 2);
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, show_apps.x, show_apps.y);
+
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(
+        !f.niri().app_drag.as_ref().unwrap().unpin,
+        "an app that is not pinned cannot be unpinned"
+    );
+    assert_eq!(
+        f.niri().dash.hovered_for_test(),
+        None,
+        "so the button must not light up either — a drag grabs the pointer, and only \
+         the unpin arming lights anything up (`dash.js:447-450`)"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        dash_favorites(&mut f),
+        before,
+        "dropping a non-favourite on the button must change nothing"
     );
 }
 

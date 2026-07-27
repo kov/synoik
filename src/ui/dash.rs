@@ -12,6 +12,15 @@
 //! button renders for fidelity but its toggle (→ APP_GRID) is S8; its clicks are
 //! consumed inertly.
 //!
+//! **Drag affordances.** The dash is a drop target for app-icon drags from the grid
+//! and the search results: [`drop_slot_at`](Dash::drop_slot_at) opens a gap that
+//! follows the pointer and a drop pins the app there (`Dash.handleDragOver` /
+//! `acceptDrop`). The show-apps button doubles as the *unpin* target for the duration
+//! of a drag ([`unpin_target_at`](Dash::unpin_target_at), `ShowAppsIcon.acceptDrop`) —
+//! the only way to unpin by dragging. GNOME also relabels that button "Unpin" while it
+//! is armed; we have no dash tooltip at all yet, so the arming shows only as its hover
+//! fill.
+//!
 //! **S6 divergence — clicking a *running* app relaunches it.** GNOME's
 //! `AppIcon.activate` calls `shell_app_activate`, which for a running app raises
 //! its most recent window instead of spawning a second copy. We have no
@@ -57,8 +66,10 @@ use crate::ui::widget::{self, AppIcon, AppIconUploads, Painter};
 pub(crate) const ICON_PX: f64 = 64.;
 /// The `.overview-icon` tile side (icon + `%tile` padding, `_common.scss:86`).
 const TILE: f64 = ICON_PX + 2. * AppIcon::PADDING; // 76
-/// Per-item advance: tile + `0 2px` item margin (`$dash_spacing`, `_dash.scss:54`).
-const ITEM_ADVANCE: f64 = TILE + 4.; // 80
+/// Per-item side margin (`margin: 0 $dash_spacing`, `_dash.scss:54`).
+const ITEM_MARGIN: f64 = 2.;
+/// Per-item advance: tile + its margin on both sides.
+const ITEM_ADVANCE: f64 = TILE + 2. * ITEM_MARGIN; // 80
 /// Pill horizontal padding: `$base_padding·2 − item margin` (`_dash.scss:22-25`).
 const PILL_PAD_H: f64 = 10.;
 /// Pill vertical padding above/below the tiles (`_dash.scss:22-25`).
@@ -258,40 +269,63 @@ impl Dash {
     /// no-op for an app already pinned there.
     ///
     /// gnome-shell's `Dash.handleDragOver` (`dash.js:860-937`): the run is divided into
-    /// equal shares and the pointer picks one, measured with the placeholder and the
-    /// separator excluded so an open gap does not shift the next answer. Two rules on
-    /// top: a drop past the last favourite clamps back to it (the running-apps zone is
-    /// not pinnable), and a favourite dropped immediately before or after itself is a
-    /// no-op rather than a reorder.
+    /// equal shares and the pointer picks one. Two rules on top: a drop past the last
+    /// favourite clamps back to it (the running-apps zone is not pinnable), and a
+    /// favourite dropped immediately before or after itself is a no-op rather than a
+    /// reorder.
+    ///
+    /// The share *width* is measured with the placeholder and the separator excluded
+    /// (`dash.js:878-891`) so the gap the pointer just opened does not move the next
+    /// answer — but the pointer still ranges over the whole, widened box. That
+    /// asymmetry is not sloppiness, it is what makes the slot *past* the last favourite
+    /// reachable: `_box` grows by the placeholder, and the strip that growth adds at the
+    /// right end is the only place `pos == numFavorites` comes from. So appending to a
+    /// dash with no running apps takes two moves — open a gap anywhere, then slide right
+    /// into the strip — exactly as it does in GNOME.
     pub fn drop_slot_at(
         &self,
         pos: Point<f64, Logical>,
         area: Rectangle<f64, Logical>,
         dragged_id: &str,
     ) -> Option<usize> {
-        // Measured without the gap, per the citation above.
-        let layout = self.layout_with(area, None);
+        // The *current* layout, gap included: this measures where the pointer is, and
+        // the pointer sees the dash as it is drawn.
+        let layout = self.layout(area);
         let pill = layout.pill;
         if pos.x < pill.loc.x || pos.x >= pill.loc.x + pill.size.w || pos.y < pill.loc.y {
             return None;
         }
 
         let run = DASH_BACKGROUND.content_box(pill);
+        // gnome-shell's drop target is `_box`, which holds the icons, the separator and
+        // the placeholder — but *not* the trailing show-apps button, a sibling inside
+        // `_dashContainer` (`dash.js:338-356`). So the button's share of our run is not
+        // a slot; it is the unpin target instead (see [`unpin_target_at`]).
+        let box_w = run.size.w - ITEM_ADVANCE;
+        let rel = pos.x - run.loc.x;
+        if rel < 0. || rel >= box_w {
+            return None;
+        }
+
+        // ...and `boxWidth`/`numChildren` then take out the placeholder and separator.
         let separator_space = if self.separator_after().is_some() {
             SEPARATOR_ADVANCE
         } else {
             0.
         };
-        let box_w = run.size.w - separator_space;
-        let n_children = self.items.len() + 1; // + show-apps
-        if box_w <= 0. || n_children == 0 {
+        let gap_w = if self.drop_slot.is_some() {
+            ITEM_ADVANCE
+        } else {
+            0.
+        };
+        let measured_w = box_w - separator_space - gap_w;
+        let n_children = self.items.len();
+        if measured_w <= 0. || n_children == 0 {
             return None;
         }
 
-        let rel = (pos.x - run.loc.x).clamp(0., box_w);
-        let slot = ((rel * n_children as f64 / box_w).floor() as usize)
-            // Past the favourites is not a pin target; clamp to the end of them.
-            .min(self.n_favorites);
+        // Past the favourites is not a pin target; clamp to the end of them.
+        let slot = ((rel * n_children as f64 / measured_w).floor() as usize).min(self.n_favorites);
 
         // "Don't allow positioning before or after self" (`dash.js:909-913`).
         if let Some(from) = self.favorite_index(dragged_id) {
@@ -300,6 +334,28 @@ impl Dash {
             }
         }
         Some(slot)
+    }
+
+    /// Whether a drag carrying `dragged_id` is over the *unpin* target.
+    ///
+    /// The show-apps button doubles as the remove target for the duration of an
+    /// app-icon drag: gnome-shell relabels it "Unpin" and hovers it
+    /// (`ShowAppsIcon.setDragApp`, `dash.js:236-247`), and its `acceptDrop` removes the
+    /// favourite (`dash.js:256-270`). Only for an app that is actually pinned —
+    /// `_canRemoveApp` (`dash.js:224-234`) requires `isFavorite`, so dragging a fresh
+    /// app from the grid onto the button does nothing.
+    ///
+    /// Deliberately tested against the *current* (gap-included) layout: the button
+    /// slides right as the gap opens, and gnome-shell's drag monitor likewise asks
+    /// whether the pointer is inside the actor where it now sits (`dash.js:441-442`).
+    pub fn unpin_target_at(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+        dragged_id: &str,
+    ) -> bool {
+        self.favorite_index(dragged_id).is_some()
+            && self.hit_test(pos, area) == Some(DashHit::ShowApps)
     }
 
     /// Where `id` sits among the favourites, if it is one.
@@ -416,8 +472,8 @@ impl Dash {
         };
         let tiles = (0..count)
             .map(|k| {
-                // `+2` is the tile's own `0 2px` margin within its advance slot.
-                let tile_left = run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + gap_shift(k) + 2.;
+                let tile_left =
+                    run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + gap_shift(k) + ITEM_MARGIN;
                 Rectangle::new(
                     Point::from((tile_left, run.loc.y)),
                     Size::from((TILE, TILE)),
@@ -460,30 +516,23 @@ impl Dash {
         if pos.y < pill.loc.y + PILL_PAD_V {
             return Some(DashHit::Background);
         }
-        let mut rel = pos.x - pill.loc.x - PILL_PAD_H;
-        if rel < 0. {
-            return Some(DashHit::Background); // left padding
-        }
-        // Take the separator's band out of the run before indexing; it is inert.
-        if let Some(at) = self.separator_after() {
-            let sep_start = ITEM_ADVANCE * at as f64;
-            if rel >= sep_start {
-                rel -= SEPARATOR_ADVANCE;
-                if rel < sep_start {
-                    return Some(DashHit::Background); // the separator itself
-                }
-            }
-        }
-        let count = layout.tiles.len();
-        if rel >= ITEM_ADVANCE * count as f64 {
-            return Some(DashHit::Background); // right padding
-        }
-        let k = (rel / ITEM_ADVANCE) as usize;
-        Some(if k < layout.n_items {
-            DashHit::App(k)
-        } else {
-            DashHit::ShowApps
-        })
+        // Indexed off the laid-out rects rather than by arithmetic on the run, so every
+        // band the layout can insert — the separator, and the drop gap, which slides
+        // everything after it by a whole advance — is inert here for free. Each tile
+        // owns its advance slot: the rect plus the `0 2px` margin either side.
+        layout
+            .tiles
+            .iter()
+            .position(|tile| {
+                pos.x >= tile.loc.x - ITEM_MARGIN && pos.x < tile.loc.x + tile.size.w + ITEM_MARGIN
+            })
+            .map_or(Some(DashHit::Background), |k| {
+                Some(if k < layout.n_items {
+                    DashHit::App(k)
+                } else {
+                    DashHit::ShowApps
+                })
+            })
     }
 
     /// The logical center of tile `i` within `area` — favorites are

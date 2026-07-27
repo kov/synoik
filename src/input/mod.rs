@@ -3078,7 +3078,14 @@ impl State {
         // The grid is reactive only while it's open and no search is covering it.
         let grid_reactive =
             self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
-        let (dash_hit, search_hit, grid_hit, arrow_hit) = if overview_visible {
+        // An app-icon drag grabs the pointer, so nothing under it tracks `:hover`:
+        // gnome-shell's DND routes motion to the drag monitor instead of to the actors,
+        // and the one thing that lights up is the show-apps button while it is offering
+        // to unpin the app being dragged (`ShowAppsIcon.setDragApp`, `dash.js:236-247`,
+        // called from `_onItemDragMotion`, `dash.js:447-450`).
+        let (dash_hit, search_hit, grid_hit, arrow_hit) = if let Some(drag) = &self.niri.app_drag {
+            (drag.unpin.then_some(DashHit::ShowApps), None, None, None)
+        } else if overview_visible {
             match self.niri.output_under(pos) {
                 Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {
                     Some(controls) => (
@@ -3352,8 +3359,10 @@ impl State {
             }
         }
 
-        self.update_panel_hover(new_pos);
+        // Drag first: the dash's hover feedback is derived from the drag's unpin state,
+        // so computing it the other way round would paint it one motion stale.
         self.update_app_drag(new_pos);
+        self.update_panel_hover(new_pos);
 
         let under = self.niri.contents_under(new_pos);
 
@@ -3499,8 +3508,8 @@ impl State {
             }
         }
 
-        self.update_panel_hover(pos);
         self.update_app_drag(pos);
+        self.update_panel_hover(pos);
 
         let under = self.niri.contents_under(pos);
 
@@ -3629,6 +3638,7 @@ impl State {
             output,
             pos: pos_within_output,
             grab_offset,
+            unpin: false,
         });
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
@@ -3638,18 +3648,34 @@ impl State {
     }
 
     /// Open, move or close the dash's drop gap for the drag in progress
-    /// (`Dash.handleDragOver`, `dash.js:860-937`).
+    /// (`Dash.handleDragOver`, `dash.js:860-937`), and arm the unpin target.
+    ///
+    /// Order matters and is GNOME's: the drag monitor tests the show-apps button
+    /// *first* and clears the placeholder when it is hovered (`dash.js:441-450`), so
+    /// the dash never offers to pin and to unpin at the same time.
     fn update_dash_drop_slot(&mut self) {
         let Some(drag) = &self.niri.app_drag else {
             return;
         };
         let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
-        let slot = self
+        let Some(dash_area) = self
             .niri
             .layout
             .controls_layout_for_output(&output)
-            .and_then(|c| self.niri.dash.drop_slot_at(pos, c.dash, &id));
+            .map(|c| c.dash)
+        else {
+            self.niri.dash.set_drop_slot(None);
+            return;
+        };
+
+        let unpin = self.niri.dash.unpin_target_at(pos, dash_area, &id);
+        let slot = (!unpin)
+            .then(|| self.niri.dash.drop_slot_at(pos, dash_area, &id))
+            .flatten();
         self.niri.dash.set_drop_slot(slot);
+        if let Some(drag) = &mut self.niri.app_drag {
+            drag.unpin = unpin;
+        }
     }
 
     /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
@@ -3667,6 +3693,15 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         if let Some(slot) = slot {
             self.pin_dragged_app(&drag.id, slot);
+            self.niri.queue_redraw_all();
+            return;
+        }
+
+        // A drop on the show-apps button unpins instead (`ShowAppsIcon.acceptDrop`,
+        // `dash.js:256-270`). `drag.unpin` already carries `_canRemoveApp`, so this is
+        // only ever reached for an app that is currently a favourite.
+        if drag.unpin {
+            self.unpin_dragged_app(&drag.id);
             self.niri.queue_redraw_all();
             return;
         }
@@ -3711,11 +3746,27 @@ impl State {
             }
             None => self.niri.app_system.add_favorite_at_pos(id, Some(slot)),
         };
-        if !changed {
-            return;
+        if changed {
+            self.commit_favorites();
         }
+    }
 
-        // Persist, then re-derive both surfaces: the app moved between them.
+    /// Unpin `id`, dropped on the dash's show-apps button
+    /// (`AppFavorites.removeFavorite`, `appFavorites.js:127-137`).
+    ///
+    /// GNOME follows the removal with an undo notification offering to put it back
+    /// (`appFavorites.js:106`); we have no undo surface for it yet, so the removal is
+    /// final. Noted here rather than in the module docs because it is one line to add
+    /// once the notification's action buttons can carry a callback.
+    fn unpin_dragged_app(&mut self, id: &str) {
+        if self.niri.app_system.remove_favorite(id) {
+            self.commit_favorites();
+        }
+    }
+
+    /// Persist the favourites and re-derive every surface that shows them: an app
+    /// pinned or unpinned moves between the dash and the grid.
+    fn commit_favorites(&mut self) {
         if let Some(writer) = &self.niri.gnome_settings_writer {
             writer.set_favorite_apps(self.niri.app_system.favorite_ids().to_vec());
         }

@@ -272,6 +272,10 @@ pub struct AppDrag {
     /// Where the pointer sat inside the icon when the drag began, so it doesn't
     /// jump to the center as it is picked up.
     pub grab_offset: Point<f64, Logical>,
+    /// Whether the pointer is over the dash's unpin target (the show-apps button,
+    /// which offers removal for the duration of the drag — `Dash::unpin_target_at`).
+    /// Drives both the button's hover feedback and what the drop does.
+    pub unpin: bool,
 }
 
 /// An app launched onto a particular workspace, waiting for its window. See
