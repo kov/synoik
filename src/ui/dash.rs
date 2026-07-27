@@ -653,6 +653,15 @@ impl Dash {
         (i < layout.tiles.len()).then(|| layout.icon_center(i))
     }
 
+    /// Tile `i`'s rect within `area` — what a context menu anchors on.
+    pub fn tile_rect(
+        &self,
+        i: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        self.layout(area).tiles.get(i).copied()
+    }
+
     /// The trailing show-apps button's index (= the app count).
     #[cfg(test)]
     pub fn show_apps_index(&self) -> usize {

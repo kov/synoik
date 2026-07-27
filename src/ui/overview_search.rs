@@ -471,11 +471,13 @@ impl OverviewSearch {
     /// conformance corpus, which clicks real pixels routed through
     /// [`hit_test`](Self::hit_test).
     pub fn result_center(&self, i: usize, area: SearchArea) -> Option<Point<f64, Logical>> {
-        let layout = self.layout(area);
-        layout
-            .tiles
-            .get(i)
+        self.result_rect(i, area)
             .map(|t| Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.)))
+    }
+
+    /// Result `i`'s tile rect — what a context menu anchors on.
+    pub fn result_rect(&self, i: usize, area: SearchArea) -> Option<Rectangle<f64, Logical>> {
+        self.layout(area).tiles.get(i).copied()
     }
 
     /// The search render elements for `output`, faded by overview `progress` (0..1).

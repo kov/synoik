@@ -516,12 +516,21 @@ impl AppGrid {
         i: usize,
         area: Rectangle<f64, Logical>,
     ) -> Option<Point<f64, Logical>> {
+        self.entry_rect(i, area)
+            .map(|t| Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.)))
+    }
+
+    /// Entry `i`'s tile rect on the page it is on — what a context menu anchors on.
+    /// `None` when `i` is on another page (the index is catalog-wide, the tiles are
+    /// per-page).
+    pub fn entry_rect(
+        &self,
+        i: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<Rectangle<f64, Logical>> {
         let layout = self.layout(area);
         let k = i.checked_sub(layout.first_index)?;
-        layout
-            .tiles
-            .get(k)
-            .map(|t| Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.)))
+        layout.tiles.get(k).copied()
     }
 
     /// The center of page `p`'s indicator dot — a geometry probe for the conformance

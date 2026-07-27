@@ -59,6 +59,7 @@ use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::overview_search::SearchHit;
+use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::ui::window_preview;
@@ -1210,7 +1211,78 @@ impl State {
                 self.niri.apply_notification_effects(effects);
             }
             PopoverAction::SetInputSource(idx) => self.set_input_source(idx),
+
+            // The app menu's launch rows. Both leave the overview, like every
+            // `Main.overview.hide()` in `AppMenu` (`appMenu.js:60,94,240`).
+            PopoverAction::AppNewWindow(id) => {
+                self.launch_from_app_menu(&id, LaunchMode::NewWindow);
+            }
+            PopoverAction::AppLaunchAction { id, action } => {
+                self.launch_from_app_menu(&id, LaunchMode::Action(action));
+            }
+            // Pinning does *not* leave the overview — gnome-shell hides it only for
+            // the rows that raise a window.
+            PopoverAction::AppToggleFavorite(id) => {
+                if self.niri.app_system.is_favorite(&id) {
+                    self.unpin_app(&id);
+                } else if self.niri.app_system.add_favorite(&id) {
+                    self.commit_favorites();
+                }
+            }
         }
+    }
+
+    /// Pop up the app context menu for an overview hit, if that hit is an app icon.
+    /// Returns whether a menu opened — anything else (the show-apps button, a page
+    /// control, the search entry) has no menu and falls through to the normal press.
+    ///
+    /// The arrow side is per-surface, as in gnome-shell: a dash icon's menu opens
+    /// *upward* (`popupMenuSide: St.Side.BOTTOM`, `dash.js:27`) because the dash sits at
+    /// the bottom of the screen, while a grid or search icon takes `AppIcon`'s default
+    /// `St.Side.LEFT` and opens to the icon's right (`appDisplay.js:2928`).
+    fn open_app_menu_for(&mut self, output: &Output, hit: OverviewHit) -> bool {
+        let Some(controls) = self.niri.layout.controls_layout_for_output(output) else {
+            return false;
+        };
+        let (id, anchor, side) = match hit {
+            OverviewHit::Dash(DashHit::App(i)) => (
+                self.niri.dash.item_id(i).map(str::to_owned),
+                self.niri.dash.tile_rect(i, controls.dash),
+                PopoverSide::Bottom,
+            ),
+            OverviewHit::GridApp(i) => (
+                self.niri.app_grid.entry_id(i).map(str::to_owned),
+                self.niri.app_grid.entry_rect(i, controls.app_display),
+                PopoverSide::Left,
+            ),
+            OverviewHit::Search(SearchHit::Result(i)) => (
+                self.niri.overview_search.result_id(i).map(str::to_owned),
+                self.niri.overview_search.result_rect(i, controls.into()),
+                PopoverSide::Left,
+            ),
+            _ => return false,
+        };
+        let (Some(id), Some(anchor)) = (id, anchor) else {
+            return false;
+        };
+        // The menu is built from the catalog entry, not from the surface's snapshot:
+        // the `.desktop` actions it lists live on the entry (`AppMenu.setApp`).
+        let Some(entry) = self.niri.app_system.lookup(&id) else {
+            return false;
+        };
+        let is_favorite = self.niri.app_system.is_favorite(&id);
+        self.niri
+            .panel_popover
+            .open_app_menu(output.clone(), anchor, side, &entry, is_favorite);
+        true
+    }
+
+    /// Launch `id` from a context-menu row and leave the overview.
+    fn launch_from_app_menu(&mut self, id: &str, mode: LaunchMode) {
+        if let Err(err) = self.niri.app_system.launch(id, mode) {
+            tracing::warn!("app-menu launch of {id} failed: {err:?}");
+        }
+        self.niri.layout.close_overview();
     }
 
     /// Start recording the active output, or stop if one is already running (the
@@ -3706,7 +3778,7 @@ impl State {
         // `dash.js:256-270`). `drag.unpin` already carries `_canRemoveApp`, so this is
         // only ever reached for an app that is currently a favourite.
         if drag.unpin {
-            self.unpin_dragged_app(&drag.id);
+            self.unpin_app(&drag.id);
             self.niri.queue_redraw_all();
             return;
         }
@@ -3756,14 +3828,14 @@ impl State {
         }
     }
 
-    /// Unpin `id`, dropped on the dash's show-apps button
-    /// (`AppFavorites.removeFavorite`, `appFavorites.js:127-137`).
+    /// Unpin `id` — dropped on the dash's show-apps button, or picked from an app
+    /// menu (`AppFavorites.removeFavorite`, `appFavorites.js:127-137`).
     ///
     /// GNOME follows the removal with an undo notification offering to put it back
     /// (`appFavorites.js:106`); we have no undo surface for it yet, so the removal is
     /// final. Noted here rather than in the module docs because it is one line to add
     /// once the notification's action buttons can carry a callback.
-    fn unpin_dragged_app(&mut self, id: &str) {
+    fn unpin_app(&mut self, id: &str) {
         if self.niri.app_system.remove_favorite(id) {
             self.commit_favorites();
         }
@@ -4108,6 +4180,22 @@ impl State {
                     .and_then(|(output, pos)| self.overview_hit(output, *pos))
                 {
                     self.niri.suppressed_buttons.insert(button_code);
+
+                    // ...with one exception: the context menu is the one overview
+                    // gesture that fires on the *press*. gnome-shell gives each
+                    // `AppIcon` a secondary-button `Clutter.ClickGesture` built with
+                    // `recognize_on_press: true` (`appDisplay.js:2981-2986`), unlike the
+                    // activation click it leaves on the release.
+                    if button == Some(MouseButton::Right) {
+                        if let Some((output, _)) = &under {
+                            let output = output.clone();
+                            if self.open_app_menu_for(&output, hit.clone()) {
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                        }
+                    }
+
                     let origin = under.as_ref().map(|(_, pos)| *pos).unwrap_or_default();
                     self.niri.overview_pressed = Some((button_code, hit, origin));
                     self.niri.queue_redraw_all();

@@ -6176,6 +6176,99 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
     );
 }
 
+/// Right-clicking an app icon pops up its context menu (`AppIcon.popupMenu`,
+/// `appDisplay.js:3027`), and the menu's rows are the app's: the launch verbs, then the
+/// favourite toggle labelled for what it would do.
+#[test]
+fn overview_right_clicking_an_icon_opens_its_context_menu() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+
+    // On a pinned app, the toggle offers to unpin.
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    assert!(
+        f.niri().panel_popover.is_app_menu(),
+        "a right-click must open the menu on the PRESS, not wait for the release \
+         (`recognize_on_press: true`, `appDisplay.js:2981-2986`)"
+    );
+    assert_eq!(
+        f.niri().panel_popover.app_menu().unwrap().labels(),
+        vec!["New Window", "Unpin"],
+    );
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    assert!(
+        f.niri().panel_popover.is_app_menu(),
+        "and the release must not take it away again"
+    );
+
+    // Dismiss, then the same on an app that is not pinned. The settle matters: a
+    // popover stays `is_open` while it fades out, and a press during that window is a
+    // dismissal (it lands on the still-grabbing menu), not a new menu.
+    f.niri().panel_popover.close();
+    f.settle_animations();
+    let grid_area = overview_controls(&mut f).app_display;
+    let unpinned = f
+        .niri()
+        .app_grid
+        .entry_center(0, grid_area)
+        .expect("grid tile 0");
+    pointer_motion_to(&mut f, unpinned.x, unpinned.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    assert_eq!(
+        f.niri().panel_popover.app_menu().unwrap().labels(),
+        vec!["New Window", "Pin to Dash"],
+        "an app that is not pinned is offered the pin"
+    );
+}
+
+/// Picking the favourite toggle pins or unpins, and — unlike the launch rows — leaves
+/// the overview up (`appMenu.js:74-80` has no `Main.overview.hide()`).
+#[test]
+fn overview_the_context_menu_pins_and_unpins() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    let origin = f.niri().panel_popover.content_location(&output);
+    let row = f
+        .niri()
+        .panel_popover
+        .app_menu()
+        .unwrap()
+        .row_center("Unpin")
+        .expect("the menu has an Unpin row");
+    let at = origin + row;
+    pointer_motion_to(&mut f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["b.desktop"],
+        "the row must unpin the app"
+    );
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "activating any popup-menu item closes the menu"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "but pinning must not leave the overview — only the launch rows do that"
+    );
+}
+
 /// An empty dash is a bare show-apps button, with no run to aim a drop at. gnome-shell
 /// reserves a placeholder-sized target for the duration of the drag
 /// (`EmptyDropTargetItem`, `dash.js:410-414`) and forces the slot to 0

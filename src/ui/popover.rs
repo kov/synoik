@@ -59,6 +59,7 @@ const POPOVER_BORDER: widget::Rgba = [0.260, 0.260, 0.279, 1.];
 
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::app_menu::AppMenu;
 use crate::ui::calendar::DateMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
@@ -134,6 +135,16 @@ pub enum PopoverAction {
     /// active xkb group and record it in `mru-sources`. The menu closes, like
     /// gnome-shell's popup menu closing on item activation.
     SetInputSource(usize),
+    /// The app menu's "New Window": launch a fresh window of this app and leave the
+    /// overview (`appMenu.js:57-61`).
+    AppNewWindow(String),
+    /// An app menu `.desktop` action row (`appMenu.js:235-241`): launch it and leave
+    /// the overview.
+    AppLaunchAction { id: String, action: String },
+    /// The app menu's "Pin to Dash" / "Unpin" (`appMenu.js:74-80`). Unlike the launch
+    /// rows this does *not* leave the overview — gnome-shell only hides it for the
+    /// items that raise a window.
+    AppToggleFavorite(String),
 }
 
 impl PopoverAction {
@@ -157,6 +168,11 @@ impl PopoverAction {
                 | PopoverAction::InvokeNotificationAction { .. }
                 // Picking a layout closes the popup, like gnome-shell's popup menu.
                 | PopoverAction::SetInputSource(_)
+                // Every app-menu row closes it: activating *any* `PopupMenuItem` runs
+                // `menu.itemActivated()`, which closes the menu it belongs to.
+                | PopoverAction::AppNewWindow(_)
+                | PopoverAction::AppLaunchAction { .. }
+                | PopoverAction::AppToggleFavorite(_)
         )
     }
 }
@@ -168,6 +184,7 @@ pub enum PopoverContent {
     Calendar(Box<DateMenu>),
     QuickSettings(Box<QuickSettings>),
     InputSources(InputSourceMenu),
+    App(Box<AppMenu>),
 }
 
 impl PopoverContent {
@@ -176,6 +193,7 @@ impl PopoverContent {
             PopoverContent::Calendar(dm) => dm.logical_size(),
             PopoverContent::QuickSettings(qs) => qs.logical_size(),
             PopoverContent::InputSources(m) => m.logical_size(),
+            PopoverContent::App(m) => m.logical_size(),
         }
     }
 
@@ -185,8 +203,26 @@ impl PopoverContent {
             PopoverContent::Calendar(dm) => dm.corner_radius(),
             PopoverContent::QuickSettings(qs) => qs.corner_radius(),
             PopoverContent::InputSources(m) => m.corner_radius(),
+            PopoverContent::App(m) => m.corner_radius(),
         }
     }
+}
+
+/// Which side of the anchor a popover's arrow is on — so the box sits on the
+/// opposite one. gnome-shell's `BoxPointer` arrow side, the third argument of
+/// `PopupMenu(sourceActor, arrowAlignment, side)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopoverSide {
+    /// Arrow on top → the box hangs *below* the anchor. Every panel menu.
+    Top,
+    /// Arrow underneath → the box sits *above* the anchor. What a dash icon's menu
+    /// uses, since the dash is at the bottom of the screen (`popupMenuSide:
+    /// St.Side.BOTTOM`, `dash.js:27`).
+    Bottom,
+    /// Arrow on the left → the box sits to the anchor's *right*. `AppIcon`'s default
+    /// (`popupMenuSide ?? St.Side.LEFT`, `appDisplay.js:2928`), which is what an
+    /// app-grid or search-result icon gets.
+    Left,
 }
 
 /// A single panel popover, owned on `Niri` alongside the other overlays.
@@ -194,8 +230,11 @@ pub struct PanelPopover {
     open: bool,
     /// The output the popover is anchored on (drawn/hit-tested only there).
     output: Option<Output>,
-    /// The panel button rect it hangs from, output-local logical.
+    /// The rect it hangs from, output-local logical: a panel button, or the icon a
+    /// context menu was summoned on.
     anchor: Rectangle<f64, Logical>,
+    /// Which side of `anchor` the arrow is on, i.e. where the box goes.
+    side: PopoverSide,
     content: Option<PopoverContent>,
     /// The shared animation clock, cloned into each open/close [`Animation`].
     clock: Clock,
@@ -226,6 +265,7 @@ impl PanelPopover {
             open: false,
             output: None,
             anchor: Rectangle::default(),
+            side: PopoverSide::Top,
             content: None,
             clock,
             config,
@@ -254,6 +294,8 @@ impl PanelPopover {
             PopoverContent::Calendar(_) => Some(crate::ui::panel::ROLE_DATE_MENU),
             PopoverContent::QuickSettings(_) => Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
             PopoverContent::InputSources(_) => Some(crate::ui::panel::ROLE_KEYBOARD),
+            // Not a panel menu: nothing in the panel should light up for it.
+            PopoverContent::App(_) => None,
         }
     }
 
@@ -319,6 +361,7 @@ impl PanelPopover {
         self.open = true;
         self.closing = false;
         self.anchor = anchor;
+        self.side = PopoverSide::Top;
         let mut date_menu = DateMenu::new(week_start, show_week_numbers, accent, groups);
         // Grow to fit the content but stay within the work area, leaving the
         // same margin at the bottom as the top (`js/ui/panelMenu.js:177-185`,
@@ -395,6 +438,7 @@ impl PanelPopover {
         self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
+        self.side = PopoverSide::Top;
         self.content = Some(PopoverContent::InputSources(InputSourceMenu::new(
             items, active,
         )));
@@ -405,6 +449,47 @@ impl PanelPopover {
     /// output-local logical — for tests that click inside the content.
     pub fn content_location(&self, output: &Output) -> Point<f64, Logical> {
         self.location(output)
+    }
+
+    /// Pop up the context menu for `entry`, anchored on the icon at `anchor` with the
+    /// arrow on `side` (`AppIcon.popupMenu`, `appDisplay.js:3027-3052`).
+    ///
+    /// Unconditionally *opens*, where the panel menus toggle: a right-click is not a
+    /// button press that latches, and a second right-click on the same icon in
+    /// gnome-shell re-opens the menu rather than dismissing it (the outside-click
+    /// dismissal is what closes it).
+    pub fn open_app_menu(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        side: PopoverSide,
+        entry: &crate::app_system::AppEntry,
+        is_favorite: bool,
+    ) {
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = side;
+        self.content = Some(PopoverContent::App(Box::new(AppMenu::new(
+            entry,
+            is_favorite,
+        ))));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Whether an app context menu is the content that is up — the overview closes it
+    /// on the way out (`Main.overview.connectObject('hiding', …)`, `appDisplay.js:3040`).
+    pub fn is_app_menu(&self) -> bool {
+        self.open && matches!(self.content, Some(PopoverContent::App(_)))
+    }
+
+    /// The open app context menu, for the corpus (which reads its rows back).
+    pub fn app_menu(&self) -> Option<&AppMenu> {
+        match &self.content {
+            Some(PopoverContent::App(m)) if self.open => Some(m),
+            _ => None,
+        }
     }
 
     /// Toggle the quick-settings menu, anchored at `anchor` on `output`. `battery`
@@ -433,6 +518,7 @@ impl PanelPopover {
         self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
+        self.side = PopoverSide::Top;
         self.content = Some(PopoverContent::QuickSettings(Box::new(QuickSettings::new(
             toggles,
             network,
@@ -556,6 +642,7 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) => dm.pointer_hover(local),
             Some(PopoverContent::QuickSettings(qs)) => qs.pointer_hover(local),
             Some(PopoverContent::InputSources(m)) => m.pointer_hover(local),
+            Some(PopoverContent::App(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -635,6 +722,7 @@ impl PanelPopover {
                 Some(PopoverContent::Calendar(dm)) => dm.pointer_click(local),
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
                 Some(PopoverContent::InputSources(m)) => m.pointer_click(local),
+                Some(PopoverContent::App(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -692,20 +780,39 @@ impl PanelPopover {
     /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.
     fn location(&self, output: &Output) -> Point<f64, Logical> {
         let scale = output.current_scale().fractional_scale();
-        let ow = output_size(output).w;
+        let os = output_size(output);
         let size = self
             .content
             .as_ref()
             .map(|c| c.logical_size())
             .unwrap_or_default();
-        let center_x = self.anchor.loc.x + self.anchor.size.w / 2.;
-        // Keep a margin from both screen edges (upper bound falls back to the lower one
-        // when the popover is wider than the margined area).
-        let max_x = (ow - size.w - POPOVER_MARGIN).max(POPOVER_MARGIN);
-        let x = (center_x - size.w / 2.).clamp(POPOVER_MARGIN, max_x);
-        Point::from((x, PANEL_HEIGHT + POPOVER_MARGIN))
-            .to_physical_precise_round(scale)
-            .to_logical(scale)
+        // Keep a margin from the screen edges on both axes (each upper bound falls back
+        // to the lower one when the popover is larger than the margined area).
+        let max_x = (os.w - size.w - POPOVER_MARGIN).max(POPOVER_MARGIN);
+        let max_y = (os.h - size.h - POPOVER_MARGIN).max(POPOVER_MARGIN);
+        let centered_x = (self.anchor.loc.x + self.anchor.size.w / 2. - size.w / 2.)
+            .clamp(POPOVER_MARGIN, max_x);
+
+        let loc = match self.side {
+            // Panel menus: centered under the panel, ignoring the anchor's own y.
+            // gnome-shell would place this off the anchor like the others; ours predates
+            // the anchored path and the panel is the only Top user, so it stays literal
+            // until there is a second one to generalize against.
+            PopoverSide::Top => Point::from((centered_x, PANEL_HEIGHT + POPOVER_MARGIN)),
+            PopoverSide::Bottom => Point::from((
+                centered_x,
+                (self.anchor.loc.y - POPOVER_MARGIN - size.h).clamp(POPOVER_MARGIN, max_y),
+            )),
+            PopoverSide::Left => Point::from((
+                (self.anchor.loc.x + self.anchor.size.w + POPOVER_MARGIN)
+                    .clamp(POPOVER_MARGIN, max_x),
+                // Vertically centred on the anchor, the `0.5` arrow alignment every
+                // `AppIcon` menu is built with (`appDisplay.js:3031`).
+                (self.anchor.loc.y + self.anchor.size.h / 2. - size.h / 2.)
+                    .clamp(POPOVER_MARGIN, max_y),
+            )),
+        };
+        loc.to_physical_precise_round(scale).to_logical(scale)
     }
 
     /// The popover render elements for `output`, or empty when closed / on another
@@ -734,6 +841,7 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) => dm.render(renderer, icons, scale, origin),
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 

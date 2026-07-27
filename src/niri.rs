@@ -5491,6 +5491,14 @@ impl Niri {
         // Banners are blocked while a panel popover is open; syncing here (once per
         // frame) covers every open/close path with a single site. The drain check
         // below re-shows queued banners once the popover closes.
+        // An app icon's context menu cannot outlive the overview it was opened from:
+        // gnome-shell closes it on the overview's `hiding` (`appDisplay.js:3039-3040`).
+        // Synced here, once per frame, because the overview closes from a dozen places
+        // (a keybind, a click, an app launching) and this covers all of them.
+        if self.panel_popover.is_app_menu() && !self.layout.is_overview_open() {
+            self.panel_popover.close();
+        }
+
         self.notification_banner
             .set_blocked(self.panel_popover.is_open());
         if self.notification_banner.can_show() && !self.notifications.banner_queue.is_empty() {

@@ -96,12 +96,17 @@ pub struct DesktopAction {
 /// (`appDisplay.js:3060`). The caller computes the mode from modifiers; the
 /// running-window branches (`open_new_window` via the app's action group,
 /// activate-existing-window) need running-app tracking and are slice S6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchMode {
     /// `shell_app_activate` — for a stopped app this is just launch.
     Activate,
     /// `shell_app_open_new_window` — prefer the `new-window` desktop action.
     NewWindow,
+    /// `g_desktop_app_info_launch_action` of a named `.desktop` action — what an app
+    /// menu's action row asks for (`shell_app_launch_action`, `appMenu.js:239`).
+    /// Unlike [`NewWindow`](Self::NewWindow) there is no fallback: the row exists
+    /// because the action does.
+    Action(String),
 }
 
 /// What [`AppSystem::launch`] resolved an intent to before it crossed the
@@ -605,6 +610,7 @@ impl AppSystem {
 fn resolve_launch(mode: LaunchMode, entry: &AppEntry) -> ResolvedLaunch {
     match mode {
         LaunchMode::Activate => ResolvedLaunch::Default,
+        LaunchMode::Action(action) => ResolvedLaunch::Action(action),
         LaunchMode::NewWindow => {
             if entry.actions.iter().any(|a| a.id == "new-window") {
                 ResolvedLaunch::Action("new-window".to_string())

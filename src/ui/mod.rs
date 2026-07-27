@@ -1,4 +1,5 @@
 pub mod app_grid;
+pub mod app_menu;
 pub mod calendar;
 pub mod config_error_notification;
 pub mod dash;
