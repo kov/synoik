@@ -21,6 +21,7 @@ Companion documents, all of which this one summarises rather than replaces:
 | [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) | timestamp queries used to resolve to zero — with a reproducer. **Fixed; see §13** |
 | [`venus-bugs/README.md`](./venus-bugs/README.md) | two dmabuf/gbm findings — with reproducers |
 | [`venus-explicit-sync-gap.md`](./venus-explicit-sync-gap.md) | explicit-sync surface |
+| [`present-misses.md`](./present-misses.md) | presentation timing: 12% of flips land a cycle late, most of them committed before the deadline |
 | [`venus-probes/probe-venus-costs/`](./venus-probes/probe-venus-costs) | the standalone probe behind §9 — image-cache, mapping bandwidth, fence cost |
 
 ---
