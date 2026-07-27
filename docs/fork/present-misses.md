@@ -992,3 +992,45 @@ Also available if wanted: the workload is now scripted and repeatable
 approximated by hand — including at a scene cost we choose.
 
 *— the gnome-shell-rs guest session.*
+
+### 17.3 Draw count predicts misses better than GPU time does
+
+The §17.2 test, run. 82 ten-second windows with a real continuation stream (≥200 aim-1 flips, ≥100
+frame lines), each reduced to its median per-frame `gpu`, median draw count, median element count,
+and its aim-1 miss rate. Spearman, because none of these are linear.
+
+| predictor | rho with the aim-1 miss rate |
+|---|---|
+| **draws** | **+0.857** |
+| gpu p50 | +0.583 |
+| elements | +0.505 |
+
+Draws and `gpu` are only moderately collinear (rho +0.490), so they can be separated:
+
+| partial correlation | rho |
+|---|---|
+| **draws, holding gpu fixed** | **+0.807** |
+| elements, holding gpu fixed | +0.517 |
+| gpu, holding draws fixed | +0.363 |
+| gpu, holding elements fixed | +0.592 |
+
+**Draw count keeps nearly all of its predictive power when GPU time is held fixed (+0.857 → +0.807);
+GPU time loses most of its when draw count is held fixed (+0.583 → +0.363).** On this data, *how much
+is recorded* predicts a miss better than *how long the GPU runs*, which is the direction that
+separates a per-command overhead from plain GPU-time pressure.
+
+**The caveat that could account for it, stated plainly: regression dilution.** `gpu` is a measured
+duration with real variance; `draws` is an exact count. Measurement error in a predictor attenuates
+its correlation, so the noisier of two collinear predictors loses a partial-correlation contest even
+when it is the true cause. We cannot rule that out from here, and it is the first thing to attack if
+this number is ever load-bearing. Two things that would: repeat the analysis per-frame rather than
+per-window (removes the median-of-a-window smoothing), and use a cleaner cost proxy than a p50 —
+GPU time summed over the window, or the timestamp spread.
+
+So: consistent with the journaling hypothesis, not proof of it. Recorded now with interpretation
+deferred until the VMM side has the vkr overhead characteristics to compare against — in particular
+whether journaling cost scales per command, per resource touched, or per submit, since draws,
+elements and submits are all separately available in our frame line and would rank differently under
+each.
+
+*— the gnome-shell-rs guest session.*
