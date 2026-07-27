@@ -255,6 +255,9 @@ impl Drop for Timed {
         if nanos > 0 {
             BAKE_NANOS.with(|c| c.set(c.get().saturating_add(nanos)));
         }
+        if self.started.is_some() {
+            niri_vk::stats::leave_attributed();
+        }
         BAKE_SITES.with(|s| {
             let mut s = s.borrow_mut();
             let entry = s.entry(self.site).or_insert((0, 0));
@@ -278,8 +281,14 @@ impl Drop for Timed {
 pub fn time_bake() -> Timed {
     BAKES.with(|c| c.set(c.get().saturating_add(1)));
     let caller = std::panic::Location::caller();
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    if started.is_some() {
+        // A bake is the outermost of the nesting: it allocates and shapes inside itself. See
+        // `niri_vk::stats::enter_attributed` for why the residual is a union and not a sum.
+        niri_vk::stats::enter_attributed();
+    }
     Timed {
-        started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+        started,
         site: (caller.file(), caller.line()),
     }
 }
@@ -545,6 +554,21 @@ impl Stats {
     }
 }
 
+/// One phase's stretch of a frame: how long it took, and how much of that some other clause of
+/// the line already explains.
+///
+/// The gap between the two is the point. A phase total says a frame was slow; the buckets
+/// (bakes, creations, shaping, submits, waits) say what *kind* of slow — and whatever is left
+/// over is work no counter has ever seen. The live seat's first overview open spent 15.95 ms in
+/// `collect` against ~5 ms of buckets, and that 11 ms sat unnoticed because reading it required
+/// subtracting five numbers by hand off a journal line.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    phase: Phase,
+    wall: Duration,
+    attributed: Duration,
+}
+
 /// The frame being timed right now.
 #[derive(Debug)]
 struct InFlight {
@@ -555,8 +579,11 @@ struct InFlight {
     started: Instant,
     /// When the current phase began — every mark closes one span and opens the next.
     phase_started: Instant,
+    /// The attributed-scope union at that same moment, so a span can report how much of itself the
+    /// frame line's other clauses account for. See [`niri_vk::stats::enter_attributed`].
+    phase_attributed: Duration,
     phase: Option<Phase>,
-    spans: Vec<(Phase, Duration)>,
+    spans: Vec<Span>,
     bakes_at_start: u64,
     shapes_at_start: u64,
     submits_at_start: u64,
@@ -797,6 +824,7 @@ impl FrameLog {
             seq,
             started: now,
             phase_started: now,
+            phase_attributed: niri_vk::stats::attributed(),
             phase: None,
             spans: Vec::with_capacity(Phase::ALL.len()),
             bakes_at_start: bakes(),
@@ -817,10 +845,16 @@ impl FrameLog {
         };
 
         let now = Instant::now();
+        let attributed = niri_vk::stats::attributed();
         if let Some(previous) = frame.phase.replace(phase) {
-            frame.spans.push((previous, now - frame.phase_started));
+            frame.spans.push(Span {
+                phase: previous,
+                wall: now - frame.phase_started,
+                attributed: attributed.saturating_sub(frame.phase_attributed),
+            });
         }
         frame.phase_started = now;
+        frame.phase_attributed = attributed;
     }
 
     /// Attach the frame's context. Call once per frame, wherever the numbers are
@@ -847,7 +881,11 @@ impl FrameLog {
 
         let now = Instant::now();
         if let Some(last) = frame.phase.take() {
-            frame.spans.push((last, now - frame.phase_started));
+            frame.spans.push(Span {
+                phase: last,
+                wall: now - frame.phase_started,
+                attributed: niri_vk::stats::attributed().saturating_sub(frame.phase_attributed),
+            });
         }
         let total = now - frame.started;
         let expected = GPU_EXPECTED.with(|c| c.replace(0));
@@ -969,14 +1007,20 @@ impl FrameLog {
         // lines line up when you read a run of them.
         line.push_str(" —");
         for phase in Phase::ALL {
-            let spent: Duration = frame
-                .spans
-                .iter()
-                .filter(|(p, _)| *p == phase)
-                .map(|(_, d)| *d)
-                .sum();
-            if !spent.is_zero() {
-                let _ = write!(line, " {} {}", phase.label(), ms(spent));
+            let mine = frame.spans.iter().filter(|s| s.phase == phase);
+            let (spent, attributed) = mine.fold((Duration::ZERO, Duration::ZERO), |(w, a), s| {
+                (w + s.wall, a + s.attributed)
+            });
+            if spent.is_zero() {
+                continue;
+            }
+            let _ = write!(line, " {} {}", phase.label(), ms(spent));
+            // Only where some of the phase *is* accounted for: a phase with no buckets at all
+            // (`queue`, `callbacks`) would otherwise claim its whole self as a mystery, which is
+            // not a finding — nothing ever promised to explain it.
+            let residual = spent.saturating_sub(attributed);
+            if !attributed.is_zero() && residual >= UNATTRIBUTED_FLOOR {
+                let _ = write!(line, " ({} unattributed)", ms(residual));
             }
         }
         if !totals.gpu.is_zero() {
@@ -1314,6 +1358,14 @@ impl FrameLog {
 /// How many bake sites a frame line names before it starts counting the rest.
 const BAKE_SITES_SHOWN: usize = 3;
 
+/// How much of a phase has to go unexplained before the line says so.
+///
+/// Not zero: the union counter reads the clock twice per scope, and a frame with a few hundred
+/// scopes carries enough of that overhead to show a residual on a phase that is genuinely fully
+/// accounted for. Half a millisecond is comfortably above that and comfortably below anything
+/// worth chasing against a 16.67 ms budget.
+const UNATTRIBUTED_FLOOR: Duration = Duration::from_micros(500);
+
 /// `(the first `n`, how many were left over)`, or `None` when there is nothing to
 /// show. Split out so the "+N more" arithmetic is pinned by a test rather than done
 /// inline in a format string.
@@ -1437,6 +1489,7 @@ mod tests {
             output: "out".to_owned(),
             started: now,
             phase_started: now,
+            phase_attributed: Duration::ZERO,
             phase: None,
             spans: Vec::new(),
             bakes_at_start: 0,
@@ -1766,6 +1819,61 @@ mod tests {
         assert_eq!(log.parked.len(), MAX_PARKED_FRAMES);
     }
 
+    /// The residual is what this whole mechanism exists to print, so pin the arithmetic and the
+    /// wording. 16 ms of `collect` with 5 ms of buckets is 11 ms nobody has ever measured — the
+    /// exact shape of the live seat's first overview open, which went unnoticed because reading it
+    /// meant subtracting five numbers off a journal line by hand.
+    #[test]
+    fn a_phase_with_unexplained_time_says_how_much() {
+        let mut frame = empty_frame();
+        frame.spans.push(Span {
+            phase: Phase::Collect,
+            wall: Duration::from_millis(16),
+            attributed: Duration::from_millis(5),
+        });
+
+        let line =
+            FrameLog::format_frame(&frame, Duration::from_millis(16), &Totals::default(), None);
+        assert!(
+            line.contains("collect 16.00ms (11.00ms unattributed)"),
+            "{line}"
+        );
+    }
+
+    /// A phase with no buckets at all — `queue`, `callbacks` — must NOT claim its whole self as
+    /// unexplained. Nothing ever promised to explain it, so "100% unattributed" is noise on every
+    /// line rather than a finding, and noise on every line is how a real residual gets ignored.
+    #[test]
+    fn a_phase_nothing_promised_to_explain_stays_quiet() {
+        let mut frame = empty_frame();
+        frame.spans.push(Span {
+            phase: Phase::Queue,
+            wall: Duration::from_millis(16),
+            attributed: Duration::ZERO,
+        });
+
+        let line =
+            FrameLog::format_frame(&frame, Duration::from_millis(16), &Totals::default(), None);
+        assert!(line.contains("queue 16.00ms"), "{line}");
+        assert!(!line.contains("unattributed"), "{line}");
+    }
+
+    /// Below the floor the line stays quiet: the union counter reads the clock twice per scope,
+    /// and a fully-accounted phase still shows a few microseconds of that.
+    #[test]
+    fn a_fully_accounted_phase_stays_quiet() {
+        let mut frame = empty_frame();
+        frame.spans.push(Span {
+            phase: Phase::Collect,
+            wall: Duration::from_micros(5100),
+            attributed: Duration::from_micros(5000),
+        });
+
+        let line =
+            FrameLog::format_frame(&frame, Duration::from_millis(6), &Totals::default(), None);
+        assert!(!line.contains("unattributed"), "{line}");
+    }
+
     /// Phase marks name the work that *follows* them, and the totals add up.
     #[test]
     fn phases_attribute_the_span_after_the_mark() {
@@ -1776,7 +1884,7 @@ mod tests {
         log.phase(Phase::Submit);
         let frame = log.in_flight.as_ref().unwrap();
         assert_eq!(frame.spans.len(), 1, "the mark closes exactly one span");
-        assert_eq!(frame.spans[0].0, Phase::Elements);
+        assert_eq!(frame.spans[0].phase, Phase::Elements);
 
         log.end(Some(Duration::from_millis(16)));
         assert!(log.in_flight.is_none());

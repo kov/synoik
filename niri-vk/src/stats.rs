@@ -178,6 +178,56 @@ thread_local! {
     static CREATES: Cell<u64> = const { Cell::new(0) };
     /// Wall time spent memcpying into mapped host-visible staging. See [`staging_write`].
     static STAGE_NANOS: Cell<u64> = const { Cell::new(0) };
+    /// How many attributed scopes are open, and when the outermost one opened. See
+    /// [`enter_attributed`].
+    static ATTRIB_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static ATTRIB_START: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Cumulative *union* of every attributed scope on this thread. Cumulative like [`draws`], so
+    /// a caller takes deltas; unlike the per-bucket counters it is never cleared, because it is
+    /// read at phase boundaries rather than once a frame.
+    static ATTRIB_NANOS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Open a scope whose time some clause of the frame line already accounts for.
+///
+/// Every timer in this module and [`crate::stats`]'s caller-side twin (`frame_log::time_bake`)
+/// opens one, so that "how much of this phase did we fail to explain?" has an answer. The naive
+/// answer — the phase total minus the sum of the buckets — is **wrong**, because the buckets
+/// nest: a widget bake allocates its texture (a creation) and shapes its label (a shaping run)
+/// *inside* the bake it is already being timed as, so summing them counts that time two or three
+/// times and can exceed the phase itself.
+///
+/// So this tracks the union instead: only the outermost scope's wall time is banked, and nesting
+/// is free. Depth-counted rather than interval-merged because the guards are RAII and therefore
+/// properly nested by construction — there is no partial overlap to merge.
+///
+/// Must be paired with [`leave_attributed`]. Every caller pairs them by tying both to the guard's
+/// `Option<Instant>`, so a guard built while timing was off never enters and never leaves.
+pub fn enter_attributed() {
+    let depth = ATTRIB_DEPTH.with(Cell::get);
+    if depth == 0 {
+        ATTRIB_START.with(|c| c.set(Some(Instant::now())));
+    }
+    ATTRIB_DEPTH.with(|c| c.set(depth.saturating_add(1)));
+}
+
+/// Close a scope opened by [`enter_attributed`], banking the outermost one's wall time.
+pub fn leave_attributed() {
+    let depth = ATTRIB_DEPTH.with(Cell::get).saturating_sub(1);
+    ATTRIB_DEPTH.with(|c| c.set(depth));
+    if depth > 0 {
+        return;
+    }
+    if let Some(started) = ATTRIB_START.with(|c| c.replace(None)) {
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        ATTRIB_NANOS.with(|c| c.set(c.get().saturating_add(nanos)));
+    }
+}
+
+/// Union of every attributed scope this thread has run, cumulative. Callers take a delta across
+/// the span they care about — see `FrameLog::phase`.
+pub fn attributed() -> Duration {
+    Duration::from_nanos(ATTRIB_NANOS.with(Cell::get))
 }
 
 fn bank(site: SubmitSite, nanos: u64, retire: bool) {
@@ -216,13 +266,18 @@ impl Drop for SubmitTimer {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(self.total, nanos);
             bank(self.site, nanos, self.retire);
+            leave_attributed();
         }
     }
 }
 
 fn timer(site: SubmitSite, total: &'static LocalKey<Cell<u64>>, retire: bool) -> SubmitTimer {
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    if started.is_some() {
+        enter_attributed();
+    }
     SubmitTimer {
-        started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+        started,
         site,
         total,
         retire,
@@ -291,7 +346,11 @@ pub fn uploaded(bytes: u64) {
 /// gated like every other timer here.
 pub fn creating() -> CreateTimer {
     add(&CREATES, 1);
-    CreateTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    if started.is_some() {
+        enter_attributed();
+    }
+    CreateTimer(started)
 }
 
 pub struct CreateTimer(Option<Instant>);
@@ -301,6 +360,7 @@ impl Drop for CreateTimer {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(&CREATE_NANOS, nanos);
+            leave_attributed();
         }
     }
 }
@@ -314,7 +374,11 @@ impl Drop for CreateTimer {
 /// with payload, so it is the number that describes a wallpaper (48 MiB ≈ 8 ms) and rounds to
 /// nothing for an icon. Read together with the uploaded-bytes counter.
 pub fn staging_write() -> StagingTimer {
-    StagingTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    if started.is_some() {
+        enter_attributed();
+    }
+    StagingTimer(started)
 }
 
 pub struct StagingTimer(Option<Instant>);
@@ -324,6 +388,7 @@ impl Drop for StagingTimer {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(&STAGE_NANOS, nanos);
+            leave_attributed();
         }
     }
 }
@@ -378,6 +443,7 @@ impl Drop for ShapeTimer {
         if let Some(started) = self.0 {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(&SHAPE_NANOS, nanos);
+            leave_attributed();
         }
     }
 }
@@ -385,7 +451,11 @@ impl Drop for ShapeTimer {
 /// Record one shaping run. Hold the guard for the shape.
 pub fn shape() -> ShapeTimer {
     add(&SHAPES, 1);
-    ShapeTimer(ENABLED.load(Ordering::Relaxed).then(Instant::now))
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    if started.is_some() {
+        enter_attributed();
+    }
+    ShapeTimer(started)
 }
 
 /// Shaping runs on this thread. The caller takes a delta across a frame.
@@ -439,6 +509,62 @@ pub fn take_retire_time() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole reason the residual is a union and not a sum: the buckets nest. A widget bake
+    /// allocates its texture and shapes its label *inside* itself, so adding `baking + creates +
+    /// shaping` counts that stretch two or three times — a sum that can exceed the phase it is
+    /// supposed to explain, and would report a negative or zero residual precisely on the frames
+    /// that have one.
+    ///
+    /// Pinned on the invariant rather than on wall clock: only the outermost scope banks, so an
+    /// inner close must move nothing at all. That is exact, and a sleep-based version would be
+    /// both slower and flakier.
+    /// Spin until the monotonic clock ticks.
+    ///
+    /// A scope containing nothing can span **zero** nanoseconds — two back-to-back `Instant::now()`
+    /// reads can return the same value — which made the assertions below flake about one run in
+    /// ten. Cheaper and more reliable than sleeping: this returns in nanoseconds.
+    fn until_the_clock_moves() {
+        let t = Instant::now();
+        while t.elapsed().is_zero() {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    fn nested_attributed_scopes_bank_once_not_once_each() {
+        let before = attributed();
+
+        enter_attributed(); // a bake
+        enter_attributed(); // its texture allocation, inside the bake
+        until_the_clock_moves();
+        leave_attributed();
+        assert_eq!(
+            attributed(),
+            before,
+            "an inner scope closing banked time while its outer scope was still open"
+        );
+
+        leave_attributed();
+        assert!(
+            attributed() > before,
+            "closing the outermost scope banked nothing"
+        );
+    }
+
+    /// Unbalanced leaves must not run the depth below zero and start banking every scope from a
+    /// stale start — the counter would then grow without bound and the residual would go negative.
+    #[test]
+    fn an_unbalanced_leave_does_not_corrupt_the_depth() {
+        leave_attributed();
+        leave_attributed();
+
+        let before = attributed();
+        enter_attributed();
+        until_the_clock_moves();
+        leave_attributed();
+        assert!(attributed() > before, "the counter stopped working");
+    }
 
     /// A counter must not see work another thread did. This is what makes an
     /// assertion like "this repaint cost no submit" trustworthy under libtest,

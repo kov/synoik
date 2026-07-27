@@ -8236,3 +8236,60 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
         .expect("headless backend must hold a Vulkan renderer")
         .expect("rendering must not error")
 }
+
+/// The frame log's unattributed-time clause has a silent-failure mode: if any `enter_attributed`
+/// in the renderer is not matched by a `leave_attributed`, the union runs past the wall time it
+/// gets subtracted from, every residual clamps to zero, and the clause simply stops appearing.
+/// Nothing else would notice — a missing warning looks exactly like a healthy frame.
+///
+/// So drive a real frame through the whole renderer and assert the union stays inside it. Unit
+/// tests pin the arithmetic on synthetic spans; only a real render exercises every guard.
+///
+/// Retried, because `stats::set_enabled` is a process-wide flag and the counters it gates are
+/// per-thread: **every** `Fixture::new` on any test thread runs `FrameLog::from_env`, which turns
+/// timing back off (`NIRI_FRAME_LOG` is unset under libtest). A neighbour constructing a fixture
+/// mid-measurement therefore reads as "attributed nothing", which is exactly what a broken guard
+/// looks like. Losing that race every attempt is vanishingly unlikely; an unwired guard loses it
+/// every time — mutation-checked. The `<=` invariant needs no retry: it holds whatever the flag is.
+#[test]
+fn the_attributed_union_stays_inside_the_work_it_measures() {
+    let Some((mut f, output, red, _blue)) = xray_wallpaper_fixture() else {
+        return;
+    };
+
+    set_wallpaper(&mut f, &red);
+
+    // Warm: measure a steady frame, not the first-touch allocation of every cache in the path.
+    niri_vk::stats::set_enabled(true);
+    for _ in 0..3 {
+        render_deferred_once(&mut f, &output);
+    }
+
+    let mut measured = None;
+    for _ in 0..8 {
+        niri_vk::stats::set_enabled(true);
+        let before = niri_vk::stats::attributed();
+        let started = std::time::Instant::now();
+        render_deferred_once(&mut f, &output);
+        let wall = started.elapsed();
+        let attributed = niri_vk::stats::attributed().saturating_sub(before);
+
+        assert!(
+            attributed <= wall,
+            "the attributed union ({attributed:?}) ran past the frame it measures ({wall:?}): an \
+             `enter_attributed` somewhere in the renderer has no matching leave, which silently \
+             clamps every residual to zero"
+        );
+
+        if attributed > Duration::ZERO {
+            measured = Some(attributed);
+            break;
+        }
+    }
+
+    assert!(
+        measured.is_some(),
+        "no attempt attributed any time at all — the guards are not wired to the union, so every \
+         phase would report itself as entirely unexplained"
+    );
+}
