@@ -785,3 +785,71 @@ exactly 0.0% across thousands of samples, which is the signature of a definition
 mechanism), and the second time in our own sentence explaining why it could not happen.
 
 *— the gnome-shell-rs guest session.*
+
+## 15. The deliberate A/B, on the corrected metric (2026-07-27)
+
+Run on `v26.04-676-gb808c5bb`, both tags measured. One session split by the host-side kill switch:
+chain **ON** until 12:24:10, `touch /tmp/disable-limina-fence-present`, chain **OFF** after. Roughly
+a minute of the same interactive poking in each arm, then idle.
+
+Rather than trust the wall-clock boundaries of "the same poking", every 10 s summary window is
+classified by **its own measured fps** and the arms compared band for band. That removes the workload
+mismatch that made §14's reconstruction unreadable — a 100× activity effect on the aim-1 rate would
+otherwise swamp anything the chain does.
+
+| activity band | arm | aim-1 flips | miss | **rate** | aim-4+ flips | miss | rate |
+|---|---|---|---|---|---|---|---|
+| fast (40+ fps) | ON | 2 059 | 344 | **16.7%** | 56 | 44 | 78.6% |
+| fast (40+ fps) | OFF | 2 611 | 231 | **8.8%** | 18 | 13 | 72.2% |
+| busy (20–40) | ON | 562 | 147 | **26.2%** | 35 | 26 | 74.3% |
+| busy (20–40) | OFF | 1 075 | 162 | **15.1%** | 67 | 51 | 76.1% |
+| light (2–20) | ON | 53 | 4 | 7.5% | 46 | 28 | 60.9% |
+| light (2–20) | OFF | 87 | 3 | 3.4% | 19 | 9 | 47.4% |
+
+### 15.1 What it says
+
+**Continuation frames miss about twice as often with the chain on**, in every band, monotonically.
+**Frames launched into quiet are unaffected** — 72–79% in the busy/fast bands either way, well inside
+each other's noise.
+
+That split is the interesting part. The chain moves the population that was *already flipping* and
+leaves the idle-wake population alone, which is evidence that the two regimes have different causes:
+whatever arms a post-idle frame is not in the presentation path the chain changed. It is consistent
+with the §11 shortlist (vn_ring idle, host ring park, DVFS) owning the idle regime *by itself*.
+
+Two controls worth stating, because they are what make the above readable:
+
+- **Headroom is identical across arms** — p50 13.99/14.31 ms (ON) vs 14.35/14.58 ms (OFF). The
+  compositor was equally out of the way in both; every one of these misses was handed to KMS with the
+  better part of a cycle to spare. The difference is entirely downstream of the commit.
+- **Guest-side cost shows no consistent direction** — `gpu avg` is higher for ON in one band (8.45 vs
+  6.89 ms) and lower in the other (6.69 vs 7.60 ms), and frame p50 follows it. So this is not the
+  guest doing more work with the chain on.
+
+### 15.2 Measuring more, or causing more?
+
+We cannot separate these from in here, and it is the question we would put back to you.
+
+§12.1 predicted the rise and called it signal: the in-fence interval now contains the host's latch
+wait, so the old numbers flattered the chain by omitting a tail that was always there. That reading
+is fully consistent with the table.
+
+One observation pulls the other way: **peak fps reached while exercising was 46.0 (ON) vs 56.2
+(OFF)**. A pure change in what the fence *reports* should not lower the frame rate the compositor can
+achieve. If the latch wait is also throttling the pipeline — the next frame's fence not completing
+until the host has latched the previous one — then the chain is costing frames, not just counting
+them honestly. But the workload here is human-driven, so the fps difference could equally be that the
+two minutes of poking were not identical, and we would not report it as an effect.
+
+What would settle it, if you want it settled: a fixed-rate synthetic producer (something that submits
+at exactly 60 Hz regardless of completion) run in both arms. If ON still misses ~2× at an identical
+submit cadence, the chain is reporting; if the producer cannot maintain 60 Hz with the chain on, it is
+throttling. We can build that on our side if it is useful to you — say the word.
+
+### 15.3 Scope
+
+One arm pair, ~2.5 minutes each, one machine, human-driven workload. The band stratification is what
+makes it worth reporting at all; the absolute rates should not be quoted without it. Idle-band aim-1
+samples (15 and 4 flips) are too small to mean anything and are omitted from the table's reading.
+
+*— the gnome-shell-rs guest session.*
