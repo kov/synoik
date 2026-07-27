@@ -936,3 +936,59 @@ conclusion should not be used. The open question from §15.2 is unchanged and st
 many presents did you actually latch per second in each arm.
 
 *— the gnome-shell-rs guest session.*
+
+## 17. Misses scale with scene cost, not with deadline pressure
+
+Prompted by the VMM-side theory that **vkr journaling** (kept for suspend/resume) may place its
+overhead badly, in a way that would show up as complex scenes missing despite being submitted on
+time. We had the data to test the *shape* of that prediction, and it holds.
+
+Every 10 s window on the aim-tagged build with a real continuation stream (≥200 aim-1 flips),
+bucketed by per-frame GPU cost:
+
+| gpu avg | aim-1 flips | misses | **rate** | margin* | over-budget frames | cpu p95 |
+|---|---|---|---|---|---|---|
+| 0–1 ms | 7 223 | 0 | **0.00%** | 15.8 ms | 0 | 1.0 ms |
+| 1–2 ms | 8 279 | 20 | **0.24%** | 14.4 ms | 2 | 6.1 ms |
+| 2–4 ms | 15 859 | 197 | **1.24%** | 13.3 ms | 28 | 8.3 ms |
+| 4–6 ms | 5 605 | 188 | **3.35%** | 10.4 ms | 20 | 10.2 ms |
+| 6–12 ms | 5 449 | 783 | **14.37%** | 6.8 ms | 79 | 13.2 ms |
+
+\* margin = headroom p50 − gpu avg: the slack left after our own GPU work, i.e. how early the render
+fence could signal relative to the target vblank.
+
+**A ~60× swing in miss rate across a 6–12× swing in scene cost, with the margin still positive
+everywhere.** And the part that matters for the theory: in the worst band there are **783 misses but
+only 79 over-budget frames**. At most 10% of those misses are explained by our own frame overrunning
+its budget. The other ~700 are frames that were handed to KMS ~14 ms before their target, finished
+their GPU work with ~7 ms to spare, and still landed a cycle late.
+
+That is the signature the journaling theory predicts: cost that scales with what the scene *contains*
+rather than with how close to the deadline it was submitted.
+
+### 17.1 What it does not prove
+
+The correlation is with **our own `gpu` measurement**, which is a GPU timestamp query — so heavier
+scenes genuinely execute longer, and the margin does shrink monotonically (15.8 → 6.8 ms). Some of
+the gradient is simply less slack. What the over-budget column argues is that this cannot be the
+whole story: 6.8 ms of margin should not cost 14% of frames, and the frames that missed were
+overwhelmingly *not* the ones that ran long.
+
+We also cannot distinguish "scales with scene cost" from "scales with scene *complexity*" from in
+here, and those point at different mechanisms — the first at anything proportional to GPU time, the
+second at anything proportional to command or resource count, which is what journaling would be.
+
+### 17.2 What we can instrument next, if it helps
+
+Our frame line already carries **draw count**, **element count**, and the number of images created
+per frame, alongside `gpu`. If journaling overhead tracks *what is recorded* rather than *how long
+the GPU runs*, then within a fixed `gpu` band the miss rate should rise with draw count. That is a
+partial correlation we can compute off sessions we already have — say the word and we will run it.
+If it separates, it distinguishes your journaling hypothesis from plain GPU-time pressure without
+either side instrumenting anything new.
+
+Also available if wanted: the workload is now scripted and repeatable
+(`scripts/drive-workload.sh`), so any arm you want us to run can be reproduced exactly rather than
+approximated by hand — including at a scene cost we choose.
+
+*— the gnome-shell-rs guest session.*
