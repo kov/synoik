@@ -2200,6 +2200,100 @@ fn vulkan_renders_the_messages_indicator_dot() {
     assert!(on > 10, "the dot composites bright when enabled (got {on})");
 }
 
+/// The workspace dots composite onto the screen, and morph while a switch runs.
+///
+/// They used to be painted into the bar bake, where a texture readback pinned them. Now
+/// they are their own
+/// [`RoundedSolidRenderElement`](crate::render_helpers::rounded_solid::RoundedSolidRenderElement)s,
+/// so the pin has to move to the composited output — an element that is built but never
+/// drawn (a wrong z-order, a dropped variant in the element enum, an empty damage
+/// intersection) leaves every other panel test green while the dots are simply gone.
+///
+/// Two facts, one render each: at rest the row paints a wide full-white pill plus dimmer
+/// circles, and mid-switch the brightest pixel in the row is strictly dimmer than that
+/// resting pill — which is only true if the *element's* colour tracks `position`.
+#[test]
+fn vulkan_composites_the_workspace_dots() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let ow = output_size(&output).w;
+    let width = to_physical_precise_round(scale.x, ow);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+
+    // The dots live inside the left indicator button, far from the centered clock.
+    let ws = crate::ui::panel::WorkspaceState {
+        count: 3,
+        active: 1,
+    };
+    let dot_region =
+        to_physical_precise_round::<i32>(scale.x, f.niri().panel.activities_rect(ws).size.w)
+            .clamp(1, width);
+    // The band row through the dots' vertical center, as (bright, dim) pixel counts.
+    let band = |pixels: &[u8]| -> (usize, usize) {
+        let y = bar_h / 2;
+        let row =
+            &pixels[(y * width) as usize * 4..((y * width) as usize + dot_region as usize) * 4];
+        let bright = row.chunks_exact(4).filter(|p| p[0] > 200).count();
+        let dim = row
+            .chunks_exact(4)
+            .filter(|p| (80..=200).contains(&p[0]))
+            .count();
+        (bright, dim)
+    };
+    let peak = |pixels: &[u8]| -> u8 {
+        let y = bar_h / 2;
+        pixels[(y * width) as usize * 4..((y * width) as usize + dot_region as usize) * 4]
+            .chunks_exact(4)
+            .map(|p| p[0])
+            .max()
+            .unwrap_or(0)
+    };
+
+    let state = f.niri_state();
+    let ((bright, dim), rest_peak, mid_peak) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let render_at = |vk: &mut VulkanRenderer, position: f64| -> Vec<u8> {
+                let elems =
+                    state
+                        .niri
+                        .panel
+                        .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
+                render_to_vec(
+                    vk,
+                    Size::<i32, Physical>::from((width, bar_h)),
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    // First=topmost, so reverse to composite bottom-up.
+                    elems.into_iter().rev(),
+                )
+                .expect("render panel")
+            };
+            let at_rest = render_at(vk, 1.);
+            let mid_switch = render_at(vk, 1.5);
+            (band(&at_rest), peak(&at_rest), peak(&mid_switch))
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        bright >= crate::ui::panel::DOT_DIAMETER as usize,
+        "the active dot should paint a pill at least one base diameter wide, got \
+         {bright} bright px — the dots may not be compositing at all"
+    );
+    assert!(dim > 0, "the inactive dots should paint dimmer, got none");
+    assert!(
+        mid_peak < rest_peak,
+        "mid-switch the dots are all partly expanded, so the brightest pixel ({mid_peak}) \
+         must be dimmer than the resting active pill ({rest_peak}) — equal means the \
+         element's colour is not tracking the switch position"
+    );
+}
+
 /// A recolored symbolic icon composites through the owned Vulkan renderer with the
 /// tint intact: rasterize an icon red, upload it, composite, and read it back — the
 /// covered pixels must be red (proving the `Abgr8888` recolor buffer composites with
@@ -7748,20 +7842,16 @@ fn the_overview_animation_rebakes_nothing_per_frame() {
     );
 }
 
-/// The workspace-switch animation, which has one **known** per-frame bake: the panel
-/// dot morph.
+/// Nothing may re-bake on every frame of a workspace switch either.
 ///
-/// The dots' geometry interpolates every frame (`draw_workspace_dots` scales each
-/// dot by its distance from the fractional position), so unlike the button pills —
-/// whose only animated property is alpha, now carried by a cached texture composited
-/// at that alpha — they cannot be served by a cached bake. Fixing it needs a rounded
-/// rect that can be a *render element* rather than a `Painter` verb; today
-/// `render_rounded_rect` is only reachable inside a bake.
-///
-/// Pinned rather than skipped, so the exception stays a known one: when the dots stop
-/// baking this test fails and says so, and if anything *else* joins them it fails too.
+/// This one carried a known exception until 2026-07-26: the panel's workspace dots
+/// interpolate their width, height and opacity every frame, so no cached bake could serve
+/// them and the trick that saves an animated pill — bake it opaque, ride the fade on the
+/// element's alpha — does not extend to a size. They are
+/// [`RoundedSolidRenderElement`](crate::render_helpers::rounded_solid::RoundedSolidRenderElement)s
+/// now, drawn straight into the frame, and the exception is gone.
 #[test]
-fn the_workspace_switch_bakes_only_the_panel_dot_morph() {
+fn the_workspace_switch_rebakes_nothing_per_frame() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("workspace bake probe")) else {
         return;
     };
@@ -7774,19 +7864,13 @@ fn the_workspace_switch_bakes_only_the_panel_dot_morph() {
     let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(30));
     let repeats = sites_baking_repeatedly(&per_frame);
 
-    let unexpected: Vec<&(String, usize)> = repeats
-        .iter()
-        .filter(|(site, _)| !site.starts_with("ui/panel.rs:"))
-        .collect();
     assert!(
-        unexpected.is_empty(),
-        "only the panel dot morph may re-bake during a workspace switch, but: {unexpected:?}",
-    );
-    assert!(
-        !repeats.is_empty(),
-        "the panel dot morph is expected to still re-bake per frame here — if it no longer \
-         does, delete this test's exception and fold the workspace switch into \
-         `the_overview_animation_rebakes_nothing_per_frame`'s rule",
+        repeats.is_empty(),
+        "these widgets re-baked across {} frames of a workspace switch: {repeats:?}\n\
+         A bake is a GPU round trip; one per frame of an animation is a stutter. An \
+         animated *alpha* can ride the element (see `pill_element`); animated *geometry* \
+         needs a real drawing primitive (see `workspace_dots`).",
+        per_frame.len(),
     );
 }
 

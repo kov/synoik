@@ -36,6 +36,7 @@ pub mod offscreen;
 pub mod render_elements;
 pub mod renderer;
 pub mod resize;
+pub mod rounded_solid;
 pub mod rounded_texture;
 pub mod shadow;
 pub mod snapshot;

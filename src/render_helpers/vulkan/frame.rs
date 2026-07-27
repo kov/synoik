@@ -484,9 +484,6 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// [`Self::render_rounded_texture`] it samples no texture (no descriptor set): the box-SDF
     /// `sdf_rect.frag` reads only `origin`/`size`/`corner_radius`/`color` from the shared
     /// [`QuadPush`]. `dst` places the quad; `damage` scopes the draw like every other material.
-    // Non-test dead until the overlay draw layer (rounded-chrome pass) calls it; exercised now by
-    // the `vulkan_rounded_rect_fills_and_cuts_corners` test.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn render_rounded_rect(
         &mut self,
         color: [f32; 4],

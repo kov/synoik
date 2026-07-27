@@ -37,13 +37,14 @@ use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Color32F, ContextId, Renderer};
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{ClockFormat, QuickToggles};
 use crate::niri_render_elements;
 use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -65,7 +66,7 @@ const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
 
 /// Base workspace-dot diameter, logical px. GNOME: `$scalable_icon_size (16) * 0.5`
 /// (`gnome-shell-sass/widgets/_panel.scss`), fully rounded (`$forced_circular_radius`).
-const DOT_DIAMETER: f64 = 8.;
+pub(crate) const DOT_DIAMETER: f64 = 8.;
 
 /// Gap between dots, logical px (`panel.js` `WorkspaceIndicators` box `spacing`).
 const DOT_SPACING: f64 = 5.;
@@ -404,13 +405,6 @@ pub struct WorkspaceState {
     pub active: usize,
 }
 
-impl WorkspaceState {
-    /// Clamp `active` into range so an out-of-range index never drops the wide pill.
-    fn active(self) -> usize {
-        self.active.min(self.count.saturating_sub(1))
-    }
-}
-
 /// The dot row's `widthMultiplier` (`panel.js` `WorkspaceIndicators._updateExpansion`):
 /// the active pill is this many base-diameters wide.
 fn width_multiplier(count: usize) -> f64 {
@@ -440,12 +434,16 @@ fn indicator_logical_width(count: usize) -> f64 {
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
     context: Option<ContextId<VkTexture>>,
-    /// Bar chrome keyed by (scale, physical width, workspace count, active index): the
-    /// count sets the checked-highlight width, and the count + active index place the
-    /// workspace dots (drawn into the bar as rounded rects). The background is NOT in
-    /// here — it is a separate element ([`bar_bg`]), which is what lets one cached bake
-    /// serve the whole overview fade.
-    textures: HashMap<(NotNan<f64>, i32, usize, usize), VkTexture>,
+    /// Bar chrome keyed by (scale, physical width). Content changes (the clock label, the
+    /// recording timer, an input-source switch) invalidate it through [`Self::clear`],
+    /// which is why the key can stay structural.
+    ///
+    /// The workspace state used to be part of this key, because the dots were baked in
+    /// here and the active index placed them. They are [`RoundedSolidRenderElement`]s now,
+    /// so nothing in this bake varies with the workspace at all. Neither is the background
+    /// ([`bar_bg`]) — one cached bake serves the whole overview fade *and* the whole
+    /// workspace switch.
+    textures: HashMap<(NotNan<f64>, i32), VkTexture>,
     /// The bar background. A buffer rather than a bare colour so its commit counter
     /// bumps when the colour or width changes — that is what tells damage tracking the
     /// background moved, now that it is no longer part of the chrome bake.
@@ -464,6 +462,12 @@ struct BarCache {
     /// count), so the cache holds a handful of entries and is stable across a whole
     /// animation.
     pills: widget::BakeCache,
+    /// One persistent identity per workspace dot, indexed by workspace. Their geometry and
+    /// opacity are recomputed every frame of a switch, but the `Id` behind each has to
+    /// survive across frames or damage tracking sees a brand-new element each time.
+    ///
+    /// Not dropped by `clear` — like [`Self::bg`], these hold no pixels, only identity.
+    dots: Vec<RoundedSolidBuffer>,
 }
 
 impl BarCache {
@@ -473,6 +477,7 @@ impl BarCache {
             textures: HashMap::new(),
             bg: SolidColorBuffer::default(),
             pills: widget::BakeCache::new(),
+            dots: Vec::new(),
         }
     }
 
@@ -486,15 +491,22 @@ impl BarCache {
 
 // One thing the panel contributes to a frame, front-to-back.
 //
-// Two variants because the bar is two layers: chrome baked into a texture, and a plain
-// coloured background rectangle underneath it. They are separate because only the
-// background's alpha animates (it fades out as the overview opens), and folding it into
-// the bake would make the bake uncacheable for the whole animation — a GPU round trip
-// per frame for a colour change.
+// Three variants because everything that animates is its own layer, over the one baked
+// texture that does not:
+//
+// * `Texture` — the chrome bake (clock and labels), plus the composited icons.
+// * `Solid` — the bar background, whose alpha fades as the overview opens.
+// * `RoundedSolid` — the workspace dots, whose *geometry* interpolates during a switch.
+//
+// The reason is the same in both animated cases and it is the expensive one: a bake is a
+// GPU round trip, so any animated property folded into it costs one round trip per frame
+// for as long as the animation runs. An alpha can ride the element instead; a size cannot,
+// which is why the dots need a real drawing primitive rather than a cached texture.
 niri_render_elements! {
     PanelElement => {
         Texture = TextureRenderElement<VkTexture>,
         Solid = SolidColorRenderElement,
+        RoundedSolid = RoundedSolidRenderElement,
     }
 }
 
@@ -1211,64 +1223,40 @@ impl Panel {
             .zip(self.right_box_rect(ROLE_KEYBOARD, width))
             .map(|(label, kb)| (label.clone(), kb.loc.x + INDICATOR_H_PADDING));
 
-        // While a workspace switch animates, `position` is fractional and the dots morph
-        // every frame, so draw the bar fresh and skip the cache (which is keyed on the
-        // integer active index, not the animated state). The switch animation already
-        // drives the per-frame redraws. At rest, cache as usual, drawing with the exact
-        // integer index so the cached texture always matches its key.
+        // Nothing animated may enter this bake. Three things have been taken out of it,
+        // each because it moved every frame and a bake is a GPU round trip: the overview
+        // fade is the bar *background*'s alpha, its own element below; the button-container
+        // fills are the pills' alpha, their own elements too ([`pill_element`]); and the
+        // workspace dots, whose geometry morphs through a switch, are rounded-solid
+        // elements ([`workspace_dots`]). Before the first two, opening the overview checked
+        // the Activities button and the bar re-baked on every frame of the fade; before the
+        // third, every workspace switch did the same.
         //
-        // Nothing else belongs in this condition, and two things have been taken out of
-        // it. The overview fade is the bar *background*'s alpha, now its own element
-        // below. The button-container fills are the pills' alpha, now their own elements
-        // too ([`pill_element`]) — until then, opening the overview checked the
-        // Activities button, whose fill fade made `are_animations_ongoing()` true, and
-        // the bar re-baked on every frame of the animation. `is_animating` is deliberately
-        // *not* consulted here any more; adding an animated property back into this bake
-        // means a GPU round trip per frame for as long as it runs.
-        // `the_overview_animation_rebakes_nothing_per_frame` is the guard.
-        let animating = (position - position.round()).abs() > 1e-6;
-        let bar_texture = if animating {
+        // What is left — the clock label and the recording/keyboard labels — changes on
+        // content, not on a clock tick within an animation, so a single bake now serves
+        // every frame of both animations. `position` is deliberately not consulted here.
+        // `the_panel_rebakes_nothing_per_frame` is the guard.
+        let bar_key = (scale_key, width_px);
+        #[allow(clippy::map_entry)]
+        if !cache.textures.contains_key(&bar_key) {
             match draw_bar_texture(
                 renderer,
                 scale,
                 width_px,
                 &self.clock_text,
-                ws.count,
-                position,
                 recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
                 keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
             ) {
-                Ok(texture) => Some(texture),
+                Ok(texture) => {
+                    cache.textures.insert(bar_key, texture);
+                }
                 Err(err) => {
                     tracing::error!("error drawing the panel bar: {err:#}");
-                    None
+                    return elements;
                 }
             }
-        } else {
-            let bar_key = (scale_key, width_px, ws.count, ws.active());
-            #[allow(clippy::map_entry)]
-            if !cache.textures.contains_key(&bar_key) {
-                match draw_bar_texture(
-                    renderer,
-                    scale,
-                    width_px,
-                    &self.clock_text,
-                    ws.count,
-                    ws.active() as f64,
-                    recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
-                    keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
-                ) {
-                    Ok(texture) => {
-                        cache.textures.insert(bar_key, texture);
-                    }
-                    Err(err) => {
-                        tracing::error!("error drawing the panel bar: {err:#}");
-                        return elements;
-                    }
-                }
-            }
-            cache.textures.get(&bar_key).cloned()
-        };
+        }
+        let bar_texture = cache.textures.get(&bar_key).cloned();
 
         if let Some(texture) = bar_texture {
             let buffer = TextureBuffer::from_texture(
@@ -1287,6 +1275,23 @@ impl Panel {
                     1.,
                     None,
                     None,
+                    Kind::Unspecified,
+                ),
+            ));
+        }
+
+        // The workspace dots, over the pills and the background but under nothing they
+        // overlap (the clock and labels in the chrome sit elsewhere in the bar). One
+        // element each, drawn straight into the frame — see [`workspace_dots`].
+        let dots = workspace_dots(ws.count, position);
+        cache.dots.resize_with(dots.len(), RoundedSolidBuffer::new);
+        for (buffer, (rect, radius, color)) in cache.dots.iter_mut().zip(&dots) {
+            buffer.update(rect.size, *radius, *color);
+            elements.push(PanelElement::RoundedSolid(
+                RoundedSolidRenderElement::from_buffer(
+                    buffer,
+                    rect.loc,
+                    Scale::from(scale),
                     Kind::Unspecified,
                 ),
             ));
@@ -1443,8 +1448,8 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
-/// Draw the workspace dots into the bar frame as rounded rects, continuously
-/// expanded around the active workspace so the row morphs smoothly while switching.
+/// The workspace dots' geometry: one rounded rect per workspace, continuously expanded
+/// around the active one so the row morphs smoothly while switching.
 ///
 /// `position` is the live (fractional) active-workspace index — gnome-shell's
 /// `WorkspacesAdjustment.value` — so at rest it's the integer active index and while a
@@ -1458,15 +1463,22 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// The per-dot allocation widths always sum to a constant (the two straddled dots'
 /// expansions sum to 1), so the whole row — and thus `indicator_logical_width`, the hit
 /// rect, and the button pill — stay the same width throughout the slide. Laid out at the
-/// left, vertically centered; fully rounded (`$forced_circular_radius`). Drawn over the
-/// opaque bar background, so the texture stays fully opaque.
-fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
+/// left, vertically centered; fully rounded (`$forced_circular_radius`).
+///
+/// Pure geometry, in panel-local logical coordinates: every returned dot becomes a
+/// [`RoundedSolidRenderElement`] drawn straight into the frame. It is emphatically *not*
+/// baked. All three of a dot's properties — width, height and opacity — move on every
+/// frame of a switch, so a bake would miss its cache every frame and cost a GPU round
+/// trip each time. That was this widget's cost until 2026-07-26, and it is the last
+/// per-frame bake the guardrail tests knew about.
+fn workspace_dots(count: usize, position: f64) -> Vec<(Rectangle<f64, Logical>, f64, [f32; 4])> {
+    // Clamp into range so an out-of-range position — a spring overshoot, or a stale
+    // active index — parks the wide pill on the end dot instead of expanding none of them.
+    let position = position.clamp(0., count.saturating_sub(1) as f64);
     let mult = width_multiplier(count);
     let band_cy = PANEL_HEIGHT / 2.;
 
+    let mut dots = Vec::with_capacity(count);
     let mut x = INDICATOR_H_PADDING; // logical left edge of the current slot
     for i in 0..count {
         let expansion = (1. - (i as f64 - position).abs()).clamp(0., 1.);
@@ -1485,15 +1497,16 @@ fn draw_workspace_dots(p: &mut Painter, count: usize, position: f64) -> anyhow::
             Size::<f64, Logical>::from((draw_w, draw_h)),
         );
         // Half the height clamps to a full circle (small dot) or stadium (pill).
-        p.fill_rounded(rect, draw_h / 2., [1., 1., 1., opacity])?;
+        dots.push((rect, draw_h / 2., [1., 1., 1., opacity]));
         x += slot_w + DOT_SPACING;
     }
-    Ok(())
+    dots
 }
 
-/// Draw the bar chrome into an offscreen [`VkTexture`]: the rounded hover/active
-/// button containers, the workspace dots and the centered clock glyph run, over a
-/// **transparent** background. The returned texture is `SHADER_READ_ONLY`
+/// Draw the bar chrome into an offscreen [`VkTexture`]: the centered clock glyph run and
+/// the recording/keyboard labels, over a **transparent** background. The hover/active
+/// button containers and the workspace dots are not here — they animate, and each is its
+/// own element. The returned texture is `SHADER_READ_ONLY`
 /// (sampleable) so the caller can composite it directly. The right-box status icons
 /// are composited separately, on top, and the bar background is a separate solid
 /// element underneath.
@@ -1577,14 +1590,11 @@ fn pill_element(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_bar_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
     width_px: i32,
     clock: &str,
-    count: usize,
-    position: f64,
     recording_label: Option<(&str, f64)>,
     keyboard_label: Option<(&str, f64)>,
 ) -> anyhow::Result<VkTexture> {
@@ -1643,8 +1653,9 @@ fn draw_bar_texture(
         // The button containers are NOT here: they are their own elements, composited
         // under this texture ([`pill_element`]). Their only animated property is alpha,
         // and alpha is free at composite time — in here it made the whole bar
-        // uncacheable for the length of every hover and every overview open.
-        draw_workspace_dots(&mut p, count, position)?;
+        // uncacheable for the length of every hover and every overview open. Neither are
+        // the workspace dots ([`workspace_dots`]), for the stronger version of the same
+        // reason: their geometry animates, and geometry cannot ride an element's alpha.
         p.text_px(&clock_run, c_origin, TEXT)?;
         // The screen-recording pill's M:SS label, over its red container.
         if let Some((run, origin)) = &recording {
@@ -2017,59 +2028,53 @@ mod tests {
         assert!((center - 960.).abs() < 1.);
     }
 
-    /// The dots are now drawn straight into the bar offscreen with `render_rounded_rect`:
-    /// in the vertically-centered band, the active pill paints a wide run of full-opacity
-    /// white while an inactive dot is dimmer (half opacity). Restricted to the left dot
-    /// region so the centered clock glyphs don't pollute the count. Skips with no device.
+    /// The dots are [`RoundedSolidRenderElement`]s now, one per workspace: the active one
+    /// is a wide, full-opacity pill and every other a small, half-opacity circle
+    /// (`panel.js WorkspaceIndicators._updateExpansion`). Pure geometry, no device.
     #[test]
-    fn draw_bar_texture_paints_workspace_dots() {
-        use smithay::backend::renderer::{ExportMem, Texture as _};
+    fn workspace_dots_expand_around_the_active_index() {
+        let dots = workspace_dots(3, 1.);
+        assert_eq!(dots.len(), 3, "one dot per workspace");
 
-        let mut vk = match VulkanRenderer::new() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "skipping draw_bar_texture_paints_workspace_dots: no Vulkan device ({e})"
-                );
-                return;
-            }
-        };
-        let ws = WorkspaceState {
-            count: 3,
-            active: 1,
-        };
-        let scale = 2.0;
-        let width_px = to_physical_precise_round::<i32>(scale, 400.);
-        let mut tex = draw_bar_texture(&mut vk, scale, width_px, "12:34", ws.count, 1., None, None)
-            .expect("bar texture");
-        let size = tex.size();
-
-        let fb = vk.bind(&mut tex).expect("bind for readback");
-        let region = Rectangle::<i32, BufferCoord>::from_size(size);
-        let mapping = vk
-            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
-            .expect("copy_framebuffer");
-        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
-
-        // Sample the band row (vertical center) over just the left dot region — the
-        // dots live within `indicator_logical_width`, far from the centered clock.
-        let w = size.w as usize;
-        let band_y = (size.h / 2) as usize;
-        let left = to_physical_precise_round::<i32>(scale, indicator_logical_width(ws.count) + 4.)
-            .clamp(1, size.w) as usize;
-        let row = &pixels[band_y * w * 4..band_y * w * 4 + left * 4];
-
-        let bright_cols = row
-            .chunks_exact(4)
-            .filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200)
-            .count();
+        let (active_rect, active_radius, active_color) = dots[1];
+        assert_eq!(active_color[3], 1., "the active dot is full opacity");
         assert!(
-            bright_cols >= (DOT_DIAMETER * scale) as usize,
-            "expected a wide bright active pill, only {bright_cols} bright columns"
+            active_rect.size.w > DOT_DIAMETER,
+            "the active dot is a pill wider than the base diameter: {}",
+            active_rect.size.w
         );
-        // A dim (half-opacity white over the dark bar) inactive dot is also present.
-        let dim = row.chunks_exact(4).any(|p| p[0] > 80 && p[0] <= 200);
-        assert!(dim, "expected dimmer inactive dots (half-opacity)");
+        assert_eq!(active_rect.size.h, DOT_DIAMETER, "at full scale");
+        // Half the height: a circle on a square dot, a stadium on the wide pill.
+        assert_eq!(active_radius, active_rect.size.h / 2.);
+
+        for (i, (rect, radius, color)) in dots.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert_eq!(color[3], INACTIVE_DOT_OPACITY as f32, "dot {i} is dimmed");
+            assert_eq!(rect.size.w, rect.size.h, "dot {i} is a circle");
+            assert!(
+                rect.size.w < active_rect.size.w,
+                "dot {i} is smaller than the active pill"
+            );
+            assert_eq!(*radius, rect.size.h / 2.);
+        }
+
+        // All of them share the vertical center of the bar.
+        for (rect, _, _) in &dots {
+            let cy = rect.loc.y + rect.size.h / 2.;
+            assert!(
+                (cy - PANEL_HEIGHT / 2.).abs() < 1e-9,
+                "dot off the band: {cy}"
+            );
+        }
+
+        // An out-of-range position parks the pill on the end dot rather than expanding
+        // none of them (the clamp `WorkspaceState::active` used to carry).
+        let past_the_end = workspace_dots(3, 9.);
+        assert_eq!(past_the_end.len(), 3);
+        assert_eq!(past_the_end[2].2[3], 1., "the last dot holds the wide pill");
+        assert_eq!(workspace_dots(0, 0.).len(), 0);
     }
 
     /// The dot row's total allocation width is invariant to the (fractional) switch
@@ -2101,61 +2106,36 @@ mod tests {
         assert!((rest - expected).abs() < 1e-9, "{rest} vs {expected}");
     }
 
-    /// Mid-switch (a fractional position), the two straddled dots are each only
-    /// partially expanded — so the peak brightness in the dot region is the ~0.75-opacity
-    /// of a half-grown dot, strictly dimmer than the full-white active pill at rest. Pins
-    /// that the fractional path actually morphs the dots. Skips with no device.
+    /// Mid-switch (a fractional position) the two straddled dots are each *partly* grown:
+    /// strictly bigger and brighter than a resting inactive dot, strictly smaller and
+    /// dimmer than a resting active one. Pins that the fractional path actually morphs
+    /// them rather than snapping at the halfway mark. Pure geometry, no device.
     #[test]
-    fn draw_bar_texture_dots_morph_during_switch() {
-        use smithay::backend::renderer::{ExportMem, Texture as _};
+    fn workspace_dots_morph_during_a_switch() {
+        let rest = workspace_dots(2, 0.);
+        let mid = workspace_dots(2, 0.5);
 
-        let mut vk = match VulkanRenderer::new() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "skipping draw_bar_texture_dots_morph_during_switch: no Vulkan device ({e})"
-                );
-                return;
-            }
-        };
-        let scale = 2.0;
-        let width_px = to_physical_precise_round::<i32>(scale, 400.);
+        let (active_w, active_a) = (rest[0].0.size.w, rest[0].2[3]);
+        let (idle_w, idle_a) = (rest[1].0.size.w, rest[1].2[3]);
 
-        // Peak red over the band row across just the two-dot region (far from the clock).
-        let peak = |vk: &mut VulkanRenderer, position: f64| -> u8 {
-            let mut tex = draw_bar_texture(vk, scale, width_px, "12:34", 2, position, None, None)
-                .expect("bar texture");
-            let size = tex.size();
-            let fb = vk.bind(&mut tex).expect("bind for readback");
-            let region = Rectangle::<i32, BufferCoord>::from_size(size);
-            let mapping = vk
-                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
-                .expect("copy_framebuffer");
-            let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
-            let w = size.w as usize;
-            let band_y = (size.h / 2) as usize;
-            let right = to_physical_precise_round::<i32>(scale, indicator_logical_width(2))
-                .clamp(1, size.w) as usize;
-            pixels[band_y * w * 4..band_y * w * 4 + right * 4]
-                .chunks_exact(4)
-                .map(|p| p[0])
-                .max()
-                .unwrap_or(0)
-        };
+        for (i, (rect, _, color)) in mid.iter().enumerate() {
+            assert!(
+                idle_w < rect.size.w && rect.size.w < active_w,
+                "mid-switch dot {i} width {} is not between {idle_w} and {active_w}",
+                rect.size.w
+            );
+            assert!(
+                idle_a < color[3] && color[3] < active_a,
+                "mid-switch dot {i} opacity {} is not between {idle_a} and {active_a}",
+                color[3]
+            );
+        }
 
-        let rest = peak(&mut vk, 0.); // dot 0 fully active → full white
-        let mid = peak(&mut vk, 0.5); // both dots half-expanded → ~0.75 opacity, no full pillar
+        // And the morph is continuous: nudging the position nudges the geometry.
+        let nudged = workspace_dots(2, 0.51);
         assert!(
-            rest > 240,
-            "resting active dot should be full white, peak {rest}"
-        );
-        assert!(
-            (150..=235).contains(&mid),
-            "mid-switch dots should be partial opacity, peak {mid}"
-        );
-        assert!(
-            mid < rest,
-            "mid-switch peak {mid} must be dimmer than the resting active pill {rest}"
+            (nudged[0].0.size.w - mid[0].0.size.w).abs() > 1e-9,
+            "a 0.01 step in position moved nothing — the dots are quantized"
         );
     }
 
@@ -2310,17 +2290,8 @@ mod tests {
             "the open overview must light the Activities pill, or the assertion below \
              that the bake does not contain it proves nothing",
         );
-        let mut tex = draw_bar_texture(
-            &mut vk,
-            1.,
-            width_px,
-            "12:34",
-            ws.count,
-            ws.active as f64,
-            None,
-            None,
-        )
-        .expect("bar texture");
+        let mut tex =
+            draw_bar_texture(&mut vk, 1., width_px, "12:34", None, None).expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
@@ -2723,8 +2694,6 @@ mod tests {
             scale,
             width_px,
             "12:34",
-            3,
-            1.,
             Some(("0:05", 306.)),
             None,
         )
