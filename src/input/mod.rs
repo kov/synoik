@@ -3576,6 +3576,7 @@ impl State {
         if let Some(drag) = &mut self.niri.app_drag {
             drag.output = output;
             drag.pos = pos_within_output;
+            self.update_dash_drop_slot();
             self.niri.queue_redraw_all();
             return;
         }
@@ -3603,6 +3604,14 @@ impl State {
                 self.niri.app_grid.entry_icon(*i).cloned(),
                 controls.and_then(|c| self.niri.app_grid.entry_center(*i, c.app_display)),
             ),
+            // A search result is a `SearchResult` actor wrapping the same `AppIcon` the
+            // grid uses, so it is draggable for the same reasons (`appDisplay.js`
+            // `AppSearchProvider` results are `AppIcon`s).
+            OverviewHit::Search(SearchHit::Result(i)) => (
+                self.niri.overview_search.result_id(*i).map(str::to_owned),
+                self.niri.overview_search.result_icon(*i).cloned(),
+                controls.and_then(|c| self.niri.overview_search.result_center(*i, c.into())),
+            ),
             _ => return,
         };
         let (Some(id), Some(icon)) = (id, icon) else {
@@ -3621,7 +3630,26 @@ impl State {
             pos: pos_within_output,
             grab_offset,
         });
+        // The drag can begin with the pointer already over the dash (picking an icon up
+        // off it, or crossing the threshold inside it), and the gap has to be open by
+        // then: it is what the drop reads.
+        self.update_dash_drop_slot();
         self.niri.queue_redraw_all();
+    }
+
+    /// Open, move or close the dash's drop gap for the drag in progress
+    /// (`Dash.handleDragOver`, `dash.js:860-937`).
+    fn update_dash_drop_slot(&mut self) {
+        let Some(drag) = &self.niri.app_drag else {
+            return;
+        };
+        let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
+        let slot = self
+            .niri
+            .layout
+            .controls_layout_for_output(&output)
+            .and_then(|c| self.niri.dash.drop_slot_at(pos, c.dash, &id));
+        self.niri.dash.set_drop_slot(slot);
     }
 
     /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
@@ -3631,6 +3659,17 @@ impl State {
         let Some(drag) = self.niri.app_drag.take() else {
             return;
         };
+
+        // A drop on the dash pins the app there, or moves it if it was already pinned
+        // (`Dash.acceptDrop`, `dash.js:942-987`). The gap that was tracking the pointer
+        // *is* the drop position, so take it before clearing.
+        let slot = self.niri.dash.drop_slot();
+        self.niri.dash.set_drop_slot(None);
+        if let Some(slot) = slot {
+            self.pin_dragged_app(&drag.id, slot);
+            self.niri.queue_redraw_all();
+            return;
+        }
 
         // The overview's own chrome is not a workspace: gnome-shell's dash and app
         // display take their own drops (favorites reordering, folders), so a drop
@@ -3650,6 +3689,39 @@ impl State {
         }
 
         self.niri.queue_redraw_all();
+    }
+
+    /// Pin `id` into the favourites at `slot`, or move it there if it is already
+    /// pinned, and persist the new order (`AppFavorites.addFavoriteAtPos` /
+    /// `moveFavoriteToPos`, `appFavorites.js:98-116`).
+    fn pin_dragged_app(&mut self, id: &str, slot: usize) {
+        // `slot` indexes the favourites *as displayed*, gap included. Removing the app
+        // first shifts everything after it down one, so a move to a later slot lands one
+        // short — gnome-shell gets this by counting favourites before the placeholder and
+        // skipping the dragged one (`dash.js:960-970`).
+        let changed = match self.niri.dash.favorite_index(id) {
+            Some(from) => {
+                let to = if from < slot { slot - 1 } else { slot };
+                if to == from {
+                    false
+                } else {
+                    self.niri.app_system.move_favorite_to_pos(id, to);
+                    true
+                }
+            }
+            None => self.niri.app_system.add_favorite_at_pos(id, Some(slot)),
+        };
+        if !changed {
+            return;
+        }
+
+        // Persist, then re-derive both surfaces: the app moved between them.
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.set_favorite_apps(self.niri.app_system.favorite_ids().to_vec());
+        }
+        self.niri.sync_dash_favorites();
+        self.niri.sync_app_grid();
+        self.niri.prewarm_app_icons();
     }
 
     /// Which of the overview's widgets is at `pos` on `output`, if the overview

@@ -5934,6 +5934,231 @@ fn overview_dash_release_off_the_icon_does_not_launch() {
     );
 }
 
+/// A fixture whose catalog has more apps than the dash pins, so the app grid has
+/// something to drag *into* the dash.
+fn favorites_and_grid_fixture(
+    all: &[&str],
+    favorites: &[&str],
+) -> (Fixture, crate::app_system::RecordingLauncher) {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let recorder = RecordingLauncher::default();
+    let apps = all
+        .iter()
+        .map(|id| AppEntry::fake(id, id))
+        .collect::<Vec<_>>();
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
+    f.niri()
+        .app_system
+        .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
+    f.niri().sync_dash_favorites();
+    f.niri().sync_app_grid();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri().layout.toggle_app_grid();
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    f.settle_animations();
+
+    (f, recorder)
+}
+
+/// The favourites, in dash order — what `favorite-apps` would be written as.
+fn dash_favorites(f: &mut Fixture) -> Vec<String> {
+    f.niri()
+        .app_system
+        .favorite_ids()
+        .iter()
+        .map(|s| s.to_owned())
+        .collect()
+}
+
+/// Dropping an app grid icon on the dash pins it, at the slot it was dropped on —
+/// gnome-shell's `Dash.acceptDrop` calls `addFavoriteAtPos` with the placeholder's
+/// index (`dash.js:942-987`).
+#[test]
+fn overview_dragging_a_grid_icon_onto_the_dash_pins_it_at_that_slot() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop"],
+    );
+    // The grid holds exactly the non-favourite.
+    assert_eq!(
+        f.niri().app_grid.entry_id(0),
+        Some("c.desktop"),
+        "the grid should hold the one app that is not pinned"
+    );
+
+    let grid_area = overview_controls(&mut f).app_display;
+    let from = f
+        .niri()
+        .app_grid
+        .entry_center(0, grid_area)
+        .expect("grid tile 0");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+
+    // Drag onto the *first* dash tile: dropping on its left half aims at slot 0.
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x - 20., first.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        Some(0),
+        "hovering the front of the dash must open the gap at slot 0"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(f.niri().dash.drop_slot(), None, "the drop closes the gap");
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["c.desktop", "a.desktop", "b.desktop"],
+        "the dropped app must be pinned at the slot it was dropped on"
+    );
+}
+
+/// Search results are drag sources too — they are the same `AppIcon` the grid uses.
+#[test]
+fn overview_dragging_a_search_result_onto_the_dash_pins_it() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let recorder = RecordingLauncher::default();
+    let catalog = FakeCatalog::new(vec![
+        AppEntry::fake("a.desktop", "a.desktop"),
+        AppEntry::fake("c.desktop", "c.desktop"),
+    ]);
+    *catalog.search_result.borrow_mut() = vec![vec!["c.desktop".to_owned()]];
+    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder));
+    f.niri()
+        .app_system
+        .set_favorites(vec!["a.desktop".to_owned()]);
+    f.niri().sync_dash_favorites();
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.niri_state().update_keyboard_focus();
+    tap(&mut f, KEY_A);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().overview_search.result_id(0),
+        Some("c.desktop"),
+        "the search must list the app we are about to drag"
+    );
+
+    let area = overview_controls(&mut f).into();
+    let from = f
+        .niri()
+        .overview_search
+        .result_center(0, area)
+        .expect("result tile 0");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x - 20., first.y);
+    assert!(
+        f.niri().app_drag.is_some(),
+        "a search result must be draggable — it was not a drag source at all before"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["c.desktop", "a.desktop"],
+        "a search result dropped on the dash must be pinned like a grid icon"
+    );
+}
+
+/// A favourite dropped immediately before or after itself is a no-op, not a reorder
+/// (`dash.js:909-913` clears the placeholder for those two positions).
+#[test]
+fn overview_dropping_a_favorite_next_to_itself_changes_nothing() {
+    let (mut f, _recorder) =
+        favorites_and_grid_fixture(&["a.desktop", "b.desktop"], &["a.desktop", "b.desktop"]);
+    let before = dash_favorites(&mut f);
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // Move enough to start the drag, but stay over its own tile.
+    pointer_motion_to(&mut f, first.x + 20., first.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        None,
+        "no gap opens before or after the dragged favourite itself"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        dash_favorites(&mut f),
+        before,
+        "dropping a favourite next to itself must not reorder it"
+    );
+}
+
+/// Reordering within the dash: an app already pinned moves rather than being pinned
+/// twice (`Dash.acceptDrop` picks `moveFavoriteToPos` for a source that is already a
+/// favourite, `dash.js:979-983`). Removing it first shifts the tail down one, which is
+/// why the target index is not simply the slot.
+#[test]
+fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["a.desktop", "b.desktop", "c.desktop"],
+    );
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["a.desktop", "b.desktop", "c.desktop"]
+    );
+
+    // Pick up the first favourite and drop it past the last one — over the show-apps
+    // button, which is past the favourites and so clamps back to their end.
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    let past_end = dash_tile_center(&mut f, 3);
+    pointer_motion_to(&mut f, past_end.x, past_end.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        Some(3),
+        "past the last favourite clamps to the end of them, not into the running zone"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["b.desktop", "c.desktop", "a.desktop"],
+        "the dragged favourite must land at the end, not be duplicated or dropped"
+    );
+
+    // And a drop *between* two others lands between them: removing the dragged app
+    // first shifts the tail down, so slot 2 of [b, c, a] is index 1.
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    let middle = dash_tile_center(&mut f, 2);
+    pointer_motion_to(&mut f, middle.x - 10., middle.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["c.desktop", "b.desktop", "a.desktop"],
+        "a drop between two favourites must land between them"
+    );
+}
+
 /// Dragging a dash icon onto a workspace launches the app *there*: gnome-shell's
 /// `Workspace.acceptDrop` calls `source.app.open_new_window(workspaceIndex)`
 /// (`workspace.js:1429-1434`). The drag starts once the pointer leaves the

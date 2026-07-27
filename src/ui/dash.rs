@@ -192,6 +192,12 @@ pub struct Dash {
     n_favorites: usize,
     /// Bumped when `items` changes — the bake revision's content part.
     content_rev: u64,
+    /// While a drag hovers the dash, the favourites index the drop would land at.
+    /// The run opens a one-tile gap there so the icons part around the incoming app
+    /// (gnome-shell's `_dragPlaceholder`, `dash.js:926-932`). The placeholder is a
+    /// pure gap — 50.1's `.placeholder` has `background-image: none`
+    /// (`_dash.scss:35-40`), so there is nothing to paint, only space to make.
+    drop_slot: Option<usize>,
     hovered: Option<DashHit>,
     cache: RefCell<DashCache>,
 }
@@ -208,6 +214,7 @@ impl Dash {
             items: Vec::new(),
             n_favorites: 0,
             content_rev: 0,
+            drop_slot: None,
             hovered: None,
             cache: RefCell::new(DashCache::default()),
         }
@@ -229,6 +236,77 @@ impl Dash {
         // so a stale index can't light the wrong tile or an out-of-range one.
         self.hovered = None;
         true
+    }
+
+    /// Open (or move, or close) the drop gap. Returns whether it changed — the gap
+    /// widens the pill, so the caller re-bakes and redraws.
+    pub fn set_drop_slot(&mut self, slot: Option<usize>) -> bool {
+        if self.drop_slot == slot {
+            return false;
+        }
+        self.drop_slot = slot;
+        true
+    }
+
+    /// The open drop gap, if any — what a drop lands on.
+    pub fn drop_slot(&self) -> Option<usize> {
+        self.drop_slot
+    }
+
+    /// Where a drag carrying `dragged_id` would drop, as an index into the favourites,
+    /// or `None` for "not a drop" — the pointer is off the dash, or the position is a
+    /// no-op for an app already pinned there.
+    ///
+    /// gnome-shell's `Dash.handleDragOver` (`dash.js:860-937`): the run is divided into
+    /// equal shares and the pointer picks one, measured with the placeholder and the
+    /// separator excluded so an open gap does not shift the next answer. Two rules on
+    /// top: a drop past the last favourite clamps back to it (the running-apps zone is
+    /// not pinnable), and a favourite dropped immediately before or after itself is a
+    /// no-op rather than a reorder.
+    pub fn drop_slot_at(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+        dragged_id: &str,
+    ) -> Option<usize> {
+        // Measured without the gap, per the citation above.
+        let layout = self.layout_with(area, None);
+        let pill = layout.pill;
+        if pos.x < pill.loc.x || pos.x >= pill.loc.x + pill.size.w || pos.y < pill.loc.y {
+            return None;
+        }
+
+        let run = DASH_BACKGROUND.content_box(pill);
+        let separator_space = if self.separator_after().is_some() {
+            SEPARATOR_ADVANCE
+        } else {
+            0.
+        };
+        let box_w = run.size.w - separator_space;
+        let n_children = self.items.len() + 1; // + show-apps
+        if box_w <= 0. || n_children == 0 {
+            return None;
+        }
+
+        let rel = (pos.x - run.loc.x).clamp(0., box_w);
+        let slot = ((rel * n_children as f64 / box_w).floor() as usize)
+            // Past the favourites is not a pin target; clamp to the end of them.
+            .min(self.n_favorites);
+
+        // "Don't allow positioning before or after self" (`dash.js:909-913`).
+        if let Some(from) = self.favorite_index(dragged_id) {
+            if slot == from || slot == from + 1 {
+                return None;
+            }
+        }
+        Some(slot)
+    }
+
+    /// Where `id` sits among the favourites, if it is one.
+    pub fn favorite_index(&self, id: &str) -> Option<usize> {
+        self.items[..self.n_favorites.min(self.items.len())]
+            .iter()
+            .position(|item| item.id == id)
     }
 
     /// The desktop id of app `i`, if present.
@@ -295,8 +373,20 @@ impl Dash {
     }
 
     fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
+        self.layout_with(area, self.drop_slot)
+    }
+
+    /// The layout with an explicit drop gap, so the drop-position math can measure the
+    /// run *without* one — gnome-shell keeps the placeholder out of that calculation
+    /// (`dash.js:878-886`), otherwise the gap it just opened would move the next answer.
+    fn layout_with(&self, area: Rectangle<f64, Logical>, drop_slot: Option<usize>) -> DashLayout {
         let n = self.items.len();
         let count = n + 1; // + show-apps
+        let gap = if drop_slot.is_some() {
+            ITEM_ADVANCE
+        } else {
+            0.
+        };
         let separator_after = self.separator_after();
         let separator_space = if separator_after.is_some() {
             SEPARATOR_ADVANCE
@@ -306,7 +396,7 @@ impl Dash {
 
         // The pill is the dash-background node wrapped around the icon run (its
         // content): width = the run, height = one tile; padding adds the rest.
-        let run_w = ITEM_ADVANCE * count as f64 + separator_space;
+        let run_w = ITEM_ADVANCE * count as f64 + separator_space + gap;
         let pill_size = DASH_BACKGROUND.allocation_for(Size::from((run_w, TILE)));
         let pill_x = (area.loc.x + (area.size.w - pill_size.w) / 2.).round();
         let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - pill_size.h).round();
@@ -319,10 +409,15 @@ impl Dash {
             Some(at) if k >= at => separator_space,
             _ => 0.,
         };
+        // Items at or after the drop slot are pushed right by the gap.
+        let gap_shift = |k: usize| match drop_slot {
+            Some(at) if k >= at => gap,
+            _ => 0.,
+        };
         let tiles = (0..count)
             .map(|k| {
                 // `+2` is the tile's own `0 2px` margin within its advance slot.
-                let tile_left = run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + 2.;
+                let tile_left = run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + gap_shift(k) + 2.;
                 Rectangle::new(
                     Point::from((tile_left, run.loc.y)),
                     Size::from((TILE, TILE)),
@@ -331,7 +426,7 @@ impl Dash {
             .collect();
 
         let separator = separator_after.map(|at| {
-            let x = run.loc.x + ITEM_ADVANCE * at as f64 + SEPARATOR_MARGIN;
+            let x = run.loc.x + ITEM_ADVANCE * at as f64 + gap_shift(at) + SEPARATOR_MARGIN;
             // `.dash-separator` is iconSize-tall, centred on the tile row.
             let (y, h) = allocate_1d(run.loc.y, TILE, SEPARATOR_H, Align1::Center);
             Rectangle::new(Point::from((x, y)), Size::from((SEPARATOR_W, h)))

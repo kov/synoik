@@ -217,6 +217,11 @@ impl OverviewSearch {
         self.results.get(i).map(|e| e.id.as_str())
     }
 
+    /// The icon of result `i`, if present (what a drag of that tile carries).
+    pub fn result_icon(&self, i: usize) -> Option<&crate::app_system::AppIconRef> {
+        self.results.get(i).map(|e| &e.icon)
+    }
+
     /// Feed a key while the overview search is engaged. Press-only: key releases are
     /// owned globally by `should_intercept_key` via the shared `suppressed_keys`, so
     /// this never sees (and must not track) releases.
@@ -454,9 +459,6 @@ impl OverviewSearch {
         self.content_rev
     }
 
-    /// The logical center of result tile `i` — a geometry probe for the
-    /// conformance corpus (which clicks real pixels routed through
-    /// [`hit_test`](Self::hit_test)). `None` if out of range.
     /// Result tile `i`'s box — a geometry probe for the render test, which needs
     /// the tile edges (not just its center) to sample the selection fill.
     #[cfg(test)]
@@ -464,7 +466,10 @@ impl OverviewSearch {
         self.layout(area).tiles.get(i).copied()
     }
 
-    #[cfg(test)]
+    /// The logical center of result tile `i`, or `None` if out of range. Used by a
+    /// drag, to keep the icon under the point it was grabbed by, and by the
+    /// conformance corpus, which clicks real pixels routed through
+    /// [`hit_test`](Self::hit_test).
     pub fn result_center(&self, i: usize, area: SearchArea) -> Option<Point<f64, Logical>> {
         let layout = self.layout(area);
         layout
