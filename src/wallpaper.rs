@@ -339,28 +339,38 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
 fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
-    // TODO(perf): a stock 4096x4096 JPEG-XL takes **2.44s** here, which is why this had to
-    // move off the main loop at all — measured 2026-07-26 on this VM, and the three
-    // theories that stood here before are now settled:
+    // TODO(perf+correctness): a stock 4096x4096 JPEG-XL takes **2.42s** here on the dev binary
+    // the seat runs, and the pixels it produces are **not the colours GNOME shows**. Both were
+    // measured 2026-07-26 by running jxl-oxide, libjxl's own jxl-rs and gdk-pixbuf over
+    // `adwaita-l.jxl` in one binary; the numbers below are that A/B, not estimates.
     //
-    //  1. *Not* the unoptimized dev build. The `[profile.dev.package."*"] opt-level = 3` override
-    //     in Cargo.toml landed, and 2.44s is the number *with* it — as is `jxl-oxide`'s rayon pool,
-    //     which is on by default and uses all 10 cores.
-    //  2. *Not* worth decoding to the output size. jxl-oxide 0.12.6 exposes no reduced-resolution
-    //     render (only `render_frame`/`render_frame_cropped`), and the stock GNOME backgrounds are
-    //     all JPEG XL. The picture is 4096² against a 3840x2160 screen and `zoom_crop` samples
-    //     nearly all of it, so a target-sized decode would save single-digit percent even if it
-    //     existed.
-    //  3. It is the decoder. The same file through gdk-pixbuf — i.e. libjxl, what GNOME itself
-    //     decodes with — takes **0.147s**, 16x faster. Nothing in our pipeline accounts for the
-    //     gap.
+    // **It is the build profile, not the decoder.** jxl-oxide decodes this file in **0.235s** in
+    // a release build and **2.42s** in a dev build — and `[profile.dev.package."*"] opt-level = 3`
+    // is already in Cargo.toml, so that is not what is missing. What the dev profile still hands
+    // dependencies is `debug-assertions` and `overflow-checks`, which that override does not turn
+    // off; disabling them for dependencies alone takes it to 1.62s. (The rest of the gap tracks
+    // parallelism: 134% CPU in dev against 339% in release.) An earlier version of this note
+    // blamed the decoder by comparing our dev build against release-built libjxl — a confounded
+    // comparison, and wrong.
     //
-    // So the open question is a dependency decision, not a code change: swap the pure-Rust
-    // decoder for libjxl (`jpegxl-rs`) and accept a C++ library in a tree whose endgame is
-    // a modern Rust base, or keep the 2.4s and the async worker that hides it. Caching the
-    // decoded light/dark variants would make a color-scheme toggle instant but costs a
-    // second 67 MiB texture pinned for the session, which is a poor trade against fixing
-    // the 16x.
+    // **Decoding to the output size is still not worth it.** jxl-oxide 0.12.6 exposes no
+    // reduced-resolution render (only `render_frame`/`render_frame_cropped`), and the picture is
+    // 4096² against a 3840x2160 screen that `zoom_crop` samples nearly all of — single-digit
+    // percent even if it existed.
+    //
+    // **The colour is a real bug, and it is ours.** `jxl_oxide::integration::JxlDecoder` documents
+    // that it does no colour management and that the consumer must apply the ICC profile it
+    // returns (`integration/image.rs:25-30`); we never do. Against libjxl through gdk-pixbuf, our
+    // output has a mean absolute error of **10.6/255** (max 63) with only 8% of pixels within 2 —
+    // the stock background's blue reads (16,48,125) here against (0,46,133) in GNOME. Asking
+    // jxl-oxide's native API for sRGB with its pure-Rust CMS (`moxcms` feature +
+    // `request_color_encoding`) costs ~19ms and cuts the mean to 3.1, but still only 8% of pixels
+    // land within 2. libjxl's own pure-Rust decoder (the `jxl` crate, BSD-3) reproduces libjxl
+    // exactly (mean 0.30, max 1) at 0.51s single-threaded — faster than us in a dev build, half
+    // our speed in release.
+    //
+    // So: fixing the stall is a profile change, and fixing the colour is a decoder or CMS change.
+    // Both are open decisions for Gustavo, not a code change to slip in here.
 
     let decoded = if path
         .extension()
