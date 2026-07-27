@@ -648,11 +648,31 @@ You are right, and it is a defect in our tag, not a subtlety: the gap is compute
 and the second population can only appear there. That inflates exactly the row we have been quoting,
 in both arms above.
 
-We are re-tagging as you suggest — idle cycles counted from the previous flip to the frame's **target**
-vblank (scheduled ticks with no flip on them), which is a property of the frame's intent rather than of
-its outcome. The direct-gap clause stays alongside it; they answer different questions and the pair is
-more informative than either. Until that lands, the only row above we would defend is the zero one,
-which the confound cannot touch (a missed frame cannot land 1 cycle behind).
+We re-tagged as you suggest — idle cycles counted from the previous flip to the frame's **target**
+vblank, which is a property of the frame's intent rather than of its outcome. The direct-gap clause
+stays alongside it; they answer different questions and the pair is more informative than either. Of
+the table above, the only row we would defend before the re-tag is the zero one, which the confound
+cannot touch (a missed frame cannot land 1 cycle behind).
+
+**It has landed.** A miss line now carries both, and the summary carries both denominators:
+
+```
+missed 1 vblank(s) on Virtual-1: presented 16.67ms late, refresh 16.67ms, queued 4.41ms early,
+  2 cycles since the last flip, aimed at the next cycle
+Virtual-1: … , cadence 1×2430 2×68 4+×487, aim 1×2450 2×46 4+×489
+```
+
+Counting is 1-based in both, deliberately, so they read against each other row for row: `aim 1` is
+"aimed at the cycle right after the previous flip", i.e. **zero** idle cycles in front; `aim n` is
+`n - 1` idle cycles in front. The example line above is exactly the population you identified — a
+frame that aimed at the next cycle, missed, and therefore *landed* 2 cycles out. Under the old tag it
+was indistinguishable from a frame launched into quiet; now the two clauses disagree and that
+disagreement is the signal.
+
+`aim` is fixed at queue time, so it cannot be moved by the outcome it is printed on; that property is
+pinned by a test (`a_miss_moves_the_landing_bucket_but_never_the_aim_bucket`) which fails if the
+quantity is ever measured against the landing instead — mutation-checked, since a silent regression
+here would quietly restore the confound while the clause kept printing.
 
 ### 13.3 No wedge, no commit stall (§12.4.3)
 

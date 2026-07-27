@@ -564,6 +564,14 @@ struct Stats {
     /// with a 2-cycle hole punched in it every second, which reads as a hitch.
     /// "22 dropped" cannot tell those apart and they want opposite fixes.
     cadence: [u64; CADENCE_MAX + 1],
+    /// The same histogram keyed on what each frame *aimed at* rather than where it landed —
+    /// cycles from the previous flip to the frame's target vblank, so index 1 is "aimed at the
+    /// next cycle" and index `n` means `n - 1` idle cycles in front of it.
+    ///
+    /// [`Self::cadence`] cannot answer "does idleness cause misses", because a missed frame lands
+    /// a cycle late by construction and so files itself under 2. This one is fixed before the
+    /// outcome is known. Both are logged: the pair is what separates intent from result.
+    aim: [u64; CADENCE_MAX + 1],
 }
 
 impl Stats {
@@ -1261,13 +1269,31 @@ impl FrameLog {
         // front of it misses 26-47%, flat from 2 cycles out to 5 seconds. Without this number a
         // miss line cannot tell the two apart, and the whole idle regime reads as one mystery.
         // See `docs/fork/present-misses.md` §10.
-        let since_last_flip = self
-            .last_presented
-            .insert(output.to_owned(), actual)
+        let prev = self.last_presented.insert(output.to_owned(), actual);
+        let since_last_flip = prev
             .and_then(|prev| actual.checked_sub(prev))
             .map(|gap| (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize);
         if let Some(cycles) = since_last_flip {
             self.stats.entry(output.to_owned()).or_default().cadence[cycles.min(CADENCE_MAX)] += 1;
+        }
+
+        // The same quantity measured against what the frame *aimed at* instead of where it landed.
+        //
+        // `since_last_flip` folds effect into cause and cannot be used to ask whether idleness
+        // causes misses: a frame that misses lands a cycle later **by construction**, so the
+        // 2-cycle bucket collects every continuation frame that missed, and only ever those. It
+        // measured 41-84% for that reason as much as any.
+        //
+        // `target` is chosen when the frame is queued, before it is known whether it will make it,
+        // so a miss cannot move this number. Same 1-based vocabulary as the direct gap on purpose —
+        // 1 means "aimed at the cycle right after the last flip", so the two histograms line up row
+        // for row and the difference between them is the thing under study. Idle cycles in front is
+        // this minus one. See `docs/fork/present-misses.md` §12.3/§13.2.
+        let aimed_after = prev
+            .and_then(|prev| target.checked_sub(prev))
+            .map(|gap| (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize);
+        if let Some(cycles) = aimed_after {
+            self.stats.entry(output.to_owned()).or_default().aim[cycles.min(CADENCE_MAX)] += 1;
         }
 
         let Some(late) = actual.checked_sub(target) else {
@@ -1292,9 +1318,11 @@ impl FrameLog {
         };
 
         let cadence = cadence_clause(since_last_flip);
+        let aim = aim_clause(aimed_after);
 
         tracing::warn!(
-            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}{queued}{cadence}",
+            "missed {missed} vblank(s) on {output}: presented {} late, \
+             refresh {}{queued}{cadence}{aim}",
             ms(late),
             ms(refresh),
         );
@@ -1373,26 +1401,14 @@ impl FrameLog {
 
             // Only the intervals that say something: an idle desktop's gaps are
             // all "4+" and would drown the run of 1s and 2s that a stutter is.
-            let cadence: String = (1..=CADENCE_MAX)
-                .filter(|i| stats.cadence[*i] > 0)
-                .map(|i| {
-                    let label = if i == CADENCE_MAX {
-                        format!("{i}+")
-                    } else {
-                        i.to_string()
-                    };
-                    format!(" {label}×{}", stats.cadence[i])
-                })
-                .collect();
-            let cadence = if cadence.is_empty() {
-                String::new()
-            } else {
-                format!(", cadence{cadence}")
-            };
+            let cadence = histogram_clause("cadence", &stats.cadence);
+            // The denominator for the miss line's `aimed` tag: without it a session can say how
+            // many frames aimed into quiet and missed, but not how many aimed into quiet at all.
+            let aim = histogram_clause("aim", &stats.aim);
 
             tracing::info!(
                 "{output}: {:.1} fps over {}, p50 {}, p95 {}, worst {}, {} over budget, \
-                 {} dropped{gpu}{headroom}{cadence}",
+                 {} dropped{gpu}{headroom}{cadence}{aim}",
                 fps,
                 ms(elapsed),
                 ms(p50),
@@ -1421,6 +1437,48 @@ fn cadence_clause(since_last_flip: Option<usize>) -> String {
         None => ", first flip".to_owned(),
         Some(1) => ", back-to-back".to_owned(),
         Some(n) => format!(", {n} cycles since the last flip"),
+    }
+}
+
+/// `, <name> 1×12 2×3 4+×5` — the non-empty buckets of a cycle histogram, or nothing at all.
+///
+/// Bucket 0 is skipped (two flips inside one cycle should not happen) and the last is `N+`, since
+/// it saturates. Shared by the two histograms so they cannot drift into different formats, which
+/// matters more than it looks: they are meant to be read side by side.
+fn histogram_clause(name: &str, buckets: &[u64; CADENCE_MAX + 1]) -> String {
+    let body: String = (1..=CADENCE_MAX)
+        .filter(|i| buckets[*i] > 0)
+        .map(|i| {
+            let label = if i == CADENCE_MAX {
+                format!("{i}+")
+            } else {
+                i.to_string()
+            };
+            format!(" {label}×{}", buckets[i])
+        })
+        .collect();
+
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!(", {name}{body}")
+    }
+}
+
+/// How much quiet was in front of the frame's *target*, which is the same question
+/// [`cadence_clause`] asks about its landing — except this one cannot be caused by the miss it is
+/// printed on.
+///
+/// A frame that misses lands a cycle later than it aimed, so the direct gap files every missed
+/// continuation frame under "2 cycles" no matter how busy the display was. The target is fixed at
+/// queue time, so it separates "this frame was launched into quiet" from "this frame missed". Same
+/// 1-based counting as the direct gap so the two read against each other; `n` here is `n - 1` idle
+/// cycles in front. See `docs/fork/present-misses.md` §12.3.
+fn aim_clause(aimed_after: Option<usize>) -> String {
+    match aimed_after {
+        None => String::new(),
+        Some(1) => ", aimed at the next cycle".to_owned(),
+        Some(n) => format!(", aimed {n} cycles after the last flip"),
     }
 }
 
@@ -1990,6 +2048,26 @@ mod tests {
         assert_eq!(cadence_clause(Some(1)), ", back-to-back");
         assert_eq!(cadence_clause(Some(4)), ", 4 cycles since the last flip");
 
+        // The aim clause sits beside it and says the same thing about the frame's *target*. Silent
+        // on the first flip, where there is no previous flip to be quiet since — the direct clause
+        // says "first flip" and repeating it would be noise.
+        assert_eq!(aim_clause(None), "");
+        assert_eq!(aim_clause(Some(1)), ", aimed at the next cycle");
+        assert_eq!(aim_clause(Some(4)), ", aimed 4 cycles after the last flip");
+
+        // Both histograms print through one formatter, so they cannot drift apart in a way that
+        // makes a side-by-side reading wrong. Bucket 0 is never shown; the top bucket saturates.
+        let mut buckets = [0u64; CADENCE_MAX + 1];
+        buckets[0] = 7;
+        buckets[1] = 12;
+        buckets[3] = 1;
+        buckets[CADENCE_MAX] = 5;
+        assert_eq!(
+            histogram_clause("aim", &buckets),
+            format!(", aim 1×12 3×1 {CADENCE_MAX}+×5")
+        );
+        assert_eq!(histogram_clause("cadence", &[0; CADENCE_MAX + 1]), "");
+
         // And the gap really is measured from the previous *presentation*: two flips four cycles
         // apart must land in the cadence histogram's bucket 4, not 1.
         let refresh = Duration::from_micros(16667);
@@ -2109,6 +2187,55 @@ mod tests {
             "a six-cycle gap saturates into the last bucket rather than being lost"
         );
         assert_eq!(cadence[0], 0, "nothing landed inside a single cycle");
+    }
+
+    /// The `aim` histogram must be blind to whether the frame it describes missed — that is the
+    /// entire reason it exists next to `cadence`.
+    ///
+    /// The confound it removes: a frame that misses lands a cycle later than it aimed, so under
+    /// the direct gap *every* missed continuation frame files itself under "2 cycles" and the
+    /// 2-cycle bucket cannot be read as "idleness causes misses" — the misses put themselves
+    /// there. Here two frames aim at the very next cycle after the previous flip and one of them
+    /// lands a cycle late: `cadence` must disagree about them, `aim` must not.
+    #[test]
+    fn a_miss_moves_the_landing_bucket_but_never_the_aim_bucket() {
+        let refresh = Duration::from_micros(16667);
+        let mut log = FrameLog {
+            parked: VecDeque::new(),
+            settings: Some(Settings::default()),
+            in_flight: None,
+            stats: HashMap::new(),
+            queued: HashMap::new(),
+            last_presented: HashMap::new(),
+            last_summary: Instant::now(),
+        };
+
+        let base = Duration::from_secs(100);
+        // Opens the interval.
+        log.presented("out", base, base, Some(refresh));
+        // Aimed at the next cycle and made it.
+        log.presented("out", base + refresh, base + refresh, Some(refresh));
+        // Aimed at the next cycle after *that* and landed one cycle late.
+        log.presented("out", base + refresh * 2, base + refresh * 3, Some(refresh));
+
+        let stats = &log.stats["out"];
+        assert_eq!(
+            stats.aim[1], 2,
+            "both frames aimed at the cycle right after the previous flip"
+        );
+        assert_eq!(stats.aim[2], 0, "no frame aimed into a quiet cycle");
+        assert_eq!(
+            stats.dropped, 1,
+            "the late frame must still be counted as a miss"
+        );
+
+        // The landing histogram sees them differently — which is the confound, stated as an
+        // assertion so that removing `aim` cannot silently take the distinction with it.
+        assert_eq!(stats.cadence[1], 1, "only one frame *landed* back-to-back");
+        assert_eq!(
+            stats.cadence[2], 1,
+            "the missed frame landed 2 cycles after the previous flip purely because it missed"
+        );
     }
 
     /// Headroom is only meaningful paired with the frame it was measured on. The
