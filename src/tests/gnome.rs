@@ -7361,3 +7361,57 @@ fn overview_close_from_the_app_grid_refits_before_it_zooms() {
         grid[1].loc.x - grid[0].loc.x,
     );
 }
+
+/// A burst of `installed-changed` pings must not reload the catalog once per ping.
+///
+/// Installing one package writes many `.desktop` files and glib's monitors fire per
+/// directory, so the pings arrive in clumps. Each reload re-enumerates every desktop entry
+/// on disk, drops four icon caches, re-syncs three surfaces and forces a redraw — on the
+/// compositor thread, and thrown away by the next ping milliseconds later. gnome-shell
+/// coalesces them on a restarting 5s timer (`shell_app_cache_queue_update`,
+/// `src/shell-app-cache.c:219-230`); this pins that we do too.
+///
+/// Observable without waiting the timer out: a catalog installed but never synced leaves
+/// the app grid empty, and only a reload would fill it.
+#[test]
+fn an_installed_changed_burst_does_not_reload_the_catalog_per_ping() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("a.desktop", "A"),
+            AppEntry::fake("b.desktop", "B"),
+        ])),
+        Box::new(RecordingLauncher::default()),
+    );
+    assert!(
+        f.niri().app_grid.entry_id(0).is_none(),
+        "the grid must start empty, or a reload proves nothing"
+    );
+
+    for _ in 0..8 {
+        f.niri().queue_app_catalog_reload();
+    }
+    f.dispatch();
+
+    assert!(
+        f.niri().app_grid.entry_id(0).is_none(),
+        "a ping reloaded the catalog inline instead of coalescing"
+    );
+    let first = f
+        .niri()
+        .app_catalog_reload_at
+        .expect("the burst queued no reload at all — the change would be lost");
+
+    // A later ping pushes the deadline out rather than arming a second timer: the reload
+    // lands once the writes stop, not once the first one starts.
+    f.niri().queue_app_catalog_reload();
+    let second = f.niri().app_catalog_reload_at.expect("still pending");
+    assert!(
+        second >= first,
+        "a ping mid-wait must move the deadline forward, not backward"
+    );
+}

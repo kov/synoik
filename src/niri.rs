@@ -227,6 +227,26 @@ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995
 /// (`src/core/startup-notification.c:38`), the same 15s a startup sequence lives.
 const PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long the app catalog waits for `installed-changed` pings to stop before
+/// reloading — gnome-shell's `DEFAULT_TIMEOUT_SECONDS` (`src/shell-app-cache.c:28`),
+/// which it uses both as the coalescing timeout and as its directory monitors'
+/// rate limit. See [`Niri::queue_app_catalog_reload`].
+const APP_CATALOG_RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// What the reload timer should do when it fires: `Some(deadline)` to wait again (a ping
+/// arrived mid-wait and pushed the deadline out), `None` to reload now.
+///
+/// Split out of the timer callback because the callback is the only place the debounce can
+/// go wrong — a timer that always reloads makes the coalescing a no-op, one that always
+/// re-waits never reloads at all — and neither is reachable from a test without sleeping
+/// out a real five seconds.
+fn app_catalog_reload_wait(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    deadline.filter(|at| *at > now)
+}
+
 /// Size of the icon carried by an app drag, logical px. gnome-shell drags the
 /// icon actor itself, which in the dash is 64px (`dash.js:321`) — the app grid's
 /// 96px icon shrinks to the same 64 through `dragActorMaxSize` there
@@ -428,6 +448,10 @@ pub struct Niri {
     /// dash and overview search resolve through. `disconnected` (empty) when
     /// headless; tests inject fakes.
     pub app_system: crate::app_system::AppSystem,
+    /// When a coalesced catalog reload is due, if one is pending — see
+    /// [`Niri::queue_app_catalog_reload`]. `Some` also means a timer is already armed, so
+    /// a burst of `installed-changed` pings arms exactly one.
+    pub app_catalog_reload_at: Option<std::time::Instant>,
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
@@ -1073,26 +1097,7 @@ impl State {
                 .event_loop
                 .insert_source(app_db_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(()) = event {
-                        state.niri.app_system.refresh();
-                        // A newly installed app's icon (or a cached negative) may
-                        // now resolve.
-                        state.niri.app_icon_cache.clear();
-                        state.niri.dash.clear_icon_uploads();
-                        state.niri.overview_search.clear_icon_uploads();
-                        state.niri.app_grid.clear_icon_uploads();
-                        // A refreshed catalog may change what the current query
-                        // resolves to, and which apps populate the grid.
-                        state.niri.sync_overview_search();
-                        state.niri.sync_dash_favorites();
-                        state.niri.sync_app_grid();
-                        // The catalog (and its icons) just changed and the caches were
-                        // cleared above — re-warm the decodes off-thread for the next open.
-                        state.niri.prewarm_app_icons();
-                        // Unconditional: dropping the icon uploads and reshuffling
-                        // search results both invalidate what is on screen, and an
-                        // idle overview produces no frames on its own — a stale frame
-                        // would let a click land on a tile that has since changed app.
-                        state.niri.queue_redraw_all();
+                        state.niri.queue_app_catalog_reload();
                     }
                 })
                 .unwrap();
@@ -3733,6 +3738,7 @@ impl Niri {
             gnome_settings: GnomeSettings::default(),
             gnome_settings_writer: None,
             app_system: crate::app_system::AppSystem::disconnected(),
+            app_catalog_reload_at: None,
             audio: None,
             mic: crate::audio::MicStatus::default(),
             sink_list: crate::audio::SinkList::default(),
@@ -8543,6 +8549,70 @@ impl Niri {
         self.app_grid.set_entries(entries)
     }
 
+    /// Note that the app catalog changed, and reload it once the pings stop.
+    ///
+    /// A single `installed-changed` is rarely a single change: installing a package
+    /// writes many `.desktop` files, and glib's monitors fire per directory. Reloading on
+    /// each one re-enumerates every desktop file on disk, drops four icon caches,
+    /// re-syncs three surfaces and forces a full redraw — all on the compositor thread,
+    /// and all of it thrown away by the next ping a few milliseconds later.
+    ///
+    /// So the ping only moves a deadline. gnome-shell does exactly this, with the same
+    /// restart-on-each-ping shape and the same interval
+    /// (`shell_app_cache_queue_update`, `src/shell-app-cache.c:219-230`,
+    /// `DEFAULT_TIMEOUT_SECONDS 5`); it also rate-limits its directory monitors to the
+    /// same period. A pending deadline means a timer is already armed, so a burst arms
+    /// exactly one.
+    pub fn queue_app_catalog_reload(&mut self) {
+        let deadline = std::time::Instant::now() + APP_CATALOG_RELOAD_DEBOUNCE;
+        if self.app_catalog_reload_at.replace(deadline).is_some() {
+            // A timer is already running; it will see the moved deadline and wait again.
+            return;
+        }
+        let armed = self.event_loop.insert_source(
+            Timer::from_duration(APP_CATALOG_RELOAD_DEBOUNCE),
+            |_, _, state| match app_catalog_reload_wait(
+                state.niri.app_catalog_reload_at,
+                std::time::Instant::now(),
+            ) {
+                Some(at) => TimeoutAction::ToInstant(at),
+                None => {
+                    state.niri.app_catalog_reload_at = None;
+                    state.niri.reload_app_catalog();
+                    TimeoutAction::Drop
+                }
+            },
+        );
+        if let Err(err) = armed {
+            // No timer means no reload, so do it now rather than lose the change.
+            tracing::warn!("could not arm the app catalog reload: {err}");
+            self.app_catalog_reload_at = None;
+            self.reload_app_catalog();
+        }
+    }
+
+    /// Re-read the app catalog and everything derived from it.
+    fn reload_app_catalog(&mut self) {
+        self.app_system.refresh();
+        // A newly installed app's icon (or a cached negative) may now resolve.
+        self.app_icon_cache.clear();
+        self.dash.clear_icon_uploads();
+        self.overview_search.clear_icon_uploads();
+        self.app_grid.clear_icon_uploads();
+        // A refreshed catalog may change what the current query resolves to, and
+        // which apps populate the grid.
+        self.sync_overview_search();
+        self.sync_dash_favorites();
+        self.sync_app_grid();
+        // The catalog (and its icons) just changed and the caches were cleared above
+        // — re-warm the decodes off-thread for the next open.
+        self.prewarm_app_icons();
+        // Unconditional: dropping the icon uploads and reshuffling search results both
+        // invalidate what is on screen, and an idle overview produces no frames on its
+        // own — a stale frame would let a click land on a tile that has since changed app.
+        self.queue_redraw_all();
+    }
+
     /// Warm the app-icon decode cache for the always-visible launch surfaces (the
     /// dash + the app grid) at each connected output's scale, so the first overview
     /// open finds the icons already decoded instead of rasterizing ~24 of them on the
@@ -9363,5 +9433,37 @@ niri_render_elements! {
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    /// The reload timer's two branches, which are otherwise only reachable by sleeping out
+    /// a real five seconds. Both failure directions are silent: a timer that always
+    /// reloads makes the coalescing a no-op, and one that always re-waits never reloads,
+    /// so a newly installed app simply never appears.
+    #[test]
+    fn the_reload_timer_waits_out_a_moved_deadline() {
+        let now = Instant::now();
+
+        // Nothing pending (the reload already ran, or was never queued): run, don't wait.
+        assert_eq!(app_catalog_reload_wait(None, now), None);
+
+        // A ping arrived mid-wait and pushed the deadline out: wait for the rest of it.
+        let later = now + APP_CATALOG_RELOAD_DEBOUNCE;
+        assert_eq!(app_catalog_reload_wait(Some(later), now), Some(later));
+
+        // The deadline has passed: reload.
+        assert_eq!(
+            app_catalog_reload_wait(Some(now - Duration::from_millis(1)), now),
+            None
+        );
+        // And exactly at the deadline, too — else a deadline that lands on the timer's own
+        // instant would re-arm for zero and spin.
+        assert_eq!(app_catalog_reload_wait(Some(now), now), None);
     }
 }
