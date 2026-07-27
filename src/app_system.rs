@@ -284,9 +284,10 @@ impl AppSystem {
     ///
     /// TODO(S3): GNOME re-emits `AppFavorites` `changed` when the *resolved*
     /// favorites change across a refresh; the dash redisplay will want that signal.
-    /// TODO(perf): every ping re-enumerates eagerly on the main thread; glib
-    /// advises deferring the re-read under update bursts (bounded to one rescan per
-    /// refresh by the monitor's edge-trigger). Consider debouncing later.
+    /// This enumerates eagerly on the main thread, so the caller is expected not to
+    /// call it per ping: `Niri::queue_app_catalog_reload` coalesces a burst onto one
+    /// reload, the way gnome-shell's `ShellAppCache` does. (GNOME also runs the
+    /// enumeration itself off-thread; we do not, yet.)
     pub fn refresh(&mut self) {
         self.installed = self.catalog.enumerate();
         self.scan_startup_wm_class_to_id();
