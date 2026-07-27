@@ -3904,6 +3904,46 @@ prop_compose! {
 }
 
 #[test]
+fn leaving_the_overview_drops_the_picker_overlay() {
+    // `render_expose` raises the hovered preview above its neighbours for as long as its hover
+    // value is non-zero. Nothing else clears that on the way out — the input handler only
+    // recomputes hover on pointer motion, and a keyboard-driven exit produces none — so the
+    // preview animated home drawn on top of windows really above it, and snapped into its true
+    // place the instant the overview handed off to the normal render path.
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ToggleOverview,
+        Op::AdvanceAnimations { msec_delta: 1000 },
+    ]);
+
+    assert!(layout.set_expose_hover(Some(&0)), "hovering should take");
+    // The hover is an ease from 0, so it is worth nothing until the clock moves.
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 1000 }]);
+    assert!(
+        layout
+            .workspaces()
+            .any(|(_, _, ws)| ws.expose_hovers().next().is_some()),
+        "the preview should be hovered before we leave"
+    );
+
+    layout.close_overview();
+
+    assert!(
+        layout
+            .workspaces()
+            .all(|(_, _, ws)| ws.expose_hovers().next().is_none()),
+        "leaving must drop the overlay outright — easing it down leaves the preview restacked \
+         for the whole exit animation"
+    );
+}
+
+#[test]
 fn dropping_on_the_strip_thumbnail_of_a_culled_workspace() {
     // The thumbnails strip accepts a drop onto ANY workspace by index
     // (`Monitor::insert_position`), including one scrolled far enough out of the overview that

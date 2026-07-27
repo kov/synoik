@@ -4951,6 +4951,19 @@ impl<W: LayoutElement> Layout<W> {
     pub fn toggle_overview(&mut self) {
         self.overview_open = !self.overview_open;
 
+        if !self.overview_open {
+            // Leaving: drop the picker overlay before the exit animation starts, rather than
+            // easing it down. `render_expose` raises the hovered preview above its neighbours
+            // for as long as its hover value is non-zero, and nothing else clears it on the way
+            // out — the input handler only recomputes hover on pointer motion, which a
+            // keyboard-driven exit never produces. The preview would fly home drawn on top of
+            // windows that are really above it, then snap into its true place the instant the
+            // overview handed off to the normal render path.
+            for ws in self.workspaces_mut() {
+                ws.clear_expose_hover();
+            }
+        }
+
         let from = self.overview_progress.take().map_or(0., |p| p.value());
         let to = if self.overview_open { 1. } else { 0. };
 

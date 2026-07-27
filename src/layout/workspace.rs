@@ -2024,6 +2024,13 @@ impl<W: LayoutElement> Workspace<W> {
         changed
     }
 
+    /// Drop the picker overlay outright, with no ease back down — for leaving the
+    /// overview, where an eased hover would keep [`Self::render_expose`] restacking
+    /// the preview above its neighbours for the whole exit animation.
+    pub(super) fn clear_expose_hover(&mut self) {
+        self.expose_hover.clear();
+    }
+
     /// Every window whose picker overlay is showing, with its progress — the
     /// hovered one plus any still easing back down.
     pub(super) fn expose_hovers(&self) -> impl Iterator<Item = (&W::Id, f64)> + '_ {
