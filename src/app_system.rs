@@ -68,8 +68,9 @@ pub struct AppEntry {
     /// nullable and panics on those entries.
     pub commandline: Option<PathBuf>,
     /// `g_desktop_app_info_list_actions()` — desktop actions, e.g. `"new-window"`,
-    /// which drives the new-window launch preference.
-    pub actions: Vec<String>,
+    /// which drives the new-window launch preference *and* fills the action section
+    /// of the app context menu (`AppMenu.setApp`, `appMenu.js:229-242`).
+    pub actions: Vec<DesktopAction>,
     /// `g_app_info_should_show()`. Consumers filter on this; the catalog keeps
     /// everything so favorites/launch can still resolve `NoDisplay` apps.
     pub should_show: bool,
@@ -79,6 +80,16 @@ pub struct AppEntry {
     /// `g_desktop_app_info_get_startup_wm_class()` — the `StartupWMClass` key that
     /// window↔app matching consults first (see [`AppSystem::app_for_window`]).
     pub startup_wm_class: Option<String>,
+}
+
+/// One `.desktop` action — `[Desktop Action <id>]` — as the app menu shows it.
+///
+/// The id is what launches (`g_desktop_app_info_launch_action`); the name is the
+/// localized label GNOME puts in the menu (`g_app_info_get_action_name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopAction {
+    pub id: String,
+    pub name: String,
 }
 
 /// How a launch was requested — the two verbs of `AppIcon.activate`
@@ -595,7 +606,7 @@ fn resolve_launch(mode: LaunchMode, entry: &AppEntry) -> ResolvedLaunch {
     match mode {
         LaunchMode::Activate => ResolvedLaunch::Default,
         LaunchMode::NewWindow => {
-            if entry.actions.iter().any(|a| a == "new-window") {
+            if entry.actions.iter().any(|a| a.id == "new-window") {
                 ResolvedLaunch::Action("new-window".to_string())
             } else {
                 ResolvedLaunch::Default
@@ -617,7 +628,15 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
     let id = info.id()?.to_string();
     let actions = info
         .downcast_ref::<DesktopAppInfo>()
-        .map(|d| d.list_actions().iter().map(|s| s.to_string()).collect())
+        .map(|d| {
+            d.list_actions()
+                .iter()
+                .map(|id| DesktopAction {
+                    name: d.action_name(id).to_string(),
+                    id: id.to_string(),
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let icon = icon_ref(info.icon(), &id);
     let startup_wm_class = info
@@ -1020,12 +1039,47 @@ mod tests {
         );
     }
 
+    /// A desktop action arrives with the localized *name* GNOME puts in the menu, not
+    /// just the id it launches by. Worth pinning against real GIO: the two are
+    /// different strings from different calls, and nothing downstream would notice a
+    /// menu labelled `new-window` instead of "New Window" except a person reading it.
+    #[test]
+    fn desktop_actions_carry_their_display_names() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("gsrs-actions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("action-probe.desktop");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(
+            b"[Desktop Entry]\nType=Application\nName=Probe\nExec=/bin/true\nActions=new-window;\n\
+              \n[Desktop Action new-window]\nName=New Window\nExec=/bin/true\n",
+        )
+        .unwrap();
+        drop(f);
+
+        let info = DesktopAppInfo::from_filename(&path).expect("the probe entry loads");
+        let entry = make_entry(info.upcast_ref::<gio::AppInfo>()).expect("it has an id");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            entry.actions,
+            vec![DesktopAction {
+                id: "new-window".to_owned(),
+                name: "New Window".to_owned(),
+            }],
+        );
+    }
+
     /// `NewWindow` prefers the `new-window` desktop action when present, else
     /// falls back to a plain relaunch (`shell_app_open_new_window`).
     #[test]
     fn new_window_prefers_new_window_desktop_action() {
         let with_action = AppEntry {
-            actions: vec!["new-window".to_string()],
+            actions: vec![DesktopAction {
+                id: "new-window".to_owned(),
+                name: "New Window".to_owned(),
+            }],
             ..AppEntry::fake("w.desktop", "W")
         };
         let without = AppEntry::fake("p.desktop", "P");
