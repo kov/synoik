@@ -1,12 +1,18 @@
-//! A host-visible staging buffer that can be created and **filled off the render thread**.
+//! Staging for uploads: a shared per-frame arena ([`StagingPool`]) for everything the render
+//! thread uploads, and a one-shot buffer ([`HostStaging`]) that can be created and **filled off
+//! the render thread**.
 //!
-//! The normal upload path ([`crate::texture::Texture::from_bytes_32bpp`]) takes a `&[u8]` the
-//! caller already owns and copies it into a staging buffer it makes on the spot. That copy is a
-//! host write into a mapping whose pages have never been touched — measured at ~7 GB/s on this
-//! VM's Venus device against ~58 GB/s into the same buffer once warm (`docs/fork/venus-cost.md`
-//! §9.2) — and for a 4K wallpaper it is tens of megabytes, so it lands on the compositor thread as
-//! a single 7–9 ms stall with no GPU work in it at all. TODO(perf): reusing buffers across uploads
-//! would remove the fault cost entirely; each `HostStaging` is created and dropped per batch.
+//! Both exist because of the same measurement. A copy into a mapping whose pages have never been
+//! touched runs at ~7 GB/s on this VM's Venus device against ~58 GB/s into the same buffer once
+//! warm (`docs/fork/venus-cost.md` §9.2), and on Venus a `HOST_VISIBLE` buffer is a host blob whose
+//! creation and mapping are round trips. So the render thread's uploads share one warm buffer and
+//! rewind it per frame rather than each making its own — see [`StagingPool`], which also records
+//! what happened when they did not.
+//!
+//! [`HostStaging`] is the exception, and deliberately un-pooled: it serves the wallpaper, which is
+//! tens of megabytes, decoded on a worker, and loaded once in a session rather than once a frame.
+//! Pooling a buffer that size would pin the peak forever to save a fault cost that is not on the
+//! compositor thread to begin with.
 //!
 //! Nothing about that copy needs the render thread. Buffer creation, memory allocation, mapping
 //! and the write itself are all `VkDevice`-level calls the spec internally synchronizes; only
