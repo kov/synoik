@@ -8,7 +8,7 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::{env, mem};
+use std::{env, mem, thread};
 
 use calloop::EventLoop;
 use clap::{CommandFactory, Parser};
@@ -169,6 +169,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
     store_and_increase_nofile_rlimit();
+
+    // Read the fonts off the disk while the event loop, the display and the backend are being
+    // built, so the first frame does not pay for it. Detached on purpose: nothing waits on the
+    // result, and if it has not finished by the first shape that call simply does the work itself.
+    thread::Builder::new()
+        .name("font prewarm".to_owned())
+        .spawn(niri_vk::text::prewarm)
+        .map_err(|err| warn!("error spawning the font prewarm thread: {err:?}"))
+        .ok();
 
     // Create the main event loop.
     let mut event_loop = EventLoop::<State>::try_new().unwrap();

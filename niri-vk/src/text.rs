@@ -216,6 +216,26 @@ fn measure_fonts() -> &'static Mutex<FontSystem> {
     FONTS.get_or_init(|| Mutex::new(FontSystem::new()))
 }
 
+/// Build the font database and resolve SansSerif, so the first frame does not have to.
+///
+/// Intended to run on a throwaway thread at startup, alongside the event loop and backend being
+/// built. Nothing here is needed by the caller — the work lands in [`measure_fonts`]'s `OnceLock`
+/// and, more importantly, in the kernel's page cache, which is what the cost actually is.
+///
+/// The live seat's very first frame spent **32.91ms shaping 4 runs**; later frames shape 2 runs in
+/// 0.34ms. Measured against a warm page cache the same construct-and-shape sequence is 6.3ms for
+/// `FontSystem::new()` plus 3.4ms for the first four runs, and a genuinely cold one made a single
+/// `measure_line_width` call take **408ms** — so the cost is font *file I/O and first parse*, not
+/// shaping, and it is paid again by the renderer's own [`TextContext`] unless the files are
+/// already resident. Warming one font system warms the files for both.
+///
+/// Idempotent and cheap to call twice; a second call is a cache hit.
+pub fn prewarm() {
+    // A shape, not just construction: `FontSystem::new()` enumerates, but resolving SansSerif is
+    // what reads and parses the face we actually draw with.
+    let _ = measure_line_width("Ag", 16.0);
+}
+
 /// Logical width, in pixels, of a single-line `text` shaped SansSerif at `px` pixels-per-em — the
 /// advance the renderer lays the run out to. GPU-free (shaping only), so callers can size a hit
 /// rectangle at construction time, before a renderer exists. Matches the width `build_glyph_run`
