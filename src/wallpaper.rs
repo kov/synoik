@@ -339,38 +339,28 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
 fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
-    // TODO(perf+correctness): a stock 4096x4096 JPEG-XL takes **2.42s** here on the dev binary
-    // the seat runs, and the pixels it produces are **not the colours GNOME shows**. Both were
-    // measured 2026-07-26 by running jxl-oxide, libjxl's own jxl-rs and gdk-pixbuf over
-    // `adwaita-l.jxl` in one binary; the numbers below are that A/B, not estimates.
+    // The "a stock background takes SECONDS to decode" problem is **fixed, in Cargo.toml** —
+    // 2.42s to 0.28s for a 4096x4096 JPEG XL. It was never the decoder: jxl-oxide always did
+    // this file in ~0.24s in an optimized build, and what the dev binary the seat runs was
+    // missing is spelled out where the fix lives (`[profile.dev]`, and the two extra settings
+    // under `[profile.dev.package."*"]`). The short version is that a dependency's *generic*
+    // code is code-generated in the crate that instantiates it, so `image`'s and jxl-oxide's
+    // decode loops were built at our crate's opt-level, not theirs.
     //
-    // **It is the build profile, not the decoder.** jxl-oxide decodes this file in **0.235s** in
-    // a release build and **2.42s** in a dev build — and `[profile.dev.package."*"] opt-level = 3`
-    // is already in Cargo.toml, so that is not what is missing. What the dev profile still hands
-    // dependencies is `debug-assertions` and `overflow-checks`, which that override does not turn
-    // off; disabling them for dependencies alone takes it to 1.62s. (The rest of the gap tracks
-    // parallelism: 134% CPU in dev against 339% in release.) An earlier version of this note
-    // blamed the decoder by comparing our dev build against release-built libjxl — a confounded
-    // comparison, and wrong.
+    // Two things stay open, neither of them a stall:
     //
-    // **Decoding to the output size is still not worth it.** jxl-oxide 0.12.6 exposes no
-    // reduced-resolution render (only `render_frame`/`render_frame_cropped`), and the picture is
-    // 4096² against a 3840x2160 screen that `zoom_crop` samples nearly all of — single-digit
-    // percent even if it existed.
-    //
-    // **The colour is a real bug, and it is ours.** `jxl_oxide::integration::JxlDecoder` documents
-    // that it does no colour management and that the consumer must apply the ICC profile it
-    // returns (`integration/image.rs:25-30`); we never do. Against libjxl through gdk-pixbuf, our
-    // output has a mean absolute error of **10.6/255** (max 63) with only 8% of pixels within 2 —
-    // the stock background's blue reads (16,48,125) here against (0,46,133) in GNOME. Asking
-    // jxl-oxide's native API for sRGB with its pure-Rust CMS (`moxcms` feature +
-    // `request_color_encoding`) costs ~19ms and cuts the mean to 3.1, but still only 8% of pixels
-    // land within 2. libjxl's own pure-Rust decoder (the `jxl` crate, BSD-3) reproduces libjxl
-    // exactly (mean 0.30, max 1) at 0.51s single-threaded — faster than us in a dev build, half
-    // our speed in release.
-    //
-    // So: fixing the stall is a profile change, and fixing the colour is a decoder or CMS change.
-    // Both are open decisions for Gustavo, not a code change to slip in here.
+    // 1. **Our colours are not GNOME's colours.** `jxl_oxide::integration::JxlDecoder` does no
+    //    colour management and documents that the consumer must apply the ICC profile it returns
+    //    (`integration/image.rs:25-30`); we never do. Against libjxl through gdk-pixbuf, this path
+    //    has a mean absolute error of 10.6/255 (max 63) with only 8% of pixels within 2 — the stock
+    //    background's blue reads (16,48,125) here against (0,46,133) in GNOME. **Deferred by
+    //    Gustavo, 2026-07-26** (visually unobjectionable today). When it comes back: jxl-oxide's
+    //    native API with the pure-Rust `moxcms` feature costs ~19ms and cuts the mean to 3.1 but
+    //    does not match; libjxl's own pure-Rust decoder (the `jxl` crate, BSD-3) reproduces it
+    //    exactly (mean 0.30, max 1) at 0.51s single-threaded.
+    // 2. **Decoding to the output size** is still not worth it: jxl-oxide 0.12.6 exposes no
+    //    reduced-resolution render, and 4096² against a 3840x2160 screen that `zoom_crop` samples
+    //    nearly all of would save single digits even if it did.
 
     let decoded = if path
         .extension()
