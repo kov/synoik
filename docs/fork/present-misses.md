@@ -873,3 +873,66 @@ makes it worth reporting at all; the absolute rates should not be quoted without
 samples (15 and 4 flips) are too small to mean anything and are omitted from the table's reading.
 
 *— the gnome-shell-rs guest session.*
+
+## 16. §15 does not survive a controlled workload — the 2× was confounding
+
+**This retracts §15.1's headline.** Driving the same workload from a script instead of by hand, with
+the desktop state pinned, the chain shows **no measurable effect** and the miss rates fall by roughly
+fifty times.
+
+Driver: pointer nudges at ~300 Hz to hold a continuous 60 fps flip stream, plus a scripted heavy
+action every 2 s; each run asserts its starting state (workspace 1, 8 windows) and returns to it.
+Arms run back to back on one session, split by the host kill switch.
+
+| phase | arm | gpu p50 | aim-1 flips | miss | rate |
+|---|---|---|---|---|---|
+| light (cursor only) | ON | 0.40 ms | 1 773 | 0 | **0.00%** |
+| light (cursor only) | OFF | 0.40 ms | 2 196 | 0 | **0.00%** |
+| overview open/close | ON | 1.17 ms | 1 784 | 6 | 0.34% |
+| overview open/close | OFF | 1.17 ms | 1 195 | 7 | 0.59% |
+| app grid open/close | ON | 1.16 ms | 1 167 | 3 | 0.26% |
+| app grid open/close | OFF | 2.34 ms | 1 157 | 5 | 0.43% |
+| **all three** | ON | | 4 724 | 9 | **0.19%** |
+| **all three** | OFF | | 4 548 | 12 | **0.26%** |
+
+Nine misses against twelve is noise. The direction is even mildly *against* §15, and both arms sit two
+orders of magnitude below the 8.8–16.7% that section reported.
+
+### 16.1 What went wrong in §15
+
+The band stratification controlled for *frame rate* and we treated that as controlling for workload.
+It does not. Two windows can both run at 45 fps while rendering entirely different things, and what
+the compositor is drawing turns out to dominate the miss rate far more than the chain does. The
+human-driven arms differed in content — different windows, workspaces, and a mix of overview, app
+grid and workspace switches in unrecorded proportions — and that difference is what §15 measured.
+
+The scale of it is the tell we should have caught: §14 already recorded a **100×** swing in the
+aim-1 rate between two sessions with the chain in the same state. Anything that varies by 100× with
+workload cannot be used to detect a 2× effect unless workload is held fixed, and we did not hold it
+fixed — we held a proxy for it fixed.
+
+### 16.2 What this does and does not establish
+
+**Does:** at 60 fps with per-frame GPU cost of 0.4–2.3 ms, the chain costs nothing measurable. The
+light phase is the cleanest arm pair we have — identical gpu p50 to the hundredth of a millisecond,
+~2 000 continuation flips each, and **zero** misses on both sides.
+
+**Does not:** exclude an effect under heavier load. Our driver tops out around 2.3 ms of GPU per
+frame; the human sessions ran 5–8 ms and missed far more often *in both arms*. Whatever makes a
+frame miss lives closer to per-frame work than to the presentation path, and we have not reached the
+regime where the chain's tail would be exposed. Nor is there power here to see a small effect: at a
+0.2% baseline, 9 events cannot separate 1.0× from 1.5×.
+
+Two of five phases had to be discarded rather than reported, both for state drift the harness did not
+catch: a workspace phase that visited different workspaces (fixed by naming them absolutely, then
+recurring because an `Escape` failed to close the grid in one arm and every later phase ran with it
+open). The comparability check — matching element counts *and* bake counts per phase — is what caught
+both, and is now the thing that gates any phase being scored at all.
+
+### 16.3 Standing
+
+§15's table stays in this document as a record of a measurement we made and then retracted; its
+conclusion should not be used. The open question from §15.2 is unchanged and still host-side: how
+many presents did you actually latch per second in each arm.
+
+*— the gnome-shell-rs guest session.*
