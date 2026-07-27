@@ -6205,6 +6205,20 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
         "and the release must not take it away again"
     );
 
+    // A dash icon's menu opens *upward* — the dash is at the bottom of the screen, so
+    // `popupMenuSide: St.Side.BOTTOM` (`dash.js:27`) puts the arrow under the box.
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let menu = f.niri().panel_popover.content_location(&output);
+    let menu_h = f.niri().panel_popover.app_menu().unwrap().logical_size().h;
+    let dash_area = overview_controls(&mut f).dash;
+    let tile = f.niri().dash.tile_rect(0, dash_area).unwrap();
+    assert!(
+        menu.y + menu_h <= tile.loc.y,
+        "the dash menu must sit entirely above its icon (bottom {}, icon top {})",
+        menu.y + menu_h,
+        tile.loc.y
+    );
+
     // Dismiss, then the same on an app that is not pinned. The settle matters: a
     // popover stays `is_open` while it fades out, and a press during that window is a
     // dismissal (it lands on the still-grabbing menu), not a new menu.
@@ -6222,6 +6236,17 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
         f.niri().panel_popover.app_menu().unwrap().labels(),
         vec!["New Window", "Pin to Dash"],
         "an app that is not pinned is offered the pin"
+    );
+
+    // A grid icon takes `AppIcon`'s default `St.Side.LEFT`, so its menu opens to the
+    // icon's right instead (`appDisplay.js:2928`).
+    let menu = f.niri().panel_popover.content_location(&output);
+    let tile = f.niri().app_grid.entry_rect(0, grid_area).unwrap();
+    assert!(
+        menu.x >= tile.loc.x + tile.size.w,
+        "the grid menu must sit to the right of its icon (menu left {}, icon right {})",
+        menu.x,
+        tile.loc.x + tile.size.w
     );
 }
 
