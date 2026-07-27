@@ -644,6 +644,10 @@ pub struct Niri {
     thumbnails_offscreen: OffscreenBuffer,
     /// Shared symbolic-icon cache for the panel and its popovers.
     pub icon_cache: IconCache,
+    /// Request sink for the symbolic-icon worker. Held here rather than only inside `icon_cache`
+    /// because an icon-theme change replaces that cache and the worker outlives it.
+    pub symbolic_icon_tx:
+        Option<std::sync::mpsc::Sender<crate::render_helpers::icon::SymbolicRequest>>,
     /// Full-color application-icon loader for the dash / app grid / search.
     pub app_icon_cache: AppIconCache,
 
@@ -1066,7 +1070,7 @@ impl State {
             // Seed both icon caches from the configured icon theme (they default
             // to Adwaita pre-settings).
             let icon_theme = state.niri.gnome_settings.icon_theme.clone();
-            state.niri.icon_cache = IconCache::new(icon_theme.as_str());
+            state.niri.replace_icon_cache(icon_theme.as_str());
             state.niri.app_icon_cache.set_theme(&icon_theme);
             // GNOME's input-sources own the keymap when present, overriding the
             // niri-config keymap the seat keyboard was created with.
@@ -1112,6 +1116,27 @@ impl State {
                 .insert_source(icon_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(decoded) = event {
                         if state.niri.app_icon_cache.apply_decoded(decoded) {
+                            state.niri.queue_redraw_all();
+                        }
+                    }
+                })
+                .unwrap();
+
+            // Same for *symbolic* icons, which had stayed inline: a miss resolved the name across
+            // every theme and category (a few hundred `stat`s when it finds nothing), read the
+            // file and parsed the SVG, all inside element collection on the frame thread.
+            let (sym_tx, sym_rx) = calloop::channel::channel();
+            state.niri.symbolic_icon_tx =
+                crate::render_helpers::icon::spawn_symbolic_worker(sym_tx);
+            if let Some(tx) = state.niri.symbolic_icon_tx.clone() {
+                state.niri.icon_cache.set_worker(tx);
+            }
+            state
+                .niri
+                .event_loop
+                .insert_source(sym_rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(done) = event {
+                        if state.niri.icon_cache.apply_rasterized(done) {
                             state.niri.queue_redraw_all();
                         }
                     }
@@ -1208,7 +1233,7 @@ impl State {
                         // theme) must be dropped or they keep serving old-theme pixels.
                         if icon_theme_changed {
                             let theme = state.niri.gnome_settings.icon_theme.clone();
-                            state.niri.icon_cache = IconCache::new(theme.as_str());
+                            state.niri.replace_icon_cache(theme.as_str());
                             state.niri.app_icon_cache.set_theme(&theme);
                             state.niri.dash.clear_icon_uploads();
                             state.niri.overview_search.clear_icon_uploads();
@@ -3834,6 +3859,7 @@ impl Niri {
             picker_offscreen: OffscreenBuffer::default(),
             thumbnails_offscreen: OffscreenBuffer::default(),
             icon_cache: IconCache::new("Adwaita"),
+            symbolic_icon_tx: None,
             app_icon_cache: AppIconCache::new("Adwaita"),
 
             window_mru_ui,
@@ -8627,6 +8653,19 @@ impl Niri {
     /// The decode runs on the worker thread and [`AppIconCache::buffer`] dedups keys
     /// that are already cached or in flight, so this is idempotent and cheap to call
     /// again whenever the scale set or the app content changes.
+    /// Build a fresh symbolic-icon cache for `theme`, keeping it pointed at the worker.
+    ///
+    /// An icon-theme change replaces the cache wholesale (that is how its textures, which are not
+    /// keyed by theme, get dropped). The worker thread outlives it, so the new cache has to be
+    /// re-handed the sink — miss that and symbolic rasterization silently falls back to running
+    /// inline on the frame thread, which is exactly what this machinery exists to prevent.
+    pub fn replace_icon_cache(&mut self, theme: &str) {
+        self.icon_cache = IconCache::new(theme);
+        if let Some(tx) = self.symbolic_icon_tx.clone() {
+            self.icon_cache.set_worker(tx);
+        }
+    }
+
     pub fn prewarm_app_icons(&self) {
         // Before the worker is wired, `buffer()` would decode inline on the main
         // thread — the exact startup stall this exists to avoid.

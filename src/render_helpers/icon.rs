@@ -25,6 +25,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use anyhow::Context as _;
@@ -55,24 +56,42 @@ const CATEGORIES: &[&str] = &[
     "mimetypes",
 ];
 
+/// Hands each [`IconCache`] a distinct `generation`. See the field for what it guards.
+static NEXT_ICON_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Resolves + rasterizes symbolic icons on demand, caching the resolved paths and
 /// the uploaded textures.
 pub struct IconCache {
     /// Themes to search, in order (e.g. the configured theme, then Adwaita/hicolor).
     themes: Vec<String>,
+    /// Unique to this instance, stamped on every request. An icon-theme change replaces the whole
+    /// `IconCache` rather than invalidating it, so a rasterization started by the *previous* cache
+    /// can still be delivered to the loop afterwards — and would otherwise be filed, under a key
+    /// that matches, into a cache built for a different theme.
+    generation: u64,
     resolved: RefCell<HashMap<String, Option<PathBuf>>>,
+    /// Rasterized pixels waiting to be uploaded, and negatives (an icon no theme provides), so a
+    /// miss is not re-queued every frame. Populated by [`apply_rasterized`]; drained by
+    /// [`texture`], which is the only place a `VulkanRenderer` exists.
+    ///
+    /// [`apply_rasterized`]: Self::apply_rasterized
+    /// [`texture`]: Self::texture
+    buffers: RefCell<HashMap<SymbolicKey, Option<MemoryBuffer>>>,
+    /// Keys currently on the worker, so a miss is queued once rather than once a frame.
+    in_flight: RefCell<HashSet<SymbolicKey>>,
+    /// Request sink to the rasterize worker; `None` in headless tests, where
+    /// [`texture`](Self::texture) falls back to rasterizing inline.
+    raster_tx: Option<mpsc::Sender<SymbolicRequest>>,
     /// Uploaded icons, keyed by [`icon_key`]. Symbolic icons are *elements*, rebuilt
     /// from scratch on every frame that draws them, and each upload is a synchronous
     /// submit + fence-wait — ~1.7ms apiece on the Venus queue, independent of size.
     /// One quick-settings popover frame asks for nine, so an open popover paid ~13ms
     /// a frame to re-upload identical pixels. Caching the texture makes a redraw free.
     ///
-    /// The rasterized pixels are deliberately **not** cached alongside: this map is
-    /// invalidated strictly more often than a raster cache would be (only by `context`
-    /// below; everything else — an icon-theme change — replaces the whole `IconCache`),
-    /// so a raster cache could only ever save work after a renderer recreation. That is
-    /// device loss, and re-rasterizing a few symbolic SVGs is the least of it.
-    textures: RefCell<HashMap<(String, u32, u32), TextureBuffer<VkTexture>>>,
+    /// The rasterized pixels live in `buffers` above rather than here: they arrive from the
+    /// worker and are consumed by the first upload, so the two maps hold different stages of the
+    /// same icon and never both hold one.
+    textures: RefCell<HashMap<SymbolicKey, TextureBuffer<VkTexture>>>,
     /// Identifies the renderer `textures` were uploaded to; a mismatch drops them all
     /// (they belong to a device that is gone). Same guard the widget bake caches use.
     context: RefCell<Option<ContextId<VkTexture>>>,
@@ -89,9 +108,55 @@ impl IconCache {
         }
         Self {
             themes,
+            generation: NEXT_ICON_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed),
             resolved: RefCell::new(HashMap::new()),
+            buffers: RefCell::new(HashMap::new()),
+            in_flight: RefCell::new(HashSet::new()),
+            raster_tx: None,
             textures: RefCell::new(HashMap::new()),
             context: RefCell::new(None),
+        }
+    }
+
+    /// Route rasterization to `tx`'s worker instead of doing it inline.
+    ///
+    /// Separate from construction because an icon-theme change *replaces* the whole cache and the
+    /// worker outlives it — one thread for the session, re-pointed at each new cache.
+    pub fn set_worker(&mut self, tx: mpsc::Sender<SymbolicRequest>) {
+        self.raster_tx = Some(tx);
+    }
+
+    /// File a finished rasterization. `true` when it changed anything, i.e. when a redraw is worth
+    /// queueing. Results stamped with another cache's generation are dropped — see `generation`.
+    pub fn apply_rasterized(&mut self, done: SymbolicRasterized) -> bool {
+        if done.generation != self.generation {
+            return false;
+        }
+        self.in_flight.get_mut().remove(&done.key);
+        self.buffers.get_mut().insert(done.key, done.buffer);
+        true
+    }
+
+    /// Queue `key` for the worker, once. No-op without a worker, and the caller then rasterizes
+    /// inline.
+    fn request(&self, name: &str, key: &SymbolicKey, scale: f64, color: [f32; 4]) {
+        let Some(tx) = self.raster_tx.as_ref() else {
+            return;
+        };
+        if !self.in_flight.borrow_mut().insert(key.clone()) {
+            return;
+        }
+        let req = SymbolicRequest {
+            key: key.clone(),
+            name: name.to_owned(),
+            themes: self.themes.clone(),
+            scale,
+            color,
+            generation: self.generation,
+        };
+        if tx.send(req).is_err() {
+            // The worker is gone; stop pretending it will answer, or this key never retries.
+            self.in_flight.borrow_mut().remove(key);
         }
     }
 
@@ -118,15 +183,11 @@ impl IconCache {
     /// caller is [`texture`](Self::texture), on a miss, so an icon already on the GPU
     /// never reaches here.
     fn rasterize(&self, name: &str, px: u32, scale: f64, color: [f32; 4]) -> Option<MemoryBuffer> {
-        let result = if let Some(bytes) = embedded_icon(name) {
-            rasterize_symbolic_bytes(bytes, px, color, scale)
-        } else {
-            let path = self.resolve(name)?;
-            rasterize_symbolic(&path, px, color, scale)
-        };
-        result
-            .map_err(|err| tracing::warn!("failed to rasterize icon {name:?}: {err:#}"))
-            .ok()
+        if embedded_icon(name).is_none() {
+            // Populate the path cache on the way through, which is what `resolve` is for.
+            self.resolve(name)?;
+        }
+        rasterize_symbolic_in(name, &self.themes, px, color, scale)
     }
 
     /// The uploaded texture for a symbolic icon — the form every caller wants, since
@@ -152,7 +213,29 @@ impl IconCache {
             return Some(tb.clone());
         }
 
-        let buffer = self.rasterize(name, key.1, scale, color)?;
+        // Rasterized pixels waiting for a renderer: this is the only place one exists.
+        let ready = self.buffers.borrow_mut().remove(&key);
+        let buffer = match ready {
+            // A negative — no theme provides it. Put it back so the miss below does not re-queue.
+            Some(None) => {
+                self.buffers.borrow_mut().insert(key, None);
+                return None;
+            }
+            Some(Some(buffer)) => buffer,
+            None if self.raster_tx.is_some() => {
+                // Off to the worker; nothing to draw this frame. GNOME does the same — a
+                // `St.Icon` miss returns an *invisible actor of the right size* and fills the
+                // texture in asynchronously (`st-texture-cache.c` `st_texture_cache_load_gicon`,
+                // "the texture will be filled asynchronously"), deduping outstanding requests the
+                // way `in_flight` does. Callers size themselves from `logical_px`, never from us,
+                // so only the pixels arrive late — the layout does not move.
+                self.request(name, &key, scale, color);
+                return None;
+            }
+            // No worker (headless tests): the old inline path, unchanged.
+            None => self.rasterize(name, key.1, scale, color)?,
+        };
+
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
                 self.textures.borrow_mut().insert(key, tb.clone());
@@ -166,9 +249,96 @@ impl IconCache {
     }
 }
 
+/// A symbolic icon's identity: the name, the *physical* pixel size (so scale is folded in), and
+/// the quantized tint — the three things that change the pixels.
+pub type SymbolicKey = (String, u32, u32);
+
+/// Handed to the rasterize worker. Carries the theme list rather than borrowing the cache, so the
+/// worker outlives an icon-theme change without holding it alive.
+pub struct SymbolicRequest {
+    key: SymbolicKey,
+    name: String,
+    themes: Vec<String>,
+    scale: f64,
+    color: [f32; 4],
+    generation: u64,
+}
+
+/// A finished rasterization on its way back to the loop, for [`IconCache::apply_rasterized`].
+/// `None` means no theme provides the icon; it is cached as a negative so the probe — up to a few
+/// hundred `stat`s across themes and categories — happens once rather than every frame.
+pub struct SymbolicRasterized {
+    key: SymbolicKey,
+    buffer: Option<MemoryBuffer>,
+    generation: u64,
+}
+
+/// Hands `IconCache` a thread that resolves and rasterizes symbolic icons, returning the request
+/// sink for [`IconCache::set_worker`]. Finished icons arrive on `result_tx`, which the caller
+/// registers as a calloop source feeding [`IconCache::apply_rasterized`].
+///
+/// This exists because resolving *and* rasterizing used to happen inline on the compositor thread,
+/// inside element collection: an unresolvable name costs `base_dirs × themes × 2 × 10` `stat`s
+/// before it gives up, and a resolved one adds a file read plus an SVG parse (~53 µs measured per
+/// icon warm, ~1.3 ms for a quick-settings popover's worth, and page-cache-cold reads are much
+/// worse — the font prewarm found a 35× swing). None of it belongs on the thread that has 16.67 ms
+/// to hand a frame to KMS.
+pub fn spawn_symbolic_worker(
+    result_tx: CalloopSender<SymbolicRasterized>,
+) -> Option<mpsc::Sender<SymbolicRequest>> {
+    let (req_tx, req_rx) = mpsc::channel::<SymbolicRequest>();
+    let spawned = std::thread::Builder::new()
+        .name("symbolic-icon".to_owned())
+        .spawn(move || {
+            // Ends when the sender (held by `IconCache`) is dropped.
+            for req in req_rx {
+                // Theme SVGs are not ours; a malformed one that panics the rasterizer must become
+                // a negative result, not a dead worker. Same rule as the app-icon worker.
+                let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rasterize_symbolic_in(&req.name, &req.themes, req.key.1, req.color, req.scale)
+                }))
+                .unwrap_or(None);
+                let done = SymbolicRasterized {
+                    key: req.key,
+                    buffer,
+                    generation: req.generation,
+                };
+                if result_tx.send(done).is_err() {
+                    break;
+                }
+            }
+        });
+    match spawned {
+        Ok(_) => Some(req_tx),
+        Err(err) => {
+            tracing::warn!("error spawning the symbolic-icon worker, rasterizing inline: {err:?}");
+            None
+        }
+    }
+}
+
+/// Resolve `name` against `themes` and rasterize it. The whole of what the worker does, and what
+/// [`IconCache::rasterize`] does inline when there is no worker.
+fn rasterize_symbolic_in(
+    name: &str,
+    themes: &[String],
+    px: u32,
+    color: [f32; 4],
+    scale: f64,
+) -> Option<MemoryBuffer> {
+    let result = if let Some(bytes) = embedded_icon(name) {
+        rasterize_symbolic_bytes(bytes, px, color, scale)
+    } else {
+        rasterize_symbolic(&resolve_symbolic(name, themes)?, px, color, scale)
+    };
+    result
+        .map_err(|err| tracing::warn!("failed to rasterize icon {name:?}: {err:#}"))
+        .ok()
+}
+
 /// [`IconCache::textures`]'s key: the name, the *physical* pixel size (so scale is
 /// folded in), and the quantized tint — the three things that change the pixels.
-fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> (String, u32, u32) {
+fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> SymbolicKey {
     let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
     (name.to_string(), px, color_key(color))
 }
@@ -981,6 +1151,116 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a cached negative is not re-requested"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    fn cache_with_worker() -> (IconCache, mpsc::Receiver<SymbolicRequest>) {
+        let mut cache = IconCache::new("Adwaita");
+        let (tx, rx) = mpsc::channel();
+        cache.set_worker(tx);
+        (cache, rx)
+    }
+
+    /// A miss is queued **once**, not once a frame. Without this the render path would re-send the
+    /// same icon on every frame until the worker answered — which for an icon no theme provides
+    /// means a few hundred `stat`s per frame, forever, since a negative never becomes a hit.
+    #[test]
+    fn a_miss_is_queued_once() {
+        let (cache, rx) = cache_with_worker();
+        let key = icon_key("night-light-symbolic", 16., 2., [1., 1., 1., 1.]);
+
+        for _ in 0..5 {
+            cache.request("night-light-symbolic", &key, 2., [1., 1., 1., 1.]);
+        }
+
+        assert_eq!(
+            rx.try_iter().count(),
+            1,
+            "the same miss was queued repeatedly"
+        );
+    }
+
+    /// The theme-change trap. An icon-theme change *replaces* the cache rather than clearing it,
+    /// so a rasterization the previous cache started can still arrive afterwards — carrying a key
+    /// that matches (name/size/tint say nothing about the theme) and pixels from the old theme.
+    /// Filing it would leave the new theme showing an old icon until something else invalidated it.
+    #[test]
+    fn a_result_from_a_previous_cache_is_dropped() {
+        let (mut cache, _rx) = cache_with_worker();
+        let key = icon_key("night-light-symbolic", 16., 2., [1., 1., 1., 1.]);
+
+        let stale = SymbolicRasterized {
+            key: key.clone(),
+            buffer: None,
+            generation: cache.generation.wrapping_sub(1),
+        };
+        assert!(
+            !cache.apply_rasterized(stale),
+            "a result from another cache was accepted"
+        );
+        assert!(
+            !cache.buffers.borrow().contains_key(&key),
+            "a result from another cache reached the buffer map"
+        );
+
+        let ours = SymbolicRasterized {
+            key: key.clone(),
+            buffer: None,
+            generation: cache.generation,
+        };
+        assert!(cache.apply_rasterized(ours), "our own result was dropped");
+        assert!(cache.buffers.borrow().contains_key(&key));
+    }
+
+    /// A negative (no theme provides the icon) is remembered, so the resolve probe runs once
+    /// rather than every frame. `apply_rasterized` clears `in_flight`, and the stored `None` is
+    /// what stops the next frame re-queueing.
+    #[test]
+    fn a_negative_result_is_remembered_and_not_requeued() {
+        let (mut cache, rx) = cache_with_worker();
+        let key = icon_key("definitely-not-an-icon-xyz", 16., 2., [1., 1., 1., 1.]);
+
+        cache.request("definitely-not-an-icon-xyz", &key, 2., [1., 1., 1., 1.]);
+        assert_eq!(rx.try_iter().count(), 1);
+
+        let miss = SymbolicRasterized {
+            key: key.clone(),
+            buffer: None,
+            generation: cache.generation,
+        };
+        cache.apply_rasterized(miss);
+        assert!(
+            cache.in_flight.borrow().is_empty(),
+            "the key stayed in flight, so it can never be retried"
+        );
+        assert!(
+            matches!(cache.buffers.borrow().get(&key), Some(None)),
+            "the negative was not cached, so the resolve probe runs again every frame"
+        );
+    }
+
+    /// Without a worker — every headless test, and any session where the thread failed to spawn —
+    /// the inline path must still produce pixels. This is what keeps the whole existing render
+    /// corpus meaningful after the hoist.
+    #[test]
+    fn without_a_worker_rasterization_still_happens_inline() {
+        let cache = IconCache::new("Adwaita");
+        let Some(name) = ["night-light-symbolic", "weather-clear-night-symbolic"]
+            .into_iter()
+            .find(|n| cache.resolve(n).is_some())
+        else {
+            eprintln!("skipping: no Adwaita symbolic icons installed");
+            return;
+        };
+
+        assert!(
+            cache.rasterize(name, 32, 1., [1., 1., 1., 1.]).is_some(),
+            "the no-worker fallback stopped rasterizing"
         );
     }
 }
