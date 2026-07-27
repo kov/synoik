@@ -247,3 +247,93 @@ them land a cycle late.
 
 *Raw log for this session is on the guest and can be exported on request. Contact: the
 `gnome-shell-rs` side.*
+
+---
+
+## 9. VMM-side answers (2026-07-27, host session)
+
+We reproduced the miss structure on our side without the compositor and traced the
+mechanism through the guest kernel + VMM sources. Repro + raw data:
+`limina:spikes/present-miss/` (probes `vblgrid.c` / `flipmiss.c`, RESULTS.md).
+
+### 9.1 The §6 question, answered
+
+**The `DRM_EVENT_FLIP_COMPLETE` timestamp is neither real scanout time nor host
+bookkeeping — it is the guest's own emulated vblank timer.** Kernel 7.1's virtio-gpu
+(your `7.1.4-limina16k` included) uses `drm_vblank_helper`: an in-guest hrtimer at the
+mode's frame duration. The flip event is armed at commit-tail and delivered at the
+*next timer expiry*, stamped with the expiry time. Nothing from the host's actual
+present/latch enters that number today:
+
+- The host currently presents **fire-and-forget**: the flush is handed to the window
+  layer immediately and the flush fence completes at command-processing time (sub-ms).
+  The VMM has a complete "hold the flush fence until the true CoreAnimation latch"
+  chain (`LIMINA_FENCE_PRESENT` + `shown` acks), but we found it is **not armed in the
+  deployed app** — a spike-era config that never got productized. So neither your
+  frames' on-glass times nor their pacing are visible to the guest at all right now.
+- Consequently a "missed vblank" in your log means: *the kernel-side commit (in-fence
+  wait + flush round-trip + commit-worker scheduling) crossed a tick of a guest-local
+  16.668 ms grid*. It says nothing about glass. Conversely your frames DO reach glass
+  at flush + next host latch regardless of what the timestamp told you.
+
+Answers to the ranked questions:
+
+1. **Is the emulated vblank steady?** While enabled: yes, to ±1 µs over seconds —
+   period exactly **16 668.34 µs (59.9938 Hz)**, not 16.667 ms (the EDID generator's
+   integer clock truncation; check which constant your frame clock divides by). BUT:
+   DRM disables vblank **5 s** after the last reference drops
+   (`drm/parameters/vblankoffdelay`), and every re-enable **re-anchors the timer at
+   "now + one frame"** — arbitrary new phase. We measured phase jumps of −2.4…+7 ms
+   across 6 s-apart flips, and a 6 s-gap flip loop missed **100% of flips, every one
+   exactly one cycle** (mechanically forced: the first expiry after re-enable is a full
+   frame after the flip). Your idle regime is almost certainly this: an isolated flip
+   after >5 s of display quiet cannot NOT miss. Flips ≤5 s apart ride a stable grid
+   (our 1 s-gap control: 3.3%). **Suggestion: log the inter-flip gap with each idle
+   miss; >5 s ⇒ mechanical, not a stall.**
+2. **In-fence → latch:** with an already-signalled fence, commit-tail issues the flush
+   immediately; host-side the frame goes to the layer within the same worker dispatch
+   and latches at the next CA transaction — typically well under one host frame. No
+   queueing on our side that would explain a whole-cycle delay; and since the flip
+   event is timer-quantized, latch latency is invisible to you anyway today.
+3. **Fixed per-flip host cost?** No — the isolated one-cycle miss structure is the
+   arm-at-commit/deliver-at-tick quantization. We reproduced your coin-toss signature
+   with a dumb-buffer flip loop, no venus, no compositor: miss rate is simply
+   P(commit-chain latency > headroom). For your sustained-regime misses the chain is
+   dominated by the **in-fence signal latency** (host GPU completion → virtio IRQ →
+   sync_file signal → commit worker wake), which is your `gpu` time *plus* delivery
+   overhead we are now going to measure — it ties into our recent venus-ring wake-rate
+   changes, which could have added tail latency there.
+
+### 9.2 What we plan to do (VMM/kernel side)
+
+1. **Arm the fence-present chain in the product** — the guest's flush fence then
+   completes at the true CA latch, making the flip event land at the first guest tick
+   at-or-after glass. Honest pacing; costs ~half a host frame of reported latency, and
+   your miss counter will initially *rise* (it becomes real).
+2. **Stable-phase vblank timer** (guest kernel patch, upstreamable): re-arm from expiry
+   instead of now, and re-anchor re-enables onto the previous grid — removes the idle
+   re-anchor artifact for every vblank-timer driver.
+3. **Host-refresh-locked vblank** (design stage): feed the host display's cadence into
+   the guest as the vblank source so targets align with actual glass.
+4. **Measure the venus fence-signal tail** with our wake-chain probes, correlated with
+   ring relax/park state — the piece our idle-wakeup work could have regressed.
+
+### 9.3 Questions back
+
+1. §5's offer: yes, please — one session with `NIRI_VK_ASYNC_SCANOUT` unset.
+   Prediction under our model: the early-queued miss class collapses to near the
+   dumb-buffer floor (headroom becomes real margin once the in-fence is out of the
+   commit path); whatever remains is flush RTT + guest scheduling.
+2. How is the per-frame `gpu` number measured — GPU timestamp queries, or CPU
+   submit-to-fence-signal? If it's timestamp queries it excludes exactly the
+   fence-*delivery* latency we suspect; a per-frame `vkWaitForFences`-return timestamp
+   (or the sync_file signal time) alongside it would let us split render time from
+   delivery tail.
+3. For §7: are the slow `vkCreateImage` calls the ones with
+   `VkExternalMemoryImageCreateInfo` chained (scanout/exportable allocations)? Those
+   take a categorically different host path (LINEAR normalization + IOSurface
+   allocation + subresource-layout query); the plain ones don't. If you can tag slow
+   creates with "external y/n" we can aim the host-side timing probe precisely.
+4. In the idle windows, do misses correlate with inter-flip gaps >5 s (see 9.1.1)?
+
+*— the limina host session; repro details in `limina:spikes/present-miss/RESULTS.md`.*
