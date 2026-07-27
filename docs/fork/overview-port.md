@@ -623,29 +623,45 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   scope at that call site, used for `key_char`.) Fix belongs in a full keyboard-nav pass rather than
   a one-key patch: audit every UI surface that keys off `raw` for the same shifted-keysym blind spot,
   and pin Shift+Tab per surface. GNOME reference: `js/ui/search.js` / `st-focus-manager`.
-- **S11 — Overview scale / aspect-ratio pass (deferred, 2026-07-26).** Reported live: on the laptop's
-  **internal** display the overview's **rounded corners and the relative scale of its elements look
-  quite off** — sizes that read correctly on the 3840x2160 external panel do not on the smaller,
-  differently-shaped internal one. Not diagnosed yet; do not assume a cause. Known axes to separate
-  before touching any constant:
-  - **Which scale is in force.** The seat's `monitors.xml` pins `Virtual-1` at 3840x2160 / scale 2
-    (logical 1920x1080); the internal panel is a different connector at a different mode, so it falls
-    through to the guessed scale ([[output-scaling-monitors-xml]]). A logical size near 1024x665 makes
-    every fixed-px constant read twice as large relative to the screen — that is a *configuration*
-    outcome, not a layout bug, and has to be ruled in or out first.
-  - **Constants that should be logical but are physical (or the reverse).** Corner radii are the
-    tell-tale, because a radius is the one dimension that is visibly wrong at both ends: too round
-    reads as a wrong logical value, too crisp/aliased as a wrong scale tag
-    ([[vulkan-buffer-scale-tag-trap]]).
-  - **Overview geometry that keys off the output's aspect ratio** rather than its logical size —
-    workspace-preview slot fitting, the dash's share of the height, the workspace strip's reserved
-    band. GNOME 50.1 reference: `js/ui/workspacesView.js` + `js/ui/overviewControls.js`
-    (`ControlsManagerLayout.vfunc_allocate` computes the split from the actual allocation).
-  Method: per [[visual-bug-anchor-then-measure]], get a real reference screenshot at the internal
-  display's exact mode/scale and measure it *before* deriving anything. The headless `Fixture` can
-  reproduce an arbitrary mode+scale, so this is pinnable by a Vulkan render test at two shapes rather
-  than being live-only. Related and already fixed at a different layer: the expose xray was sampling
-  the backdrop unscaled (`39e25b69`) — that one is done, and is not this.
+- **S11 — Overview scale on the internal display (ROOT-CAUSED + FIXED, 2026-07-26; live validation
+  pending).** Reported live: on the laptop's **internal** display the overview's **rounded corners
+  and the relative scale of its elements look quite off** — sizes that read correctly on the
+  3840x2160 external panel do not on the smaller, differently-shaped internal one.
+  **Diagnosis (from the `(internal|external){,-grid}.png` screenshot pairs, measured in physical
+  px):** it was the first axis — *which scale is in force* — and nothing else. The chrome is
+  pixel-for-pixel the **same physical size** in both screenshots (search entry 704x80 at the same
+  y, clock glyphs 22px, dash Firefox clip 118x87; app grid keeps 8 columns and only its pitch
+  adapts, 360→215px), so every component rendered consistently at scale 2 with the same logical
+  constants — **not** a per-component divergence, and the corner radii were correct for the scale
+  in force. What was wrong is that scale 2 applied at all: the internal panel is the **same krun
+  connector `Virtual-1` at a different mode** (the VM window moving screens changes the mode,
+  3840x2160 ↔ 2048x1330, and the EDID with it), and `monitors_xml::setting_for` matched on
+  connector alone with `<mode>` parsed-but-ignored — so the scale 2 persisted *for the 4K mode*
+  was applied to 2048x1330, shrinking the desktop to a **1024x665 logical canvas**. Fixed-logical
+  chrome then legitimately eats ~2x the relative space while the workspace preview (which fits the
+  screen) shrinks; the grid's label center-clipping is just the pitch collapsing. mutter treats
+  the stored mode as part of the config: assignment fails when the mode isn't available
+  (`meta-monitor-config-manager.c:327` "Invalid mode") and `ensure_configured`
+  (`meta-monitor-manager.c:684`) falls back to the guessed default; stored configs are also keyed
+  on the full monitorspec set (`meta-monitor-config-store.c:2195`), so a changed EDID alone would
+  already unmatch them.
+  **Fix (`5a4d4458`, this branch):** parse `<mode>` into `MonitorSetting` and gate applicability
+  on the output's *current* mode (width/height exact, rate within mutter's
+  `MAXIMUM_REFRESH_RATE_DIFF` 0.001 — real mutter writes full-precision rates while our modes
+  carry integer mHz; no stored or current mode → no veto). Both consumers
+  (`reload_output_config`, `add_output`) pass the mode. With the store inapplicable the internal
+  mode falls to the DPI guess: 2048x1330 at 320x180mm → 1.25 → logical **1638x1064**. Pinned by
+  `saved_scale_is_pinned_to_its_mode` in `src/monitors_xml.rs`.
+  **Not fixed / follow-ups:** (1) `applied_display_config` (a config live-applied earlier in the
+  session) sits *above* the store in precedence and is keyed by connector only, so it can carry a
+  stale scale across a mode change the same way — mutter invalidates its "current" config when
+  the monitor set changes; ours should too. (2) The grid's label overflow is a center-clip with
+  no ellipsis (`waita De` for `Adwaita Demo`); GNOME ellipsizes. Cosmetic, only visible on tiny
+  logical widths. (3) The missing workspace-thumbnail strip in the internal shot is **not** a
+  bug: 2 workspaces there, 3 in the external shot, and GNOME's strip only shows above
+  `NUM_WORKSPACES_THRESHOLD = 2` (`workspaceThumbnail.js:16,697`). Related and already fixed at a
+  different layer: the expose xray was sampling the backdrop unscaled (`39e25b69`) — done, not
+  this.
 
 **Rough dependency order:** S1 → S2 → {S3, S4} → S5 → S6/S7 → S8 → S9+. S1 gates everything; S2 gates
 any icon rendering; S7 is independent and small.
