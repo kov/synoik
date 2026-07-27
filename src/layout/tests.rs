@@ -3903,6 +3903,99 @@ prop_compose! {
     }
 }
 
+#[test]
+fn dropping_on_the_strip_thumbnail_of_a_culled_workspace() {
+    // The thumbnails strip accepts a drop onto ANY workspace by index
+    // (`Monitor::insert_position`), including one scrolled far enough out of the overview that
+    // rendering culls it. The pre-strip path could not: it picks out of the culled iteration, so
+    // an `Existing` hint always named a visible workspace. `update_render_elements` still assumed
+    // that when it looked the hint's geometry up, and unwrapped a `None` — a live crash when
+    // dragging a window onto the strip.
+    let mut ops = vec![Op::AddOutput(1)];
+    for ws_name in 1..=8 {
+        ops.push(Op::AddNamedWorkspace {
+            ws_name,
+            output_name: Some(1),
+            layout_config: None,
+        });
+    }
+    ops.push(Op::AddWindow {
+        params: TestWindowParams::new(0),
+    });
+    ops.push(Op::ToggleOverview);
+    // Twice: the first advance is what flips `thumbnails_shown` and *starts* the strip's expand
+    // ease, so after one the strip is still at fraction 0 and thumbnail_strip() returns None.
+    ops.push(Op::AdvanceAnimations { msec_delta: 1000 });
+    ops.push(Op::AdvanceAnimations { msec_delta: 1000 });
+    let mut layout = check_ops(ops);
+    // The monitor only learns the overview progress inside update_render_elements, and the strip
+    // does not exist until it has: query it before this and thumbnail_strip() is None.
+    layout.update_render_elements(None);
+
+    // Aim at a workspace that the overview is not rendering, via its thumbnail.
+    let mon = layout.monitors().next().unwrap();
+    let strip = mon
+        .thumbnail_strip()
+        .expect("the overview should be showing the strip");
+    let visible: Vec<_> = mon
+        .workspaces_with_render_geo()
+        .map(|(ws, _)| ws.id())
+        .collect();
+    let (idx, _) = mon
+        .workspaces
+        .iter()
+        .enumerate()
+        .find(|(_, ws)| !visible.contains(&ws.id()))
+        // Without one, this test would pass for the wrong reason.
+        .expect("some workspace must be culled for this to test anything");
+    let thumb = strip.thumbs[idx];
+    let target = thumb.loc + Point::from((thumb.size.w / 2., thumb.size.h / 2.));
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::InteractiveMoveBegin {
+                window: 0,
+                output_idx: 1,
+                px: 100.,
+                py: 100.,
+            },
+            // The move stays in `Starting` until the accumulated delta crosses
+            // INTERACTIVE_MOVE_START_THRESHOLD; only `Moving` computes an insert hint.
+            Op::InteractiveMoveUpdate {
+                window: 0,
+                dx: 1000.,
+                dy: 1000.,
+                output_idx: 1,
+                px: 200.,
+                py: 200.,
+            },
+            Op::InteractiveMoveUpdate {
+                window: 0,
+                dx: 0.,
+                dy: 0.,
+                output_idx: 1,
+                px: target.x,
+                py: target.y,
+            },
+        ],
+    );
+
+    // Panicked here before the fix: update_insert_hint (called from here) lets the strip name a
+    // culled workspace, and the geometry lookup below it assumed a visible one.
+    layout.update_render_elements(None);
+
+    let mon = layout.monitors().next().unwrap();
+    assert!(
+        matches!(
+            mon.insert_hint.as_ref().map(|hint| hint.workspace),
+            Some(InsertWorkspace::Existing(_))
+        ),
+        "the strip should have taken the drop onto the culled workspace, got {:?}",
+        mon.insert_hint,
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: if std::env::var_os("RUN_SLOW_TESTS").is_none() {

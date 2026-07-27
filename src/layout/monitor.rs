@@ -1240,19 +1240,24 @@ impl<W: LayoutElement> Monitor<W> {
             }
         }
 
-        let mut insert_hint_ws_geo = None;
         let insert_hint_ws_id = self
             .insert_hint
             .as_ref()
             .and_then(|hint| hint.workspace.existing_id());
 
-        let background_radius = self.workspace_background_radius();
-        for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
-            ws.update_render_elements(is_active, background_radius);
+        // Deliberately NOT the culled iteration. A drop onto the thumbnail strip names a workspace
+        // by index (`insert_position`), so the hint can point at a workspace that is scrolled out
+        // of the overview and therefore culled from rendering — and it still needs its geometry.
+        // Harvesting this inside the culled loop below is what made that case unwrap a None.
+        let insert_hint_ws_geo = insert_hint_ws_id.and_then(|id| {
+            zip(self.workspaces.iter(), self.workspaces_render_geo())
+                .find(|(ws, _)| ws.id() == id)
+                .map(|(_, geo)| geo)
+        });
 
-            if Some(ws.id()) == insert_hint_ws_id {
-                insert_hint_ws_geo = Some(geo);
-            }
+        let background_radius = self.workspace_background_radius();
+        for (ws, _) in self.workspaces_with_render_geo_mut(true) {
+            ws.update_render_elements(is_active, background_radius);
         }
 
         self.insert_hint_render_loc = None;
@@ -1265,9 +1270,10 @@ impl<W: LayoutElement> Monitor<W> {
                             let view_size = ws.view_size();
 
                             // Make sure the hint is at least partially visible.
-                            if matches!(hint.position, InsertPosition::NewColumn(_)) {
+                            let clamp_to = insert_hint_ws_geo
+                                .filter(|_| matches!(hint.position, InsertPosition::NewColumn(_)));
+                            if let Some(geo) = clamp_to {
                                 let zoom = self.overview_zoom();
-                                let geo = insert_hint_ws_geo.unwrap();
                                 let geo = geo.downscale(zoom);
 
                                 area.loc.x = area.loc.x.max(-geo.loc.x - area.size.w / 2.);
