@@ -3640,6 +3640,10 @@ impl State {
             grab_offset,
             unpin: false,
         });
+        // An empty dash reserves its drop target for the duration of the drag, before
+        // any slot is computed — with nothing in the run there would otherwise be
+        // nothing to aim at (`_onItemDragBegin`, `dash.js:410-414`).
+        self.niri.dash.set_drag_active(true);
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
@@ -3691,6 +3695,7 @@ impl State {
         // *is* the drop position, so take it before clearing.
         let slot = self.niri.dash.drop_slot();
         self.niri.dash.set_drop_slot(None);
+        self.niri.dash.set_drag_active(false);
         if let Some(slot) = slot {
             self.pin_dragged_app(&drag.id, slot);
             self.niri.queue_redraw_all();

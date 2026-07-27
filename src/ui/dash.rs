@@ -115,6 +115,10 @@ const SHOW_APPS_FG: [f32; 4] = [0.980, 0.980, 0.984, 1.];
 /// The show-apps button glyph (`view-app-grid-symbolic`, `dash.js:216`).
 const SHOW_APPS_ICON: &str = "view-app-grid-symbolic";
 
+/// The empty-dash drop target's side (`$dash_placeholder_size`, `_dash.scss:6,42-45`).
+/// Space only: `.empty-dash-drop-target` sets a width and a height and nothing else.
+const EMPTY_DROP_TARGET_PX: f64 = 32.;
+
 /// Separator line width (`.dash-separator`, `_dash.scss:84`).
 const SEPARATOR_W: f64 = 1.;
 /// Separator side margins (`$base_margin`, `_dash.scss:85-86`).
@@ -209,6 +213,12 @@ pub struct Dash {
     /// pure gap — 50.1's `.placeholder` has `background-image: none`
     /// (`_dash.scss:35-40`), so there is nothing to paint, only space to make.
     drop_slot: Option<usize>,
+    /// Whether an app-icon drag is in flight anywhere. Only the empty dash cares: with
+    /// no icons there is nothing to aim at, so gnome-shell reserves a placeholder-sized
+    /// target for the duration of the drag (`EmptyDropTargetItem`, inserted in
+    /// `_onItemDragBegin` and dropped in `_endItemDrag`, `dash.js:410-414,429-434`).
+    /// Like the gap it is pure space — `.empty-dash-drop-target` sets only a size.
+    drag_active: bool,
     hovered: Option<DashHit>,
     cache: RefCell<DashCache>,
 }
@@ -226,6 +236,7 @@ impl Dash {
             n_favorites: 0,
             content_rev: 0,
             drop_slot: None,
+            drag_active: false,
             hovered: None,
             cache: RefCell::new(DashCache::default()),
         }
@@ -262,6 +273,19 @@ impl Dash {
     /// The open drop gap, if any — what a drop lands on.
     pub fn drop_slot(&self) -> Option<usize> {
         self.drop_slot
+    }
+
+    /// Tell the dash an app-icon drag began or ended. Returns whether it changed: on an
+    /// *empty* dash this reserves (or releases) the drop target that gives the drag
+    /// something to aim at, which resizes the pill.
+    pub fn set_drag_active(&mut self, active: bool) -> bool {
+        if self.drag_active == active {
+            return false;
+        }
+        self.drag_active = active;
+        // Only an empty dash changes shape, but the flag is cheap and the caller
+        // redraws for the drag anyway.
+        self.items.is_empty()
     }
 
     /// Where a drag carrying `dragged_id` would drop, as an index into the favourites,
@@ -305,6 +329,13 @@ impl Dash {
         let rel = pos.x - run.loc.x;
         if rel < 0. || rel >= box_w {
             return None;
+        }
+
+        // "Always insert at the start when dash is empty" (`dash.js:894-895`) — with no
+        // icons the box is just the reserved target, and all of it is slot 0. (Not
+        // reachable without one: an empty dash with no drag has `box_w == 0`.)
+        if self.items.is_empty() {
+            return Some(0);
         }
 
         // ...and `boxWidth`/`numChildren` then take out the placeholder and separator.
@@ -428,21 +459,28 @@ impl Dash {
         (self.n_favorites > 0 && self.n_favorites < self.items.len()).then_some(self.n_favorites)
     }
 
-    fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
-        self.layout_with(area, self.drop_slot)
+    /// Width the empty-dash drop target reserves in the run, if it is up: only while a
+    /// drag is in flight *and* there are no icons at all (`dash.js:410-414`). Without it
+    /// an empty dash is a bare show-apps button with nowhere to drop the first
+    /// favourite.
+    fn empty_drop_target_w(&self) -> f64 {
+        if self.drag_active && self.items.is_empty() {
+            EMPTY_DROP_TARGET_PX
+        } else {
+            0.
+        }
     }
 
-    /// The layout with an explicit drop gap, so the drop-position math can measure the
-    /// run *without* one — gnome-shell keeps the placeholder out of that calculation
-    /// (`dash.js:878-886`), otherwise the gap it just opened would move the next answer.
-    fn layout_with(&self, area: Rectangle<f64, Logical>, drop_slot: Option<usize>) -> DashLayout {
+    fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
         let n = self.items.len();
         let count = n + 1; // + show-apps
+        let drop_slot = self.drop_slot;
         let gap = if drop_slot.is_some() {
             ITEM_ADVANCE
         } else {
             0.
         };
+        let empty_target = self.empty_drop_target_w();
         let separator_after = self.separator_after();
         let separator_space = if separator_after.is_some() {
             SEPARATOR_ADVANCE
@@ -452,7 +490,7 @@ impl Dash {
 
         // The pill is the dash-background node wrapped around the icon run (its
         // content): width = the run, height = one tile; padding adds the rest.
-        let run_w = ITEM_ADVANCE * count as f64 + separator_space + gap;
+        let run_w = ITEM_ADVANCE * count as f64 + separator_space + gap + empty_target;
         let pill_size = DASH_BACKGROUND.allocation_for(Size::from((run_w, TILE)));
         let pill_x = (area.loc.x + (area.size.w - pill_size.w) / 2.).round();
         let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - pill_size.h).round();
@@ -470,10 +508,16 @@ impl Dash {
             Some(at) if k >= at => gap,
             _ => 0.,
         };
+        // The empty drop target is inserted at the front of the box (`dash.js:412`), so
+        // everything — which is only ever the show-apps button — follows it.
         let tiles = (0..count)
             .map(|k| {
-                let tile_left =
-                    run.loc.x + ITEM_ADVANCE * k as f64 + shift(k) + gap_shift(k) + ITEM_MARGIN;
+                let tile_left = run.loc.x
+                    + ITEM_ADVANCE * k as f64
+                    + shift(k)
+                    + gap_shift(k)
+                    + empty_target
+                    + ITEM_MARGIN;
                 Rectangle::new(
                     Point::from((tile_left, run.loc.y)),
                     Size::from((TILE, TILE)),
@@ -553,6 +597,12 @@ impl Dash {
     #[cfg(test)]
     pub fn show_apps_index(&self) -> usize {
         self.items.len()
+    }
+
+    /// The background pill's box within `area` (for the corpus).
+    #[cfg(test)]
+    pub fn pill_box(&self, area: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        self.layout(area).pill
     }
 
     /// The separator box within `area`, if one is drawn (for the corpus).

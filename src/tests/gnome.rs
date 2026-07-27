@@ -6173,6 +6173,64 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
     );
 }
 
+/// An empty dash is a bare show-apps button, with no run to aim a drop at. gnome-shell
+/// reserves a placeholder-sized target for the duration of the drag
+/// (`EmptyDropTargetItem`, `dash.js:410-414`) and forces the slot to 0
+/// (`dash.js:894-895`), which is what makes pinning the *first* favourite possible at
+/// all.
+#[test]
+fn overview_an_empty_dash_reserves_a_drop_target_while_dragging() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(&["a.desktop"], &[]);
+    assert_eq!(
+        f.niri().dash.item_id(0),
+        None,
+        "the dash must start empty for this to be the empty-dash path"
+    );
+
+    let area = overview_controls(&mut f).dash;
+    let idle_w = f.niri().dash.pill_box(area).size.w;
+
+    let grid_area = overview_controls(&mut f).app_display;
+    let from = f
+        .niri()
+        .app_grid
+        .entry_center(0, grid_area)
+        .expect("grid tile 0");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from.x, from.y + 40.);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+
+    let pill = f.niri().dash.pill_box(area);
+    assert_eq!(
+        pill.size.w - idle_w,
+        32.,
+        "the drag must reserve `$dash_placeholder_size` of run for the drop target"
+    );
+
+    // Anywhere in that reserved run is slot 0.
+    pointer_motion_to(&mut f, pill.loc.x + 15., pill.loc.y + 50.);
+    assert_eq!(
+        f.niri().dash.drop_slot(),
+        Some(0),
+        "an empty dash always drops at the start"
+    );
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        dash_favorites(&mut f),
+        vec!["a.desktop"],
+        "the drop must pin the first favourite"
+    );
+    assert_eq!(
+        f.niri().dash.pill_box(area).size.w,
+        idle_w + 80.,
+        "and the target must be released, leaving the pill one tile wider than empty"
+    );
+}
+
 /// The show-apps button doubles as the unpin target for the duration of a drag:
 /// gnome-shell relabels it and hovers it (`ShowAppsIcon.setDragApp`, `dash.js:236-247`)
 /// and its `acceptDrop` removes the favourite (`dash.js:256-270`). Dropping there is
