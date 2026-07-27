@@ -1085,8 +1085,10 @@ window selection — the published digits should be read as ±0.03, not as exact
 
 ### 19.1 Like-for-like: the scripted workload, before and after
 
-Six pre-0051 driver runs (12:35-13:00, boot -1) against four post-0051 runs. Run 1 of the new set was
-discarded: a stray click landed in it, and a commit hook ran `cargo clippy` inside it.
+Five pre-0051 driver runs (12:38:12-13:00:33, boot -1 — two of them the §16 fence-present arms, which
+§16 found do not differ) against four post-0051 runs. Run 1 of the new set was discarded: a stray
+click landed in it, and a commit hook ran `cargo clippy` inside it. Every run behind these numbers is
+inventoried in `docs/fork/present-misses-runs.md`, with the journal slices to recover it.
 
 | draws band | before flips | before rate | after flips | after rate | ratio |
 |---|---|---|---|---|---|
