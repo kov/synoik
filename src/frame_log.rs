@@ -645,6 +645,25 @@ struct Parked {
 /// short GPU total beats a frame that never appears in the log at all.
 const MAX_PARKED_FRAMES: usize = 4;
 
+/// What a frame actually cost, which is not what it *took* once the CPU stopped waiting for the
+/// GPU.
+///
+/// `total` is wall time on the compositor thread. Under a synchronous finish that already contains
+/// the GPU, because the thread parked on the fence — so adding [`Totals::gpu`] would double-count.
+/// Under async scanout the thread walks away and the GPU work lands on the flip instead, so `total`
+/// contains none of it and the budget verdict built on `total` alone reads **every frame as
+/// comfortable**: a live seat reported "0 over budget" for a session in which 19% of deep-overview
+/// frames needed more than a refresh interval of CPU + GPU (p50 13.83 ms, p90 16.98 ms).
+///
+/// [`Totals::retiring`] is how long the frame *did* park, so `gpu - retiring` is the GPU time
+/// nobody waited for, and one expression is right in both configurations — and in the mixed case
+/// where a frame defers its scanout but still waits on an offscreen. It is an upper bound: GPU
+/// execution can overlap the CPU recording that follows it, so the true cost is somewhere between
+/// `total` and this.
+fn frame_cost(total: Duration, totals: &Totals) -> Duration {
+    total + totals.gpu.saturating_sub(totals.retiring)
+}
+
 /// See the [module docs](self).
 #[derive(Debug)]
 pub struct FrameLog {
@@ -908,7 +927,8 @@ impl FrameLog {
             budget,
             ..
         } = parked;
-        let over = budget.is_some_and(|budget| total > budget);
+        let cost = frame_cost(total, &totals);
+        let over = budget.is_some_and(|budget| cost > budget);
 
         if over || settings.log_all {
             let line = Self::format_frame(&frame, total, &totals, budget);
@@ -919,12 +939,13 @@ impl FrameLog {
             }
         }
 
-        self.stats.entry(frame.output).or_default().record(
-            total,
-            over,
-            totals.gpu,
-            totals.gpu_lost,
-        );
+        // The summary's percentiles are the same quantity its over-budget count is, or the two
+        // disagree: "p50 1.24ms, 0 over budget" was a true statement about a session whose frames
+        // needed 13.83ms.
+        self.stats
+            .entry(frame.output)
+            .or_default()
+            .record(cost, over, totals.gpu, totals.gpu_lost);
     }
 
     fn format_frame(
@@ -934,6 +955,12 @@ impl FrameLog {
         budget: Option<Duration>,
     ) -> String {
         let mut line = format!("frame on {} took {}", frame.output, ms(total));
+        // Only when the two differ, i.e. only when the frame walked away from GPU work that
+        // `took` therefore does not contain. See [`frame_cost`].
+        let cost = frame_cost(total, totals);
+        if cost != total {
+            let _ = write!(line, " +{} unwaited GPU = {}", ms(cost - total), ms(cost));
+        }
         if let Some(budget) = budget {
             let _ = write!(line, " (budget {})", ms(budget));
         }
@@ -1905,5 +1932,81 @@ mod tests {
         log.queued("out", late, late + Duration::from_millis(2));
         log.presented("out", late, late + refresh, Some(refresh));
         assert_eq!(headroom(&log), [4000, -2000]);
+    }
+
+    /// A frame that walked away from its GPU work still cost that work, and the budget verdict has
+    /// to say so — while a frame that *waited* must not be charged for it twice.
+    ///
+    /// Under async scanout the compositor thread does not park on the scanout fence, so `took`
+    /// stops containing GPU execution and every frame reads as comfortable. The live seat reported
+    /// "0 over budget" across a session where 19% of deep-overview frames needed more than a
+    /// refresh interval of CPU + GPU. Under a synchronous finish the same `took` already contains
+    /// the GPU, so the naive fix double-counts and flags healthy frames.
+    #[test]
+    fn a_frame_is_charged_for_gpu_work_it_did_not_wait_for() {
+        let gpu = Duration::from_millis(9);
+        let deferred = Totals {
+            gpu,
+            retiring: Duration::ZERO,
+            ..Totals::default()
+        };
+        let waited = Totals {
+            gpu,
+            retiring: Duration::from_millis(10),
+            ..Totals::default()
+        };
+
+        let cpu = Duration::from_millis(4);
+        assert_eq!(
+            frame_cost(cpu, &deferred),
+            Duration::from_millis(13),
+            "a deferred frame's GPU time is not on its thread, but it is still on its deadline"
+        );
+
+        // The synchronous shape: `took` is the CPU work *plus* the park, and the park covers the
+        // GPU. Charging it again would call a 14ms frame a 23ms one.
+        let took = cpu + Duration::from_millis(10);
+        assert_eq!(
+            frame_cost(took, &waited),
+            took,
+            "a frame that parked on its fence was charged for the GPU twice"
+        );
+
+        // Mixed, which is the real seat: the scanout defers while an offscreen still waits.
+        let partly = Totals {
+            gpu,
+            retiring: Duration::from_millis(3),
+            ..Totals::default()
+        };
+        assert_eq!(frame_cost(cpu, &partly), Duration::from_millis(10));
+    }
+
+    /// The verdict and the percentiles must be the same quantity, or a summary can report a p50
+    /// well under budget beside a nonzero over-budget count and mean both.
+    #[test]
+    fn the_budget_verdict_and_the_summary_agree() {
+        let _ = take_gpu_samples();
+        let mut log = test_log();
+        let budget = Duration::from_millis(16);
+
+        log.begin("out");
+        promise_gpu_samples(1);
+        let seq = log.in_flight.as_ref().unwrap().seq;
+        log.end(Some(budget));
+        // A frame whose CPU time is trivial but whose GPU work blows the budget on its own.
+        add_gpu_time(seq, Duration::from_millis(20));
+        log.flush_parked(log.settings.unwrap());
+
+        let stats = &log.stats["out"];
+        assert_eq!(stats.frames, 1);
+        assert_eq!(
+            stats.over_budget, 1,
+            "a frame needing 20ms of GPU against a 16ms budget was reported as comfortable"
+        );
+        assert!(
+            stats.worst >= Duration::from_millis(20),
+            "the summary's worst frame ignores the GPU time the verdict counted: {:?}",
+            stats.worst
+        );
     }
 }
