@@ -2432,7 +2432,9 @@ impl State {
             let applied = self.niri.applied_display_config.get(&name.connector);
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
-            let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
+            let saved = monitors_config
+                .as_ref()
+                .and_then(|m| m.setting_for(name, output.current_mode()));
 
             let scale = applied
                 .and_then(|a| a.scale)
@@ -4052,7 +4054,9 @@ impl Niri {
         // first frame, not just on reload), then the KDL config, then the DPI guess.
         let applied = self.applied_display_config.get(&name.connector);
         let monitors_config = crate::monitors_xml::MonitorsConfig::load();
-        let saved = monitors_config.as_ref().and_then(|m| m.setting_for(name));
+        let saved = monitors_config
+            .as_ref()
+            .and_then(|m| m.setting_for(name, output.current_mode()));
         let scale = applied
             .and_then(|a| a.scale)
             .or_else(|| saved.map(|s| s.scale))

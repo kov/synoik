@@ -17,9 +17,10 @@ use niri_config::OutputName;
 use smithay::utils::Transform;
 
 /// One saved logical-monitor setting for a single physical monitor, flattened out of the
-/// `<logicalmonitor>`/`<monitor>` nesting. We keep only what we apply today (scale + transform);
-/// position/mode/primary are parsed-but-ignored for now (single-monitor is the common case and the
-/// preferred mode already matches — see the module TODO).
+/// `<logicalmonitor>`/`<monitor>` nesting. We keep what we apply today (scale + transform) plus
+/// the `<mode>` the setting was saved *for*; position/primary are parsed-but-ignored for now
+/// (single-monitor is the common case and the preferred mode already matches — see the module
+/// TODO).
 #[derive(Debug, Clone)]
 pub struct MonitorSetting {
     /// EDID/DRM connector, e.g. `Virtual-1` — the primary match key.
@@ -28,8 +29,35 @@ pub struct MonitorSetting {
     pub product: Option<String>,
     /// `<serial>` (≈ niri's `OutputName.serial`), likewise corroborating.
     pub serial: Option<String>,
+    /// The `<mode>` this setting was saved for. In mutter a stored config is only applicable if
+    /// this mode can actually be assigned on the monitor (`meta-monitor-config-manager.c:327`
+    /// fails with "Invalid mode" otherwise, and `ensure_configured` then falls through to the
+    /// guessed default) — a saved scale is a judgement about *that mode's* pixel density, not
+    /// about the connector forever. We approximate with "matches the current mode" since we
+    /// don't set modes from the store. `None` (absent in the XML) applies unconditionally.
+    pub mode: Option<SavedMode>,
     pub scale: f64,
     pub transform: Transform,
+}
+
+/// The `<mode>` element of a saved `<monitor>`: what the monitor was running when the setting was
+/// persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct SavedMode {
+    pub width: i32,
+    pub height: i32,
+    /// Refresh rate in Hz; mutter compares rates with a 0.001 tolerance
+    /// (`meta-monitor.c` `MAXIMUM_REFRESH_RATE_DIFF`).
+    pub rate: f64,
+}
+
+impl SavedMode {
+    /// Whether this saved mode is the given current mode, with mutter's refresh-rate tolerance.
+    fn matches(&self, current: smithay::output::Mode) -> bool {
+        self.width == current.size.w
+            && self.height == current.size.h
+            && (self.rate - f64::from(current.refresh) / 1000.).abs() < 0.001
+    }
 }
 
 impl MonitorSetting {
@@ -135,10 +163,22 @@ impl MonitorsConfig {
                 let Some(connector) = text(spec, "connector") else {
                     continue;
                 };
+                let mode = monitor
+                    .children()
+                    .find(|c| c.has_tag_name("mode"))
+                    .and_then(|m| {
+                        let num = |tag: &str| text(m, tag)?.parse::<f64>().ok();
+                        Some(SavedMode {
+                            width: num("width")? as i32,
+                            height: num("height")? as i32,
+                            rate: num("rate")?,
+                        })
+                    });
                 settings.push(MonitorSetting {
                     connector,
                     product: text(spec, "product"),
                     serial: text(spec, "serial"),
+                    mode,
                     scale,
                     transform,
                 });
@@ -148,31 +188,42 @@ impl MonitorsConfig {
         Ok(Self { settings })
     }
 
-    /// The saved setting for `name`, if any (`None` → use the DPI guess). The **connector** is the
-    /// match key: unique per session and the one field the writer and reader represent identically.
-    /// If several saved entries share the connector (a monitor saved in more than one layout, or a
-    /// different physical panel previously on the same port) we prefer the one whose product+serial
-    /// also corroborate, else fall back to the first. (Divergence from mutter's whole-connected-set
-    /// matching, noted in the module docs — correct for the single-monitor case and self-correcting
-    /// otherwise: the user just re-picks the scale, which re-persists.)
-    pub fn setting_for(&self, name: &OutputName) -> Option<&MonitorSetting> {
-        let mut by_connector = self
-            .settings
-            .iter()
-            .filter(|s| s.connector == name.connector);
+    /// The saved setting for `name` at `current_mode`, if any (`None` → use the DPI guess). The
+    /// **connector** is the match key: unique per session and the one field the writer and reader
+    /// represent identically. A setting whose stored `<mode>` differs from the current mode is
+    /// **not applicable** — the same connector at a different mode is effectively a different
+    /// display (the krun window moving between the internal and an external screen changes the
+    /// mode under a fixed `Virtual-1`), and mutter likewise rejects a stored config whose mode
+    /// can't be assigned, falling back to the guess (`meta-monitor-manager.c`
+    /// `ensure_configured`). If several applicable entries share the connector (a monitor saved
+    /// in more than one layout, or a different physical panel previously on the same port) we
+    /// prefer the one whose product+serial also corroborate, else fall back to the first.
+    /// (Divergence from mutter's whole-connected-set matching, noted in the module docs — correct
+    /// for the single-monitor case and self-correcting otherwise: the user just re-picks the
+    /// scale, which re-persists.)
+    pub fn setting_for(
+        &self,
+        name: &OutputName,
+        current_mode: Option<smithay::output::Mode>,
+    ) -> Option<&MonitorSetting> {
+        let applicable = |s: &&MonitorSetting| {
+            s.connector == name.connector
+                && match (s.mode, current_mode) {
+                    (Some(saved), Some(current)) => saved.matches(current),
+                    // No stored mode (foreign/hand-edited XML) or no current mode: don't veto.
+                    _ => true,
+                }
+        };
+        let mut by_connector = self.settings.iter().filter(applicable);
         let first = by_connector.next()?;
         // Fast path: a single entry for this connector — use it regardless of product/serial.
-        let Some(second) = by_connector.next() else {
+        if by_connector.next().is_none() {
             return Some(first);
-        };
+        }
         // Multiple: prefer a corroborating entry, else the first.
-        [first, second]
-            .into_iter()
-            .chain(
-                self.settings
-                    .iter()
-                    .filter(|s| s.connector == name.connector),
-            )
+        self.settings
+            .iter()
+            .filter(applicable)
             .find(|s| s.corroborates(name))
             .or(Some(first))
     }
@@ -330,6 +381,13 @@ mod tests {
         }
     }
 
+    fn mode(width: i32, height: i32, rate: f64) -> Option<smithay::output::Mode> {
+        Some(smithay::output::Mode {
+            size: (width, height).into(),
+            refresh: (rate * 1000.).round() as i32,
+        })
+    }
+
     const KOV_XML: &str = r#"<monitors version="2">
   <configuration>
     <layoutmode>logical</layoutmode>
@@ -358,23 +416,58 @@ mod tests {
     #[test]
     fn parses_and_matches_real_monitors_xml() {
         let cfg = MonitorsConfig::parse(KOV_XML).unwrap();
+        let at_4k = mode(3840, 2160, 59.996);
         // Matches by connector; product/serial corroborate; the "RHT" vs full-make mismatch is
         // deliberately not consulted.
         let s = cfg
-            .setting_for(&name("Virtual-1", Some("krun-display"), Some("0x00000001")))
+            .setting_for(
+                &name("Virtual-1", Some("krun-display"), Some("0x00000001")),
+                at_4k,
+            )
             .expect("saved setting for Virtual-1");
         assert_eq!(s.scale, 2.0);
         assert_eq!(s.transform, Transform::Normal);
         // A connector match with no model/serial on our side still matches (fields don't veto).
-        assert!(cfg.setting_for(&name("Virtual-1", None, None)).is_some());
+        assert!(cfg
+            .setting_for(&name("Virtual-1", None, None), at_4k)
+            .is_some());
         // A different connector does not match.
-        assert!(cfg.setting_for(&name("DP-3", None, None)).is_none());
+        assert!(cfg.setting_for(&name("DP-3", None, None), at_4k).is_none());
         // A UNIQUE connector matches even if serial differs — the writer's and reader's serial
         // representations can disagree (headless persists `headless-1` but reports `1`); connector
         // is the reliable key. Product/serial only disambiguate multiple same-connector entries.
         assert!(cfg
-            .setting_for(&name("Virtual-1", Some("krun-display"), Some("nope")))
+            .setting_for(
+                &name("Virtual-1", Some("krun-display"), Some("nope")),
+                at_4k
+            )
             .is_some());
+    }
+
+    #[test]
+    fn saved_scale_is_pinned_to_its_mode() {
+        // The overview-port S11 bug: the krun VM window moving to the laptop's internal screen
+        // keeps the connector (Virtual-1) but changes the mode to 2048x1330 — the scale 2 saved
+        // for the 4K mode must NOT apply there (mutter rejects a stored config whose mode can't
+        // be assigned and falls back to the guess), else the desktop runs on a 1024x665 logical
+        // canvas.
+        let cfg = MonitorsConfig::parse(KOV_XML).unwrap();
+        let internal = name("Virtual-1", Some("krun-display"), Some("0x00000001"));
+        assert!(cfg
+            .setting_for(&internal, mode(2048, 1330, 59.996))
+            .is_none());
+        // Same resolution at a clearly different refresh rate is a different mode too...
+        assert!(cfg.setting_for(&internal, mode(3840, 2160, 30.0)).is_none());
+        // ...but mutter's MAXIMUM_REFRESH_RATE_DIFF (0.001) tolerates representation noise: a
+        // real mutter writes the full float ("59.996398925781250") while our modes carry integer
+        // millihertz, so exact comparison would spuriously reject every mutter-written file.
+        let mutter_precision = KOV_XML.replace("59.996", "59.996398925781250");
+        let cfg_mutter = MonitorsConfig::parse(&mutter_precision).unwrap();
+        assert!(cfg_mutter
+            .setting_for(&internal, mode(3840, 2160, 59.996))
+            .is_some());
+        // An unknown current mode does not veto (we'd rather restore than guess).
+        assert!(cfg.setting_for(&internal, None).is_some());
     }
 
     #[test]
@@ -391,20 +484,20 @@ mod tests {
 </monitors>"#;
         let cfg = MonitorsConfig::parse(xml).unwrap();
         assert_eq!(
-            cfg.setting_for(&name("DP-1", None, Some("BBB")))
+            cfg.setting_for(&name("DP-1", None, Some("BBB")), None)
                 .unwrap()
                 .scale,
             3.
         );
         assert_eq!(
-            cfg.setting_for(&name("DP-1", None, Some("AAA")))
+            cfg.setting_for(&name("DP-1", None, Some("AAA")), None)
                 .unwrap()
                 .scale,
             1.
         );
         // No corroboration → first entry.
         assert_eq!(
-            cfg.setting_for(&name("DP-1", None, Some("ZZZ")))
+            cfg.setting_for(&name("DP-1", None, Some("ZZZ")), None)
                 .unwrap()
                 .scale,
             1.
@@ -424,7 +517,9 @@ mod tests {
             "<scale>1.5</scale>\n      <transform><rotation>left</rotation><flipped>no</flipped></transform>",
         );
         let cfg = MonitorsConfig::parse(&xml).unwrap();
-        let s = cfg.setting_for(&name("Virtual-1", None, None)).unwrap();
+        let s = cfg
+            .setting_for(&name("Virtual-1", None, None), None)
+            .unwrap();
         assert_eq!(s.scale, 1.5);
         assert_eq!(s.transform, Transform::_90);
     }
@@ -454,7 +549,10 @@ mod tests {
         );
         let cfg = MonitorsConfig::parse(&xml).unwrap();
         let s = cfg
-            .setting_for(&name("Virtual-1", Some("krun-display"), Some("0x00000001")))
+            .setting_for(
+                &name("Virtual-1", Some("krun-display"), Some("0x00000001")),
+                mode(3840, 2160, 59.996),
+            )
             .expect("round-tripped setting");
         assert_eq!(s.scale, 2.0);
         assert_eq!(s.transform, Transform::_90);
