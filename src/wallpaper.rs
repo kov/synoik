@@ -339,15 +339,28 @@ fn upload_vulkan(renderer: &mut VulkanRenderer, image: &Image) -> Option<Texture
 fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let _span = tracy_client::span!("wallpaper::decode");
 
-    // TODO(perf): a stock 4K JPEG-XL takes *seconds* here, which is why this had
-    // to move off the main loop at all. Investigate before it becomes a papered-
-    // over cost: (1) the gsrs binary is a *debug* build and `jxl-oxide`/`image`
-    // are unoptimized — an `opt-level = 3` dev-profile override for the decode
-    // crates (like the `insta`/`similar` overrides in Cargo.toml) may alone cut
-    // it to well under a second; (2) we decode full-res then downscale to an 8192
-    // cap and upload — decoding straight to the output size would do far less
-    // work; (3) cache the decoded light/dark variants so toggling color-scheme
-    // back is instant instead of re-decoding.
+    // TODO(perf): a stock 4096x4096 JPEG-XL takes **2.44s** here, which is why this had to
+    // move off the main loop at all — measured 2026-07-26 on this VM, and the three
+    // theories that stood here before are now settled:
+    //
+    //  1. *Not* the unoptimized dev build. The `[profile.dev.package."*"] opt-level = 3` override
+    //     in Cargo.toml landed, and 2.44s is the number *with* it — as is `jxl-oxide`'s rayon pool,
+    //     which is on by default and uses all 10 cores.
+    //  2. *Not* worth decoding to the output size. jxl-oxide 0.12.6 exposes no reduced-resolution
+    //     render (only `render_frame`/`render_frame_cropped`), and the stock GNOME backgrounds are
+    //     all JPEG XL. The picture is 4096² against a 3840x2160 screen and `zoom_crop` samples
+    //     nearly all of it, so a target-sized decode would save single-digit percent even if it
+    //     existed.
+    //  3. It is the decoder. The same file through gdk-pixbuf — i.e. libjxl, what GNOME itself
+    //     decodes with — takes **0.147s**, 16x faster. Nothing in our pipeline accounts for the
+    //     gap.
+    //
+    // So the open question is a dependency decision, not a code change: swap the pure-Rust
+    // decoder for libjxl (`jpegxl-rs`) and accept a C++ library in a tree whose endgame is
+    // a modern Rust base, or keep the 2.4s and the async worker that hides it. Caching the
+    // decoded light/dark variants would make a color-scheme toggle instant but costs a
+    // second 67 MiB texture pinned for the session, which is a poor trade against fixing
+    // the 16x.
 
     let decoded = if path
         .extension()
