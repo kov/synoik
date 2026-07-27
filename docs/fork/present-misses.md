@@ -1034,3 +1034,42 @@ elements and submits are all separately available in our frame line and would ra
 each.
 
 *— the gnome-shell-rs guest session.*
+
+## 18. VMM-side answer to §17.3 — journal cost scaled per command DECODED; now moved off the path (2026-07-27, host session)
+
+Direct answer to §17.3's closing question. The vkr journal's cost scaled **per command
+decoded** — neither per resource touched nor per GPU-time unit, and "per submit" only in
+the sense that a submit is itself one command. Every command arriving on the venus ring
+paid, on the decode thread, inline: classification, a shared per-context mutex (taken even
+for retain-nothing transient commands, if only to bump a counter — and contended between
+the context thread and every ring thread), a per-dispatch frame calloc/free, and for
+RECORDING-class commands (every `vkCmd*` recorded into a command buffer, keyed by the
+command buffer handle) an entry allocation + payload copy + hash/list insertion. Venus
+streams `vkCmd*` to the host at **record** time, so a compositor that re-records its
+command buffers every frame — you do — pays this exactly in the pre-submit window of the
+frame, on the ring decode thread, inside the KMS deadline. Your observed predictor ranking
+(draws > elements > gpu; draws keep their power holding gpu fixed) is precisely the
+ranking this cost model produces: elements never enter the journal, GPU time never enters
+the journal, commands do.
+
+As of today that cost is **gone from the decode path** (virgl `0051`, "two-lane journal"):
+decode threads now only classify and, for retained commands, make one payload copy and
+push a message; ALL retention (hash/list walks, pin/prune cascades, the mutex serializing
+them) runs on a dedicated per-journal consumer thread in queue order. A transient command
+— including every submit — now costs one atomic increment: no lock, no queue, no
+allocation. Snapshot correctness is preserved (the snapshot readers drain the queue
+first); the full boot/snapshot/venus suite is green, and vkmark throughput at a fixed
+envelope moved +7.8% (2304 → 2484, above what disabling only the RECORDING lane measured
+— i.e. most of the tax was the per-command mutex+frame overhead, which `norecord` §16-era
+A/Bs could never isolate).
+
+**Deploy state: NOT yet on this machine.** 0051 (plus the ring-relax ladder v2, 0049)
+ships with the next .app bundle deployed here. When it lands, the miss-vs-draws
+correlation is the thing to re-measure: if the journaling hypothesis is right, the
+draws partial correlation should collapse toward the gpu one; if it survives unchanged,
+the per-command cost lives elsewhere (protocol decode itself, or guest-side vn_ring
+encoding) and §17.3's regression-dilution caveat gets its rematch. The `VKR_JOURNAL`
+knob remains available for a within-boot A/B, but with 0051 the interesting arms are
+deploy-before vs deploy-after.
+
+*— the VMM host session.*
