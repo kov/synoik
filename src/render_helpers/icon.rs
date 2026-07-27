@@ -549,6 +549,13 @@ pub struct AppIconCache {
     /// The current icon theme (`org.gnome.desktop.interface icon-theme`).
     theme: String,
     buffers: RefCell<HashMap<IconKey, Option<MemoryBuffer>>>,
+    /// What `buffers` held before the last invalidation. An invalidated icon is not
+    /// gone, it is *out of date*: the replacement decodes off-thread, and drawing
+    /// nothing until it lands blanks every tile for a frame or more. So the old
+    /// pixels stay servable until their replacement arrives — the visible artifact
+    /// is briefly-old icons rather than briefly-absent ones. Entries leave here as
+    /// each decode lands ([`apply_decoded`](Self::apply_decoded)).
+    stale: RefCell<HashMap<IconKey, Option<MemoryBuffer>>>,
     /// Bumped on every cache-invalidating change (theme swap / `clear`); stamped on
     /// each request so a result that lands after an invalidation is dropped.
     generation: u64,
@@ -567,6 +574,7 @@ impl AppIconCache {
         Self {
             theme: theme.into(),
             buffers: RefCell::new(HashMap::new()),
+            stale: RefCell::new(HashMap::new()),
             generation: 0,
             in_flight: RefCell::new(HashSet::new()),
             decode_tx: None,
@@ -616,20 +624,30 @@ impl AppIconCache {
     /// result whose generation the cache has moved past (a theme swap / `clear` fired
     /// while it was in flight) is dropped, but its in-flight slot is always freed so
     /// the icon re-resolves.
-    pub fn apply_decoded(&mut self, decoded: IconDecoded) -> bool {
+    pub fn apply_decoded(&mut self, decoded: IconDecoded) -> Option<IconKey> {
         self.in_flight.get_mut().remove(&decoded.key);
         if decoded.generation != self.generation {
-            return false;
+            return None;
         }
-        self.buffers.get_mut().insert(decoded.key, decoded.buffer);
-        true
+        // This key is current again, so the superseded pixels must go — otherwise a
+        // later invalidation would demote the *fresh* buffer and find the ancient one
+        // still sitting underneath it.
+        self.stale.get_mut().remove(&decoded.key);
+        self.buffers
+            .get_mut()
+            .insert(decoded.key.clone(), decoded.buffer);
+        Some(decoded.key)
     }
 
     /// Bump the generation and drop everything in-flight — every cache-invalidating
     /// change routes through here, so a decode started before it lands stale.
     fn invalidate(&mut self) {
         self.generation += 1;
-        self.buffers.get_mut().clear();
+        // Demote rather than drop, so `buffer` can keep serving the old pixels until
+        // the replacement decode lands. Extending (not replacing) keeps the oldest
+        // still-unreplaced entry across back-to-back invalidations.
+        let outgoing = std::mem::take(self.buffers.get_mut());
+        self.stale.get_mut().extend(outgoing);
         self.in_flight.get_mut().clear();
     }
 
@@ -691,11 +709,14 @@ impl AppIconCache {
                         // Worker gone: decode this one synchronously and cache it.
                         self.in_flight.borrow_mut().remove(&key);
                         let result = render_icon(&self.theme, icon, logical_px, scale, px);
+                        self.stale.borrow_mut().remove(&key);
                         self.buffers.borrow_mut().insert(key, result.clone());
                         return result;
                     }
                 }
-                None
+                // Not blank while we wait: if this icon was drawn before an
+                // invalidation, keep drawing those pixels until the new ones land.
+                self.stale.borrow().get(&key).cloned().flatten()
             }
             // No worker (tests): decode inline, caching the result (incl. negatives).
             None => {
@@ -1099,12 +1120,64 @@ mod tests {
         );
         assert!(rx.try_recv().is_err(), "not re-queued while in flight");
 
-        assert!(cache.apply_decoded(IconDecoded {
-            key: req.key,
-            buffer: Some(dummy_buffer()),
-            generation: req.generation,
-        }));
+        assert!(cache
+            .apply_decoded(IconDecoded {
+                key: req.key,
+                buffer: Some(dummy_buffer()),
+                generation: req.generation,
+            })
+            .is_some());
         assert!(cache.buffer(&icon, 96., 1.0).is_some(), "now warm");
+    }
+
+    /// An invalidation keeps drawing the icon it already has until the replacement
+    /// lands. Blanking instead is what made the dash flicker on an `installed-changed`
+    /// ping: the decode is off-thread, so "no pixels yet" is a visible frame.
+    #[test]
+    fn an_invalidated_icon_keeps_its_old_pixels_until_the_new_ones_land() {
+        let mut cache = AppIconCache::new("hicolor");
+        let rx = cache.wire_test_channel();
+        let icon = AppIconRef::Themed(vec!["some-app".into()]);
+
+        cache.buffer(&icon, 96., 1.0);
+        let first = rx.try_recv().expect("a decode was requested");
+        cache
+            .apply_decoded(IconDecoded {
+                key: first.key,
+                buffer: Some(dummy_buffer()),
+                generation: first.generation,
+            })
+            .expect("the first decode is current");
+        assert!(
+            cache.buffer(&icon, 96., 1.0).is_some(),
+            "warm to begin with"
+        );
+
+        cache.clear();
+        assert!(
+            cache.buffer(&icon, 96., 1.0).is_some(),
+            "an invalidated icon must keep drawing its old pixels, not go blank, \
+             while the replacement decodes off-thread"
+        );
+        let second = rx.try_recv().expect("the replacement was requested");
+
+        // ...and once the replacement lands it is what gets served, so the old pixels
+        // are a stopgap rather than a permanent shadow.
+        let key = cache
+            .apply_decoded(IconDecoded {
+                key: second.key.clone(),
+                buffer: None,
+                generation: second.generation,
+            })
+            .expect("the replacement is current");
+        assert_eq!(
+            key, second.key,
+            "the applied key identifies what to re-upload"
+        );
+        assert!(
+            cache.buffer(&icon, 96., 1.0).is_none(),
+            "a replacement that resolves to nothing must win over the stale pixels"
+        );
     }
 
     /// A result that lands after a `clear` (installed-changed) is dropped, and the
@@ -1120,11 +1193,13 @@ mod tests {
         cache.clear(); // bumps the generation + clears in-flight
 
         assert!(
-            !cache.apply_decoded(IconDecoded {
-                key: stale.key,
-                buffer: Some(dummy_buffer()),
-                generation: stale.generation,
-            }),
+            cache
+                .apply_decoded(IconDecoded {
+                    key: stale.key,
+                    buffer: Some(dummy_buffer()),
+                    generation: stale.generation,
+                })
+                .is_none(),
             "a pre-clear result is stale"
         );
         assert!(cache.buffer(&icon, 96., 1.0).is_none());

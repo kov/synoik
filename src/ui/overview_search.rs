@@ -347,6 +347,16 @@ impl OverviewSearch {
         cache.icons.clear();
     }
 
+    /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
+    /// decoded pixels — see [`widget::drop_app_icon_upload`].
+    pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
+        crate::ui::widget::drop_app_icon_upload(
+            &mut self.cache.borrow_mut().icons,
+            icon,
+            logical_px,
+        );
+    }
+
     /// Lay out the entry pill + (when active) the results card + tiles inside the
     /// boxes [`crate::ui::overview_layout`] allocated: the entry bin at the top of
     /// the work area, the results strip spanning everything between it and the dash.

@@ -230,6 +230,16 @@ impl AppGrid {
         self.cache.borrow_mut().icons.clear();
     }
 
+    /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
+    /// decoded pixels — see [`widget::drop_app_icon_upload`].
+    pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
+        crate::ui::widget::drop_app_icon_upload(
+            &mut self.cache.borrow_mut().icons,
+            icon,
+            logical_px,
+        );
+    }
+
     /// The id of tile `i`, if present (what a click launches).
     pub fn entry_id(&self, i: usize) -> Option<&str> {
         self.entries.get(i).map(|e| e.id.as_str())

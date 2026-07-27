@@ -262,6 +262,16 @@ impl Dash {
         cache.icons.clear();
     }
 
+    /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
+    /// decoded pixels — see [`widget::drop_app_icon_upload`].
+    pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
+        crate::ui::widget::drop_app_icon_upload(
+            &mut self.cache.borrow_mut().icons,
+            icon,
+            logical_px,
+        );
+    }
+
     /// How many icon uploads are cached. Only the tests look at this: dropping them
     /// is invisible in a still frame (the worker re-decodes and they come back), but
     /// it blanks every tile in between, so a test needs to see the drop itself.

@@ -849,6 +849,30 @@ impl AppEntry {
 
 #[cfg(test)]
 mod tests {
+    /// A ping is not proof of a change. glib's monitors fire for any write under a
+    /// watched directory and one lands a few seconds into every session, so the
+    /// reload has to check rather than trust the signal — everything it re-derives
+    /// downstream is either wasted or, in the icon caches' case, destructive.
+    #[test]
+    fn refresh_reports_whether_the_catalog_actually_changed() {
+        let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")]);
+        let apps = catalog.apps.clone();
+        let mut system =
+            AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+
+        assert!(
+            !system.refresh(),
+            "re-enumerating the same catalog is not a change"
+        );
+
+        apps.borrow_mut().push(AppEntry::fake("b.desktop", "B"));
+        assert!(system.refresh(), "an added app is a change");
+        assert!(!system.refresh(), "and it is only a change once");
+
+        apps.borrow_mut().clear();
+        assert!(system.refresh(), "a removed app is a change too");
+    }
+
     use super::*;
 
     /// The `launched` signal's `platform_data` is an untyped `a{sv}`, so reading the pid out of it

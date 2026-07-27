@@ -1115,7 +1115,10 @@ impl State {
                 .event_loop
                 .insert_source(icon_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(decoded) = event {
-                        if state.niri.app_icon_cache.apply_decoded(decoded) {
+                        if let Some((icon, logical, _)) =
+                            state.niri.app_icon_cache.apply_decoded(decoded)
+                        {
+                            state.niri.drop_app_icon_uploads(&icon, logical);
                             state.niri.queue_redraw_all();
                         }
                     }
@@ -1234,10 +1237,9 @@ impl State {
                         if icon_theme_changed {
                             let theme = state.niri.gnome_settings.icon_theme.clone();
                             state.niri.replace_icon_cache(theme.as_str());
+                            // Old pixels stay on screen until each re-decode lands,
+                            // which is also what drops that icon's uploads.
                             state.niri.app_icon_cache.set_theme(&theme);
-                            state.niri.dash.clear_icon_uploads();
-                            state.niri.overview_search.clear_icon_uploads();
-                            state.niri.app_grid.clear_icon_uploads();
                             // `set_theme` invalidated the decode cache — re-warm it in
                             // the new theme off-thread for the next open.
                             state.niri.prewarm_app_icons();
@@ -8633,11 +8635,10 @@ impl Niri {
             // flicker once, ~6s after startup, with nothing happening.
             return;
         }
-        // A newly installed app's icon (or a cached negative) may now resolve.
+        // A newly installed app's icon (or a cached negative) may now resolve. The
+        // cache keeps serving the old pixels until each replacement decode lands, and
+        // the uploads are dropped per icon at that point — so nothing blanks here.
         self.app_icon_cache.clear();
-        self.dash.clear_icon_uploads();
-        self.overview_search.clear_icon_uploads();
-        self.app_grid.clear_icon_uploads();
         // A refreshed catalog may change what the current query resolves to, and
         // which apps populate the grid.
         self.sync_overview_search();
@@ -8673,6 +8674,25 @@ impl Niri {
         if let Some(tx) = self.symbolic_icon_tx.clone() {
             self.icon_cache.set_worker(tx);
         }
+    }
+
+    /// Drop one icon's uploaded textures everywhere it can appear, because its pixels
+    /// just changed underneath them.
+    ///
+    /// The upload key is (scale, descriptor, size) with no notion of *which* decode
+    /// produced it, so a texture uploaded while the cache was serving stale pixels
+    /// would otherwise be served forever. Dropping per-icon as each decode lands is
+    /// what lets an invalidation keep drawing the old icons instead of nothing:
+    /// nothing has to clear the whole map up front.
+    pub fn drop_app_icon_uploads(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
+        self.dash.drop_icon_upload(icon, logical_px);
+        self.app_grid.drop_icon_upload(icon, logical_px);
+        self.overview_search.drop_icon_upload(icon, logical_px);
+        crate::ui::widget::drop_app_icon_upload(
+            &mut self.app_drag_uploads.borrow_mut(),
+            icon,
+            logical_px,
+        );
     }
 
     pub fn prewarm_app_icons(&self) {

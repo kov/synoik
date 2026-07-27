@@ -6492,14 +6492,17 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
          draw blank until the off-thread decodes land"
     );
 
-    // A real change must still drop them: an installed app's icon may now resolve.
+    // And a catalog that really did change must not blank them either: the old pixels
+    // stay up until each replacement decode lands, which is when that icon's upload is
+    // dropped (`Niri::drop_app_icon_uploads`).
     apps.borrow_mut()
         .push(AppEntry::fake("c.desktop", "c.desktop"));
     f.niri().reload_app_catalog();
     assert_eq!(
         f.niri().dash.icon_upload_count(),
-        0,
-        "a changed catalog must drop the uploads so icons re-resolve"
+        warm,
+        "a changed catalog dropped the uploads up front — the dash would draw blank \
+         tiles until the worker caught up, which is the flicker this all exists to avoid"
     );
 }
 

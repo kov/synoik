@@ -38,6 +38,16 @@ use crate::utils::to_physical_precise_round;
 /// the grid/search) so a hover re-bake doesn't re-upload the icon textures.
 pub type AppIconUploads = HashMap<(NotNan<f64>, AppIconRef, u16), TextureBuffer<VkTexture>>;
 
+/// Drop the uploads of one icon at one logical size, across every output scale.
+///
+/// The upload key carries no notion of *which* decode produced the pixels, so a
+/// texture uploaded from a stale buffer would otherwise be served forever once the
+/// fresh decode landed. Surfaces call this as each decode arrives, which is also why
+/// nothing needs to clear the whole map on a theme or catalog change.
+pub fn drop_app_icon_upload(uploads: &mut AppIconUploads, icon: &AppIconRef, logical_px: u16) {
+    uploads.retain(|(_, cached, px), _| cached != icon || *px != logical_px);
+}
+
 /// Straight-alpha RGBA, the color type every draw verb takes (glyph coverage /
 /// SDF alpha modulates it). Matches the `[f32; 4]` the frame primitives want.
 pub type Rgba = [f32; 4];
