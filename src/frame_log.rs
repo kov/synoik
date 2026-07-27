@@ -64,7 +64,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 thread_local! {
@@ -238,6 +238,39 @@ static CURRENT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Whether anything is listening. Sampled by the scoped timers so an unlogged
 /// session does not pay two `Instant::now()` calls per bake and per shaped run.
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The log writer's dropped-line counter, and how many drops the last summary already reported.
+///
+/// Logging is non-blocking (`main`), so a burst the writer thread cannot keep up with is *dropped*
+/// rather than allowed to stall the compositor. A dropped frame line is a hole in exactly the
+/// analyses this log exists for — an inter-flip gap that never happened, a miss that reads as
+/// absent — so the holes have to announce themselves. Silence here would be the worst outcome:
+/// data that looks complete and is not.
+static DROPPED_LINES: Mutex<Option<(tracing_appender::non_blocking::ErrorCounter, u64)>> =
+    Mutex::new(None);
+
+/// Tell the frame log where to read dropped-line counts. Called once from `main`, after the
+/// subscriber is built; without it the summary simply never mentions drops.
+pub fn watch_dropped_lines(counter: tracing_appender::non_blocking::ErrorCounter) {
+    *DROPPED_LINES.lock().unwrap() = Some((counter, 0));
+}
+
+/// Drops since the last call, or `None` if nothing is watching / nothing was dropped.
+fn take_dropped_lines() -> Option<u64> {
+    let mut guard = DROPPED_LINES.lock().unwrap();
+    let (counter, reported) = guard.as_mut()?;
+    dropped_delta(counter.dropped_lines() as u64, reported)
+}
+
+/// How many drops are new since `reported`, advancing it. Split out from the counter so the
+/// arithmetic is testable: `ErrorCounter` is cumulative and cannot be constructed by hand, and
+/// getting this wrong is quiet in both directions — report the total every time and every summary
+/// screams about drops that already happened, forget to advance and drops are never mentioned.
+fn dropped_delta(total: u64, reported: &mut u64) -> Option<u64> {
+    let new = total.saturating_sub(*reported);
+    *reported = total;
+    (new > 0).then_some(new)
+}
 
 /// Accumulates its lifetime into this thread's bake time — and its originating
 /// widget's — when dropped. The timing is inert when frame logging is off, so call
@@ -1277,6 +1310,16 @@ impl FrameLog {
         }
         self.last_summary = now;
 
+        // Before the per-output lines, so a hole is visible above the numbers it puts in doubt.
+        if let Some(dropped) = take_dropped_lines() {
+            tracing::warn!(
+                "{dropped} log lines were DROPPED since the last summary — the non-blocking log \
+                 writer's buffer overflowed, so this log has holes in it. Set NIRI_LOG_BLOCKING=1 \
+                 to make the writer apply backpressure instead (at the cost of stalling whatever \
+                 thread is logging)."
+            );
+        }
+
         for (output, stats) in &mut self.stats {
             if stats.frames == 0 {
                 // Still report drops on an output that rendered nothing: that is
@@ -1913,6 +1956,27 @@ mod tests {
         assert!(log.in_flight.is_none());
         let stats = &log.stats["test-output"];
         assert_eq!(stats.frames, 1);
+    }
+
+    /// Each summary reports only the drops that are new. The failure is quiet in both directions:
+    /// reporting the running total makes every summary after one overflow scream about drops that
+    /// already happened, and forgetting to advance the mark means drops are never mentioned at all
+    /// — which is the outcome the counter exists to prevent.
+    #[test]
+    fn only_new_dropped_lines_are_reported() {
+        let mut reported = 0;
+        assert_eq!(dropped_delta(0, &mut reported), None, "no drops, no report");
+        assert_eq!(dropped_delta(7, &mut reported), Some(7));
+        assert_eq!(
+            dropped_delta(7, &mut reported),
+            None,
+            "the same drops were reported twice"
+        );
+        assert_eq!(
+            dropped_delta(10, &mut reported),
+            Some(3),
+            "only the new ones"
+        );
     }
 
     /// A miss line has to say how long the display had been quiet in front of it. Measured across

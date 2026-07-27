@@ -19,6 +19,7 @@ use niri::backend::BackendMode;
 use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
 use niri::dbus;
+use niri::frame_log;
 use niri::ipc::client::handle_msg;
 use niri::niri::State;
 use niri::utils::spawning::{
@@ -50,11 +51,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         REMOVE_ENV_RUST_LIB_BACKTRACE.store(true, Ordering::Relaxed);
     }
 
+    // Log through a writer thread, so emitting a line is a channel send instead of a `write(2)`.
+    //
+    // Under systemd our stderr is a journald socket, and writing to it blocks whenever journald
+    // is behind — on a thread that has 16.67 ms to hand a frame to KMS. Measured at a realistic
+    // 60 Hz it is only ~26 µs (p99 112 µs, worst 714 µs over 30 s), so this is not about the
+    // steady-state cost; it is that the cost is *unbounded* under backpressure, and that the
+    // `io::stderr()` lock serializes the compositor thread against every service thread we
+    // deliberately moved off it. `NIRI_FRAME_LOG` also makes this per-frame, which means the
+    // instrument was perturbing the very runs we take decisions from.
+    //
+    // Lossy: on overflow a line is dropped rather than the compositor stalled. Drops are counted
+    // and reported by the frame-log summary (`frame_log::watch_dropped_lines`) — a hole in this
+    // log has to announce itself, or an absent frame line reads as a frame that never happened.
+    // `NIRI_LOG_BLOCKING=1` swaps in backpressure for when a run must not lose anything.
+    let blocking = env::var_os("NIRI_LOG_BLOCKING").is_some();
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        // ~16k lines of slack. At the ~120 lines/s a fully instrumented session produces that is
+        // over two minutes of buffer, which is far more journald hiccup than we have ever seen;
+        // the cap exists so a runaway logger cannot grow without bound.
+        .buffered_lines_limit(16_384)
+        .lossy(!blocking)
+        .thread_name("log-writer")
+        .finish(io::stderr());
+    // Held to the end of `main`: dropping the guard shuts the writer thread down and flushes what
+    // is queued. Bound to a name rather than `_`, which would drop it here and take the log with
+    // it. Note this cannot flush on `abort` — a crash loses whatever is still queued, which is the
+    // price of not blocking.
+    let _log_guard = guard;
+    frame_log::watch_dropped_lines(writer.error_counter());
+
     let directives = env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_owned());
     let env_filter = EnvFilter::builder().parse_lossy(directives);
     tracing_subscriber::fmt()
         .compact()
-        .with_writer(io::stderr)
+        .with_writer(writer)
         .with_env_filter(env_filter)
         .with_ansi_sanitization(false)
         .init();
