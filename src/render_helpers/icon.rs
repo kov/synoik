@@ -92,6 +92,17 @@ pub struct IconCache {
     /// worker and are consumed by the first upload, so the two maps hold different stages of the
     /// same icon and never both hold one.
     textures: RefCell<HashMap<SymbolicKey, TextureBuffer<VkTexture>>>,
+    /// The *previous* cache's uploads, kept servable until each is re-rasterized.
+    ///
+    /// An icon-theme change replaces the whole cache, and re-rasterizing goes through the
+    /// worker — so a brand-new cache has nothing to draw and every symbolic icon on screen
+    /// (panel status, quick-settings toggles, calendar chevrons) vanishes for a frame or
+    /// more. Inheriting the outgoing textures ([`adopt_textures_from`]) makes the artifact
+    /// briefly-old icons instead of briefly-absent ones. Entries leave as their replacements
+    /// upload.
+    ///
+    /// [`adopt_textures_from`]: Self::adopt_textures_from
+    stale_textures: RefCell<HashMap<SymbolicKey, TextureBuffer<VkTexture>>>,
     /// Identifies the renderer `textures` were uploaded to; a mismatch drops them all
     /// (they belong to a device that is gone). Same guard the widget bake caches use.
     context: RefCell<Option<ContextId<VkTexture>>>,
@@ -114,8 +125,20 @@ impl IconCache {
             in_flight: RefCell::new(HashSet::new()),
             raster_tx: None,
             textures: RefCell::new(HashMap::new()),
+            stale_textures: RefCell::new(HashMap::new()),
             context: RefCell::new(None),
         }
+    }
+
+    /// Take over `previous`'s uploaded icons as stale ones, so a theme change keeps
+    /// drawing the old pixels until each replacement rasterizes — see `stale_textures`.
+    /// The textures belong to a renderer, so the context they were uploaded to comes
+    /// with them; a later mismatch drops both maps together.
+    pub fn adopt_textures_from(&mut self, previous: &IconCache) {
+        *self.stale_textures.borrow_mut() = previous.textures.borrow().clone();
+        self.context
+            .borrow_mut()
+            .clone_from(&previous.context.borrow());
     }
 
     /// Route rasterization to `tx`'s worker instead of doing it inline.
@@ -135,6 +158,25 @@ impl IconCache {
         self.in_flight.get_mut().remove(&done.key);
         self.buffers.get_mut().insert(done.key, done.buffer);
         true
+    }
+
+    /// Route rasterization to a channel the test drains itself, so the async miss path
+    /// (the one that can draw nothing) is exercised without a real worker thread.
+    #[cfg(test)]
+    pub(crate) fn wire_test_worker(&mut self) -> mpsc::Receiver<SymbolicRequest> {
+        let (tx, rx) = mpsc::channel();
+        self.raster_tx = Some(tx);
+        rx
+    }
+
+    /// How many icons this cache has uploaded, and how many it inherited from the cache it
+    /// replaced. Tests only: a theme change leaving both at zero is the blank frame.
+    #[cfg(test)]
+    pub(crate) fn texture_counts(&self) -> (usize, usize) {
+        (
+            self.textures.borrow().len(),
+            self.stale_textures.borrow().len(),
+        )
     }
 
     /// Queue `key` for the worker, once. No-op without a worker, and the caller then rasterizes
@@ -205,6 +247,8 @@ impl IconCache {
         let context = renderer.context_id();
         if self.context.borrow().as_ref() != Some(&context) {
             self.textures.borrow_mut().clear();
+            // The inherited ones belong to that same dead device.
+            self.stale_textures.borrow_mut().clear();
             *self.context.borrow_mut() = Some(context);
         }
 
@@ -230,7 +274,9 @@ impl IconCache {
                 // way `in_flight` does. Callers size themselves from `logical_px`, never from us,
                 // so only the pixels arrive late — the layout does not move.
                 self.request(name, &key, scale, color);
-                return None;
+                // Not blank while we wait: if a previous cache had drawn this icon, keep
+                // showing those pixels until the replacement uploads.
+                return self.stale_textures.borrow().get(&key).cloned();
             }
             // No worker (headless tests): the old inline path, unchanged.
             None => self.rasterize(name, key.1, scale, color)?,
@@ -238,6 +284,7 @@ impl IconCache {
 
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
+                self.stale_textures.borrow_mut().remove(&key);
                 self.textures.borrow_mut().insert(key, tb.clone());
                 Some(tb)
             }
@@ -271,6 +318,31 @@ pub struct SymbolicRasterized {
     key: SymbolicKey,
     buffer: Option<MemoryBuffer>,
     generation: u64,
+}
+
+#[cfg(test)]
+impl SymbolicRequest {
+    pub(crate) fn key(&self) -> SymbolicKey {
+        self.key.clone()
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[cfg(test)]
+impl SymbolicRasterized {
+    pub(crate) fn for_test(
+        key: SymbolicKey,
+        buffer: Option<MemoryBuffer>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            key,
+            buffer,
+            generation,
+        }
+    }
 }
 
 /// Hands `IconCache` a thread that resolves and rasterizes symbolic icons, returning the request

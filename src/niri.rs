@@ -8670,10 +8670,15 @@ impl Niri {
     /// re-handed the sink — miss that and symbolic rasterization silently falls back to running
     /// inline on the frame thread, which is exactly what this machinery exists to prevent.
     pub fn replace_icon_cache(&mut self, theme: &str) {
-        self.icon_cache = IconCache::new(theme);
+        let mut replacement = IconCache::new(theme);
+        // Keep the outgoing cache's icons drawable until each is re-rasterized in the new
+        // theme; re-rasterizing goes through the worker, so a bare replacement blanks every
+        // symbolic icon on screen until it catches up.
+        replacement.adopt_textures_from(&self.icon_cache);
         if let Some(tx) = self.symbolic_icon_tx.clone() {
-            self.icon_cache.set_worker(tx);
+            replacement.set_worker(tx);
         }
+        self.icon_cache = replacement;
     }
 
     /// Drop one icon's uploaded textures everywhere it can appear, because its pixels

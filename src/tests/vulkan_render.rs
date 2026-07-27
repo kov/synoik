@@ -6425,6 +6425,86 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
 /// above the icon) against tile 1's (plain pill background); tile 0 must be brighter
 /// on every color channel. A sign flip (a theme reading it as a darken) fails here.
 #[test]
+fn an_icon_theme_change_keeps_the_symbolic_icons_drawable() {
+    use std::sync::mpsc::TryRecvError;
+
+    use smithay::backend::allocator::Fourcc;
+    use smithay::utils::{Scale, Transform};
+
+    use crate::render_helpers::icon::{IconCache, SymbolicRasterized};
+    use crate::render_helpers::memory::MemoryBuffer;
+
+    // An icon-theme change replaces the whole IconCache, and re-rasterizing goes through the
+    // worker — so a bare replacement has nothing to draw and every symbolic icon on screen
+    // (panel status, quick-settings toggles, calendar chevrons) vanishes until it catches up.
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+
+    const NAME: &str = "view-app-grid-symbolic";
+    const PX: f64 = 16.;
+    const COLOR: [f32; 4] = [1., 1., 1., 1.];
+
+    let state = f.niri_state();
+    let outcome = state.backend.headless().with_vulkan_renderer(|vk| {
+        let mut cache = IconCache::new("Adwaita");
+        let rx = cache.wire_test_worker();
+
+        // A cold miss draws nothing and queues the rasterization — the async path.
+        assert!(
+            cache.texture(vk, NAME, PX, 1., COLOR).is_none(),
+            "a cold miss has nothing to draw yet"
+        );
+        let req = match rx.try_recv() {
+            Ok(req) => req,
+            Err(TryRecvError::Empty) => panic!("the miss queued no rasterization"),
+            Err(err) => panic!("worker channel broke: {err:?}"),
+        };
+        let pixels = MemoryBuffer::new(
+            vec![255u8; 4],
+            Fourcc::Abgr8888,
+            Size::from((1, 1)),
+            Scale::from(1.0),
+            Transform::Normal,
+        );
+        cache.apply_rasterized(SymbolicRasterized::for_test(
+            req.key(),
+            Some(pixels),
+            req.generation(),
+        ));
+        assert!(
+            cache.texture(vk, NAME, PX, 1., COLOR).is_some(),
+            "the rasterized icon should upload and draw"
+        );
+        assert_eq!(cache.texture_counts().0, 1, "one icon uploaded");
+
+        // Now the theme changes: a fresh cache that inherits the old uploads.
+        let mut next = IconCache::new("Papirus");
+        next.adopt_textures_from(&cache);
+        let _rx = next.wire_test_worker();
+        assert_eq!(
+            next.texture_counts(),
+            (0, 1),
+            "the replacement starts with nothing of its own and one inherited icon"
+        );
+        assert!(
+            next.texture(vk, NAME, PX, 1., COLOR).is_some(),
+            "a theme change must keep drawing the old symbolic pixels until the new ones \
+             rasterize — drawing nothing blanks the panel and quick settings for a frame"
+        );
+    });
+    if outcome.is_none() {
+        eprintln!(
+            "skipping an_icon_theme_change_keeps_the_symbolic_icons_drawable: no Vulkan device"
+        );
+    }
+}
+
+#[test]
 fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
 
