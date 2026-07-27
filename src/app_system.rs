@@ -672,24 +672,61 @@ impl AppCatalog for GioCatalog {
 }
 
 /// The production launcher. Re-resolves the desktop entry (thread-safe,
-/// cache-backed) and launches with no launch context — startup-notify/timestamp/
-/// systemd-scope wrapping is a deferred refinement (`overview-port.md` §4).
+/// cache-backed) and launches through [`scoped_launch_context`], so the app lands
+/// in its own systemd scope. Startup-notify/timestamp wrapping is still a deferred
+/// refinement (`overview-port.md` §4).
 struct GioLauncher;
 
 impl AppLauncher for GioLauncher {
     fn launch(&self, entry: &AppEntry, verb: &ResolvedLaunch) -> Result<(), String> {
         let desktop = DesktopAppInfo::new(&entry.id)
             .ok_or_else(|| format!("no desktop entry: {}", entry.id))?;
+        let context = scoped_launch_context();
         match verb {
             ResolvedLaunch::Default => desktop
-                .launch(&[], gio::AppLaunchContext::NONE)
+                .launch(&[], Some(&context))
                 .map_err(|e| e.to_string()),
             ResolvedLaunch::Action(name) => {
-                desktop.launch_action(name, gio::AppLaunchContext::NONE);
+                desktop.launch_action(name, Some(&context));
                 Ok(())
             }
         }
     }
+}
+
+/// A launch context that moves whatever it launches into its own systemd scope.
+///
+/// GNOME builds the same thing in `shell-global.c:1221` (`create_app_launch_context`) and hooks
+/// `launched` at line 1206; see [`crate::utils::spawning::start_app_scope`] for why the scope
+/// matters. Ours carries only the scope hookup — GNOME's context also plumbs the startup
+/// notification and target workspace, which we do not have yet.
+fn scoped_launch_context() -> gio::AppLaunchContext {
+    let context = gio::AppLaunchContext::new();
+    context.connect_launched(|_context, info, platform_data| {
+        let Some(pid) = launched_pid(platform_data) else {
+            return;
+        };
+        // GNOME: "If pid == 0 the application was launched through D-Bus activation, therefore
+        // it's already in its own unit" (`shell-global.c:1194`).
+        if pid == 0 {
+            return;
+        }
+
+        let id = info
+            .id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| info.executable().to_string_lossy().into_owned());
+        crate::utils::spawning::start_app_scope(&id, pid as u32);
+    });
+    context
+}
+
+/// The `pid` out of a `launched` signal's `platform_data` dictionary.
+fn launched_pid(platform_data: &glib::Variant) -> Option<i32> {
+    glib::VariantDict::new(Some(platform_data))
+        .lookup::<i32>("pid")
+        .ok()
+        .flatten()
 }
 
 /// The disconnected catalog — nothing installed.
@@ -805,6 +842,32 @@ impl AppEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `launched` signal's `platform_data` is an untyped `a{sv}`, so reading the pid out of it
+    /// is the kind of thing that silently yields `None` forever and takes the systemd scope with
+    /// it — nothing downstream errors, apps just quietly keep landing in the compositor's cgroup.
+    /// Pin the shape GIO actually sends (`g_desktop_app_info_launch_uris_with_spawn` puts an `i`
+    /// under "pid"), including the D-Bus-activation case that legitimately has no pid.
+    #[test]
+    fn the_launched_pid_is_read_out_of_the_platform_data() {
+        let with_pid = glib::VariantDict::new(None);
+        with_pid.insert("pid", 4321i32);
+        with_pid.insert("startup-notification-id", "gnome-shell-1");
+        assert_eq!(launched_pid(&with_pid.end()), Some(4321));
+
+        // D-Bus activation: GNOME reads this as "already in its own unit" and skips the scope.
+        let activated = glib::VariantDict::new(None);
+        activated.insert("pid", 0i32);
+        assert_eq!(launched_pid(&activated.end()), Some(0));
+
+        // No pid at all, and a pid of the wrong type, must both decline rather than panic.
+        let empty = glib::VariantDict::new(None);
+        assert_eq!(launched_pid(&empty.end()), None);
+
+        let wrong_type = glib::VariantDict::new(None);
+        wrong_type.insert("pid", "4321");
+        assert_eq!(launched_pid(&wrong_type.end()), None);
+    }
 
     /// The GIO catalog round-trips real installed apps. Skips cleanly on a bare
     /// host with no apps (like the icon tests in `render_helpers/icon.rs`). Only

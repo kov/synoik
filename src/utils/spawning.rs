@@ -203,6 +203,28 @@ fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
 #[cfg(feature = "systemd")]
 use systemd::do_spawn;
 
+/// Move an already-running application into its own transient systemd scope.
+///
+/// For apps we *spawn* this happens inside [`spawn`]; this is the other path, an app launched
+/// through GIO from the dash/grid/search, where the process already exists and only needs
+/// re-parenting. Without it the app stays in the compositor's own cgroup — which for us is
+/// `org.gnome.Shell@user.service` — where it is a stray in a stopping unit at logout, reaped by
+/// that unit's `TimeoutStopSec` with SIGABRT rather than asked to quit.
+///
+/// GNOME does exactly this, from the launch context's `launched` signal:
+/// `shell-global.c:1182-1207` calls libgnome-desktop's `gnome_start_systemd_scope`, whose unit
+/// name is `app-gnome-<id>-<pid>.scope` — matched here, including the prefix, since we are the
+/// shell those tools expect to be looking at.
+///
+/// A no-op without the `systemd` feature, and without being a systemd service ourselves.
+#[cfg(feature = "systemd")]
+pub fn start_app_scope(app_id: &str, pid: u32) {
+    systemd::start_app_scope(app_id, pid);
+}
+
+#[cfg(not(feature = "systemd"))]
+pub fn start_app_scope(_app_id: &str, _pid: u32) {}
+
 #[cfg(feature = "systemd")]
 mod systemd {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -405,12 +427,7 @@ mod systemd {
         intermediate_pid: u32,
         child_pid: u32,
     ) -> anyhow::Result<()> {
-        use std::fmt::Write as _;
         use std::os::unix::ffi::OsStrExt;
-        use std::sync::OnceLock;
-
-        use anyhow::Context;
-        use zbus::zvariant::{OwnedObjectPath, Value};
 
         use crate::utils::IS_SYSTEMD_SERVICE;
 
@@ -423,20 +440,45 @@ mod systemd {
 
         // Extract the basename.
         let name = Path::new(name).file_name().unwrap_or(name);
+        let scope_name = format!(
+            "app-niri-{}-{child_pid}.scope",
+            escape_unit_name(name.as_bytes())
+        );
 
-        let mut scope_name = String::from("app-niri-");
+        // Wait for the job: the intermediate child must not exit before the scope exists, or the
+        // scope is created around a PID that is already gone.
+        start_transient_scope(&scope_name, &[intermediate_pid, child_pid], true)
+    }
 
-        // Escape for systemd similarly to libgnome-desktop, which says it had adapted this from
-        // systemd source.
-        for &c in name.as_bytes() {
+    /// Escape a name for use inside a systemd unit name, similarly to libgnome-desktop, which says
+    /// it had adapted this from systemd source.
+    fn escape_unit_name(name: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut escaped = String::with_capacity(name.len());
+        for &c in name {
             if c.is_ascii_alphanumeric() || matches!(c, b':' | b'_' | b'.') {
-                scope_name.push(char::from(c));
+                escaped.push(char::from(c));
             } else {
-                let _ = write!(scope_name, "\\x{c:02x}");
+                let _ = write!(escaped, "\\x{c:02x}");
             }
         }
+        escaped
+    }
 
-        let _ = write!(scope_name, "-{child_pid}.scope");
+    /// Ask systemd to put `pids` into a new transient scope called `scope_name`.
+    ///
+    /// `wait_for_job` blocks until systemd reports the unit started; callers that have nothing
+    /// waiting on the scope's existence should pass `false` and not pay the round trip.
+    fn start_transient_scope(
+        scope_name: &str,
+        pids: &[u32],
+        wait_for_job: bool,
+    ) -> anyhow::Result<()> {
+        use std::sync::OnceLock;
+
+        use anyhow::Context;
+        use zbus::zvariant::{OwnedObjectPath, Value};
 
         // Ask systemd to start a transient scope.
         static CONNECTION: OnceLock<zbus::Result<zbus::blocking::Connection>> = OnceLock::new();
@@ -453,11 +495,12 @@ mod systemd {
         )
         .context("error creating a Proxy")?;
 
-        let signals = proxy
-            .receive_signal("JobRemoved")
+        // Subscribe before the call, so a job that finishes immediately is not missed.
+        let signals = wait_for_job
+            .then(|| proxy.receive_signal("JobRemoved"))
+            .transpose()
             .context("error creating a signal iterator")?;
 
-        let pids: &[_] = &[intermediate_pid, child_pid];
         let properties: &[_] = &[
             ("PIDs", Value::new(pids)),
             ("CollectMode", Value::new("inactive-or-failed")),
@@ -467,6 +510,10 @@ mod systemd {
         let job: OwnedObjectPath = proxy
             .call("StartTransientUnit", &(scope_name, "fail", properties, aux))
             .context("error calling StartTransientUnit")?;
+
+        let Some(signals) = signals else {
+            return Ok(());
+        };
 
         trace!("waiting for JobRemoved");
         for message in signals {
@@ -481,5 +528,58 @@ mod systemd {
         }
 
         Ok(())
+    }
+
+    pub fn start_app_scope(app_id: &str, pid: u32) {
+        use crate::utils::IS_SYSTEMD_SERVICE;
+
+        if !IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let scope_name = format!(
+            "app-gnome-{}-{pid}.scope",
+            escape_unit_name(app_id.as_bytes())
+        );
+
+        // Off-thread and unwaited, like GNOME's ("Start async request; we don't care about the
+        // result"). This runs from the launch path, which is the compositor thread; a
+        // StartTransientUnit round trip there would be a frame's worth of blocking D-Bus for a
+        // result nothing reads.
+        let spawned = thread::Builder::new()
+            .name("app scope".to_owned())
+            .spawn(move || {
+                if let Err(err) = start_transient_scope(&scope_name, &[pid], false) {
+                    // Losing the race against a process that exits immediately is normal.
+                    trace!("error starting the app scope: {err:?}");
+                }
+            });
+        if let Err(err) = spawned {
+            warn!("error spawning the app scope thread: {err:?}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A malformed unit name is rejected by systemd, not by us — the scope silently fails to
+        /// appear and the app stays in our cgroup, which is exactly the bug this all exists to fix.
+        /// So pin the escaping against the characters real app ids and argv[0]s actually contain.
+        #[test]
+        fn app_ids_survive_escaping_into_a_unit_name() {
+            // Dots are legal in unit names and must NOT be escaped, or every reverse-DNS app id
+            // (which is most of them) turns into noise.
+            assert_eq!(
+                escape_unit_name(b"org.mozilla.firefox.desktop"),
+                "org.mozilla.firefox.desktop"
+            );
+            assert_eq!(escape_unit_name(b"kitty"), "kitty");
+            assert_eq!(escape_unit_name(b"gnome-terminal"), "gnome\\x2dterminal");
+            assert_eq!(escape_unit_name(b"my app"), "my\\x20app");
+            assert_eq!(escape_unit_name(b"a/b"), "a\\x2fb");
+            // Non-ASCII goes byte by byte rather than by char, since unit names are bytes.
+            assert_eq!(escape_unit_name("é".as_bytes()), "\\xc3\\xa9");
+        }
     }
 }
