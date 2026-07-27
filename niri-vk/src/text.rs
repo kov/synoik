@@ -12,7 +12,7 @@
 //! differ slightly from pango/cairo/FreeType — expected, not a bug.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use anyhow::{bail, Context, Result};
 use ash::vk;
@@ -207,27 +207,46 @@ impl PendingGlyph {
     }
 }
 
-/// A process-global font system used only for GPU-free text *measurement* — sizing a hit rectangle
-/// or a layout box before any renderer (hence any [`TextContext`]) exists. The first call scans the
-/// system fonts (tens of ms); every measurement after is cheap. Shaping only, never rasterization,
-/// so it needs no [`Gpu`]. The draw path uses the renderer's own [`TextContext`] font system.
-fn measure_fonts() -> &'static Mutex<FontSystem> {
+/// Lock **the** font database — one per process, shared by the GPU-free measurement helpers and
+/// by every [`TextContext`] shape.
+///
+/// Global because building one scans and parses the system fonts, which is the expensive half of
+/// the text stack (see [`prewarm`]), and because a second copy buys nothing: measurement and
+/// drawing want the same faces. It is also what lets the startup prewarm warm the *actual* object
+/// the renderer will shape through instead of only the page cache underneath it.
+///
+/// **Not reentrant.** Anything that already holds this guard must pass `&mut FontSystem` down
+/// rather than call back into a helper that locks — see [`TextContext::resolve`].
+///
+/// The lock is free today: only the compositor thread shapes, plus the prewarm thread once at
+/// startup. If shaping ever moves off-thread (a text-heavy bake on a worker), this becomes a
+/// serialization point and the answer is a per-thread `FontSystem` over a shared `fontdb`, not a
+/// bigger critical section.
+fn fonts() -> MutexGuard<'static, FontSystem> {
     static FONTS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
-    FONTS.get_or_init(|| Mutex::new(FontSystem::new()))
+    let mutex = FONTS.get_or_init(|| Mutex::new(FontSystem::new()));
+    // Recover from poisoning rather than propagate it. A shape that panics while holding this
+    // guard would otherwise brick *all* text in the process for the rest of the session — every
+    // later lock panics, and this module's contract is that a failure degrades to no glyphs, not
+    // a panic. What the guard protects is a cache: the worst a mid-shape panic leaves behind is a
+    // missing entry, which the next shape refills.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Build the font database and resolve SansSerif, so the first frame does not have to.
 ///
 /// Intended to run on a throwaway thread at startup, alongside the event loop and backend being
-/// built. Nothing here is needed by the caller — the work lands in [`measure_fonts`]'s `OnceLock`
-/// and, more importantly, in the kernel's page cache, which is what the cost actually is.
+/// built. Nothing here is needed by the caller — the work lands in [`fonts`]'s `OnceLock`, which
+/// is the same database every later shape uses, and in the kernel's page cache underneath it.
 ///
 /// The live seat's very first frame spent **32.91ms shaping 4 runs**; later frames shape 2 runs in
 /// 0.34ms. Measured against a warm page cache the same construct-and-shape sequence is 6.3ms for
 /// `FontSystem::new()` plus 3.4ms for the first four runs, and a genuinely cold one made a single
 /// `measure_line_width` call take **408ms** — so the cost is font *file I/O and first parse*, not
-/// shaping, and it is paid again by the renderer's own [`TextContext`] unless the files are
-/// already resident. Warming one font system warms the files for both.
+/// shaping. Prewarming on a thread took the seat's first frame from 57.81ms to 26.18ms and its
+/// shaping clause from 32.91ms to 10.75ms; the rest of that clause was the renderer's *own*
+/// `FontSystem` repeating the parse, which is why there is only one now. Behind this call,
+/// [`TextContext::new`] is 1µs and the first frame's four runs shape in 0.18ms.
 ///
 /// Idempotent and cheap to call twice; a second call is a cache hit.
 pub fn prewarm() {
@@ -290,7 +309,7 @@ pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
 
 fn measure_line_width_uncached(text: &str, px: f32, bold: bool) -> f64 {
     let _timed = crate::stats::shape();
-    let mut fonts = measure_fonts().lock().unwrap();
+    let mut fonts = fonts();
     let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
     {
         let mut b = buffer.borrow_with(&mut fonts);
@@ -413,7 +432,7 @@ fn wrap_lines_uncached(
 ) -> Vec<String> {
     const ELLIPSIS: char = '\u{2026}';
     let _timed = crate::stats::shape();
-    let mut fonts = measure_fonts().lock().unwrap();
+    let mut fonts = fonts();
     let wrap = wrap_px as f32;
     let ranges = shape_line_ranges(&mut fonts, text, px, bold, wrap);
     if ranges.len() <= max_lines {
@@ -440,14 +459,23 @@ fn wrap_lines_uncached(
     }
 }
 
-/// The long-lived pieces of the text stack. `FontSystem::new()` scans and parses the system fonts
-/// (tens of ms); `ScaleContext` caches per-font scaler state. Both are expensive to build and
-/// cheap to reuse, so the compositor holds ONE `TextContext` for the life of the renderer.
+/// The renderer-scoped pieces of the text stack: `ScaleContext` caches per-font scaler state, and
+/// the residency map for the **persistent** glyph atlas ([`GlyphAtlasIndex`]) — glyphs are
+/// rasterized once and stay, so re-shaping changing text costs a shape and nothing more. The
+/// compositor holds ONE of these for the life of the renderer.
 ///
-/// It also owns the residency map for the **persistent** glyph atlas ([`GlyphAtlasIndex`]): glyphs
-/// are rasterized once and stay, so re-shaping changing text costs a shape and nothing more.
+/// The font database is **not** here: it is the process-global [`fonts`], shared with the
+/// measurement path. Two `FontSystem`s meant scanning and parsing the system fonts twice — the
+/// expensive half of the text stack, and the whole of what [`prewarm`] exists to move off the
+/// first frame — for two copies of the same data. Sharing also means the prewarm warms the exact
+/// object the renderer shapes through, rather than only the page cache underneath it.
+///
+/// What stays per-renderer is what *has* to: the atlas index describes a specific atlas image, and
+/// the two are kept in step by a generation counter rather than by identity. A global index would
+/// outlive the image it describes — a recreated renderer starts with no atlas image while the
+/// index still claims glyphs are resident in it, and the mismatch is silent (blank or wrong
+/// glyphs), not a panic.
 pub struct TextContext {
-    fonts: FontSystem,
     scale: ScaleContext,
     atlas: GlyphAtlasIndex,
 }
@@ -461,7 +489,6 @@ impl Default for TextContext {
 impl TextContext {
     pub fn new() -> Self {
         TextContext {
-            fonts: FontSystem::new(),
             scale: ScaleContext::new(),
             atlas: GlyphAtlasIndex::new(INITIAL_ATLAS_SIDE),
         }
@@ -486,16 +513,17 @@ impl TextContext {
         bold: bool,
     ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         let _timed = crate::stats::shape();
-        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(px, (px * 1.25).round()));
+        let mut fonts = fonts();
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
         {
-            let mut b = buffer.borrow_with(&mut self.fonts);
+            let mut b = buffer.borrow_with(&mut fonts);
             b.set_size(None, None);
             let attrs = sans_label_attrs(bold);
             b.set_text(text, &attrs, Shaping::Advanced, None);
             b.shape_until_scroll(false);
         }
-        self.resolve(&buffer)
+        self.resolve(&mut fonts, &buffer)
     }
 
     /// Lay out a styled, center-aligned paragraph wrapped to `wrap_px` pixels: each [`TextSpan`]
@@ -510,13 +538,11 @@ impl TextContext {
         base_px: f32,
     ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         let _timed = crate::stats::shape();
-        let mut buffer = Buffer::new(
-            &mut self.fonts,
-            Metrics::new(base_px, (base_px * 1.25).round()),
-        );
+        let mut fonts = fonts();
+        let mut buffer = Buffer::new(&mut fonts, Metrics::new(base_px, (base_px * 1.25).round()));
         buffer.set_hinting(Hinting::Enabled);
         {
-            let mut b = buffer.borrow_with(&mut self.fonts);
+            let mut b = buffer.borrow_with(&mut fonts);
             b.set_size(Some(wrap_px), None);
             let default_attrs = Attrs::new().family(SANS_FAMILY);
             // Tag each span with its index (cosmic-text carries it to every laid-out glyph as
@@ -529,7 +555,7 @@ impl TextContext {
             b.set_rich_text(rich, &default_attrs, Shaping::Advanced, Some(Align::Center));
             b.shape_until_scroll(false);
         }
-        self.resolve(&buffer)
+        self.resolve(&mut fonts, &buffer)
     }
 
     /// The atlas residency map, for the owner of the atlas image (see [`GlyphAtlasIndex`]).
@@ -553,9 +579,16 @@ impl TextContext {
     /// Loops rather than retrying once: a single doubling need not be enough (a full ASCII set at
     /// 44px overflows both a 64px atlas and the 128px one it first grows to), and stopping early
     /// would fail a run the atlas can in fact hold.
-    fn resolve(&mut self, buffer: &Buffer) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
+    ///
+    /// Takes `fonts` rather than locking: the caller is already holding the guard across its
+    /// shape, and re-locking here would deadlock on a non-reentrant mutex.
+    fn resolve(
+        &mut self,
+        fonts: &mut FontSystem,
+        buffer: &Buffer,
+    ) -> Result<(ShapedRun, Vec<PendingGlyph>)> {
         loop {
-            if let Some(resolved) = self.resolve_once(buffer) {
+            if let Some(resolved) = self.resolve_once(fonts, buffer) {
                 return Ok(resolved);
             }
             if !self.atlas.grow() {
@@ -566,7 +599,11 @@ impl TextContext {
 
     /// One resolution pass. `None` means the atlas ran out of room, which is the caller's cue to
     /// grow and retry — not an error.
-    fn resolve_once(&mut self, buffer: &Buffer) -> Option<(ShapedRun, Vec<PendingGlyph>)> {
+    fn resolve_once(
+        &mut self,
+        fonts: &mut FontSystem,
+        buffer: &Buffer,
+    ) -> Option<(ShapedRun, Vec<PendingGlyph>)> {
         // Line-box metrics for baseline centering: the font's ascent/descent (px) at this size,
         // taken from the first line's first glyph, plus that line's baseline. Pango/St center a
         // single-line label on this box (ascent+descent) — reserving descent space — not on the
@@ -578,7 +615,7 @@ impl TextContext {
         'metrics: for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
-                if let Some(font) = self.fonts.get_font(key.font_id, key.font_weight) {
+                if let Some(font) = fonts.get_font(key.font_id, key.font_weight) {
                     let m = font.as_swash().metrics(&[]).scale(ppem);
                     baseline = run.line_y.round() as i32;
                     ascent = m.ascent;
@@ -608,7 +645,7 @@ impl TextContext {
                 let slot = match self.atlas.slots.get(&key) {
                     Some(cached) => *cached,
                     None => {
-                        let raster = Self::rasterize_glyph(&mut self.fonts, &mut self.scale, key);
+                        let raster = Self::rasterize_glyph(fonts, &mut self.scale, key);
                         match raster {
                             Some(raster) => {
                                 let slot = self.atlas.allocate(key, &raster)?;
@@ -1493,6 +1530,30 @@ mod tests {
         assert!(
             crate::stats::shapes() > shapes,
             "the bold variant was not shaped"
+        );
+    }
+
+    /// One shared [`FontSystem`] means one shared mutex, so a shape that panics while holding it
+    /// poisons the database for everyone. Propagating that would turn a single bad run into "this
+    /// session can never draw text again" — every later lock panicking in turn. Recovery keeps the
+    /// contract that a text failure costs glyphs, not the compositor.
+    ///
+    /// The panic this deliberately provokes prints a backtrace during the run; that is the test
+    /// working, not a failure.
+    #[test]
+    fn a_panic_while_shaping_does_not_brick_text_for_the_rest_of_the_process() {
+        let died = std::thread::spawn(|| {
+            let _guard = fonts();
+            panic!("pretend a shape blew up mid-buffer");
+        })
+        .join();
+        assert!(died.is_err(), "the thread was supposed to panic");
+
+        // An unmeasured string, so this goes through the lock rather than the memo cache.
+        let width = measure_line_width("after the poisoning", 16.0);
+        assert!(
+            width > 0.,
+            "the font database stayed poisoned — later text got no glyphs"
         );
     }
 
