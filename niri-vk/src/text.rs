@@ -327,6 +327,8 @@ fn shape_line_ranges(
 /// scale-independent break points. GPU-free (shaping only), like [`measure_line_width`]. This is
 /// the notification-card body path: GNOME clamps a message body to one ellipsized line collapsed
 /// and six expanded (`LabelExpanderLayout`, gnome-shell `js/ui/messageList.js:220-275`).
+///
+/// Memoized (see [`wrap_cache`]); a hit does no shaping at all.
 pub fn wrap_lines_weighted(
     text: &str,
     px: f32,
@@ -334,11 +336,63 @@ pub fn wrap_lines_weighted(
     wrap_px: f64,
     max_lines: usize,
 ) -> Vec<String> {
-    const ELLIPSIS: char = '\u{2026}';
     let max_lines = max_lines.max(1);
     if text.is_empty() {
         return Vec::new();
     }
+    let key = (
+        text.to_owned(),
+        px.to_bits(),
+        bold,
+        wrap_px.to_bits(),
+        max_lines,
+    );
+    if let Some(lines) = wrap_cache().lock().unwrap().get(&key) {
+        return lines.clone();
+    }
+
+    let lines = wrap_lines_uncached(text, px, bold, wrap_px, max_lines);
+
+    let mut cache = wrap_cache().lock().unwrap();
+    if cache.len() >= WRAP_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, lines.clone());
+    lines
+}
+
+/// Cache for [`wrap_lines_weighted`], keyed by the whole argument list.
+///
+/// A wrap is strictly more expensive than a measure — one shape per attempt, and the
+/// ellipsis retreat re-shapes in a loop — and its callers ask for it the way they would
+/// read a field: a notification card lays itself out once per hit-test and again per
+/// render-element collection, so a pointer crossing the message list re-wraps every
+/// visible card's body on every motion event. Nothing about the body changed.
+///
+/// Bounded the same way [`measure_cache`] is, and for the same reason: a body can carry a
+/// live counter ("3 new messages"), which would otherwise contribute a never-reused key
+/// per update. Clearing wholesale costs a re-wrap of what is on screen.
+fn wrap_cache() -> &'static Mutex<WrapCache> {
+    static CACHE: OnceLock<Mutex<WrapCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Wrapped lines keyed by `(text, px bits, bold, wrap px bits, max lines)`.
+type WrapCache = HashMap<(String, u32, bool, u64, usize), Vec<String>>;
+
+/// Smaller than [`MEASURE_CACHE_CAP`]: the values are whole line vectors, and the keys are
+/// message bodies rather than short labels.
+const WRAP_CACHE_CAP: usize = 256;
+
+fn wrap_lines_uncached(
+    text: &str,
+    px: f32,
+    bold: bool,
+    wrap_px: f64,
+    max_lines: usize,
+) -> Vec<String> {
+    const ELLIPSIS: char = '\u{2026}';
+    let _timed = crate::stats::shape();
     let mut fonts = measure_fonts().lock().unwrap();
     let wrap = wrap_px as f32;
     let ranges = shape_line_ranges(&mut fonts, text, px, bold, wrap);
@@ -1419,6 +1473,53 @@ mod tests {
         assert!(
             crate::stats::shapes() > shapes,
             "the bold variant was not shaped"
+        );
+    }
+
+    /// A repeated wrap must not re-shape either. This one matters more than the
+    /// measurement: a wrap costs one shape per attempt plus a re-shaping loop to fit the
+    /// ellipsis, and a notification card runs it once per hit-test and again per
+    /// render-element collection — so a pointer crossing the message list used to re-wrap
+    /// every visible body on every motion event.
+    #[test]
+    fn a_repeated_wrap_is_cached() {
+        let body = "a notification body long enough that it has to wrap onto more than \
+                    one line and then be ellipsized when the budget runs out";
+        let first = wrap_lines_weighted(body, 14.0, false, 180., 2);
+        assert_eq!(first.len(), 2, "the body should have filled the budget");
+        assert!(
+            first.last().is_some_and(|l| l.ends_with('\u{2026}')),
+            "the clamped last line should be ellipsized: {first:?}"
+        );
+
+        let shapes = crate::stats::shapes();
+        let again = wrap_lines_weighted(body, 14.0, false, 180., 2);
+        assert_eq!(again, first, "the cached wrap differs from the shaped one");
+        assert_eq!(
+            crate::stats::shapes(),
+            shapes,
+            "a repeated wrap re-shaped instead of hitting the cache"
+        );
+
+        // The width is part of the key — the same body in a wider column wraps
+        // differently, and must not come back from the cache.
+        let wider = wrap_lines_weighted(body, 14.0, false, 360., 2);
+        assert_ne!(wider, first, "the wrap width is not in the key");
+        assert!(
+            crate::stats::shapes() > shapes,
+            "the wider wrap was not shaped"
+        );
+
+        // As is the line budget: the same text and width, more room, no ellipsis.
+        let shapes = crate::stats::shapes();
+        let taller = wrap_lines_weighted(body, 14.0, false, 180., 6);
+        assert!(
+            taller.len() > first.len(),
+            "the line budget is not in the key: {taller:?}"
+        );
+        assert!(
+            crate::stats::shapes() > shapes,
+            "the taller wrap was not shaped"
         );
     }
 }

@@ -286,10 +286,12 @@ pub fn layout(
 /// the no-scroll message list caps an expanded card to the space left above
 /// its controls row (gnome-shell scrolls instead; recorded divergence).
 ///
-/// TODO(perf): this is no longer pure arithmetic — a non-empty body is shaped
-/// (wrap + width measure) under the global measure-font mutex on every call,
-/// and callers re-layout per hit-test / per render-element collection. Fine at
-/// today's card counts; cache per (body, width, lines) if it ever shows up.
+/// This is not pure arithmetic — a non-empty body is wrapped and measured, and
+/// callers re-layout per hit-test and per render-element collection, so a pointer
+/// crossing the message list runs this over every visible card on every motion
+/// event. Both text calls are memoized in `niri_vk::text` on their full argument
+/// lists (`wrap_cache`, `measure_cache`), so a repeat layout of an unchanged card
+/// shapes nothing; what is left here is arithmetic and a few small allocations.
 pub fn layout_clamped(
     content: &CardContent,
     width: f64,
