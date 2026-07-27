@@ -29,7 +29,7 @@ type WorldClocksCache = Option<(Vec<WorldLocation>, Vec<ResolvedLocation>)>;
 /// same store gnome-shell/mutter use — and keeps the model current afterwards.
 /// Detection code reads through this model, so updates never need to touch the
 /// input path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GnomeSettings {
     /// `org.gnome.mutter overlay-key`: the keys whose lone tap toggles the
     /// Activities overview. Empty disables the overlay key. GNOME's default is
@@ -793,13 +793,31 @@ pub fn load_and_watch_gsettings() -> (
 
                 // Subscribe before the initial read so no change can fall
                 // between them; a racing change just re-arrives via `tx`.
+                //
+                // A change to *any* key in *any* watched store re-reads the whole
+                // model, and most of those keys are not ones we model — so the usual
+                // ping produces a model identical to the one already applied. Sending
+                // it anyway made the main loop re-derive everything downstream for
+                // nothing. Emit only on a real difference; the consumer then knows a
+                // delivered model genuinely changed.
+                let last: Rc<RefCell<Option<GnomeSettings>>> = Rc::new(RefCell::new(None));
+                let seen = last.clone();
                 stores.subscribe(move |settings| {
+                    if !is_new_model(&seen, &settings) {
+                        return;
+                    }
                     let _ = tx.send(settings);
                 });
                 // Mirror GNOME Clocks' locations into the shell gsettings before the
                 // initial read, so a running Clocks is reflected in the first model.
                 stores.setup_clocks_mirror();
-                let _ = init_tx.send(stores.read());
+                let initial = stores.read();
+                // Seed the dedup with what the consumer starts from, so the first
+                // unrelated ping after startup compares against it rather than
+                // counting as a change. (A change *during* startup still gets through:
+                // `last` is None until here, so those callbacks always send.)
+                *last.borrow_mut() = Some(initial.clone());
+                let _ = init_tx.send(initial);
 
                 if stores.any() {
                     glib::MainLoop::new(Some(&ctx), false).run();
@@ -997,6 +1015,21 @@ fn adopted_mutter_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
 /// The GSettings stores feeding [`GnomeSettings`]. Any change to any of them
 /// re-reads the whole model — settings churn is rare and the read is cheap,
 /// and one code path means one behavior to test.
+/// Whether `settings` differs from the last model recorded in `seen`, recording it
+/// when it does.
+///
+/// The gsettings watcher re-reads the whole model on a change to any key in any
+/// watched store, including the many keys we do not model, so most reads reproduce
+/// what the consumer already has. `None` (before the initial read has been recorded)
+/// counts as new, so a genuine change during startup is never swallowed.
+fn is_new_model(seen: &RefCell<Option<GnomeSettings>>, settings: &GnomeSettings) -> bool {
+    if seen.borrow().as_ref() == Some(settings) {
+        return false;
+    }
+    *seen.borrow_mut() = Some(settings.clone());
+    true
+}
+
 struct Stores {
     mutter: Option<gio::Settings>,
     mutter_keybindings: Option<gio::Settings>,
@@ -1453,6 +1486,35 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    /// The watcher re-reads the whole model whenever any key in any watched store
+    /// changes — including the many keys we do not model — so an unrelated write
+    /// produces a model identical to the one already applied. Forwarding it made the
+    /// main loop re-derive everything downstream for nothing, and one such write
+    /// lands a few seconds into every session.
+    #[test]
+    fn only_a_model_that_actually_changed_is_forwarded() {
+        let seen = RefCell::new(None);
+        let settings = GnomeSettings::default();
+
+        assert!(
+            is_new_model(&seen, &settings),
+            "the first model must always go through — nothing has been applied yet"
+        );
+        assert!(
+            !is_new_model(&seen, &settings),
+            "an unrelated key changed and the re-read produced the same model: \
+             forwarding it re-derives the whole downstream for nothing"
+        );
+
+        let mut changed = settings.clone();
+        changed.icon_theme = "Papirus".to_owned();
+        assert!(
+            is_new_model(&seen, &changed),
+            "a real change must go through"
+        );
+        assert!(!is_new_model(&seen, &changed), "and only once");
+    }
+
     use super::*;
 
     /// Regression: `locale_week_start` must read the weekday item, not a month name. The historic
