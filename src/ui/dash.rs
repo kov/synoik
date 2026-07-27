@@ -55,6 +55,7 @@ use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
+use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -118,6 +119,18 @@ const SHOW_APPS_ICON: &str = "view-app-grid-symbolic";
 /// The empty-dash drop target's side (`$dash_placeholder_size`, `_dash.scss:6,42-45`).
 /// Space only: `.empty-dash-drop-target` sets a width and a height and nothing else.
 const EMPTY_DROP_TARGET_PX: f64 = 32.;
+
+/// The drop gap's open width. gnome-shell sizes the placeholder's child to `iconSize`
+/// (`dash.js:927`) — narrower than the tile it makes room for, so the run parts by a
+/// bare icon's width, not a whole advance.
+const PLACEHOLDER_W: f64 = ICON_PX;
+/// `DASH_ANIMATION_TIME` (`dash.js:16`); the curve is `EASE_OUT_QUAD` (`dash.js:164`).
+const GAP_ANIMATION_MS: u64 = 200;
+
+/// An animation that is already over, resting at `value` — the gap at rest.
+fn settled(clock: &Clock, value: f64) -> Animation {
+    Animation::ease(clock.clone(), value, value, 0., 0, Curve::EaseOutQuad)
+}
 
 /// Separator line width (`.dash-separator`, `_dash.scss:84`).
 const SEPARATOR_W: f64 = 1.;
@@ -208,11 +221,28 @@ pub struct Dash {
     /// Bumped when `items` changes — the bake revision's content part.
     content_rev: u64,
     /// While a drag hovers the dash, the favourites index the drop would land at.
-    /// The run opens a one-tile gap there so the icons part around the incoming app
+    /// The run opens a gap there so the icons part around the incoming app
     /// (gnome-shell's `_dragPlaceholder`, `dash.js:926-932`). The placeholder is a
     /// pure gap — 50.1's `.placeholder` has `background-image: none`
     /// (`_dash.scss:35-40`), so there is nothing to paint, only space to make.
     drop_slot: Option<usize>,
+    /// The gap's width, eased 0 ⇄ [`PLACEHOLDER_W`] as it opens and closes. Moving an
+    /// open gap between slots is *not* animated: gnome-shell destroys the placeholder
+    /// and re-shows it with `fadeIn = false` (`dash.js:918-932`), so only the first
+    /// appearance and the disappearance take time.
+    ///
+    /// This does re-bake the pill chrome on every frame it moves, because the pill's
+    /// size is part of the bake key. That is *not* the animated-property-in-the-key bug
+    /// class ([[animation-per-frame-bake]]) — the pill really is a different width each
+    /// frame, so there is nothing to reuse. Making it free would mean drawing the pill
+    /// as a rounded-rect render element instead of a baked texture, which is a bigger
+    /// change than this gesture justifies.
+    gap: Animation,
+    /// Where the gap's space is inserted. Tracks `drop_slot` while one is open, and is
+    /// *retained* while the gap collapses — gnome-shell's placeholder is still a child
+    /// at its index while it animates out, so the icons after it stay parted until it
+    /// is gone.
+    gap_slot: usize,
     /// Whether an app-icon drag is in flight anywhere. Only the empty dash cares: with
     /// no icons there is nothing to aim at, so gnome-shell reserves a placeholder-sized
     /// target for the duration of the drag (`EmptyDropTargetItem`, inserted in
@@ -220,24 +250,22 @@ pub struct Dash {
     /// Like the gap it is pure space — `.empty-dash-drop-target` sets only a size.
     drag_active: bool,
     hovered: Option<DashHit>,
+    clock: Clock,
     cache: RefCell<DashCache>,
 }
 
-impl Default for Dash {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Dash {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock) -> Self {
         Self {
             items: Vec::new(),
             n_favorites: 0,
             content_rev: 0,
             drop_slot: None,
+            gap: settled(&clock, 0.),
+            gap_slot: 0,
             drag_active: false,
             hovered: None,
+            clock,
             cache: RefCell::new(DashCache::default()),
         }
     }
@@ -262,12 +290,53 @@ impl Dash {
 
     /// Open (or move, or close) the drop gap. Returns whether it changed — the gap
     /// widens the pill, so the caller re-bakes and redraws.
+    ///
+    /// Opening and closing are eased over [`GAP_ANIMATION_MS`]; *moving* an open gap is
+    /// instant, because gnome-shell recreates the placeholder at the new index with
+    /// `fadeIn = false` when one is already up (`dash.js:918-932`).
     pub fn set_drop_slot(&mut self, slot: Option<usize>) -> bool {
         if self.drop_slot == slot {
             return false;
         }
+        let was_open = self.drop_slot.is_some();
         self.drop_slot = slot;
+        if let Some(slot) = slot {
+            self.gap_slot = slot;
+        }
+        match (was_open, slot.is_some()) {
+            // Re-targeted from wherever it is now, not from 0: a gap that reopens while
+            // it is still collapsing must not restart. (gnome-shell instead refuses to
+            // move a placeholder while one animates out — `_animatingPlaceholdersCount`,
+            // `dash.js:843-846,906` — which it needs because its placeholders are
+            // separate actors and ours is one width.)
+            (false, true) => self.gap = self.ease_gap_to(PLACEHOLDER_W),
+            (true, false) => self.gap = self.ease_gap_to(0.),
+            _ => (),
+        }
         true
+    }
+
+    fn ease_gap_to(&self, to: f64) -> Animation {
+        Animation::ease(
+            self.clock.clone(),
+            self.gap_w(),
+            to,
+            0.,
+            GAP_ANIMATION_MS,
+            Curve::EaseOutQuad,
+        )
+    }
+
+    /// The gap's current width. Read by the layout *and* by the drop math, which is
+    /// what keeps the two consistent while it is still opening.
+    fn gap_w(&self) -> f64 {
+        self.gap.clamped_value()
+    }
+
+    /// Whether the gap is still moving — keeps the redraw loop alive, since nothing
+    /// else generates damage while the pointer holds still mid-animation.
+    pub fn are_animations_ongoing(&self) -> bool {
+        !self.gap.is_done()
     }
 
     /// The open drop gap, if any — what a drop lands on.
@@ -344,12 +413,10 @@ impl Dash {
         } else {
             0.
         };
-        let gap_w = if self.drop_slot.is_some() {
-            ITEM_ADVANCE
-        } else {
-            0.
-        };
-        let measured_w = box_w - separator_space - gap_w;
+        // Taking out the gap's *current* width, not its target, keeps the share size
+        // constant while it eases open — otherwise the answer would drift under a
+        // motionless pointer and the gap would chase itself across slots.
+        let measured_w = box_w - separator_space - self.gap_w();
         let n_children = self.items.len();
         if measured_w <= 0. || n_children == 0 {
             return None;
@@ -474,12 +541,7 @@ impl Dash {
     fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
         let n = self.items.len();
         let count = n + 1; // + show-apps
-        let drop_slot = self.drop_slot;
-        let gap = if drop_slot.is_some() {
-            ITEM_ADVANCE
-        } else {
-            0.
-        };
+        let gap = self.gap_w();
         let empty_target = self.empty_drop_target_w();
         let separator_after = self.separator_after();
         let separator_space = if separator_after.is_some() {
@@ -503,11 +565,9 @@ impl Dash {
             Some(at) if k >= at => separator_space,
             _ => 0.,
         };
-        // Items at or after the drop slot are pushed right by the gap.
-        let gap_shift = |k: usize| match drop_slot {
-            Some(at) if k >= at => gap,
-            _ => 0.,
-        };
+        // Items at or after the gap are pushed right by it.
+        let gap_slot = self.gap_slot;
+        let gap_shift = |k: usize| if k >= gap_slot { gap } else { 0. };
         // The empty drop target is inserted at the front of the box (`dash.js:412`), so
         // everything — which is only ever the show-apps button — follows it.
         let tiles = (0..count)
@@ -856,15 +916,82 @@ mod tests {
     use super::*;
 
     fn dash_with(n: usize) -> Dash {
-        let mut dash = Dash::new();
+        let mut dash = Dash::new(Clock::with_time(std::time::Duration::ZERO));
         let items = (0..n).map(|i| entry(&format!("app{i}.desktop"))).collect();
         dash.set_items(items, n);
         dash
     }
 
+    /// The drop gap eases open and shut over `DASH_ANIMATION_TIME` but *jumps* between
+    /// slots: gnome-shell re-shows the placeholder with `fadeIn = false` when one is
+    /// already up (`dash.js:918-932`).
+    #[test]
+    fn the_drop_gap_eases_open_and_shut_but_jumps_between_slots() {
+        use std::time::Duration;
+
+        let mut dash = dash_with(3);
+        let mut clock = dash.clock.clone();
+        let area = box_1080();
+        let closed_w = dash.layout(area).pill.size.w;
+
+        // Opening: nothing at t=0, part-way at t=100ms, all of it by t=200ms.
+        assert!(dash.set_drop_slot(Some(1)));
+        assert_eq!(dash.gap_w(), 0., "the gap must start closed and grow");
+        clock.set_unadjusted(Duration::from_millis(100));
+        let mid = dash.gap_w();
+        assert!(
+            mid > 0. && mid < PLACEHOLDER_W,
+            "mid-animation the gap must be part-open, got {mid}"
+        );
+        assert!(
+            dash.are_animations_ongoing(),
+            "and must hold the redraw loop open while it moves"
+        );
+        clock.set_unadjusted(Duration::from_millis(200));
+        assert_eq!(dash.gap_w(), PLACEHOLDER_W);
+        assert!(!dash.are_animations_ongoing());
+        assert_eq!(
+            dash.layout(area).pill.size.w,
+            closed_w + PLACEHOLDER_W,
+            "the open gap widens the pill by exactly the placeholder"
+        );
+
+        // Moving: instant, and the space moves with it.
+        let before = dash.layout(area).tiles[1].loc.x;
+        assert!(dash.set_drop_slot(Some(2)));
+        assert_eq!(dash.gap_w(), PLACEHOLDER_W, "moving must not re-animate");
+        assert_eq!(
+            dash.layout(area).tiles[1].loc.x,
+            before - PLACEHOLDER_W,
+            "tile 1 is no longer after the gap, so it comes back by its width"
+        );
+
+        // Closing: eased, and the icons stay parted around it until it is gone.
+        assert!(dash.set_drop_slot(None));
+        assert_eq!(
+            dash.gap_w(),
+            PLACEHOLDER_W,
+            "the close starts from wide open"
+        );
+        clock.set_unadjusted(Duration::from_millis(300));
+        let mid = dash.gap_w();
+        assert!(
+            mid > 0. && mid < PLACEHOLDER_W,
+            "mid-close the gap must still hold space, got {mid}"
+        );
+        assert_eq!(
+            dash.layout(area).tiles[2].loc.x - dash.layout(area).tiles[1].loc.x,
+            ITEM_ADVANCE + mid,
+            "the collapsing gap keeps parting the icons it was between"
+        );
+        clock.set_unadjusted(Duration::from_millis(400));
+        assert_eq!(dash.gap_w(), 0.);
+        assert_eq!(dash.layout(area).pill.size.w, closed_w);
+    }
+
     /// A dash with `n_fav` favorites followed by `n_running` running non-favorites.
     fn dash_with_running(n_fav: usize, n_running: usize) -> Dash {
-        let mut dash = Dash::new();
+        let mut dash = Dash::new(Clock::with_time(std::time::Duration::ZERO));
         let mut items: Vec<DashEntry> = (0..n_fav)
             .map(|i| entry(&format!("fav{i}.desktop")))
             .collect();
@@ -977,7 +1104,7 @@ mod tests {
 
     #[test]
     fn set_favorites_reports_change() {
-        let mut dash = Dash::new();
+        let mut dash = Dash::new(Clock::with_time(std::time::Duration::ZERO));
         assert!(dash.set_items(vec![entry("a.desktop")], 1));
         assert!(!dash.set_items(vec![entry("a.desktop")], 1));
         assert!(

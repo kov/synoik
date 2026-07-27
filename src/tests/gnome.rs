@@ -6135,6 +6135,9 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
         Some(2),
         "hovering the third tile opens the gap before it"
     );
+    // The gap eases open, and the strip past the last tile is made *of* that width —
+    // so it isn't there to aim at until the animation lands.
+    f.settle_animations();
     // Slightly left of where the show-apps button *was*: opening the gap widened the
     // pill, and a centered pill grows both ways, so everything slid half a tile left.
     pointer_motion_to(&mut f, past_end.x - 20., past_end.y);

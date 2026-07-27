@@ -3707,7 +3707,7 @@ impl Niri {
             is_session_instance,
             start_time: Instant::now(),
             is_at_startup: true,
-            clock: animation_clock,
+            clock: animation_clock.clone(),
 
             layout,
             global_space: Space::default(),
@@ -3850,7 +3850,7 @@ impl Niri {
             panel,
             panel_popover,
             overview_was_open: false,
-            dash: Dash::new(),
+            dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(),
             preview_chrome: PreviewChrome::new(),
@@ -6372,6 +6372,9 @@ impl Niri {
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
+            // The dash's drop gap eases shut after a drop, with no pointer motion left
+            // to generate the frames it needs.
+            state.unfinished_animations_remain |= self.dash.are_animations_ongoing();
             // The overview search cross-fade lives on `Niri` (not the layout), so it
             // must keep the redraw loop alive here too — otherwise the fade only
             // advances when another event (e.g. pointer motion) forces a frame, and
