@@ -1222,12 +1222,19 @@ impl FrameLog {
         // to the previous presentation, in whole cycles. Recorded before the
         // early-outs below, because a frame presented *early* still lands on some
         // vblank and still contributes an interval.
-        if let Some(prev) = self.last_presented.insert(output.to_owned(), actual) {
-            if let Some(gap) = actual.checked_sub(prev) {
-                let cycles = (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize;
-                self.stats.entry(output.to_owned()).or_default().cadence
-                    [cycles.min(CADENCE_MAX)] += 1;
-            }
+        // Also kept for the miss line below. A flip that immediately follows another and a flip
+        // after a quiet stretch are different events on this stack: measured across ~18500 live
+        // flips, back-to-back ones miss 1% of the time and *anything* with a cycle of quiet in
+        // front of it misses 26-47%, flat from 2 cycles out to 5 seconds. Without this number a
+        // miss line cannot tell the two apart, and the whole idle regime reads as one mystery.
+        // See `docs/fork/present-misses.md` §10.
+        let since_last_flip = self
+            .last_presented
+            .insert(output.to_owned(), actual)
+            .and_then(|prev| actual.checked_sub(prev))
+            .map(|gap| (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize);
+        if let Some(cycles) = since_last_flip {
+            self.stats.entry(output.to_owned()).or_default().cadence[cycles.min(CADENCE_MAX)] += 1;
         }
 
         let Some(late) = actual.checked_sub(target) else {
@@ -1251,8 +1258,10 @@ impl FrameLog {
             None => String::new(),
         };
 
+        let cadence = cadence_clause(since_last_flip);
+
         tracing::warn!(
-            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}{queued}",
+            "missed {missed} vblank(s) on {output}: presented {} late, refresh {}{queued}{cadence}",
             ms(late),
             ms(refresh),
         );
@@ -1357,6 +1366,20 @@ impl FrameLog {
 
 /// How many bake sites a frame line names before it starts counting the rest.
 const BAKE_SITES_SHOWN: usize = 3;
+
+/// How long the display had been quiet in front of a missed flip, in whole refresh cycles.
+///
+/// Its own function so a test can pin the wording without going through a page flip. The
+/// distinction it draws is the one the live data says matters: a flip that immediately follows
+/// another misses ~1% of the time on this stack, and one with even a single idle cycle in front of
+/// it misses 26–47% — flat from 2 cycles out to 5 seconds. See `docs/fork/present-misses.md` §10.
+fn cadence_clause(since_last_flip: Option<usize>) -> String {
+    match since_last_flip {
+        None => ", first flip".to_owned(),
+        Some(1) => ", back-to-back".to_owned(),
+        Some(n) => format!(", {n} cycles since the last flip"),
+    }
+}
 
 /// How much of a phase has to go unexplained before the line says so.
 ///
@@ -1890,6 +1913,33 @@ mod tests {
         assert!(log.in_flight.is_none());
         let stats = &log.stats["test-output"];
         assert_eq!(stats.frames, 1);
+    }
+
+    /// A miss line has to say how long the display had been quiet in front of it. Measured across
+    /// ~18 500 live flips, a back-to-back flip misses 1% of the time and one with even a single
+    /// idle cycle in front of it misses 26–47% — so the gap, not the lateness, is what sorts the
+    /// two populations. The cadence figure is what the VM/VMM side asked for
+    /// (`docs/fork/present-misses.md` §9.3/§10), so pin the three shapes it can take.
+    #[test]
+    fn a_miss_line_says_how_long_the_display_had_been_quiet() {
+        assert_eq!(cadence_clause(None), ", first flip");
+        assert_eq!(cadence_clause(Some(1)), ", back-to-back");
+        assert_eq!(cadence_clause(Some(4)), ", 4 cycles since the last flip");
+
+        // And the gap really is measured from the previous *presentation*: two flips four cycles
+        // apart must land in the cadence histogram's bucket 4, not 1.
+        let refresh = Duration::from_micros(16667);
+        let mut log = test_log();
+        let first = Duration::from_secs(100);
+        log.presented("out", first, first, Some(refresh));
+        let second = first + refresh * 4;
+        log.presented("out", second, second, Some(refresh));
+
+        assert_eq!(
+            log.stats["out"].cadence[4], 1,
+            "a flip four cycles after the previous one was not recorded as such: {:?}",
+            log.stats["out"].cadence
+        );
     }
 
     /// A frame is missed when it lands a whole refresh cycle or more after the
