@@ -504,3 +504,67 @@ This is recorded as evidence, not as a reversal — the nested-bake constraint i
 Painter-walks-a-tree model is unchanged, and none of the above is an argument for a CSS cascade, a
 signal system, or an accessibility tree. If the retained tree is argued back in, it should be argued
 on §10.1 and §10.4, and it should say what it does about §3.
+
+## 11. Which retained model, if one comes back: CoreAnimation, not Clutter (2026-07-27)
+
+§10.5 left the retained tree open and set the bar: argue it on §10.1 and §10.4, and say what it does
+about §3. This section does not schedule the work — it settles **which model we would copy**, so
+that when a piece of it lands it lands facing the right direction.
+
+**The boundary, agreed with Gustavo:** CoreAnimation for the **layer tree, animation and
+compositing**; St/Clutter for **layout and style**. Not a compromise — the two halves are answering
+different questions, and each reference is better at the one it keeps.
+
+### 11.1 Why CA for the animation half
+
+Clutter is what St is written against, so the instinct is to copy Clutter throughout. But we are not
+porting Clutter's *implementation*, we are porting GNOME's *behavior*, and on the animation side
+Clutter's API is the part St works around rather than the part it relies on. CA's model earns its
+place by killing bug classes we have actually paid for, not by being tidier:
+
+- **Model layer vs presentation layer** is the structural fix for the animated-geometry class: a lerp
+  whose endpoints depend on the running progress bends its path, and we have fixed that by hand each
+  time it appeared. Put the target on the model layer and let only the presentation layer move, and
+  the endpoints are frozen *by construction* rather than by remembering to freeze them.
+- **Animatable properties live apart from contents** (opacity, transform, position vs the backing
+  store). That is precisely the fix pattern §10.2 applies by hand — "put the animated alpha on the
+  element, not in the bake" — promoted from a thing you must know to a thing the type system says.
+  The per-frame re-bake class exists because a widget's animated property and its baked content are
+  the same bag of fields; CA's split is that bag, separated.
+- **Property setters imply the dirty**, which is §10.1's twenty-one hand-bumped revision counters
+  written once, in the substrate, instead of twenty-one times in the widgets.
+- **Content ownership stops being a per-widget convention** (§10.4): a layer either has contents or
+  it does not, and that is observable from outside the widget.
+
+### 11.2 What it does about §3 — the constraint that killed the Painter tree
+
+§3 rejected a Painter-walks-a-tree model because a nested sub-bake needs `&mut renderer` and cannot
+open inside a live parent frame, so the model breaks at the first clipping container. **CA does not
+have that problem, because CA never draws a tree in one pass.** A CALayer owns its own backing store,
+drawn independently; the tree is walked by the *compositor*, over already-backed layers. Clipping is
+`masksToBounds` on a layer that is composited, not a painter state pushed mid-walk.
+
+That is a description of what our widgets already do — the calendar bakes its scrolled list as a
+sibling texture and composites it with a clip. So the CA model is the one retained model that fits
+§3's substrate rather than fighting it, which is the strongest single argument here: it is not a new
+constraint to satisfy, it is a name for the shape the code already has.
+
+### 11.3 What stays St, and why
+
+Layout and style do not move. The box model, theme nodes, `allocate_1d`/cross-axis placement, the
+CSS-ish cascade feeding one struct — that is where GNOME fidelity lives, it is what
+[`layer-a-theme-node.md`](./layer-a-theme-node.md) is already building against the real
+`st-theme-node.c`, and CA has no equivalent to translate onto. A layer tree underneath, St on top.
+
+This does not weaken the fork tenet: "GNOME's way replaces niri's" is about observable behavior and
+the config surface, not about which internal architecture we borrow to produce that behavior.
+
+### 11.4 The one thing to watch
+
+CA's implicit animations are *implicit* — a property set inside a transaction animates with the
+transaction's defaults. GNOME's timings are explicit and specified (durations and easing curves per
+widget, cited in [`gnome-style-reference.md`](./gnome-style-reference.md)). If we adopt the
+mechanism and inherit CA's defaults with it, we drift from the reference in exactly the way that is
+hardest to see: everything still animates, nothing looks obviously wrong, and every duration is
+subtly not GNOME's. **The transaction defaults must be ours.** Whatever lands first should pin a
+GNOME-cited duration and curve in a test, so the default cannot quietly become Apple's.
