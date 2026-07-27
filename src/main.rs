@@ -204,6 +204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read the fonts off the disk while the event loop, the display and the backend are being
     // built, so the first frame does not pay for it. Detached on purpose: nothing waits on the
     // result, and if it has not finished by the first shape that call simply does the work itself.
+    // That last part is load-bearing rather than incidental — making the first shape wait for this
+    // thread instead moved 310ms into time-to-first-frame on the live seat.
     thread::Builder::new()
         .name("font prewarm".to_owned())
         .spawn(niri_vk::text::prewarm)

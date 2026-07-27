@@ -224,13 +224,37 @@ impl PendingGlyph {
 /// bigger critical section.
 fn fonts() -> MutexGuard<'static, FontSystem> {
     static FONTS: OnceLock<Mutex<FontSystem>> = OnceLock::new();
-    let mutex = FONTS.get_or_init(|| Mutex::new(FontSystem::new()));
+    let mutex = race_to_init(&FONTS, || Mutex::new(FontSystem::new()));
     // Recover from poisoning rather than propagate it. A shape that panics while holding this
     // guard would otherwise brick *all* text in the process for the rest of the session — every
     // later lock panics, and this module's contract is that a failure degrades to no glyphs, not
     // a panic. What the guard protects is a cache: the worst a mid-shape panic leaves behind is a
     // missing entry, which the next shape refills.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `OnceLock::get_or_init`, except a caller that arrives mid-build **builds its own** instead of
+/// waiting, and the first value to land wins.
+///
+/// The difference is the whole point of prewarming. `get_or_init` blocks every later arrival until
+/// the initializing thread finishes, which turns the startup prewarm from an overlap into a
+/// dependency: the compositor thread reached the font database while the prewarm thread was still
+/// reading fonts and sat there. Measured on the live seat, that moved 237ms out of the first frame
+/// and into the time before it — first frame 26.18 → 13.50ms, but time from process start to first
+/// frame 339 → 649ms.
+///
+/// Racing costs a redundant build in exactly the case where it is cheap: the loser is parsing files
+/// the winner has already pulled into the page cache, which is ~10ms against the ~250ms+ the cold
+/// read costs (see [`prewarm`]). Whoever loses drops their copy, so the steady state is still one
+/// database — this only changes who waits, never how many survive.
+fn race_to_init<T>(cell: &'static OnceLock<T>, build: impl FnOnce() -> T) -> &'static T {
+    if let Some(value) = cell.get() {
+        return value;
+    }
+    // Deliberately not `get_or_init`: building outside the cell is what lets a second caller
+    // proceed. `set` discards ours if another thread got there first, which is the intended loss.
+    let _ = cell.set(build());
+    cell.get().expect("a value was just set")
 }
 
 /// Build the font database and resolve SansSerif, so the first frame does not have to.
@@ -245,8 +269,15 @@ fn fonts() -> MutexGuard<'static, FontSystem> {
 /// `measure_line_width` call take **408ms** — so the cost is font *file I/O and first parse*, not
 /// shaping. Prewarming on a thread took the seat's first frame from 57.81ms to 26.18ms and its
 /// shaping clause from 32.91ms to 10.75ms; the rest of that clause was the renderer's *own*
-/// `FontSystem` repeating the parse, which is why there is only one now. Behind this call,
-/// [`TextContext::new`] is 1µs and the first frame's four runs shape in 0.18ms.
+/// `FontSystem` repeating the parse, which is why there is only one now. Behind a database this
+/// call has already built, [`TextContext::new`] is 1µs and the first frame's four runs shape in
+/// 0.18ms.
+///
+/// **This is an overlap, not a handoff.** Nothing waits on it: a shape that arrives before the
+/// prewarm finishes builds its own database and wins or loses the race on the merits (see
+/// [`race_to_init`]). Making the first shape *wait* here instead is measurably worse — it hands
+/// the whole cold read to the critical path and cost 310ms of time-to-first-frame on the live
+/// seat, which is more than the prewarm saves.
 ///
 /// Idempotent and cheap to call twice; a second call is a cache hit.
 pub fn prewarm() {
@@ -979,6 +1010,9 @@ impl TextRenderer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::gpu::Gpu;
     use crate::render::{sampler_set_layout, RenderTarget};
@@ -1530,6 +1564,47 @@ mod tests {
         assert!(
             crate::stats::shapes() > shapes,
             "the bold variant was not shaped"
+        );
+    }
+
+    /// A caller arriving while another thread is still building must build its own and carry on,
+    /// not park until the slow one finishes. This is the difference between the startup font
+    /// prewarm being an *overlap* and being a *dependency*: with `get_or_init` the compositor
+    /// thread waited out the prewarm's cold font read, which cost 310ms of time-to-first-frame on
+    /// the live seat.
+    ///
+    /// Timing-based, but with a 10× margin: the slow builder takes 500ms and the late arrival is
+    /// allowed 50ms.
+    #[test]
+    fn a_late_caller_builds_its_own_instead_of_waiting_for_a_slow_initializer() {
+        static CELL: OnceLock<&'static str> = OnceLock::new();
+        static BUILDING: Barrier = Barrier::new(2);
+
+        let slow = std::thread::spawn(|| {
+            race_to_init(&CELL, || {
+                BUILDING.wait();
+                std::thread::sleep(Duration::from_millis(500));
+                "slow"
+            })
+        });
+
+        // Arrive strictly after the slow builder has started building.
+        BUILDING.wait();
+        let started = Instant::now();
+        let mine = race_to_init(&CELL, || "fast");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_millis(50),
+            "a late caller waited {waited:?} for the in-progress build instead of doing its own"
+        );
+        assert_eq!(*mine, "fast", "the value that landed first should have won");
+
+        // The loser drops its copy: everyone still ends up on one shared value.
+        assert_eq!(
+            *slow.join().unwrap(),
+            "fast",
+            "two values survived the race"
         );
     }
 
