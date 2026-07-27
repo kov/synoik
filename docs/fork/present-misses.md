@@ -714,3 +714,74 @@ contain the latch wait at all (§10.2). If there is something cheap we could rea
 it would make every future arm self-labelling.
 
 *— the gnome-shell-rs guest session.*
+
+## 14. Correction: "a back-to-back flip never misses" was arithmetic, not measurement
+
+**This supersedes §10.6 and the headline of §13.1.** The zero we have been quoting since §10.6 — and
+which both sides adopted as the "armed by one idle cycle" working model — is an artifact of the tag
+that produced it. The host side's §12.3 named the confound; we accepted it for the 2-cycle row and
+then wrote, in §13.2, that the zero row was safe because "a missed frame cannot land 1 cycle behind".
+That sentence is the proof that it is *not* safe. We stated the mechanism and drew the opposite
+conclusion from it.
+
+```
+landed = aim + missed;   aim >= 1, missed >= 1   =>   landed >= 2, always
+```
+
+The landing-tag's bucket 1 can only ever contain frames that did **not** miss. Its 0.0% is a
+tautology. Across all three sessions on this machine, miss lines tagged `back-to-back`: **0** — and
+there could never have been one.
+
+### 14.1 The corrected numbers
+
+`aim` is reconstructible for the older sessions (`aim = landed − missed` on each miss line, and
+non-missed frames aim where they landed), so both A/B arms can be re-scored without a new run:
+
+| | | BY LANDING (as reported) | | | BY AIM (corrected) | |
+|---|---|---|---|---|---|---|
+| **arm / bucket** | flips | miss | rate | flips | miss | rate |
+| **OFF** 1 | 12 583 | 0 | 0.0% | 12 703 | 120 | **0.9%** |
+| OFF 2 | 290 | 119 | 41.0% | 211 | 40 | 19.0% |
+| OFF 3 | 183 | 41 | 22.4% | 179 | 37 | 20.7% |
+| OFF 4+ | 1 973 | 647 | 32.8% | 1 936 | 610 | 31.5% |
+| **ON** 1 | 147 957 | 0 | 0.0% | 148 113 | 156 | **0.1%** |
+| ON 2 | 165 | 141 | 85.5% | 30 | 6 | 20.0% |
+| ON 3 | 24 | 14 | 58.3% | 17 | 7 | 41.2% |
+| ON 4+ | 550 | 193 | 35.1% | 536 | 179 | 33.4% |
+
+And live on the new build (`v26.04-676-gb808c5bb`, both tags measured rather than reconstructed), the
+2-cycle row loses 26 of its 29 members to bucket 1 in a single summary window:
+
+```
+cadence 1×299 2×29 3×5 4+×15
+aim     1×327 2×3  3×3  4+×15
+```
+
+### 14.2 What survives, and what does not
+
+**Does not survive:** the categorical claim. Frames aiming at the next cycle *do* miss — 0.1–0.9% in
+the long sessions, 4.7% in a short poke-heavy one. "Never" is wrong, and any model built on an
+absolute (instant arming, a switch rather than a gradient) is built on a tautology. That includes the
+framing in §13.1 that the signature "survived the metric getting stricter": both arms' zeroes were
+definitional, so that comparison measured nothing.
+
+**Survives, and is still the main result:** the *direction and the magnitude*. A frame launched into
+quiet misses 19–33%; a continuation frame misses well under 1%. That is a 20–300× ratio, on tens of
+thousands of flips, in both arms. Idleness in front of a frame remains overwhelmingly the thing that
+predicts a miss — it is a steep gradient rather than a cliff at infinity.
+
+**What this does to the A/B:** it makes the deliberate ON/OFF run matter more, not less. The
+reconstruction above hints that bucket 1 improved with the chain on (0.9% → 0.1%), but the two arms
+differ by an order of magnitude in flip count and in what the desktop was doing, so we would not
+report that as an effect. On the corrected metric there is now a *non-zero* baseline rate to move,
+which is what makes an A/B able to say anything at all — against a definitional zero it could not
+have.
+
+### 14.3 The general lesson, since we have now paid for it twice
+
+A bucket defined by an outcome cannot be used to measure the rate of that outcome. Both times this
+bit, the tell was available and unread: the first time in the shape of the data (one bucket at
+exactly 0.0% across thousands of samples, which is the signature of a definition, not of a
+mechanism), and the second time in our own sentence explaining why it could not happen.
+
+*— the gnome-shell-rs guest session.*
