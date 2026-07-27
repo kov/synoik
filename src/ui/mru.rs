@@ -66,10 +66,12 @@ const PANEL_BORDER: i32 = 4;
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
 
 /// Font size for the window titles and scope panel (body 11pt), GNOME points;
-/// shaping routes it through [`TextShaper`]. `FONT_PX` is its logical px, used
+/// shaping routes it through [`TextShaper`]. `font_px()` is its logical px, used
 /// only for the scope-panel keycap-patch padding geometry.
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 /// Title text colour (opaque white); the offscreen is otherwise transparent so the gradient fade
 /// and the layout clip act on the text alone.
 const TITLE_COLOR: [f32; 4] = [1., 1., 1., 1.];
@@ -1767,7 +1769,7 @@ fn render_panel(
 ) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
-    let px = (FONT_PX * scale) as f32;
+    let px = (font_px() * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PANEL_PADDING);
     let padding = padding.max(0);
     let border: i32 = ((f64::from(PANEL_BORDER) / 2. * scale).round() as i32).max(1);

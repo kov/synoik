@@ -65,13 +65,19 @@ const RADIUS: f64 = 20.;
 
 /// Row text: `.popup-menu` inherits the 11pt body size (`_popovers.scss:16-24`).
 const TEXT_PT: f64 = 11.;
-const TEXT_PX: f64 = crate::ui::pt_to_px(TEXT_PT);
+fn text_px() -> f64 {
+    crate::ui::pt_to_px(TEXT_PT)
+}
 
 /// `.popup-menu { min-width: 15em }` (`_popovers.scss:17`), em against the row font.
-const MIN_W: f64 = 15. * TEXT_PX;
+fn min_w() -> f64 {
+    15. * text_px()
+}
 /// `.app-menu { max-width: 27.25em }` (`_popovers.scss:143-144`). A label wider than
 /// this is ellipsized rather than widening the menu.
-const MAX_W: f64 = 27.25 * TEXT_PX;
+fn max_w() -> f64 {
+    27.25 * text_px()
+}
 
 /// What activating a row does. Held by the row so the click handler stays a lookup;
 /// the app id rides along so the input layer needs no state of its own.
@@ -175,13 +181,13 @@ impl AppMenu {
             .filter_map(|r| match r {
                 Row::Item { label, .. } => Some(niri_vk::text::measure_line_width_weighted(
                     label,
-                    TEXT_PX as f32,
+                    text_px() as f32,
                     false,
                 )),
                 Row::Separator => None,
             })
             .fold(0., f64::max);
-        let width = (2. * (CONTENT_PAD + ITEM_PAD_H) + widest).clamp(MIN_W, MAX_W);
+        let width = (2. * (CONTENT_PAD + ITEM_PAD_H) + widest).clamp(min_w(), max_w());
         // `row_top(len)` is the content pad plus every row, so the trailing pad closes it.
         Size::from((width, self.row_top(self.rows.len()) + CONTENT_PAD))
     }

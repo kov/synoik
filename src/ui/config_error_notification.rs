@@ -16,10 +16,12 @@ use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagr
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-/// Notification font size (body), GNOME points. `FONT_PX` is its logical px, used
+/// Notification font size (body), GNOME points. `font_px()` is its logical px, used
 /// only for keycap-padding geometry; shaping goes through [`ParagraphSpan`] at pt.
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 /// A generous non-wrapping layout width (logical px); the notification is content-sized, so this
 /// only needs to exceed the natural line width (a very long config path wraps rather than
 /// producing an ultra-wide banner).
@@ -260,8 +262,8 @@ fn prepare_dialog(
     let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
     let keycap = (kw > 0 && kh > 0)
         .then(|| {
-            let pad_x = to_physical_precise_round::<i32>(scale, FONT_PX * 0.25);
-            let pad_y = to_physical_precise_round::<i32>(scale, FONT_PX * 0.15);
+            let pad_x = to_physical_precise_round::<i32>(scale, font_px() * 0.25);
+            let pad_y = to_physical_precise_round::<i32>(scale, font_px() * 0.15);
             Rectangle::new(
                 Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
                 Size::from((kw + pad_x * 2, kh + pad_y * 2)),

@@ -55,7 +55,9 @@ const PAD: f64 = 18.;
 /// `.quick-toggle` is a fixed `12em` (`min/max-width`, `_quick-settings.scss:17-18`). `1em` is
 /// `$base_font_size` (11pt), so 12em = `12 * pt_to_px(11)` ≈ 176px — wider than the old 150, which
 /// cramped two-line tiles (Power Mode) and made the whole menu narrower than gnome-shell's.
-const TILE_W: f64 = 12.0 * crate::ui::pt_to_px(11.0);
+fn tile_w() -> f64 {
+    12.0 * crate::ui::pt_to_px(11.0)
+}
 const TILE_H: f64 = 56.;
 const TILE_GAP: f64 = 8.;
 const COLS: usize = 2;
@@ -1926,7 +1928,7 @@ impl QuickSettings {
 
 /// The menu's logical width: two tile columns plus padding.
 fn menu_w() -> f64 {
-    PAD * 2. + COLS as f64 * TILE_W + (COLS as f64 - 1.) * TILE_GAP
+    PAD * 2. + COLS as f64 * tile_w() + (COLS as f64 - 1.) * TILE_GAP
 }
 
 /// The y of the tile grid's top edge. The grid sits below the system row, and below the volume
@@ -2026,11 +2028,11 @@ fn slider_handle_x(sl: Slider, volume: f64, layout: Layout) -> f64 {
 fn tile_rect(i: usize, layout: Layout) -> Rectangle<f64, Logical> {
     let row = (i / COLS) as f64;
     let col = (i % COLS) as f64;
-    let x = PAD + col * (TILE_W + TILE_GAP);
+    let x = PAD + col * (tile_w() + TILE_GAP);
     let y = grid_top(layout.sliders) + row * (TILE_H + TILE_GAP);
     Rectangle::new(
         Point::from((x, y + layout.shift_below(y))),
-        Size::from((TILE_W, TILE_H)),
+        Size::from((tile_w(), TILE_H)),
     )
 }
 
@@ -2783,7 +2785,10 @@ mod tests {
             tile_arrow_rect(ni, GridTile::Network, l).expect("the Network tile carries an arrow");
         // The body ends at (or before) the arrow's left edge — a separator sits between.
         assert!(body.loc.x + body.size.w <= arrow.loc.x);
-        assert_eq!(arrow.loc.x + arrow.size.w, tile_rect(ni, l).loc.x + TILE_W);
+        assert_eq!(
+            arrow.loc.x + arrow.size.w,
+            tile_rect(ni, l).loc.x + tile_w()
+        );
         // A gsettings toggle (Do Not Disturb, cell 2) is all body, no arrow.
         assert!(tile_arrow_rect(2, BASE_GRID[2], l).is_none());
         assert_eq!(tile_body_rect(2, BASE_GRID[2], l), tile_rect(2, l));
@@ -2846,7 +2851,7 @@ mod tests {
 
         // The empty cell beside it (row 2, column 1) is grid space with no tile: consumed, no-op.
         let empty = Point::from((
-            tile_rect(1, qs.layout()).loc.x + TILE_W / 2.,
+            tile_rect(1, qs.layout()).loc.x + tile_w() / 2.,
             air.loc.y + TILE_H / 2.,
         ));
         assert!(matches!(qs.pointer_click(empty), PopoverAction::Consumed));

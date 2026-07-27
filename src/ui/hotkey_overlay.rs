@@ -15,10 +15,12 @@ use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagr
 use crate::utils::{output_size, to_physical_precise_round};
 
 const PADDING: i32 = 8;
-/// Overlay font size, GNOME points. `FONT_PX` is its logical px, used only for the
+/// Overlay font size, GNOME points. `font_px()` is its logical px, used only for the
 /// inline key/spawn patch padding geometry; shaping goes through [`ParagraphSpan`].
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
@@ -417,7 +419,7 @@ fn prepare(
 ) -> anyhow::Result<(Size<i32, Physical>, OverlayLayout)> {
     let _span = tracy_client::span!("hotkey_overlay::prepare");
 
-    let font_px = FONT_PX * scale;
+    let font_px = font_px() * scale;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
     let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
     // Keep the border width even to avoid blurry edges.

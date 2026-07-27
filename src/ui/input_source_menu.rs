@@ -48,11 +48,13 @@ const MIN_W: f64 = 200.;
 /// (0.12 here vs 0.10/0.22 elsewhere) pending a reference reconciliation.
 const SEPARATOR: [f32; 4] = [1., 1., 1., 0.12];
 
-/// Row text size (`%heading`, GNOME points). `TEXT_PX` is its logical px, used
+/// Row text size (`%heading`, GNOME points). `text_px()` is its logical px, used
 /// only for GPU-free width measurement in [`InputSourceMenu::logical_size`]; the
 /// bake shapes via [`widget::TextStyle`] so no draw site touches the px.
 const TEXT_PT: f64 = 11.;
-const TEXT_PX: f64 = crate::ui::pt_to_px(TEXT_PT);
+fn text_px() -> f64 {
+    crate::ui::pt_to_px(TEXT_PT)
+}
 
 /// One configured layout as shown in the menu (gnome-shell's `LayoutMenuItem`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +126,7 @@ impl InputSourceMenu {
 
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let measure =
-            |s: &str| niri_vk::text::measure_line_width_weighted(s, TEXT_PX as f32, false);
+            |s: &str| niri_vk::text::measure_line_width_weighted(s, text_px() as f32, false);
         let w_display = self
             .items
             .iter()

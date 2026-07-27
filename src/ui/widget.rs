@@ -602,6 +602,12 @@ pub fn bake<P>(
         cache.text_epoch = text_epoch;
     }
 
+    // Fold the style generation into every widget's revision, so a change to the base
+    // font size re-bakes all of them. It cannot be left to the per-widget keys: a
+    // fixed-size surface with text inside it (the panel bar) has an unchanged
+    // `(scale, size, revision)` and would keep serving the old text.
+    let revision = revision ^ crate::ui::style_generation();
+
     let fresh = matches!(cache.textures.get(&key), Some((rev, _)) if *rev == revision);
     if !fresh {
         let prepared = prepare(renderer)?;

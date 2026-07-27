@@ -35,9 +35,11 @@ const SELECTION_BORDER: i32 = 2;
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
 /// Help-line font size, GNOME points; shaping routes it through [`ParagraphSpan`].
-/// `FONT_PX` is its logical px, used only for the keycap-patch padding geometry.
+/// `font_px()` is its logical px, used only for the keycap-patch padding geometry.
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 /// Panel corner radius, logical px — GNOME `.screenshot-ui-panel` `$modal_radius * 2`
 /// (`_screenshot.scss:9`). The whole panel is one rounded `%osd_panel` card.
 const PANEL_RADIUS: f64 = 32.;
@@ -1518,7 +1520,7 @@ fn generate_panel(
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("screenshot_ui::generate_panel");
 
-    let px = (FONT_PX * scale) as f32;
+    let px = (font_px() * scale) as f32;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
     let radius: i32 = to_physical_precise_round(scale, RADIUS);
     // 2 px between the two lines, matching the old cairo line spacing.

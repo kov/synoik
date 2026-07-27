@@ -97,8 +97,21 @@ pt in §1.2 and call `pt_to_px`.
 | exit-confirm / MRU / hotkey / config-error | `…::FONT_PX` | 11pt → 14.7 |
 | calendar month / weekday+day | `calendar::HEADER_PX` / `WEEKDAY_PX`,`DAY_PX` | 11pt → 14.7 / 9pt → 12.0 |
 
-One knob: if live output reads uniformly too large/small, adjust `PX_PER_PT` and every UI tracks it.
-Not yet live-validated on the seat.
+**The point sizes in this document are nominal, not absolute.** GNOME's `fontsize($size)` mixin
+(`_drawing.scss:69-75`) reduces to `font-size: ($size/11pt)em` — the `1.091` and the `16px` inside it
+cancel — so the theme never states a size in points, only a *ratio* against the stage. The stage is
+`fontsize($base_font_size)` = `1em`, which St resolves against the theme context's font: built from
+`StSettings:font-name` (`st-theme-context.c:240-243`) = `org.gnome.desktop.interface font-name`
+(`st-settings.c:32,509`), and re-derived when it changes (`on_font_name_changed`, `:339-344`).
+
+So on a desktop set to "Cantarell 12" every GNOME string renders 12/11 larger than the pt this table
+quotes. `ui::pt_to_px` scales by that ratio (`ui::base_font_pt`, fed from the settings watcher), and
+`ui::em` rides the same base. **Anything the theme leaves unsized is `1em`** — a `.popup-menu-item`,
+an app name under its icon — so it takes the base directly, not a `%caption`.
+
+`PX_PER_PT` is the unit conversion only; the knob for "uniformly too large/small" is the base.
+Live-confirmed 2026-07-27: on a `Cantarell 12` desktop our text read ~9% short of GNOME's until the
+base was followed.
 
 ### 1.3.1 Font family — Cantarell everywhere
 

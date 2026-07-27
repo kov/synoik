@@ -77,8 +77,10 @@ pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + Entry::HEIGHT + ENTRY
 /// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
 /// (`iconGrid.js:11,83`) — bigger than the dash's 64.
 const RESULT_ICON_PX: f64 = 96.;
-/// Result-tile label point size (`%caption`-ish app name under the icon).
-const LABEL_PT: f64 = 10.;
+/// Result-tile label point size. `.search-result` `@extend .overview-tile`
+/// (`_search-results.scss:59`), which sets no `font-size` — so, like the grid, an app
+/// name here renders at the inherited stage size.
+const LABEL_PT: f64 = crate::ui::BASE_FONT_PT;
 /// `.overview-tile` padding — the selection fill sits on the outer tile here, not
 /// on the inner icon the way the dash does. See [`AppIcon::OVERVIEW_TILE_PADDING`].
 const TILE_PAD: f64 = AppIcon::OVERVIEW_TILE_PADDING;

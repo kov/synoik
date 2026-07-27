@@ -19,10 +19,12 @@ use crate::utils::{output_size, to_physical_precise_round};
 
 const KEY_NAME: &str = "Enter";
 const PADDING: i32 = 16;
-/// Dialog font size, GNOME message-dialog body, GNOME points. `FONT_PX` is its
+/// Dialog font size, GNOME message-dialog body, GNOME points. `font_px()` is its
 /// logical px, used only for keycap-padding geometry; shaping uses [`ParagraphSpan`].
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 /// A generous non-wrapping layout width (logical px); the dialog is sized to its content, so this
 /// only needs to exceed the widest line.
 const WRAP_WIDTH: i32 = 1000;
@@ -286,8 +288,8 @@ fn prepare_dialog(
     let (kx, ky, kw, kh) = run.span_ink_bounds(KEYCAP_SPAN);
     let keycap = (kw > 0 && kh > 0)
         .then(|| {
-            let pad_x = to_physical_precise_round::<i32>(scale, FONT_PX * 0.3);
-            let pad_y = to_physical_precise_round::<i32>(scale, FONT_PX * 0.2);
+            let pad_x = to_physical_precise_round::<i32>(scale, font_px() * 0.3);
+            let pad_y = to_physical_precise_round::<i32>(scale, font_px() * 0.2);
             Rectangle::new(
                 Point::from((origin.x + kx - pad_x, origin.y + ky - pad_y)),
                 Size::from((kw + pad_x * 2, kh + pad_y * 2)),

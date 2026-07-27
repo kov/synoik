@@ -44,11 +44,13 @@ const BTN_RADIUS: f64 = 8.;
 /// Gap between action buttons (`$base_margin`).
 const BTN_GAP: f64 = 4.;
 /// Body/title/source/action font size (11pt) and the header time label (9pt),
-/// GNOME points; shaping routes them through [`TextShaper`]. `TITLE_PX` is the
+/// GNOME points; shaping routes them through [`TextShaper`]. `title_px()` is the
 /// logical px, used by [`layout`] for wrap/measure (no scale — logical geometry).
 const TITLE_PT: f64 = 11.;
 const TIME_PT: f64 = 9.;
-const TITLE_PX: f64 = crate::ui::pt_to_px(TITLE_PT);
+fn title_px() -> f64 {
+    crate::ui::pt_to_px(TITLE_PT)
+}
 /// An expanded body shows at most this many wrapped lines
 /// (`DEFAULT_EXPAND_LINES`, `js/ui/messageList.js:23`).
 pub const EXPAND_LINES: usize = 6;
@@ -343,7 +345,7 @@ pub fn layout_clamped(
         } else {
             1
         };
-        niri_vk::text::wrap_lines_weighted(&content.body, TITLE_PX as f32, false, text_w, lines)
+        niri_vk::text::wrap_lines_weighted(&content.body, title_px() as f32, false, text_w, lines)
     };
     let can_expand = expand_button
         && (expanded
@@ -351,7 +353,7 @@ pub fn layout_clamped(
             || (!content.body.is_empty()
                 && niri_vk::text::measure_line_width_weighted(
                     &content.body,
-                    TITLE_PX as f32,
+                    title_px() as f32,
                     false,
                 ) > text_w));
 

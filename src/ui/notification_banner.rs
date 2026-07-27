@@ -49,10 +49,14 @@ use crate::ui::notification_card::{card_elements, layout, CardCache, CardContent
 use crate::ui::widget;
 use crate::utils::output_size;
 
-/// 1em at the 11pt base font.
-const EM: f64 = crate::ui::pt_to_px(11.);
+/// 1em — the realized base font (`crate::ui::base_font_pt`), not the theme's nominal 11pt.
+fn em() -> f64 {
+    crate::ui::pt_to_px(11.)
+}
 /// `$notification_banner_width: 34em` (`_notifications.scss:2`).
-const WIDTH: f64 = 34. * EM;
+fn width_px() -> f64 {
+    34. * em()
+}
 /// `$modal_radius` (`_notifications.scss:11`).
 const RADIUS: f64 = 16.;
 /// GNOME `.notification-banner` `box-shadow: 0 2px 4px 2px $shadow_color`
@@ -169,7 +173,7 @@ impl NotificationBanner {
     /// The banner's card layout: 34em wide, no expand-caret slot
     /// (`js/ui/messageTray.js:1137`); the action row appears when expanded.
     fn layout(&self, content: &CardContent) -> CardLayout {
-        layout(content, WIDTH, self.expanded, false)
+        layout(content, width_px(), self.expanded, false)
     }
 
     pub fn is_expanded(&self) -> bool {

@@ -54,8 +54,13 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::widget::{self, style, AppIconUploads, Painter, TileMetrics};
 
-/// Grid tile label point size (`%caption`), shared with the search results.
-const LABEL_PT: f64 = 10.;
+/// Grid tile label point size, shared with the search results.
+///
+/// `.overview-tile` sets **no** `font-size` (`_app-grid.scss:21-37`), and neither does
+/// the `.overview-icon` inside it, so an app name renders at the inherited stage size —
+/// `$base_font_size`. It is not a `%caption`; that this said 10pt (and cited `%caption`,
+/// which is 9pt anyway) made every app name ~9% short of GNOME's.
+const LABEL_PT: f64 = crate::ui::BASE_FONT_PT;
 
 // `.icon-grid` page metrics (`_app-grid.scss:7-15`; `$base_padding` = 6). Spacing
 // starts at the base and grows (distributing slack) up to the max, after which the

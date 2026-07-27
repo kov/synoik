@@ -59,10 +59,12 @@ use crate::utils::{output_size, to_physical_precise_round};
 pub const PANEL_HEIGHT: f64 = 35.;
 
 /// Panel font size. The clock draws at GNOME's `panel_button` base of 11pt
-/// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `FONT_PX`
+/// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `font_px()`
 /// is its logical px, kept for the advance-width measure that centers the clock.
 const FONT_PT: f64 = 11.;
-const FONT_PX: f64 = crate::ui::pt_to_px(FONT_PT);
+fn font_px() -> f64 {
+    crate::ui::pt_to_px(FONT_PT)
+}
 
 /// Base workspace-dot diameter, logical px. GNOME: `$scalable_icon_size (16) * 0.5`
 /// (`gnome-shell-sass/widgets/_panel.scss`), fully rounded (`$forced_circular_radius`).
@@ -918,7 +920,7 @@ impl Panel {
     /// side, centered on the output. `output_width` is the output's logical width.
     pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
         let clock_w =
-            niri_vk::text::measure_line_width_weighted(&self.clock_text, FONT_PX as f32, true);
+            niri_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
         let w = clock_w + H_PADDING * 2.;
         Rectangle::new(
             Point::from(((output_width - w) / 2., 0.)),
@@ -988,7 +990,8 @@ impl Panel {
         let Some(rec) = &self.recording else {
             return 0.;
         };
-        let label_w = niri_vk::text::measure_line_width_weighted(&rec.label, FONT_PX as f32, true);
+        let label_w =
+            niri_vk::text::measure_line_width_weighted(&rec.label, font_px() as f32, true);
         2. * INDICATOR_H_PADDING + label_w + R1_SPACING + R1_ICON
     }
 
@@ -998,7 +1001,7 @@ impl Panel {
         let Some(label) = &self.keyboard_layout else {
             return 0.;
         };
-        let label_w = niri_vk::text::measure_line_width_weighted(label, FONT_PX as f32, true);
+        let label_w = niri_vk::text::measure_line_width_weighted(label, font_px() as f32, true);
         2. * INDICATOR_H_PADDING + label_w
     }
 
@@ -1603,7 +1606,7 @@ fn draw_bar_texture(
     let width_px = width_px.max(1);
     let height_px: i32 = to_physical_precise_round(scale, PANEL_HEIGHT);
     let height_px = height_px.max(1);
-    let px = (FONT_PX * scale) as f32;
+    let px = (font_px() * scale) as f32;
 
     // Shape every run up front (needs `&mut renderer`, before the bake frame opens). `TextShaper`
     // owns the pt → physical-px multiply; the clock draws bold, like GNOME's `panel_button`.
@@ -2146,7 +2149,7 @@ mod tests {
     /// fails, flagging that advance-centering alone would no longer be steady.
     #[test]
     fn clock_advance_width_is_stable_across_seconds() {
-        let px = FONT_PX as f32;
+        let px = font_px() as f32;
         let a = niri_vk::text::measure_line_width("12:34:56", px);
         let b = niri_vk::text::measure_line_width("12:34:07", px);
         let c = niri_vk::text::measure_line_width("18:88:88", px);

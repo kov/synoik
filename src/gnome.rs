@@ -63,6 +63,10 @@ pub struct GnomeSettings {
     /// gnome-shell's palette (st-theme-context.c). Drives accent-colored
     /// chrome like the overview thumbnail indicator.
     pub accent_color: [u8; 3],
+    /// `org.gnome.desktop.interface font-name`'s point size — the **realized** base
+    /// every theme point size is a ratio against. See [`crate::ui::base_font_pt`] for
+    /// why the theme's own `$base_font_size` is only nominal. GNOME's default is 11.
+    pub base_font_pt: f64,
     /// `org.gnome.desktop.interface icon-theme`: the icon theme both the symbolic
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
@@ -147,6 +151,7 @@ impl Default for GnomeSettings {
             edge_tiling: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
+            base_font_pt: crate::ui::BASE_FONT_PT,
             icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
@@ -357,6 +362,13 @@ impl GnomeSettings {
             let value = interface.string("icon-theme");
             if !value.is_empty() {
                 self.icon_theme = value.to_string();
+            }
+        }
+        if settings_has_key(interface, "font-name") {
+            let value = interface.string("font-name");
+            match parse_font_size_pt(value.as_str()) {
+                Some(pt) => self.base_font_pt = pt,
+                None => warn!("ignoring font-name {value:?} with no point size"),
             }
         }
         if settings_has_key(interface, "clock-format") {
@@ -1453,6 +1465,17 @@ fn parse_picture_options(value: &str) -> BackgroundOptions {
 
 /// gnome-shell's accent palette (st-theme-context.c `ACCENT_COLOR_*`),
 /// keyed by the `org.gnome.desktop.interface accent-color` enum values.
+/// The point size out of a Pango font description like `"Cantarell 12"` or
+/// `"Cantarell Bold Italic 11.5"` — the trailing number, which is all
+/// `pango_font_description_from_string` takes as the size (`st-theme-context.c:243`).
+/// `None` when there is no trailing size, in which case the caller keeps the default
+/// rather than guessing.
+fn parse_font_size_pt(desc: &str) -> Option<f64> {
+    let last = desc.rsplit(' ').next()?;
+    let pt = last.parse::<f64>().ok()?;
+    (pt > 0.).then_some(pt)
+}
+
 fn parse_accent_color(name: &str) -> Option<[u8; 3]> {
     Some(match name {
         "blue" => ACCENT_BLUE,
@@ -1561,6 +1584,22 @@ mod tests {
         );
         let empty = Vec::<(String, String)>::new().to_variant();
         assert!(read_source_tuples(&empty).is_empty());
+    }
+
+    /// The base font size is the trailing number of a Pango description, whatever style
+    /// words precede it — that is all `pango_font_description_from_string` reads as the
+    /// size. A description with no size keeps the default rather than guessing.
+    #[test]
+    fn the_base_font_size_is_the_trailing_point_size() {
+        assert_eq!(parse_font_size_pt("Cantarell 11"), Some(11.));
+        assert_eq!(parse_font_size_pt("Cantarell 12"), Some(12.));
+        assert_eq!(
+            parse_font_size_pt("Source Sans Pro Semibold 10.5"),
+            Some(10.5)
+        );
+        assert_eq!(parse_font_size_pt("Cantarell"), None);
+        assert_eq!(parse_font_size_pt(""), None);
+        assert_eq!(parse_font_size_pt("Cantarell 0"), None);
     }
 
     #[test]

@@ -77,7 +77,9 @@ const WEEKDAY_H: f64 = 22.;
 /// Day-cell pitch. GNOME's `.calendar-day` is `3em` (`_calendar.scss:75-76`), which renders as
 /// ~44px at the 11pt base em — measured 43px logical against a real 50.1 popover (ours was a
 /// cramped 34). `em(3.0)` tracks the base font so the grid can't drift from it.
-const CELL: f64 = crate::ui::em(3.0);
+fn cell() -> f64 {
+    crate::ui::em(3.0)
+}
 /// Week-number column width, scaled with the cell (only shown when week numbers are enabled).
 const WEEKCOL_W: f64 = 34.;
 const GRID_ROWS: usize = 6;
@@ -236,8 +238,8 @@ impl Calendar {
 
     /// The calendar's logical size (depends only on whether the week column shows).
     pub fn logical_size(&self) -> Size<f64, Logical> {
-        let w = grid_left(self.show_week_numbers) + GRID_COLS as f64 * CELL + PAD;
-        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
+        let w = grid_left(self.show_week_numbers) + GRID_COLS as f64 * cell() + PAD;
+        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD;
         Size::from((w, h))
     }
 
@@ -428,8 +430,8 @@ impl Layout {
     }
 
     fn bounds(&self) -> Rectangle<f64, Logical> {
-        let w = grid_left(self.week) + GRID_COLS as f64 * CELL + PAD;
-        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD;
+        let w = grid_left(self.week) + GRID_COLS as f64 * cell() + PAD;
+        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD;
         Rectangle::new(Point::from((0., 0.)), Size::from((w, h)))
     }
 
@@ -455,9 +457,9 @@ impl Layout {
     }
 
     fn cell(&self, row: usize, col: usize) -> Rectangle<f64, Logical> {
-        let x = grid_left(self.week) + col as f64 * CELL;
-        let y = grid_top() + HEADER_H + WEEKDAY_H + row as f64 * CELL;
-        Rectangle::new(Point::from((x, y)), Size::from((CELL, CELL)))
+        let x = grid_left(self.week) + col as f64 * cell();
+        let y = grid_top() + HEADER_H + WEEKDAY_H + row as f64 * cell();
+        Rectangle::new(Point::from((x, y)), Size::from((cell(), cell())))
     }
 }
 
@@ -651,14 +653,14 @@ impl Calendar {
             // Weekday header row.
             let wd_cy = grid_top() + HEADER_H + WEEKDAY_H / 2.;
             for (c, run) in weekday_runs.iter().enumerate() {
-                let cx = grid_left(self.show_week_numbers) + (c as f64 + 0.5) * CELL;
+                let cx = grid_left(self.show_week_numbers) + (c as f64 + 0.5) * cell();
                 p.text(run, Point::from((cx, wd_cy)), Align::CENTER, MUTED)?;
             }
 
             // Week-number column: a rounded `.calendar-week-number` pill behind each number.
             for (r, run) in week_runs.iter().enumerate() {
                 let cx = PAD + WEEKCOL_W / 2.;
-                let cy = grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * CELL;
+                let cy = grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * cell();
                 // `ink_bounds` is physical px; back to logical for the Painter (× scale
                 // internally).
                 let (_ix, _iy, iw, ih) = run.ink_bounds();
@@ -721,9 +723,13 @@ impl Calendar {
 // ---- The dateMenu popover: message list column + calendar ----
 
 /// 1em at the 11pt base font.
-const LIST_EM: f64 = crate::ui::pt_to_px(11.);
+fn list_em() -> f64 {
+    crate::ui::pt_to_px(11.)
+}
 /// `.message-list` width (`_message-list.scss:3`).
-const LIST_W: f64 = 29. * LIST_EM;
+fn list_w() -> f64 {
+    29. * list_em()
+}
 /// `.popup-menu-content` padding (`_popovers.scss:28`) — the uniform inset between
 /// the popover box and its content. Applied on the left (before the list column),
 /// the right (after the calendar column), and the bottom (below the calendar
@@ -737,7 +743,9 @@ const LIST_MARGIN_R: f64 = 4.;
 /// (scrollbar room, `_message-list.scss:11,31`).
 const LIST_SCROLL_R: f64 = 18.;
 /// Card width in the list column.
-const CARD_W: f64 = LIST_W - LIST_SCROLL_R;
+fn card_w() -> f64 {
+    list_w() - LIST_SCROLL_R
+}
 /// `.message` `margin-bottom: $base_padding * 2` (`_message-list.scss:37`).
 const CARD_GAP: f64 = 12.;
 /// List-card radius: `$modal_radius + 2px` (`_message-list.scss:39`).
@@ -764,7 +772,9 @@ const CONTROLS_PAD_B: f64 = 9.;
 const CLEAR_H: f64 = 28.;
 const CLEAR_PAD_X: f64 = 14.;
 const CLEAR_PT: f64 = 11.;
-const CLEAR_PX: f64 = crate::ui::pt_to_px(CLEAR_PT);
+fn clear_px() -> f64 {
+    crate::ui::pt_to_px(CLEAR_PT)
+}
 /// `.button` flat fill on the dark theme (matches the card action pills).
 const CLEAR_BG: [f32; 4] = [1., 1., 1., 0.1];
 /// `.message-list-placeholder` (`_message-list.scss:14-26`): 96px icon over a
@@ -772,7 +782,9 @@ const CLEAR_BG: [f32; 4] = [1., 1., 1., 0.1];
 const PLACEHOLDER_ICON: f64 = 96.;
 const PLACEHOLDER_GAP: f64 = 12.;
 const PLACEHOLDER_PT: f64 = 15.;
-const PLACEHOLDER_PX: f64 = crate::ui::pt_to_px(PLACEHOLDER_PT);
+fn placeholder_px() -> f64 {
+    crate::ui::pt_to_px(PLACEHOLDER_PT)
+}
 const PLACEHOLDER_FG: [f32; 4] = [1., 1., 1., 0.45];
 /// Overlay scrollbar handle: `StScrollBar` min-width 8px with a 3px transparent
 /// border → a ~6px visible handle (`_scrollbars.scss:10-25`), a
@@ -1067,7 +1079,7 @@ impl CalendarMessageList {
     /// the click target).
     fn card_layout(&self, content: &CardContent, caret: bool) -> CardLayout {
         let expanded = caret && self.body_expanded.contains(&content.id);
-        notification_card::layout(content, CARD_W, expanded, caret)
+        notification_card::layout(content, card_w(), expanded, caret)
     }
 
     /// Collapsed-stack geometry for a group with >1 card: the top card layout,
@@ -1083,7 +1095,7 @@ impl CalendarMessageList {
             STACK_WIDTH_INSET,
         };
         // The top card carries no caret: the whole stack is one click target.
-        let top = notification_card::layout(&group.cards[0], CARD_W, false, false);
+        let top = notification_card::layout(&group.cards[0], card_w(), false, false);
         let top_h = top.size.h;
         let visible = group.cards.len().min(STACK_MAX_VISIBLE);
         let mut peeks = Vec::new();
@@ -1095,7 +1107,7 @@ impl CalendarMessageList {
             let inset = STACK_WIDTH_INSET * depth as f64;
             peeks.push((
                 Point::from((origin.x + inset, origin.y + cumulative)),
-                Size::from((CARD_W - 2. * inset, top_h)),
+                Size::from((card_w() - 2. * inset, top_h)),
                 stack_bg(depth),
             ));
         }
@@ -1135,11 +1147,11 @@ impl CalendarMessageList {
             } else if expanded {
                 let header = Rectangle::new(
                     Point::from((LIST_PAD, y)),
-                    Size::from((CARD_W, GROUP_HEADER_H)),
+                    Size::from((card_w(), GROUP_HEADER_H)),
                 );
                 let collapse = Rectangle::new(
                     Point::from((
-                        LIST_PAD + CARD_W - GROUP_HEADER_PAD - GROUP_COLLAPSE_D,
+                        LIST_PAD + card_w() - GROUP_HEADER_PAD - GROUP_COLLAPSE_D,
                         y + (GROUP_HEADER_H - GROUP_COLLAPSE_D) / 2.,
                     )),
                     Size::from((GROUP_COLLAPSE_D, GROUP_COLLAPSE_D)),
@@ -1160,7 +1172,7 @@ impl CalendarMessageList {
                     group: g,
                     bounds: Rectangle::new(
                         Point::from((LIST_PAD, y)),
-                        Size::from((CARD_W, group_bottom - y)),
+                        Size::from((card_w(), group_bottom - y)),
                     ),
                     kind: GroupKind::Expanded {
                         header,
@@ -1178,7 +1190,7 @@ impl CalendarMessageList {
                 let ids = group.cards.iter().map(|c| c.id).collect();
                 out.push(GroupLayout {
                     group: g,
-                    bounds: Rectangle::new(origin, Size::from((CARD_W, stack_h))),
+                    bounds: Rectangle::new(origin, Size::from((card_w(), stack_h))),
                     kind: GroupKind::Collapsed {
                         origin,
                         top,
@@ -1209,7 +1221,7 @@ impl CalendarMessageList {
             content_h,
             off_y: LIST_PAD - scroll,
             scroll,
-            viewport: Rectangle::new(Point::from((0., LIST_PAD)), Size::from((LIST_W, vh))),
+            viewport: Rectangle::new(Point::from((0., LIST_PAD)), Size::from((list_w(), vh))),
         }
     }
 
@@ -1242,7 +1254,7 @@ impl CalendarMessageList {
 
     /// The Clear pill's popover-local rect (only meaningful when non-empty).
     fn clear_rect(&self, height: f64) -> Rectangle<f64, Logical> {
-        let label_w = niri_vk::text::measure_line_width_weighted("Clear", CLEAR_PX as f32, true);
+        let label_w = niri_vk::text::measure_line_width_weighted("Clear", clear_px() as f32, true);
         Rectangle::new(
             Point::from((LIST_PAD + CONTROLS_PAD, height - CONTROLS_PAD_B - CLEAR_H)),
             Size::from((label_w + 2. * CLEAR_PAD_X, CLEAR_H)),
@@ -1655,7 +1667,7 @@ impl CalendarMessageList {
             }
         }
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-        let phys = Size::<i32, Physical>::from((px(LIST_W).max(1), px(p.viewport.size.h).max(1)));
+        let phys = Size::<i32, Physical>::from((px(list_w()).max(1), px(p.viewport.size.h).max(1)));
         // Content y=scroll lands at the texture top; everything above/below the
         // window falls outside the buffer and is clipped.
         let base = Point::from((0., -p.scroll));
@@ -1704,7 +1716,7 @@ impl CalendarMessageList {
         // above `vh` (a very short viewport must not make `min > max`).
         let thumb_h = (vh * vh / p.content_h).clamp(SCROLLBAR_MIN_H.min(vh), vh);
         let thumb_y = p.viewport.loc.y + (p.scroll / max_scroll) * (vh - thumb_h);
-        let thumb_x = LIST_W - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
+        let thumb_x = list_w() - SCROLLBAR_W - SCROLLBAR_EDGE_GAP;
         let mut cache = self.cache.borrow_mut();
         let rev = self.revision & 0xffff_ffff;
         // A fixed key well above `render_groups`' running counter (which stays
@@ -1809,11 +1821,11 @@ impl CalendarMessageList {
         title: &str,
         collapse: &Rectangle<f64, Logical>,
         header_origin: Point<f64, Logical>,
-        // header rect is `(CARD_W, GROUP_HEADER_H)` at `header_origin`.
+        // header rect is `(card_w(), GROUP_HEADER_H)` at `header_origin`.
         hover_collapse: bool,
     ) -> anyhow::Result<VkTexture> {
         let px = |v: f64| to_physical_precise_round::<i32>(scale, v);
-        let phys = Size::<i32, Physical>::from((px(CARD_W).max(1), px(GROUP_HEADER_H).max(1)));
+        let phys = Size::<i32, Physical>::from((px(card_w()).max(1), px(GROUP_HEADER_H).max(1)));
         let title_run = {
             let mut shaper = TextShaper::new(renderer, scale);
             shaper.shape(title, TextStyle::new(GROUP_TITLE_PT).bold())?
@@ -2225,7 +2237,7 @@ pub struct DateMenu {
 
 /// The x where the calendar column starts (also the list column's width).
 fn calendar_col_x() -> f64 {
-    LIST_PAD + LIST_W + LIST_MARGIN_R
+    LIST_PAD + list_w() + LIST_MARGIN_R
 }
 
 impl DateMenu {
@@ -2682,7 +2694,7 @@ impl DateMenu {
             // `Painter::hairline` keeps it crisp (an SDF fill would AA-dim a 1px line away).
             p.hairline(
                 Rectangle::new(
-                    Point::from((LIST_PAD + LIST_W, 0.)),
+                    Point::from((LIST_PAD + list_w(), 0.)),
                     Size::from((1., size.h)),
                 ),
                 widget::style::BORDERS,
@@ -2693,7 +2705,7 @@ impl DateMenu {
                 let (_, cy) = placeholder_centers(size.h);
                 p.text(
                     run,
-                    Point::from((LIST_PAD + LIST_W / 2., cy)),
+                    Point::from((LIST_PAD + list_w() / 2., cy)),
                     Align::CENTER,
                     PLACEHOLDER_FG,
                 )?;
@@ -3004,7 +3016,7 @@ impl DateMenu {
         // The message-list cards, or the placeholder icon when empty.
         if self.list.is_empty() {
             let (icon_cy, _) = placeholder_centers(size.h);
-            let center = Point::from((LIST_PAD + LIST_W / 2., icon_cy));
+            let center = Point::from((LIST_PAD + list_w() / 2., icon_cy));
             if let Some(tb) = icons.texture(
                 renderer,
                 "no-notifications-symbolic",
@@ -3143,7 +3155,7 @@ impl DateMenu {
 /// The placeholder's vertical centers `(icon_cy, label_cy)`: the 96px icon
 /// over the label with a 12px gap, the stack centered in the column.
 fn placeholder_centers(height: f64) -> (f64, f64) {
-    let label_h = PLACEHOLDER_PX * 1.3;
+    let label_h = placeholder_px() * 1.3;
     let total = PLACEHOLDER_ICON + PLACEHOLDER_GAP + label_h;
     let top = (height - total) / 2.;
     (
@@ -3460,7 +3472,7 @@ mod tests {
         let cal = Calendar::new(0, false, [0, 0, 0]);
         assert_eq!(
             cal.logical_size().h,
-            grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * CELL + PAD
+            grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD
         );
 
         // A fresh calendar is already on today: clicking the card is a no-op (no revision bump).
@@ -3663,7 +3675,7 @@ mod tests {
         assert_eq!(size.w, calendar_col_x() + cal.w + LIST_PAD);
         assert_eq!(size.h, cal.h + LIST_PAD);
         assert!(
-            calendar_col_x() > 29. * LIST_EM,
+            calendar_col_x() > 29. * list_em(),
             "the list column is 29em wide plus its margins"
         );
     }
