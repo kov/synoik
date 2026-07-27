@@ -657,11 +657,16 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   stale scale across a mode change the same way — mutter invalidates its "current" config when
   the monitor set changes; ours should too. (2) The grid's label overflow is a center-clip with
   no ellipsis (`waita De` for `Adwaita Demo`); GNOME ellipsizes. Cosmetic, only visible on tiny
-  logical widths. (3) The missing workspace-thumbnail strip in the internal shot is **not** a
-  bug: 2 workspaces there, 3 in the external shot, and GNOME's strip only shows above
-  `NUM_WORKSPACES_THRESHOLD = 2` (`workspaceThumbnail.js:16,697`). Related and already fixed at a
-  different layer: the expose xray was sampling the backdrop unscaled (`39e25b69`) — done, not
-  this.
+  logical widths — folded into the adaptive-chrome design below. (3) The missing
+  workspace-thumbnail strip in the internal shot is **not** a bug: 2 workspaces there, 3 in the
+  external shot, and GNOME's strip only shows above `NUM_WORKSPACES_THRESHOLD = 2`
+  (`workspaceThumbnail.js:16,697`). Related and already fixed at a different layer: the expose
+  xray was sampling the backdrop unscaled (`39e25b69`) — done, not this.
+  **Approved follow-on divergence (Gustavo, 2026-07-26): adaptive overview chrome** — everything
+  in the overview except the panel and text sizes adapts to the logical canvas (GNOME's fixed
+  constants read comically on small canvases: near-round 30px preview corners, picker gaps
+  pegged at the 80px clamp, 64px dash icons over 24px grid icons). Full piece inventory, ramp
+  design, testing plan and sequencing: `docs/fork/adaptive-overview-chrome.md`.
 
 **Rough dependency order:** S1 → S2 → {S3, S4} → S5 → S6/S7 → S8 → S9+. S1 gates everything; S2 gates
 any icon rendering; S7 is independent and small.
