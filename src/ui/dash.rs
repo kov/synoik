@@ -262,6 +262,14 @@ impl Dash {
         cache.icons.clear();
     }
 
+    /// How many icon uploads are cached. Only the tests look at this: dropping them
+    /// is invisible in a still frame (the worker re-decodes and they come back), but
+    /// it blanks every tile in between, so a test needs to see the drop itself.
+    #[cfg(test)]
+    pub fn icon_upload_count(&self) -> usize {
+        self.cache.borrow().icons.len()
+    }
+
     /// Lay out the dash within its allocated `box` (logical, output coords;
     /// [`crate::ui::overview_layout`] bottom-anchors it to the work area): the
     /// centered pill and its tiles, with the pill's own gap below it. Always at

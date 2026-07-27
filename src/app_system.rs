@@ -288,12 +288,20 @@ impl AppSystem {
     /// call it per ping: `Niri::queue_app_catalog_reload` coalesces a burst onto one
     /// reload, the way gnome-shell's `ShellAppCache` does. (GNOME also runs the
     /// enumeration itself off-thread; we do not, yet.)
-    pub fn refresh(&mut self) {
-        self.installed = self.catalog.enumerate();
+    ///
+    /// Returns whether the enumeration actually differs from the one it replaces.
+    /// A ping is not proof of a change — glib's monitors fire for any write under a
+    /// watched directory, and one arrives shortly after startup on a catalog that is
+    /// already loaded — so the caller can skip re-deriving everything downstream.
+    pub fn refresh(&mut self) -> bool {
+        let installed = self.catalog.enumerate();
+        let changed = installed != self.installed;
+        self.installed = installed;
         self.scan_startup_wm_class_to_id();
         // Re-resolve the open windows: an app installed while its window was
         // already mapped now matches.
         self.recompute_running();
+        changed
     }
 
     /// Rebuild the `StartupWMClass` → id table (`scan_startup_wm_class_to_id`,

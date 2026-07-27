@@ -8622,8 +8622,17 @@ impl Niri {
     }
 
     /// Re-read the app catalog and everything derived from it.
-    fn reload_app_catalog(&mut self) {
-        self.app_system.refresh();
+    pub(crate) fn reload_app_catalog(&mut self) {
+        if !self.app_system.refresh() {
+            // Same catalog: everything below is a no-op *except* the cache clearing,
+            // which is destructive. Icons are re-decoded off-thread, so dropping them
+            // blanks every dash and grid tile until the worker catches up — and the
+            // `queue_redraw_all()` at the end guarantees a frame is drawn in that gap.
+            // glib's monitors ping for any write under a watched directory and one
+            // lands a few seconds into every session, which is what made the dash
+            // flicker once, ~6s after startup, with nothing happening.
+            return;
+        }
         // A newly installed app's icon (or a cached negative) may now resolve.
         self.app_icon_cache.clear();
         self.dash.clear_icon_uploads();

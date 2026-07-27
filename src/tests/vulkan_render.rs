@@ -6425,6 +6425,85 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
 /// above the icon) against tile 1's (plain pill background); tile 0 must be brighter
 /// on every color channel. A sign flip (a theme reading it as a darken) fails here.
 #[test]
+fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    // glib's app-info monitor pings for any write under a watched directory, and one lands a
+    // few seconds into every session on a catalog that is already loaded. The reload cleared
+    // every icon upload regardless — and since icons re-decode off-thread, the dash drew blank
+    // tiles until the worker caught up. That is the single dash flicker ~6s after startup that
+    // needed nothing to be happening.
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let catalog = FakeCatalog::new(vec![
+        AppEntry::fake("a.desktop", "a.desktop"),
+        AppEntry::fake("b.desktop", "b.desktop"),
+    ]);
+    let apps = catalog.apps.clone();
+    f.niri().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+    f.niri()
+        .app_system
+        .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
+    f.niri().sync_dash_favorites();
+
+    let controls = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+
+    // Render once, purely to populate the upload cache the reload would drop.
+    let state = f.niri_state();
+    let rendered = state.backend.headless().with_vulkan_renderer(|vk| {
+        let niri = &mut state.niri;
+        let _ = niri.dash.render(
+            vk,
+            &niri.app_icon_cache,
+            &niri.icon_cache,
+            &output,
+            controls.dash,
+            1.0,
+        );
+    });
+    if rendered.is_none() {
+        eprintln!("skipping a_ping_on_an_unchanged_catalog_keeps_the_dash_icons: no Vulkan device");
+        return;
+    }
+
+    let warm = f.niri().dash.icon_upload_count();
+    assert!(
+        warm > 0,
+        "the dash uploaded no icons, so this test could not see them being dropped"
+    );
+
+    f.niri().reload_app_catalog();
+    assert_eq!(
+        f.niri().dash.icon_upload_count(),
+        warm,
+        "a ping on an unchanged catalog dropped the dash icon uploads — every tile would \
+         draw blank until the off-thread decodes land"
+    );
+
+    // A real change must still drop them: an installed app's icon may now resolve.
+    apps.borrow_mut()
+        .push(AppEntry::fake("c.desktop", "c.desktop"));
+    f.niri().reload_app_catalog();
+    assert_eq!(
+        f.niri().dash.icon_upload_count(),
+        0,
+        "a changed catalog must drop the uploads so icons re-resolve"
+    );
+}
+
+#[test]
 fn vulkan_dash_hover_lightens_the_tile() {
     use smithay::utils::Logical;
 
