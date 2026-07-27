@@ -1274,6 +1274,8 @@ impl State {
         self.niri
             .panel_popover
             .open_app_menu(output.clone(), anchor, side, &entry, is_favorite);
+        // Remembered so the icon can stay highlighted for as long as its menu is up.
+        self.niri.app_menu_source = Some(hit);
         true
     }
 
@@ -3157,6 +3159,26 @@ impl State {
         // called from `_onItemDragMotion`, `dash.js:447-450`).
         let (dash_hit, search_hit, grid_hit, arrow_hit) = if let Some(drag) = &self.niri.app_drag {
             (drag.unpin.then_some(DashHit::ShowApps), None, None, None)
+        } else if self.niri.panel_popover.is_open() {
+            // An open menu holds a `Clutter.Grab` (`PopupMenuManager`), so motion never
+            // reaches the actors beneath it — not the icon under the box, and not the
+            // ones beside it either. Without this an app's own context menu lights up
+            // the icon it is covering.
+            //
+            // The one exception is that icon itself: `popupMenu()` pins it with
+            // `setForcedHighlight(true)` (`appDisplay.js:3028`) and only releases it when
+            // the menu pops down (`_onMenuPoppedDown`, `appDisplay.js:3055-3058`), so the
+            // menu visibly belongs to something for as long as it is up.
+            match self.niri.app_menu_source.as_ref().filter(|_| {
+                // Read only while an app menu is actually up: the source is left behind
+                // when the menu closes rather than cleared from every close path.
+                self.niri.panel_popover.is_app_menu()
+            }) {
+                Some(OverviewHit::Dash(hit)) => (Some(*hit), None, None, None),
+                Some(OverviewHit::GridApp(i)) => (None, None, Some(*i), None),
+                Some(OverviewHit::Search(hit)) => (None, Some(*hit), None, None),
+                _ => (None, None, None, None),
+            }
         } else if overview_visible {
             match self.niri.output_under(pos) {
                 Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {

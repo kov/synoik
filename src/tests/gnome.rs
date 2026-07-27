@@ -6181,6 +6181,8 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
 /// favourite toggle labelled for what it would do.
 #[test]
 fn overview_right_clicking_an_icon_opens_its_context_menu() {
+    use crate::ui::dash::DashHit;
+
     let (mut f, _recorder) = favorites_and_grid_fixture(
         &["a.desktop", "b.desktop", "c.desktop"],
         &["a.desktop", "b.desktop"],
@@ -6203,6 +6205,17 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     assert!(
         f.niri().panel_popover.is_app_menu(),
         "and the release must not take it away again"
+    );
+
+    // The menu grabs, so nothing under it hovers — except its own icon, which stays
+    // highlighted for as long as the menu is up.
+    let second = dash_tile_center(&mut f, 1);
+    pointer_motion_to(&mut f, second.x, second.y);
+    assert_eq!(
+        f.niri().dash.hovered_for_test(),
+        Some(DashHit::App(0)),
+        "the icon whose menu is open keeps its highlight, and the icon the pointer \
+         moved to must NOT take it (the menu holds a grab)"
     );
 
     // A dash icon's menu opens *upward* — the dash is at the bottom of the screen, so

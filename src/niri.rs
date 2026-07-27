@@ -627,6 +627,10 @@ pub struct Niri {
     pub pending_launches: Vec<PendingLaunch>,
     /// An app icon being dragged onto a workspace — see [`AppDrag`].
     pub app_drag: Option<AppDrag>,
+    /// The icon whose context menu is open, so it can keep its highlight for as long as
+    /// the menu is (`setForcedHighlight`, `appDisplay.js:3028`). Stale once the menu
+    /// closes — read only while `panel_popover.is_app_menu()`.
+    pub app_menu_source: Option<crate::input::OverviewHit>,
     /// GPU uploads for the dragged icon.
     pub app_drag_uploads: RefCell<AppIconUploads>,
     /// When the app grid last flipped a page on a wheel notch, to debounce a fast
@@ -3857,6 +3861,7 @@ impl Niri {
             preview_close_hovered: None,
             pending_launches: Vec::new(),
             app_drag: None,
+            app_menu_source: None,
             app_drag_uploads: RefCell::new(AppIconUploads::default()),
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
