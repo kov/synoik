@@ -22,15 +22,30 @@
 # comparison was meaningless. Hence the settle preamble, absolute workspace
 # references, and the printed baseline.
 #
-# Usage:  scripts/drive-workload.sh [SEAT_UID] [WORKSPACE]
+# Usage:  scripts/drive-workload.sh [SEAT_UID] [WORKSPACE] [PROFILE]
+#
+#   PROFILE=mixed (default)  the five-phase workload: what a session feels like.
+#   PROFILE=heavy            sustained animation, for the top of the cost range.
+#
+# Why `heavy` exists: `mixed` fires one action per 2 s while nudging the cursor
+# continuously, so most frames in any 10 s window are cheap cursor repaints and
+# the window's MEDIAN draw count stays under ~55 no matter how heavy the action
+# was. That makes it blind to the region where the miss rate actually lives
+# (§17: 4-26% above 60 draws, versus 0.6% below 40). Holding a UI open does not
+# fix it either — a settled overview is static, and cursor damage repaints it at
+# a flat 43 draws. Only *continuous transitions* keep a whole window expensive.
 #
 # Then score both arms with scripts/score-frame-log.py, which will REFUSE to
 # compare phases whose element and bake counts disagree — that check is what
 # caught both contaminations and is the reason any of this is trustworthy.
+# For cost-vs-miss correlations across a whole session, use
+# scripts/correlate-frame-log.py, which prints the covered range of every
+# predictor: two runs only compare if they spanned the same workload.
 
 set -u
 UID_SEAT=${1:-1002}
 WS=${2:-1}
+PROFILE=${3:-mixed}
 RUNTIME=/run/user/$UID_SEAT
 SOCK=$(ls "$RUNTIME"/niri.wayland-*.sock 2>/dev/null | head -1)
 NIRI=${NIRI_BIN:-$(dirname "$0")/../target/debug/niri}
@@ -65,6 +80,31 @@ nudge_loop() {          # $1 = seconds, $2 = per-2s action | none
     n=$((n+1))
   done
 }
+
+# As fast as the compositor will take it, so a transition is always in flight.
+# The nudges still matter: they keep damage coming while an action settles.
+hold_loop() {           # $1 = seconds, $2 = workspace | overview
+  local end=$(( $(date +%s) + $1 )) n=0 i
+  while [ "$(date +%s)" -lt "$end" ]; do
+    case $2 in
+      workspace) if [ $(( n % 2 )) -eq 0 ]; then act focus-workspace $(( WS + 1 ))
+                 else act focus-workspace "$WS"; fi
+                 msg pointer-motion -- 5 2; msg pointer-motion -- -5 -2 ;;
+      overview)  msg key Super_L                                  # self-toggling: open, close, open
+                 for i in 1 2 3 4 5 6; do msg pointer-motion -- 6 2; msg pointer-motion -- -6 -2; done ;;
+    esac
+    n=$((n+1))
+  done
+}
+
+if [ "$PROFILE" = heavy ]; then
+  echo "PHASE1-START $(date +%H:%M:%S)  workspace transitions (sustained)" ; hold_loop 70 workspace
+  act focus-workspace "$WS"; sleep 2
+  echo "PHASE2-START $(date +%H:%M:%S)  overview transitions (sustained)"  ; hold_loop 70 overview
+  msg key Escape; sleep 1; msg key Escape
+  echo "DONE $(date +%H:%M:%S) workspace=$(active_ws)"
+  exit 0
+fi
 
 echo "PHASE1-START $(date +%H:%M:%S)  light (cursor only)"        ; nudge_loop 40 none
 echo "PHASE2-START $(date +%H:%M:%S)  overview"                   ; nudge_loop 20 overview ; msg key Escape; sleep 1

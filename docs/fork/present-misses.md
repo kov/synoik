@@ -1073,3 +1073,83 @@ knob remains available for a within-boot A/B, but with 0051 the interesting arms
 deploy-before vs deploy-after.
 
 *— the VMM host session.*
+
+## 19. Deploy-after measured: misses down 3-70x, and the scene-cost gradient survives (2026-07-27, guest session)
+
+§18's re-measure, run the same afternoon on the same guest binary (nothing in `src/` moved between
+the arms — only the host did). Both arms are reduced by one script, `scripts/correlate-frame-log.py`,
+kept precisely so the two sides cannot differ by how they were counted; §17.3's own numbers came from
+an ad-hoc pass that no longer exists, and re-deriving them from the same journal gives +0.881 /
++0.782 rather than the published +0.857 / +0.807. Same direction, same separation, slightly different
+window selection — the published digits should be read as ±0.03, not as exact.
+
+### 19.1 Like-for-like: the scripted workload, before and after
+
+Six pre-0051 driver runs (12:35-13:00, boot -1) against four post-0051 runs. Run 1 of the new set was
+discarded: a stray click landed in it, and a commit hook ran `cargo clippy` inside it.
+
+| draws band | before flips | before rate | after flips | after rate | ratio |
+|---|---|---|---|---|---|
+| 0-40 | 28 860 | **0.57%** | 12 275 | **0.05%** | 11x |
+| 40-60 | 4 548 | **0.90%** | 11 563 | **0.42%** | 2.1x |
+| all | 33 408 | **0.62%** | 23 838 | **0.23%** | 2.7x |
+
+**The confound runs against the result, which is what makes it usable.** The post-0051 desktop was
+the *heavier* of the two — elements p50 159 vs 77, gpu p50 2.92 ms vs 1.19 ms — because the session
+was restored to a later state than the §16-era arms. The after arm did more work per frame and missed
+less anyway, so 2.7x is a floor, not an estimate.
+
+### 19.2 The heavy region, which the scripted workload could not reach
+
+`drive-workload.sh` fires one action per 2 s while nudging continuously, so a window's *median* draw
+count never exceeds ~55 however heavy the action was — the cheap cursor repaints outnumber it. Every
+number above 60 draws in §17 came from hand-poking. Holding a UI open does not fix this either: a
+settled overview is static, and cursor damage repaints it at a flat 43 draws, 1.66 ms. Only
+continuous transitions keep a whole window expensive, which is now `PROFILE=heavy`.
+
+| region | before (hand-driven) | after (scripted) |
+|---|---|---|
+| draws 60-130 | **7.31%** (183 / 2 502) | **0.10%** (4 / 4 025) |
+| draws 200+ | **14.15%** (673 / 4 755) | **3.04%** (106 / 3 488) |
+| draws 200+, warm only | **4.92%** (55 / 1 117) | **0.67%** (12 / 1 788) |
+
+Both arms warm: at a flat 240 draws the after run fell 10.61% → 4.17% → 2.21% → 0.67% as gpu settled
+9.00 → 5.13 ms, and the before run shows the same shape (25% → 4.5%). The warm-only row compares the
+settled tails and is the fairest single number here: **~7x**.
+
+A second heavy sample, taken through the committed `PROFILE=heavy` rather than the ad-hoc probes,
+lands in the same place from a warmer start: **0.05%** (2 / 4 118) at 69-74 draws and **1.11%**
+(46 / 4 133) at 237-240 draws, with the same within-run decay (2.74% → 0.33%). Two independent heavy
+runs agreeing to this degree is the reason the cross-workload rows are worth quoting at all.
+
+### 19.3 What this does not establish
+
+- **0051 ships with 0049** (ring-relax ladder v2). Everything above is the pair. The guest cannot
+  separate them; the within-boot `VKR_JOURNAL` knob still can.
+- **The heavy rows are cross-workload.** Before is hand-poking, after is scripted, matched only on
+  draw count. A 70x gap at 60-130 draws is not plausibly workload alone, but it is not a controlled
+  comparison and should not be quoted as one. The §19.1 rows are the controlled ones.
+- **The deploy is unverifiable from in here.** Mesa 26.1.4 is the guest driver and does not move with
+  virgl; §18 says 0051 was not yet on this machine, the operator says it now is. The data is the only
+  witness.
+- **§18's pre-registered test came out inconclusive, not confirmed.** The prediction was that the
+  draws partial correlation would collapse toward gpu's. It weakened (+0.740 → +0.526) without
+  collapsing, elements overtook it (+0.683), and gpu went negative (-0.376) — but 56% of post-0051
+  windows have **zero** misses and the largest has 9, so a rank correlation on a mostly-tied variable
+  is not evidence in either direction. The instrument degrades exactly as the effect it measures
+  shrinks. Reading a mechanism out of those numbers would be the §15 mistake again.
+
+### 19.4 The part worth keeping
+
+**The scene-cost gradient survived.** After 0051 the miss rate still climbs with what the scene
+contains — 0.05% at under 40 draws to 3.04% above 200, a ~60x spread, if anything a *steeper*
+relative gradient than the ~25x before. What moved is the absolute level, everywhere, by roughly an
+order of magnitude in the middle of the range.
+
+So the per-command tax was real and removing it mattered, but it was not the whole of §17: something
+still makes an expensive scene miss at 14 ms of margin. Whether that residual is the remaining decode
+work, guest-side `vn_ring` encoding, or something else is exactly what a `VKR_JOURNAL` A/B on the new
+build would now separate, and it is a cleaner experiment than before because the confound it has to
+beat is ten times smaller.
+
+*— the gnome-shell-rs guest session.*
