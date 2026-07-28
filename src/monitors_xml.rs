@@ -227,6 +227,36 @@ impl MonitorsConfig {
             .find(|s| s.corroborates(name))
             .or(Some(first))
     }
+
+    /// Every mode saved for `name`'s connector, corroborating entries first.
+    ///
+    /// This is the *un*-gated counterpart to [`Self::setting_for`], and the two are a pair: the
+    /// scale a setting carries is a judgement about the mode it was saved for, so restoring the
+    /// scale means restoring the mode. mutter restores both together — a stored config assigns
+    /// each monitor its `<mode>` (`meta-monitor-config-manager.c` `meta_monitor_config_new` →
+    /// "Invalid mode" if it can't be assigned) — and without this a saved 1920x1200@125% never
+    /// comes back: the connector lights up at its *preferred* mode and `setting_for`'s gate then
+    /// rejects the entry.
+    ///
+    /// Several entries can share a connector (the same port having driven different panels), so
+    /// the caller takes the first one the hardware actually advertises.
+    pub fn saved_modes_for<'a>(
+        &'a self,
+        name: &'a OutputName,
+    ) -> impl Iterator<Item = SavedMode> + 'a {
+        let for_connector = |s: &&MonitorSetting| s.connector == name.connector;
+        let corroborating = self
+            .settings
+            .iter()
+            .filter(for_connector)
+            .filter(|s| s.corroborates(name));
+        let rest = self
+            .settings
+            .iter()
+            .filter(for_connector)
+            .filter(|s| !s.corroborates(name));
+        corroborating.chain(rest).filter_map(|s| s.mode)
+    }
 }
 
 /// One physical monitor of a logical-monitor group to be written to `monitors.xml`: its full
@@ -468,6 +498,28 @@ mod tests {
             .is_some());
         // An unknown current mode does not veto (we'd rather restore than guess).
         assert!(cfg.setting_for(&internal, None).is_some());
+    }
+
+    #[test]
+    fn a_saved_mode_is_restorable_even_though_the_gate_rejects_it() {
+        // The other half of `saved_scale_is_pinned_to_its_mode`: gating the scale on the mode only
+        // restores anything if we also *set* the mode. At login the connector lights up at its
+        // preferred mode, so `setting_for` says no — but `saved_modes_for` still offers the saved
+        // mode, and once the backend has switched to it the gate matches and the scale comes back.
+        // (Gustavo, 2026-07-28: saved 1920x1200 @ 125%, logged back in to 2048x1330 @ 225%.)
+        let cfg = MonitorsConfig::parse(&KOV_XML.replace("3840", "1920").replace("2160", "1200"))
+            .unwrap();
+        let internal = name("Virtual-1", Some("krun-display"), Some("0x00000001"));
+        let preferred = mode(2048, 1330, 59.996);
+
+        assert!(cfg.setting_for(&internal, preferred).is_none());
+
+        let saved: Vec<_> = cfg.saved_modes_for(&internal).collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].width, saved[0].height), (1920, 1200));
+
+        let restored = mode(saved[0].width, saved[0].height, saved[0].rate);
+        assert_eq!(cfg.setting_for(&internal, restored).unwrap().scale, 2.0);
     }
 
     #[test]

@@ -1289,13 +1289,14 @@ impl Tty {
             }
         }
 
+        let target = target_mode(&connector, &output_name, &config);
         let (mode, fallback) = match mode {
             Some(x) => (x, false),
-            None => pick_mode(&connector, config.mode).ok_or_else(|| anyhow!("no mode"))?,
+            None => pick_mode(&connector, target).ok_or_else(|| anyhow!("no mode"))?,
         };
 
         if fallback {
-            let target = config.mode.unwrap();
+            let target = target.unwrap();
             warn!(
                 "configured mode {}x{}{} could not be found, falling back to preferred",
                 target.mode.width,
@@ -2293,9 +2294,10 @@ impl Tty {
                     }
                 }
 
+                let target = target_mode(connector, &surface.name, &config);
                 let (mode, fallback) = match mode {
                     Some(x) => (x, false),
-                    None => match pick_mode(connector, config.mode) {
+                    None => match pick_mode(connector, target) {
                         Some(result) => result,
                         None => {
                             warn!("couldn't pick mode for enabled connector");
@@ -2356,7 +2358,7 @@ impl Tty {
 
                 if change_mode {
                     if fallback {
-                        let target = config.mode.unwrap();
+                        let target = target.unwrap();
                         warn!(
                             "output {:?}: configured mode {}x{}{} could not be found, \
                              falling back to preferred",
@@ -3254,6 +3256,60 @@ fn modeinfo_name_slice_from_string(mode_name: &str) -> [core::ffi::c_char; 32] {
     }
 
     name
+}
+
+/// The mode to drive an output at: the KDL `output {}` mode when the user set one (and a live
+/// apply lands there too), else the mode GNOME's `monitors.xml` store saved for this monitor.
+///
+/// Restoring the stored mode is what makes a stored *scale* come back at all: the scale lookup is
+/// gated on the mode its setting was saved for, so a monitor lighting up at its preferred mode
+/// would reject the entry and fall through to the DPI guess (see
+/// [`MonitorsConfig::saved_modes_for`]). mutter restores the two together.
+///
+/// Only a mode the connector actually advertises is returned, so a stored mode can never trip
+/// `pick_mode`'s "configured mode could not be found" fallback.
+fn target_mode(
+    connector: &connector::Info,
+    name: &OutputName,
+    config: &niri_config::Output,
+) -> Option<niri_config::output::Mode> {
+    if config.mode.is_some() {
+        return config.mode;
+    }
+
+    let store = crate::monitors_xml::MonitorsConfig::load()?;
+    let saved_modes: Vec<_> = store.saved_modes_for(name).collect();
+    saved_modes.into_iter().find_map(|saved| {
+        let advertised = |m: &control::Mode| {
+            m.size() == (saved.width as u16, saved.height as u16)
+                && !m.flags().contains(ModeFlags::INTERLACE)
+        };
+        // The rate only narrows the choice when the hardware advertises it exactly; mutter
+        // compares rates with a tolerance, and a saved rate we can't match must not cost us the
+        // resolution.
+        let rate = (saved.rate * 1000.).round() as i32;
+        let refresh = connector
+            .modes()
+            .iter()
+            .filter(|m| advertised(m))
+            .any(|m| Mode::from(*m).refresh == rate)
+            .then_some(saved.rate);
+
+        connector.modes().iter().any(advertised).then_some({
+            debug!(
+                "output {:?}: restoring saved mode {}x{}",
+                name.connector, saved.width, saved.height
+            );
+            niri_config::output::Mode {
+                custom: false,
+                mode: niri_ipc::ConfiguredMode {
+                    width: saved.width as u16,
+                    height: saved.height as u16,
+                    refresh,
+                },
+            }
+        })
+    })
 }
 
 fn pick_mode(
