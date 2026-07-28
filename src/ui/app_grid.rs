@@ -187,10 +187,15 @@ const FOLDER_SUBICONS: usize = 4;
 /// `PAGE_SWITCH_TIME` (`iconGrid.js:13`) — how long the view takes to slide one page.
 const PAGE_SWITCH_MS: u64 = 300;
 
-/// One page is `TOUCHPAD_BASE_WIDTH` of horizontal travel (`swipeTracker.js:14`, used as
-/// the swipe `distance` at `:183`). Clutter cannot ask libinput for the real touchpad
+/// A **touchpad** page is `TOUCHPAD_BASE_WIDTH` of travel (`swipeTracker.js:14`, passed as
+/// the gesture `distance` at `:183`). Clutter cannot ask libinput for the real touchpad
 /// size, so GNOME picks a fixed value and every GTK app agrees on it.
-const SWIPE_PAGE_PX: f64 = 400.;
+///
+/// This is touchpad-*only*. A pointer drag divides by `SwipeTracker.distance`
+/// (`_updatePanGesture`, `:578-585`), which `_swipeBegin` sets to the grid's own
+/// allocation width (`appDisplay.js:713-716`, `swipeTracker.js:710-711`) — so a drag is
+/// one *page width* per page, i.e. actually 1:1 with the content under the pointer.
+const SWIPE_TOUCHPAD_PAGE_PX: f64 = 400.;
 /// `SCROLL_MULTIPLIER` (`swipeTracker.js:18`) — a two-finger scroll delta is scaled up
 /// before it counts as gesture travel.
 pub const SWIPE_SCROLL_MULTIPLIER: f64 = 10.;
@@ -413,6 +418,8 @@ pub struct AppGrid {
     /// Velocity history for the release projection (`swipeTracker.js:601-631`).
     swipe: crate::input::swipe_tracker::SwipeTracker,
     swipe_source: SwipeSource,
+    /// How much travel makes one page for the gesture in flight — `SwipeTracker.distance`.
+    swipe_distance: f64,
     /// Bumped on any change that affects the bake (entries/hover/page).
     content_rev: u64,
     /// The order as it was when a drag started, so an unsuccessful drop can put it
@@ -537,6 +544,7 @@ impl AppGrid {
             gesture_from: 0.,
             swipe: crate::input::swipe_tracker::SwipeTracker::new(),
             swipe_source: SwipeSource::Touchpad,
+            swipe_distance: SWIPE_TOUCHPAD_PAGE_PX,
             content_rev: 0,
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
@@ -876,12 +884,17 @@ impl AppGrid {
 
     /// Begin a 1:1 page swipe (`_swipeBegin`, `appDisplay.js:706-719`): the running
     /// slide is dropped and the view follows the finger from wherever it had got to.
-    pub fn gesture_begin(&mut self, source: SwipeSource) {
+    pub fn gesture_begin(&mut self, source: SwipeSource, area: Rectangle<f64, Logical>) {
         let from = self.page_pos();
         self.gesture = Some(from);
         self.gesture_from = from;
         self.swipe = crate::input::swipe_tracker::SwipeTracker::new();
         self.swipe_source = source;
+        self.swipe_distance = match source {
+            SwipeSource::Touchpad => SWIPE_TOUCHPAD_PAGE_PX,
+            // `confirmSwipe(this._grid.allocation.get_width(), …)`.
+            SwipeSource::Pointer => area.size.w.max(1.),
+        };
     }
 
     /// Whether a swipe is currently holding the view.
@@ -907,7 +920,7 @@ impl AppGrid {
         }
         // The tracker holds *pixels*, which is the unit the release threshold is in.
         self.swipe.push(delta_px, timestamp);
-        let step = delta_px / SWIPE_PAGE_PX;
+        let step = delta_px / self.swipe_distance;
         // At most one page either side of where the gesture began (`_getBounds`).
         let lo = (self.gesture_from.floor() - 1.).clamp(0., last);
         let hi = (self.gesture_from.ceil() + 1.).clamp(0., last);
@@ -954,7 +967,7 @@ impl AppGrid {
         // `|Δprogress| / velocity * DURATION_MULTIPLIER` with the velocity normalized to
         // pages (`swipeTracker.js:644,652-654`) — a fast flick settles quickly, a slow one
         // does not snap.
-        let pages_per_ms = velocity / SWIPE_PAGE_PX;
+        let pages_per_ms = velocity / self.swipe_distance;
         let ms = if pages_per_ms == 0. {
             PAGE_SWITCH_MS
         } else {

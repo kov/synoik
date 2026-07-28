@@ -3738,7 +3738,14 @@ impl State {
                         || (pos_within_output.y - pan.origin.y).abs() > DRAG_THRESHOLD)
                 {
                     pan.dragging = true;
-                    self.niri.app_grid.gesture_begin(SwipeSource::Pointer);
+                    if let Some(area) = self
+                        .niri
+                        .layout
+                        .controls_layout_for_output(&output)
+                        .map(|c| c.app_display)
+                    {
+                        self.niri.app_grid.gesture_begin(SwipeSource::Pointer, area);
+                    }
                 }
                 if self.niri.app_grid_pan.as_ref().is_some_and(|p| p.dragging) {
                     let area = self
@@ -5378,7 +5385,9 @@ impl State {
                                 redraw |= self.niri.app_grid.gesture_end(area);
                             } else {
                                 if action.begin() {
-                                    self.niri.app_grid.gesture_begin(SwipeSource::Touchpad);
+                                    self.niri
+                                        .app_grid
+                                        .gesture_begin(SwipeSource::Touchpad, area);
                                 }
                                 redraw |= self.niri.app_grid.gesture_update(
                                     dx * crate::ui::app_grid::SWIPE_SCROLL_MULTIPLIER,

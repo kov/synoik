@@ -8627,7 +8627,9 @@ fn overview_app_grid_pages_by_dragging_its_background() {
 
     // Grab the band well below the tiles — the background, not an icon: a press on an
     // icon belongs to that icon's own drag.
-    let start_x = area.loc.x + area.size.w / 2.;
+    // Near the right edge, so a long leftward drag does not run the pointer into the
+    // side of the screen (which silently shortens the travel).
+    let start_x = area.loc.x + area.size.w - 20.;
     let start_y = area.loc.y + area.size.h - 6.;
     assert!(
         f.niri()
@@ -8637,18 +8639,25 @@ fn overview_app_grid_pages_by_dragging_its_background() {
         "the grab point must not be on a tile"
     );
 
-    // Drag left by 240 px: the pages follow, 240 of the 400 that make a page.
+    // Drag left, slowly. A pointer drag is one *page width* per page — `_swipeBegin`
+    // confirms the swipe with the grid's own allocation width, and `_updatePanGesture`
+    // divides by that (`appDisplay.js:713-716`, `swipeTracker.js:578-585,710-711`) — so
+    // the pages travel exactly as far as the pointer does. The touchpad's 400 px is an
+    // override for a device whose physical size Clutter cannot know.
+    let travel = 1100.;
     pointer_motion_to(&mut f, start_x, start_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    for i in 1..=6 {
+    for i in 1..=10 {
         f.advance_input_time(50);
-        pointer_motion_to(&mut f, start_x - 40. * f64::from(i), start_y);
+        pointer_motion_to(&mut f, start_x - travel / 10. * f64::from(i), start_y);
     }
     let dragged = f.niri().app_grid.page_pos();
+    let expected = travel / area.size.w;
     assert!(
-        (dragged - 0.6).abs() < 0.01,
-        "the pages follow the pointer 1:1, and *towards* the next page when dragged \
-         left, got {dragged}"
+        (dragged - expected).abs() < 0.01,
+        "the pages follow the pointer 1:1 — {travel} px of a {} px page is {expected}, \
+         and *towards* the next page when dragged left; got {dragged}",
+        area.size.w
     );
 
     // Released past halfway, it settles on the next page.
