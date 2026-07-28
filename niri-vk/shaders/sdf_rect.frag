@@ -14,6 +14,14 @@ layout(push_constant) uniform Push {
     // instead of a solid fill. A focus ring, a 1px outline, etc.
     float stroke_width;
     vec4 color;
+    // Unused here; declared so `ramp` lands at the shared push block's `cutoff` offset (112).
+    vec4 tex_transform[3];
+    // Horizontal alpha ramp across the quad, in `v_uv.x` (0 at the left edge, 1 at the right):
+    // full colour at `ramp.x`, fully transparent at `ramp.y`, linear between and clamped outside.
+    // Either direction; `ramp.x == ramp.y` (the default 0,0) disables it. This is GNOME's
+    // `background-gradient-direction: horizontal` for the case both stops share an RGB and differ
+    // only in alpha — which is every gradient in the theme we have needed so far.
+    vec2 ramp;
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -40,6 +48,10 @@ void main() {
 
     float aa = max(fwidth(d), 1e-4);
     float coverage = 1.0 - smoothstep(-aa, aa, d);
+
+    if (pc.ramp.x != pc.ramp.y) {
+        coverage *= clamp((pc.ramp.y - v_uv.x) / (pc.ramp.y - pc.ramp.x), 0.0, 1.0);
+    }
     // `pc.color` is premultiplied (the frame method premultiplies the toolkit's straight Rgba) and
     // the pipeline blends premultiplied-over, so coverage scales rgb and alpha together.
     o = pc.color * coverage;

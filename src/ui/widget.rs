@@ -1384,6 +1384,34 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// [`fill_rounded`](Self::fill_rounded) with a horizontal alpha ramp: full `color` at
+    /// `from`, transparent at `to`, both fractions of `rect`'s width (0 = its left edge) and in
+    /// either order. GNOME's `background-gradient-direction: horizontal` where the two stops
+    /// share an RGB and differ only in alpha, which is every gradient in the theme so far.
+    ///
+    /// Rounding is all four corners, as everywhere else. GNOME's per-corner `border-radius`
+    /// (the page hints round only their inner pair) is expressed by letting the rect run past
+    /// the bake buffer on the side that should stay square — the corners fall outside and are
+    /// clipped, which is a real rounded rect rather than a painted-on curve.
+    pub fn fill_rounded_faded(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        radius: f64,
+        color: Rgba,
+        from: f64,
+        to: f64,
+    ) -> anyhow::Result<()> {
+        let r = (radius * self.scale) as f32;
+        self.frame.render_rounded_rect_faded(
+            color,
+            r,
+            self.rect_px(rect),
+            &[self.full],
+            (from as f32, to as f32),
+        )?;
+        Ok(())
+    }
+
     /// Draw an [`AppIcon`] tile's **state** layer (not the icon pixels — those ride
     /// on top as an [`app_icon_element`]). Normal is a no-op: a flat `.overview-icon`
     /// tile shares its parent's background (`_drawing.scss:175-177`), so nothing is
@@ -1860,6 +1888,58 @@ mod tests {
             fringe > center + 20 && fringe < corner - 20,
             "fringe just outside the box should be mid-grey (blur falloff): \
              center {center}, fringe {fringe}, corner {corner}",
+        );
+    }
+
+    /// The horizontal alpha ramp on the rounded-rect material: full colour at one end,
+    /// nothing at the other, linear between. Also pins the "run the rect past the buffer
+    /// to keep a corner square" idiom the page hints use — with the rect extending 40px
+    /// beyond the right edge, the right corners are clipped away and that edge is full
+    /// height, while the left ones are visibly cut by the radius.
+    #[test]
+    fn a_faded_rounded_rect_ramps_across_its_width() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(vk) => vk,
+            Err(e) => {
+                eprintln!("skipping a_faded_rounded_rect_ramps_across_its_width: no device ({e})");
+                return;
+            }
+        };
+
+        let scale = 1.0;
+        let size = Size::<i32, Physical>::from((100, 100));
+        let mut tex = bake_uncached_sized(&mut vk, size, |frame| {
+            let mut p = Painter::new(frame, scale, size);
+            p.clear([0., 0., 0., 0.])?;
+            // Opaque white, rounded 20, running 40px past the right edge; brightest at the
+            // left edge (u=0) and gone by the right edge of the *drawn* rect (u=1 of 140).
+            let rect =
+                Rectangle::<f64, Logical>::new(Point::from((0., 0.)), Size::from((140., 100.)));
+            p.fill_rounded_faded(rect, 20., [1., 1., 1., 1.], 0., 1.)?;
+            Ok(())
+        })
+        .expect("bake");
+
+        let tex_size = tex.size();
+        let fb = vk.bind(&mut tex).expect("bind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(tex_size);
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+        let alpha = |x: i32, y: i32| pixels[((y * 100 + x) * 4 + 3) as usize] as i32;
+
+        let (left, mid, right) = (alpha(2, 50), alpha(50, 50), alpha(98, 50));
+        assert!(left > 220, "full colour at the ramp's start: {left}");
+        assert!(
+            (left - right) > 40 && mid > right && mid < left,
+            "the ramp must fall monotonically across the width: {left} {mid} {right}"
+        );
+        // Left corners cut by the radius, right edge square (its corners fell outside).
+        assert_eq!(alpha(1, 1), 0, "the left corner is rounded away");
+        assert!(
+            alpha(98, 1) > 0,
+            "the right edge runs off the buffer square"
         );
     }
 

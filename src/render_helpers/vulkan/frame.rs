@@ -491,7 +491,23 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
-        self.render_rounded_rect_impl(color, corner_radius, 0.0, dst, damage)
+        self.render_rounded_rect_impl(color, corner_radius, 0.0, dst, damage, (0., 0.))
+    }
+
+    /// [`render_rounded_rect`](Self::render_rounded_rect) with a horizontal alpha ramp: full
+    /// `color` at `ramp.0`, transparent at `ramp.1`, both in 0..1 across `dst`'s width and in
+    /// either order. This is GNOME's `background-gradient-direction: horizontal` for the case
+    /// the two stops share an RGB and differ only in alpha — the app grid's page-preview hints
+    /// (`.page-navigation-hint`, `_app-grid.scss:150-170`).
+    pub(crate) fn render_rounded_rect_faded(
+        &mut self,
+        color: [f32; 4],
+        corner_radius: f32,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        ramp: (f32, f32),
+    ) -> Result<(), VulkanError> {
+        self.render_rounded_rect_impl(color, corner_radius, 0.0, dst, damage, ramp)
     }
 
     /// Stroke a rounded rectangle: an inset ring of `stroke_width` physical px hugging the inside
@@ -505,9 +521,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
-        self.render_rounded_rect_impl(color, corner_radius, stroke_width.max(0.), dst, damage)
+        self.render_rounded_rect_impl(
+            color,
+            corner_radius,
+            stroke_width.max(0.),
+            dst,
+            damage,
+            (0., 0.),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_rounded_rect_impl(
         &mut self,
         color: [f32; 4],
@@ -515,6 +539,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         stroke_width: f32,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
+        ramp: (f32, f32),
     ) -> Result<(), VulkanError> {
         let scissors = self.damage_scissors(dst, damage);
         if scissors.is_empty() {
@@ -530,6 +555,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // The toolkit states colors straight-alpha (as the SCSS does); the renderer is
             // premultiplied. This is that boundary.
             color: premultiply(color),
+            // `sdf_rect.frag` reads this at the shared block's `cutoff` offset.
+            cutoff: [ramp.0, ramp.1],
             ..Default::default()
         };
         let dev = &self.renderer.gpu.device;
