@@ -493,9 +493,7 @@ fn wrap_lines_uncached(
         return if break_words {
             lines.collect()
         } else {
-            lines
-                .map(|line| ellipsize_to_fit(&mut fonts, line, px, bold, wrap_px))
-                .collect()
+            ellipsize_lines(&mut fonts, lines.collect(), px, bold, wrap_px)
         };
     }
     // Cut at the end of the last kept line, append the ellipsis, and pop characters until the
@@ -511,9 +509,7 @@ fn wrap_lines_uncached(
             return if break_words {
                 lines.collect()
             } else {
-                lines
-                    .map(|line| ellipsize_to_fit(&mut fonts, line, px, bold, wrap_px))
-                    .collect()
+                ellipsize_lines(&mut fonts, lines.collect(), px, bold, wrap_px)
             };
         }
         match head.char_indices().next_back() {
@@ -521,6 +517,31 @@ fn wrap_lines_uncached(
             _ => return vec![ELLIPSIS.to_string()],
         }
     }
+}
+
+/// Ellipsize each line that overflows, and stop at the first one that did.
+///
+/// A line only overflows when a single word is wider than the box, and once a word has
+/// been cut the lines after it are noise: "Chrome Web Store" in a box too narrow for
+/// "Chrome" reads "Chr…/We…", where GNOME (one line, always) reads "Chr…". So the cut
+/// line is the last one.
+fn ellipsize_lines(
+    fonts: &mut FontSystem,
+    lines: Vec<String>,
+    px: f32,
+    bold: bool,
+    wrap_px: f64,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let cut = ellipsize_to_fit(fonts, line, px, bold, wrap_px);
+        let ellipsized = cut.ends_with('\u{2026}');
+        out.push(cut);
+        if ellipsized {
+            break;
+        }
+    }
+    out
 }
 
 /// Cut `line` down until it fits `wrap_px`, ending in an ellipsis — what Pango's

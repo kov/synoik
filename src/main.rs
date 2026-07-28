@@ -248,8 +248,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = state.backend.headless().add_renderer() {
             warn!("error creating headless renderer, running without one: {err:?}");
         }
+        // `NIRI_HEADLESS_MODE=WxH` sizes the virtual output. The headless backend
+        // advertises exactly one (custom) mode, so `niri msg output … mode` cannot reach
+        // any other shape — and chrome that adapts to the canvas has to be judged on a
+        // canvas, at the mode+scale of the display being reproduced.
+        let size = env::var("NIRI_HEADLESS_MODE")
+            .ok()
+            .and_then(|s| {
+                let (w, h) = s.split_once(['x', 'X'])?;
+                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+            })
+            .unwrap_or((1920, 1080));
         let niri = &mut state.niri;
-        state.backend.headless().add_output(niri, 1, (1920, 1080));
+        state.backend.headless().add_output(niri, 1, size);
     }
 
     // Set WAYLAND_DISPLAY for children.

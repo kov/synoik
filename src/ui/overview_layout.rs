@@ -51,6 +51,38 @@ const THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM: f64 = 0.4;
 /// under the search entry, and the app grid fills the space below it.
 const SMALL_WORKSPACE_RATIO: f64 = 0.15;
 
+/// The reference canvas: the smallest logical size GNOME's fixed chrome constants still
+/// read correctly on. Above it nothing changes; below it [`chrome_ramp`] shrinks.
+const REFERENCE_CANVAS: (f64, f64) = (1280., 800.);
+
+/// The floor: chrome may shrink to half GNOME's constants and no further, so hit targets
+/// and rings stay usable on an absurd canvas.
+const CHROME_RAMP_FLOOR: f64 = 0.5;
+
+/// **Divergence (approved 2026-07-26, `docs/fork/adaptive-overview-chrome.md`).** How far
+/// the overview's chrome shrinks on this canvas: `1.0` on anything at least as big as
+/// [`REFERENCE_CANVAS`], down to [`CHROME_RAMP_FLOOR`].
+///
+/// gnome-shell is *not* adaptive — the dash icon is a flat 64 (`dash.js:321`), the
+/// workspace background radius a flat 30 (`workspace.js:30`), the picker gap clamps a flat
+/// 24..80 (`workspacesView.js:22-23`) — and that reads fine only because it assumes a
+/// canvas of roughly 1280x800 or more. On a 1024x665 one it produces a dash wider than
+/// half the screen over an app grid whose own icons have laddered down to 32, and a
+/// near-circular corner on a preview a couple of hundred px tall.
+///
+/// Two rules decide how a piece uses this, and mixing them per-widget is the thing to
+/// avoid: chrome whose box is a fixed logical constant multiplies that constant by the
+/// ramp, while chrome whose box already scales with the canvas derives its radii and
+/// spacing from *its own box* instead (so its shape is scale-invariant, which a ramped
+/// constant would not be). The top panel and every text size are exempt — the panel is the
+/// one fixed landmark, and text size is a readability constant whose knob is
+/// `text-scaling-factor`, not the canvas.
+pub fn chrome_ramp(view_size: Size<f64, Logical>) -> f64 {
+    let w = view_size.w / REFERENCE_CANVAS.0;
+    let h = view_size.h / REFERENCE_CANVAS.1;
+    w.min(h).clamp(CHROME_RAMP_FLOOR, 1.)
+}
+
 /// gnome-shell's `ControlsState` (`overviewControls.js:32-36`) as a continuous
 /// axis: `HIDDEN` 0, `WINDOW_PICKER` 1, `APP_GRID` 2. [`layout`] takes a fractional
 /// value and interpolates the state-dependent boxes (workspaces + app grid) between
@@ -80,6 +112,10 @@ pub struct ControlsLayout {
     /// `WINDOW_PICKER` it fills the band; at `APP_GRID` it shrinks to the small
     /// top strip.
     pub workspaces: Rectangle<f64, Logical>,
+    /// How far this canvas shrinks GNOME's fixed chrome constants ([`chrome_ramp`]) — 1
+    /// on anything at or above the reference canvas. Carried here so the divergence is
+    /// readable off the same layout model as the boxes it produced.
+    pub chrome_ramp: f64,
     /// The app grid — the state-interpolated app-display box
     /// (`_getAppDisplayBoxForState`, `overviewControls.js:112-138`). Parked at the
     /// work-area bottom (off-screen below) in `HIDDEN`/`WINDOW_PICKER`, it slides up
@@ -184,6 +220,7 @@ pub fn layout(
         thumbnails,
         dash,
         search_results,
+        chrome_ramp: chrome_ramp(view_size),
         workspaces,
         app_display,
     }
@@ -212,6 +249,36 @@ fn lerp_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ramp: 1 on every canvas GNOME's own constants were written for, monotone
+    /// below that, floored, and never above 1 — this divergence only ever *shrinks*.
+    #[test]
+    fn the_chrome_ramp_is_monotone_clamped_and_neutral_at_the_reference() {
+        let r = |w: f64, h: f64| chrome_ramp(Size::from((w, h)));
+
+        assert_eq!(r(1280., 800.), 1., "neutral at the reference canvas");
+        assert_eq!(r(1920., 1080.), 1., "and on anything bigger");
+        assert_eq!(r(3840., 2160.), 1.);
+
+        // The axis that runs out first drives it, so a wide-but-short canvas ramps too.
+        assert_eq!(r(1920., 600.), 0.75, "height binds");
+        assert_eq!(r(640., 1080.), 0.5, "width binds, and the floor holds");
+        assert_eq!(r(200., 200.), CHROME_RAMP_FLOOR, "floored, never zero");
+
+        // Monotone in both axes.
+        let mut prev = 0.;
+        for h in [400., 500., 600., 700., 800., 900.] {
+            let cur = r(1920., h);
+            assert!(
+                cur >= prev,
+                "ramp must not go down: {h} gave {cur} after {prev}"
+            );
+            prev = cur;
+        }
+
+        // The canvas this divergence was written for (2048x1330 @ 2).
+        assert_eq!(r(1024., 665.), 0.8);
+    }
 
     /// The heights the fork's own widgets publish, so the expectations below
     /// are hand-derived rather than observed.

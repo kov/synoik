@@ -7405,6 +7405,71 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// **Adaptive overview chrome** (`docs/fork/adaptive-overview-chrome.md`, approved
+/// 2026-07-26). gnome-shell's overview chrome is fixed logical constants — a 64px dash
+/// icon (`dash.js:321`), a 30px workspace-background radius (`workspace.js:30`), 24..80
+/// picker-gap clamps (`workspacesView.js:22-23`), a 24em search entry — and they read
+/// correctly only because it assumes a canvas of roughly 1280x800 or more. On the
+/// 1024x665 canvas this fork actually runs on, they produce a dash wider than half the
+/// screen over an app grid whose own icons have laddered down, a near-circular corner on
+/// a short preview, and a gap pegged at its 80px maximum.
+///
+/// Two things are asserted, and the first matters as much as the second: on a canvas at
+/// or above the reference **nothing changes** — the divergence only ever shrinks.
+#[test]
+fn overview_chrome_ramps_down_on_a_small_canvas() {
+    use crate::ui::dash::Dash;
+
+    // (dash icon, entry pill width, workspace background radius, picker gap)
+    let measure = |size: (u16, u16)| -> (f64, f64, f64, f64) {
+        let mut f = Fixture::new();
+        f.add_output(1, size);
+        let output = f.niri_output(1);
+        f.niri_state().do_action(Action::OpenOverview, false);
+        f.niri_complete_animations();
+
+        let controls = f
+            .niri()
+            .layout
+            .controls_layout_for_output(&output)
+            .expect("the output has a monitor");
+        let icon = Dash::metrics(controls.dash).icon_px;
+        let entry = f.niri().overview_search.entry_pill(controls.into()).size.w;
+        let mon = f
+            .niri()
+            .layout
+            .monitor_for_output(&output)
+            .expect("the output has a monitor");
+        // Un-divide the zoom the accessor applies, so this is the radius as drawn.
+        let radius = mon.workspace_background_radius() * mon.overview_zoom();
+        let gap = mon.workspace_gap_for_test();
+        (icon, entry, radius, gap)
+    };
+
+    // 1920x1080 — above the reference canvas, so every number is GNOME's own.
+    let (icon, entry, radius, gap) = measure((1920, 1080));
+    assert_eq!(icon, 64., "the dash keeps GNOME's icon on a normal canvas");
+    assert_eq!(entry, 352., "…and the entry its 24em");
+    assert_eq!(radius, 30., "…and the preview its 30px corner");
+    assert!(gap <= 80., "…and the gap stays inside GNOME's clamps");
+
+    // 1024x665 (2048x1330 @ 2) — the canvas this divergence was written for. Ramp 0.8.
+    let (s_icon, s_entry, s_radius, s_gap) = measure((1024, 665));
+    assert_eq!(
+        s_icon, 48.,
+        "the dash steps down a ladder rung (64 x 0.8 = 51.2 -> 48)"
+    );
+    assert_eq!(s_entry, 282., "the entry keeps its share of the screen");
+    assert!(
+        s_radius < radius && s_radius >= 8.,
+        "the corner follows the preview down but stays a corner: {s_radius}"
+    );
+    assert!(
+        s_gap < 80.,
+        "the gap is no longer pegged at the un-ramped maximum: {s_gap}"
+    );
+}
+
 /// Dropping a dash favourite into the app grid unpins it: the grid excludes pinned apps,
 /// so `AppDisplay.acceptDrop` calls `removeFavorite` for the same reason it calls
 /// `view.removeApp` for a folder member (`appDisplay.js:1680-1697`). The drag also needs a

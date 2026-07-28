@@ -1962,6 +1962,16 @@ mod tests {
         assert_eq!(two.len(), 2, "a space is a break point: {two:?}");
         assert!(!two[0].ends_with('…'), "and needs no ellipsis: {two:?}");
 
+        // A first line that had to be cut is the LAST line: "Chrome Web Store" in a box
+        // too narrow for "Chrome" reads "Chr…", not "Chr…/We…".
+        let cut_first = tile_label_lines("Chrome Web Store", pt, 40., TILE_LABEL_LINES, false);
+        assert_eq!(
+            cut_first.len(),
+            1,
+            "nothing follows an ellipsized line: {cut_first:?}"
+        );
+        assert!(cut_first[0].ends_with('…'));
+
         // Expanded may split it, because there is nowhere else for the characters to go.
         let expanded = tile_label_lines("Graphics", pt, narrow, TILE_LABEL_EXPAND_LINES, true);
         assert!(

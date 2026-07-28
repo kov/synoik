@@ -60,10 +60,20 @@ use crate::ui::widget::{
 /// `appDisplay.js:1760`).
 pub const MAX_RESULTS: usize = 6;
 
+/// The entry pill's width on a canvas with this chrome ramp.
+fn entry_width(ramp: f64) -> f64 {
+    (ENTRY_WIDTH * ramp).round()
+}
+
 /// The hint shown in the empty entry (`hint_text: _('Type to search')`,
 /// `overviewControls.js:330`).
 const PLACEHOLDER: &str = "Type to search";
 /// Entry pill width, logical (`.search-entry` `width: 24em`; em = 11pt·4/3 ≈ 14.67px).
+///
+/// **Adaptive chrome, rule 2 — ramped** (`docs/fork/adaptive-overview-chrome.md`): this is
+/// the width on a canvas at or above the reference; [`entry_width`] shrinks it below that,
+/// so the pill keeps the *share* of the screen GNOME gives it. Its **height** does not
+/// ramp — that is the entry's text plus padding, and text is exempt.
 const ENTRY_WIDTH: f64 = 352.;
 /// `.search-entry` `margin-top: $base_padding*2` (`_search-entry.scss:4`).
 const ENTRY_MARGIN_TOP: f64 = 12.;
@@ -407,7 +417,7 @@ impl OverviewSearch {
         let entry = Entry::layout(
             area.entry.loc.x + area.entry.size.w / 2.,
             area.entry.loc.y + ENTRY_MARGIN_TOP,
-            ENTRY_WIDTH,
+            entry_width(area.ramp),
         );
 
         let active = self.is_active();
@@ -608,14 +618,21 @@ impl OverviewSearch {
         }
 
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
+        // The pill's own width — the bake is the chrome, so it has to be the width the
+        // layout placed, ramp included, or the two disagree by the ramp.
+        let pill_w = entry_width(area.ramp);
         match Entry::bake(
             renderer,
             &mut cache.entry_bake,
             scale,
-            ENTRY_WIDTH,
+            pill_w,
             &self.query,
             PLACEHOLDER,
-            self.content_rev,
+            // The width is part of what was baked; a canvas change must re-bake it.
+            widget::Revision::new()
+                .of(self.content_rev)
+                .of(pill_w.to_bits())
+                .done(),
         ) {
             Ok(texture) => {
                 let buffer = TextureBuffer::from_texture(
@@ -846,6 +863,8 @@ pub struct SearchFade {
 pub struct SearchArea {
     pub entry: Rectangle<f64, Logical>,
     pub results: Rectangle<f64, Logical>,
+    /// The canvas's chrome ramp (`ControlsLayout::chrome_ramp`).
+    pub ramp: f64,
 }
 
 impl From<ControlsLayout> for SearchArea {
@@ -853,6 +872,7 @@ impl From<ControlsLayout> for SearchArea {
         Self {
             entry: l.search_entry,
             results: l.search_results,
+            ramp: l.chrome_ramp,
         }
     }
 }
@@ -1026,7 +1046,7 @@ mod tests {
             Size::from((1920., 1080.)),
             35.,
             PREFERRED_ENTRY_HEIGHT,
-            crate::ui::dash::PREFERRED_HEIGHT,
+            crate::ui::dash::preferred_height(Size::from((1920., 1080.))),
             54.,
             1.,
             crate::ui::overview_layout::state::WINDOW_PICKER,
@@ -1043,7 +1063,7 @@ mod tests {
         let area = area_1080();
         let layout = s.layout(area);
         let entry_center = Point::from((
-            layout.entry.pill.loc.x + ENTRY_WIDTH / 2.,
+            layout.entry.pill.loc.x + entry_width(area.ramp) / 2.,
             layout.entry.pill.loc.y + Entry::HEIGHT / 2.,
         ));
         assert_eq!(

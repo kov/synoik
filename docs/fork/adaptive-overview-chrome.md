@@ -1,9 +1,18 @@
 # Adaptive overview chrome
 
-**Status: approved divergence, not yet implemented.** Gustavo approved this 2026-07-26 as a
-deliberate departure from GNOME; implementation is planned as its own pass ("the scale rework")
-after the monitors.xml mode gate (`5a4d4458`) is merged and the internal screen is re-judged on a
-sane canvas. Trigger and evidence: `overview-port.md` §S11.
+**Status: implemented 2026-07-28** (pieces 1-5; the panel stays exempt by Gustavo's call —
+"begin by leaving the panel alone", to be revisited once the rest has shrunk around it). The mode
+gate landed as `ce9325c1`; the canvas this was written for turned out to be the one the fork runs
+on daily (the internal display, 2048x1330 @ 2 = **1024x665 logical**), so it was judged there
+rather than hypothetically. Trigger and evidence: `overview-port.md` §S11.
+
+**Open questions settled at implementation.** (A) Reference canvas: **1280x800** as proposed —
+the live canvas lands at ramp 0.8, which steps the dash one ladder rung and reads right. (B) Ramp
+shape: linear, not snapped — no mushiness observed. (C) Layer B: untouched, as planned.
+
+**Method note.** Judging this needs a canvas, and `--headless` hardcoded 1920x1080; it now takes
+`NIRI_HEADLESS_MODE=WxH`, so the harness reproduces any display exactly (mode + `niri msg output
+… scale`) and the chrome can be eyeballed on the shape that is actually wrong.
 
 ## Decision
 

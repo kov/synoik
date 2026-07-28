@@ -68,6 +68,18 @@ const WORKSPACE_MAX_SPACING: f64 = 80.;
 /// sync with `.workspace-background`'s `border-radius` (`_window-picker.scss:58`).
 const WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 30.;
 
+/// The preview height GNOME's flat 30px radius is *for*: the window picker's preview on
+/// the reference canvas ([`crate::ui::overview_layout::chrome_ramp`]), which is a hair
+/// over half its 800px height. Below it the radius follows the preview down.
+const REFERENCE_PREVIEW_H: f64 = 520.;
+
+/// …and never below this, so a corner stays a corner (the interactive-floor rule).
+const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
+
+/// The thumbnail height GNOME's 6px thumb radius is for: 5% of a 1080px view
+/// (`MAX_THUMBNAIL_SCALE`, `layout/thumbnails.rs`).
+const REFERENCE_THUMB_H: f64 = 54.;
+
 /// gnome-shell's `WORKSPACE_INACTIVE_SCALE` (`workspacesView.js:25`): how far a
 /// workspace shrinks once the row has scrolled off it.
 pub const WORKSPACE_INACTIVE_SCALE: f64 = 0.94;
@@ -1206,7 +1218,18 @@ impl<W: LayoutElement> Monitor<W> {
     /// backdrop showed through each rounded corner as a pointy dark tab.
     pub fn workspace_background_radius(&self) -> f64 {
         let progress = self.expose_progress().unwrap_or(0.);
-        WORKSPACE_BACKGROUND_CORNER_RADIUS * progress / self.overview_zoom()
+        let zoom = self.overview_zoom();
+        // **Adaptive chrome, rule 1 — self-derived** (`docs/fork/adaptive-overview-chrome.md`).
+        // The preview's box already scales with the canvas, so its corner is a fraction of
+        // its own height rather than a flat 30: 30px on a 200px-tall preview is a lozenge,
+        // not a rounded rectangle. Capped at GNOME's constant, so every canvas at or above
+        // the reference is unchanged, and floored so the corner never disappears.
+        let preview_h = self.view_size.h * zoom;
+        let radius = (WORKSPACE_BACKGROUND_CORNER_RADIUS * preview_h / REFERENCE_PREVIEW_H).clamp(
+            MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS,
+            WORKSPACE_BACKGROUND_CORNER_RADIUS,
+        );
+        radius * progress / zoom
     }
 
     pub fn update_render_elements(&mut self, is_active: bool) {
@@ -1565,6 +1588,13 @@ impl<W: LayoutElement> Monitor<W> {
     /// would instead run the formula up to the maximum; there the
     /// [`FitMode::All`] `(1 - fitMode)` factor zeroes it, so the fitted row packs
     /// back at the minimum.
+    /// [`Self::workspace_gap`] at the picker's own zoom — a probe for the conformance
+    /// corpus, which asserts the ramped clamps rather than the raw formula.
+    #[cfg(test)]
+    pub fn workspace_gap_for_test(&self) -> f64 {
+        self.workspace_gap(self.overview_zoom(), FitMode::Single)
+    }
+
     fn workspace_gap(&self, zoom: f64, fit_mode: FitMode) -> f64 {
         let scale = self.scale.fractional_scale();
         let gap = if self.workspaces_horizontal() {
@@ -1574,7 +1604,11 @@ impl<W: LayoutElement> Monitor<W> {
                 FitMode::Single => available - ws_width * 0.4,
                 FitMode::All => 0.,
             };
-            raw.clamp(WORKSPACE_MIN_SPACING, WORKSPACE_MAX_SPACING)
+            // **Adaptive chrome, rule 2 — ramped.** The clamps are fixed logical
+            // constants, and on a small canvas the formula runs straight into the 80px
+            // maximum, which is where "comical" spacing came from.
+            let ramp = crate::ui::overview_layout::chrome_ramp(self.view_size);
+            raw.clamp(WORKSPACE_MIN_SPACING * ramp, WORKSPACE_MAX_SPACING * ramp)
         } else {
             self.view_size.h * 0.1 * zoom
         };
@@ -1806,7 +1840,7 @@ impl<W: LayoutElement> Monitor<W> {
             self.view_size,
             self.working_area.loc.y,
             crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
-            crate::ui::dash::PREFERRED_HEIGHT,
+            crate::ui::dash::preferred_height(self.view_size),
             thumbnails::preferred_height(self.view_size, self.workspaces.len()),
             self.thumbnails_expand_fraction(),
             state,
@@ -2583,7 +2617,12 @@ impl<W: LayoutElement> Monitor<W> {
             // backs workspaces without one.
             let mut wallpapered = false;
             if let Some(wallpaper) = wallpaper {
-                let radius = 6. / strip.scale;
+                // Rule 1 again: the thumb is 5% of the screen by construction, so its
+                // corner is a fraction of its own height and its *shape* is the same on
+                // every canvas (`6.` is GNOME's `$base_border_radius * 0.5` at 1080).
+                let radius = (6. * ws.view_size().h * strip.scale / REFERENCE_THUMB_H)
+                    .clamp(2., 6.)
+                    / strip.scale;
                 if let Some(elem) = wallpaper.render(
                     ctx.renderer,
                     ws.view_size(),

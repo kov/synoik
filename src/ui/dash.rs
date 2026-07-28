@@ -63,51 +63,141 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
 use crate::ui::widget::{self, AppIcon, Painter, SharedAppIconUploads};
 
-/// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`).
+/// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`) — the largest rung
+/// of [`ICON_LADDER`], and what every canvas at or above the adaptive-chrome reference
+/// gets.
 pub(crate) const ICON_PX: f64 = 64.;
-/// The `.overview-icon` tile side (icon + `%tile` padding, `_common.scss:86`).
-const TILE: f64 = ICON_PX + 2. * AppIcon::PADDING; // 76
-/// Per-item side margin (`margin: 0 $dash_spacing`, `_dash.scss:54`).
+
+/// gnome-shell's `baseIconSizes` (`dash.js:19`): `_adjustIconSize` picks the largest rung
+/// that fits the box it was allocated, rather than any size in between.
+const ICON_LADDER: [f64; 6] = [16., 22., 24., 32., 48., 64.];
+
+/// Per-item side margin (`margin: 0 $dash_spacing`, `_dash.scss:54`) at [`ICON_PX`].
 const ITEM_MARGIN: f64 = 2.;
-/// Per-item advance: tile + its margin on both sides.
-const ITEM_ADVANCE: f64 = TILE + 2. * ITEM_MARGIN; // 80
 /// Pill horizontal padding: `$base_padding·2 − item margin` (`_dash.scss:22-25`).
 const PILL_PAD_H: f64 = 10.;
 /// Pill vertical padding above/below the tiles (`_dash.scss:22-25`).
 const PILL_PAD_V: f64 = 12.;
-/// Pill height: tile + vertical padding both sides.
-const PILL_H: f64 = TILE + 2. * PILL_PAD_V; // 100
 /// Pill corner radius: `$modal_radius + $base_padding·2` (`_dash.scss:9,21`).
 const PILL_RADIUS: f64 = 28.;
 /// Gap from the screen bottom edge (`margin-bottom` = `$dash_edge_offset`,
 /// `_dash.scss:8,95-99`).
 const MARGIN_BOTTOM: f64 = 12.;
 
-/// What the dash asks [`crate::ui::overview_layout`] for: the pill plus the
-/// gap below it. gnome-shell caps this at `DASH_MAX_HEIGHT_RATIO` of the work
-/// area and shrinks the icons to fit (`Dash._adjustIconSize`); we take the cap
-/// but keep the icon size, so on a very short screen the pill overflows its
-/// box upward rather than getting smaller.
-pub const PREFERRED_HEIGHT: f64 = PILL_H + MARGIN_BOTTOM;
+/// Every dash length, for one icon size.
+///
+/// **Adaptive chrome, rule 2 — ramped** (`docs/fork/adaptive-overview-chrome.md`). GNOME's
+/// dash is a flat 64px icon and it only shrinks on *overflow* (`_adjustIconSize`,
+/// `dash.js:321`); on a small canvas that leaves a pill wider than half the screen sitting
+/// under an app grid whose own icons have laddered down to 32. Here the icon additionally
+/// follows the canvas — and everything the pill is built from follows the icon, so the
+/// dash keeps its proportions rather than growing fat padding around a small icon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DashMetrics {
+    /// Icon side, a rung of [`ICON_LADDER`].
+    pub icon_px: f64,
+    /// The `.overview-icon` tile side (icon + `%tile` padding, `_common.scss:86`).
+    pub tile: f64,
+    /// Per-item side margin.
+    pub item_margin: f64,
+    /// Per-item advance: tile + its margin on both sides.
+    pub item_advance: f64,
+    /// Pill padding, horizontal and vertical.
+    pub pill_pad_h: f64,
+    pub pill_pad_v: f64,
+    /// Pill height: tile + vertical padding both sides.
+    pub pill_h: f64,
+    /// Pill corner radius.
+    pub pill_radius: f64,
+    /// Gap from the screen bottom edge.
+    pub margin_bottom: f64,
+}
+
+impl DashMetrics {
+    /// The lengths for `icon_px`, every one of them proportional to it — which is what
+    /// keeps a shrunk dash looking like the dash.
+    pub fn for_icon(icon_px: f64) -> Self {
+        let k = icon_px / ICON_PX;
+        let tile = icon_px + 2. * AppIcon::PADDING * k;
+        let item_margin = ITEM_MARGIN * k;
+        let pill_pad_v = PILL_PAD_V * k;
+        Self {
+            icon_px,
+            tile,
+            item_margin,
+            item_advance: tile + 2. * item_margin,
+            pill_pad_h: PILL_PAD_H * k,
+            pill_pad_v,
+            pill_h: tile + 2. * pill_pad_v,
+            pill_radius: PILL_RADIUS * k,
+            margin_bottom: MARGIN_BOTTOM * k,
+        }
+    }
+
+    /// GNOME's own metrics — the 64px dash, unramped.
+    pub fn gnome() -> Self {
+        Self::for_icon(ICON_PX)
+    }
+
+    /// The largest rung whose pill plus bottom margin fits `height`.
+    ///
+    /// This is `_adjustIconSize`'s shape (`dash.js:321-372`) and it is why the ramp needs
+    /// no new plumbing: [`crate::ui::overview_layout`] already reserves the dash the band
+    /// it asked for, so sizing to the band it was *given* picks up the ramp and GNOME's
+    /// own `DASH_MAX_HEIGHT_RATIO` overflow shrink at once.
+    pub fn fitting(height: f64) -> Self {
+        let icon = ICON_LADDER
+            .iter()
+            .rev()
+            .copied()
+            .find(|&icon| Self::for_icon(icon).preferred_height() <= height)
+            .unwrap_or(ICON_LADDER[0]);
+        Self::for_icon(icon)
+    }
+
+    /// What the dash asks [`crate::ui::overview_layout`] for: the pill plus the gap below
+    /// it. gnome-shell caps this at `DASH_MAX_HEIGHT_RATIO` of the work area
+    /// (`overviewControls.js:22`), which is the overflow half of the shrink.
+    pub fn preferred_height(&self) -> f64 {
+        self.pill_h + self.margin_bottom
+    }
+
+    /// The `.dash-background` pill as a [`ThemeNode`] (`_dash.scss:19-25`) at this size:
+    /// its padding wraps the icon run into the pill, and the box model derives the pill
+    /// size ([`ThemeNode::allocation_for`]) and the run's origin
+    /// ([`ThemeNode::content_box`]) so those numbers aren't hand-summed. The icon tile
+    /// itself is [`AppIcon`] (the `.overview-icon` primitive); only the pill needed
+    /// modelling.
+    fn background(&self) -> ThemeNode {
+        ThemeNode {
+            padding: Edges::symmetric(self.pill_pad_v, self.pill_pad_h),
+            border: Edges::ZERO,
+            border_color: [0., 0., 0., 0.],
+            border_radius: self.pill_radius,
+            background: Some(DASH_BG),
+            width: None,
+            height: None,
+        }
+    }
+}
+
+/// What the dash asks for on a canvas of `view_size`: [`ICON_PX`] shrunk by the chrome
+/// ramp, snapped down to a ladder rung.
+pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
+    let ramp = crate::ui::overview_layout::chrome_ramp(view_size);
+    let icon = ICON_LADDER
+        .iter()
+        .rev()
+        .copied()
+        .find(|&icon| icon <= ICON_PX * ramp)
+        .unwrap_or(ICON_LADDER[0]);
+    DashMetrics::for_icon(icon).preferred_height()
+}
 
 /// `$dash_background_color = mix(#222226, #fafafb, 90%)` (`_dash.scss:20`,
 /// `_colors.scss:50`, `_default-colors.scss:4-5`) ≈ `#38383B`.
 const DASH_BG: [f32; 4] = [0.218, 0.218, 0.233, 1.];
 
-/// The `.dash-background` pill as a [`ThemeNode`] (`_dash.scss:19-25`): its padding
-/// wraps the icon run into the pill, and the box model derives the pill size
-/// ([`ThemeNode::allocation_for`]) and the run's origin ([`ThemeNode::content_box`])
-/// so those numbers aren't hand-summed. The icon tile itself is [`AppIcon`] (the
-/// `.overview-icon` primitive); only the pill needed modelling.
-const DASH_BACKGROUND: ThemeNode = ThemeNode {
-    padding: Edges::symmetric(PILL_PAD_V, PILL_PAD_H),
-    border: Edges::ZERO,
-    border_color: [0., 0., 0., 0.],
-    border_radius: PILL_RADIUS,
-    background: Some(DASH_BG),
-    width: None,
-    height: None,
-};
 /// The tile hover fill: `st-lighten($dash_background_color, 7%)` (flat + always-dark,
 /// `_drawing.scss:186-189,270-274`). Lightens (the per-widget hover direction).
 const TILE_HOVER: [f32; 4] = [0.286, 0.286, 0.305, 1.];
@@ -120,9 +210,10 @@ const SHOW_APPS_ICON: &str = "view-app-grid-symbolic";
 /// Space only: `.empty-dash-drop-target` sets a width and a height and nothing else.
 const EMPTY_DROP_TARGET_PX: f64 = 32.;
 
-/// The drop gap's open width. gnome-shell sizes the placeholder's child to `iconSize`
-/// (`dash.js:927`) — narrower than the tile it makes room for, so the run parts by a
-/// bare icon's width, not a whole advance.
+/// The drop gap's open width at [`ICON_PX`]. gnome-shell sizes the placeholder's child to
+/// `iconSize` (`dash.js:927`) — narrower than the tile it makes room for, so the run parts
+/// by a bare icon's width, not a whole advance. The animation runs in these units and the
+/// layout scales it to the dash's actual icon size.
 const PLACEHOLDER_W: f64 = ICON_PX;
 /// `DASH_ANIMATION_TIME` (`dash.js:16`); the curve is `EASE_OUT_QUAD` (`dash.js:164`).
 const GAP_ANIMATION_MS: u64 = 200;
@@ -138,8 +229,6 @@ const SEPARATOR_W: f64 = 1.;
 const SEPARATOR_MARGIN: f64 = 4.;
 /// Horizontal space one separator takes from the item run.
 const SEPARATOR_ADVANCE: f64 = SEPARATOR_W + 2. * SEPARATOR_MARGIN; // 9
-/// Separator height (`height: this.iconSize`, `dash.js:813`).
-const SEPARATOR_H: f64 = ICON_PX;
 /// `$system_borders_color = transparentize($system_fg_color, .9)` — white at 10%
 /// (`_colors.scss:48`, `_dash.scss:87`).
 const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.1];
@@ -182,6 +271,8 @@ pub enum DashHit {
 /// logical). Item `favorites.len()` is the show-apps button. Feeds both drawing and
 /// hit-testing from one place (the panel `items`/`hit_test`-agree invariant).
 struct DashLayout {
+    /// The lengths this layout was built from — the dash sizes itself to its band.
+    metrics: DashMetrics,
     pill: Rectangle<f64, Logical>,
     /// Tile boxes; `[0, n)` apps, `[n]` the show-apps button.
     tiles: Vec<Rectangle<f64, Logical>>,
@@ -389,12 +480,12 @@ impl Dash {
             return None;
         }
 
-        let run = DASH_BACKGROUND.content_box(pill);
+        let run = layout.metrics.background().content_box(pill);
         // gnome-shell's drop target is `_box`, which holds the icons, the separator and
         // the placeholder — but *not* the trailing show-apps button, a sibling inside
         // `_dashContainer` (`dash.js:338-356`). So the button's share of our run is not
         // a slot; it is the unpin target instead (see [`unpin_target_at`]).
-        let box_w = run.size.w - ITEM_ADVANCE;
+        let box_w = run.size.w - layout.metrics.item_advance;
         let rel = pos.x - run.loc.x;
         if rel < 0. || rel >= box_w {
             return None;
@@ -548,11 +639,20 @@ impl Dash {
         }
     }
 
+    /// The lengths for the band the dash was allocated (see [`DashMetrics::fitting`]).
+    pub fn metrics(area: Rectangle<f64, Logical>) -> DashMetrics {
+        DashMetrics::fitting(area.size.h)
+    }
+
     fn layout(&self, area: Rectangle<f64, Logical>) -> DashLayout {
+        let m = Self::metrics(area);
         let n = self.items.len();
         let count = n + 1; // + show-apps
-        let gap = self.gap_w();
-        let empty_target = self.empty_drop_target_w();
+                           // The gap and the empty-dash target are modelled in GNOME's units (the animation
+                           // runs 0 ⇄ `PLACEHOLDER_W`), so they follow the icon down with everything else.
+        let k = m.icon_px / ICON_PX;
+        let gap = self.gap_w() * k;
+        let empty_target = self.empty_drop_target_w() * k;
         let separator_after = self.separator_after();
         let separator_space = if separator_after.is_some() {
             SEPARATOR_ADVANCE
@@ -562,14 +662,14 @@ impl Dash {
 
         // The pill is the dash-background node wrapped around the icon run (its
         // content): width = the run, height = one tile; padding adds the rest.
-        let run_w = ITEM_ADVANCE * count as f64 + separator_space + gap + empty_target;
-        let pill_size = DASH_BACKGROUND.allocation_for(Size::from((run_w, TILE)));
+        let run_w = m.item_advance * count as f64 + separator_space + gap + empty_target;
+        let pill_size = m.background().allocation_for(Size::from((run_w, m.tile)));
         let pill_x = (area.loc.x + (area.size.w - pill_size.w) / 2.).round();
-        let pill_y = (area.loc.y + area.size.h - MARGIN_BOTTOM - pill_size.h).round();
+        let pill_y = (area.loc.y + area.size.h - m.margin_bottom - pill_size.h).round();
         let pill = Rectangle::new(Point::from((pill_x, pill_y)), pill_size);
 
         // The icon run occupies the pill's content box (pill minus padding).
-        let run = DASH_BACKGROUND.content_box(pill);
+        let run = m.background().content_box(pill);
         // Items after the separator are pushed right by its advance.
         let shift = |k: usize| match separator_after {
             Some(at) if k >= at => separator_space,
@@ -583,26 +683,27 @@ impl Dash {
         let tiles = (0..count)
             .map(|k| {
                 let tile_left = run.loc.x
-                    + ITEM_ADVANCE * k as f64
+                    + m.item_advance * k as f64
                     + shift(k)
                     + gap_shift(k)
                     + empty_target
-                    + ITEM_MARGIN;
+                    + m.item_margin;
                 Rectangle::new(
                     Point::from((tile_left, run.loc.y)),
-                    Size::from((TILE, TILE)),
+                    Size::from((m.tile, m.tile)),
                 )
             })
             .collect();
 
         let separator = separator_after.map(|at| {
-            let x = run.loc.x + ITEM_ADVANCE * at as f64 + gap_shift(at) + SEPARATOR_MARGIN;
+            let x = run.loc.x + m.item_advance * at as f64 + gap_shift(at) + SEPARATOR_MARGIN;
             // `.dash-separator` is iconSize-tall, centred on the tile row.
-            let (y, h) = allocate_1d(run.loc.y, TILE, SEPARATOR_H, Align1::Center);
+            let (y, h) = allocate_1d(run.loc.y, m.tile, m.icon_px, Align1::Center);
             Rectangle::new(Point::from((x, y)), Size::from((SEPARATOR_W, h)))
         });
 
         DashLayout {
+            metrics: m,
             pill,
             tiles,
             n_items: n,
@@ -743,6 +844,7 @@ impl Dash {
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
+        let metrics = layout.metrics;
         let alpha = progress as f32;
 
         let mut cache = self.cache.borrow_mut();
@@ -876,7 +978,7 @@ impl Dash {
             |frame, phys, ()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(widget::style::TRANSPARENT)?;
-                DASH_BACKGROUND.paint(&mut p, pill_local)?;
+                metrics.background().paint(&mut p, pill_local)?;
 
                 // The favorites/running divider. `hairline` *clears* rather than
                 // blends, so the translucent `$system_borders_color` has to be
@@ -959,7 +1061,7 @@ mod tests {
         clock.set_unadjusted(Duration::from_millis(100));
         let mid = dash.gap_w();
         assert!(
-            mid > 0. && mid < PLACEHOLDER_W,
+            mid > 0. && mid < DashMetrics::gnome().icon_px,
             "mid-animation the gap must be part-open, got {mid}"
         );
         assert!(
@@ -1000,7 +1102,7 @@ mod tests {
         );
         assert_eq!(
             dash.layout(area).tiles[2].loc.x - dash.layout(area).tiles[1].loc.x,
-            ITEM_ADVANCE + mid,
+            DashMetrics::gnome().item_advance + mid,
             "the collapsing gap keeps parting the icons it was between"
         );
         clock.set_unadjusted(Duration::from_millis(400));
@@ -1034,12 +1136,11 @@ mod tests {
     }
 
     /// The box `overview_layout` allocates the dash on 1920×1080 with the 35px
-    /// panel strut: bottom-anchored, `PREFERRED_HEIGHT` tall.
+    /// panel strut: bottom-anchored, the dash's preferred height tall. 1920×1080 is above
+    /// the adaptive-chrome reference canvas, so these are GNOME's own lengths.
     fn box_1080() -> Rectangle<f64, Logical> {
-        Rectangle::new(
-            Point::from((0., 1080. - PREFERRED_HEIGHT)),
-            Size::from((1920., PREFERRED_HEIGHT)),
-        )
+        let h = preferred_height(Size::from((1920., 1080.)));
+        Rectangle::new(Point::from((0., 1080. - h)), Size::from((1920., h)))
     }
 
     /// Every tile's center hit-tests back to that tile; side pads are Background.
@@ -1060,7 +1161,10 @@ mod tests {
             Some(DashHit::ShowApps)
         );
         // The pill's left padding is Background, not a favorite.
-        let pad = Point::from((layout.pill.loc.x + 2., layout.pill.loc.y + PILL_H / 2.));
+        let pad = Point::from((
+            layout.pill.loc.x + 2.,
+            layout.pill.loc.y + layout.metrics.pill_h / 2.,
+        ));
         assert_eq!(dash.hit_test(pad, area), Some(DashHit::Background));
         // Well outside the pill: no hit.
         assert_eq!(dash.hit_test(Point::from((10., 10.)), area), None);
@@ -1170,20 +1274,24 @@ mod tests {
         );
     }
 
-    /// The `DASH_BACKGROUND` theme-node reproduces the pill's hand-summed constants:
-    /// height is padding-only (`TILE + 2·PILL_PAD_V = PILL_H`), width is the run plus
-    /// horizontal padding, and its content box insets by exactly the padding. Pins
-    /// the node ⇄ const equivalence so a drift in either is caught.
+    /// The dash-background theme-node reproduces the pill's hand-summed lengths: height
+    /// is padding-only (`tile + 2·pill_pad_v = pill_h`), width is the run plus horizontal
+    /// padding, and its content box insets by exactly the padding. Pins the node ⇄
+    /// metrics equivalence so a drift in either is caught.
     #[test]
     fn dash_background_node_matches_the_pill_constants() {
-        let size = DASH_BACKGROUND.allocation_for(Size::from((100., TILE)));
-        assert_eq!(size.h, PILL_H);
-        assert_eq!(size.w, 100. + 2. * PILL_PAD_H);
+        let m = DashMetrics::gnome();
+        let size = m.background().allocation_for(Size::from((100., m.tile)));
+        assert_eq!(size.h, m.pill_h);
+        assert_eq!(size.w, 100. + 2. * m.pill_pad_h);
 
         let pill = Rectangle::new(Point::from((0., 0.)), size);
-        let run = DASH_BACKGROUND.content_box(pill);
-        assert_eq!(run.loc, Point::from((PILL_PAD_H, PILL_PAD_V)));
-        assert_eq!(run.size, Size::from((100., TILE)));
+        let run = m.background().content_box(pill);
+        assert_eq!(run.loc, Point::from((m.pill_pad_h, m.pill_pad_v)));
+        assert_eq!(run.size, Size::from((100., m.tile)));
+
+        // GNOME's own numbers, so the ladder's top rung is still the reference dash.
+        assert_eq!((m.icon_px, m.tile, m.pill_h), (64., 76., 100.));
     }
 
     /// The separator is drawn only when there is at least one favorite *and* at
@@ -1198,7 +1306,10 @@ mod tests {
         let sep = with_sep
             .separator
             .expect("favorites + running draws a divider");
-        assert_eq!(sep.size, Size::from((SEPARATOR_W, SEPARATOR_H)));
+        assert_eq!(
+            sep.size,
+            Size::from((SEPARATOR_W, DashMetrics::gnome().icon_px))
+        );
 
         // It sits between the last favorite and the first running app.
         assert!(sep.loc.x >= with_sep.tiles[1].loc.x + with_sep.tiles[1].size.w);
