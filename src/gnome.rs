@@ -1066,6 +1066,23 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Add `app` to the folder `id` (`FolderView.addApp`, `appDisplay.js:2223-2236`).
+    /// A read-modify-write on the watcher thread, because `apps` is not the folder's
+    /// membership: a categories-based folder sweeps in members that were never listed
+    /// there, and writing the *resolved* list back would freeze the sweep.
+    pub fn add_to_app_folder(&self, id: &str, app: &str) {
+        let (folder_id, app) = (id.to_owned(), app.to_owned());
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if s.app_folders.is_some() {
+                    add_to_app_folder(&folder_id, &app, None);
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {
@@ -1620,6 +1637,42 @@ fn create_app_folder(
     if let Err(err) = app_folders.set_strv("folder-children", children) {
         warn!("error adding {id} to folder-children: {err}");
         return false;
+    }
+    true
+}
+
+/// Add `app` to the folder `id`'s `apps`, and take it off its `excluded-apps` if it was
+/// listed there — which only a categories-based folder ever has (`FolderView.addApp`,
+/// `appDisplay.js:2223-2236`).
+fn add_to_app_folder(id: &str, app: &str, backend: Option<&gio::SettingsBackend>) -> bool {
+    let Some(source) = gio::SettingsSchemaSource::default() else {
+        return false;
+    };
+    let Some(schema) = source.lookup(APP_FOLDER_SCHEMA, true) else {
+        return false;
+    };
+    let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
+    let store = gio::Settings::new_full(&schema, backend, Some(&path));
+
+    let mut apps = strv(&store, "apps");
+    if apps.iter().any(|a| a == app) {
+        return false;
+    }
+    apps.push(app.to_owned());
+    let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
+    if let Err(err) = store.set_strv("apps", refs) {
+        warn!("error adding {app} to the app folder {id}: {err}");
+        return false;
+    }
+
+    let excluded = strv(&store, "excluded-apps");
+    if excluded.iter().any(|a| a == app) {
+        let kept: Vec<&str> = excluded
+            .iter()
+            .map(String::as_str)
+            .filter(|a| *a != app)
+            .collect();
+        let _ = store.set_strv("excluded-apps", kept);
     }
     true
 }

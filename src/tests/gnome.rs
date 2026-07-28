@@ -6878,6 +6878,78 @@ fn overview_dropping_a_grid_icon_on_another_makes_a_folder() {
     );
 }
 
+/// Dropping an app icon on a *folder* tile puts it in that folder (`FolderIcon.acceptDrop`
+/// -> `FolderView.addApp`, `appDisplay.js:2400-2408,2223-2236`): it appends to the folder's
+/// members and leaves the top level. Unlike the fold, the folder tile takes the `:drop`
+/// state at once — there is nothing to preview and nothing to wait for.
+///
+/// A *folder* dragged onto an app is not a drop at all: both `_canAccept`s take only an
+/// `AppIcon` (`:3118-3124`, `:2386-2398`), so it falls through to the reorder, which has
+/// nothing to do over an icon's body either.
+#[test]
+fn overview_dropping_a_grid_icon_on_a_folder_joins_it() {
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+    assert_eq!(f.niri().app_grid.entry_id(0), Some("a.desktop"));
+    assert_eq!(f.niri().app_grid.entry_id(1), Some("Utilities"));
+
+    let area = overview_controls(&mut f).app_display;
+    let app = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    let folder = f.niri().app_grid.entry_center(1, area).expect("tile 1");
+
+    // The folder onto the app: no drop, no reorder, nothing.
+    pointer_motion_to(&mut f, folder.x, folder.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, app.x, app.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().app_grid.drop_hover(),
+        None,
+        "a folder is not something another icon can swallow"
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(f.niri().app_grid.entry_id(0), Some("a.desktop"));
+    assert_eq!(f.niri().app_grid.entry_id(1), Some("Utilities"));
+
+    // The app onto the folder: a join.
+    pointer_motion_to(&mut f, app.x, app.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, folder.x, folder.y);
+    assert_eq!(
+        f.niri().app_grid.drop_hover(),
+        Some(1),
+        "a folder lights up the moment the drag reaches it — no 500 ms preview"
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let members: Vec<&str> = f
+        .niri()
+        .app_grid
+        .entry_folder(0)
+        .expect("the folder took the slot the app left")
+        .iter()
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(
+        members,
+        vec!["m.desktop", "z.desktop", "a.desktop"],
+        "the joined app appends, as `addApp` pushes onto `apps`"
+    );
+    assert_eq!(
+        f.niri().app_grid.entry_id(1),
+        None,
+        "and it is gone from the top level"
+    );
+}
+
 /// Dropping a dragged icon on a page-preview band sends it to that page and follows it
 /// there (`acceptDrop`'s hint branch, `appDisplay.js:1004-1013`). Stepping past the last
 /// page is allowed — that is how a new page gets made.

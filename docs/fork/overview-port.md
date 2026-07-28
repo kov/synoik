@@ -1154,6 +1154,16 @@ keeps a folder from forming every time a drag crosses an icon.
   (`:1725-1733`) is a per-page `reduce` in GNOME; over one flat list it is just "did the source
   sit earlier", which agrees with GNOME within a page and is right, rather than one slot off,
   across pages.
-* **E2 — join and leave.** Dropping on a folder tile adds; dragging out of the dialog removes,
-  with the emptied-folder delete.
+* **E2a — join.** ✅ Dropping an app on a folder tile adds it (`FolderIcon.acceptDrop` →
+  `FolderView.addApp`). The `apps` write is a **read-modify-write on the settings thread**, not a
+  write-back of the resolved members: a categories-based folder sweeps in apps that were never in
+  `apps`, and persisting the resolved list would freeze the sweep. `excluded-apps` loses the app
+  at the same time, which is the only way back in for one that was excluded.
+
+  The two drop states share a field (`AppGrid::drop_hover`) but not a schedule: a folder takes
+  `:drop` the instant the drag reaches it, an app only after 500 ms, because on an app the state
+  *is* the offer to make a folder and every icon a drag crosses would otherwise flash it.
+* **E2b — leave.** Dragging an app out of the open folder dialog removes it, with the
+  emptied-folder delete (reset every relocatable key, drop the id from `folder-children`) and the
+  `excluded-apps` push that a categories-based folder needs to make the removal stick.
 * **E3 — rename.** The edit button and the entry in the dialog.

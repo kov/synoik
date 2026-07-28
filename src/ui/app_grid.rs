@@ -287,6 +287,65 @@ fn focus_bg(ring: Rgba) -> Rgba {
     [ch(0), ch(1), ch(2), a]
 }
 
+/// `.overview-tile:drop`'s fill — `st-transparentize(-st-accent-color, .8)`
+/// (`_drawing.scss:375`). Its ring is `focus_ring()`'s to the pixel, so only the
+/// background differs from `:focus`.
+const DROP_BG_ALPHA: f32 = 0.2;
+
+/// Bake one tile's worth of ring-over-fill and push it at `tile`'s corner — the shape
+/// `.overview-tile:focus` and `:drop` share. One tile is baked and *moved* as the state
+/// walks the grid, so neither costs a re-shape of anything else.
+#[allow(clippy::too_many_arguments)]
+fn push_tile_ring(
+    renderer: &mut VulkanRenderer,
+    bake: &mut widget::BakeCache,
+    scale: f64,
+    tile: Rectangle<f64, Logical>,
+    radius: f64,
+    ring: Rgba,
+    bg: Rgba,
+    alpha: f32,
+    elements: &mut Vec<TextureRenderElement<VkTexture>>,
+    what: &str,
+) {
+    // Colors are the only thing that shapes this bake; f32 has no `Hash`, and its bits
+    // are exactly the equality the cache wants here.
+    let revision = widget::Revision::new()
+        .of(ring.map(f32::to_bits))
+        .of(bg.map(f32::to_bits))
+        .done();
+    match widget::bake(
+        renderer,
+        bake,
+        scale,
+        tile.size,
+        revision,
+        |_| Ok(()),
+        move |frame, phys, _: &()| {
+            let mut p = Painter::new(frame, scale, phys);
+            p.clear(style::TRANSPARENT)?;
+            let rect = Rectangle::from_size(tile.size);
+            p.fill_rounded(rect, radius, bg)?;
+            p.stroke_rounded(rect, radius, FOCUS_RING_W, ring)?;
+            Ok(())
+        },
+    ) {
+        Ok(texture) => {
+            let buffer =
+                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, vec![]);
+            elements.push(TextureRenderElement::from_texture_buffer(
+                buffer,
+                tile.loc,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
+        }
+        Err(err) => tracing::error!("error baking the app-grid {what}: {err:#}"),
+    }
+}
+
 /// A keyboard navigation direction — St's four spatial directions
 /// (`StDirectionType` `ST_DIR_UP`/`DOWN`/`LEFT`/`RIGHT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +419,8 @@ struct GridCache {
     hover_bake: widget::BakeCache,
     /// The `.overview-tile:focus` ring, likewise one tile's worth, moved as focus moves.
     focus_bake: widget::BakeCache,
+    /// The `.overview-tile:drop` ring a drag hovering a tile paints — same shape again.
+    drop_bake: widget::BakeCache,
     /// Captions too long for one line, one bake each, keyed by `(page, page-relative tile)`.
     ///
     /// They cannot live in the page bake: the hovered one expands to the full wrapped
@@ -439,11 +500,17 @@ pub struct AppGrid {
     peek: Animation,
     /// Which hint band the drag is over, if any — the `.dnd` flat fill.
     hint_hovered: Option<PageArrow>,
-    /// The tile a drag is hovering long enough to fold into a folder — it takes the
-    /// `:drop` state and previews the 2x2 it is about to become, its own icon eased down
-    /// to [`widget::FOLDER_SUBICON_FRACTION`] with its caption hidden
-    /// (`_showFolderPreview`, `appDisplay.js:3102-3108`). An absolute entry index.
-    folder_hover: Option<usize>,
+    /// The tile a drag is offering to drop *into*, as an absolute entry index. It draws
+    /// the `:drop` state — an accent-tinted fill under a 2px accent ring
+    /// (`_drawing.scss:374-377`).
+    ///
+    /// An **app** tile takes it only after 500 ms of hovering, and previews the folder it
+    /// is about to become as well: its own icon eases down to
+    /// [`widget::FOLDER_SUBICON_FRACTION`] with its caption hidden (`_showFolderPreview`,
+    /// `appDisplay.js:3102-3108`). A **folder** tile takes it at once and only paints
+    /// (`FolderIcon._setHoveringByDnd`, `:2350-2360`) — there is nothing to preview,
+    /// the drop just joins.
+    drop_hover: Option<usize>,
     /// A tile that must draw at reduced opacity, and how much: the folder whose dialog is
     /// up fades its source tile out while the dialog zooms out of it and back in as it
     /// shrinks home (`appDisplay.js:2441-2451`). The *id* is folded into the bake
@@ -561,7 +628,7 @@ impl AppGrid {
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
             hint_hovered: None,
-            folder_hover: None,
+            drop_hover: None,
             tile_fade: None,
             modes,
             align,
@@ -853,25 +920,26 @@ impl AppGrid {
         )
     }
 
-    /// Mark the tile a drag has hovered long enough to fold into a folder, or clear it.
+    /// Mark the tile a drag is offering to drop into ([`Self::drop_hover`]), or clear it.
     /// Returns whether it changed (→ redraw).
     ///
     /// Bumps `content_rev`: unlike a hover wash this changes what the *page bake* holds —
-    /// the previewed tile's caption goes away — so the shared bake really does differ.
-    /// It only moves on a 500 ms timer, never per frame, so a re-bake here is cheap.
-    pub fn set_folder_hover(&mut self, hover: Option<usize>) -> bool {
+    /// a previewing app tile's caption goes away — so the shared bake really does differ.
+    /// It only moves when the pointer settles on another tile, never per frame, so a
+    /// re-bake here is cheap.
+    pub fn set_drop_hover(&mut self, hover: Option<usize>) -> bool {
         let hover = hover.filter(|&i| i < self.entries.len());
-        if self.folder_hover == hover {
+        if self.drop_hover == hover {
             return false;
         }
-        self.folder_hover = hover;
+        self.drop_hover = hover;
         self.content_rev += 1;
         true
     }
 
-    /// The tile currently previewing a folder, if any.
-    pub fn folder_hover(&self) -> Option<usize> {
-        self.folder_hover
+    /// The tile currently in the `:drop` state, if any.
+    pub fn drop_hover(&self) -> Option<usize> {
+        self.drop_hover
     }
 
     /// Fade one tile (by id) to `alpha`, or clear the fade. Returns whether anything
@@ -1203,6 +1271,36 @@ impl AppGrid {
         true
     }
 
+    /// Move the app `source_id` into the folder at tile `target` — the model half of
+    /// `FolderIcon.acceptDrop` → `FolderView.addApp` (`appDisplay.js:2400-2408,2223-2236`).
+    /// Returns the folder's id for the caller's `apps` write, or `None` when the drop is
+    /// not a join (`_canAccept`, `:2386-2398`: the source must be an app, the target a
+    /// folder, and the app must not already be in it).
+    ///
+    /// The app goes to the end, as `addApp` appends to `apps`. For a categories-based
+    /// folder the swept-in members are not in `apps` at all, so the reload that follows
+    /// the write may re-order it in among them; that is the resolution's business
+    /// ([`crate::app_system::AppSystem::folder_members`]), not this preview's.
+    pub fn join_folder(&mut self, target: usize, source_id: &str) -> Option<String> {
+        let source = self.entries.iter().position(|e| e.id == source_id)?;
+        if source == target || self.entries[source].folder.is_some() {
+            return None;
+        }
+        let members = self.entries.get(target)?.folder.as_ref()?;
+        if members.iter().any(|m| m.id == source_id) {
+            return None;
+        }
+        let entry = self.entries.remove(source);
+        let target = target - usize::from(source < target);
+        let folder = self.entries[target].folder.as_mut()?;
+        folder.push(entry);
+        let id = self.entries[target].id.clone();
+        self.hovered = None;
+        self.drop_hover = None;
+        self.content_rev += 1;
+        Some(id)
+    }
+
     /// Fold the app `source_id` into a new folder over tile `target` — the *model* half
     /// of `AppDisplay.createFolder` (`appDisplay.js:1699-1751`); the settings write is
     /// the caller's. Both apps leave the top level and the folder lands where the
@@ -1248,7 +1346,7 @@ impl AppGrid {
             },
         );
         self.hovered = None;
-        self.folder_hover = None;
+        self.drop_hover = None;
         self.content_rev += 1;
         Some(apps)
     }
@@ -1744,9 +1842,10 @@ impl AppGrid {
         //     (`createFolderIcon`, `appDisplay.js:2138-2162`). ---
         for (k, entry) in page_entries.iter().enumerate() {
             let tile = layout.tiles[k];
-            // The tile a drag is about to fold into a folder previews the 2x2 by easing
-            // its own icon down to the sub-icon fraction (`_showFolderPreview`).
-            let previewing = self.folder_hover == Some(first + k);
+            // The app tile a drag is about to fold into a folder previews the 2x2 by
+            // easing its own icon down to the sub-icon fraction (`_showFolderPreview`).
+            // A folder tile in the same state has nothing to preview and keeps its 2×2.
+            let previewing = self.drop_hover == Some(first + k);
             let icon_px = if previewing {
                 (widget::FOLDER_SUBICON_FRACTION * metrics.icon_px).floor()
             } else {
@@ -1808,10 +1907,11 @@ impl AppGrid {
             fits[k] = false;
         }
         // The previewing tile's caption is hidden outright (`icon.label.opacity = 0`), so
-        // it simply leaves the shared bake and nothing is emitted in its place.
+        // it simply leaves the shared bake and nothing is emitted in its place. Only an
+        // *app* tile previews: a folder in the `:drop` state just paints the ring.
         let hidden = self
-            .folder_hover
-            .filter(|i| page_range.contains(i))
+            .drop_hover
+            .filter(|i| page_range.contains(i) && self.entries[*i].folder.is_none())
             .map(|i| i - first);
         if let Some(k) = hidden {
             fits[k] = false;
@@ -1953,6 +2053,39 @@ impl AppGrid {
             Err(err) => tracing::error!("error baking the app grid: {err:#}"),
         }
 
+        let accent_f = |alpha: f32| {
+            [
+                f32::from(accent[0]) / 255.,
+                f32::from(accent[1]) / 255.,
+                f32::from(accent[2]) / 255.,
+                alpha,
+            ]
+        };
+
+        // --- The drop state (`.overview-tile:drop`, `_drawing.scss:374-377`): the same
+        //     2px accent ring as the focus one, over a plainly transparentized accent
+        //     fill rather than the focus background's mix. Under the focus ring, since a
+        //     drag has no keyboard focus to fight with anyway. ---
+        if let Some((tile, ring_alpha)) = self
+            .drop_hover
+            .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
+            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
+        {
+            let ring = accent_f(FOCUS_RING_ALPHA);
+            push_tile_ring(
+                renderer,
+                &mut cache.drop_bake,
+                scale,
+                tile,
+                metrics.radius,
+                ring,
+                accent_f(DROP_BG_ALPHA),
+                ring_alpha,
+                elements,
+                "drop ring",
+            );
+        }
+
         // --- The keyboard focus ring (`.overview-tile:focus`, `_drawing.scss:308-327`):
         //     a 2px inset accent stroke over a faint accent-tinted fill. Pushed *before*
         //     the hover wash, i.e. above it, because GNOME's `box-shadow: inset` paints
@@ -1965,50 +2098,19 @@ impl AppGrid {
             .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
         {
             tile.size.h += focus_extra_h;
-            let radius = metrics.radius;
-            let ring = [
-                f32::from(accent[0]) / 255.,
-                f32::from(accent[1]) / 255.,
-                f32::from(accent[2]) / 255.,
-                FOCUS_RING_ALPHA,
-            ];
-            let bg = focus_bg(ring);
-            let revision = widget::Revision::new().of(accent).done();
-            match widget::bake(
+            let ring = accent_f(FOCUS_RING_ALPHA);
+            push_tile_ring(
                 renderer,
                 &mut cache.focus_bake,
                 scale,
-                tile.size,
-                revision,
-                |_| Ok(()),
-                move |frame, phys, _: &()| {
-                    let mut p = Painter::new(frame, scale, phys);
-                    p.clear(style::TRANSPARENT)?;
-                    let rect = Rectangle::from_size(tile.size);
-                    p.fill_rounded(rect, radius, bg)?;
-                    p.stroke_rounded(rect, radius, FOCUS_RING_W, ring)?;
-                    Ok(())
-                },
-            ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        tile.loc,
-                        ring_alpha,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ));
-                }
-                Err(err) => tracing::error!("error baking the app-grid focus ring: {err:#}"),
-            }
+                tile,
+                metrics.radius,
+                ring,
+                focus_bg(ring),
+                ring_alpha,
+                elements,
+                "focus ring",
+            );
         }
 
         // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten

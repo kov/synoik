@@ -671,10 +671,12 @@ pub struct Niri {
     pub grid_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
     /// The timer arming that move; dropped and re-armed whenever the target changes.
     pub grid_move_timer: Option<RegistrationToken>,
-    /// The tile a drag is resting on, waiting out [`FOLDER_PREVIEW_MS`] before it offers
-    /// to make a folder — an absolute entry index, and the timer counting it down.
-    pub grid_pending_folder: Option<usize>,
-    pub grid_folder_timer: Option<RegistrationToken>,
+    /// The tile a drag is resting on that would take the drop *into* it — an absolute
+    /// entry index. Onto a folder that is a join and lights up at once; onto an app it is
+    /// an offer to make a folder, and `grid_drop_timer` counts out [`FOLDER_PREVIEW_MS`]
+    /// before it shows.
+    pub grid_drop_target: Option<usize>,
+    pub grid_drop_timer: Option<RegistrationToken>,
     /// The timer that flips the grid's page while a drag hovers a preview band or leans
     /// on the screen edge (`appDisplay.js:827-921`) — first the initial delay, then the
     /// repeat.
@@ -3946,8 +3948,8 @@ impl Niri {
             ),
             grid_pending_move: None,
             grid_move_timer: None,
-            grid_pending_folder: None,
-            grid_folder_timer: None,
+            grid_drop_target: None,
+            grid_drop_timer: None,
             grid_page_switch_timer: None,
             grid_page_switch_overshoot: None,
             app_grid_last_page_flip: None,
