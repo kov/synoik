@@ -7,6 +7,7 @@
 //! across the input/render code.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -63,6 +64,15 @@ pub struct GnomeSettings {
     /// gnome-shell's palette (st-theme-context.c). Drives accent-colored
     /// chrome like the overview thumbnail indicator.
     pub accent_color: [u8; 3],
+    /// `org.gnome.shell app-picker-layout`: the user's saved app-grid arrangement, as
+    /// `(page, position)` per desktop id — what the grid orders by
+    /// (`PageManager.getAppPosition` + `AppDisplay._compareItems`,
+    /// `appDisplay.js:1276-1291,1475-1490`). Empty until the user rearranges the grid,
+    /// in which case everything falls back to the by-name order.
+    ///
+    /// Folder ids appear here too (`"Utilities"`); they resolve to no app and are simply
+    /// not found when an id is looked up.
+    pub app_picker_layout: HashMap<String, (usize, i32)>,
     /// `org.gnome.desktop.interface font-name`'s point size — the **realized** base
     /// every theme point size is a ratio against. See [`crate::ui::base_font_pt`] for
     /// why the theme's own `$base_font_size` is only nominal. GNOME's default is 11.
@@ -151,6 +161,7 @@ impl Default for GnomeSettings {
             edge_tiling: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
+            app_picker_layout: HashMap::new(),
             base_font_pt: crate::ui::BASE_FONT_PT,
             icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
@@ -312,6 +323,9 @@ impl GnomeSettings {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+        }
+        if settings_has_key(shell, "app-picker-layout") {
+            self.app_picker_layout = read_app_picker_layout(&shell.value("app-picker-layout"));
         }
     }
 
@@ -1465,6 +1479,34 @@ fn parse_picture_options(value: &str) -> BackgroundOptions {
 
 /// gnome-shell's accent palette (st-theme-context.c `ACCENT_COLOR_*`),
 /// keyed by the `org.gnome.desktop.interface accent-color` enum values.
+/// Unpack `app-picker-layout` (`aa{sv}`: one dict per page, desktop id → `{position:
+/// <int32>}`) into a flat id → `(page, position)` map — the shape
+/// `PageManager.getAppPosition` answers in (`appDisplay.js:1276-1291`).
+///
+/// An entry with no readable `position` is skipped rather than defaulted: a zero would
+/// silently jump it to the front of its page.
+fn read_app_picker_layout(value: &glib::Variant) -> HashMap<String, (usize, i32)> {
+    let mut out = HashMap::new();
+    for (page, page_value) in value.iter().enumerate() {
+        for (id, props) in page_value.iter().filter_map(|e| {
+            let id = e.child_value(0).str()?.to_owned();
+            Some((id, e.child_value(1)))
+        }) {
+            // `a{sv}` values are variants boxed one deeper.
+            let Some(position) = props
+                .iter()
+                .find(|kv| kv.child_value(0).str() == Some("position"))
+                .and_then(|kv| kv.child_value(1).as_variant())
+                .and_then(|v| v.get::<i32>())
+            else {
+                continue;
+            };
+            out.insert(id, (page, position));
+        }
+    }
+    out
+}
+
 /// The point size out of a Pango font description like `"Cantarell 12"` or
 /// `"Cantarell Bold Italic 11.5"` — the trailing number, which is all
 /// `pango_font_description_from_string` takes as the size (`st-theme-context.c:243`).

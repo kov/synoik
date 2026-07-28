@@ -6757,6 +6757,41 @@ fn app_grid_fixture(
 
 /// A left-click on an app-grid tile launches the app (`Activate`) and closes the
 /// overview (`AppIcon.activate` → `Main.overview.hide`, `appDisplay.js:3060,3077`).
+/// The grid follows the user's saved arrangement, not our own idea of an order:
+/// `AppDisplay._compareItems` (`appDisplay.js:1475-1490`) sorts by the `(page, position)`
+/// each app has in `org.gnome.shell app-picker-layout`, and drops everything unplaced in
+/// *after* those, by name. A profile that has never rearranged the grid has an empty
+/// layout, which is why the fallback looks alphabetical.
+#[test]
+fn overview_app_grid_follows_the_saved_arrangement() {
+    use std::collections::HashMap;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    let ids = |f: &mut Fixture| -> Vec<String> {
+        (0..3)
+            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        ids(&mut f),
+        vec!["a.desktop", "m.desktop", "z.desktop"],
+        "with no saved layout the order is by name"
+    );
+
+    // Place two of them, out of name order and on separate pages; leave one unplaced.
+    f.niri().gnome_settings.app_picker_layout = HashMap::from([
+        ("z.desktop".to_owned(), (0, 7)),
+        ("m.desktop".to_owned(), (1, 0)),
+    ]);
+    f.niri().sync_app_grid();
+    assert_eq!(
+        ids(&mut f),
+        vec!["z.desktop", "m.desktop", "a.desktop"],
+        "placed apps come first in (page, position) order — page 0 before page 1, and \
+         the position is an ordering key, not an index — then the unplaced ones by name"
+    );
+}
+
 /// The grid holds the installed apps minus favorites, name-sorted.
 #[test]
 fn overview_app_grid_click_launches_and_closes() {

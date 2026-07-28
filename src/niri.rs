@@ -1217,11 +1217,6 @@ impl State {
                             .niri
                             .app_system
                             .set_favorites(settings.favorite_apps.clone());
-                        state.niri.sync_dash_favorites();
-                        state.niri.sync_app_grid();
-                        // Pinning/unpinning moves an app between the dash and the grid;
-                        // warm any icon that just entered a surface (idempotent).
-                        state.niri.prewarm_app_icons();
                         // A keymap-affecting change (layout list / options / model)
                         // rebuilds the keymap; an mru-only change (e.g. our own
                         // switch write) just re-seeds the active group — no rebuild.
@@ -1244,6 +1239,15 @@ impl State {
                         if base_font_changed {
                             crate::ui::set_base_font_pt(state.niri.gnome_settings.base_font_pt);
                         }
+                        // Both surfaces are re-derived *after* the assignment: the grid's
+                        // order comes out of `app_picker_layout`, so syncing it against
+                        // the old settings would show the previous arrangement until some
+                        // later change happened to sync it again.
+                        state.niri.sync_dash_favorites();
+                        state.niri.sync_app_grid();
+                        // Pinning/unpinning moves an app between the dash and the grid;
+                        // warm any icon that just entered a surface (idempotent).
+                        state.niri.prewarm_app_icons();
                         if keymap_changed {
                             state.apply_effective_xkb();
                             state.ipc_keyboard_layouts_changed();
@@ -8601,13 +8605,27 @@ impl Niri {
                 icon: e.icon.clone(),
             })
             .collect();
-        // localeCompare, approximated by a case-folded compare (std has no collator;
-        // see the module divergence note).
+        // gnome-shell's `AppDisplay._compareItems` (`appDisplay.js:1475-1490`): apps the
+        // user has placed sort by their saved `(page, position)`; everything else falls
+        // in *after* them, by name. So a fresh profile is alphabetical, and rearranging
+        // the grid in GNOME is honoured here — the arrangement lives in
+        // `org.gnome.shell app-picker-layout`, not in any state of ours.
+        let layout = &self.gnome_settings.app_picker_layout;
         entries.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.name.cmp(&b.name))
+            // localeCompare, approximated by a case-folded compare (std has no collator;
+            // see the module divergence note).
+            let by_name = || {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.name.cmp(&b.name))
+            };
+            match (layout.get(&a.id), layout.get(&b.id)) {
+                (Some(a), Some(b)) => a.cmp(b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => by_name(),
+            }
         });
         self.app_grid.set_entries(entries)
     }
