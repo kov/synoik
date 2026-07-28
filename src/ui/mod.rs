@@ -69,11 +69,24 @@ pub fn base_font_pt() -> f64 {
 /// none of which has a settings handle, and it is exactly the process-wide singleton
 /// `StThemeContext` is.
 pub fn set_base_font_pt(pt: f64) {
-    if pt.to_bits() == BASE_FONT_PT_BITS.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+    if store_base_font_pt(&BASE_FONT_PT_BITS, pt) {
+        STYLE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    BASE_FONT_PT_BITS.store(pt.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    STYLE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The store half of [`set_base_font_pt`], against an explicit cell: returns whether the
+/// base actually changed, i.e. whether a generation bump is owed.
+///
+/// Split out so the tests can exercise it without touching the process-wide cell. They
+/// cannot: `pt_to_px` is read from inside every widget's bake, so a test that moved the
+/// real base would change what a *concurrently running* test measures — which it did,
+/// as an occasional extra bake in `a_container_fade_reuses_one_pill_bake`.
+fn store_base_font_pt(cell: &std::sync::atomic::AtomicU64, pt: f64) -> bool {
+    if pt.to_bits() == cell.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    cell.store(pt.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Bumped whenever something changes what every widget would draw — today only the
@@ -92,7 +105,12 @@ static BASE_FONT_PT_BITS: std::sync::atomic::AtomicU64 =
 /// `%heading` is 11pt, `%title_3` is 15pt, `%caption` is 9pt) into our logical
 /// pixels-per-em, scaled by the user's font size the way the theme's ems are.
 pub fn pt_to_px(pt: f64) -> f64 {
-    pt * PX_PER_PT * base_font_pt() / BASE_FONT_PT
+    pt_to_px_at(base_font_pt(), pt)
+}
+
+/// [`pt_to_px`] against an explicit base — the arithmetic, with no global read.
+fn pt_to_px_at(base_pt: f64, pt: f64) -> f64 {
+    pt * PX_PER_PT * base_pt / BASE_FONT_PT
 }
 
 /// GNOME's `$base_font_size` (`_common.scss:30`) is **11pt**, and the theme sizes structural
@@ -118,38 +136,33 @@ mod tests {
     /// renders the theme's nominal 11pt at 12pt. Getting this wrong is invisible on a
     /// default desktop and makes every string ~9% small on this one.
     ///
-    /// The generation half is here rather than in its own test on purpose: the base is
-    /// process-wide, and two tests touching it would race under the default harness.
+    /// Nothing here touches the process-wide base: every widget bake reads it, so a
+    /// test that moved it would change what a *concurrently running* test measures.
+    /// It did — as an occasional extra bake in `a_container_fade_reuses_one_pill_bake`.
     #[test]
     fn point_sizes_scale_with_the_user_font_size() {
-        let restore = base_font_pt();
-
-        set_base_font_pt(BASE_FONT_PT);
-        assert!(close(pt_to_px(11.), 11. * 4. / 3.));
-        assert!(close(em(1.), pt_to_px(BASE_FONT_PT)), "1em is the base");
-
-        let before = style_generation();
-        set_base_font_pt(BASE_FONT_PT);
-        assert_eq!(
-            style_generation(),
-            before,
-            "an unchanged base bumps nothing"
-        );
-
-        set_base_font_pt(12.);
+        assert!(close(pt_to_px_at(BASE_FONT_PT, 11.), 11. * 4. / 3.));
         assert!(
-            close(pt_to_px(11.), 11. * 4. / 3. * 12. / 11.),
+            close(pt_to_px_at(12., 11.), 11. * 4. / 3. * 12. / 11.),
             "the theme's nominal 11pt must render at the user's 12pt"
         );
-        assert!(
-            close(em(1.), pt_to_px(BASE_FONT_PT)),
-            "structure follows text"
-        );
-        // A change has to re-bake every widget, including the ones whose own cache key
-        // (scale, size, revision) does not move — a fixed-size panel bar with text
-        // inside it would otherwise keep serving the old size.
-        assert_ne!(style_generation(), before);
-
-        set_base_font_pt(restore);
+        // `em` is the same conversion at the base size, so structure follows text.
+        assert!(close(em(1.), pt_to_px(BASE_FONT_PT)), "1em is the base");
+        assert!(close(pt_to_px(11.), pt_to_px_at(base_font_pt(), 11.)));
     }
+
+    /// A base-size change has to re-bake every widget, including the ones whose own
+    /// cache key (scale, size, revision) does not move — a fixed-size panel bar with
+    /// text inside it would otherwise keep serving the old size. An unchanged base must
+    /// bump nothing, or every settings notification would re-bake the whole UI.
+    #[test]
+    fn only_a_real_base_change_owes_a_style_generation() {
+        let cell = std::sync::atomic::AtomicU64::new(BASE_FONT_PT.to_bits());
+        assert!(!store_base_font_pt(&cell, BASE_FONT_PT));
+        assert!(store_base_font_pt(&cell, 12.));
+        assert!(!store_base_font_pt(&cell, 12.));
+        assert!(close(f64::from_bits(cell.load(Relaxed)), 12.));
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
 }
