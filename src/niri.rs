@@ -8812,22 +8812,29 @@ impl Niri {
         // itself on every layout pass, so a real profile's grid reflects install order
         // plus manual moves, never plain alphabetical.
         let layout = &self.gnome_settings.app_picker_layout;
-        entries.sort_by(|a, b| {
-            // localeCompare, approximated by a case-folded compare (std has no collator;
-            // see the module divergence note).
-            let by_name = || {
-                a.name
-                    .to_lowercase()
-                    .cmp(&b.name.to_lowercase())
-                    .then_with(|| a.name.cmp(&b.name))
-            };
+        // The name fallback is `localeCompare`, i.e. a real collation: "Écran" belongs
+        // with the E's, not after Z. GLib's collation key is the same one GTK sorts with
+        // and reads the process locale, so it is the closest thing to gnome-shell's
+        // without pulling in an ICU of our own. Built once per entry rather than per
+        // comparison — the key is what is cheap to compare, not to make.
+        let mut keyed: Vec<(AppGridEntry, gio::glib::CollationKey)> = entries
+            .drain(..)
+            .map(|e| {
+                let key = gio::glib::CollationKey::from(e.name.as_str());
+                (e, key)
+            })
+            .collect();
+        keyed.sort_by(|(a, a_key), (b, b_key)| {
             match (layout.get(&a.id), layout.get(&b.id)) {
                 (Some(a), Some(b)) => a.cmp(b),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => by_name(),
+                // Ties broken by the raw name, so the order is total and stable across
+                // runs even for two apps whose names collate equal.
+                (None, None) => a_key.cmp(b_key).then_with(|| a.name.cmp(&b.name)),
             }
         });
+        entries = keyed.into_iter().map(|(e, _)| e).collect();
         // An open folder follows the model it was opened from: its members are re-resolved,
         // and a folder that no longer resolves to anything takes its dialog down with it
         // (GNOME destroys the `FolderIcon`, and the dialog is destroyed with its source,

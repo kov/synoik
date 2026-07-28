@@ -32,12 +32,38 @@ pub struct State {
     pub clients: Vec<Client>,
 }
 
+/// Pin the collation locale for the whole test process.
+///
+/// `LC_COLLATE` is a process global that the test binary — which never runs `main`, and so
+/// never calls [`crate::gnome::init_collation`] — would otherwise leave at C, where sorting
+/// is codepoint order and "Utilities" comes before "archive". Every test that asserts on
+/// the app grid's order depends on which it is, so it is pinned rather than inherited:
+/// `en_US.UTF-8` if the machine has it, else whatever the environment says.
+fn pin_collation() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: inside a `Once`, before the fixture hands out any state.
+        unsafe {
+            for locale in [
+                c"en_US.UTF-8".as_ptr(),
+                c"en_US.utf8".as_ptr(),
+                c"".as_ptr(),
+            ] {
+                if !libc::setlocale(libc::LC_COLLATE, locale).is_null() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 impl Fixture {
     pub fn new() -> Self {
         Self::with_config(Config::default())
     }
 
     pub fn with_config(config: Config) -> Self {
+        pin_collation();
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
 

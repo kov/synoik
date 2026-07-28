@@ -7405,6 +7405,50 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// The grid's name fallback is a *collation*, not a byte or case-folded compare: an
+/// accented initial belongs with its base letter, which is what `localeCompare`
+/// (`_compareItems`, `appDisplay.js:1475-1490`) gives GNOME and what a `to_lowercase()`
+/// compare does not — it puts every accented name after Z.
+#[test]
+fn overview_app_grid_sorts_names_by_collation() {
+    let (mut f, _recorder) = app_grid_fixture(&[], &[]);
+    // The fixture pins the collation locale; skip where the machine has no dictionary
+    // collation to pin it to (`C.UTF-8` sorts by codepoint, which would fail this for a
+    // reason that is not ours). Detected by asking, not by locale name.
+    use gio::glib::CollationKey;
+    if CollationKey::from("Écran") > CollationKey::from("Zip") {
+        eprintln!("skipping overview_app_grid_sorts_names_by_collation: codepoint collation");
+        return;
+    }
+    {
+        use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+        let named = [
+            ("a.desktop", "Archive Manager"),
+            ("e.desktop", "Écran"),
+            ("z.desktop", "Zip"),
+            ("d.desktop", "disks"),
+        ];
+        let apps: Vec<AppEntry> = named
+            .iter()
+            .map(|(id, name)| AppEntry::fake(id, name))
+            .collect();
+        f.niri().app_system = AppSystem::with_parts(
+            Box::new(FakeCatalog::new(apps)),
+            Box::new(RecordingLauncher::default()),
+        );
+        f.niri().sync_app_grid();
+    }
+
+    let order: Vec<String> = (0..4)
+        .filter_map(|i| f.niri().app_grid.entry_name(i).map(str::to_owned))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["Archive Manager", "disks", "Écran", "Zip"],
+        "Écran sorts with the E's and case is ignored, as a collation does"
+    );
+}
+
 /// A folder with more than one page takes a drag onto its *other* page: `FolderView`
 /// inherits `BaseAppView`'s page-switch machinery whole — the preview bands, the edge
 /// bump, and `acceptDrop`'s band branch (`appDisplay.js:827-959,1004-1013`). Ours wired

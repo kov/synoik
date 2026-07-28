@@ -67,9 +67,9 @@
 //! about 5/255 apart. Pages here are always
 //! **full**: our order is a flat list chunked by the page size, where GNOME's grid is
 //! built with `allow_incomplete_pages: true` (`appDisplay.js:655`) and can leave holes.
-//! The name fallback sort is a case-folded `to_lowercase` compare rather
-//! than full locale collation (`localeCompare`): std has no collator, so accented
-//! initials can misplace; an `icu` collator is the faithful fix. An expanded caption is
+//! The name fallback sort collates through GLib (`g_utf8_collate_key`, the process
+//! locale) where GNOME's `localeCompare` collates through ICU — the same answer for
+//! everything short of a locale-specific tailoring. An expanded caption is
 //! capped at [`widget::TILE_LABEL_EXPAND_LINES`] lines (GNOME grows the tile without a
 //! limit) and it does not animate open. Like the dash and
 //! search, the grid draws on **every** output with one shared hover/page (GNOME shows

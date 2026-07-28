@@ -1831,6 +1831,21 @@ fn folder_settings(id: &str, backend: Option<&gio::SettingsBackend>) -> Option<g
     Some(gio::Settings::new_full(&schema, backend, Some(&path)))
 }
 
+/// Adopt the user's locale for **collation only**, so GLib sorts names the way the
+/// session does (`g_utf8_collate_key` reads `LC_COLLATE`, and a process that never calls
+/// `setlocale` is in the C locale, where sorting is codepoint order and "Écran" lands
+/// after "Zip"). gnome-shell gets the equivalent from ICU via `localeCompare`.
+///
+/// `LC_COLLATE` and not `LC_ALL`: `LC_NUMERIC` in particular changes the decimal
+/// separator that C libraries in this process parse and print with — a well-known way to
+/// break shader and config parsing in the graphics stack for a sorting fix.
+pub fn init_collation() {
+    // SAFETY: called once, before any thread is spawned.
+    unsafe {
+        libc::setlocale(libc::LC_COLLATE, c"".as_ptr());
+    }
+}
+
 /// The relocatable per-folder schema, one instance per `folder-children` id
 /// (`appDisplay.js:2295-2299`).
 const APP_FOLDER_SCHEMA: &str = "org.gnome.desktop.app-folders.folder";
