@@ -8449,6 +8449,42 @@ fn overview_prewarm_requests_dash_and_grid_icon_decodes() {
     );
 }
 
+/// A scale change re-warms the icon decodes.
+///
+/// Gustavo, 2026-07-28: after changing the resolution or scale, the first app-grid open
+/// showed icons appearing a few at a time. Every decode is keyed on the icon's *physical*
+/// size, so the startup warm is worthless at the new scale and each icon decodes on the
+/// frame it is first drawn.
+#[test]
+fn overview_prewarm_follows_a_scale_change() {
+    let (mut f, _r) = app_grid_fixture(&["fav.desktop"], &["a.desktop", "b.desktop"]);
+
+    let rx = f.niri().app_icon_cache.wire_test_channel();
+    f.niri().prewarm_app_icons();
+    let warmed: Vec<f64> = rx.try_iter().map(|req| req.scale()).collect();
+    assert!(!warmed.is_empty(), "the fixture warms at its own scale");
+    assert!(warmed.iter().all(|scale| *scale == 1.));
+
+    let output = f.niri_output(1);
+    output.change_current_state(
+        None,
+        None,
+        Some(smithay::output::Scale::Fractional(2.)),
+        None,
+    );
+    f.niri().output_resized(&output);
+
+    let rewarmed: Vec<f64> = rx.try_iter().map(|req| req.scale()).collect();
+    assert!(
+        !rewarmed.is_empty(),
+        "a scale change re-warms; without this the grid decodes each icon as it draws it"
+    );
+    assert!(
+        rewarmed.iter().all(|scale| *scale == 2.),
+        "…at the new scale: {rewarmed:?}"
+    );
+}
+
 /// The dash is only live while the overview is open: a click at a favorite's
 /// position with the overview closed passes through to the windows/workspace, never
 /// launching the app.

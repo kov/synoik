@@ -821,6 +821,12 @@ impl IconRequest {
     pub(crate) fn logical_px(&self) -> f64 {
         self.logical_px
     }
+
+    /// The output scale requested — the other half of the decode key, and what a
+    /// scale change re-warms.
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
 }
 
 /// Resolve + decode an icon in `theme` (a free function so it runs on the decode

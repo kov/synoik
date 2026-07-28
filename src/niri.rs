@@ -4411,6 +4411,14 @@ impl Niri {
 
         self.layout.update_output_size(output);
 
+        // Every icon decode is keyed on its *physical* size, so a scale or resolution
+        // change invalidates the whole startup warm — and the app grid then decodes each
+        // icon on the frame it first draws it, which is what a first open after changing
+        // the display looks like: icons arriving a few at a time. Re-warm off-thread for
+        // the new geometry (the size also picks the grid's icon rung, so this is not just
+        // the scale). Idempotent, and outputs resize rarely.
+        self.prewarm_app_icons();
+
         if let Some(state) = self.output_state.get_mut(output) {
             state.backdrop_buffer.resize(output_size);
 
