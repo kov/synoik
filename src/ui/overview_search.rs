@@ -688,6 +688,7 @@ impl OverviewSearch {
                             LABEL_PT,
                             label_w,
                             widget::TILE_LABEL_LINES,
+                            false,
                         )
                     })
                     .collect();
@@ -747,6 +748,7 @@ impl OverviewSearch {
                             LABEL_PT,
                             label_w,
                             widget::TILE_LABEL_LINES,
+                            false,
                         )
                         .len();
                         18. * (lines as f64 - 1.)

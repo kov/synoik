@@ -345,7 +345,16 @@ pub fn layout_clamped(
         } else {
             1
         };
-        niri_vk::text::wrap_lines_weighted(&content.body, title_px() as f32, false, text_w, lines)
+        // A body is prose: GNOME wraps it `WORD_CHAR` (`_bodyLabel`), so a long word
+        // breaks across lines rather than being cut.
+        niri_vk::text::wrap_lines_weighted(
+            &content.body,
+            title_px() as f32,
+            false,
+            text_w,
+            lines,
+            true,
+        )
     };
     let can_expand = expand_button
         && (expanded

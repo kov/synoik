@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use ash::vk;
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Hinting, Metrics,
-    Shaping, Weight,
+    Shaping, Weight, Wrap,
 };
 use etagere::{size2, AtlasAllocator};
 use swash::scale::image::Content;
@@ -341,9 +341,16 @@ pub fn measure_line_width_weighted(text: &str, px: f32, bold: bool) -> f64 {
 fn measure_line_width_uncached(text: &str, px: f32, bold: bool) -> f64 {
     let _timed = crate::stats::shape();
     let mut fonts = fonts();
-    let mut buffer = Buffer::new(&mut fonts, Metrics::new(px, (px * 1.25).round()));
+    measure_line_width_with(&mut fonts, text, px, bold)
+}
+
+/// [`measure_line_width_uncached`] against a `FontSystem` the caller already holds — the
+/// lock is not reentrant, so a wrap (which holds it for the whole wrap) must measure
+/// through this rather than through the memoized entry point.
+fn measure_line_width_with(fonts: &mut FontSystem, text: &str, px: f32, bold: bool) -> f64 {
+    let mut buffer = Buffer::new(fonts, Metrics::new(px, (px * 1.25).round()));
     {
-        let mut b = buffer.borrow_with(&mut fonts);
+        let mut b = buffer.borrow_with(fonts);
         b.set_size(None, None);
         let attrs = sans_label_attrs(bold);
         b.set_text(text, &attrs, Shaping::Advanced, None);
@@ -364,11 +371,20 @@ fn shape_line_ranges(
     px: f32,
     bold: bool,
     wrap_px: f32,
+    break_words: bool,
 ) -> Vec<(usize, usize)> {
     let mut buffer = Buffer::new(fonts, Metrics::new(px, (px * 1.25).round()));
     {
         let mut b = buffer.borrow_with(fonts);
         b.set_size(Some(wrap_px), None);
+        // `WordOrGlyph` is Pango's `WORD_CHAR`: a word too long for the line is split
+        // mid-word. `Word` leaves it whole and overflowing, which the caller then
+        // ellipsizes — the difference between "Graphi/cs" and "Graphic…".
+        b.set_wrap(if break_words {
+            Wrap::WordOrGlyph
+        } else {
+            Wrap::Word
+        });
         let mut attrs = Attrs::new().family(SANS_FAMILY);
         if bold {
             attrs = attrs.weight(Weight::BOLD);
@@ -405,6 +421,7 @@ pub fn wrap_lines_weighted(
     bold: bool,
     wrap_px: f64,
     max_lines: usize,
+    break_words: bool,
 ) -> Vec<String> {
     let max_lines = max_lines.max(1);
     if text.is_empty() {
@@ -416,12 +433,13 @@ pub fn wrap_lines_weighted(
         bold,
         wrap_px.to_bits(),
         max_lines,
+        break_words,
     );
     if let Some(lines) = wrap_cache().lock().unwrap().get(&key) {
         return lines.clone();
     }
 
-    let lines = wrap_lines_uncached(text, px, bold, wrap_px, max_lines);
+    let lines = wrap_lines_uncached(text, px, bold, wrap_px, max_lines, break_words);
 
     let mut cache = wrap_cache().lock().unwrap();
     if cache.len() >= WRAP_CACHE_CAP {
@@ -447,8 +465,8 @@ fn wrap_cache() -> &'static Mutex<WrapCache> {
     CACHE.get_or_init(Default::default)
 }
 
-/// Wrapped lines keyed by `(text, px bits, bold, wrap px bits, max lines)`.
-type WrapCache = HashMap<(String, u32, bool, u64, usize), Vec<String>>;
+/// Wrapped lines keyed by `(text, px bits, bold, wrap px bits, max lines, break words)`.
+type WrapCache = HashMap<(String, u32, bool, u64, usize, bool), Vec<String>>;
 
 /// Smaller than [`MEASURE_CACHE_CAP`]: the values are whole line vectors, and the keys are
 /// message bodies rather than short labels.
@@ -460,14 +478,25 @@ fn wrap_lines_uncached(
     bold: bool,
     wrap_px: f64,
     max_lines: usize,
+    break_words: bool,
 ) -> Vec<String> {
     const ELLIPSIS: char = '\u{2026}';
     let _timed = crate::stats::shape();
     let mut fonts = fonts();
     let wrap = wrap_px as f32;
-    let ranges = shape_line_ranges(&mut fonts, text, px, bold, wrap);
+    let ranges = shape_line_ranges(&mut fonts, text, px, bold, wrap, break_words);
     if ranges.len() <= max_lines {
-        return ranges.iter().map(|&(s, e)| text[s..e].to_owned()).collect();
+        let lines = ranges.iter().map(|&(s, e)| text[s..e].to_owned());
+        // Without word breaking a word wider than the line is left whole and overflowing,
+        // so each line is ellipsized on its own — the one-line path every caption used to
+        // take, applied per line.
+        return if break_words {
+            lines.collect()
+        } else {
+            lines
+                .map(|line| ellipsize_to_fit(&mut fonts, line, px, bold, wrap_px))
+                .collect()
+        };
     }
     // Cut at the end of the last kept line, append the ellipsis, and pop characters until the
     // ellipsis no longer spills onto an extra line (word wrap can pull the whole last word down
@@ -476,16 +505,47 @@ fn wrap_lines_uncached(
     loop {
         let head = text[..cut].trim_end();
         let candidate = format!("{head}{ELLIPSIS}");
-        let ranges = shape_line_ranges(&mut fonts, &candidate, px, bold, wrap);
+        let ranges = shape_line_ranges(&mut fonts, &candidate, px, bold, wrap, break_words);
         if ranges.len() <= max_lines {
-            return ranges
-                .iter()
-                .map(|&(s, e)| candidate[s..e].to_owned())
-                .collect();
+            let lines = ranges.iter().map(|&(s, e)| candidate[s..e].to_owned());
+            return if break_words {
+                lines.collect()
+            } else {
+                lines
+                    .map(|line| ellipsize_to_fit(&mut fonts, line, px, bold, wrap_px))
+                    .collect()
+            };
         }
         match head.char_indices().next_back() {
             Some((idx, _)) if idx > 0 => cut = idx,
             _ => return vec![ELLIPSIS.to_string()],
+        }
+    }
+}
+
+/// Cut `line` down until it fits `wrap_px`, ending in an ellipsis — what Pango's
+/// `ELLIPSIZE_END` does to a line that overflows, and what a caption wrapped without word
+/// breaking needs for the word that is simply too long.
+fn ellipsize_to_fit(
+    fonts: &mut FontSystem,
+    line: String,
+    px: f32,
+    bold: bool,
+    wrap_px: f64,
+) -> String {
+    const ELLIPSIS: char = '\u{2026}';
+    if measure_line_width_with(fonts, &line, px, bold) <= wrap_px {
+        return line;
+    }
+    let mut cut = line.len();
+    loop {
+        match line[..cut].char_indices().next_back() {
+            Some((idx, _)) if idx > 0 => cut = idx,
+            _ => return ELLIPSIS.to_string(),
+        }
+        let candidate = format!("{}{ELLIPSIS}", line[..cut].trim_end());
+        if measure_line_width_with(fonts, &candidate, px, bold) <= wrap_px {
+            return candidate;
         }
     }
 }
@@ -1167,12 +1227,12 @@ mod tests {
     fn wrap_lines_wraps_and_ellipsizes() {
         let px = 15.0;
         assert_eq!(
-            wrap_lines_weighted("hello", px, false, 400., 6),
+            wrap_lines_weighted("hello", px, false, 400., 6, true),
             vec!["hello"]
         );
 
         let text = "The quick brown fox jumps over the lazy dog and keeps running on through the quiet woods";
-        let lines = wrap_lines_weighted(text, px, false, 200., 32);
+        let lines = wrap_lines_weighted(text, px, false, 200., 32, true);
         assert!(lines.len() > 1, "expected a wrap: {lines:?}");
         for line in &lines {
             assert!(
@@ -1187,7 +1247,7 @@ mod tests {
         );
 
         for max in [1, 2] {
-            let clamped = wrap_lines_weighted(text, px, false, 200., max);
+            let clamped = wrap_lines_weighted(text, px, false, 200., max, true);
             assert_eq!(clamped.len(), max, "clamped: {clamped:?}");
             let last = clamped.last().unwrap();
             assert!(last.ends_with('\u{2026}'), "no ellipsis: {clamped:?}");
@@ -1219,7 +1279,7 @@ mod tests {
         );
         for text in [rtl_in_ltr, ltr_in_rtl] {
             for max in [1, 3, 32] {
-                let lines = wrap_lines_weighted(&text, px, false, 120., max);
+                let lines = wrap_lines_weighted(&text, px, false, 120., max, true);
                 assert!(!lines.is_empty());
                 assert!(lines.len() <= max.max(1));
             }
@@ -1641,7 +1701,7 @@ mod tests {
     fn a_repeated_wrap_is_cached() {
         let body = "a notification body long enough that it has to wrap onto more than \
                     one line and then be ellipsized when the budget runs out";
-        let first = wrap_lines_weighted(body, 14.0, false, 180., 2);
+        let first = wrap_lines_weighted(body, 14.0, false, 180., 2, true);
         assert_eq!(first.len(), 2, "the body should have filled the budget");
         assert!(
             first.last().is_some_and(|l| l.ends_with('\u{2026}')),
@@ -1649,7 +1709,7 @@ mod tests {
         );
 
         let shapes = crate::stats::shapes();
-        let again = wrap_lines_weighted(body, 14.0, false, 180., 2);
+        let again = wrap_lines_weighted(body, 14.0, false, 180., 2, true);
         assert_eq!(again, first, "the cached wrap differs from the shaped one");
         assert_eq!(
             crate::stats::shapes(),
@@ -1659,7 +1719,7 @@ mod tests {
 
         // The width is part of the key — the same body in a wider column wraps
         // differently, and must not come back from the cache.
-        let wider = wrap_lines_weighted(body, 14.0, false, 360., 2);
+        let wider = wrap_lines_weighted(body, 14.0, false, 360., 2, true);
         assert_ne!(wider, first, "the wrap width is not in the key");
         assert!(
             crate::stats::shapes() > shapes,
@@ -1668,7 +1728,7 @@ mod tests {
 
         // As is the line budget: the same text and width, more room, no ellipsis.
         let shapes = crate::stats::shapes();
-        let taller = wrap_lines_weighted(body, 14.0, false, 180., 6);
+        let taller = wrap_lines_weighted(body, 14.0, false, 180., 6, true);
         assert!(
             taller.len() > first.len(),
             "the line budget is not in the key: {taller:?}"

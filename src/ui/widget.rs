@@ -422,9 +422,22 @@ pub const TILE_LABEL_LINES: usize = 2;
 /// `max_lines` is which of the two states this is: [`TILE_LABEL_LINES`] collapsed,
 /// [`TILE_LABEL_EXPAND_LINES`] expanded — or 1 for a caption that is neither, like a
 /// search result's.
-pub fn tile_label_lines(name: &str, pt: f64, wrap_w: f64, max_lines: usize) -> Vec<String> {
+///
+/// `break_words` is Pango's `WORD_CHAR` vs `WORD`, and it goes with the state: **expanded**
+/// breaks words, because the point of expanding is to show the whole name and a word wider
+/// than the tile has nowhere else to go. **At rest** it must not — a resting caption that
+/// splits "Graphics" into "Graphi/cs" reads as broken, where "Graphic…" reads as a name
+/// that did not fit. (GNOME never faces this: its resting label is one line, so there is
+/// no wrap to choose a mode for.)
+pub fn tile_label_lines(
+    name: &str,
+    pt: f64,
+    wrap_w: f64,
+    max_lines: usize,
+    break_words: bool,
+) -> Vec<String> {
     let px = crate::ui::pt_to_px(pt) as f32;
-    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1))
+    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1), break_words)
 }
 
 /// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
@@ -1922,6 +1935,41 @@ mod tests {
         );
     }
 
+    /// A **resting** caption never splits a word: on a narrow tile (a small canvas shrinks
+    /// the icon, and the caption box with it) "Graphics" must read "Graphic…", not
+    /// "Graphi/cs". Expanding is the opposite — it exists to show the whole name, so there
+    /// a word wider than the tile breaks across lines (Pango `WORD_CHAR`) rather than
+    /// losing characters. Live report, 2026-07-28, on a 1024x665 canvas.
+    #[test]
+    fn a_resting_caption_ellipsizes_a_long_word_instead_of_splitting_it() {
+        let pt = crate::ui::BASE_FONT_PT;
+        // The caption box of a tile whose icon has stepped well down the ladder.
+        let narrow = TileMetrics {
+            icon_px: 32.,
+            ..TileMetrics::OVERVIEW
+        }
+        .label_w();
+
+        let resting = tile_label_lines("Graphics", pt, narrow, TILE_LABEL_LINES, false);
+        assert_eq!(resting.len(), 1, "one word stays on one line: {resting:?}");
+        assert!(
+            resting[0].ends_with('…') && !resting[0].contains(' '),
+            "…ellipsized, not split: {resting:?}"
+        );
+
+        // Two words still wrap at the space — that is the whole point of the second line.
+        let two = tile_label_lines("Image Editors", pt, narrow, TILE_LABEL_LINES, false);
+        assert_eq!(two.len(), 2, "a space is a break point: {two:?}");
+        assert!(!two[0].ends_with('…'), "and needs no ellipsis: {two:?}");
+
+        // Expanded may split it, because there is nowhere else for the characters to go.
+        let expanded = tile_label_lines("Graphics", pt, narrow, TILE_LABEL_EXPAND_LINES, true);
+        assert!(
+            expanded.len() > 1 && !expanded.concat().contains('…'),
+            "expanded breaks the word rather than cutting it: {expanded:?}"
+        );
+    }
+
     /// A name that does not fit is wrapped to [`TILE_LABEL_LINES`] and ellipsized past
     /// them at rest, and wrapped whole (no ellipsis) expanded — `_updateMultiline`,
     /// `appDisplay.js:1891-1924`, with the resting line count our own divergence.
@@ -1932,7 +1980,7 @@ mod tests {
         let w = TileMetrics::OVERVIEW.label_w();
         let pt = crate::ui::BASE_FONT_PT;
 
-        let collapsed = tile_label_lines(name, pt, w, TILE_LABEL_LINES);
+        let collapsed = tile_label_lines(name, pt, w, TILE_LABEL_LINES, false);
         assert_eq!(collapsed.len(), 2, "at rest a long name wraps to two lines");
         assert!(
             !collapsed.concat().contains('…'),
@@ -1944,16 +1992,17 @@ mod tests {
             pt,
             w,
             TILE_LABEL_LINES,
+            false,
         );
         assert_eq!(long.len(), 2);
         assert!(long[1].ends_with('…'), "cut past the last line: {long:?}");
 
         // One line is still one line — what a search result asks for.
-        let one = tile_label_lines(name, pt, w, 1);
+        let one = tile_label_lines(name, pt, w, 1, false);
         assert_eq!(one.len(), 1);
         assert!(one[0].ends_with('…'));
 
-        let expanded = tile_label_lines(name, pt, w, TILE_LABEL_EXPAND_LINES);
+        let expanded = tile_label_lines(name, pt, w, TILE_LABEL_EXPAND_LINES, true);
         assert!(expanded.len() > 1, "expanded wraps: {expanded:?}");
         assert!(!expanded.concat().contains('…'), "and drops the ellipsis");
         assert_eq!(
@@ -1964,11 +2013,11 @@ mod tests {
 
         // A name that fits is untouched in both states — it stays in the page bake.
         assert_eq!(
-            tile_label_lines("Files", pt, w, TILE_LABEL_LINES),
+            tile_label_lines("Files", pt, w, TILE_LABEL_LINES, false),
             vec!["Files"]
         );
         assert_eq!(
-            tile_label_lines("Files", pt, w, TILE_LABEL_EXPAND_LINES),
+            tile_label_lines("Files", pt, w, TILE_LABEL_EXPAND_LINES, true),
             vec!["Files"]
         );
     }

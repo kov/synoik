@@ -2208,7 +2208,15 @@ impl AppGrid {
         let focused_at = self.focused.filter(|i| page_range.contains(i));
         let collapsed: Vec<Vec<String>> = page_entries
             .iter()
-            .map(|e| widget::tile_label_lines(&e.name, LABEL_PT, label_w, widget::TILE_LABEL_LINES))
+            .map(|e| {
+                widget::tile_label_lines(
+                    &e.name,
+                    LABEL_PT,
+                    label_w,
+                    widget::TILE_LABEL_LINES,
+                    false,
+                )
+            })
             .collect();
         // Hover-independent by construction: whether a name fits is a property of the
         // name and the label box, so the page bake's contents still never move on hover.
@@ -2257,6 +2265,7 @@ impl AppGrid {
                     LABEL_PT,
                     label_w,
                     widget::TILE_LABEL_EXPAND_LINES,
+                    true,
                 )
             } else {
                 collapsed[k].clone()
@@ -2889,6 +2898,7 @@ impl AppGrid {
                             LABEL_PT,
                             label_w,
                             widget::TILE_LABEL_LINES,
+                            false,
                         )
                     })
                     .collect();
