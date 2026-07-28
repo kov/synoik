@@ -125,6 +125,12 @@ pub mod style {
     /// the dash and the `.search-section-content` results card. Same value the dash
     /// bakes as its pill (kept in sync via this one constant).
     pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
+    /// A `.button` / `.icon-button` sitting **on** [`OVERLAY_BG`] — `button(normal)`'s
+    /// `st-mix($system_fg_color, $system_overlay_bg_color, 9%)` (`_drawing.scss:171`,
+    /// `$background_mix_factor` 9%), i.e. 9% of #fafafb over the overlay surface ≈ `#49494d`.
+    /// NOT the surface itself: `$c` is the background the button sits on, not its fill, and
+    /// using it directly makes the button invisible against its own container.
+    pub const OVERLAY_BUTTON_BG: Rgba = [0.287, 0.287, 0.301, 1.];
 
     /// `.app-folder` fill — the one tile in the grid that is **raised** rather than
     /// flat: `tile_button($bg:$system_base_color, $raised:true)` (`_app-grid.scss:41`)

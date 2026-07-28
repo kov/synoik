@@ -1079,7 +1079,7 @@ impl FolderDialog {
             move |frame, phys, _: &()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(size.h / 2., style::OVERLAY_BG)?;
+                p.fill_rounded_full(size.h / 2., style::OVERLAY_BUTTON_BG)?;
                 if washed {
                     p.fill_rounded_full(size.h / 2., style::HOVER_WASH)?;
                 }
@@ -1155,47 +1155,8 @@ impl FolderDialog {
             accent,
         );
 
-        // The panel itself: the rounded overlay surface and its inset hairline border.
-        let panel_size = l.panel.size;
-        let revision = widget::Revision::new()
-            .px(panel_size.w)
-            .px(panel_size.h)
-            .done();
-        match widget::bake(
-            renderer,
-            &mut self.cache.borrow_mut().panel,
-            scale,
-            panel_size,
-            revision,
-            |_| Ok(()),
-            move |frame, phys, _: &()| {
-                let mut p = Painter::new(frame, scale, phys);
-                p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(RADIUS, style::OVERLAY_BG)?;
-                p.stroke_rounded_full(RADIUS, BORDER_W, style::BORDERS)?;
-                Ok(())
-            },
-        ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
-                content.push(TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    l.panel.loc,
-                    alpha,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ));
-            }
-            Err(err) => tracing::error!("error baking the folder dialog: {err:#}"),
-        }
-
+        // The name row, the entry and the edit button — pushed **before** the panel, which
+        // is what puts them above it: the first element pushed is the topmost.
         // The name: label and entry stacked in the same band, cross-fading. The fade is on
         // the *elements* — putting a per-frame alpha in either bake would re-shape the text
         // every frame of the 300 ms.
@@ -1250,6 +1211,47 @@ impl FolderDialog {
             self.render_name_entry(renderer, scale, &l, alpha * fade, accent, &mut content);
         }
         self.render_edit_button(renderer, sym_icons, scale, &l, alpha, accent, &mut content);
+
+        // The panel itself: the rounded overlay surface and its inset hairline border.
+        let panel_size = l.panel.size;
+        let revision = widget::Revision::new()
+            .px(panel_size.w)
+            .px(panel_size.h)
+            .done();
+        match widget::bake(
+            renderer,
+            &mut self.cache.borrow_mut().panel,
+            scale,
+            panel_size,
+            revision,
+            |_| Ok(()),
+            move |frame, phys, _: &()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(RADIUS, style::OVERLAY_BG)?;
+                p.stroke_rounded_full(RADIUS, BORDER_W, style::BORDERS)?;
+                Ok(())
+            },
+        ) {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    vec![],
+                );
+                content.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    l.panel.loc,
+                    alpha,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => tracing::error!("error baking the folder dialog: {err:#}"),
+        }
 
         // --- The zoom ([`Zoom`]; `_zoomAndFadeIn`/`_zoomAndFadeOut`, `appDisplay.js:2660-2746`).
         //

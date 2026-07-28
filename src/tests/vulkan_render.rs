@@ -8992,6 +8992,47 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
             );
         }
     }
+
+    // The name row sits ON the panel, not under it. Both the label and the edit button are
+    // their own elements now (they cross-fade / take hover), and the first element pushed is
+    // the *topmost* — so pushing them after the panel buries them, which is invisible to
+    // every geometry test and is exactly what happened.
+    let label = px(
+        &pixels,
+        w,
+        (l.name_band.loc.x + l.name_band.size.w / 2.) as i32,
+        (l.name_band.loc.y + l.name_band.size.h / 2.) as i32,
+    );
+    eprintln!("vulkan_folder_dialog: name={label:?}");
+    assert!(
+        label[0] > 150 && label[1] > 150 && label[2] > 150,
+        "the folder name draws over the panel in $system_fg_color: {label:?}"
+    );
+
+    // The edit button's disc is `button(normal)` *over* the overlay surface — a distinctly
+    // lighter fill. Sampled off-center so the pencil glyph does not decide the result.
+    let disc = px(
+        &pixels,
+        w,
+        (l.edit_button.loc.x + 6.) as i32,
+        (l.edit_button.loc.y + l.edit_button.size.h / 2.) as i32,
+    );
+    eprintln!("vulkan_folder_dialog: edit disc={disc:?}");
+    for ch in 0..3 {
+        let want = (crate::ui::widget::style::OVERLAY_BUTTON_BG[ch] * 255.).round() as i32;
+        assert!(
+            (disc[ch] as i32 - want).abs() <= 6,
+            "the edit button is `st-mix($system_fg_color, $system_overlay_bg_color, 9%)`, \
+             NOT the panel it sits on: got {disc:?}, want channel {ch} ≈ {want}"
+        );
+    }
+    assert!(
+        disc.iter()
+            .take(3)
+            .zip(inside.iter())
+            .any(|(a, b)| a.abs_diff(*b) > 10),
+        "…and so it is visible against the panel: disc={disc:?}, panel={inside:?}"
+    );
 }
 
 /// Mid-close, the dialog really is drawn shrunk toward its source tile: a point inside the
