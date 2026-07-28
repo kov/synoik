@@ -169,3 +169,91 @@ impl<R: Renderer> RenderElement<R> for SolidColorRenderElement {
         None
     }
 }
+
+/// A rescaled edge must land where the arithmetic puts it.
+///
+/// The overview's window previews are drawn through smithay's `RescaleRenderElement`
+/// (`workspace.rs` `render_expose`), which animates *both* the scale and the origin it scales
+/// about. `Rectangle::to_i32_round` rounds a rect's location and size **independently**, so the
+/// far edge came out as `origin + round((loc−origin)·z) + round(size·z)` — two roundings whose
+/// errors add, landing up to a pixel away from the real edge and flipping between frames as the
+/// animation's per-frame change goes sub-pixel. Measured on 2026-07-28 at output scale 2.25: a
+/// preview's bottom edge read 602, 602, 601, 602, 602, 601 over consecutive frames while the
+/// workspace behind it did not move at all — the shimmering bottom edge Gustavo reported.
+///
+/// Our smithay fork rounds the extremities, which is exactly "the edge lands at `round(edge)`".
+/// That is what this pins; it fails on the independent rounding.
+#[cfg(test)]
+mod rescale_tests {
+    use smithay::backend::renderer::element::utils::RescaleRenderElement;
+    use smithay::backend::renderer::element::{Element, Kind};
+
+    use super::*;
+
+    #[test]
+    fn a_rescaled_edge_lands_where_the_arithmetic_puts_it() {
+        // A window-ish box, at the fractional scale the live session runs at.
+        let logical = Rectangle::new(Point::from((100., 137.)), Size::from((640., 400.)));
+        let scale = Scale::from(2.25);
+        let physical = SolidColorRenderElement::new(
+            Id::new(),
+            logical,
+            CommitCounter::default(),
+            Color32F::from([1., 0., 0., 1.]),
+            Kind::Unspecified,
+        )
+        .geometry(scale)
+        .to_f64();
+
+        // Sweep the shape of an expose animation: the tile shrinks toward its slot while the
+        // origin it scales about travels there too. Neither alone reproduces this — with a fixed
+        // origin both roundings grow together and the error cancels.
+        for step in 0..=600 {
+            let progress = f64::from(step) / 600.;
+            let zoom = 1. - 0.45 * progress;
+            let origin = Point::<i32, crate::render_helpers::Physical>::from((
+                (60. + 500. * progress).round() as i32,
+                (40. + 430. * progress).round() as i32,
+            ));
+
+            let rescaled = RescaleRenderElement::from_element(
+                SolidColorRenderElement::new(
+                    Id::new(),
+                    logical,
+                    CommitCounter::default(),
+                    Color32F::from([1., 0., 0., 1.]),
+                    Kind::Unspecified,
+                ),
+                origin,
+                zoom,
+            );
+            let geo = rescaled.geometry(scale);
+
+            for (axis, got, o, loc, size) in [
+                (
+                    "x",
+                    geo.loc.x + geo.size.w,
+                    f64::from(origin.x),
+                    physical.loc.x,
+                    physical.size.w,
+                ),
+                (
+                    "y",
+                    geo.loc.y + geo.size.h,
+                    f64::from(origin.y),
+                    physical.loc.y,
+                    physical.size.h,
+                ),
+            ] {
+                let exact = o + (loc - o) * zoom + size * zoom;
+                assert_eq!(
+                    f64::from(got),
+                    exact.round(),
+                    "{axis} far edge at zoom {zoom}, origin {o}: rounding the location and the \
+                     size apart puts the edge {} off",
+                    f64::from(got) - exact.round(),
+                );
+            }
+        }
+    }
+}
