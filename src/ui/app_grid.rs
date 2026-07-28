@@ -86,9 +86,9 @@ const GRID_MODES: [(usize, usize); 4] = [(3, 8), (4, 6), (6, 4), (8, 3)];
 /// The icon-size ladder, largest first (`IconSize`, `iconGrid.js:16-23`); the grid
 /// shrinks the icon to the largest size whose page fits (`_findBestIconSize`).
 const ICON_SIZES: [f64; 6] = [96., 64., 48., 32., 24., 16.];
-/// A labelled `.overview-tile` is `icon + 48` tall (padding 12, icon, gap 6, label
-/// 18, padding 12) and `icon + 24` wide; the grid lays it in a square cell of the
-/// taller side (`iconGrid.js` `_getChildrenMaxSize` = `max(w, h)`), centered within.
+/// A labelled `.overview-tile` is `icon + 48` **square** (padding 12, icon, gap 6,
+/// label 18, padding 12 — see [`TileMetrics::size`]), so the square cell the grid lays
+/// it in (`iconGrid.js` `_getChildrenMaxSize` = `max(w, h)`) is exactly the tile.
 const TILE_EXTRA_H: f64 = 48.;
 
 // Page indicator dots (`_app-grid.scss:119-131`): 10px circles, `$system_fg_color`,
@@ -387,7 +387,7 @@ impl AppGrid {
             ..TileMetrics::OVERVIEW
         };
         let tile = metrics.size();
-        let cell = tile.h; // square cell = the taller (label) side
+        let cell = tile.h; // the tile is square, so the `max(w, h)` cell is the tile
 
         let per_page = cols * rows;
         let n_pages = n.div_ceil(per_page);
@@ -1082,8 +1082,8 @@ mod tests {
         // First eight tiles share row 0; the ninth starts row 1 → 8 columns.
         assert!((0..8).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
         assert!(l.tiles[8].loc.y > l.tiles[0].loc.y);
-        // 96px icon → 120-wide tile; a single page shows no dots.
-        assert_eq!(l.tiles[0].size.w, 120.);
+        // 96px icon → a 144 square tile, filling its square cell; one page, no dots.
+        assert_eq!(l.tiles[0].size, Size::from((144., 144.)));
         assert!(l.indicators.is_none());
     }
 

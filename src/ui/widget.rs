@@ -292,22 +292,21 @@ impl TileMetrics {
         radius: AppIcon::OVERVIEW_TILE_RADIUS,
     };
 
-    /// The tile's outer size: pad+icon+pad wide, pad+icon+gap+label+pad tall.
+    /// The tile's outer size — **square**: [`Self::label_w`] plus padding on each side.
+    ///
+    /// A tile is `.overview-tile` padding around a `BaseIcon`, and a `BaseIcon` is a
+    /// `Shell.SquareBin` (`iconGrid.js:62`) whose preferred *width* is its preferred
+    /// *height* (`shell-square-bin.c:14-30`). So the width follows the content height —
+    /// icon + spacing + one caption line — and not, as this used to say, the icon alone.
+    /// At GNOME's metrics that is 144, not 120: the tile was 24 px too narrow, which
+    /// showed as a hover wash narrower than GNOME's.
     pub fn size(&self) -> Size<f64, Logical> {
-        Size::from((
-            self.pad + self.icon_px + self.pad,
-            self.pad + self.icon_px + self.label_gap + self.label_h + self.pad,
-        ))
+        let side = self.pad + self.label_w() + self.pad;
+        Size::from((side, side))
     }
 
-    /// The width the caption is laid out in.
-    ///
-    /// GNOME's caption is a child of `BaseIcon`, a `Shell.SquareBin` whose preferred
-    /// *width* is its preferred *height* (`shell-square-bin.c:14-30`,
-    /// `iconGrid.js:62,89-94`) — so the label box is as wide as icon + spacing + one
-    /// caption line is tall, not as wide as whatever the caller drew the tile at.
-    /// (With GNOME's `$base_padding` metrics that happens to equal [`Self::size`]'s
-    /// width, since `pad*2` and `label_gap + label_h` are both 24; pinned below.)
+    /// The width the caption is laid out in: the `Shell.SquareBin` box, i.e. the tile
+    /// minus its padding (see [`Self::size`] for why that box is square).
     pub fn label_w(&self) -> f64 {
         self.icon_px + self.label_gap + self.label_h
     }
@@ -1764,16 +1763,18 @@ mod tests {
     use super::{bake_uncached_sized, tile_label_lines, Painter, Revision, TileMetrics};
     use crate::render_helpers::vulkan::VulkanRenderer;
 
-    /// GNOME lays a tile caption out in the `Shell.SquareBin` box, not the tile box —
-    /// two different derivations that happen to agree at GNOME's `$base_padding`
-    /// metrics (`pad*2` = 24 = `label_gap + label_h`). Pinned so a change to either
-    /// side of that coincidence shows up here instead of silently moving where every
-    /// app name ellipsizes.
+    /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so it is square
+    /// and its width follows the *content height* — icon + spacing + one caption line
+    /// (`shell-square-bin.c:14-30`, `iconGrid.js:62`). Deriving it from the icon alone
+    /// made it 120 wide against GNOME's 144. Pinned in numbers because the whole grid
+    /// and the search results card size off it.
     #[test]
-    fn a_tile_caption_is_laid_out_in_the_square_bin_box() {
+    fn an_overview_tile_is_a_square_around_its_caption_box() {
         let m = TileMetrics::OVERVIEW;
         assert_eq!(m.label_w(), m.icon_px + m.label_gap + m.label_h);
-        assert_eq!(m.label_w(), m.size().w);
+        assert_eq!(m.label_w(), 120.);
+        assert_eq!(m.size(), Size::from((144., 144.)));
+        assert_eq!(m.size().w, m.label_w() + 2. * m.pad);
     }
 
     /// A name that does not fit is ellipsized on one line collapsed, and wrapped
