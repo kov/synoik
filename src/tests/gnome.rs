@@ -8610,3 +8610,70 @@ fn overview_app_grid_swipes_between_pages() {
     assert_eq!(f.niri().app_grid.page_pos(), 0.);
     assert_eq!(f.niri().app_grid.current_page(), 0);
 }
+
+/// Dragging the app grid's background with the mouse pages it. gnome-shell's swipe
+/// tracker attaches a `Clutter.PanGesture` with `min_n_points: 1` and `allowDrag` on by
+/// default (`swipeTracker.js:367-404`), so a plain click-drag pans the same adjustment a
+/// touchpad swipe does — which on a machine with no touchpad is the *only* way to swipe.
+/// The pages follow the pointer, so the travel is the negation of it
+/// (`_getGestureDirFactor` is -1 for LTR, `swipeTracker.js:689-695`).
+#[test]
+fn overview_app_grid_pages_by_dragging_its_background() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, recorder) = app_grid_fixture(&[], &others);
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(f.niri().app_grid.page_count(area), 2);
+
+    // Grab the band well below the tiles — the background, not an icon: a press on an
+    // icon belongs to that icon's own drag.
+    let start_x = area.loc.x + area.size.w / 2.;
+    let start_y = area.loc.y + area.size.h - 6.;
+    assert!(
+        f.niri()
+            .app_grid
+            .hit_test((start_x, start_y).into(), area)
+            .is_none(),
+        "the grab point must not be on a tile"
+    );
+
+    // Drag left by 240 px: the pages follow, 240 of the 400 that make a page.
+    pointer_motion_to(&mut f, start_x, start_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    for i in 1..=6 {
+        f.advance_input_time(50);
+        pointer_motion_to(&mut f, start_x - 40. * f64::from(i), start_y);
+    }
+    let dragged = f.niri().app_grid.page_pos();
+    assert!(
+        (dragged - 0.6).abs() < 0.01,
+        "the pages follow the pointer 1:1, and *towards* the next page when dragged \
+         left, got {dragged}"
+    );
+
+    // Released past halfway, it settles on the next page.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+    assert_eq!(f.niri().app_grid.current_page(), 1);
+    assert_eq!(f.niri().app_grid.page_pos(), 1.);
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a drag on the background launches nothing"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "…and does not dismiss the grid"
+    );
+
+    // A press that never moves is just a click on the background: nothing happens.
+    pointer_motion_to(&mut f, start_x, start_y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "a click on the background does not page"
+    );
+    assert!(f.niri().layout.is_app_grid_open());
+}

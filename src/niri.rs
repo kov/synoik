@@ -284,6 +284,16 @@ pub struct AppDrag {
     pub unpin: bool,
 }
 
+/// A press on the app-grid background that may turn into a page drag.
+#[derive(Debug)]
+pub struct AppGridPan {
+    pub button: u32,
+    pub output: Output,
+    pub origin: Point<f64, Logical>,
+    pub last: Point<f64, Logical>,
+    pub dragging: bool,
+}
+
 /// An app launched onto a particular workspace, waiting for its window. See
 /// [`Niri::expect_launch_on_workspace`].
 #[derive(Debug)]
@@ -548,6 +558,13 @@ pub struct Niri {
     /// the release and only if it lands on the same widget, so the press records
     /// the target here and the release consumes it.
     pub overview_pressed: Option<(u32, OverviewHit, Point<f64, Logical>)>,
+    /// A press on the app grid's background, which may become a page drag: the button,
+    /// the output, where it started and where it last was. `SwipeTracker` attaches a
+    /// `Clutter.PanGesture` with `min_n_points: 1` to the grid's scroll view and
+    /// `allowDrag` defaults to true (`swipeTracker.js:367-404`), so an ordinary
+    /// click-drag pages the grid — the only route there is on a machine with no
+    /// touchpad. `dragging` is false until the press clears the drag threshold.
+    pub app_grid_pan: Option<AppGridPan>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -3855,6 +3872,7 @@ impl Niri {
             overlay_key_last_fired: None,
             suppressed_buttons: HashSet::new(),
             overview_pressed: None,
+            app_grid_pan: None,
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,
@@ -9190,6 +9208,7 @@ impl Niri {
             self.folder_dialog.hide();
             // A swipe cannot outlive the grid it was dragging.
             self.app_grid_scroll_swipe.reset();
+            self.app_grid_pan = None;
             // A grid that is not on screen holds no key focus — a re-opened grid starts
             // over from its first page (`goToPage(0)`, `appDisplay.js:1342`) with nothing
             // lit, exactly as a fresh `AppDisplay` does.

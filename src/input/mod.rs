@@ -55,8 +55,8 @@ use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
-    DragLocation, FocusDir, PageArrow, DELAYED_MOVE_MS, EDGE_BUMP_PX, PAGE_SWITCH_INITIAL_MS,
-    PAGE_SWITCH_REPEAT_MS,
+    DragLocation, FocusDir, PageArrow, SwipeSource, DELAYED_MOVE_MS, EDGE_BUMP_PX,
+    PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
 };
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
@@ -3725,6 +3725,38 @@ impl State {
             return;
         }
 
+        // A page drag on the grid background, once it has cleared the threshold. The
+        // pages follow the pointer, so the travel is the *negation* of it —
+        // `_getGestureDirFactor` is -1 for LTR (`swipeTracker.js:689-695`), which is the
+        // opposite sign to the scroll path.
+        if let Some(pan) = &mut self.niri.app_grid_pan {
+            if pan.output == output {
+                let dx = pos_within_output.x - pan.last.x;
+                pan.last = pos_within_output;
+                if !pan.dragging
+                    && ((pos_within_output.x - pan.origin.x).abs() > DRAG_THRESHOLD
+                        || (pos_within_output.y - pan.origin.y).abs() > DRAG_THRESHOLD)
+                {
+                    pan.dragging = true;
+                    self.niri.app_grid.gesture_begin(SwipeSource::Pointer);
+                }
+                if self.niri.app_grid_pan.as_ref().is_some_and(|p| p.dragging) {
+                    let area = self
+                        .niri
+                        .layout
+                        .controls_layout_for_output(&output)
+                        .map(|c| c.app_display);
+                    if let Some(area) = area {
+                        let now = self.niri.clock.now_unadjusted();
+                        if self.niri.app_grid.gesture_update(-dx, now, area) {
+                            self.niri.queue_redraw_all();
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         let Some((_, hit, origin)) = &self.niri.overview_pressed else {
             return;
         };
@@ -4578,6 +4610,29 @@ impl State {
         // the widget it was pressed on (`clutter-click-gesture.c:68-81`) — lift off
         // it (or drag away) and nothing is activated. Runs before the suppression
         // check below, which is what keeps the release from reaching clients.
+        // Releasing a grid page drag settles it on a page; a press that never moved is
+        // simply dropped (a click on the grid background does nothing, as in GNOME).
+        if button_state == ButtonState::Released {
+            if let Some(pan) = self.niri.app_grid_pan.take() {
+                if pan.button == button_code {
+                    self.niri.suppressed_buttons.remove(&button_code);
+                    if pan.dragging {
+                        let area = self
+                            .niri
+                            .layout
+                            .controls_layout_for_output(&pan.output)
+                            .map(|c| c.app_display);
+                        if let Some(area) = area {
+                            self.niri.app_grid.gesture_end(area);
+                        }
+                    }
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+                self.niri.app_grid_pan = Some(pan);
+            }
+        }
+
         if button_state == ButtonState::Released {
             if let Some((code, hit, origin)) = self.niri.overview_pressed.take() {
                 if code == button_code {
@@ -4752,6 +4807,36 @@ impl State {
                     self.niri.overview_pressed = Some((button_code, hit, origin));
                     self.niri.queue_redraw_all();
                     return;
+                }
+
+                // A press on the app grid's *background* — no tile, dot or arrow under it
+                // — may become a page drag. gnome-shell's swipe tracker puts a
+                // single-point `Clutter.PanGesture` on the grid's scroll view
+                // (`swipeTracker.js:383-404`), and a press that lands on an icon is taken
+                // by the icon's own DND instead, which is the case handled above.
+                if button == Some(MouseButton::Left)
+                    && self.niri.layout.is_app_grid_open()
+                    && !self.niri.overview_search.is_active()
+                    && !self.niri.folder_dialog.is_open()
+                {
+                    let over_grid = under.as_ref().and_then(|(output, pos)| {
+                        let controls = self.niri.layout.controls_layout_for_output(output)?;
+                        controls
+                            .app_display
+                            .contains(*pos)
+                            .then(|| (output.clone(), *pos))
+                    });
+                    if let Some((output, pos)) = over_grid {
+                        self.niri.suppressed_buttons.insert(button_code);
+                        self.niri.app_grid_pan = Some(crate::niri::AppGridPan {
+                            button: button_code,
+                            output,
+                            origin: pos,
+                            last: pos,
+                            dragging: false,
+                        });
+                        return;
+                    }
                 }
 
                 // A left-click on a panel button: the workspace indicator toggles the overview
@@ -5293,7 +5378,7 @@ impl State {
                                 redraw |= self.niri.app_grid.gesture_end(area);
                             } else {
                                 if action.begin() {
-                                    self.niri.app_grid.gesture_begin();
+                                    self.niri.app_grid.gesture_begin(SwipeSource::Touchpad);
                                 }
                                 redraw |= self.niri.app_grid.gesture_update(
                                     dx * crate::ui::app_grid::SWIPE_SCROLL_MULTIPLIER,

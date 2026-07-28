@@ -194,11 +194,26 @@ const SWIPE_PAGE_PX: f64 = 400.;
 /// `SCROLL_MULTIPLIER` (`swipeTracker.js:18`) — a two-finger scroll delta is scaled up
 /// before it counts as gesture travel.
 pub const SWIPE_SCROLL_MULTIPLIER: f64 = 10.;
-/// `VELOCITY_THRESHOLD_TOUCHPAD` (`swipeTracker.js:23`) — in **pixels** per millisecond,
-/// not pages: the velocity history holds raw deltas (`:597,676`) and the threshold is
-/// compared against them before the normalization at `:644`. Below it a release is a slow
-/// drag and simply falls to whichever page is nearest.
-const SWIPE_VELOCITY_THRESHOLD: f64 = 0.6;
+/// `VELOCITY_THRESHOLD_TOUCHPAD` / `VELOCITY_THRESHOLD_TOUCH` (`swipeTracker.js:22-23`) —
+/// in **pixels** per millisecond, not pages: the velocity history holds raw deltas
+/// (`:597,676`) and the threshold is compared against them before the normalization at
+/// `:644`. Below it a release is a slow drag and simply falls to whichever page is
+/// nearest. A pointer or touch drag gets the lower bar, because it is real travel rather
+/// than a scroll delta scaled by [`SWIPE_SCROLL_MULTIPLIER`].
+const SWIPE_VELOCITY_THRESHOLD_TOUCHPAD: f64 = 0.6;
+const SWIPE_VELOCITY_THRESHOLD_TOUCH: f64 = 0.3;
+
+/// Where a live page swipe is coming from — `SwipeTracker` runs a `TouchpadSwipeGesture`
+/// and a `Clutter.PanGesture` side by side over the same state (`swipeTracker.js:383-404`),
+/// and the two differ in how a release is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwipeSource {
+    /// Two-finger scrolling: deltas are scaled by [`SWIPE_SCROLL_MULTIPLIER`].
+    Touchpad,
+    /// A pointer (or touch) drag: 1:1 with real travel, and `allowDrag` defaults to true
+    /// with `min_n_points: 1`, which is what makes a plain click-drag page the grid.
+    Pointer,
+}
 /// `MIN_ANIMATION_DURATION` / `MAX_ANIMATION_DURATION` (`swipeTracker.js:20-21`). The max
 /// is `400 * log2(1 + nPoints)` and a swipe can only ever cross one page here, so it is
 /// exactly 400.
@@ -397,6 +412,7 @@ pub struct AppGrid {
     gesture_from: f64,
     /// Velocity history for the release projection (`swipeTracker.js:601-631`).
     swipe: crate::input::swipe_tracker::SwipeTracker,
+    swipe_source: SwipeSource,
     /// Bumped on any change that affects the bake (entries/hover/page).
     content_rev: u64,
     /// The order as it was when a drag started, so an unsuccessful drop can put it
@@ -520,6 +536,7 @@ impl AppGrid {
             gesture: None,
             gesture_from: 0.,
             swipe: crate::input::swipe_tracker::SwipeTracker::new(),
+            swipe_source: SwipeSource::Touchpad,
             content_rev: 0,
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
@@ -859,11 +876,17 @@ impl AppGrid {
 
     /// Begin a 1:1 page swipe (`_swipeBegin`, `appDisplay.js:706-719`): the running
     /// slide is dropped and the view follows the finger from wherever it had got to.
-    pub fn gesture_begin(&mut self) {
+    pub fn gesture_begin(&mut self, source: SwipeSource) {
         let from = self.page_pos();
         self.gesture = Some(from);
         self.gesture_from = from;
         self.swipe = crate::input::swipe_tracker::SwipeTracker::new();
+        self.swipe_source = source;
+    }
+
+    /// Whether a swipe is currently holding the view.
+    pub fn gesture_is_active(&self) -> bool {
+        self.gesture.is_some()
     }
 
     /// Move a live swipe by `delta_px` of horizontal travel (`_swipeUpdate`,
@@ -908,7 +931,11 @@ impl AppGrid {
         let velocity = self.swipe.velocity() / 1000.;
         let initial = self.gesture_from.round();
 
-        let target = if velocity.abs() < SWIPE_VELOCITY_THRESHOLD {
+        let threshold = match self.swipe_source {
+            SwipeSource::Touchpad => SWIPE_VELOCITY_THRESHOLD_TOUCHPAD,
+            SwipeSource::Pointer => SWIPE_VELOCITY_THRESHOLD_TOUCH,
+        };
+        let target = if velocity.abs() < threshold {
             // A slow drag just falls to the nearest page (`_getEndProgress`, first branch).
             pos.round()
         } else if velocity > 0. {
@@ -2300,7 +2327,10 @@ impl AppGrid {
                 &mut cache.dots_bake,
                 scale,
                 dots_box.size,
-                self.content_rev,
+                // The *active* page has to be in here. It used to ride `content_rev`,
+                // which bumped on every page change; per-page bakes took that bump away
+                // and left the strip frozen with the first dot lit.
+                widget::Revision::new().of(self.content_rev).of(page).done(),
                 |_| Ok(()),
                 move |frame, phys, _: &()| {
                     let mut p = Painter::new(frame, scale, phys);

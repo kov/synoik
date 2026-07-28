@@ -9476,3 +9476,108 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
         "…with nothing still hanging off to the right ({end_hi} vs {rest_hi})"
     );
 }
+
+/// The page-indicator dots follow the page. The active dot is the full 10 px at full
+/// opacity and the others shrink to 2/3 at half (`pageIndicators.js`), so "which dot is
+/// lit" is a pixel question — and the strip is one cached bake, which is exactly how it
+/// came to be frozen on the first dot when the page stopped bumping the bake revision.
+#[test]
+fn vulkan_app_grid_dots_follow_the_page() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_dots_follow_the_page: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let entries: Vec<AppGridEntry> = (0..30)
+        .map(|i| AppGridEntry {
+            id: format!("o{i:02}.desktop"),
+            name: format!("O{i:02}"),
+            icon: AppIconRef::Fallback,
+            folder: None,
+        })
+        .collect();
+    f.niri().app_grid.set_entries(entries);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    assert_eq!(f.niri().app_grid.page_count(area), 2);
+    let dots: Vec<_> = (0..2)
+        .map(|p| {
+            f.niri()
+                .app_grid
+                .indicator_center(p, area)
+                .expect("both dots are laid out")
+        })
+        .collect();
+
+    let shoot =
+        |f: &mut Fixture| -> (Vec<u8>, i32) {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                        crate::gnome::ACCENT_BLUE,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            composited
+                .expect("no Vulkan device")
+                .expect("compositing the grid must not error")
+        };
+
+    // Which dot is the bright one, by alpha at its own center.
+    let lit = |f: &mut Fixture| -> Vec<u8> {
+        let (pixels, w) = shoot(f);
+        dots.iter()
+            .map(|c| px(&pixels, w, c.x.round() as i32, c.y.round() as i32)[3])
+            .collect()
+    };
+
+    let on_first = lit(&mut f);
+    eprintln!("vulkan_app_grid_dots: page 0 -> {on_first:?}");
+    assert!(
+        on_first[0] > on_first[1] + 40,
+        "the first dot is the lit one on page 0: {on_first:?}"
+    );
+
+    assert!(f.niri().app_grid.set_page(1, area));
+    f.settle_animations();
+    let on_second = lit(&mut f);
+    eprintln!("vulkan_app_grid_dots: page 1 -> {on_second:?}");
+    assert!(
+        on_second[1] > on_second[0] + 40,
+        "…and the second one on page 1 — a strip still showing the first dot lit is the \
+         cached bake, not the layout: {on_second:?}"
+    );
+}

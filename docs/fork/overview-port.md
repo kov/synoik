@@ -1051,6 +1051,13 @@ right: after the first visit a page switch re-bakes nothing.
   per page, and the release projects to a snap point and eases there. Reuses the existing
   `ScrollSwipeGesture` (begin/update/end from axis events) and `SwipeTracker`
   (velocity + `projected_end_pos`), the same pair the overview's own scroll swipe uses.
+  A **pointer drag** on the grid background pans it too: the tracker's `Clutter.PanGesture`
+  takes `min_n_points: 1` and `allowDrag` defaults to true (`swipeTracker.js:367-404`), so
+  a plain click-drag is a swipe — the only route to one on a machine with no touchpad.
+  It is 1:1 with real travel (no `SCROLL_MULTIPLIER`), judged on release against the lower
+  `VELOCITY_THRESHOLD_TOUCH` 0.3, and its sign is *inverted* relative to the scroll path:
+  `_getGestureDirFactor` is -1 for LTR (`:689-695`), because the pages follow the pointer.
+  A press that lands on an icon belongs to that icon's own DND instead.
 
 **A unit trap worth recording**, found by the test failing: GNOME's velocity history holds
 **raw pixel deltas** (`swipeTracker.js:597,676`), and `_getEndProgress` compares them
