@@ -265,6 +265,12 @@ pub struct AppDrag {
     pub id: String,
     /// Its icon — the drag actor.
     pub icon: AppIconRef,
+    /// When the dragged item is a *folder*, the member icons its tile composes (up to
+    /// four). GNOME's `FolderIcon.getDragActor` builds a `BaseIcon` with the folder's own
+    /// `_createIcon` and its `overview-tile app-folder` style class
+    /// (`appDisplay.js:2286,2368-2379`), so the drag actor is the composed 2x2 over the
+    /// raised folder background — not any one member's icon.
+    pub folder: Option<Vec<AppIconRef>>,
     /// Output the pointer is on.
     pub output: Output,
     /// Pointer position within that output.
@@ -635,6 +641,9 @@ pub struct Niri {
     pub app_menu_source: Option<crate::input::OverviewHit>,
     /// GPU uploads for the dragged icon.
     pub app_drag_uploads: RefCell<AppIconUploads>,
+    /// The raised fill under a dragged *folder*'s composed icon. Held rather than rebuilt
+    /// per frame so the element keeps its identity as the drag moves.
+    app_drag_bg: RefCell<crate::render_helpers::rounded_solid::RoundedSolidBuffer>,
     /// The grid slot a drag is hovering, waiting out `DELAYED_MOVE_MS` before the grid
     /// reflows around it (`_delayedMoveData`, `appDisplay.js:768-825`), with the page
     /// size the target was resolved against.
@@ -3905,6 +3914,9 @@ impl Niri {
             app_drag: None,
             app_menu_source: None,
             app_drag_uploads: RefCell::new(AppIconUploads::default()),
+            app_drag_bg: RefCell::new(
+                crate::render_helpers::rounded_solid::RoundedSolidBuffer::new(),
+            ),
             grid_pending_move: None,
             grid_move_timer: None,
             grid_page_switch_timer: None,
@@ -5845,19 +5857,67 @@ impl Niri {
         // gnome-shell's DND actor in `Main.uiGroup` (`dnd.js:213-216`).
         if let Some(drag) = &self.app_drag {
             if drag.output == *output {
+                let scale = output.current_scale().fractional_scale();
                 let center = drag.pos + drag.grab_offset;
-                if let Some(element) = crate::ui::widget::app_icon_element(
-                    ctx.renderer,
-                    &mut self.app_drag_uploads.borrow_mut(),
-                    &self.app_icon_cache,
-                    &drag.icon,
-                    APP_DRAG_ICON_PX,
-                    output.current_scale().fractional_scale(),
-                    Point::from((0., 0.)),
-                    center,
-                    1.,
-                ) {
-                    push(element.into());
+                let mut uploads = self.app_drag_uploads.borrow_mut();
+                let mut icon_at = |icon: &AppIconRef, px: f64, at: Point<f64, Logical>| {
+                    crate::ui::widget::app_icon_element(
+                        ctx.renderer,
+                        &mut uploads,
+                        &self.app_icon_cache,
+                        icon,
+                        px,
+                        scale,
+                        Point::from((0., 0.)),
+                        at,
+                        1.,
+                    )
+                };
+                match &drag.folder {
+                    // A folder drags as its whole tile: the 2×2 composition over the
+                    // raised `.app-folder` fill, laid out by the same `TileMetrics` the
+                    // grid uses so the proxy matches the tile it left.
+                    Some(members) => {
+                        let metrics = crate::ui::widget::TileMetrics {
+                            icon_px: APP_DRAG_ICON_PX,
+                            ..crate::ui::widget::TileMetrics::OVERVIEW
+                        };
+                        // The tile's caption space is cropped off: our drag proxy carries
+                        // no name (GNOME's does), so the fill is the padded icon box, which
+                        // leaves `icon_center` exactly on the pointer.
+                        let side = APP_DRAG_ICON_PX + 2. * metrics.pad;
+                        let tile = Rectangle::new(
+                            Point::from((center.x - side / 2., center.y - side / 2.)),
+                            Size::from((side, side)),
+                        );
+                        for (i, icon) in members.iter().take(4).enumerate() {
+                            let at = metrics.folder_subicon_center(tile, i);
+                            if let Some(el) = icon_at(icon, metrics.folder_subicon_px(), at) {
+                                push(el.into());
+                            }
+                        }
+                        drop(uploads);
+                        let mut bg = self.app_drag_bg.borrow_mut();
+                        bg.update(
+                            tile.size,
+                            metrics.radius,
+                            crate::ui::widget::style::FOLDER_BG,
+                        );
+                        push(
+                            crate::render_helpers::rounded_solid::RoundedSolidRenderElement::from_buffer(
+                                &bg,
+                                tile.loc,
+                                Scale::from(scale),
+                                Kind::Unspecified,
+                            )
+                            .into(),
+                        );
+                    }
+                    None => {
+                        if let Some(element) = icon_at(&drag.icon, APP_DRAG_ICON_PX, center) {
+                            push(element.into());
+                        }
+                    }
                 }
             }
         }
@@ -8857,28 +8917,44 @@ impl Niri {
         );
     }
 
+    /// The `(output scale, grid icon px, open-folder icon px)` combinations the app
+    /// surfaces will draw at — the decode-cache keys a prewarm has to hit to be worth
+    /// anything. Separate from [`Self::prewarm_app_icons`] so it can be asserted without
+    /// a decode worker (the prewarm itself no-ops without one).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prewarm_variants(&self) -> Vec<(f64, f64, Option<f64>)> {
+        let mut variants: Vec<(f64, f64, Option<f64>)> = Vec::new();
+        for output in self.global_space.outputs() {
+            let scale = output.current_scale().fractional_scale();
+            let metrics = self
+                .layout
+                .controls_layout_for_output(output)
+                .map(|c| self.app_grid.metrics_for(c.app_display))
+                .unwrap_or(crate::ui::widget::TileMetrics::OVERVIEW);
+            let view = Rectangle::from_size(output_size(output));
+            let variant = (scale, metrics.icon_px, self.folder_dialog.icon_px(view));
+            if !variants.contains(&variant) {
+                variants.push(variant);
+            }
+        }
+        variants
+    }
+
     pub fn prewarm_app_icons(&self) {
         // Before the worker is wired, `buffer()` would decode inline on the main
         // thread — the exact startup stall this exists to avoid.
         if !self.app_icon_cache.has_worker() {
             return;
         }
-        // The distinct output scales the surfaces will draw at (each is its own cache
-        // key). A handful of outputs at most, so a linear dedup is fine.
-        let mut scales: Vec<f64> = Vec::new();
-        for output in self.global_space.outputs() {
-            let scale = output.current_scale().fractional_scale();
-            if !scales.contains(&scale) {
-                scales.push(scale);
-            }
-        }
-        // The dash renders its icons at `dash::ICON_PX`; the grid (and search) at the
-        // `.overview-tile` BaseIcon size. Warm each at the sizes it can appear.
-        let grid_px = crate::ui::widget::TileMetrics::OVERVIEW.icon_px;
-        // A folder tile draws its members at the smaller sub-icon size, which is its
-        // own decode-cache key.
-        let subicon_px = crate::ui::widget::TileMetrics::OVERVIEW.folder_subicon_px();
-        for scale in scales {
+        // The distinct (scale, grid icon size) pairs the surfaces will draw at — each
+        // combination is its own decode-cache key. The grid's icon size is **chosen from
+        // the band it is given** (`AppGrid::metrics_for`), not fixed at
+        // `TileMetrics::OVERVIEW`'s 96: a 1280×800 screen renders the grid at 48. Warming
+        // 96 there warms an entry nothing ever asks for, and every icon then decodes
+        // lazily the first time its page comes up — which is exactly what a one-time blink
+        // on first reaching a page looks like. A handful of outputs at most, so a linear
+        // dedup is fine.
+        for (scale, grid_px, folder_px) in self.prewarm_variants() {
             for icon in self.dash.icon_refs() {
                 let _ = self
                     .app_icon_cache
@@ -8887,12 +8963,21 @@ impl Niri {
             for icon in self.app_grid.icon_refs() {
                 let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
             }
+            // A folder tile draws its members at the smaller sub-icon size, which is its
+            // own decode-cache key.
+            let subicon_px = crate::ui::widget::TileMetrics {
+                icon_px: grid_px,
+                ..crate::ui::widget::TileMetrics::OVERVIEW
+            }
+            .folder_subicon_px();
             for icon in self.app_grid.folder_icon_refs() {
                 let _ = self.app_icon_cache.buffer(icon, subicon_px, scale);
             }
-            // An open folder's own view draws its members at the full tile icon size.
-            for icon in self.folder_dialog.icon_refs() {
-                let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
+            // An open folder's own view draws its members at *its* tile icon size.
+            if let Some(folder_px) = folder_px {
+                for icon in self.folder_dialog.icon_refs() {
+                    let _ = self.app_icon_cache.buffer(icon, folder_px, scale);
+                }
             }
         }
     }
@@ -9697,6 +9782,8 @@ niri_render_elements! {
         Panel = PanelElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
+        // The raised background under a dragged folder's composed icon.
+        RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
     }

@@ -504,6 +504,13 @@ impl FolderDialog {
         self.open.as_ref()?.view.entry_id(i)
     }
 
+    /// The icon size the open folder's view will render at for an output `view` — its own
+    /// 3×3 in the panel, so not the top-level grid's ([`AppGrid::metrics_for`]).
+    pub fn icon_px(&self, view: Rectangle<f64, Logical>) -> Option<f64> {
+        let open = self.open.as_ref()?;
+        Some(open.view.metrics_for(layout(view).grid_area).icon_px)
+    }
+
     /// The member icons, for the startup decode prewarm.
     pub fn icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
         self.open.iter().flat_map(|o| o.view.icon_refs())

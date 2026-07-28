@@ -3737,6 +3737,16 @@ impl State {
         // Only the app icons are drag sources; the show-apps button, the page
         // controls and the search card are not.
         let controls = self.niri.layout.controls_layout_for_output(&output);
+        // A dragged folder carries its whole composed tile, not one member's icon
+        // (`FolderIcon.getDragActor`, `appDisplay.js:2368-2379`).
+        let folder = match hit {
+            OverviewHit::GridApp(i) => self
+                .niri
+                .app_grid
+                .entry_folder(*i)
+                .map(|members| members.iter().map(|m| m.icon.clone()).collect()),
+            _ => None,
+        };
         let (id, icon, tile_center) = match hit {
             OverviewHit::Dash(DashHit::App(i)) => (
                 self.niri.dash.item_id(*i).map(str::to_owned),
@@ -3770,6 +3780,7 @@ impl State {
         self.niri.app_drag = Some(AppDrag {
             id,
             icon,
+            folder,
             output,
             pos: pos_within_output,
             grab_offset,

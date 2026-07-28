@@ -7094,6 +7094,75 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     assert!(!f.niri().folder_dialog.is_open(), "with the folder");
 }
 
+/// Dragging a folder tile carries the *folder*, not one of the apps inside it.
+/// `FolderIcon.getDragActor` builds a `BaseIcon` from the folder's own `_createIcon` with
+/// its `overview-tile app-folder` style class (`appDisplay.js:2286,2368-2379`), so the
+/// proxy is the composed 2×2 over the raised fill. Ours carried `members[0].icon`, which
+/// looked exactly like dragging the folder's first app out of it.
+#[test]
+fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let grid_area = overview_controls(&mut f).app_display;
+    let members: Vec<crate::app_system::AppIconRef> = f
+        .niri()
+        .app_grid
+        .entry_folder(1)
+        .expect("tile 1 is the folder")
+        .iter()
+        .map(|m| m.icon.clone())
+        .collect();
+    assert_eq!(members.len(), 2);
+
+    // Pick the folder tile up and move far enough to pass the drag threshold.
+    let from = f
+        .niri()
+        .app_grid
+        .entry_center(1, grid_area)
+        .expect("the folder tile");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from.x + 120., from.y);
+    let drag = f
+        .niri()
+        .app_drag
+        .as_ref()
+        .expect("the drag must have started");
+    assert_eq!(drag.id, "Utilities");
+    assert_eq!(
+        drag.folder.as_deref(),
+        Some(members.as_slice()),
+        "the proxy composes the folder's members, rather than standing in as one of them"
+    );
+
+    // An ordinary app tile stays a plain single icon.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    let from = f
+        .niri()
+        .app_grid
+        .entry_center(0, grid_area)
+        .expect("the app tile");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, from.x + 120., from.y);
+    let drag = f
+        .niri()
+        .app_drag
+        .as_ref()
+        .expect("the drag must have started");
+    assert_eq!(drag.id, "a.desktop");
+    assert_eq!(drag.folder, None, "an app is not a folder");
+}
+
 /// An open folder takes the arrows for itself — it is its own focus group in gnome-shell
 /// (`global.focus_manager.add_group(this)` + `navigate_from_event`,
 /// `appDisplay.js:2516,2788-2789`), so navigation stays inside the dialog and never reaches
@@ -8412,4 +8481,46 @@ fn an_installed_changed_burst_does_not_reload_the_catalog_per_ping() {
         second >= first,
         "a ping mid-wait must move the deadline forward, not backward"
     );
+}
+
+/// The icon prewarm has to warm the size the grid will actually *render*. The grid picks
+/// its icon size from the band it is given — the largest of `ICON_SIZES` whose cells fit
+/// the chosen mode (`iconGrid.js:395`) — so it is not 96 on every display: a 1280×800
+/// screen renders at 48. The decode cache is keyed by logical px, so prewarming a size the
+/// grid never draws warms an entry nothing asks for and leaves every icon to decode lazily
+/// the first time its page is looked at, which is what a one-time blink on first reaching a
+/// page looks like.
+#[test]
+fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    for (mode, expect_default) in [((1920, 1080), true), ((1280, 800), false)] {
+        let mut f = Fixture::new();
+        f.add_output(1, mode);
+        f.niri().app_system = AppSystem::with_parts(
+            Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a")])),
+            Box::new(RecordingLauncher::default()),
+        );
+        f.niri().sync_app_grid();
+        f.niri_state().do_action(Action::OpenOverview, false);
+        f.niri().layout.toggle_app_grid();
+        f.niri_complete_animations();
+
+        let area = overview_controls(&mut f).app_display;
+        let rendered = f.niri().app_grid.metrics_for(area).icon_px;
+        let default = crate::ui::widget::TileMetrics::OVERVIEW.icon_px;
+        assert_eq!(
+            rendered == default,
+            expect_default,
+            "{mode:?} should{} render at the default {default}, got {rendered}",
+            if expect_default { "" } else { " NOT" }
+        );
+
+        let variants = f.niri().prewarm_variants();
+        assert_eq!(variants.len(), 1, "one output, one variant: {variants:?}");
+        assert_eq!(
+            variants[0].1, rendered,
+            "{mode:?}: the prewarm must warm the rendered size, not {default}"
+        );
+    }
 }

@@ -1201,6 +1201,17 @@ impl AppGrid {
         None
     }
 
+    /// The tile metrics the grid will actually render `area` with.
+    ///
+    /// The icon size is **chosen from the band** — the largest of [`ICON_SIZES`] whose
+    /// cells fit the mode — so it is not [`TileMetrics::OVERVIEW`]'s 96 on every display
+    /// (a 1280×800 screen renders at 48). The decode cache is keyed by logical px, so a
+    /// prewarm at the wrong size warms an entry nothing ever asks for, and every icon
+    /// still decodes lazily the first time its page is looked at.
+    pub fn metrics_for(&self, area: Rectangle<f64, Logical>) -> TileMetrics {
+        self.layout(area).metrics
+    }
+
     /// The logical center of the current page's tile `k` — a geometry probe for the
     /// conformance corpus (which clicks real pixels routed through
     /// [`hit_test`](Self::hit_test)).
