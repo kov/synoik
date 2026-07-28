@@ -181,16 +181,10 @@ struct Progress {
     /// into the icon (`_ensureFolderDialog`'s `open-state-changed` handler,
     /// `appDisplay.js:2441-2451`).
     ///
-    /// **Divergence on the close half.** GNOME delays this fade by `TIME / 2` and then
-    /// runs it `EASE_IN_QUAD`, which leaves a real hole: the transform is `EASE_OUT_EXPO`,
-    /// so the panel has finished shrinking by the halfway mark and then sits there at 25%
-    /// opacity and falling, while the icon has not started and is still only a quarter lit
-    /// at 150 ms. Measured over the 200 ms, the two together never exceed about a third of
-    /// one solid icon between 90 and 170 ms — over a grid whose shade has already lifted,
-    /// so it reads as a bright, ordinary grid with an empty slot. We instead cross-fade:
-    /// `source = 1 - content`, so the pair always sums to exactly one icon. The *open*
-    /// half keeps GNOME's timing, where the panel and the icon overlap and there is no
-    /// hole to close.
+    /// The fade timing is GNOME's on both halves: out over `TIME / 2` as the dialog
+    /// opens, and on the close delayed by `TIME / 2` and then `EASE_IN_QUAD`. What that
+    /// delay needs to work is a panel still *moving* while the icon comes up — see the
+    /// close's `zoom` curve, which is where we diverge instead.
     source: f64,
 }
 
@@ -266,6 +260,18 @@ fn expo_x_for(y: f64) -> f64 {
     }
 }
 
+/// The same for [`Curve::EaseOutQuad`] — `y = 1 - (1 - x)²`, so `x = 1 - √(1 - y)`. This is
+/// the close's curve, so it is what a *popdown* interrupting an open has to invert.
+fn quad_x_for(y: f64) -> f64 {
+    if y <= 0. {
+        0.
+    } else if y >= 1. {
+        1.
+    } else {
+        1. - (1. - y).sqrt()
+    }
+}
+
 impl Progress {
     /// Everything at rest — the dialog fully open.
     const OPEN: Self = Self {
@@ -306,12 +312,26 @@ impl Progress {
             // Closing runs the same eases *forward* from the open state to the source, so
             // each quantity is its opening counterpart mirrored — not the opening curve
             // evaluated backwards, which would ease from the wrong end.
+            //
+            // **Divergence: the collapse is `EASE_OUT_QUAD`, not GNOME's `EASE_OUT_EXPO`.**
+            // Exponential means 82% of the travel happens in the first quarter of the
+            // animation: measured, GNOME's panel is within 3% of the tile by the halfway
+            // mark and spends the whole back half as a stationary speck. That is exactly
+            // when the source icon's delayed fade is coming up, so there is no motion left
+            // to carry the eye across the hand-over and the panel reads as *vanishing*
+            // rather than landing. Quad puts the panel's size on the same curve as its
+            // opacity, so it arrives at the tile at the instant it finishes fading — the
+            // continuity the delayed fade assumes.
             Phase::Closing => Self {
-                zoom: 1. - Curve::EaseOutExpo.y(x),
+                zoom: 1. - Curve::EaseOutQuad.y(x),
                 shade: 1. - Curve::EaseOutQuad.y(x),
                 content: 1. - Curve::EaseOutQuad.y(x),
-                // The complement of `content` — see the field's divergence note.
-                source: Curve::EaseOutQuad.y(x),
+                // Delayed by TIME/2, then ease-in-quad — `EASE_IN_QUAD` is just `u²`,
+                // and our `Curve` set has no ease-*in* member.
+                source: {
+                    let u = (x * 2. - 1.).max(0.);
+                    u * u
+                },
             },
         }
     }
@@ -405,7 +425,7 @@ impl FolderDialog {
         // shrinks from where it is instead of jumping out to full size first.
         let from = Progress::at(open.phase, open.timeline.clamped_value()).zoom;
         open.phase = Phase::Closing;
-        open.timeline = ease_from(&self.clock, expo_x_for(1. - from));
+        open.timeline = ease_from(&self.clock, quad_x_for(1. - from));
         true
     }
 
@@ -841,6 +861,28 @@ mod tests {
         );
     }
 
+    /// Closing an interrupted *open* resumes from the size it had reached, not from full
+    /// size. The two directions now run different curves, so their inverses are different
+    /// too — crossing them is a one-character bug that shows only as a mid-animation jump.
+    #[test]
+    fn closing_mid_open_resumes_from_where_it_had_grown_to() {
+        let mut d = FolderDialog::new(Clock::with_time(std::time::Duration::ZERO));
+        d.popup("Utilities", "Utilities", vec![entry("a.desktop")]);
+        at_ms(&mut d, 20);
+        let caught = d.progress().zoom;
+        assert!(
+            caught > 0.05 && caught < 0.95,
+            "the test must catch it mid-open, got {caught}"
+        );
+
+        assert!(d.popdown());
+        assert!(
+            (d.progress().zoom - caught).abs() < 1e-6,
+            "the shrink starts at the size it had reached: {} vs {caught}",
+            d.progress().zoom
+        );
+    }
+
     /// The curves, sampled *between* the endpoints — where a direction flip or a swapped
     /// curve actually shows. Endpoints are structurally blind to both.
     #[test]
@@ -848,30 +890,50 @@ mod tests {
         let open = Progress::at(Phase::Opening, 0.25);
         let close = Progress::at(Phase::Closing, 0.25);
 
-        // EASE_OUT_EXPO is front-loaded: a quarter of the way in, the open is nearly
-        // done travelling and the close has nearly arrived at the tile.
+        // The open is GNOME's EASE_OUT_EXPO and is front-loaded: a quarter of the way in
+        // the panel has nearly finished travelling.
         assert!(open.zoom > 0.8, "opening rushes out: {}", open.zoom);
-        assert!(close.zoom < 0.2, "closing rushes home: {}", close.zoom);
-        // The shade is the gentler quad, so it lags the transform on both legs.
         assert!(open.shade < open.zoom, "the shade trails the zoom in");
-        assert!(close.shade > close.zoom, "…and trails it out");
 
-        // The source tile fades OUT over the first half of the open, as GNOME's does.
+        // On the close, the panel's size, its opacity and the shade now all run the one
+        // quad, so they are locked together — the panel arrives at the tile at the very
+        // instant it finishes fading, which is what makes the hand-over readable.
+        assert!((close.zoom - close.content).abs() < 1e-9, "{close:?}");
+        assert!((close.shade - close.content).abs() < 1e-9, "{close:?}");
+
+        // The close is our slower quad. The point of diverging is that the panel is still
+        // visibly travelling when the source icon's delayed fade starts at the halfway
+        // mark — GNOME's expo has it within 3% of the tile by then, a stationary speck.
+        assert!(
+            Progress::at(Phase::Closing, 0.5).zoom > 0.2,
+            "at the hand-over the panel must still have somewhere to go, got {}",
+            Progress::at(Phase::Closing, 0.5).zoom
+        );
+        assert!(
+            1. - Curve::EaseOutExpo.y(0.5) < 0.05,
+            "…which is exactly what GNOME's expo does not leave"
+        );
+        // …and it is monotone home, never bouncing.
+        let mut last = 1.;
+        for step in 1..=20 {
+            let z = Progress::at(Phase::Closing, f64::from(step) / 20.).zoom;
+            assert!(
+                z < last,
+                "the collapse must not stall or bounce: {z} !< {last}"
+            );
+            last = z;
+        }
+
+        // The source tile keeps GNOME's timing on both halves: out over the first half of
+        // the open, and in over the *second* half of the close after its TIME/2 delay.
         assert_eq!(Progress::at(Phase::Opening, 0.).source, 1.);
         assert_eq!(Progress::at(Phase::Opening, 0.5).source, 0.);
-
-        // On the close it is the panel's exact complement — our divergence. GNOME delays
-        // it by TIME/2, which leaves both faint at once for ~70 ms; summing to one solid
-        // icon at every instant is the whole point of diverging, so pin the sum, not a
-        // sample of the curve.
-        for step in 0..=20 {
-            let x = f64::from(step) / 20.;
-            let p = Progress::at(Phase::Closing, x);
-            assert!(
-                (p.content + p.source - 1.).abs() < 1e-9,
-                "the panel and the icon must always sum to one icon; at {x}: {p:?}"
-            );
-        }
+        assert_eq!(Progress::at(Phase::Closing, 0.5).source, 0.);
+        assert_eq!(Progress::at(Phase::Closing, 1.).source, 1.);
+        assert!(
+            Progress::at(Phase::Closing, 0.75).source < 0.5,
+            "ease-in: it starts slowly"
+        );
     }
 
     /// The zoom maps the container so that at 0 it sits exactly on the source tile, per

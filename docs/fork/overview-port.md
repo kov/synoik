@@ -904,13 +904,18 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
   is what makes the panel appear to become the icon again; in the grid that tile leaves the shared
   label and folder-background bakes and is re-emitted on its own, with the fading *id* in the bake
   revision and the alpha deliberately not (else the page's text re-shapes every frame).
-  **Divergence, live-validated 2026-07-28:** on the *close* half the tile cross-fades with the panel
-  (`source = 1 - content`) instead of taking GNOME's `TIME/2` delay + `EASE_IN_QUAD`. GNOME's timing
-  leaves a real hole — the `EASE_OUT_EXPO` transform has the panel fully shrunk by the halfway mark,
-  where it sits at 25% opacity and falling while the icon has not started and is still only a
-  quarter lit at 150 ms, so between ~90 and ~170 ms the two together never exceed about a third of
-  one solid icon, over a grid whose shade has already lifted. Measured, then confirmed on the seat.
-  The *open* half keeps GNOME's timing, where the panel and icon overlap and there is no hole.
+  **Divergence, chosen on the seat 2026-07-28: the close's transform is `EASE_OUT_QUAD`, not GNOME's
+  `EASE_OUT_EXPO`.** Reported as "the folder disappears before the icon is restored". Measured, the
+  gap is real *and* faithful: exponential puts 82% of the travel in the first quarter, so GNOME's
+  panel is within 3% of the tile by the halfway mark and spends the whole back half as a stationary
+  speck — exactly when the source icon's `TIME/2`-delayed fade is coming up, leaving no motion to
+  carry the eye across the hand-over. Quad puts the panel's size on the same curve as its opacity
+  (and the shade), so all three are locked and the panel arrives at the tile at the instant it
+  finishes fading. The source tile's fade keeps GNOME's timing on both halves, and the *open* half
+  keeps expo — it has no gap to close.
+  A pure cross-fade (`source = 1 - content`, no delay) was tried first and closes the gap
+  arithmetically, but the slower collapse read better on the seat; it is the motion, not the summed
+  opacity, that carries the hand-over.
   Divergences: an interrupted transition runs only the time it has left, where Clutter re-eases
   from the current value over a full duration (they agree whenever nothing is interrupted); and
   leaving the app grid drops the dialog outright rather than letting it fade with the overview
