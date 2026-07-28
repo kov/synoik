@@ -187,6 +187,27 @@ const FOLDER_SUBICONS: usize = 4;
 /// `PAGE_SWITCH_TIME` (`iconGrid.js:13`) — how long the view takes to slide one page.
 const PAGE_SWITCH_MS: u64 = 300;
 
+/// One page is `TOUCHPAD_BASE_WIDTH` of horizontal travel (`swipeTracker.js:14`, used as
+/// the swipe `distance` at `:183`). Clutter cannot ask libinput for the real touchpad
+/// size, so GNOME picks a fixed value and every GTK app agrees on it.
+const SWIPE_PAGE_PX: f64 = 400.;
+/// `SCROLL_MULTIPLIER` (`swipeTracker.js:18`) — a two-finger scroll delta is scaled up
+/// before it counts as gesture travel.
+pub const SWIPE_SCROLL_MULTIPLIER: f64 = 10.;
+/// `VELOCITY_THRESHOLD_TOUCHPAD` (`swipeTracker.js:23`) — in **pixels** per millisecond,
+/// not pages: the velocity history holds raw deltas (`:597,676`) and the threshold is
+/// compared against them before the normalization at `:644`. Below it a release is a slow
+/// drag and simply falls to whichever page is nearest.
+const SWIPE_VELOCITY_THRESHOLD: f64 = 0.6;
+/// `MIN_ANIMATION_DURATION` / `MAX_ANIMATION_DURATION` (`swipeTracker.js:20-21`). The max
+/// is `400 * log2(1 + nPoints)` and a swipe can only ever cross one page here, so it is
+/// exactly 400.
+const SWIPE_MIN_MS: u64 = 100;
+const SWIPE_MAX_MS: u64 = 400;
+/// `DURATION_MULTIPLIER` (`swipeTracker.js:31`) — the derivative of `easeOutCubic` at 0,
+/// which is what makes the settle continue at the speed the finger left off.
+const SWIPE_DURATION_MULTIPLIER: f64 = 3.;
+
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
 const PAGE_PREVIEW_RATIO: f64 = 0.20;
@@ -369,6 +390,13 @@ pub struct AppGrid {
     /// from either end. `None` while a gesture holds it directly.
     slide: Animation,
     gesture: Option<f64>,
+    /// Where a live gesture started, in pages. A swipe may cross **at most one** page:
+    /// `_getBounds` clamps the live progress to the snap points either side of where the
+    /// gesture began unless `allowLongSwipes` is set, and `AppDisplay` does not set it
+    /// (`swipeTracker.js:547-577`).
+    gesture_from: f64,
+    /// Velocity history for the release projection (`swipeTracker.js:601-631`).
+    swipe: crate::input::swipe_tracker::SwipeTracker,
     /// Bumped on any change that affects the bake (entries/hover/page).
     content_rev: u64,
     /// The order as it was when a drag started, so an unsuccessful drop can put it
@@ -490,6 +518,8 @@ impl AppGrid {
             current_page: 0,
             slide: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
             gesture: None,
+            gesture_from: 0.,
+            swipe: crate::input::swipe_tracker::SwipeTracker::new(),
             content_rev: 0,
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
@@ -825,6 +855,99 @@ impl AppGrid {
         self.gesture = None;
         self.slide = Animation::ease(self.clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic);
         true
+    }
+
+    /// Begin a 1:1 page swipe (`_swipeBegin`, `appDisplay.js:706-719`): the running
+    /// slide is dropped and the view follows the finger from wherever it had got to.
+    pub fn gesture_begin(&mut self) {
+        let from = self.page_pos();
+        self.gesture = Some(from);
+        self.gesture_from = from;
+        self.swipe = crate::input::swipe_tracker::SwipeTracker::new();
+    }
+
+    /// Move a live swipe by `delta_px` of horizontal travel (`_swipeUpdate`,
+    /// `appDisplay.js:721-724` — the adjustment simply *is* the gesture position, which
+    /// is why the drag is 1:1 and not a rate). Returns whether it moved (→ redraw).
+    pub fn gesture_update(
+        &mut self,
+        delta_px: f64,
+        timestamp: std::time::Duration,
+        area: Rectangle<f64, Logical>,
+    ) -> bool {
+        let Some(pos) = self.gesture else {
+            return false;
+        };
+        let last = self.page_count(area).saturating_sub(1) as f64;
+        if last <= 0. {
+            return false;
+        }
+        // The tracker holds *pixels*, which is the unit the release threshold is in.
+        self.swipe.push(delta_px, timestamp);
+        let step = delta_px / SWIPE_PAGE_PX;
+        // At most one page either side of where the gesture began (`_getBounds`).
+        let lo = (self.gesture_from.floor() - 1.).clamp(0., last);
+        let hi = (self.gesture_from.ceil() + 1.).clamp(0., last);
+        let next = (pos + step).clamp(lo, hi);
+        if next == pos {
+            return false;
+        }
+        self.gesture = Some(next);
+        true
+    }
+
+    /// Release a swipe (`_swipeEnd`, `appDisplay.js:726-735`): project where it would
+    /// coast to, snap that to a page, and ease there — then the page bookkeeping catches
+    /// up, which is `goToPage(endProgress, false)`. Returns whether anything changed.
+    pub fn gesture_end(&mut self, area: Rectangle<f64, Logical>) -> bool {
+        let Some(pos) = self.gesture else {
+            return false;
+        };
+        let last = self.page_count(area).saturating_sub(1) as f64;
+        // Pixels per millisecond (`velocity()` is per second).
+        let velocity = self.swipe.velocity() / 1000.;
+        let initial = self.gesture_from.round();
+
+        let target = if velocity.abs() < SWIPE_VELOCITY_THRESHOLD {
+            // A slow drag just falls to the nearest page (`_getEndProgress`, first branch).
+            pos.round()
+        } else if velocity > 0. {
+            initial + 1.
+        } else {
+            initial - 1.
+        }
+        .clamp(0., last);
+        // Above the threshold GNOME projects `velocity * slope` and clamps it to the snap
+        // points either side of where the gesture began (`_getEndProgress` +
+        // `_getBounds`). The projection is in pixels while the progress it is added to is
+        // in pages, so for any velocity that clears the threshold at all it overshoots and
+        // the clamp decides: a flick moves exactly one page, in the direction of travel.
+        // That is what is reproduced above, rather than the arithmetic that gets there.
+
+        // `|Δprogress| / velocity * DURATION_MULTIPLIER` with the velocity normalized to
+        // pages (`swipeTracker.js:644,652-654`) — a fast flick settles quickly, a slow one
+        // does not snap.
+        let pages_per_ms = velocity / SWIPE_PAGE_PX;
+        let ms = if pages_per_ms == 0. {
+            PAGE_SWITCH_MS
+        } else {
+            let raw = ((target - pos) / pages_per_ms * SWIPE_DURATION_MULTIPLIER).abs();
+            (raw.round() as u64).clamp(SWIPE_MIN_MS, SWIPE_MAX_MS)
+        };
+
+        self.current_page = target as usize;
+        self.slide_to(target, ms);
+        true
+    }
+
+    /// Abandon a live swipe without a release — the pointer left the grid, or the grid
+    /// went away. Settles onto the page it is nearest.
+    pub fn gesture_cancel(&mut self, area: Rectangle<f64, Logical>) -> bool {
+        if self.gesture.is_none() {
+            return false;
+        }
+        self.swipe = crate::input::swipe_tracker::SwipeTracker::new();
+        self.gesture_end(area)
     }
 
     /// Ease the view to `to` (in pages) over `ms`, from wherever it is now — an

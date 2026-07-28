@@ -225,6 +225,21 @@ impl Fixture {
             event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: 120.0,
+                finger: None,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    /// Inject a continuous (touchpad) scroll of `(dx, dy)` through the real input
+    /// pipeline. A `(0., 0.)` event is the gesture end libinput sends when the fingers
+    /// lift — which is how [`crate::input::scroll_swipe_gesture`] knows a swipe is over.
+    pub fn scroll_finger(&mut self, dx: f64, dy: f64) {
+        let event = InputEvent::<SyntheticInputBackend>::PointerAxis {
+            event: SyntheticPointerAxisEvent {
+                time: self.next_input_micros(),
+                v120: 0.,
+                finger: Some((dx, dy)),
             },
         };
         self.niri_state().process_input_event(event);

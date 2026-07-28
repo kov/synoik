@@ -8524,3 +8524,89 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
         );
     }
 }
+
+/// A touchpad swipe drags the app grid's pages 1:1 and settles on a page when the fingers
+/// lift — GNOME gives `AppDisplay` its own `SwipeTracker` over the grid's scroll view
+/// (`appDisplay.js:605-614,706-735`), and the value it drags is the very same scroll
+/// adjustment `goToPage` eases, which is why the swipe and the slide are one state.
+/// One page is `TOUCHPAD_BASE_WIDTH` 400 px of travel and a scroll delta counts ×10
+/// (`swipeTracker.js:14,18,183`); a swipe crosses at most one page (`_getBounds`), and
+/// the release threshold is 0.6 **pixels** per ms, not pages.
+#[test]
+fn overview_app_grid_swipes_between_pages() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&[], &others);
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(f.niri().app_grid.page_count(area), 2);
+
+    // Park the pointer over the grid — the swipe is only live there.
+    let center = f
+        .niri()
+        .app_grid
+        .entry_center(0, area)
+        .expect("the first tile");
+    pointer_motion_to(&mut f, center.x, center.y);
+
+    // `n` scroll notches of `dx`, `gap` ms apart, then the fingers lift.
+    let swipe = |f: &mut Fixture, n: usize, dx: f64, gap: u32| {
+        for _ in 0..n {
+            f.advance_input_time(gap);
+            f.scroll_finger(dx, 0.);
+        }
+    };
+    let lift = |f: &mut Fixture| {
+        f.advance_input_time(1);
+        f.scroll_finger(0., 0.);
+        f.settle_animations();
+    };
+
+    // A slow drag: 8 notches of 2 is 160 px of travel (×10), two fifths of a page. The
+    // view follows it 1:1 rather than snapping — that is the point of a 1:1 gesture.
+    swipe(&mut f, 8, 2., 50);
+    let dragged = f.niri().app_grid.page_pos();
+    assert!(
+        (dragged - 0.4).abs() < 0.01,
+        "the pages follow the finger 1:1 (160 px of 400), got {dragged}"
+    );
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        0,
+        "…without committing to a page yet"
+    );
+
+    // Released slowly, it falls back to the page it is nearest.
+    lift(&mut f);
+    assert_eq!(f.niri().app_grid.current_page(), 0, "two fifths snaps back");
+    assert_eq!(f.niri().app_grid.page_pos(), 0.);
+
+    // Dragged past halfway just as slowly, it falls forward instead.
+    swipe(&mut f, 13, 2., 50);
+    lift(&mut f);
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "past halfway, the nearest page is the next one"
+    );
+
+    // A flick: a short drag, but fast enough to clear the velocity threshold, so it
+    // carries a whole page even though the drag itself covered a fifth of one.
+    swipe(&mut f, 4, -2., 1);
+    lift(&mut f);
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        0,
+        "a flick advances a page the drag never reached"
+    );
+    assert_eq!(f.niri().app_grid.page_pos(), 0.);
+
+    // A vertical two-finger scroll is swallowed and moves nothing: GNOME's tracker is
+    // horizontal, and letting it through would page the workspaces behind the grid.
+    swipe(&mut f, 4, 0., 20);
+    for _ in 0..4 {
+        f.advance_input_time(20);
+        f.scroll_finger(0., 4.);
+    }
+    assert_eq!(f.niri().app_grid.page_pos(), 0.);
+    assert_eq!(f.niri().app_grid.current_page(), 0);
+}

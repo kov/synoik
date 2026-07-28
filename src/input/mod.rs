@@ -5280,10 +5280,51 @@ impl State {
                                     self.niri.queue_redraw_all();
                                 }
                             }
+                        } else {
+                            // Continuous scrolling is the 1:1 page swipe. GNOME's tracker
+                            // is HORIZONTAL, so only sideways travel moves the pages — a
+                            // two-finger vertical scroll over the grid does nothing, and
+                            // is swallowed all the same.
+                            let dx = event.amount(Axis::Horizontal).unwrap_or(0.);
+                            let dy = event.amount(Axis::Vertical).unwrap_or(0.);
+                            let action = self.niri.app_grid_scroll_swipe.update(dx, dy);
+                            let mut redraw = false;
+                            if action.end() {
+                                redraw |= self.niri.app_grid.gesture_end(area);
+                            } else {
+                                if action.begin() {
+                                    self.niri.app_grid.gesture_begin();
+                                }
+                                redraw |= self.niri.app_grid.gesture_update(
+                                    dx * crate::ui::app_grid::SWIPE_SCROLL_MULTIPLIER,
+                                    timestamp,
+                                    area,
+                                );
+                            }
+                            if redraw {
+                                self.niri.queue_redraw_all();
+                            }
                         }
                         // Consume all scroll over the grid.
                         return;
                     }
+                }
+            }
+        }
+
+        // A scroll that did not reach the grid ends any swipe it had going — the pointer
+        // left the band, or the grid closed under it.
+        if self.niri.app_grid_scroll_swipe.reset() {
+            let area = self
+                .niri
+                .layout
+                .active_output()
+                .cloned()
+                .and_then(|o| self.niri.layout.controls_layout_for_output(&o))
+                .map(|c| c.app_display);
+            if let Some(area) = area {
+                if self.niri.app_grid.gesture_cancel(area) {
+                    self.niri.queue_redraw_all();
                 }
             }
         }

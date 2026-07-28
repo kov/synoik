@@ -81,6 +81,7 @@ pub fn inject(state: &mut State, event: &InjectedEvent) -> Result<(), String> {
                 event: SyntheticPointerAxisEvent {
                     time: now(),
                     v120: notches * 120.0,
+                    finger: None,
                 },
             };
             state.process_input_event(event);
@@ -331,10 +332,15 @@ impl PointerMotionEvent<SyntheticInputBackend> for SyntheticPointerMotionEvent {
     }
 }
 
-/// A discrete (wheel) scroll of `v120 / 120` notches on the vertical axis.
+/// A scroll: either a discrete wheel notch (`v120 / 120` notches on the vertical axis)
+/// or a continuous finger scroll, which is what a touchpad two-finger swipe produces and
+/// what the app grid's page swipe rides on.
 pub struct SyntheticPointerAxisEvent {
     pub time: u64,
     pub v120: f64,
+    /// `Some((dx, dy))` makes this a continuous [`AxisSource::Finger`] scroll instead of a
+    /// wheel; `(0., 0.)` is the gesture-end event libinput sends when the fingers lift.
+    pub finger: Option<(f64, f64)>,
 }
 
 impl Event<SyntheticInputBackend> for SyntheticPointerAxisEvent {
@@ -348,11 +354,17 @@ impl Event<SyntheticInputBackend> for SyntheticPointerAxisEvent {
 }
 
 impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
-    fn amount(&self, _axis: Axis) -> Option<f64> {
-        None
+    fn amount(&self, axis: Axis) -> Option<f64> {
+        self.finger.map(|(dx, dy)| match axis {
+            Axis::Vertical => dy,
+            Axis::Horizontal => dx,
+        })
     }
 
     fn amount_v120(&self, axis: Axis) -> Option<f64> {
+        if self.finger.is_some() {
+            return None;
+        }
         Some(match axis {
             Axis::Vertical => self.v120,
             Axis::Horizontal => 0.0,
@@ -360,7 +372,11 @@ impl PointerAxisEvent<SyntheticInputBackend> for SyntheticPointerAxisEvent {
     }
 
     fn source(&self) -> AxisSource {
-        AxisSource::Wheel
+        if self.finger.is_some() {
+            AxisSource::Finger
+        } else {
+            AxisSource::Wheel
+        }
     }
 
     fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {

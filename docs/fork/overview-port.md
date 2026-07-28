@@ -1047,7 +1047,17 @@ right: after the first visit a page switch re-bakes nothing.
 
 * **P1 — the slide.** *(landed.)* `page_pos`, the two-page render, the per-page caches, `EASE_OUT_CUBIC`
   over 300 ms. Dots and arrows stay put. Wheel/dot/arrow/key paging all inherit it.
-* **P2 — the swipe.** The reserved continuous-scroll branch drives `page_pos` 1:1 at 400 px
+* **P2 — the swipe.** *(landed.)* The reserved continuous-scroll branch drives `page_pos` 1:1 at 400 px
   per page, and the release projects to a snap point and eases there. Reuses the existing
   `ScrollSwipeGesture` (begin/update/end from axis events) and `SwipeTracker`
   (velocity + `projected_end_pos`), the same pair the overview's own scroll swipe uses.
+
+**A unit trap worth recording**, found by the test failing: GNOME's velocity history holds
+**raw pixel deltas** (`swipeTracker.js:597,676`), and `_getEndProgress` compares them
+against `VELOCITY_THRESHOLD_TOUCHPAD` *before* the normalization at `:644` — so 0.6 is
+0.6 px/ms, not 0.6 pages/ms. It then adds a pixel-scale projection (`velocity * slope`) to
+a page-scale progress and clamps the result to the snap points either side of where the
+gesture began. Those units do not agree, and the consequence is that **any** velocity past
+the threshold overshoots and is decided by the clamp: a flick moves exactly one page in the
+direction of travel. We reproduce that outcome rather than the arithmetic that reaches it,
+because the arithmetic only works by way of the clamp.

@@ -593,6 +593,10 @@ pub struct Niri {
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
+    /// The same, for the app grid's own 1:1 page swipe — GNOME gives `AppDisplay` its own
+    /// `SwipeTracker` on the grid's scroll view (`appDisplay.js:605-614`), independent of
+    /// the overview's.
+    pub app_grid_scroll_swipe: ScrollSwipeGesture,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
@@ -3881,6 +3885,7 @@ impl Niri {
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+            app_grid_scroll_swipe: ScrollSwipeGesture::new(),
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
             mods_with_mouse_binds,
@@ -9183,6 +9188,8 @@ impl Niri {
         // being modal the moment the close starts, and retires itself when it ends.
         if !self.layout.is_app_grid_open() {
             self.folder_dialog.hide();
+            // A swipe cannot outlive the grid it was dragging.
+            self.app_grid_scroll_swipe.reset();
             // A grid that is not on screen holds no key focus — a re-opened grid starts
             // over from its first page (`goToPage(0)`, `appDisplay.js:1342`) with nothing
             // lit, exactly as a fresh `AppDisplay` does.
