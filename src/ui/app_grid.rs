@@ -48,9 +48,10 @@
 //! within [`EDGE_BUMP_PX`] of the grid's edge flips it at once. Dropping *on* a band
 //! sends the app to that page, creating one past the end.
 //!
-//! **Divergences, revisited later.** No **context menu** on an icon (`AppIconMenu`,
-//! `appDisplay.js:3170-3340`): a right-click is consumed inertly, so New Window / app
-//! details / the open-windows list are all unreachable here and in the dash. Inside a
+//! **Divergences, revisited later.** The icon's context menu is [`crate::ui::app_menu`],
+//! which builds New Window, the `.desktop` action section and the favourite toggle; its
+//! own doc lists what is missing there and why (Open Windows and Quit want per-window
+//! identity, App Details an `org.gnome.Software` call). Inside a
 //! folder a drag cannot **change the page**: the edge bump and the preview bands are
 //! wired for the top-level grid only. The nav arrows ride the centering gutter rather
 //! than a fixed `indicatorsPadding` band (differs only at narrow widths). A folder
