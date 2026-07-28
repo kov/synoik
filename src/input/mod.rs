@@ -3895,6 +3895,7 @@ impl State {
         // nothing to aim at (`_onItemDragBegin`, `dash.js:410-414`).
         self.niri.dash.set_drag_active(true);
         self.niri.app_grid.set_drag_active(true);
+        self.niri.folder_dialog.set_drag_active(true);
         // The live grid reflow is provisional: remember where everything was, so a drag
         // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`). The open
         // folder's view reorders on the same terms, and takes the same snapshot.
@@ -3984,6 +3985,18 @@ impl State {
             return;
         }
         let view = Rectangle::from_size(output_size(&output));
+        // Page switching first, then the drop target — the same order and the same two
+        // mechanisms the grid has (`_onDragMotion`, `appDisplay.js:932-959`), because a
+        // switch changes which page a target would even mean.
+        let area = crate::ui::folder_dialog::FolderDialog::view_area(view);
+        if !self.drag_maybe_switch_page_immediately(area, pos) {
+            let hint = self.niri.folder_dialog.hint_at(pos, view);
+            self.niri.folder_dialog.set_hint_hovered(hint);
+            match hint {
+                Some(direction) => self.arm_drag_page_switch(direction),
+                None => self.reset_drag_page_switch(),
+            }
+        }
         let Some(per_page) = self.niri.folder_dialog.items_per_page(view) else {
             self.clear_folder_pending_move();
             return;
@@ -4177,11 +4190,27 @@ impl State {
         self.niri.grid_page_switch_overshoot = None;
     }
 
-    /// Step the grid one page in `direction`, on the output the drag is over.
+    /// Step one page in `direction`, on the output the drag is over — of the open folder's
+    /// view when the dialog has the drag, of the app grid otherwise. `FolderView` inherits
+    /// the whole page-switch machinery from `BaseAppView`, so a member can be dragged onto
+    /// the folder's other page exactly as an app can onto the grid's.
     fn step_grid_page(&mut self, direction: PageArrow) {
         let Some(output) = self.niri.app_drag.as_ref().map(|d| d.output.clone()) else {
             return;
         };
+        if self.niri.folder_dialog.is_open() {
+            let view = Rectangle::from_size(output_size(&output));
+            let page = self.niri.folder_dialog.current_page();
+            let page = match direction {
+                PageArrow::Prev => page.saturating_sub(1),
+                PageArrow::Next => page + 1,
+            };
+            if self.niri.folder_dialog.set_page(page, view) {
+                self.clear_folder_pending_move();
+                self.niri.queue_redraw_all();
+            }
+            return;
+        }
         let Some(area) = self
             .niri
             .layout
@@ -4423,6 +4452,7 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        self.niri.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
         self.niri.app_grid.set_dragged(None);
         self.niri.folder_dialog.set_dragged(None);
@@ -4560,6 +4590,7 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        self.niri.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
         self.niri.app_grid.set_dragged(None);
         self.niri.folder_dialog.set_dragged(None);
@@ -4659,10 +4690,22 @@ impl State {
                 .grid_area
                 .contains(drag.pos)
         });
-        if over_view {
+        // A drop *on* a preview band sends the member to that page rather than reordering
+        // within this one (`acceptDrop`, `appDisplay.js:1004-1013`). Read before the
+        // previews are told to slide away, since that is what makes a band a target.
+        let hint = self.niri.app_drag.as_ref().and_then(|drag| {
+            let view = Rectangle::from_size(output_size(&drag.output));
+            self.niri.folder_dialog.hint_at(drag.pos, view)
+        });
+        if let (Some(direction), Some(drag)) = (hint, self.niri.app_drag.as_ref()) {
+            let (id, output) = (drag.id.clone(), drag.output.clone());
+            self.drop_member_onto_page(&id, direction, &output);
+        } else if over_view {
             self.apply_folder_pending_move();
         }
         self.clear_folder_pending_move();
+        self.niri.folder_dialog.set_hint_hovered(None);
+        self.reset_drag_page_switch();
 
         let Some(drag) = self.niri.app_drag.take() else {
             return;
@@ -4670,6 +4713,7 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        self.niri.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
         self.niri.app_grid.set_dragged(None);
         self.niri.folder_dialog.set_dragged(None);
@@ -4757,6 +4801,30 @@ impl State {
         // Where it actually landed: a full page pushes it on to the next one.
         let page = page.min(self.niri.app_grid.page_count(area).saturating_sub(1));
         self.niri.app_grid.set_page(page, area);
+    }
+
+    /// Send a folder member to the page a preview band leads to, and follow it there —
+    /// the folder's half of `acceptDrop`'s hint branch (`appDisplay.js:1004-1013`).
+    fn drop_member_onto_page(&mut self, id: &str, direction: PageArrow, output: &Output) {
+        let view = Rectangle::from_size(output_size(output));
+        let Some(per_page) = self.niri.folder_dialog.items_per_page(view) else {
+            return;
+        };
+        let n_pages = self.niri.folder_dialog.page_count(view);
+        let current = self.niri.folder_dialog.current_page();
+        let page = match direction {
+            PageArrow::Prev => current.saturating_sub(1),
+            PageArrow::Next => (current + 1).min(n_pages),
+        };
+        let target = crate::ui::app_grid::GridDropTarget {
+            page,
+            position: if page < n_pages { None } else { Some(0) },
+            location: DragLocation::EmptySpace,
+        };
+        self.niri.folder_dialog.move_entry(id, target, per_page);
+        // Where it actually landed: a full page pushes it on to the next one.
+        let page = page.min(self.niri.folder_dialog.page_count(view).saturating_sub(1));
+        self.niri.folder_dialog.set_page(page, view);
     }
 
     /// Persist the grid arrangement (`AppDisplay._savePages`, `appDisplay.js:1387-1404`).

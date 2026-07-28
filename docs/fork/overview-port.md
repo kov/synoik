@@ -1211,10 +1211,11 @@ keeps a folder from forming every time a drag crosses an icon.
   `:drop` state for a folder-sourced drag like any other — and an offer that silently does
   something else is worse than the divergence.
 
-  **Not ported:** page-switching *inside* a folder mid-drag. `FolderView` inherits
-  `BaseAppView`'s edge bump and preview-band hover (`:827-959`) plus `acceptDrop`'s
-  page-indicator branch (`:1004-1013`); we wire those for the top-level grid only, so in a
-  folder with more than nine apps a member cannot be dragged onto the other page.
+  **Page-switching inside a folder ✅** — the same three mechanisms the grid has, pointed at
+  the folder's view while the dialog holds the drag: the preview bands slide in
+  (`showPageIndicators` is `BaseAppView`'s, so the folder's view peeks too), the edge bump
+  flips at once, hovering a band flips after a beat, and a drop *on* a band sends the member
+  to that page and follows it (`:827-959`, `:1004-1013`).
 
   Two more, both from a folder big enough to paginate: the dialog never asked its inner view
   whether an animation was running, so the page slide advanced only on frames something else had

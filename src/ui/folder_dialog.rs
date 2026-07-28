@@ -706,6 +706,45 @@ impl FolderDialog {
             .drop_target_at(pos, layout(view).grid_area, dragged)
     }
 
+    /// Slide the folder view's page previews in or out for an item drag — `FolderView`
+    /// gets `showPageIndicators` from `BaseAppView` like the app display does, so a
+    /// folder with more than one page offers the same bands to drag onto.
+    pub fn set_drag_active(&mut self, active: bool) -> bool {
+        self.open
+            .as_mut()
+            .is_some_and(|o| o.view.set_drag_active(active))
+    }
+
+    /// Which preview band the drag is over inside the folder, if any.
+    pub fn hint_at(
+        &self,
+        pos: Point<f64, Logical>,
+        view: Rectangle<f64, Logical>,
+    ) -> Option<PageArrow> {
+        let open = self.open.as_ref()?;
+        open.view.hint_at(pos, layout(view).grid_area)
+    }
+
+    /// Light the band a drag is resting on.
+    pub fn set_hint_hovered(&mut self, hint: Option<PageArrow>) -> bool {
+        self.open
+            .as_mut()
+            .is_some_and(|o| o.view.set_hint_hovered(hint))
+    }
+
+    /// How many pages the open folder has.
+    pub fn page_count(&self, view: Rectangle<f64, Logical>) -> usize {
+        self.open
+            .as_ref()
+            .map_or(0, |o| o.view.page_count(layout(view).grid_area))
+    }
+
+    /// The folder's grid area in `view` — where its members are laid out, and the box a
+    /// drag's edge bump is measured against.
+    pub fn view_area(view: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        layout(view).grid_area
+    }
+
     /// Mark a member as the one being dragged, so its tile scales and fades out of the
     /// folder's view like a grid tile does (see [`AppGrid::set_dragged`]).
     pub fn set_dragged(&mut self, id: Option<&str>) {

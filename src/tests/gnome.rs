@@ -7405,6 +7405,88 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// A folder with more than one page takes a drag onto its *other* page: `FolderView`
+/// inherits `BaseAppView`'s page-switch machinery whole — the preview bands, the edge
+/// bump, and `acceptDrop`'s band branch (`appDisplay.js:827-959,1004-1013`). Ours wired
+/// all three to the top-level grid only, so a member could not leave page 1.
+#[test]
+fn overview_dragging_a_member_onto_a_folder_page_band_moves_it_there() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+    use crate::ui::folder_dialog::FolderDialog;
+
+    let apps: Vec<String> = (0..12).map(|i| format!("m{i:02}.desktop")).collect();
+    let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&[], &refs);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: apps.clone(),
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let area = overview_controls(&mut f).app_display;
+    let center = f.niri().app_grid.tile_center(0, area).expect("folder tile");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri().folder_dialog.page_count(view),
+        2,
+        "twelve members make two pages of the 3x3 folder grid"
+    );
+
+    // Pick the first member up and hold it over the next-page band.
+    let member = f
+        .niri()
+        .folder_dialog
+        .entry_center(0, view)
+        .expect("tile 0");
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    let grid = FolderDialog::view_area(view);
+    // Inside the preview band but clear of the 20 px edge-bump strip, so this exercises
+    // the band drop rather than the bump.
+    let band: Point<f64, smithay::utils::Logical> = Point::from((
+        grid.loc.x + grid.size.w - 30.,
+        grid.loc.y + grid.size.h / 2.,
+    ));
+    pointer_motion_to(&mut f, band.x, band.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    // The bands slide in over 150 ms and are not a drop target until they are there
+    // (`hint_at` reads the peek). `niri_complete_animations` will not do: it flips the
+    // clock's complete-instantly flag back off, so the peek reads 0 again the moment it
+    // returns — the animation clock has to really move.
+    f.settle_animations();
+    assert_eq!(
+        f.niri().folder_dialog.current_page(),
+        0,
+        "hovering a band does not switch the page on its own — that takes a beat"
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        f.niri().folder_dialog.is_open(),
+        "the folder took the drop, so the dialog stays up"
+    );
+    assert_eq!(
+        f.niri().folder_dialog.current_page(),
+        1,
+        "and follows the member to the page it was sent to"
+    );
+    let members = f.niri().folder_dialog.member_ids();
+    assert_eq!(
+        members.last().map(String::as_str),
+        Some("m00.desktop"),
+        "the member moved to the end, i.e. onto the second page: {members:?}"
+    );
+}
+
 /// The folder's **view** is what takes a drop, not the panel around it: the name row has no
 /// delegate of its own, so a drop there bubbles to the dialog actor — which covers the whole
 /// monitor — and `AppFolderDialog.acceptDrop` pops down and removes the app
