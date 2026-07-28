@@ -1184,8 +1184,43 @@ keeps a folder from forming every time a drag crosses an icon.
   has no *members* left — identical for every explicit-apps folder, and what the user is
   actually asking for.
 
-  **Not ported:** reordering *within* a folder (`FolderView.acceptDrop`, `:2213-2221`). A drop
-  back inside the panel puts the icon home.
+* **E2c — reorder inside a folder.** ✅ `FolderView.acceptDrop` (`:2213-2221`). `FolderView` is a
+  `BaseAppView`, so it inherits the same `_maybeMoveItem` the app display uses: a drag that stays
+  inside the panel arms the same 200 ms delayed move against the folder's own view, and the drop
+  writes `_orderedItems.map(item => item.id)` straight back to the folder's `apps`.
+
+  That write is deliberately **not** a read-modify-write, and GNOME's is not either: for a
+  categories-based folder it lists the swept-in members in `apps` explicitly. `categories` stays,
+  so later installs are still swept in; only what was already there gains a position.
+
+  The drop boundary is the **view**, not the panel: the folder's name row has no delegate of its
+  own, so a drop there bubbles to the dialog actor (which covers the monitor) and
+  `AppFolderDialog.acceptDrop` (`:2857-2865`) takes the app *out* — the same as a drop on the
+  shade. `_withinDialog` (`:2807-2810`) measures the panel, but it only drives the backdrop
+  lightening and the popdown countdown, never who accepts.
+
+  Two grid-side bugs fell out of the same drag path: the frame a drag *begins* on drove the grid
+  behind the dialog (the motion path was gated on `_currentDialog`, the begin path was not), and a
+  drop onto another grid icon never took the app out of the folder it came from, so dragging one
+  from folder A into folder B copied it.
+
+  **Divergence (deliberate) — folding/joining from inside a folder.** GNOME refuses it: both
+  `AppIcon._canAccept` (`:3118-3123`) and `FolderIcon._canAccept` (`:2386-2392`) require the
+  *source's* view to be an `AppDisplay`, so an icon dragged out of a folder falls through to a
+  plain grid reorder plus `removeApp`. Ours accepts, because our icon offers to — it takes the
+  `:drop` state for a folder-sourced drag like any other — and an offer that silently does
+  something else is worse than the divergence.
+
+  **Not ported:** page-switching *inside* a folder mid-drag. `FolderView` inherits
+  `BaseAppView`'s edge bump and preview-band hover (`:827-959`) plus `acceptDrop`'s
+  page-indicator branch (`:1004-1013`); we wire those for the top-level grid only, so in a
+  folder with more than nine apps a member cannot be dragged onto the other page.
+
+  Two more, both from a folder big enough to paginate: the dialog never asked its inner view
+  whether an animation was running, so the page slide advanced only on frames something else had
+  asked for; and nothing clipped the view, so the outgoing and incoming pages slid across the
+  desktop on either side of the panel (`clip_to_allocation` — the app grid gets it from the output
+  edge, a 700px island in mid-screen does not).
 * **E3 — rename.** ✅ The edit button and the entry in the dialog.
 
   The name band now sizes to its tallest child (the entry, i.e. the line plus `%entry_common`'s

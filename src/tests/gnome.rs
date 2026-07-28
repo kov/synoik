@@ -7173,8 +7173,9 @@ fn overview_folder_dialog_renames_the_folder() {
 /// keeps the rest. The tile it becomes is GNOME's placeholder, added to the grid when the
 /// drag began (`_ensurePlaceholder`, `:1434-1448`).
 ///
-/// Dropping it back *inside* the panel is not a removal — GNOME reorders within the folder
-/// there, which we do not port yet, so the icon simply goes home.
+/// Dropping it back *inside* the panel is not a removal: that drop belongs to the folder's own
+/// view, which reorders its members (see `overview_dragging_inside_a_folder_reorders_its_members`)
+/// — and a drop on the slot the icon started in moves nothing.
 #[test]
 fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     use smithay::utils::{Point, Rectangle, Size};
@@ -7277,6 +7278,190 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
         "an emptied folder is deleted, not shown empty"
     );
     assert_eq!(f.niri().app_grid.index_of("z.desktop"), Some(2));
+}
+
+/// A drag that stays inside the folder reorders its members: `FolderView` is a
+/// `BaseAppView`, so it inherits the same delayed move the app display uses, and its
+/// `acceptDrop` writes the new order straight back to the folder's `apps`
+/// (`appDisplay.js:2213-2221`).
+#[test]
+fn overview_dragging_inside_a_folder_reorders_its_members() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(
+        &[],
+        &[
+            "a.desktop",
+            "m.desktop",
+            "n.desktop",
+            "o.desktop",
+            "z.desktop",
+        ],
+    );
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec![
+            "m.desktop".to_owned(),
+            "n.desktop".to_owned(),
+            "o.desktop".to_owned(),
+            "z.desktop".to_owned(),
+        ],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let area = overview_controls(&mut f).app_display;
+    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri().folder_dialog.member_ids(),
+        vec!["m.desktop", "n.desktop", "o.desktop", "z.desktop"]
+    );
+
+    let at = |f: &mut Fixture, i: usize| {
+        f.niri()
+            .folder_dialog
+            .entry_center(i, view)
+            .expect("member tile")
+    };
+    let (first, second, third) = (at(&mut f, 0), at(&mut f, 1), at(&mut f, 2));
+    let pitch = second.x - first.x;
+
+    // The first member, dropped just past the third: it lands *after* it.
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(
+        f.niri().folder_pending_move.is_some(),
+        "the folder arms the same delayed move the grid does"
+    );
+    // A drop that beats the 200 ms timer still commits the move, as it does in the grid.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        f.niri().folder_dialog.is_open(),
+        "a drop inside the panel is the folder's, so the dialog stays up"
+    );
+    assert_eq!(
+        f.niri().folder_dialog.member_ids(),
+        vec!["n.desktop", "o.desktop", "m.desktop", "z.desktop"],
+        "the dragged member took its new place"
+    );
+    assert_eq!(
+        f.niri().app_grid.index_of("m.desktop"),
+        None,
+        "and the drag placeholder is gone from the grid behind"
+    );
+
+    // A drag that goes nowhere puts them back: `_onDragCancelled` → `_redisplay`.
+    let (first, second) = (at(&mut f, 0), at(&mut f, 1));
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, second.x, second.y);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        f.niri().folder_dialog.member_ids(),
+        vec!["n.desktop", "o.desktop", "m.desktop", "z.desktop"],
+        "a drag back to where it started changes nothing"
+    );
+
+    // A drop that beat the 200 ms timer must *unregister* it, not merely forget it: a
+    // one-shot left registered fires against the next drag and commits its armed move on
+    // the spot, which is the delayed move failing open.
+    let (first, third) = (at(&mut f, 0), at(&mut f, 2));
+    let pitch = at(&mut f, 1).x - first.x;
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    let after_first = f.niri().folder_dialog.member_ids();
+
+    // Wait out most of that timer's delay, so its firing lands *inside* the window the
+    // second drag is watched over.
+    f.dispatch_until(Duration::from_millis(150), |_| false);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
+    assert!(f.niri().folder_pending_move.is_some(), "a move is armed");
+    let moved_early = f.dispatch_until(Duration::from_millis(100), |state| {
+        state.niri.folder_dialog.member_ids() != after_first
+    });
+    assert!(
+        !moved_early,
+        "nothing moves before the delay is out: {:?} became {:?}",
+        after_first,
+        f.niri().folder_dialog.member_ids()
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+}
+
+/// The folder's **view** is what takes a drop, not the panel around it: the name row has no
+/// delegate of its own, so a drop there bubbles to the dialog actor — which covers the whole
+/// monitor — and `AppFolderDialog.acceptDrop` pops down and removes the app
+/// (`appDisplay.js:2857-2865`), exactly as a drop on the shade does.
+#[test]
+fn overview_dropping_a_member_on_the_folder_name_row_takes_it_out() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let area = overview_controls(&mut f).app_display;
+    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    let l = crate::ui::folder_dialog::layout(view);
+    let name = Point::from((
+        l.name_band.loc.x + l.name_band.size.w / 2.,
+        l.name_band.loc.y + l.name_band.size.h / 2.,
+    ));
+    assert!(
+        l.panel.contains(name) && !l.grid_area.contains(name),
+        "the name row is on the panel but off the view"
+    );
+
+    let member = f
+        .niri()
+        .folder_dialog
+        .entry_center(0, view)
+        .expect("tile 0");
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, name.x, name.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        !f.niri().folder_dialog.is_open(),
+        "the dialog takes the drop and pops down"
+    );
+    assert_eq!(
+        f.niri().app_grid.index_of("m.desktop"),
+        Some(2),
+        "the app is a top-level tile now"
+    );
 }
 
 /// The grid behind the open dialog takes no part in a drag that never leaves the panel:

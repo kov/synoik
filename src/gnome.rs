@@ -1100,6 +1100,32 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Write the folder `id`'s members back in the order a drag left them
+    /// (`FolderView.acceptDrop`, `appDisplay.js:2213-2221`).
+    ///
+    /// The one folder write that is *not* a read-modify-write, and GNOME's is not either:
+    /// `_orderedItems` is the resolved membership, so for a categories-based folder this
+    /// does list the swept-in apps in `apps` explicitly. `categories` stays, so the sweep
+    /// still picks up anything installed later; only the apps that were already there
+    /// gain an explicit position — which is the point of reordering them.
+    pub fn set_app_folder_apps(&self, id: &str, apps: Vec<String>) {
+        let folder_id = id.to_owned();
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if s.app_folders.is_some() {
+                    if let Some(store) = folder_settings(&folder_id, None) {
+                        let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
+                        if let Err(err) = store.set_strv("apps", refs) {
+                            warn!("error reordering the app folder {folder_id}: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Rename the folder `id` (`_maybeUpdateFolderName`, `appDisplay.js:2650-2657`).
     /// `translate` goes off with it: a user-typed name is the string to show, not a
     /// `.directory` basename to look up.

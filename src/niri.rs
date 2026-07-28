@@ -686,6 +686,11 @@ pub struct Niri {
     /// outside its panel; when it fires the dialog pops down and the drag carries on over
     /// the grid (`_setupPopdownTimeout`, `appDisplay.js:2832-2841`).
     pub folder_popdown_timer: Option<RegistrationToken>,
+    /// The same delayed move as `grid_pending_move`, but among the *open folder's* members:
+    /// `FolderView` inherits `BaseAppView._maybeMoveItem`, so a drag inside the dialog
+    /// reorders the folder on exactly the same terms.
+    pub folder_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
+    pub folder_move_timer: Option<RegistrationToken>,
     /// The timer that flips the grid's page while a drag hovers a preview band or leans
     /// on the screen edge (`appDisplay.js:827-921`) — first the initial delay, then the
     /// repeat.
@@ -3960,6 +3965,8 @@ impl Niri {
             grid_drop_target: None,
             grid_drop_timer: None,
             folder_popdown_timer: None,
+            folder_pending_move: None,
+            folder_move_timer: None,
             grid_page_switch_timer: None,
             grid_page_switch_overshoot: None,
             app_grid_last_page_flip: None,

@@ -17,8 +17,6 @@
 //!   *is* modeled — it is what makes typing over the old name work). GNOME centers the label by
 //!   balancing the edit button with an equally-sized ghost actor (`_addFolderNameEntry`,
 //!   `appDisplay.js:2531-2601`); centering it in the band puts it in the same place.
-//! - **Reordering inside a folder** (`FolderView.acceptDrop`) is not ported: a member dragged back
-//!   onto the folder's own view goes home. Dragging one *out* does remove it.
 //! - The panel is **clamped** to the space the container leaves it. GNOME allocates its natural
 //!   720² and lets a short screen clip it (which is why the container pads the top by the panel
 //!   height at all, `_app-grid.scss:53-56`); we would have no way to reach what fell off.
@@ -41,7 +39,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::app_grid::{
-    AppGrid, AppGridEntry, FocusDir, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
+    AppGrid, AppGridEntry, FocusDir, GridDropTarget, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
 };
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::widget::{self, style, Align, Painter};
@@ -667,6 +665,65 @@ impl FolderDialog {
             return false;
         };
         open.view.remove_entry(id)
+    }
+
+    /// The open folder's members, in the order the view has them — what
+    /// `FolderView.acceptDrop` writes back to the folder's `apps`
+    /// (`this._orderedItems.map(item => item.id)`, `appDisplay.js:2213-2221`).
+    pub fn member_ids(&self) -> Vec<String> {
+        let Some(open) = &self.open else {
+            return Vec::new();
+        };
+        (0..open.view.entry_count())
+            .filter_map(|i| open.view.entry_id(i).map(str::to_owned))
+            .collect()
+    }
+
+    /// Tiles per page of the open folder's view, for a drop target to count in.
+    pub fn items_per_page(&self, view: Rectangle<f64, Logical>) -> Option<usize> {
+        let open = self.open.as_ref()?;
+        Some(open.view.items_per_page(layout(view).grid_area))
+    }
+
+    /// Where a drag holding `dragged` would land among the members — the folder's own
+    /// half of `BaseAppView._maybeMoveItem`, which `FolderView` inherits, and which is
+    /// what makes reordering *inside* a folder work at all.
+    pub fn drop_target_at(
+        &self,
+        pos: Point<f64, Logical>,
+        view: Rectangle<f64, Logical>,
+        dragged: &str,
+    ) -> Option<GridDropTarget> {
+        let open = self.open.as_ref()?;
+        open.view
+            .drop_target_at(pos, layout(view).grid_area, dragged)
+    }
+
+    /// Move a member to `target` within the folder. Returns whether anything moved.
+    pub fn move_entry(&mut self, id: &str, target: GridDropTarget, per_page: usize) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        open.view.move_entry(id, target, per_page)
+    }
+
+    /// Remember the members' order, so a drag that ends nowhere puts them back
+    /// (`_onDragCancelled` → `_redisplay`).
+    pub fn begin_reorder(&mut self) {
+        if let Some(open) = &mut self.open {
+            open.view.begin_reorder();
+        }
+    }
+
+    /// Put the members back where they were. Returns whether anything moved back.
+    pub fn cancel_reorder(&mut self) -> bool {
+        self.open.as_mut().is_some_and(|o| o.view.cancel_reorder())
+    }
+
+    /// Keep the members where the drag left them. Returns whether the order changed —
+    /// i.e. whether `apps` is worth writing.
+    pub fn finish_reorder(&mut self) -> bool {
+        self.open.as_mut().is_some_and(|o| o.view.finish_reorder())
     }
 
     /// Whether the rename entry is up (`_showFolderEntry`, `appDisplay.js:2643-2648`).

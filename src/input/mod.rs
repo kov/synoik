@@ -3895,8 +3895,10 @@ impl State {
         self.niri.dash.set_drag_active(true);
         self.niri.app_grid.set_drag_active(true);
         // The live grid reflow is provisional: remember where everything was, so a drag
-        // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`).
+        // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`). The open
+        // folder's view reorders on the same terms, and takes the same snapshot.
         self.niri.app_grid.begin_reorder();
+        self.niri.folder_dialog.begin_reorder();
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
@@ -3926,8 +3928,12 @@ impl State {
         self.niri.folder_dialog.set_drag_outside(outside);
         if !outside {
             self.clear_folder_popdown_timer();
+            self.update_folder_drop_target();
             return;
         }
+        // Out over the shade the members stop rearranging, but they stay where the drag
+        // has already left them — the reorder is only undone by a cancel.
+        self.clear_folder_pending_move();
         if self.niri.folder_popdown_timer.is_some() {
             return;
         }
@@ -3952,6 +3958,90 @@ impl State {
     fn clear_folder_popdown_timer(&mut self) {
         if let Some(token) = self.niri.folder_popdown_timer.take() {
             self.niri.event_loop.remove(token);
+        }
+    }
+
+    /// Track where a drag inside the open folder would land among its members and arm the
+    /// delayed move. `FolderView` is a `BaseAppView` like the app display, so it inherits
+    /// the same `_maybeMoveItem` — including the [`DELAYED_MOVE_MS`] wait, which is what
+    /// keeps a drag that merely sweeps across the folder from shuffling it.
+    fn update_folder_drop_target(&mut self) {
+        let Some(drag) = &self.niri.app_drag else {
+            return;
+        };
+        let (id, pos, output) = (drag.id.clone(), drag.pos, drag.output.clone());
+        // Only a member of *this* folder reorders it. An icon dragged in from elsewhere
+        // cannot be here anyway — the dialog is modal and the grid is covered.
+        if drag.from_folder.as_deref() != self.niri.folder_dialog.folder_id() {
+            self.clear_folder_pending_move();
+            return;
+        }
+        let view = Rectangle::from_size(output_size(&output));
+        let Some(per_page) = self.niri.folder_dialog.items_per_page(view) else {
+            self.clear_folder_pending_move();
+            return;
+        };
+        let target = self
+            .niri
+            .folder_dialog
+            .drop_target_at(pos, view, &id)
+            // Over the body of an icon, or over the dragged icon's own slot, there is
+            // nothing to reflow around. Folding a folder into a folder is not a thing
+            // (`FolderView` holds no `FolderIcon`s), so `ON_ICON` here is simply dead.
+            .filter(|t| t.location != DragLocation::OnIcon);
+        let Some(target) = target else {
+            self.clear_folder_pending_move();
+            return;
+        };
+        if self.niri.folder_pending_move == Some((target, per_page)) {
+            return; // unchanged — let the armed timer run out
+        }
+
+        self.clear_folder_pending_move();
+        self.niri.folder_pending_move = Some((target, per_page));
+        let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.folder_move_timer = None;
+                state.apply_folder_pending_move();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.niri.folder_move_timer = Some(token);
+    }
+
+    /// Forget any armed move inside the folder.
+    fn clear_folder_pending_move(&mut self) {
+        self.niri.folder_pending_move = None;
+        if let Some(token) = self.niri.folder_move_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+    }
+
+    /// Commit the armed move — from the timer, or from the drop when it beat the timer.
+    ///
+    /// Goes through [`Self::clear_folder_pending_move`] so the *source* is unregistered and
+    /// not merely forgotten: a one-shot the drop beat still fires, and would then commit the
+    /// next drag's armed move the moment it is armed — the delayed move's whole point being
+    /// that it is not immediate. (The timer path nulls the token before calling in, so this
+    /// never removes a source from inside its own callback.)
+    fn apply_folder_pending_move(&mut self) {
+        let Some((target, per_page)) = self.niri.folder_pending_move else {
+            return;
+        };
+        self.clear_folder_pending_move();
+        let Some(id) = self.niri.app_drag.as_ref().map(|d| d.id.clone()) else {
+            return;
+        };
+        // Escape pops the dialog down without ending the drag, so a timer armed a moment
+        // earlier can land on a folder that is already shrinking.
+        if !self.niri.folder_dialog.is_open() {
+            return;
+        }
+        if self.niri.folder_dialog.move_entry(&id, target, per_page) {
+            self.niri.queue_redraw_all();
         }
     }
 
@@ -4189,6 +4279,7 @@ impl State {
             .niri
             .event_loop
             .insert_source(timer, move |_, _, state| {
+                state.niri.grid_move_timer = None;
                 state.apply_grid_pending_move();
                 TimeoutAction::Drop
             })
@@ -4248,10 +4339,16 @@ impl State {
             return false;
         };
         let (source_id, output) = (drag.id.clone(), drag.output.clone());
-        // An app dragged out of a folder is a *move*, not a copy: whatever takes the drop,
-        // it leaves the folder it came from (`AppDisplay.acceptDrop`'s `view.removeApp`,
-        // `appDisplay.js:1688-1691`, which runs for every drop the app display accepts —
-        // folding and joining included).
+        // An app dragged out of a folder is a *move*, not a copy: it leaves the folder it
+        // came from, as it does on every other drop the app display accepts
+        // (`AppDisplay.acceptDrop`'s `view.removeApp`, `appDisplay.js:1688-1691`).
+        //
+        // Divergence: in GNOME this drop cannot happen at all. Both `AppIcon._canAccept`
+        // (`:3118-3123`) and `FolderIcon._canAccept` (`:2386-2392`) require the *source's*
+        // view to be an `AppDisplay`, so an icon dragged out of a folder is refused by the
+        // icon under it and falls through to a plain grid reorder. We let it fold and join,
+        // because the icon offers to — it takes the `:drop` state either way — and a
+        // visible offer that silently does something else is worse than the divergence.
         let from_folder = drag.from_folder.clone();
 
         if self.niri.app_grid.entry_folder(target).is_some() {
@@ -4347,11 +4444,14 @@ impl State {
 
     /// Commit the armed move — from the timer, or from the drop when it beat the timer
     /// (`acceptDrop`, `appDisplay.js:1014-1020`).
+    ///
+    /// Clears rather than forgets, for the reason [`Self::apply_folder_pending_move`]
+    /// spells out: a one-shot the drop beat is still registered.
     fn apply_grid_pending_move(&mut self) {
-        self.niri.grid_move_timer = None;
-        let Some((target, per_page)) = self.niri.grid_pending_move.take() else {
+        let Some((target, per_page)) = self.niri.grid_pending_move else {
             return;
         };
+        self.clear_grid_pending_move();
         let Some(id) = self.niri.app_drag.as_ref().map(|d| d.id.clone()) else {
             return;
         };
@@ -4528,12 +4628,29 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    /// Finish a drag that ended while the folder dialog was still up. Outside the panel
-    /// the dialog takes the drop itself: it pops down, the app leaves the folder and the
-    /// grid selects it (`AppFolderDialog.acceptDrop`, `appDisplay.js:2857-2865`). Inside,
-    /// the drag is simply abandoned — reordering *within* a folder is not ported yet, so
-    /// a drop back on the folder's own view puts the icon back rather than moving it.
+    /// Finish a drag that ended while the folder dialog was still up.
+    ///
+    /// The boundary is the folder's **view**, not the panel: a drop on it is
+    /// `FolderView.acceptDrop` (`appDisplay.js:2213-2221`), which keeps the new order —
+    /// reordering inside a folder. A drop anywhere else has no delegate that takes it and
+    /// bubbles to the dialog actor, which covers the whole monitor: `AppFolderDialog`
+    /// pops down, the app leaves the folder and the grid selects it (`:2857-2865`). So
+    /// releasing over the folder's *name row* takes the app out, exactly as releasing over
+    /// the shade does — the panel chrome is not a drop target.
     fn end_folder_dialog_drag(&mut self) {
+        // A drop that beat the delayed-move timer still commits the move, as it does in
+        // the grid. Before `app_drag` is taken — that is where the id comes from.
+        let over_view = self.niri.app_drag.as_ref().is_some_and(|drag| {
+            let view = Rectangle::from_size(output_size(&drag.output));
+            crate::ui::folder_dialog::layout(view)
+                .grid_area
+                .contains(drag.pos)
+        });
+        if over_view {
+            self.apply_folder_pending_move();
+        }
+        self.clear_folder_pending_move();
+
         let Some(drag) = self.niri.app_drag.take() else {
             return;
         };
@@ -4541,11 +4658,10 @@ impl State {
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
 
-        let view = Rectangle::from_size(output_size(&drag.output));
-        let outside = self.niri.folder_dialog.hit_test(drag.pos, view) == Some(DialogHit::Outside);
         let from_folder = drag.from_folder.clone();
-        match drag.from_folder.filter(|_| outside) {
+        match drag.from_folder.filter(|_| !over_view) {
             Some(folder) => {
+                self.niri.folder_dialog.cancel_reorder();
                 self.niri.folder_dialog.popdown();
                 self.leave_folder(&folder, &drag.id);
                 self.niri.app_grid.finish_reorder();
@@ -4559,6 +4675,15 @@ impl State {
                 self.niri.app_grid.cancel_reorder();
                 if from_folder.is_some() {
                     self.niri.app_grid.remove_entry(&drag.id);
+                }
+                // The folder keeps whatever order the drag left, and writes it back.
+                if self.niri.folder_dialog.finish_reorder() {
+                    if let Some(folder) = self.niri.folder_dialog.folder_id().map(str::to_owned) {
+                        let apps = self.niri.folder_dialog.member_ids();
+                        if let Some(writer) = &self.niri.gnome_settings_writer {
+                            writer.set_app_folder_apps(&folder, apps);
+                        }
+                    }
                 }
             }
         }
