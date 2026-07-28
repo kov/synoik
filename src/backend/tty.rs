@@ -60,6 +60,7 @@ use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
+use crate::monitors_xml::{MonitorsConfig, SavedMode};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::vulkan::VulkanRenderer;
@@ -2242,6 +2243,62 @@ impl Tty {
         false
     }
 
+    /// Drops a live-applied display config the hardware can no longer satisfy.
+    ///
+    /// A config applied this session (GNOME Settings' `ApplyMonitorsConfig`, `niri msg output`,
+    /// wlr-output-management) outranks everything, which is right while the display it was applied
+    /// to is still there — and wrong the moment it isn't. Moving this VM's window from an external
+    /// monitor to the laptop panel keeps the connector but changes the mode list, and the external
+    /// display's scale would otherwise stick forever, on a resolution it never asked for.
+    ///
+    /// mutter takes exactly this test — a current config survives a hardware change only if
+    /// `is_config_applicable` still accepts it (see [`applied_config_is_stale`]) — and falls back
+    /// to the store, then to the computed default, when it fails. Ours lives in two places (the
+    /// override plus the fields the apply wrote into the output config), so both go: the whole
+    /// point is to leave nothing of the old display behind for the chain to pick up. Only outputs
+    /// with a recorded override are touched, so a scale/mode a user wrote in their KDL config by
+    /// hand is never cleared.
+    fn forget_inapplicable_applied_config(&mut self, niri: &mut Niri) {
+        let mut stale = vec![];
+        for device in self.devices.values() {
+            for surface in device.surfaces.values() {
+                if !niri
+                    .applied_display_config
+                    .contains_key(&surface.name.connector)
+                {
+                    continue;
+                }
+                let Some(connector) = device.drm_scanner.connectors().get(&surface.connector)
+                else {
+                    continue;
+                };
+                let config_mode = self
+                    .config
+                    .borrow()
+                    .outputs
+                    .find(&surface.name)
+                    .and_then(|c| c.mode);
+                if applied_config_is_stale(&AdvertisedMode::list(connector), config_mode) {
+                    stale.push(surface.name.clone());
+                }
+            }
+        }
+
+        for name in stale {
+            debug!(
+                "output {:?}: dropping the applied display config, its mode is gone",
+                name.connector
+            );
+            niri.applied_display_config.remove(&name.connector);
+            let mut config = self.config.borrow_mut();
+            if let Some(output) = config.outputs.find_mut(&name) {
+                output.mode = None;
+                output.scale = None;
+                output.transform = niri_ipc::Transform::Normal;
+            }
+        }
+    }
+
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
         let _span = tracy_client::span!("Tty::on_output_config_changed");
 
@@ -2251,6 +2308,8 @@ impl Tty {
             return;
         }
         self.update_output_config_on_resume = false;
+
+        self.forget_inapplicable_applied_config(niri);
 
         // Figure out if we should disable laptop panels.
         let disable_laptop_panels = self.should_disable_laptop_panels(niri.is_lid_closed);
@@ -2394,16 +2453,9 @@ impl Tty {
                     // lookup and the DPI guess are keyed on the current mode, so keeping the
                     // previous values renders the new display at the old display's scale.
                     //
-                    // If the mode wasn't asked for by config, the change came from the hardware
-                    // (this VM moving between displays, a dock swapping panels), so the
-                    // live-applied override goes with it — mutter likewise discards a current
-                    // config the new hardware can't satisfy and re-runs its config chain
-                    // (meta-monitor-manager.c `meta_monitor_manager_ensure_configured` →
-                    // `meta_monitor_manager_is_config_complete` → `is_config_applicable`).
-                    if config.mode.is_none() {
-                        niri.applied_display_config.remove(&surface.name.connector);
-                    }
-                    let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+                    // (An override the new hardware invalidated is already gone — see
+                    // `forget_inapplicable_applied_config`.)
+                    let monitors_config = MonitorsConfig::load();
                     let (scale, transform) =
                         niri.derive_output_scale_transform(&output, monitors_config.as_ref());
                     if output.current_scale().fractional_scale() != scale
@@ -3258,58 +3310,135 @@ fn modeinfo_name_slice_from_string(mode_name: &str) -> [core::ffi::c_char; 32] {
     name
 }
 
-/// The mode to drive an output at: the KDL `output {}` mode when the user set one (and a live
-/// apply lands there too), else the mode GNOME's `monitors.xml` store saved for this monitor.
+/// One mode a connector advertises, reduced to what mode selection cares about.
+///
+/// Selection is expressed over this rather than over `drm::control::Mode` so it can be tested
+/// without a DRM device: the plumbing around it (scanning connectors, setting the mode) needs
+/// real hardware, but the *decisions* do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdvertisedMode {
+    width: u16,
+    height: u16,
+    /// Refresh in mHz, as `smithay::output::Mode` counts it.
+    refresh: i32,
+}
+
+impl AdvertisedMode {
+    fn list(connector: &connector::Info) -> Vec<Self> {
+        connector
+            .modes()
+            .iter()
+            // Interlaced modes don't appear to work (same filter as `pick_mode`).
+            .filter(|m| !m.flags().contains(ModeFlags::INTERLACE))
+            .map(|m| {
+                let (width, height) = m.size();
+                Self {
+                    width,
+                    height,
+                    refresh: Mode::from(*m).refresh,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether `mode` can be assigned on a connector advertising `advertised`, by `pick_mode`'s rules:
+/// the size must be advertised, and a mode that names a refresh rate needs that rate exactly (with
+/// no rate, `pick_mode` takes the highest of that size).
+fn mode_is_available(advertised: &[AdvertisedMode], mode: niri_config::output::Mode) -> bool {
+    // A custom modeline is generated, not chosen from the advertised list.
+    if mode.custom {
+        return true;
+    }
+    let refresh = mode.mode.refresh.map(|r| (r * 1000.).round() as i32);
+    advertised.iter().any(|m| {
+        (m.width, m.height) == (mode.mode.width, mode.mode.height)
+            && refresh.is_none_or(|r| m.refresh == r)
+    })
+}
+
+/// Whether a live-applied display config has been invalidated by the hardware.
+///
+/// mutter reuses its current config across a hardware change only if it is still *applicable* —
+/// every monitor's mode must be assignable (`meta-monitor-manager.c`
+/// `meta_monitor_manager_ensure_configured` → `meta_monitor_manager_is_config_complete` →
+/// `is_config_applicable`); otherwise it is discarded and the chain re-runs from the store. This
+/// is that test: the connector no longer offers the mode the apply asked for, so this is a
+/// different display and the scale that came with it means nothing here.
+fn applied_config_is_stale(
+    advertised: &[AdvertisedMode],
+    config_mode: Option<niri_config::output::Mode>,
+) -> bool {
+    config_mode.is_some_and(|mode| !mode_is_available(advertised, mode))
+}
+
+/// The mode to drive an output at: the config's mode when the hardware can still deliver it (the
+/// KDL `output {}` mode, and a live apply lands there too), else the mode GNOME's `monitors.xml`
+/// store saved for this monitor, else `None` for the preferred mode.
 ///
 /// Restoring the stored mode is what makes a stored *scale* come back at all: the scale lookup is
 /// gated on the mode its setting was saved for, so a monitor lighting up at its preferred mode
 /// would reject the entry and fall through to the DPI guess (see
 /// [`MonitorsConfig::saved_modes_for`]). mutter restores the two together.
 ///
-/// Only a mode the connector actually advertises is returned, so a stored mode can never trip
-/// `pick_mode`'s "configured mode could not be found" fallback.
-fn target_mode(
-    connector: &connector::Info,
-    name: &OutputName,
-    config: &niri_config::Output,
+/// Everything returned is either a custom modeline or a mode the connector advertises, so this can
+/// never trip `pick_mode`'s "configured mode could not be found" fallback.
+fn choose_target_mode(
+    advertised: &[AdvertisedMode],
+    config_mode: Option<niri_config::output::Mode>,
+    saved: &[SavedMode],
 ) -> Option<niri_config::output::Mode> {
-    if config.mode.is_some() {
-        return config.mode;
+    if let Some(mode) = config_mode {
+        if mode_is_available(advertised, mode) {
+            return Some(mode);
+        }
     }
 
-    let store = crate::monitors_xml::MonitorsConfig::load()?;
-    let saved_modes: Vec<_> = store.saved_modes_for(name).collect();
-    saved_modes.into_iter().find_map(|saved| {
-        let advertised = |m: &control::Mode| {
-            m.size() == (saved.width as u16, saved.height as u16)
-                && !m.flags().contains(ModeFlags::INTERLACE)
-        };
+    saved.iter().find_map(|saved| {
+        let same_size =
+            |m: &&AdvertisedMode| (m.width, m.height) == (saved.width as u16, saved.height as u16);
         // The rate only narrows the choice when the hardware advertises it exactly; mutter
         // compares rates with a tolerance, and a saved rate we can't match must not cost us the
         // resolution.
         let rate = (saved.rate * 1000.).round() as i32;
-        let refresh = connector
-            .modes()
+        let refresh = advertised
             .iter()
-            .filter(|m| advertised(m))
-            .any(|m| Mode::from(*m).refresh == rate)
+            .filter(same_size)
+            .any(|m| m.refresh == rate)
             .then_some(saved.rate);
 
-        connector.modes().iter().any(advertised).then_some({
-            debug!(
-                "output {:?}: restoring saved mode {}x{}",
-                name.connector, saved.width, saved.height
-            );
-            niri_config::output::Mode {
+        advertised
+            .iter()
+            .any(|m| same_size(&m))
+            .then_some(niri_config::output::Mode {
                 custom: false,
                 mode: niri_ipc::ConfiguredMode {
                     width: saved.width as u16,
                     height: saved.height as u16,
                     refresh,
                 },
-            }
-        })
+            })
     })
+}
+
+/// [`choose_target_mode`] against a real connector, loading the store on the spot.
+fn target_mode(
+    connector: &connector::Info,
+    name: &OutputName,
+    config: &niri_config::Output,
+) -> Option<niri_config::output::Mode> {
+    let saved: Vec<_> = MonitorsConfig::load()
+        .map(|store| store.saved_modes_for(name).collect())
+        .unwrap_or_default();
+
+    let chosen = choose_target_mode(&AdvertisedMode::list(connector), config.mode, &saved);
+    if chosen != config.mode {
+        debug!(
+            "output {:?}: driving saved mode {chosen:?} (config asked for {:?})",
+            name.connector, config.mode
+        );
+    }
+    chosen
 }
 
 fn pick_mode(
@@ -3814,5 +3943,111 @@ mod tests {
             ),
         }
         "#);
+    }
+}
+
+/// Mode selection across a display change.
+///
+/// The DRM plumbing around this (scanning connectors, switching the mode, re-deriving the scale)
+/// needs real hardware — a VKMS device, at least — but the decisions do not, and the decisions are
+/// where both display-swap bugs lived. `advertised` is what a connector offers, which is the only
+/// thing that changes when this VM's window moves between the laptop panel and an external screen.
+#[cfg(test)]
+mod mode_selection_tests {
+    use super::*;
+
+    fn adv(list: &[(u16, u16, i32)]) -> Vec<AdvertisedMode> {
+        list.iter()
+            .map(|&(width, height, refresh)| AdvertisedMode {
+                width,
+                height,
+                refresh,
+            })
+            .collect()
+    }
+
+    fn cfg(width: u16, height: u16, refresh: Option<f64>) -> Option<niri_config::output::Mode> {
+        Some(niri_config::output::Mode {
+            custom: false,
+            mode: niri_ipc::ConfiguredMode {
+                width,
+                height,
+                refresh,
+            },
+        })
+    }
+
+    fn saved(width: i32, height: i32, rate: f64) -> SavedMode {
+        SavedMode {
+            width,
+            height,
+            rate,
+        }
+    }
+
+    /// The internal panel and an external monitor, as this VM sees them: one connector, two mode
+    /// lists, and only the internal offers 2048x1330.
+    const INTERNAL: &[(u16, u16, i32)] = &[(2048, 1330, 59988), (1920, 1200, 59885)];
+    const EXTERNAL: &[(u16, u16, i32)] = &[(3840, 2160, 59996), (1920, 1080, 60000)];
+
+    #[test]
+    fn a_saved_mode_is_restored_when_the_config_asks_for_nothing() {
+        let chosen = choose_target_mode(&adv(INTERNAL), None, &[saved(1920, 1200, 59.885)]);
+        assert_eq!(chosen, cfg(1920, 1200, Some(59.885)));
+
+        // A saved rate the hardware doesn't advertise must not cost us the resolution: mutter
+        // compares rates with a tolerance, and dropping the rate lets `pick_mode` take the best
+        // of that size.
+        let chosen = choose_target_mode(&adv(INTERNAL), None, &[saved(1920, 1200, 74.9)]);
+        assert_eq!(chosen, cfg(1920, 1200, None));
+
+        // Nothing saved for a size this display has, so the preferred mode stands.
+        assert_eq!(
+            choose_target_mode(&adv(INTERNAL), None, &[saved(3840, 2160, 59.996)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_config_wins_until_the_hardware_stops_offering_its_mode() {
+        let want = cfg(1920, 1200, Some(59.885));
+        assert_eq!(choose_target_mode(&adv(INTERNAL), want, &[]), want);
+
+        // Gustavo's second report: set up on the external monitor, then move to the internal one.
+        // The external's mode is gone, so it must not be driven — nor may it drag its scale along
+        // (that is `applied_config_is_stale`), which is how the session ended up at the internal
+        // panel's preferred resolution wearing the external monitor's 200%.
+        let external = cfg(3840, 2160, Some(59.996));
+        assert!(!applied_config_is_stale(&adv(EXTERNAL), external));
+        assert!(applied_config_is_stale(&adv(INTERNAL), external));
+        assert_eq!(
+            choose_target_mode(&adv(INTERNAL), external, &[saved(1920, 1200, 59.885)]),
+            cfg(1920, 1200, Some(59.885)),
+            "with the applied config invalidated, the store gets its say again"
+        );
+
+        // A config with no mode at all can't be invalidated, and neither can a custom modeline
+        // (it is generated, not chosen from the list).
+        assert!(!applied_config_is_stale(&adv(INTERNAL), None));
+        let mut modeline = external.unwrap();
+        modeline.custom = true;
+        assert!(!applied_config_is_stale(&adv(INTERNAL), Some(modeline)));
+    }
+
+    #[test]
+    fn a_named_refresh_rate_has_to_be_there_too() {
+        // 1920x1200 exists on the internal panel, but not at 120 Hz.
+        assert!(mode_is_available(
+            &adv(INTERNAL),
+            cfg(1920, 1200, None).unwrap()
+        ));
+        assert!(mode_is_available(
+            &adv(INTERNAL),
+            cfg(1920, 1200, Some(59.885)).unwrap()
+        ));
+        assert!(!mode_is_available(
+            &adv(INTERNAL),
+            cfg(1920, 1200, Some(120.)).unwrap()
+        ));
     }
 }
