@@ -300,6 +300,23 @@ impl TileMetrics {
         ))
     }
 
+    /// The width the caption is laid out in.
+    ///
+    /// GNOME's caption is a child of `BaseIcon`, a `Shell.SquareBin` whose preferred
+    /// *width* is its preferred *height* (`shell-square-bin.c:14-30`,
+    /// `iconGrid.js:62,89-94`) — so the label box is as wide as icon + spacing + one
+    /// caption line is tall, not as wide as whatever the caller drew the tile at.
+    /// (With GNOME's `$base_padding` metrics that happens to equal [`Self::size`]'s
+    /// width, since `pad*2` and `label_gap + label_h` are both 24; pinned below.)
+    pub fn label_w(&self) -> f64 {
+        self.icon_px + self.label_gap + self.label_h
+    }
+
+    /// Top of the caption band within a tile box `rect` (logical).
+    pub fn label_top(&self, rect: Rectangle<f64, Logical>) -> f64 {
+        rect.loc.y + self.pad + self.icon_px + self.label_gap
+    }
+
     /// The icon's center within a tile box `rect` (logical) — the icon sits at the
     /// top of the tile, the label below it.
     pub fn icon_center(&self, rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
@@ -308,6 +325,35 @@ impl TileMetrics {
             rect.loc.y + self.pad + self.icon_px / 2.,
         ))
     }
+}
+
+/// How many lines an *expanded* tile caption may use.
+///
+/// GNOME does not cap it — `line_wrap: true` with `ellipsize: NONE` lets the label
+/// grow and the tile's allocation follow it. A bake needs a size up front, so we cap;
+/// three lines at the caption's wrap width clears every name in a default install,
+/// and [`tile_label_lines`] ellipsizes past it rather than dropping text silently.
+pub const TILE_LABEL_EXPAND_LINES: usize = 3;
+
+/// The caption lines of a `.overview-tile`, top to bottom, for a label box `wrap_w`
+/// wide (see [`TileMetrics::label_w`]).
+///
+/// GNOME's two states (`AppViewItem._updateMultiline`, `appDisplay.js:1891-1924`):
+///
+/// * **collapsed** — one line, ellipsized at the end. That is not something the app grid opts into:
+///   `StLabel` sets `PANGO_ELLIPSIZE_END` on its `ClutterText` (`st-label.c:331`), so it is what
+///   *every* caption does, search results included (they pass `expandTitleOnHover: false`,
+///   `appDisplay.js:1837-1841`, and so never leave this state).
+/// * **expanded** — hover, key focus, or the forced highlight of an open context menu
+///   (`appDisplay.js:1901`): wrapping on (`Pango.WrapMode.WORD_CHAR`), ellipsis off, so the whole
+///   name is readable.
+///
+/// Break points are computed in **logical** px, so they do not move with the output
+/// scale; the result is memoized in [`niri_vk::text::wrap_lines_weighted`].
+pub fn tile_label_lines(name: &str, pt: f64, wrap_w: f64, expanded: bool) -> Vec<String> {
+    let px = crate::ui::pt_to_px(pt) as f32;
+    let max = if expanded { TILE_LABEL_EXPAND_LINES } else { 1 };
+    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max)
 }
 
 /// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
@@ -1390,6 +1436,26 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         Ok(())
     }
 
+    /// Draw a tile caption — one band of `line_h` per line, each centered in a box
+    /// `w` wide starting at the bake's origin. The lines come from
+    /// [`tile_label_lines`]; a collapsed caption is one of them, an expanded one is
+    /// several. Meant for a bake sized exactly `w × lines.len()*line_h`, which is why
+    /// it anchors at the origin rather than taking a tile rect.
+    pub fn caption(
+        &mut self,
+        lines: &[ShapedText],
+        w: f64,
+        line_h: f64,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        for (i, line) in lines.iter().enumerate() {
+            let top = i as f64 * line_h;
+            let band = Rectangle::new(Point::from((0., top)), Size::from((w, line_h)));
+            self.text_band(line, w / 2., HAlign::Center, top, line_h, color, band)?;
+        }
+        Ok(())
+    }
+
     /// Draw GNOME's `box-shadow`: a gaussian-blurred rounded rect behind a card.
     /// `rect`/`radius` are the casting box (logical); `blur` is the CSS blur radius
     /// (logical px; the gaussian σ = blur/2); `offset` shifts the shadow (logical —
@@ -1695,8 +1761,48 @@ mod tests {
     use smithay::backend::renderer::{Bind, ExportMem, Texture};
     use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
 
-    use super::{bake_uncached_sized, Painter, Revision};
+    use super::{bake_uncached_sized, tile_label_lines, Painter, Revision, TileMetrics};
     use crate::render_helpers::vulkan::VulkanRenderer;
+
+    /// GNOME lays a tile caption out in the `Shell.SquareBin` box, not the tile box —
+    /// two different derivations that happen to agree at GNOME's `$base_padding`
+    /// metrics (`pad*2` = 24 = `label_gap + label_h`). Pinned so a change to either
+    /// side of that coincidence shows up here instead of silently moving where every
+    /// app name ellipsizes.
+    #[test]
+    fn a_tile_caption_is_laid_out_in_the_square_bin_box() {
+        let m = TileMetrics::OVERVIEW;
+        assert_eq!(m.label_w(), m.icon_px + m.label_gap + m.label_h);
+        assert_eq!(m.label_w(), m.size().w);
+    }
+
+    /// A name that does not fit is ellipsized on one line collapsed, and wrapped
+    /// whole (no ellipsis) expanded — `_updateMultiline`, `appDisplay.js:1891-1924`.
+    /// Before this, a long name was hard-clipped mid-glyph by the label band.
+    #[test]
+    fn a_long_tile_caption_ellipsizes_collapsed_and_wraps_expanded() {
+        let name = "Passwords and Keys";
+        let w = TileMetrics::OVERVIEW.label_w();
+        let pt = crate::ui::BASE_FONT_PT;
+
+        let collapsed = tile_label_lines(name, pt, w, false);
+        assert_eq!(collapsed.len(), 1, "collapsed is a single line");
+        assert_ne!(collapsed[0], name, "…which this name does not fit on");
+        assert!(collapsed[0].ends_with('…'), "so it ends in an ellipsis");
+
+        let expanded = tile_label_lines(name, pt, w, true);
+        assert!(expanded.len() > 1, "expanded wraps: {expanded:?}");
+        assert!(!expanded.concat().contains('…'), "and drops the ellipsis");
+        assert_eq!(
+            expanded.join(" ").split_whitespace().collect::<Vec<_>>(),
+            name.split_whitespace().collect::<Vec<_>>(),
+            "the whole name is readable"
+        );
+
+        // A name that fits is untouched in both states — it stays in the page bake.
+        assert_eq!(tile_label_lines("Files", pt, w, false), vec!["Files"]);
+        assert_eq!(tile_label_lines("Files", pt, w, true), vec!["Files"]);
+    }
 
     /// The gaussian drop-shadow verb: a black shadow over a white buffer must darken the
     /// casting box to near-black, fade through mid-grey in the blur fringe just outside it,

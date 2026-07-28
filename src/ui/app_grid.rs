@@ -8,9 +8,13 @@
 //! show, **minus** the favorites (they live in the dash) and minus parental-control
 //! hidden apps: `AppDisplay._loadApps` is `Shell.AppSystem.get_installed().filter(a =>
 //! !appFavorites.isFavorite(a.get_id()) && parentalControls.shouldShowApp(a))`
-//! (`appDisplay.js:1492-1504`). Order is `a.name.localeCompare(b.name)`
-//! (`_compareItems`, `appDisplay.js:1122-1124`). A click launches the app and closes
-//! the overview (`AppIcon.activate` → `Main.overview.hide`, `appDisplay.js:3060,3077`).
+//! (`appDisplay.js:1492-1504`). Order is each app's saved `(page, position)` in
+//! `org.gnome.shell app-picker-layout`, with everything unplaced appended by name
+//! (`_compareItems`, `appDisplay.js:1475-1490`; the sort itself lives in
+//! `Niri::sync_app_grid`). A click launches the app and closes the overview
+//! (`AppIcon.activate` → `Main.overview.hide`, `appDisplay.js:3060,3077`). A caption
+//! too long for its box is ellipsized, and expands to the whole name wrapped while the
+//! tile is highlighted (`_updateMultiline`, `appDisplay.js:1891-1924`).
 //!
 //! **Paginated layout (`IconGrid`, `iconGrid.js`).** The page mode `(columns, rows)`
 //! is the `defaultGridModes` entry (`{3×8,4×6,6×4,8×3}`, `iconGrid.js:30-47`) whose
@@ -33,10 +37,13 @@
 //! they can crowd the edge tiles at very narrow widths. No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
 //! 1:1 swipe is deferred), no keyboard paging
-//! (`Page_Up/Down`), no folders/drag-reorder, and the saved `app-picker-layout` is
-//! ignored (pure name sort). The sort is a case-folded `to_lowercase` compare rather
+//! (`Page_Up/Down`), and no folders/drag-reorder — so `app-picker-layout` is read but
+//! never written back, and the apps GNOME would hide inside a folder are shown
+//! individually. The name fallback sort is a case-folded `to_lowercase` compare rather
 //! than full locale collation (`localeCompare`): std has no collator, so accented
-//! initials can misplace; an `icu` collator is the faithful fix. Like the dash and
+//! initials can misplace; an `icu` collator is the faithful fix. An expanded caption is
+//! capped at [`widget::TILE_LABEL_EXPAND_LINES`] lines (GNOME grows the tile without a
+//! limit) and it does not animate open. Like the dash and
 //! search, the grid draws on **every** output with one shared hover/page (GNOME shows
 //! it on the primary only); hit-testing stays per-output.
 
@@ -129,6 +136,15 @@ struct GridCache {
     /// The tile hover wash — a separate element so a hover change repositions it without
     /// re-baking (re-shaping) the labels (keeps the open animation smooth under the mouse).
     hover_bake: widget::BakeCache,
+    /// Captions too long for one line, one bake each, keyed by page-relative tile index.
+    ///
+    /// They cannot live in the page bake: the hovered one expands to the full wrapped
+    /// name (`_updateMultiline`, `appDisplay.js:1891-1924`), so the page bake would
+    /// depend on the hover again — the re-shape-every-frame stutter `c5336421` removed.
+    /// Giving each its own element means a hover change re-bakes one caption-sized
+    /// texture and leaves the other ~23 labels alone. Names that fit stay in the page
+    /// bake, so a typical page adds only a handful of elements.
+    long_labels: std::collections::HashMap<usize, widget::BakeCache>,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
     /// Full-color icon uploads (shared key space with the dash's and search's).
@@ -689,6 +705,92 @@ impl AppGrid {
             }
         }
 
+        // --- Tile captions. A name that fits its label box on one line goes into the
+        //     page bake below with everything else; a name that has to be cut becomes
+        //     its OWN element, because the hovered tile shows the whole name wrapped
+        //     (`_updateMultiline`, `appDisplay.js:1891-1924`) and folding that into the
+        //     page bake would make the page depend on the hover again. ---
+        let label_w = metrics.label_w();
+        let page_range = first..first + layout.tiles.len();
+        let expanded_at = self.hovered.filter(|i| page_range.contains(i));
+        let collapsed: Vec<Vec<String>> = page_entries
+            .iter()
+            .map(|e| widget::tile_label_lines(&e.name, LABEL_PT, label_w, false))
+            .collect();
+        // Hover-independent by construction: whether a name fits is a property of the
+        // name and the label box, so the page bake's contents still never move on hover.
+        let fits: Vec<bool> = collapsed
+            .iter()
+            .zip(page_entries)
+            .map(|(lines, e)| lines.first().is_none_or(|line| *line == e.name))
+            .collect();
+
+        cache
+            .long_labels
+            .retain(|k, _| fits.get(*k).is_some_and(|fits| !fits));
+        // How much taller the expanded caption made the hovered tile — GNOME's tile
+        // allocation follows its label, so the `:hover` background grows with it.
+        let mut expanded_extra_h = 0.;
+        for (k, entry) in page_entries.iter().enumerate() {
+            if fits[k] {
+                continue;
+            }
+            let expanded = expanded_at == Some(first + k);
+            let lines = if expanded {
+                widget::tile_label_lines(&entry.name, LABEL_PT, label_w, true)
+            } else {
+                collapsed[k].clone()
+            };
+            let line_h = metrics.label_h;
+            if expanded {
+                expanded_extra_h = line_h * (lines.len() as f64 - 1.);
+            }
+            let size = Size::from((label_w, line_h * lines.len() as f64));
+            let revision = widget::Revision::new().each(&lines).done();
+            let shape_lines = lines.clone();
+            let bake = match widget::bake(
+                renderer,
+                cache.long_labels.entry(k).or_default(),
+                scale,
+                size,
+                revision,
+                move |r| {
+                    let mut shaper = widget::TextShaper::new(r, scale);
+                    shape_lines
+                        .iter()
+                        .map(|line| shaper.shape(line, widget::TextStyle::new(LABEL_PT)))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                },
+                move |frame, phys, shaped| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    p.caption(shaped, label_w, line_h, style::TEXT)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => texture,
+                Err(err) => {
+                    tracing::error!("error baking an app-grid caption: {err:#}");
+                    continue;
+                }
+            };
+            let tile = layout.tiles[k];
+            let at = Point::from((
+                (tile.loc.x + (tile.size.w - label_w) / 2.).round(),
+                metrics.label_top(tile),
+            ));
+            let buffer =
+                TextureBuffer::from_texture(renderer, bake, scale, Transform::Normal, vec![]);
+            elements.push(TextureRenderElement::from_texture_buffer(
+                buffer,
+                at,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ));
+        }
+
         // --- The tile labels, one baked transparent texture the size of the block. The
         //     hover wash is drawn as a SEPARATE element below, so a hover change (every
         //     mouse move) never re-runs this text shaping — the bake is keyed on
@@ -698,9 +800,16 @@ impl AppGrid {
         let rel_rects: Vec<Rectangle<f64, Logical>> = layout
             .tiles
             .iter()
-            .map(|t| Rectangle::new(t.loc - origin, t.size))
+            .zip(&fits)
+            .filter(|(_, fits)| **fits)
+            .map(|(t, _)| Rectangle::new(t.loc - origin, t.size))
             .collect();
-        let names: Vec<String> = page_entries.iter().map(|e| e.name.clone()).collect();
+        let names: Vec<String> = page_entries
+            .iter()
+            .zip(&fits)
+            .filter(|(_, fits)| **fits)
+            .map(|(e, _)| e.name.clone())
+            .collect();
         match widget::bake(
             renderer,
             &mut cache.bake,
@@ -746,11 +855,14 @@ impl AppGrid {
         // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten
         //     element under the labels/icons. Baked at one tile's size and just
         //     repositioned as the pointer moves between tiles, so it costs no re-shape. ---
-        if let Some(tile) = self
+        if let Some(mut tile) = self
             .hovered
             .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
             .map(|i| layout.tiles[i - first])
         {
+            // An expanded caption is taller than the one line the tile box reserves;
+            // GNOME re-allocates the tile around it, so the wash covers the extra lines.
+            tile.size.h += expanded_extra_h;
             let radius = metrics.radius;
             match widget::bake(
                 renderer,

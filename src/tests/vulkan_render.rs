@@ -7193,6 +7193,112 @@ fn vulkan_app_grid_draws_hovered_tile() {
     );
 }
 
+/// A grid caption too long for one line ellipsizes at rest and, when the tile is
+/// highlighted, wraps onto further lines showing the whole name
+/// (`AppViewItem._updateMultiline`, `appDisplay.js:1891-1924`). Before this the label
+/// was hard-clipped to the tile box, so the tail of a long name was cut mid-glyph and
+/// hovering did nothing.
+///
+/// Sampled on the *second* caption line, which only exists when expanded: at rest that
+/// band is empty, hovered it carries glyph ink (bright, well past the 10% hover wash
+/// that also grows over it).
+#[test]
+fn vulkan_app_grid_expands_a_long_caption_on_hover() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+    use crate::ui::widget::TileMetrics;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!(
+            "skipping vulkan_app_grid_expands_a_long_caption_on_hover: no Vulkan device ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Tile 1's name does not fit the caption box; tile 0's does.
+    let long = "Passwords and Keys";
+    f.niri().app_grid.set_entries(
+        ["Files", long]
+            .iter()
+            .map(|n| AppGridEntry {
+                id: format!("{n}.desktop"),
+                name: (*n).to_string(),
+                icon: AppIconRef::Fallback,
+            })
+            .collect(),
+    );
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
+    let m = TileMetrics::OVERVIEW;
+    // Tile top from its center, then the middle of the SECOND caption line's band.
+    let tile_top = t1.y - m.size().h / 2.;
+    let row_y = (tile_top + m.pad + m.icon_px + m.label_gap + m.label_h * 1.5) as i32;
+    let first_x = (t1.x - m.label_w() / 2.) as i32;
+
+    // Brightest pixel across the second caption line of tile 1.
+    let mut peak =
+        |hovered: Option<usize>| -> u8 {
+            f.niri().app_grid.set_hovered(hovered);
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            let (pixels, w) = composited
+                .expect("a Vulkan device")
+                .expect("compositing the app grid through Vulkan must not error");
+            (0..m.label_w() as i32)
+                .map(|dx| px(&pixels, w, first_x + dx, row_y)[3])
+                .max()
+                .unwrap_or(0)
+        };
+
+    let at_rest = peak(None);
+    let expanded = peak(Some(1));
+    eprintln!("vulkan_app_grid caption: at_rest={at_rest} expanded={expanded}");
+    assert_eq!(
+        at_rest, 0,
+        "a collapsed caption is one line — nothing may paint below it"
+    );
+    assert!(
+        expanded > 128,
+        "the expanded caption must wrap onto a second line of glyph ink, not just the \
+         10% hover wash (alpha ~26): {expanded}"
+    );
+}
+
 /// The grid's batch icon upload path: two distinct icons (so the page has >1 pending upload,
 /// tripping `import_memory_batch`) must both draw, each with its own colors — proving the single
 /// submit uploaded every texture correctly, not a swapped/blank one.

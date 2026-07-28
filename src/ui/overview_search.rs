@@ -638,7 +638,20 @@ impl OverviewSearch {
                     .iter()
                     .map(|t| Rectangle::new(t.loc - origin, t.size))
                     .collect();
-                let names: Vec<String> = self.results.iter().map(|e| e.name.clone()).collect();
+                // A search result's caption never expands — the provider builds its icons
+                // with `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is
+                // always the collapsed, end-ellipsized line.
+                let label_w = widget::TileMetrics::OVERVIEW.label_w();
+                let names: Vec<String> = self
+                    .results
+                    .iter()
+                    .map(|e| {
+                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, false)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default()
+                    })
+                    .collect();
                 let label_rects = rel_rects.clone();
                 match widget::bake(
                     renderer,
