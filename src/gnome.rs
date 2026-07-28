@@ -965,6 +965,30 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Persist the app-grid arrangement: `org.gnome.shell app-picker-layout`, an
+    /// `aa{sv}` of one dict per page mapping each app id to a boxed
+    /// `{'position': <int32>}` (`AppDisplay._savePages`, `appDisplay.js:1387-1404`).
+    /// The read side is `read_app_picker_layout`. Missing store/key is a no-op.
+    ///
+    /// The write re-enters our own `changed` subscription, which re-sorts the grid from
+    /// the new key — that is why it has to describe the order we are already showing.
+    pub fn set_app_picker_layout(&self, pages: Vec<Vec<String>>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(shell) = &s.shell {
+                    if settings_has_key(shell, "app-picker-layout") {
+                        let value = build_app_picker_layout(&pages);
+                        if let Err(err) = shell.set_value("app-picker-layout", &value) {
+                            warn!("error writing org.gnome.shell app-picker-layout: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {
@@ -1477,10 +1501,29 @@ fn parse_picture_options(value: &str) -> BackgroundOptions {
     }
 }
 
-/// gnome-shell's accent palette (st-theme-context.c `ACCENT_COLOR_*`),
-/// keyed by the `org.gnome.desktop.interface accent-color` enum values.
-/// Unpack `app-picker-layout` (`aa{sv}`: one dict per page, desktop id → `{position:
-/// <int32>}`) into a flat id → `(page, position)` map — the shape
+/// The inverse of [`read_app_picker_layout`]: pages of app ids → the `aa{sv}` the key
+/// holds. `ToVariant for Variant` boxes, which is exactly what the `v` needs — at both
+/// levels, since the per-app value is itself a boxed `a{sv}`.
+fn build_app_picker_layout(pages: &[Vec<String>]) -> glib::Variant {
+    use glib::prelude::ToVariant;
+    let pages: Vec<HashMap<String, glib::Variant>> = pages
+        .iter()
+        .map(|page| {
+            page.iter()
+                .enumerate()
+                .map(|(position, id)| {
+                    let props: HashMap<String, glib::Variant> =
+                        [("position".to_owned(), (position as i32).to_variant())].into();
+                    (id.clone(), props.to_variant())
+                })
+                .collect()
+        })
+        .collect();
+    pages.to_variant()
+}
+
+/// Unpack `app-picker-layout` (`aa{sv}`: one dict per page, desktop id → a boxed
+/// `{'position': <int32>}`) into a flat id → `(page, position)` map — the shape
 /// `PageManager.getAppPosition` answers in (`appDisplay.js:1276-1291`).
 ///
 /// An entry with no readable `position` is skipped rather than defaulted: a zero would
@@ -1490,9 +1533,12 @@ fn read_app_picker_layout(value: &glib::Variant) -> HashMap<String, (usize, i32)
     for (page, page_value) in value.iter().enumerate() {
         for (id, props) in page_value.iter().filter_map(|e| {
             let id = e.child_value(0).str()?.to_owned();
-            Some((id, e.child_value(1)))
+            // Both `v`s have to be opened: the per-app value boxes the property dict,
+            // and the property value boxes the int. Iterating the box instead of the
+            // dict yields the dict itself as a single "entry" whose key is not a
+            // string, so every lookup silently misses and the whole key reads empty.
+            Some((id, e.child_value(1).as_variant()?))
         }) {
-            // `a{sv}` values are variants boxed one deeper.
             let Some(position) = props
                 .iter()
                 .find(|kv| kv.child_value(0).str() == Some("position"))
@@ -1626,6 +1672,28 @@ mod tests {
         );
         let empty = Vec::<(String, String)>::new().to_variant();
         assert!(read_source_tuples(&empty).is_empty());
+    }
+
+    /// `app-picker-layout` is `aa{sv}` whose values are *doubly* boxed — a variant
+    /// holding `a{sv}` holding a variant holding an int32. Getting either level wrong
+    /// writes a variant gsettings rejects (or that gnome-shell can't read), which is
+    /// invisible from this side, so the write is pinned by feeding it back through the
+    /// reader we already had.
+    #[test]
+    fn the_app_picker_layout_round_trips_through_its_own_reader() {
+        let pages = vec![
+            vec!["a.desktop".to_owned(), "b.desktop".to_owned()],
+            vec!["c.desktop".to_owned()],
+        ];
+        let value = build_app_picker_layout(&pages);
+        assert_eq!(value.type_().as_str(), "aa{sv}");
+        let read = read_app_picker_layout(&value);
+        assert_eq!(read.get("a.desktop"), Some(&(0, 0)));
+        assert_eq!(read.get("b.desktop"), Some(&(0, 1)));
+        assert_eq!(read.get("c.desktop"), Some(&(1, 0)));
+        assert_eq!(read.len(), 3);
+
+        assert_eq!(build_app_picker_layout(&[]).type_().as_str(), "aa{sv}");
     }
 
     /// The base font size is the trailing number of a Pango description, whatever style
