@@ -7405,6 +7405,47 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// Escape during an item drag cancels the *drag* and nothing else: the icon goes home,
+/// the grid keeps its old order, and the app grid stays open (`_onEvent` → `_cancelDrag`,
+/// `dnd.js:567-573`). It used to fall through to the overview's own Escape, so one press
+/// left the grid mid-drag and a second closed the overview.
+#[test]
+fn overview_escape_during_a_drag_cancels_the_drag() {
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    let area = overview_controls(&mut f).app_display;
+    let before: Vec<String> = (0..3)
+        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .collect();
+
+    let first = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.niri().app_grid.entry_center(2, area).expect("tile 2");
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, third.x, third.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+
+    tap(&mut f, KEY_ESC);
+    assert!(f.niri().app_drag.is_none(), "the drag is cancelled");
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "…and the grid it was over stays open — Escape went no further"
+    );
+    let after: Vec<String> = (0..3)
+        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .collect();
+    assert_eq!(
+        after, before,
+        "the order the drag was reflowing is put back"
+    );
+
+    // The button is still down; releasing it must not now act as a drop.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    let after: Vec<String> = (0..3)
+        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .collect();
+    assert_eq!(after, before, "and the release that follows is not a drop");
+}
+
 /// Every app-icon surface draws from **one** GPU upload map, as gnome-shell keeps one
 /// Cogl texture per gicon+size shell-wide (`st-texture-cache.c:998`). Ours had one per
 /// surface, so a search result re-uploaded, at the same size, an icon the grid already

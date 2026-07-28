@@ -2332,12 +2332,21 @@ impl AppGrid {
             .filter(|(_, fits)| **fits)
             .map(|(e, _)| e.name.clone())
             .collect();
+        // Keyed on the content *and* on which tiles are in it. A tile that becomes an
+        // actor leaves this bake, and `content_rev` does not move when it stops being one
+        // — so keying on content alone meant the texture baked mid-animation, with the
+        // moving tiles' captions missing, was served for ever after. (It healed on a page
+        // change only because that bumps `content_rev`.)
+        let revision = widget::Revision::new()
+            .of(self.content_rev)
+            .each(&fits)
+            .done();
         match widget::bake(
             renderer,
             cache.bakes.entry(page).or_default(),
             scale,
             block.size,
-            self.content_rev,
+            revision,
             move |r| {
                 let mut shaper = widget::TextShaper::new(r, scale);
                 names
@@ -2505,12 +2514,18 @@ impl AppGrid {
             .collect();
         if !folder_rects.is_empty() {
             let radius = metrics.radius;
+            // Same trap as the caption bake above: an actor folder tile leaves this one,
+            // and its resting fill has to come back when it stops being one.
+            let revision = widget::Revision::new()
+                .of(self.content_rev)
+                .each((0..page_entries.len()).map(has_actor))
+                .done();
             match widget::bake(
                 renderer,
                 cache.folder_bakes.entry(page).or_default(),
                 scale,
                 block.size,
-                self.content_rev,
+                revision,
                 |_| Ok(()),
                 move |frame, phys, _: &()| {
                     let mut p = Painter::new(frame, scale, phys);

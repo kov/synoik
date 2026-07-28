@@ -9254,6 +9254,13 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
         Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.))
     };
     let (slot1, slot3) = (center(&mut f, 1), center(&mut f, 3));
+    let tile_h = f
+        .niri()
+        .app_grid
+        .entry_rect(0, area)
+        .expect("a tile")
+        .size
+        .h;
 
     /// A composite, its stride, and every element's center with its width.
     type Shot = (Vec<u8>, i32, Vec<(Point<f64, Logical>, f64)>);
@@ -9395,10 +9402,25 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
         );
     }
 
-    // And it arrives.
+    // And it arrives — with everything that left the page's shared bake back in it. That
+    // bake is keyed on the content, which does not change when an animation *ends*, so a
+    // texture made while the tiles were actors (their captions missing from it) would be
+    // served for ever after. Counted as ink below the icon row, where the captions are.
+    let caption_y = (slot1.y + tile_h * 0.35).round() as i32;
+    let ink = |pixels: &[u8], w: i32, y: i32| -> usize {
+        (0..w).filter(|x| px(pixels, w, *x, y)[3] > 20).count()
+    };
+    let before = ink(&pixels, w, caption_y);
+
     f.settle_animations();
     f.niri().app_grid.advance_animations();
     let (pixels, w, _) = shoot(&mut f);
+    assert!(
+        ink(&pixels, w, caption_y) >= before,
+        "every caption is back in the settled page: {} px of caption ink, was {before} \
+         mid-animation",
+        ink(&pixels, w, caption_y)
+    );
     let landed = red_x(&pixels, w, row_y).expect("the marked icon lands");
     assert!(
         (landed - slot3.x).abs() < 8.,

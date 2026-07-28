@@ -776,6 +776,17 @@ impl State {
                 };
 
                 if matches!(res, FilterResult::Forward) {
+                    // Escape cancels an item drag in flight and goes no further: the icon
+                    // flows home and the grid keeps its old order (`_onEvent` →
+                    // `_cancelDrag`, `dnd.js:567-573`). It is consumed rather than passed
+                    // on because gnome-shell's drag holds a stage grab, so the key never
+                    // reaches the overview's own Escape either — and cancelling a drag is
+                    // a whole intent, not a step toward closing the grid.
+                    if pressed && raw == Some(Keysym::Escape) && this.niri.app_drag.is_some() {
+                        this.cancel_app_drag();
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
                     if this.niri.keyboard_focus.is_overview() && pressed {
                         // Overview search: typing engages the search entry (GNOME's
                         // `_onStageKeyPress`/`_shouldTriggerSearch`, searchController.js:145-236).
@@ -4532,6 +4543,40 @@ impl State {
         if let Some(drag) = &mut self.niri.app_drag {
             drag.unpin = unpin;
         }
+    }
+
+    /// Abandon an item drag without a drop (Escape): everything the drag put in flight is
+    /// undone — the live reorder, the placeholder a drag out of a folder added, the page
+    /// previews, the `:drop` state — and the icon eases back to full size where it started
+    /// (`_cancelDrag`, `dnd.js:501-540`).
+    fn cancel_app_drag(&mut self) {
+        self.clear_folder_popdown_timer();
+        self.clear_folder_pending_move();
+        self.clear_grid_pending_move();
+        self.clear_grid_drop_hover();
+        self.reset_drag_page_switch();
+        self.niri.folder_dialog.set_drag_outside(false);
+        self.niri.folder_dialog.set_hint_hovered(None);
+        self.niri.app_grid.set_hint_hovered(None);
+
+        let Some(drag) = self.niri.app_drag.take() else {
+            return;
+        };
+        self.niri.dash.set_drop_slot(None);
+        self.niri.dash.set_drag_active(false);
+        self.niri.app_grid.set_drag_active(false);
+        self.niri.folder_dialog.set_drag_active(false);
+        self.niri.app_grid.set_dragged(None);
+        self.niri.folder_dialog.set_dragged(None);
+
+        self.niri.app_grid.cancel_reorder();
+        self.niri.folder_dialog.cancel_reorder();
+        // The placeholder an out-of-a-folder drag added is withdrawn, exactly as it is for
+        // a drop nobody took (`_removePlaceholder`, `appDisplay.js:1450-1456`).
+        if drag.from_folder.is_some() {
+            self.niri.app_grid.remove_entry(&drag.id);
+        }
+        self.niri.queue_redraw_all();
     }
 
     /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
