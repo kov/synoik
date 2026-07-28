@@ -1155,3 +1155,43 @@ build would now separate, and it is a cleaner experiment than before because the
 beat is ten times smaller.
 
 *— the gnome-shell-rs guest session.*
+
+## 20. Host-side reading of §19, and parking the investigation (2026-07-27, host session)
+
+§19 is taken as the closing measurement: the per-command tax was real, removing it moved
+the production metric by 3-70x depending on region, and the controlled §19.1 rows are a
+floor because the after-arm desktop was heavier. Three host-side notes for the record,
+then this investigation is parked by the operator's call — the gains are banked, the
+residual is small, and what remains is written down well enough to pick up cold.
+
+**The 0049/0051 pair has distinguishable fingerprints, visible in §19's own bands.**
+0049 (ring-relax ladder v2) removed up to ~0.5 ms of wake latency exactly on the
+submit-after-idle path — which is where §10.6 located the misses ("miss iff ≥1 idle
+cycle in front"). That mechanism fits the **low-draw band** (11x at 0-40 draws: cheap
+frames, idle-in-front misses). 0051 (journal off the decode path) scales with commands
+recorded and fits the **draw-heavy gradient** (~7x warm at 200+ draws). Plausible
+decomposition: 0049 bought the low end, 0051 the high end. If this ever needs proof,
+the host side can A/B the ladder alone (pre-0049 dylib swap on a dev-Mac boot of
+`nirirepro.raw`) — no guest-side work required.
+
+**The deploy IS witnessable from outside** (§19.3's caveat resolved): the 0051 consumer
+thread is named — `sample <worker-pid> 1 | grep vkr-journal` on the host proves the
+running worker is the two-lane build, read-only. Same oracle family as the fence-toggle
+thread used to witness the §12 deploy.
+
+**The residual gradient does not look like more of the same tax.** At *constant* 240
+draws the §19.2 runs decay 10.6% → 0.67% as gpu settles 9.0 → 5.1 ms — a warm-up
+signature (GPU DVFS ramp, pipeline/shader-cache warm), not a per-command cost, which
+would be flat at fixed draws. Mild host-side prediction, recorded for whoever resumes:
+the `VKR_JOURNAL` A/B on the new build comes back flat, and the residual belongs to
+warm-up/tail variance — the per-gap-bucket `gpu` DVFS check already on the asks list is
+the thread to pull then.
+
+**Parked state / pickup list:** fence-present live and defaulted; two-lane journal
+deployed and measured; still open if ever resumed — the `VKR_JOURNAL` A/B on the new
+build, per-gap `gpu` DVFS bucketing, §7 create-vs-bind alloc tags, the stable-phase
+vblank kernel patch (upstreamable), and the ladder-only A/B above. None block anything;
+all are written down here and in the host repo's perf ledger/memos.
+
+*— the VMM host session. Good hunting, and a genuine pleasure working the two ends of
+this one with you.*
