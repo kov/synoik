@@ -34,12 +34,19 @@
 //! reset to page 0 on a fresh overview open (`'hidden'` → `goToPage(0)`,
 //! `appDisplay.js:1342`) changes the page.
 //!
+//! **Drag-reorder.** Dragging an icon within the grid moves it: the pointer resolves
+//! to a `(page, position)` insertion point ([`AppGrid::drop_target_at`]), the grid
+//! reflows around it once the target has held still for [`DELAYED_MOVE_MS`], and the
+//! drop persists the arrangement to `app-picker-layout` (`_savePages`). A drag nobody
+//! accepted puts the order back.
+//!
 //! **Divergences, revisited later.** No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
-//! 1:1 swipe is deferred), no keyboard paging
-//! (`Page_Up/Down`), and no folders/drag-reorder — so `app-picker-layout` is read but
-//! never written back, and the apps GNOME would hide inside a folder are shown
-//! individually. The name fallback sort is a case-folded `to_lowercase` compare rather
+//! 1:1 swipe is deferred), no keyboard paging (`Page_Up/Down`), and no folders — so the
+//! apps GNOME would hide inside one are shown individually. Pages here are always
+//! **full**: our order is a flat list chunked by the page size, where GNOME's grid is
+//! built with `allow_incomplete_pages: true` (`appDisplay.js:655`) and can leave holes.
+//! The name fallback sort is a case-folded `to_lowercase` compare rather
 //! than full locale collation (`localeCompare`): std has no collator, so accented
 //! initials can misplace; an `icu` collator is the faithful fix. An expanded caption is
 //! capped at [`widget::TILE_LABEL_EXPAND_LINES`] lines (GNOME grows the tile without a
@@ -114,6 +121,15 @@ const ARROW_DISC: f64 = ARROW_ICON_PX + 2. * ARROW_PAD;
 /// the disc plus a margin each side.
 const ARROW_MARGIN: f64 = 6.;
 
+/// Leeway at each tile edge within which a drag drops *between* icons rather than on
+/// one (`LEFT_DIVIDER_LEEWAY` / `RIGHT_DIVIDER_LEEWAY`, `iconGrid.js:49-50`).
+const DIVIDER_LEEWAY: f64 = 20.;
+
+/// How long a drop target must hold still before the grid reflows around it
+/// (`DELAYED_MOVE_TIMEOUT`, `appDisplay.js:55`). The reflow is live and provisional —
+/// the drop commits it, a drag that ends elsewhere throws it away.
+pub const DELAYED_MOVE_MS: u64 = 200;
+
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
 const PAGE_PREVIEW_RATIO: f64 = 0.20;
@@ -135,6 +151,29 @@ fn indicators_w(band_w: f64) -> f64 {
 pub enum PageArrow {
     Prev,
     Next,
+}
+
+/// Where a drag sits relative to the tile under it (`DragLocation`,
+/// `iconGrid.js:53-59`; `INVALID` is our `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragLocation {
+    /// Within [`DIVIDER_LEEWAY`] of the tile's leading edge — insert before it.
+    StartEdge,
+    /// Over the body of a tile — not an insertion point; the grid does not reflow.
+    OnIcon,
+    /// Within [`DIVIDER_LEEWAY`] of the tile's trailing edge — insert after it.
+    EndEdge,
+    /// Past the last tile of the page — append to it.
+    EmptySpace,
+}
+
+/// A resolved drop target inside the grid ([`AppGrid::drop_target_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridDropTarget {
+    pub page: usize,
+    /// Position within the page. `None` is GNOME's `-1` — append (`EmptySpace`).
+    pub position: Option<usize>,
+    pub location: DragLocation,
 }
 
 /// One grid app — a plain-data snapshot (not a live catalog borrow), like
@@ -184,6 +223,9 @@ pub struct AppGrid {
     current_page: usize,
     /// Bumped on any change that affects the bake (entries/hover/page).
     content_rev: u64,
+    /// The order as it was when a drag started, so an unsuccessful drop can put it
+    /// back — the live reflow is provisional (`_onDragCancelled`, `appDisplay.js:979`).
+    reorder_restore: Option<Vec<String>>,
     cache: RefCell<GridCache>,
 }
 
@@ -204,6 +246,13 @@ struct GridLayout {
     metrics: TileMetrics,
     /// The absolute entry index of `tiles[0]` (= `page * items_per_page`).
     first_index: usize,
+    /// Columns per page, and the distributed cell spacing on each axis — the drop
+    /// target reads all three (a hit is allowed half a spacing beyond a tile).
+    cols: usize,
+    h_sp: f64,
+    v_sp: f64,
+    /// Tiles per page (`cols * rows`), which is what a `(page, position)` pair means.
+    per_page: usize,
     /// Total page count (0 when there are no apps).
     n_pages: usize,
     /// The page these `tiles` belong to (clamped `current_page`).
@@ -246,6 +295,7 @@ impl AppGrid {
             hovered_arrow: None,
             current_page: 0,
             content_rev: 0,
+            reorder_restore: None,
             cache: RefCell::new(GridCache::default()),
         }
     }
@@ -352,6 +402,192 @@ impl AppGrid {
         true
     }
 
+    /// Tiles per page for `area` — what a `(page, position)` pair counts in.
+    pub fn items_per_page(&self, area: Rectangle<f64, Logical>) -> usize {
+        self.layout(area).per_page
+    }
+
+    /// The id at `target`, if any — GNOME's `getItemAt(page, position)`. `None` for an
+    /// append target or a position past the end.
+    pub fn entry_id_at(&self, target: GridDropTarget, per_page: usize) -> Option<&str> {
+        let position = target.position?;
+        self.entry_id(target.page * per_page + position)
+    }
+
+    /// Where a drag holding `dragged` would insert, for a pointer at `pos`
+    /// (`IconGrid.getDropTarget`, `iconGrid.js:1032-1120`, then the reflow adjustment
+    /// in `AppDisplay._getDropTarget`, `appDisplay.js:1156-1201`). `None` is GNOME's
+    /// `INVALID` — above or below the rows, or an empty grid.
+    ///
+    /// Only the current page is laid out (GNOME keeps every page in one scrolled
+    /// actor), so a target is always on it; reaching another page is the job of the
+    /// page-preview bands.
+    pub fn drop_target_at(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+        dragged: &str,
+    ) -> Option<GridDropTarget> {
+        let layout = self.layout(area);
+        if layout.tiles.is_empty() {
+            return None;
+        }
+        let block = layout.block;
+        // Above or below the rows is not a drop target at all.
+        if pos.y < block.loc.y || pos.y > block.loc.y + block.size.h {
+            return None;
+        }
+        let in_left = pos.x < block.loc.x;
+        let in_right = pos.x > block.loc.x + block.size.w;
+        let (half_h, half_v) = (layout.h_sp / 2., layout.v_sp / 2.);
+
+        for (i, tile) in layout.tiles.iter().enumerate() {
+            let (x1, x2) = (tile.loc.x, tile.loc.x + tile.size.w);
+            let (y1, y2) = (tile.loc.y, tile.loc.y + tile.size.h);
+            let first_in_row = i % layout.cols == 0;
+            let last_in_row = i % layout.cols == layout.cols - 1;
+            // In the side margins only the row matters: the outermost tile of the row
+            // claims everything beside it.
+            if (in_left && first_in_row) || (in_right && last_in_row) {
+                if pos.y < y1 - half_v || pos.y > y2 + half_v {
+                    continue;
+                }
+            } else if pos.x < x1 - half_h
+                || pos.x > x2 + half_h
+                || pos.y < y1 - half_v
+                || pos.y > y2 + half_v
+            {
+                continue;
+            }
+            let location = if pos.x < x1 + DIVIDER_LEEWAY {
+                DragLocation::StartEdge
+            } else if pos.x > x2 - DIVIDER_LEEWAY {
+                DragLocation::EndEdge
+            } else {
+                DragLocation::OnIcon
+            };
+            return Some(self.adjust_for_reflow(&layout, i, location, dragged));
+        }
+
+        Some(GridDropTarget {
+            page: layout.page,
+            position: None,
+            location: DragLocation::EmptySpace,
+        })
+    }
+
+    /// Retarget an edge hit to the adjacent tile when the reflow would push the wrong
+    /// way (`appDisplay.js:1156-1201`). Dropping just left of an icon that will move
+    /// *left* to make room can't "naturally push it away", so the insertion is really
+    /// after its neighbour — except in the first/last column, where there is no
+    /// neighbour to push.
+    fn adjust_for_reflow(
+        &self,
+        layout: &GridLayout,
+        position: usize,
+        location: DragLocation,
+        dragged: &str,
+    ) -> GridDropTarget {
+        let source = self.entries.iter().position(|e| e.id == dragged);
+        let (source_page, source_position) = match source {
+            Some(i) => (i / layout.per_page, i % layout.per_page),
+            None => (usize::MAX, usize::MAX),
+        };
+        // The app grid is built with `allow_incomplete_pages: true`
+        // (`appDisplay.js:655`), so GNOME's `sourcePage < targetPage` branch — the one
+        // that forces a START reflow when pages must stay full — never applies here.
+        let reflow_start = source_page == layout.page && source_position < position;
+        let reflow_none = source_position == position && !reflow_start;
+
+        let column = position % layout.cols;
+        let (position, location) = match location {
+            DragLocation::StartEdge if reflow_start && column > 0 => {
+                (position - 1, DragLocation::EndEdge)
+            }
+            DragLocation::EndEdge if !reflow_start && !reflow_none && column + 1 < layout.cols => {
+                (position + 1, DragLocation::StartEdge)
+            }
+            _ => (position, location),
+        };
+        GridDropTarget {
+            page: layout.page,
+            position: Some(position),
+            location,
+        }
+    }
+
+    /// Move `id` to `target` (`AppDisplay._moveItem` over `IconGrid.moveItem`,
+    /// `appDisplay.js:1203-1209`): pull it out, then put it back at that position
+    /// *within the shortened list*. Returns whether anything moved.
+    pub fn move_entry(&mut self, id: &str, target: GridDropTarget, per_page: usize) -> bool {
+        let Some(from) = self.entries.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let entry = self.entries.remove(from);
+        let page_start = (target.page * per_page).min(self.entries.len());
+        let page_end = (page_start + per_page).min(self.entries.len());
+        let to = match target.position {
+            Some(position) => (page_start + position).min(page_end),
+            None => page_end,
+        };
+        self.entries.insert(to, entry);
+        if to == from {
+            return false;
+        }
+        // The hover is an absolute index, so a reorder would leave it on a different
+        // app; a drag suppresses the wash anyway, so just drop it.
+        self.hovered = None;
+        self.content_rev += 1;
+        true
+    }
+
+    /// Snapshot the current order so a drag that ends nowhere can put it back
+    /// (`_onDragCancelled` → `_redisplay`, `appDisplay.js:979-984`).
+    pub fn begin_reorder(&mut self) {
+        self.reorder_restore = Some(self.entries.iter().map(|e| e.id.clone()).collect());
+    }
+
+    /// Restore the pre-drag order. Returns whether anything moved back (→ redraw).
+    pub fn cancel_reorder(&mut self) -> bool {
+        let Some(order) = self.reorder_restore.take() else {
+            return false;
+        };
+        if order.len() != self.entries.len()
+            || order.iter().zip(&self.entries).all(|(id, e)| *id == e.id)
+        {
+            return false;
+        }
+        // Rebuild by id; anything the catalog changed under us keeps its current place.
+        let mut restored = Vec::with_capacity(self.entries.len());
+        for id in &order {
+            if let Some(k) = self.entries.iter().position(|e| e.id == *id) {
+                restored.push(self.entries.remove(k));
+            }
+        }
+        restored.append(&mut self.entries);
+        self.entries = restored;
+        self.hovered = None;
+        self.content_rev += 1;
+        true
+    }
+
+    /// Accept the live reorder; returns whether the order actually changed, i.e.
+    /// whether it is worth writing `app-picker-layout` back.
+    pub fn finish_reorder(&mut self) -> bool {
+        self.reorder_restore
+            .take()
+            .is_some_and(|order| !order.iter().zip(&self.entries).all(|(id, e)| *id == e.id))
+    }
+
+    /// The current order as pages of app ids — what `_savePages` persists
+    /// (`appDisplay.js:1387-1404`).
+    pub fn pages(&self, per_page: usize) -> Vec<Vec<String>> {
+        self.entries
+            .chunks(per_page.max(1))
+            .map(|chunk| chunk.iter().map(|e| e.id.clone()).collect())
+            .collect()
+    }
+
     /// Lay the apps into `area` (the `app_display` band) as GNOME's paginated
     /// `IconGrid`: pick the page mode by aspect ratio, shrink the icon to the largest
     /// size that fits, distribute the spacing, and position the current page's tiles
@@ -362,6 +598,10 @@ impl AppGrid {
             block: Rectangle::from_size(Size::from((0., 0.))),
             metrics: TileMetrics::OVERVIEW,
             first_index: 0,
+            cols: 1,
+            h_sp: 0.,
+            v_sp: 0.,
+            per_page: 1,
             n_pages: 0,
             page: 0,
             indicators: None,
@@ -484,6 +724,10 @@ impl AppGrid {
             block,
             metrics,
             first_index,
+            cols,
+            h_sp,
+            v_sp,
+            per_page,
             n_pages,
             page,
             indicators,
@@ -1165,6 +1409,140 @@ mod tests {
         // A single page shows neither.
         let l = grid_n(10).layout(area);
         assert!(l.prev_arrow.is_none() && l.next_arrow.is_none());
+    }
+
+    /// The drop target classifies a point against the tile under it: the middle of a
+    /// tile is `OnIcon` (nothing to insert between), each edge's 20px leeway is an
+    /// insertion point, and past the last tile is an append (`iconGrid.js:1032-1120`).
+    /// Above or below the rows is `INVALID`, i.e. no target at all.
+    #[test]
+    fn the_drop_target_reads_edges_body_and_empty_space() {
+        let g = grid_n(3);
+        let area = wide();
+        let l = g.layout(area);
+        let (t0, t2) = (l.tiles[0], l.tiles[2]);
+        let mid_y = t0.loc.y + t0.size.h / 2.;
+        let at = |x: f64, y: f64| g.drop_target_at(Point::from((x, y)), area, "nothing");
+
+        let body = at(t0.loc.x + t0.size.w / 2., mid_y).expect("over a tile");
+        assert_eq!(body.location, DragLocation::OnIcon);
+
+        // Leading edge of the *third* tile: nothing is being dragged out of the grid
+        // here, so the reflow pushes right and the target stays where it was.
+        let lead = at(t2.loc.x + 5., mid_y).expect("a tile edge");
+        assert_eq!(
+            (lead.position, lead.location),
+            (Some(2), DragLocation::StartEdge)
+        );
+        // Trailing edge of the first tile retargets to the next tile's leading edge —
+        // the reflow can push tile 1 away, tile 0 it cannot.
+        let trail = at(t0.loc.x + t0.size.w - 5., mid_y).expect("a tile edge");
+        assert_eq!(
+            (trail.position, trail.location),
+            (Some(1), DragLocation::StartEdge)
+        );
+
+        // Past the last tile of the row, still within the rows: append.
+        let past = at(t2.loc.x + t2.size.w + 200., mid_y).expect("empty space");
+        assert_eq!(
+            (past.position, past.location),
+            (None, DragLocation::EmptySpace)
+        );
+
+        // Above and below the rows there is no target at all.
+        assert!(at(t0.loc.x + 5., l.block.loc.y - 5.).is_none());
+        assert!(at(t0.loc.x + 5., l.block.loc.y + l.block.size.h + 5.).is_none());
+    }
+
+    /// Dragging an icon *rightwards* flips which side of a tile counts as the
+    /// insertion point: the icons behind it reflow left, so a hit on a tile's leading
+    /// edge really means "after its neighbour" (`appDisplay.js:1180-1198`).
+    #[test]
+    fn a_forward_drag_retargets_the_edge_it_cannot_push() {
+        let g = grid_n(4);
+        let area = wide();
+        let l = g.layout(area);
+        let mid_y = l.tiles[0].loc.y + l.tiles[0].size.h / 2.;
+        let dragged = g.entry_id(0).unwrap().to_owned();
+
+        // Leading edge of tile 2 while dragging tile 0: retargeted back onto tile 1's
+        // trailing edge, which is the slot that can actually open.
+        let t = g
+            .drop_target_at(Point::from((l.tiles[2].loc.x + 5., mid_y)), area, &dragged)
+            .expect("a tile edge");
+        assert_eq!((t.position, t.location), (Some(1), DragLocation::EndEdge));
+    }
+
+    /// A move is a remove-then-insert *in the shortened list*, so dragging forward
+    /// lands one short of the raw index — the difference between "insert before what
+    /// used to be here" and "insert at this index" (`IconGrid.moveItem`).
+    #[test]
+    fn moving_an_entry_reindexes_against_the_shortened_list() {
+        let mut g = grid_n(4);
+        let ids = |g: &AppGrid| -> Vec<String> { g.entries.iter().map(|e| e.id.clone()).collect() };
+        let target = |position: Option<usize>| GridDropTarget {
+            page: 0,
+            position,
+            location: DragLocation::StartEdge,
+        };
+
+        assert!(g.move_entry("app00.desktop", target(Some(2)), 24));
+        assert_eq!(
+            ids(&g),
+            [
+                "app01.desktop",
+                "app02.desktop",
+                "app00.desktop",
+                "app03.desktop"
+            ]
+        );
+        // An append target (`EmptySpace`, GNOME's -1) goes to the end of the page.
+        assert!(g.move_entry("app00.desktop", target(None), 24));
+        assert_eq!(*ids(&g).last().unwrap(), "app00.desktop");
+        // A move that changes nothing reports nothing.
+        assert!(!g.move_entry("app00.desktop", target(None), 24));
+    }
+
+    /// The live reflow is provisional: a drag nobody accepted puts every icon back
+    /// (`_onDragCancelled` → `_redisplay`, `appDisplay.js:979-984`), and an accepted
+    /// one reports whether the arrangement is worth writing back.
+    #[test]
+    fn a_cancelled_reorder_restores_the_order() {
+        let mut g = grid_n(4);
+        let ids = |g: &AppGrid| -> Vec<String> { g.entries.iter().map(|e| e.id.clone()).collect() };
+        let before = ids(&g);
+        let target = GridDropTarget {
+            page: 0,
+            position: Some(3),
+            location: DragLocation::StartEdge,
+        };
+
+        g.begin_reorder();
+        assert!(g.move_entry("app00.desktop", target, 24));
+        assert_ne!(ids(&g), before);
+        assert!(g.cancel_reorder());
+        assert_eq!(ids(&g), before);
+
+        g.begin_reorder();
+        assert!(!g.finish_reorder(), "an untouched drag saves nothing");
+        g.begin_reorder();
+        assert!(g.move_entry("app00.desktop", target, 24));
+        assert!(g.finish_reorder(), "a real move is worth persisting");
+        assert!(!g.cancel_reorder(), "…and cannot then be undone");
+    }
+
+    /// `_savePages` writes one dict per page, in display order.
+    #[test]
+    fn pages_chunk_the_order_for_persistence() {
+        let g = grid_n(5);
+        assert_eq!(
+            g.pages(2),
+            vec![
+                vec!["app00.desktop".to_owned(), "app01.desktop".to_owned()],
+                vec!["app02.desktop".to_owned(), "app03.desktop".to_owned()],
+                vec!["app04.desktop".to_owned()],
+            ]
+        );
     }
 
     /// `indicatorsPadding`: 10% of the band on each side, floored at an arrow's own

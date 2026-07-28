@@ -6792,6 +6792,41 @@ fn overview_app_grid_follows_the_saved_arrangement() {
     );
 }
 
+/// Dragging a grid icon onto the leading edge of a later one reorders the grid
+/// (`_maybeMoveItem` → `_moveItem`, `appDisplay.js:768-810,1203-1209`). The drop
+/// commits a move the 200 ms timer had not reached yet (`acceptDrop`, `:1014-1020`),
+/// which is what this drives — the timer itself is real-time and its own concern.
+///
+/// (The other half — a drag nobody accepts putting the grid back — is
+/// `a_cancelled_reorder_restores_the_order` in `ui::app_grid`.)
+#[test]
+fn overview_dragging_a_grid_icon_reorders_the_grid() {
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    let ids = |f: &mut Fixture| -> Vec<String> {
+        (0..3)
+            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(ids(&mut f), vec!["a.desktop", "m.desktop", "z.desktop"]);
+
+    let area = overview_controls(&mut f).app_display;
+    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.niri().app_grid.entry_rect(2, area).expect("tile 2");
+    pointer_motion_to(&mut f, start.x, start.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // Aim just inside the leading edge of the third tile — within the 20px divider
+    // leeway, so it is an insertion point and not the icon's body.
+    pointer_motion_to(&mut f, third.loc.x + 5., third.loc.y + third.size.h / 2.);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(
+        ids(&mut f),
+        vec!["m.desktop", "a.desktop", "z.desktop"],
+        "the dragged app must land where the pointer was, pushing the rest along"
+    );
+}
+
 /// The grid holds the installed apps minus favorites, name-sorted.
 #[test]
 fn overview_app_grid_click_launches_and_closes() {

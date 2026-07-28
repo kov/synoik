@@ -54,7 +54,7 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
-use crate::ui::app_grid::PageArrow;
+use crate::ui::app_grid::{DragLocation, PageArrow, DELAYED_MOVE_MS};
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
@@ -3680,6 +3680,7 @@ impl State {
             drag.output = output;
             drag.pos = pos_within_output;
             self.update_dash_drop_slot();
+            self.update_grid_drop_target();
             self.niri.queue_redraw_all();
             return;
         }
@@ -3738,11 +3739,100 @@ impl State {
         // any slot is computed — with nothing in the run there would otherwise be
         // nothing to aim at (`_onItemDragBegin`, `dash.js:410-414`).
         self.niri.dash.set_drag_active(true);
+        // The live grid reflow is provisional: remember where everything was, so a drag
+        // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`).
+        self.niri.app_grid.begin_reorder();
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
         self.update_dash_drop_slot();
+        self.update_grid_drop_target();
         self.niri.queue_redraw_all();
+    }
+
+    /// Track where a drag would land in the app grid and arm the delayed move
+    /// (`_maybeMoveItem`, `appDisplay.js:768-810`).
+    ///
+    /// The move is deliberately *not* immediate: the target has to hold still for
+    /// [`DELAYED_MOVE_MS`] before the grid reflows around it, so sweeping across the
+    /// page does not shuffle every icon on the way. A pointer that stops still has to
+    /// fire it, which is why this is a real timer and not a per-frame check.
+    fn update_grid_drop_target(&mut self) {
+        let Some(drag) = &self.niri.app_drag else {
+            return;
+        };
+        // The dash speaks first: while its gap is open or the unpin target is armed,
+        // the drop belongs to it, exactly as the drag monitor's ordering has it.
+        if drag.unpin || self.niri.dash.drop_slot().is_some() {
+            self.clear_grid_pending_move();
+            return;
+        }
+        let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
+        let Some(area) = self
+            .niri
+            .layout
+            .controls_layout_for_output(&output)
+            .map(|c| c.app_display)
+        else {
+            self.clear_grid_pending_move();
+            return;
+        };
+        if !self.niri.layout.is_app_grid_open() {
+            self.clear_grid_pending_move();
+            return;
+        }
+
+        let per_page = self.niri.app_grid.items_per_page(area);
+        let target = self.niri.app_grid.drop_target_at(pos, area, &id);
+        // Over the body of an icon, or over the dragged icon's own slot, there is
+        // nothing to reflow around.
+        let target = target.filter(|t| {
+            t.location != DragLocation::OnIcon
+                && self.niri.app_grid.entry_id_at(*t, per_page) != Some(id.as_str())
+        });
+        let Some(target) = target else {
+            self.clear_grid_pending_move();
+            return;
+        };
+        if self.niri.grid_pending_move == Some((target, per_page)) {
+            return; // unchanged — let the armed timer run out
+        }
+
+        self.clear_grid_pending_move();
+        self.niri.grid_pending_move = Some((target, per_page));
+        let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.apply_grid_pending_move();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.niri.grid_move_timer = Some(token);
+    }
+
+    /// Forget any armed move (the target left the grid, or the drag ended).
+    fn clear_grid_pending_move(&mut self) {
+        self.niri.grid_pending_move = None;
+        if let Some(token) = self.niri.grid_move_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+    }
+
+    /// Commit the armed move — from the timer, or from the drop when it beat the timer
+    /// (`acceptDrop`, `appDisplay.js:1014-1020`).
+    fn apply_grid_pending_move(&mut self) {
+        self.niri.grid_move_timer = None;
+        let Some((target, per_page)) = self.niri.grid_pending_move.take() else {
+            return;
+        };
+        let Some(id) = self.niri.app_drag.as_ref().map(|d| d.id.clone()) else {
+            return;
+        };
+        if self.niri.app_grid.move_entry(&id, target, per_page) {
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// Open, move or close the dash's drop gap for the drag in progress
@@ -3779,8 +3869,19 @@ impl State {
     /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
     /// thumbnail — opens the app there (`Workspace.acceptDrop`,
     /// `workspace.js:1429-1434`); anywhere else it is simply dropped.
+    ///
+    /// Whoever takes the drop also decides the fate of the grid's live reorder: a drag
+    /// that nobody accepted is *cancelled*, and gnome-shell redisplays the grid from
+    /// the saved layout (`_onDragCancelled`, `appDisplay.js:979-984`).
     fn end_app_drag(&mut self) {
+        // A drop that beat the delayed-move timer still commits the move
+        // (`acceptDrop`, `appDisplay.js:1014-1020`). Before `app_drag` is taken — that
+        // is where the id comes from.
+        self.apply_grid_pending_move();
+        self.clear_grid_pending_move();
+
         let Some(drag) = self.niri.app_drag.take() else {
+            self.niri.app_grid.cancel_reorder();
             return;
         };
 
@@ -3790,39 +3891,74 @@ impl State {
         let slot = self.niri.dash.drop_slot();
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
-        if let Some(slot) = slot {
-            self.pin_dragged_app(&drag.id, slot);
-            self.niri.queue_redraw_all();
-            return;
-        }
 
         // A drop on the show-apps button unpins instead (`ShowAppsIcon.acceptDrop`,
         // `dash.js:256-270`). `drag.unpin` already carries `_canRemoveApp`, so this is
         // only ever reached for an app that is currently a favourite.
-        if drag.unpin {
+        let accepted = if let Some(slot) = slot {
+            self.pin_dragged_app(&drag.id, slot);
+            true
+        } else if drag.unpin {
             self.unpin_app(&drag.id);
-            self.niri.queue_redraw_all();
-            return;
-        }
+            true
+        } else {
+            // The overview's own chrome is not a workspace: gnome-shell's dash and app
+            // display take their own drops (favorites reordering, folders), so a drop
+            // that never left them just goes back where it came from.
+            let over_chrome = self.overview_hit(&drag.output, drag.pos).is_some();
+            let target = (!over_chrome)
+                .then(|| self.niri.layout.drop_workspace_at(&drag.output, drag.pos))
+                .flatten();
 
-        // The overview's own chrome is not a workspace: gnome-shell's dash and app
-        // display take their own drops (favorites reordering, folders), so a drop
-        // that never left them just goes back where it came from.
-        let over_chrome = self.overview_hit(&drag.output, drag.pos).is_some();
-        let target = (!over_chrome)
-            .then(|| self.niri.layout.drop_workspace_at(&drag.output, drag.pos))
-            .flatten();
-
-        if let Some(workspace) = target {
-            // `open_new_window`, not `activate`: a drop always asks for a window
-            // *here*, even for an app that is already running elsewhere.
-            match self.niri.app_system.launch(&drag.id, LaunchMode::NewWindow) {
-                Ok(()) => self.niri.expect_launch_on_workspace(drag.id, workspace),
-                Err(err) => tracing::warn!("drag launch of {} failed: {err:?}", drag.id),
+            if let Some(workspace) = target {
+                // `open_new_window`, not `activate`: a drop always asks for a window
+                // *here*, even for an app that is already running elsewhere.
+                match self.niri.app_system.launch(&drag.id, LaunchMode::NewWindow) {
+                    Ok(()) => self.niri.expect_launch_on_workspace(drag.id, workspace),
+                    Err(err) => tracing::warn!("drag launch of {} failed: {err:?}", drag.id),
+                }
+                true
+            } else {
+                // The app display accepts any app icon dropped anywhere inside it
+                // (`_canAccept` + `handleDragOver`, `appDisplay.js:986-995`) — that is
+                // what makes a reorder stick even when the pointer ended between tiles.
+                self.niri.layout.is_app_grid_open()
+                    && self
+                        .niri
+                        .layout
+                        .controls_layout_for_output(&drag.output)
+                        .is_some_and(|c| c.app_display.contains(drag.pos))
             }
+        };
+
+        if accepted {
+            if self.niri.app_grid.finish_reorder() {
+                self.save_app_picker_layout(&drag.output);
+            }
+        } else {
+            self.niri.app_grid.cancel_reorder();
         }
 
         self.niri.queue_redraw_all();
+    }
+
+    /// Persist the grid arrangement (`AppDisplay._savePages`, `appDisplay.js:1387-1404`).
+    /// The page size comes from the output the drag ended on — pagination is per-output
+    /// geometry, and that is the one the user was looking at.
+    fn save_app_picker_layout(&mut self, output: &Output) {
+        let Some(area) = self
+            .niri
+            .layout
+            .controls_layout_for_output(output)
+            .map(|c| c.app_display)
+        else {
+            return;
+        };
+        let per_page = self.niri.app_grid.items_per_page(area);
+        let pages = self.niri.app_grid.pages(per_page);
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.set_app_picker_layout(pages);
+        }
     }
 
     /// Pin `id` into the favourites at `slot`, or move it there if it is already

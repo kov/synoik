@@ -633,6 +633,12 @@ pub struct Niri {
     pub app_menu_source: Option<crate::input::OverviewHit>,
     /// GPU uploads for the dragged icon.
     pub app_drag_uploads: RefCell<AppIconUploads>,
+    /// The grid slot a drag is hovering, waiting out `DELAYED_MOVE_MS` before the grid
+    /// reflows around it (`_delayedMoveData`, `appDisplay.js:768-825`), with the page
+    /// size the target was resolved against.
+    pub grid_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
+    /// The timer arming that move; dropped and re-armed whenever the target changes.
+    pub grid_move_timer: Option<RegistrationToken>,
     /// When the app grid last flipped a page on a wheel notch, to debounce a fast
     /// spin (`SCROLL_TIMEOUT_TIME`=150ms, `appDisplay.js:696-701`).
     pub app_grid_last_page_flip: Option<Duration>,
@@ -3878,6 +3884,8 @@ impl Niri {
             app_drag: None,
             app_menu_source: None,
             app_drag_uploads: RefCell::new(AppIconUploads::default()),
+            grid_pending_move: None,
+            grid_move_timer: None,
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
