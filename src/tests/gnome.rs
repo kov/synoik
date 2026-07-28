@@ -7405,6 +7405,90 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// Dropping a dash favourite into the app grid unpins it: the grid excludes pinned apps,
+/// so `AppDisplay.acceptDrop` calls `removeFavorite` for the same reason it calls
+/// `view.removeApp` for a folder member (`appDisplay.js:1680-1697`). The drag also needs a
+/// placeholder to reorder against, since the app has no tile in the grid to begin with
+/// (`_onDragBegin`, `:1646-1656`).
+#[test]
+fn overview_dropping_a_favourite_on_the_grid_unpins_it() {
+    let (mut f, _recorder) = app_grid_fixture(
+        &["a.desktop", "b.desktop", "c.desktop"],
+        &["m.desktop", "z.desktop"],
+    );
+    assert!(
+        f.niri().app_system.is_favorite("a.desktop"),
+        "a.desktop starts pinned"
+    );
+    assert_eq!(
+        f.niri().app_grid.index_of("a.desktop"),
+        None,
+        "…and so is not in the grid"
+    );
+
+    let controls = overview_controls(&mut f);
+    let (area, dash) = (controls.app_display, controls.dash);
+    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
+    let onto = f.niri().app_grid.entry_rect(1, area).expect("grid tile 1");
+
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // The leading edge of a tile: an insertion point, not the body a fold would take.
+    pointer_motion_to(&mut f, onto.loc.x + 5., onto.loc.y + onto.size.h / 2.);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(
+        f.niri().app_grid.index_of("a.desktop").is_some(),
+        "a placeholder joins the grid for the duration of the drag"
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        !f.niri().app_system.is_favorite("a.desktop"),
+        "the drop unpinned it"
+    );
+    assert!(
+        f.niri().app_grid.index_of("a.desktop").is_some(),
+        "and it is a grid tile now"
+    );
+
+    // Folding a favourite into a new folder unpins it too (`AppIcon.acceptDrop` reaches
+    // the same `removeFavorite` via `AppDisplay.createFolder`, `appDisplay.js:1699-1751`).
+    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
+    let onto = f
+        .niri()
+        .app_grid
+        .entry_center(0, area)
+        .expect("grid tile 0");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, onto.x, onto.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        !f.niri().app_system.is_favorite("b.desktop"),
+        "the fold unpinned it"
+    );
+    // Only the unpin is asserted here: unpinning re-derives the grid from the settings
+    // model, and this fixture has no settings writer for the new folder to come back
+    // from. The fold itself is pinned by `overview_dropping_a_grid_icon_on_another_…`.
+
+    // A drag that ends nowhere leaves the dash alone and withdraws the placeholder.
+    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
+    let pinned = f.niri().dash.item_id(0).map(str::to_owned).expect("a tile");
+    pointer_motion_to(&mut f, from.x, from.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, 4., 4.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(
+        f.niri().app_system.is_favorite(&pinned),
+        "a drop on nothing keeps it pinned: {pinned}"
+    );
+    assert_eq!(
+        f.niri().app_grid.index_of(&pinned),
+        None,
+        "…and its placeholder is withdrawn"
+    );
+}
+
 /// Escape during an item drag cancels the *drag* and nothing else: the icon goes home,
 /// the grid keeps its old order, and the app grid stays open (`_onEvent` → `_cancelDrag`,
 /// `dnd.js:567-573`). It used to fall through to the overview's own Escape, so one press

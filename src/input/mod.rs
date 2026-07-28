@@ -3872,14 +3872,17 @@ impl State {
         let (Some(id), Some(icon)) = (id, icon) else {
             return;
         };
+        // A **favourite** needs the same placeholder and for the same reason: the grid
+        // excludes pinned apps, so a dash icon dragged into it has nothing there to
+        // reorder either (`_onDragBegin`'s second arm, `appDisplay.js:1646-1656`).
+        let from_dash = self.niri.app_system.is_favorite(&id);
 
         // The icon keeps the point it was grabbed by: gnome-shell positions its drag
         // actor at the pointer plus the offset the press had inside it
         // (`dnd.js:257-259`), so the icon doesn't jump under the cursor.
         let grab_offset = tile_center.map_or_else(Point::default, |center| center - *origin);
         self.niri.overview_pressed = None;
-        if let Some(entry) = from_folder
-            .is_some()
+        if let Some(entry) = (from_folder.is_some() || from_dash)
             .then(|| AppGridEntry {
                 id: id.clone(),
                 name: self.niri.app_system.lookup(&id).map_or_else(
@@ -4391,7 +4394,9 @@ impl State {
         let (source_id, output) = (drag.id.clone(), drag.output.clone());
         // An app dragged out of a folder is a *move*, not a copy: it leaves the folder it
         // came from, as it does on every other drop the app display accepts
-        // (`AppDisplay.acceptDrop`'s `view.removeApp`, `appDisplay.js:1688-1691`).
+        // (`AppDisplay.acceptDrop`'s `view.removeApp`, `appDisplay.js:1688-1691`). A
+        // favourite folded or joined from the dash is unpinned for the same reason, by the
+        // `removeFavorite` two lines below it (`:1693-1694`).
         //
         // Divergence: in GNOME this drop cannot happen at all. Both `AppIcon._canAccept`
         // (`:3118-3123`) and `FolderIcon._canAccept` (`:2386-2392`) require the *source's*
@@ -4411,10 +4416,14 @@ impl State {
             // No `_savePages` for the join itself: `addApp` writes only the folder's
             // `apps`, and every tile the joined app left behind keeps the position it
             // already had. Emptying the *source* folder does remove a tile, though.
-            let save = from_folder.as_deref().map(|from| {
+            let mut save = from_folder.as_deref().map(|from| {
                 self.leave_folder(from, &source_id);
                 output.clone()
             });
+            if self.niri.app_system.is_favorite(&source_id) {
+                self.unpin_app(&source_id);
+                save = Some(output.clone());
+            }
             self.finish_grid_icon_drop(save.as_ref());
             return true;
         }
@@ -4451,6 +4460,9 @@ impl State {
         }
         if let Some(from) = &from_folder {
             self.leave_folder(from, &source_id);
+        }
+        if self.niri.app_system.is_favorite(&source_id) {
+            self.unpin_app(&source_id);
         }
         self.finish_grid_icon_drop(Some(&output));
         true
@@ -4571,9 +4583,10 @@ impl State {
 
         self.niri.app_grid.cancel_reorder();
         self.niri.folder_dialog.cancel_reorder();
-        // The placeholder an out-of-a-folder drag added is withdrawn, exactly as it is for
-        // a drop nobody took (`_removePlaceholder`, `appDisplay.js:1450-1456`).
-        if drag.from_folder.is_some() {
+        // The placeholder the drag added — for a folder member or for a favourite — is
+        // withdrawn, exactly as it is for a drop nobody took (`_removePlaceholder`,
+        // `appDisplay.js:1450-1456`).
+        if drag.from_folder.is_some() || self.niri.app_system.is_favorite(&drag.id) {
             self.niri.app_grid.remove_entry(&drag.id);
         }
         self.niri.queue_redraw_all();
@@ -4706,11 +4719,20 @@ impl State {
         } else {
             self.niri.app_grid.cancel_reorder();
         }
-        // The placeholder either becomes the real icon — and the app leaves the folder —
-        // or it is withdrawn (`_removePlaceholder`, `appDisplay.js:1450-1456`).
-        if let Some(folder) = &from_folder {
+        // The placeholder either becomes the real icon — and the app leaves wherever it
+        // was excluded from the grid *by* — or it is withdrawn (`_removePlaceholder`,
+        // `appDisplay.js:1450-1456`). A folder member leaves its folder; a favourite is
+        // unpinned, which is the same `AppDisplay.acceptDrop` line for both
+        // (`view.removeApp` / `removeFavorite`, `:1688-1694`).
+        let was_favorite = self.niri.app_system.is_favorite(&drag_id);
+        if from_folder.is_some() || was_favorite {
             if grid_took {
-                self.leave_folder(folder, &drag_id);
+                if let Some(folder) = &from_folder {
+                    self.leave_folder(folder, &drag_id);
+                }
+                if was_favorite {
+                    self.unpin_app(&drag_id);
+                }
                 self.save_app_picker_layout(&drag.output);
             } else {
                 self.niri.app_grid.remove_entry(&drag_id);
