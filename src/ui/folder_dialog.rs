@@ -176,10 +176,21 @@ struct Progress {
     /// The panel's own opacity — part of the transform's ease on the way in, its own quad
     /// on the way out (`:2684-2686` vs `:2717-2721`).
     content: f64,
-    /// What the *source tile in the grid* should be drawn at: it fades out over
-    /// `TIME / 2` while the dialog opens and back in over the second half of the close,
-    /// so the shrinking panel appears to turn back into the icon
-    /// (`_ensureFolderDialog`'s `open-state-changed` handler, `appDisplay.js:2441-2451`).
+    /// What the *source tile in the grid* should be drawn at: it fades out while the
+    /// dialog opens and back in as it shrinks home, so the panel appears to turn back
+    /// into the icon (`_ensureFolderDialog`'s `open-state-changed` handler,
+    /// `appDisplay.js:2441-2451`).
+    ///
+    /// **Divergence on the close half.** GNOME delays this fade by `TIME / 2` and then
+    /// runs it `EASE_IN_QUAD`, which leaves a real hole: the transform is `EASE_OUT_EXPO`,
+    /// so the panel has finished shrinking by the halfway mark and then sits there at 25%
+    /// opacity and falling, while the icon has not started and is still only a quarter lit
+    /// at 150 ms. Measured over the 200 ms, the two together never exceed about a third of
+    /// one solid icon between 90 and 170 ms — over a grid whose shade has already lifted,
+    /// so it reads as a bright, ordinary grid with an empty slot. We instead cross-fade:
+    /// `source = 1 - content`, so the pair always sums to exactly one icon. The *open*
+    /// half keeps GNOME's timing, where the panel and the icon overlap and there is no
+    /// hole to close.
     source: f64,
 }
 
@@ -284,9 +295,6 @@ impl Progress {
                 Phase::Closing => Self::SHUT,
             };
         }
-        // GNOME has no ease-*in* curve in our `Curve` set; the close's source-icon fade is
-        // the only user of one, and quad in is just `x²`.
-        let ease_in_quad = |u: f64| u * u;
         match phase {
             Phase::Visible => Self::OPEN,
             Phase::Opening => Self {
@@ -302,7 +310,8 @@ impl Progress {
                 zoom: 1. - Curve::EaseOutExpo.y(x),
                 shade: 1. - Curve::EaseOutQuad.y(x),
                 content: 1. - Curve::EaseOutQuad.y(x),
-                source: ease_in_quad((x * 2. - 1.).max(0.)),
+                // The complement of `content` — see the field's divergence note.
+                source: Curve::EaseOutQuad.y(x),
             },
         }
     }
@@ -847,13 +856,22 @@ mod tests {
         assert!(open.shade < open.zoom, "the shade trails the zoom in");
         assert!(close.shade > close.zoom, "…and trails it out");
 
-        // The source tile fades OUT over the first half of the open and back IN over the
-        // second half of the close — the delay is what makes the panel become the icon.
+        // The source tile fades OUT over the first half of the open, as GNOME's does.
         assert_eq!(Progress::at(Phase::Opening, 0.).source, 1.);
         assert_eq!(Progress::at(Phase::Opening, 0.5).source, 0.);
-        assert_eq!(Progress::at(Phase::Closing, 0.5).source, 0.);
-        assert_eq!(Progress::at(Phase::Closing, 1.).source, 1.);
-        assert!(Progress::at(Phase::Closing, 0.75).source < 0.5, "ease-in");
+
+        // On the close it is the panel's exact complement — our divergence. GNOME delays
+        // it by TIME/2, which leaves both faint at once for ~70 ms; summing to one solid
+        // icon at every instant is the whole point of diverging, so pin the sum, not a
+        // sample of the curve.
+        for step in 0..=20 {
+            let x = f64::from(step) / 20.;
+            let p = Progress::at(Phase::Closing, x);
+            assert!(
+                (p.content + p.source - 1.).abs() < 1e-9,
+                "the panel and the icon must always sum to one icon; at {x}: {p:?}"
+            );
+        }
     }
 
     /// The zoom maps the container so that at 0 it sits exactly on the source tile, per
