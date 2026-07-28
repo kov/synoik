@@ -8930,6 +8930,36 @@ fn overview_search_inert_when_overview_closed() {
     );
 }
 
+/// Closing the overview while a search is up takes the search with it
+/// (`prepareToLeaveOverview` → `_setSearchActive(false)`, plus the `reset()` on unmap,
+/// `searchController.js:117-131`). It used to survive: the picker's alpha is
+/// `1 - overview_search_fade()` with no overview term, so every window stayed at alpha 0
+/// behind the shade, Escape had no search left to reach, and only re-opening healed it.
+#[test]
+fn overview_search_closing_the_overview_drops_the_search() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+    // Prime the edge detector for the open state *before* typing: the rising edge is
+    // itself a clear, and it has not been seen yet in this fixture.
+    f.niri().refresh_overview_search_state();
+    tap(&mut f, KEY_A);
+    assert!(f.niri().overview_search.is_active());
+
+    f.niri_state().do_action(Action::ToggleOverview, false);
+    f.niri().refresh_overview_search_state(); // falling edge → clear
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "the search does not outlive the overview"
+    );
+
+    f.niri_complete_animations();
+    f.niri().advance_animations();
+    assert_eq!(
+        f.niri().overview_search_fade(),
+        0.,
+        "…so the window picker is at full alpha again, not hidden behind the shade"
+    );
+}
+
 /// Re-opening the overview starts search fresh: a query left from a previous session
 /// is cleared on the visibility rising edge (`refresh_overview_search_state`).
 #[test]

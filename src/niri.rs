@@ -9242,6 +9242,16 @@ impl Niri {
             // (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
             self.app_grid.reset_page();
         }
+        // …and a search never outlives the overview that hosted it: gnome-shell drops it
+        // on the way out (`prepareToLeaveOverview`'s `_setSearchActive(false)`, and the
+        // full `reset()` on unmap — `searchController.js:117-131`). Clearing it here
+        // retargets the cross-fade, so the window picker fades back in under the closing
+        // overview rather than popping. Leaving it active kept `picker_alpha` at 0 with
+        // no overview left to explain it: every window vanished behind the shade and the
+        // only way back was to open the overview again.
+        if !open && self.overview_search_was_visible {
+            self.overview_search.clear();
+        }
         // Leaving the app grid takes any open folder with it — hiding the whole overview
         // and returning to the window picker alike. It *animates* out rather than being
         // dropped, so the shrink runs alongside the grid's own fade; the dialog stops
