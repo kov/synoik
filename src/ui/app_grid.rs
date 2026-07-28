@@ -50,8 +50,10 @@
 //!
 //! **Divergences, revisited later.** No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
-//! 1:1 swipe is deferred), no keyboard paging (`Page_Up/Down`), and no folders — so the
-//! apps GNOME would hide inside one are shown individually. Pages here are always
+//! 1:1 swipe is deferred), and no keyboard paging (`Page_Up/Down`). Folders are read
+//! only: a folder takes a grid slot and hides its members from the top level
+//! ([`AppGridEntry::folder`]), but nothing here creates, renames or edits one — a drag
+//! can never make a folder, and dropping an app on one does nothing. Pages here are always
 //! **full**: our order is a flat list chunked by the page size, where GNOME's grid is
 //! built with `allow_incomplete_pages: true` (`appDisplay.js:655`) and can leave holes.
 //! The name fallback sort is a case-folded `to_lowercase` compare rather
@@ -161,9 +163,10 @@ const HINT_COLOR: [f32; 4] = [1., 1., 1., 0.05];
 /// The same band while a drag is over it (`.page-navigation-hint.dnd`,
 /// `_app-grid.scss:151-153`) — a flat 10% fill, no gradient.
 const HINT_DND_COLOR: [f32; 4] = [1., 1., 1., 0.1];
-/// `$modal_radius * 1.5` (`_app-grid.scss:160,168`). Only the band's **inner** corners
-/// are cut; see [`widget::Painter::fill_rounded_faded`] for how that is expressed.
-const HINT_RADIUS: f64 = 36.;
+/// `$modal_radius * 1.5` (`_app-grid.scss:160,168`), i.e. `$base_border_radius * 2 * 1.5`
+/// = 24 (`_common.scss:33,40`). Only the band's **inner** corners are cut; see
+/// [`widget::Painter::fill_rounded_faded`] for how that is expressed.
+const HINT_RADIUS: f64 = 24.;
 
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
@@ -211,13 +214,23 @@ pub struct GridDropTarget {
     pub location: DragLocation,
 }
 
-/// One grid app — a plain-data snapshot (not a live catalog borrow), like
-/// [`crate::ui::dash::DashEntry`].
+/// One grid slot — a plain-data snapshot (not a live catalog borrow), like
+/// [`crate::ui::dash::DashEntry`]. It is an app, or a *folder* of apps: GNOME's
+/// `_redisplay` pushes `FolderIcon`s into the same list as `AppIcon`s
+/// (`appDisplay.js:1508-1533`), so a folder sorts and drags exactly like an app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppGridEntry {
+    /// A desktop id for an app; a `folder-children` id for a folder. Both share the
+    /// `app-picker-layout` id space.
     pub id: String,
     pub name: String,
+    /// The app's icon. Unused for a folder, whose tile composes its members'
+    /// icons instead ([`Self::folder`]).
     pub icon: AppIconRef,
+    /// `Some` for a folder: its members in display order, resolved by
+    /// [`crate::app_system::AppSystem::folder_members`]. Never empty — an empty
+    /// folder is not displayed at all (`appDisplay.js:1523-1527`).
+    pub folder: Option<Vec<AppGridEntry>>,
 }
 
 #[derive(Default)]
@@ -438,6 +451,11 @@ impl AppGrid {
     /// The id of tile `i`, if present (what a click launches).
     pub fn entry_id(&self, i: usize) -> Option<&str> {
         self.entries.get(i).map(|e| e.id.as_str())
+    }
+
+    /// Tile `i`'s folder members, if it is a folder rather than an app.
+    pub fn entry_folder(&self, i: usize) -> Option<&[AppGridEntry]> {
+        self.entries.get(i)?.folder.as_deref()
     }
 
     /// The icon of tile `i`, if present (what a drag of that tile carries).
@@ -1629,6 +1647,7 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
             icon: AppIconRef::Fallback,
+            folder: None,
         }
     }
 

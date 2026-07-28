@@ -8613,16 +8613,48 @@ impl Niri {
     /// `appDisplay.js:1122`). Returns whether the grid changed. (Parental controls are
     /// not modeled yet, so that half of the filter is a no-op for now.)
     pub fn sync_app_grid(&mut self) -> bool {
+        // Folders first: each takes a grid slot of its own and its members stop
+        // appearing at the top level (`_redisplay` collects `appsInsideFolders` and
+        // filters the app list against it, `appDisplay.js:1508-1533`). A folder that
+        // resolves to nothing is destroyed rather than displayed.
+        let mut inside_folders: HashSet<String> = HashSet::new();
+        let mut folders: Vec<AppGridEntry> = Vec::new();
+        for folder in &self.gnome_settings.app_folders {
+            let members = self.app_system.folder_members(folder);
+            if members.is_empty() {
+                continue;
+            }
+            inside_folders.extend(members.iter().map(|e| e.id.clone()));
+            folders.push(AppGridEntry {
+                id: folder.id.clone(),
+                name: folder.name.clone(),
+                icon: AppIconRef::Fallback,
+                folder: Some(
+                    members
+                        .into_iter()
+                        .map(|e| AppGridEntry {
+                            id: e.id,
+                            name: e.name,
+                            icon: e.icon,
+                            folder: None,
+                        })
+                        .collect(),
+                ),
+            });
+        }
+
         let mut entries: Vec<AppGridEntry> = self
             .app_system
             .installed()
-            .filter(|e| !self.app_system.is_favorite(&e.id))
+            .filter(|e| !self.app_system.is_favorite(&e.id) && !inside_folders.contains(&e.id))
             .map(|e| AppGridEntry {
                 id: e.id.clone(),
                 name: e.name.clone(),
                 icon: e.icon.clone(),
+                folder: None,
             })
             .collect();
+        entries.append(&mut folders);
         // gnome-shell's `AppDisplay._compareItems` (`appDisplay.js:1475-1490`): apps the
         // user has placed sort by their saved `(page, position)`; everything else falls
         // in *after* them, by name. The arrangement lives in `org.gnome.shell

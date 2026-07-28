@@ -7117,6 +7117,7 @@ fn vulkan_app_grid_draws_hovered_tile() {
                     id: format!("{n}.desktop"),
                     name: (*n).to_string(),
                     icon: AppIconRef::Fallback,
+                    folder: None,
                 })
                 .collect(),
         );
@@ -7235,6 +7236,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
                 id: format!("{n}.desktop"),
                 name: (*n).to_string(),
                 icon: AppIconRef::Fallback,
+                folder: None,
             })
             .collect(),
     );
@@ -7333,6 +7335,7 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
                 id: format!("app{i:02}.desktop"),
                 name: format!("App {i:02}"),
                 icon: AppIconRef::Fallback,
+                folder: None,
             })
             .collect(),
     );
@@ -7437,11 +7440,13 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
                 id: "red.desktop".into(),
                 name: "Red".into(),
                 icon: AppIconRef::File(red_path.clone()),
+                folder: None,
             },
             AppGridEntry {
                 id: "blue.desktop".into(),
                 name: "Blue".into(),
                 icon: AppIconRef::File(blue_path.clone()),
+                folder: None,
             },
         ]);
     }
@@ -7533,6 +7538,7 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
                     id: format!("app{i:02}.desktop"),
                     name: format!("App {i:02}"),
                     icon: AppIconRef::Fallback,
+                    folder: None,
                 })
                 .collect(),
         );
@@ -7623,6 +7629,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
                     id: format!("app{i:02}.desktop"),
                     name: format!("App {i:02}"),
                     icon: AppIconRef::Fallback,
+                    folder: None,
                 })
                 .collect(),
         );

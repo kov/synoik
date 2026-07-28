@@ -746,8 +746,9 @@ adjacent page's icons slide into.
 **(b) The hint bands.** `_prevPageIndicator` / `_nextPageIndicator` are plain `St.Widget`s styled
 `.page-navigation-hint {previous,next}` (`appDisplay.js:528-549`), allocated to exactly the reserve
 box. `_app-grid.scss:150-170`: a horizontal gradient from `rgba(255,255,255,0.05)` to transparent,
-running *inward*, with `$modal_radius * 1.5` (36px) rounding on the two **outer** corners only; while
-a drag hovers one it gains `.dnd`, a flat `rgba(255,255,255,0.1)`. They fade in over
+running *inward*, with `$modal_radius * 1.5` rounding on the two **outer** corners only; while
+a drag hovers one it gains `.dnd`, a flat `rgba(255,255,255,0.1)`. `$modal_radius` is
+`$base_border_radius * 2` = 16 (`_common.scss:33,40`), so the rounding is **24 px**. They fade in over
 `PAGE_INDICATOR_FADE_TIME` 200 ms and are shown on **item-drag-begin** — any overview item drag, not
 only a grid one (`_onDragBegin` → `showPageIndicators`, `appDisplay.js:923-930`). The *next* hint is
 always shown during a drag even on the last page, because dropping there creates a page
@@ -802,3 +803,87 @@ Dropping *on* a hint band moves the item to that page (`acceptDrop`, `:1004-1013
 **Known deferrals** (state them, don't silently skip): no page-*slide* animation, so a switch is a
 snap; no folders, so a drop can never make one; and the reorder is grid-internal — dragging a grid
 icon onto the dash still pins it, which is the existing behaviour.
+
+## 8. App folders — see & open (cited plan, 2026-07-27)
+
+Goal: the grid shows the user's folders as folder tiles, their apps stop appearing at the top level,
+and clicking one opens the folder dialog to launch from. **Folder *editing* is out of scope** (see the
+deferrals at the end). Everything below is 50.1 as shipped.
+
+### 8.1 The model
+
+**Where folders live.** `org.gnome.desktop.app-folders folder-children` is an `as` of folder ids; each
+id has a *relocatable* `org.gnome.desktop.app-folders.folder` at
+`${folderSettings.path}folders/<id>/` (`appDisplay.js:1510-1513`), with keys `name`, `translate`,
+`categories`, `apps`, `excluded-apps`.
+
+**Membership** — `FolderView._loadApps` (`appDisplay.js:2164-2199`): the `apps` list first, in order,
+then every installed app whose `Categories` intersect the folder's `categories`
+(`_getCategories`/`_listsIntersect`, `appDisplay.js:79-95` — `Categories` split on `;`). `addAppId`
+drops an id that is in `excluded-apps`, is not installed, is a favorite, is hidden by parental
+controls, or is already in the list.
+
+**The name.** `_getFolderName` (`appDisplay.js:97-104`): `name`, and if the folder's `translate`
+boolean is set, looked up as a `.directory` file. `shell_util_get_translated_folder_name`
+(`shell-app-cache.c:95-147`) scans `$XDG_DATA_DIRS/desktop-directories/<name>` — **user data dir
+first**, then system dirs — and reads `[Desktop Entry] Name` as a locale string; **first added wins**.
+On this machine `Utilities` → `/usr/share/desktop-directories/X-GNOME-Utilities.directory`.
+
+**Where a folder sits in the grid.** `_redisplay` (`appDisplay.js:1508-1533`) pushes folder icons into
+the same `appIcons` array as apps and collects `appsInsideFolders`, which the app list is then filtered
+against. So folder ids share the `app-picker-layout` id space and sort by the same comparator — on
+this machine `'Utilities': <{'position': <7>}>`, a slot we currently leave as a hole. **An empty
+folder is destroyed, not displayed** (`icon.visible`, `appDisplay.js:1523-1527`).
+
+### 8.2 The folder tile
+
+`FolderIcon` (`appDisplay.js:2284-2461`) is `style_class: 'overview-tile app-folder'` — i.e. the same
+tile as an app, but *raised*: `.app-folder { @include tile_button($bg:$system_base_color, $raised:
+true) }` (`_app-grid.scss:40-42`), so it has a filled button background at rest rather than the app
+tile's transparent one. Its "icon" is composed, `createFolderIcon(size)`
+(`appDisplay.js:2138-2162`): a homogeneous 2×2 `Clutter.GridLayout` sized `size×size`, holding up to
+the first four member icons at `floor(FOLDER_SUBICON_FRACTION * size)` = **0.4×** each
+(`appDisplay.js:31`), attached at `(i % 2, floor(i / 2))` — so 4 cells, blank where the folder has
+fewer than four apps. `button_mask: PRIMARY`, and `vfunc_clicked` just calls `open()`.
+
+### 8.3 The dialog
+
+`AppFolderDialog` (`appDisplay.js:2463-2600`) is a full-monitor actor (`MonitorConstraint({primary:
+true})`) whose background eases to `DIALOG_SHADE_NORMAL` = `rgba(0,0,0,0.8)` (`appDisplay.js:57`),
+holding a `.app-folder-dialog-container` bin (`padding-top: $panel_height`) around the
+`.app-folder-dialog` box. `_app-grid.scss:53-110`: **720×720** (`$app_folder_size`), radius
+`$modal_radius * 4` = **64**, `background-color: $system_overlay_bg_color` (= `system_base_color`
+mixed 90% with the fg), `box-shadow: inset 0 0 0 1px $system_borders_color`, its `.overview-tile`s
+re-themed against the overlay bg, and `.page-indicators { margin-bottom: $base_padding * 4 }`. The
+name sits in `.folder-name-container` (`padding: $base_padding*4 $base_padding*6`, `padding-bottom:
+0`) as a `%title_1` label — **20pt, weight 800** (`_common.scss:246-249`). The inner grid is
+`FolderGrid` (`appDisplay.js:2067-2084`): **3 columns × 3 rows**, `allow_incomplete_pages: false`,
+centered both ways, one grid mode only. A click whose coordinates fall outside `_viewBox.allocation`
+pops down (`appDisplay.js:2486`).
+
+### 8.4 The open/close animation
+
+`_zoomAndFadeIn` (`appDisplay.js:2660-2695`): the dialog child starts translated to the source icon's
+transformed position, scaled to `source.width / child.width`, opacity 0, and eases to identity over
+`FOLDER_DIALOG_ANIMATION_TIME` **200 ms** — `EASE_OUT_EXPO` for the transform, `EASE_OUT_QUAD` for the
+shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself** fades out over
+`FOLDER_DIALOG_ANIMATION_TIME / 2` while open, delayed by `TIME - duration` on the way back
+(`appDisplay.js:2442-2451`).
+
+### 8.5 Slices
+
+* **F1 — the model.** `GnomeSettings` reads `folder-children` + each relocatable folder schema + the
+  `.directory` name translation; `AppEntry` gains `categories`; `Niri::sync_app_grid` resolves
+  membership *before* the sort, drops members from the top level, drops empty folders, and gives each
+  folder entry its `app-picker-layout` slot. No chrome — fully headless-testable.
+* **F2 — the folder tile.** A grid entry becomes app-or-folder; render the raised `.app-folder` tile
+  with the 2×2 sub-icon composition at 0.4×. Click opens (no dialog yet — assert the state).
+* **F3 — the dialog.** The 720² panel with its title, its own 3×3 paginated grid, launching from
+  inside, click-outside/Esc/Super to close.
+* **F4 — the zoom-and-fade.** The 200 ms popup/popdown against the source tile's rect, the shade
+  ramp, and the source icon's half-duration fade.
+
+**Deferrals** (state them, don't silently skip): no drag-to-create a folder, no drag in/out of one, no
+rename entry (so `translate` is only ever read), no `_ensureDefaultFolders`, and no auto-delete of a
+folder emptied by removal — all of those are the *editing* half, which needs the folder settings
+writer and the rename popup.

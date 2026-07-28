@@ -98,6 +98,36 @@ pub struct GnomeSettings {
     /// `org.gnome.shell.world-clocks locations` resolved to timezones, plus whether
     /// GNOME Clocks is installed — drives the dateMenu World Clocks section.
     pub world_clocks: WorldClocks,
+    /// `org.gnome.desktop.app-folders`: the user's app-grid folders, in
+    /// `folder-children` order. See [`AppFolder`].
+    pub app_folders: Vec<AppFolder>,
+}
+
+/// One app-grid folder, as `FolderIcon`/`FolderView` read it
+/// (`js/ui/appDisplay.js`).
+///
+/// Ids come from `org.gnome.desktop.app-folders folder-children`; each has its own
+/// *relocatable* `org.gnome.desktop.app-folders.folder` instance at
+/// `/org/gnome/desktop/app-folders/folders/<id>/` (`appDisplay.js:1510-1513`).
+/// Resolving this to a member list is
+/// [`AppSystem::folder_members`](crate::app_system::AppSystem::folder_members).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppFolder {
+    /// The `folder-children` id, e.g. `"Utilities"`. Folder ids share the
+    /// `app-picker-layout` id space with desktop ids, so a folder sorts into the
+    /// grid exactly like an app does.
+    pub id: String,
+    /// The displayed name, already resolved through the `.directory` translation
+    /// when the folder's `translate` key asked for it (`_getFolderName`,
+    /// `appDisplay.js:97-104`).
+    pub name: String,
+    /// `categories`: the folder claims every shown app whose `Categories`
+    /// intersect this list.
+    pub categories: Vec<String>,
+    /// `apps`: explicitly-placed members, in order — they come first.
+    pub apps: Vec<String>,
+    /// `excluded-apps`: ids the category match must not pull in.
+    pub excluded_apps: Vec<String>,
 }
 
 /// The dateMenu World Clocks section's data (`js/ui/dateMenu.js` `WorldClocksSection`).
@@ -170,6 +200,7 @@ impl Default for GnomeSettings {
             last_power_profile: "power-saver".to_string(),
             input_sources: InputSources::default(),
             world_clocks: WorldClocks::default(),
+            app_folders: Vec::new(),
         }
     }
 }
@@ -1094,6 +1125,17 @@ struct Stores {
     color: Option<gio::Settings>,
     input_sources: Option<gio::Settings>,
     world_clocks: Option<gio::Settings>,
+    app_folders: Option<gio::Settings>,
+    /// The relocatable `org.gnome.desktop.app-folders.folder` instances, one per
+    /// `folder-children` id, opened lazily and then kept alive so the `changed`
+    /// subscription installed on first sight stays live (a folder's *contents* live
+    /// in its own store, so without this only `folder-children` itself would be
+    /// watched).
+    folder_stores: RefCell<HashMap<String, gio::Settings>>,
+    /// What to call when a folder store changes — the same closure `subscribe`
+    /// installed on the fixed stores, stashed so a folder store opened later can
+    /// join in.
+    folder_on_change: RefCell<Option<SettingsCallback>>,
     /// Whether `org.gnome.clocks.desktop` is installed, sampled once at open.
     clocks_installed: bool,
     /// Cache for the expensive coordinate→timezone resolution, keyed by the parsed
@@ -1123,6 +1165,9 @@ impl Stores {
             color: gsettings("org.gnome.settings-daemon.plugins.color"),
             input_sources: gsettings("org.gnome.desktop.input-sources"),
             world_clocks: gsettings("org.gnome.shell.world-clocks"),
+            app_folders: gsettings("org.gnome.desktop.app-folders"),
+            folder_stores: RefCell::new(HashMap::new()),
+            folder_on_change: RefCell::new(None),
             clocks_installed: desktop_app_installed("org.gnome.clocks.desktop"),
             world_clocks_cache: RefCell::new(None),
             clocks_proxy: RefCell::new(None),
@@ -1160,13 +1205,14 @@ impl Stores {
             &self.color,
             &self.input_sources,
             &self.world_clocks,
+            &self.app_folders,
         ]
         .into_iter()
         .flatten()
     }
 
     /// GNOME's defaults overlaid with the live values of every open store.
-    fn read(&self) -> GnomeSettings {
+    fn read(self: &Rc<Self>) -> GnomeSettings {
         let mut settings = GnomeSettings::default();
         if let Some(mutter) = &self.mutter {
             settings.load_mutter(mutter);
@@ -1206,13 +1252,75 @@ impl Stores {
         if let Some(world_clocks) = &self.world_clocks {
             settings.load_world_clocks(world_clocks, &self.world_clocks_cache);
         }
+        settings.app_folders = self.read_app_folders();
         settings
+    }
+
+    /// The `folder-children` folders, each read from its own relocatable store
+    /// (`_redisplay`, `appDisplay.js:1510-1533`).
+    fn read_app_folders(self: &Rc<Self>) -> Vec<AppFolder> {
+        let Some(folders) = &self.app_folders else {
+            return Vec::new();
+        };
+        if !settings_has_key(folders, "folder-children") {
+            return Vec::new();
+        }
+        folders
+            .strv("folder-children")
+            .iter()
+            .filter_map(|id| {
+                let store = self.folder_store(id.as_str())?;
+                let name = store.string("name").to_string();
+                let name = if store.boolean("translate") {
+                    translated_folder_name(&name).unwrap_or(name)
+                } else {
+                    name
+                };
+                Some(AppFolder {
+                    id: id.to_string(),
+                    name,
+                    categories: strv(&store, "categories"),
+                    apps: strv(&store, "apps"),
+                    excluded_apps: strv(&store, "excluded-apps"),
+                })
+            })
+            .collect()
+    }
+
+    /// The relocatable store for one folder id, opened on first sight and cached.
+    ///
+    /// It is cached because it is also *subscribed*: a folder's keys live here, not
+    /// in `org.gnome.desktop.app-folders`, so dropping the handle would leave every
+    /// change to a folder's contents unwatched.
+    fn folder_store(self: &Rc<Self>, id: &str) -> Option<gio::Settings> {
+        if let Some(store) = self.folder_stores.borrow().get(id) {
+            return Some(store.clone());
+        }
+        let source = gio::SettingsSchemaSource::default()?;
+        source.lookup(APP_FOLDER_SCHEMA, true)?;
+        let store = gio::Settings::with_path(
+            APP_FOLDER_SCHEMA,
+            &format!("/org/gnome/desktop/app-folders/folders/{id}/"),
+        );
+        if let Some(on_change) = self.folder_on_change.borrow().clone() {
+            let stores = self.clone();
+            store.connect_changed(None, move |_, _key| {
+                on_change(stores.read());
+            });
+        }
+        self.folder_stores
+            .borrow_mut()
+            .insert(id.to_owned(), store.clone());
+        Some(store)
     }
 
     /// Invoke `on_change` with a freshly-read model whenever any key in any
     /// store changes. The subscriptions live as long as the stores do.
     fn subscribe(self: &Rc<Self>, on_change: impl Fn(GnomeSettings) + 'static) {
-        let on_change = Rc::new(on_change);
+        let on_change: SettingsCallback = Rc::new(on_change);
+        // Stash it before the first read: `read` opens the per-folder stores lazily,
+        // and each wants this same subscription (see `folder_store`).
+        *self.folder_on_change.borrow_mut() = Some(on_change.clone());
         for settings in self.all() {
             let stores = self.clone();
             let on_change = on_change.clone();
@@ -1285,6 +1393,18 @@ impl Stores {
     }
 }
 
+/// What a store's `changed` subscription runs with the freshly-read model.
+type SettingsCallback = Rc<dyn Fn(GnomeSettings)>;
+
+/// The relocatable per-folder schema, one instance per `folder-children` id
+/// (`appDisplay.js:2295-2299`).
+const APP_FOLDER_SCHEMA: &str = "org.gnome.desktop.app-folders.folder";
+
+/// An `as` key as owned `String`s.
+fn strv(settings: &gio::Settings, key: &str) -> Vec<String> {
+    settings.strv(key).iter().map(|s| s.to_string()).collect()
+}
+
 /// Open a [`gio::Settings`] for `schema_id`, or `None` if the schema isn't
 /// installed (e.g. running outside a GNOME environment). Guarding with the schema
 /// source avoids `gio::Settings::new`'s abort-on-missing-schema behavior.
@@ -1299,6 +1419,14 @@ fn gsettings(schema_id: &str) -> Option<gio::Settings> {
 /// XDG `applications` dirs for a flat `<id>` file (nested / vendor-prefixed
 /// desktop-id resolution is a recorded divergence — fine for `org.gnome.clocks`).
 fn desktop_app_installed(desktop_id: &str) -> bool {
+    xdg_data_dirs()
+        .iter()
+        .any(|dir| dir.join("applications").join(desktop_id).exists())
+}
+
+/// The XDG data search path, **user directory first** — the order every
+/// first-wins lookup below walks (`shell-app-cache.c:112-140`).
+fn xdg_data_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(data_home));
@@ -1308,8 +1436,38 @@ fn desktop_app_installed(desktop_id: &str) -> bool {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS")
         .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
     dirs.extend(std::env::split_paths(&data_dirs));
-    dirs.iter()
-        .any(|dir| dir.join("applications").join(desktop_id).exists())
+    dirs
+}
+
+/// The translated display name of an app folder whose `translate` key is set —
+/// `shell_util_get_translated_folder_name` (`src/shell-app-cache.c:95-147`).
+///
+/// `name` is a `.directory` file name (e.g. `"X-GNOME-Utilities.directory"`), looked
+/// up under `desktop-directories/` in each XDG data dir, user dir first; the answer
+/// is its `[Desktop Entry] Name` as a **locale** string. First file found wins, even
+/// if it has no `Name` — GNOME caches the first entry it managed to add.
+fn translated_folder_name(name: &str) -> Option<String> {
+    translated_folder_name_in(&xdg_data_dirs(), name)
+}
+
+/// [`translated_folder_name`] against an explicit search path — the lookup, with no
+/// environment read, so a test can point it at a fixture directory.
+fn translated_folder_name_in(dirs: &[PathBuf], name: &str) -> Option<String> {
+    for dir in dirs {
+        let path = dir.join("desktop-directories").join(name);
+        let keyfile = glib::KeyFile::new();
+        if keyfile
+            .load_from_file(&path, glib::KeyFileFlags::NONE)
+            .is_err()
+        {
+            continue;
+        }
+        return keyfile
+            .locale_string("Desktop Entry", "Name", None)
+            .ok()
+            .map(|s| s.to_string());
+    }
+    None
 }
 
 bitflags::bitflags! {
@@ -1597,6 +1755,49 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    /// A folder that asks to be translated names a `.directory` file, not a string:
+    /// the display name is that file's `[Desktop Entry] Name`, looked up under
+    /// `desktop-directories/` with the **user** data dir first and the first file
+    /// found winning outright (`shell-app-cache.c:112-140`) — so a user override
+    /// shadows the system file even when its own `Name` is missing.
+    #[test]
+    fn a_translated_folder_name_comes_from_the_first_directory_file_found() {
+        let root = std::env::temp_dir().join(format!("gsrs-folder-name-{}", std::process::id()));
+        let user = root.join("user/desktop-directories");
+        let system = root.join("system/desktop-directories");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(
+            system.join("X-GNOME-Utilities.directory"),
+            "[Desktop Entry]\nName=Utilities\nName[pt_BR]=Utilitários\n",
+        )
+        .unwrap();
+        let dirs = [root.join("user"), root.join("system")];
+
+        assert_eq!(
+            translated_folder_name_in(&dirs, "X-GNOME-Utilities.directory").as_deref(),
+            Some("Utilities")
+        );
+        assert_eq!(
+            translated_folder_name_in(&dirs, "Nope.directory"),
+            None,
+            "a folder naming a file nobody ships keeps its raw name"
+        );
+
+        // The user file wins even though it carries no `Name` at all.
+        std::fs::write(
+            user.join("X-GNOME-Utilities.directory"),
+            "[Desktop Entry]\nIcon=folder\n",
+        )
+        .unwrap();
+        assert_eq!(
+            translated_folder_name_in(&dirs, "X-GNOME-Utilities.directory"),
+            None
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// The watcher re-reads the whole model whenever any key in any watched store
     /// changes — including the many keys we do not model — so an unrelated write
     /// produces a model identical to the one already applied. Forwarding it made the
@@ -1974,6 +2175,9 @@ mod tests {
                 color: None,
                 input_sources: None,
                 world_clocks: None,
+                app_folders: None,
+                folder_stores: RefCell::new(HashMap::new()),
+                folder_on_change: RefCell::new(None),
                 clocks_installed: false,
                 world_clocks_cache: RefCell::new(None),
                 clocks_proxy: RefCell::new(None),
@@ -2077,6 +2281,9 @@ mod tests {
                         color: None,
                         input_sources: None,
                         world_clocks: None,
+                        app_folders: None,
+                        folder_stores: RefCell::new(HashMap::new()),
+                        folder_on_change: RefCell::new(None),
                         clocks_installed: false,
                         world_clocks_cache: RefCell::new(None),
                         clocks_proxy: RefCell::new(None),
@@ -2163,6 +2370,9 @@ mod tests {
                         color: None,
                         input_sources: None,
                         world_clocks: None,
+                        app_folders: None,
+                        folder_stores: RefCell::new(HashMap::new()),
+                        folder_on_change: RefCell::new(None),
                         clocks_installed: false,
                         world_clocks_cache: RefCell::new(None),
                         clocks_proxy: RefCell::new(None),

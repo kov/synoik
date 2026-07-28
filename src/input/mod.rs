@@ -4322,6 +4322,11 @@ impl State {
             }
             // An app grid tile launches the app and closes the overview
             // (`AppIcon.activate`, `appDisplay.js:3060,3077`).
+            // A folder tile opens instead of launching (`FolderIcon.vfunc_clicked`,
+            // `appDisplay.js:2343`) — the dialog is slice F3, so for now a click on
+            // one does nothing rather than trying to launch a folder id.
+            OverviewHit::GridApp(i) if launches && self.niri.app_grid.entry_folder(i).is_some() => {
+            }
             OverviewHit::GridApp(i) if launches => {
                 if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {
                     if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {

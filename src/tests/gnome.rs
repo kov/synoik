@@ -6889,6 +6889,92 @@ fn overview_app_grid_click_launches_and_closes() {
     );
 }
 
+/// An app folder is a grid slot of its own, and its members stop appearing at the top
+/// level: `_redisplay` (`appDisplay.js:1508-1533`) pushes each `FolderIcon` into the
+/// same list as the app icons, collects `appsInsideFolders`, and filters the app list
+/// against it. So a folder sorts by `app-picker-layout` under its `folder-children` id
+/// exactly like an app does — on a real profile `'Utilities'` holds a position in that
+/// dict. A folder that resolves to nothing is not displayed at all
+/// (`appDisplay.js:1523-1527`), and clicking a folder opens it rather than launching
+/// anything (`FolderIcon.vfunc_clicked`, `appDisplay.js:2343`).
+#[test]
+fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
+    use std::collections::HashMap;
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    let ids = |f: &mut Fixture| -> Vec<String> {
+        (0..4)
+            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .collect()
+    };
+
+    f.niri().gnome_settings.app_folders = vec![
+        AppFolder {
+            id: "Utilities".to_owned(),
+            name: "Utilities".to_owned(),
+            apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+            ..Default::default()
+        },
+        AppFolder {
+            id: "Empty".to_owned(),
+            name: "Empty".to_owned(),
+            apps: vec!["nothing-installed.desktop".to_owned()],
+            ..Default::default()
+        },
+    ];
+    f.niri().sync_app_grid();
+
+    assert_eq!(
+        ids(&mut f),
+        vec!["a.desktop", "Utilities"],
+        "the folder's two apps left the top level, the folder took one slot, and the \
+         folder that resolved to nothing is not displayed"
+    );
+    assert_eq!(
+        f.niri()
+            .app_grid
+            .entry_folder(1)
+            .expect("tile 1 is the folder")
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>(),
+        vec!["m.desktop", "z.desktop"],
+        "the folder carries its members, in the order it lists them"
+    );
+    assert!(
+        f.niri().app_grid.entry_folder(0).is_none(),
+        "an app tile is not a folder"
+    );
+
+    // The folder id sorts through the same saved arrangement as a desktop id.
+    f.niri().gnome_settings.app_picker_layout = HashMap::from([("Utilities".to_owned(), (0, 0))]);
+    f.niri().sync_app_grid();
+    assert_eq!(ids(&mut f), vec!["Utilities", "a.desktop"]);
+
+    // Clicking it launches nothing and leaves the overview up.
+    let area = overview_controls(&mut f).app_display;
+    let center = f
+        .niri()
+        .app_grid
+        .tile_center(0, area)
+        .expect("the folder tile is in range");
+    f.pointer_motion(center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a folder launches nothing"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "clicking a folder must not close the overview"
+    );
+}
+
 /// With more apps than fit one page, the grid paginates: a wheel scroll over it and a
 /// click on a page-indicator dot move between pages, and a fresh overview open resets
 /// to the first page (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).

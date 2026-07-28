@@ -80,6 +80,10 @@ pub struct AppEntry {
     /// `g_desktop_app_info_get_startup_wm_class()` — the `StartupWMClass` key that
     /// window↔app matching consults first (see [`AppSystem::app_for_window`]).
     pub startup_wm_class: Option<String>,
+    /// The `Categories` key, split on `;` — what a *category-based* app folder
+    /// matches its members against (`_getCategories`/`_listsIntersect`,
+    /// `appDisplay.js:79-95`). Nothing else reads it.
+    pub categories: Vec<String>,
 }
 
 /// One `.desktop` action — `[Desktop Action <id>]` — as the app menu shows it.
@@ -494,6 +498,50 @@ impl AppSystem {
         self.catalog.lookup(id)
     }
 
+    /// An app folder's members, in display order — `FolderView._loadApps`
+    /// (`appDisplay.js:2164-2199`).
+    ///
+    /// The folder's explicitly-placed `apps` come first, in their saved order, then
+    /// every *shown* app whose `Categories` intersect the folder's `categories`
+    /// (`_listsIntersect`, `appDisplay.js:86-93`). A candidate is dropped when it is
+    /// in `excluded-apps`, is not installed, is a favorite (favorites live in the
+    /// dash, never in the grid), or is already in the list.
+    ///
+    /// Parental controls are the one filter of GNOME's we do not apply: we have no
+    /// `ParentalControlsManager`, so a malcontent-hidden app is visible everywhere
+    /// in our grid, not just inside folders.
+    ///
+    /// An empty result means the folder is not displayed at all
+    /// (`appDisplay.js:1523-1527`); the caller decides that.
+    pub fn folder_members(&self, folder: &crate::gnome::AppFolder) -> Vec<AppEntry> {
+        let mut members: Vec<AppEntry> = Vec::new();
+        let push = |id: &str, members: &mut Vec<AppEntry>| {
+            if folder.excluded_apps.iter().any(|e| e == id) || self.is_favorite(id) {
+                return;
+            }
+            if members.iter().any(|m| m.id == id) {
+                return;
+            }
+            if let Some(app) = self.lookup(id) {
+                members.push(app);
+            }
+        };
+        for id in &folder.apps {
+            push(id, &mut members);
+        }
+        if !folder.categories.is_empty() {
+            let matched: Vec<String> = self
+                .installed()
+                .filter(|e| e.categories.iter().any(|c| folder.categories.contains(c)))
+                .map(|e| e.id.clone())
+                .collect();
+            for id in matched {
+                push(&id, &mut members);
+            }
+        }
+        members
+    }
+
     /// Relevance-grouped app search, delegated verbatim to the catalog
     /// (`g_desktop_app_info_search`). Provider-level filtering/usage-sorting/
     /// system-actions live above this in slice S4.
@@ -649,6 +697,19 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         .downcast_ref::<DesktopAppInfo>()
         .and_then(|d| d.startup_wm_class())
         .map(|s| s.to_string());
+    // `Categories` is a trailing-semicolon list; GNOME splits on `;` and keeps
+    // whatever falls out (`_getCategories`, `appDisplay.js:79-83`), so an empty
+    // tail is the only thing worth dropping.
+    let categories = info
+        .downcast_ref::<DesktopAppInfo>()
+        .and_then(|d| d.categories())
+        .map(|c| {
+            c.split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     Some(AppEntry {
         id,
         name: info.name().to_string(),
@@ -658,6 +719,7 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         should_show: info.should_show(),
         icon,
         startup_wm_class,
+        categories,
     })
 }
 
@@ -860,6 +922,15 @@ impl AppEntry {
             should_show: true,
             icon: AppIconRef::Fallback,
             startup_wm_class: None,
+            categories: Vec::new(),
+        }
+    }
+
+    /// The same, declaring `Categories` — what a category-based folder matches on.
+    pub fn fake_in_categories(id: &str, name: &str, categories: &[&str]) -> Self {
+        Self {
+            categories: categories.iter().map(|c| c.to_string()).collect(),
+            ..Self::fake(id, name)
         }
     }
 
@@ -1242,6 +1313,70 @@ mod tests {
             ["a.desktop"]
         );
         assert_eq!(system.favorite_ids(), ["a.desktop", "b.desktop"]);
+    }
+
+    // ---- App folders ----
+
+    /// `_loadApps` builds a folder from two sources with different rules: the
+    /// explicit `apps` list, verbatim and in order, then a category sweep over the
+    /// shown apps. Every candidate from either source runs the same gauntlet —
+    /// `excluded-apps`, favorites, not-installed, already-there — so a category
+    /// match can neither duplicate an explicit member nor resurrect an excluded one.
+    #[test]
+    fn a_folder_takes_its_explicit_apps_first_then_its_categories() {
+        let mut system = system_with(vec![
+            AppEntry::fake_in_categories("terminal.desktop", "Terminal", &["System", "Utility"]),
+            AppEntry::fake_in_categories("disks.desktop", "Disks", &["Utility"]),
+            AppEntry::fake_in_categories("games.desktop", "Games", &["Game"]),
+            AppEntry::fake_in_categories("boring.desktop", "Boring", &["Utility"]),
+            AppEntry::fake_in_categories("faved.desktop", "Faved", &["Utility"]),
+            AppEntry::fake("placed.desktop", "Placed"),
+        ]);
+        system.set_favorites(vec!["faved.desktop".to_owned()]);
+
+        let folder = crate::gnome::AppFolder {
+            id: "Utilities".to_owned(),
+            name: "Utilities".to_owned(),
+            categories: vec!["Utility".to_owned()],
+            // `terminal` is listed *and* matches the category: it must appear once,
+            // in the explicit list's position, not the sweep's.
+            apps: vec![
+                "placed.desktop".to_owned(),
+                "terminal.desktop".to_owned(),
+                "missing.desktop".to_owned(),
+            ],
+            excluded_apps: vec!["boring.desktop".to_owned()],
+        };
+
+        let members: Vec<String> = system
+            .folder_members(&folder)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            members,
+            ["placed.desktop", "terminal.desktop", "disks.desktop"]
+        );
+    }
+
+    /// A folder with no categories does not sweep at all — and one whose members
+    /// all resolve away is empty, which is what makes the caller hide it
+    /// (`appDisplay.js:1523-1527`).
+    #[test]
+    fn a_folder_can_resolve_to_nothing() {
+        let mut system = system_with(vec![AppEntry::fake_in_categories(
+            "faved.desktop",
+            "Faved",
+            &["Utility"],
+        )]);
+        system.set_favorites(vec!["faved.desktop".to_owned()]);
+
+        let folder = crate::gnome::AppFolder {
+            id: "Utilities".to_owned(),
+            categories: vec!["Utility".to_owned()],
+            ..Default::default()
+        };
+        assert!(system.folder_members(&folder).is_empty());
     }
 
     // ---- Window ↔ app matching (S6) ----
