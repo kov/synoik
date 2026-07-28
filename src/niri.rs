@@ -1119,6 +1119,17 @@ impl State {
                 .app_system
                 .set_favorites(state.niri.gnome_settings.favorite_apps.clone());
             state.niri.sync_dash_favorites();
+            // Seed the default app folders if this profile has never had any —
+            // gnome-shell does it once from `AppDisplay._init` (`appDisplay.js:1349`),
+            // and it needs the catalog because the default lists are filtered to what
+            // is installed. The write comes back through the settings watcher, which
+            // re-syncs the grid; `sync_app_grid` below just shows what we have now.
+            if let Some(writer) = &state.niri.gnome_settings_writer {
+                let app_system = &state.niri.app_system;
+                writer.ensure_default_folders(crate::gnome::default_folders(|id| {
+                    app_system.lookup(id).is_some()
+                }));
+            }
             state.niri.sync_app_grid();
             state
                 .niri

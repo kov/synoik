@@ -54,7 +54,10 @@
 //! only: a folder takes a grid slot, hides its members from the top level and draws
 //! them as a raised `.app-folder` tile ([`AppGridEntry::folder`]), but nothing here
 //! creates, renames or edits one — a drag can never make a folder, and dropping an app
-//! on one does nothing. A folder *dragged* carries the fallback icon rather than its
+//! on one does nothing. (The one write is the once-per-profile default-folder seed,
+//! [`crate::gnome::GnomeSettingsWriter::ensure_default_folders`], which is what makes
+//! any folder exist at all on a profile that never ran gnome-shell.) A folder
+//! *dragged* carries the fallback icon rather than its
 //! own composition, since a drag proxy is one [`AppIconRef`]. Its hover uses the grid's
 //! shared [`style::HOVER_WASH`] (10% white) where GNOME lightens the raised fill 4%;
 //! about 5/255 apart. Pages here are always

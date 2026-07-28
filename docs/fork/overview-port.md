@@ -885,6 +885,11 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
   ramp, and the source icon's half-duration fade.
 
 **Deferrals** (state them, don't silently skip): no drag-to-create a folder, no drag in/out of one, no
-rename entry (so `translate` is only ever read), no `_ensureDefaultFolders`, and no auto-delete of a
-folder emptied by removal — all of those are the *editing* half, which needs the folder settings
-writer and the rename popup.
+rename entry (so `translate` is only ever written by the seed, never by the user), and no auto-delete
+of a folder emptied by removal — all of those are the *editing* half, which needs the rename popup and
+the per-folder writes that go with a drag.
+
+`_ensureDefaultFolders` was in that list and came **out** of it: it is a one-shot seed, not
+interactive editing, and without it the feature is invisible on any profile that has never run stock
+gnome-shell — which is exactly what happened on the live seat, where `folder-children` read `@as []`
+while a profile that had run gnome-shell read `['Utilities', 'YaST']`. Landed with F2's follow-up.

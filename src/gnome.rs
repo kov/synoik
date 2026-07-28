@@ -1020,6 +1020,35 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Seed the default app folders on a profile that has never had any —
+    /// `AppDisplay._ensureDefaultFolders` (`appDisplay.js:1406-1431`), which
+    /// gnome-shell runs once from `AppDisplay._init`.
+    ///
+    /// Without it a fresh profile shows **no** folders at all: `folder-children` starts
+    /// empty and nothing else ever writes it, which is why the live seat had no
+    /// Utilities folder while a profile that had run stock gnome-shell did.
+    ///
+    /// The guard is `folder-children` having *no user value* **and** reading empty. A
+    /// user who deletes every folder leaves a user value behind, so the defaults do not
+    /// come back — that is the whole point of checking both.
+    ///
+    /// `folders` is [`default_folders`] with each app list already filtered to what is
+    /// installed (the caller owns the catalog); folders that filter down to nothing are
+    /// still listed, because an empty folder is simply not displayed.
+    pub fn ensure_default_folders(&self, folders: Vec<DefaultFolder>) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(app_folders) = &s.app_folders {
+                    // Opened by `Stores::open` on the default backend, so the folder
+                    // stores go there too.
+                    ensure_default_folders(app_folders, &folders, None);
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {
@@ -1395,6 +1424,141 @@ impl Stores {
 
 /// What a store's `changed` subscription runs with the freshly-read model.
 type SettingsCallback = Rc<dyn Fn(GnomeSettings)>;
+
+/// One entry of GNOME's `DEFAULT_FOLDERS` table (`appDisplay.js:60-77`), as
+/// [`GnomeSettingsWriter::ensure_default_folders`] writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultFolder {
+    /// The `folder-children` id.
+    pub id: &'static str,
+    /// The `.directory` file the folder's `name` points at. Seeded folders always get
+    /// `translate` set, so this is never shown raw — see [`translated_folder_name`].
+    pub directory: &'static str,
+    pub categories: &'static [&'static str],
+    /// The default members, already filtered to installed apps by the caller.
+    pub apps: Vec<String>,
+}
+
+/// GNOME's `DEFAULT_FOLDERS` (`appDisplay.js:60-77`) with the app lists 50.1 generates
+/// from `data/default-apps/{system,utilities}-folder.txt` at build time, filtered by
+/// `is_installed` the way `_ensureDefaultFolders` filters with `lookup_app`.
+///
+/// `System` and `Utilities` are explicit app lists; `YaST` and `Pardus` are
+/// distro category folders that resolve to nothing on most machines — GNOME writes
+/// all four regardless and lets the empty ones go undisplayed.
+pub fn default_folders(is_installed: impl Fn(&str) -> bool) -> Vec<DefaultFolder> {
+    // `data/default-apps/system-folder.txt` and `utilities-folder.txt`, in file order.
+    const SYSTEM_APPS: &[&str] = &[
+        "nm-connection-editor.desktop",
+        "org.gnome.DejaDup.desktop",
+        "org.gnome.baobab.desktop",
+        "org.gnome.DiskUtility.desktop",
+        "org.gnome.Logs.desktop",
+        "org.freedesktop.MalcontentControl.desktop",
+        "org.freedesktop.GnomeAbrt.desktop",
+        "org.gnome.Sysprof.desktop",
+        "org.gnome.SystemMonitor.desktop",
+        "org.gnome.tweaks.desktop",
+    ];
+    const UTILITIES_APPS: &[&str] = &[
+        "org.gnome.Decibels.desktop",
+        "org.gnome.Connections.desktop",
+        "org.gnome.Papers.desktop",
+        "org.gnome.FileRoller.desktop",
+        "org.gnome.font-viewer.desktop",
+        "org.gnome.Loupe.desktop",
+        // Both seahorse ids ship in the list: the old desktop name and the new one.
+        "org.gnome.seahorse.Application.desktop",
+        "org.gnome.Seahorse.desktop",
+        "org.gnome.Showtime.desktop",
+    ];
+    let filter = |apps: &[&str]| -> Vec<String> {
+        apps.iter()
+            .filter(|id| is_installed(id))
+            .map(|id| (*id).to_owned())
+            .collect()
+    };
+    vec![
+        DefaultFolder {
+            id: "System",
+            directory: "X-GNOME-Shell-System.directory",
+            categories: &[],
+            apps: filter(SYSTEM_APPS),
+        },
+        DefaultFolder {
+            id: "Utilities",
+            directory: "X-GNOME-Shell-Utilities.directory",
+            categories: &[],
+            apps: filter(UTILITIES_APPS),
+        },
+        DefaultFolder {
+            id: "YaST",
+            directory: "suse-yast.directory",
+            categories: &["X-SuSE-YaST"],
+            apps: Vec::new(),
+        },
+        DefaultFolder {
+            id: "Pardus",
+            directory: "X-Pardus-Apps.directory",
+            categories: &["X-Pardus-Apps"],
+            apps: Vec::new(),
+        },
+    ]
+}
+
+/// Whether `folder-children` has never been seeded — `_ensureDefaultFolders`'s guard
+/// (`appDisplay.js:1407-1409`), as a function of the two things it reads so it can be
+/// tested without a store.
+fn app_folders_need_seeding(has_user_value: bool, children: &[String]) -> bool {
+    !has_user_value && children.is_empty()
+}
+
+/// The store half of [`GnomeSettingsWriter::ensure_default_folders`].
+///
+/// `backend` is the one the parent store was opened on — `None` for the real dconf.
+/// The four per-folder stores **must** be opened on that same backend, or a test
+/// handing this a memory-backed parent would still write the children into the running
+/// user's real dconf.
+fn ensure_default_folders(
+    app_folders: &gio::Settings,
+    folders: &[DefaultFolder],
+    backend: Option<&gio::SettingsBackend>,
+) {
+    if !settings_has_key(app_folders, "folder-children") {
+        return;
+    }
+    let children = strv(app_folders, "folder-children");
+    if !app_folders_need_seeding(
+        app_folders.user_value("folder-children").is_some(),
+        &children,
+    ) {
+        return;
+    }
+    let Some(source) = gio::SettingsSchemaSource::default() else {
+        return;
+    };
+    let Some(schema) = source.lookup(APP_FOLDER_SCHEMA, true) else {
+        return;
+    };
+    let ids: Vec<&str> = folders.iter().map(|f| f.id).collect();
+    if let Err(err) = app_folders.set_strv("folder-children", ids) {
+        warn!("error seeding org.gnome.desktop.app-folders folder-children: {err}");
+        return;
+    }
+    for folder in folders {
+        let path = format!("/org/gnome/desktop/app-folders/folders/{}/", folder.id);
+        let store = gio::Settings::new_full(&schema, backend, Some(&path));
+        let _ = store.set_string("name", folder.directory);
+        let _ = store.set_boolean("translate", true);
+        if !folder.categories.is_empty() {
+            let _ = store.set_strv("categories", folder.categories);
+        }
+        if !folder.apps.is_empty() {
+            let apps: Vec<&str> = folder.apps.iter().map(String::as_str).collect();
+            let _ = store.set_strv("apps", apps);
+        }
+    }
+}
 
 /// The relocatable per-folder schema, one instance per `folder-children` id
 /// (`appDisplay.js:2295-2299`).
@@ -1796,6 +1960,105 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A profile that has never run a shell has an *empty* `folder-children`, and
+    /// nothing but `_ensureDefaultFolders` (`appDisplay.js:1406-1431`) ever fills it —
+    /// which is why the live seat showed no Utilities folder while a profile that had
+    /// run stock gnome-shell did. It must run exactly once: the guard is no user value
+    /// **and** an empty list, so a user who deletes every folder (leaving a user value
+    /// of `[]`) does not get them all back on the next login.
+    #[test]
+    fn the_default_folders_seed_once_and_only_on_a_virgin_profile() {
+        assert!(app_folders_need_seeding(false, &[]), "a virgin profile");
+        assert!(
+            !app_folders_need_seeding(true, &[]),
+            "a user who emptied the list keeps it empty"
+        );
+        assert!(
+            !app_folders_need_seeding(false, &["Utilities".to_owned()]),
+            "a profile that already has folders is left alone"
+        );
+
+        // The table is GNOME's `DEFAULT_FOLDERS`, with the app lists filtered to what
+        // is installed — every id in all four, so nothing distro-specific is dropped.
+        let all = default_folders(|_| true);
+        assert_eq!(
+            all.iter().map(|f| f.id).collect::<Vec<_>>(),
+            ["System", "Utilities", "YaST", "Pardus"]
+        );
+        let utilities = &all[1];
+        assert_eq!(utilities.directory, "X-GNOME-Shell-Utilities.directory");
+        assert!(utilities
+            .apps
+            .contains(&"org.gnome.Loupe.desktop".to_owned()));
+        assert!(all[2].categories.contains(&"X-SuSE-YaST"));
+
+        // On a machine with none of them installed the folders are still listed —
+        // GNOME writes all four and lets the empty ones go undisplayed.
+        let none = default_folders(|_| false);
+        assert_eq!(none.len(), 4);
+        assert!(none.iter().all(|f| f.apps.is_empty()));
+    }
+
+    /// The seed itself, against a memory backend: `folder-children` gains the four ids
+    /// and each folder's own store gets `name` + `translate` (+ `categories`/`apps`),
+    /// exactly the keys `_ensureDefaultFolders` writes (`appDisplay.js:1421-1429`).
+    /// A second call must be a no-op — the first one left a user value behind.
+    ///
+    /// The memory backend is load-bearing, not decoration: the per-folder stores are
+    /// relocatable, and opening them on the *default* backend would make this test
+    /// overwrite the folders of whoever ran it.
+    #[test]
+    fn seeding_writes_every_default_folders_own_store() {
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let (Some(parent_schema), Some(folder_schema)) = (
+            source.lookup("org.gnome.desktop.app-folders", true),
+            source.lookup(APP_FOLDER_SCHEMA, true),
+        ) else {
+            return; // schemas not installed
+        };
+
+        let backend = gio::memory_settings_backend_new();
+        let parent = gio::Settings::new_full(&parent_schema, Some(&backend), None);
+        let folders = default_folders(|id| id == "org.gnome.Loupe.desktop");
+
+        ensure_default_folders(&parent, &folders, Some(&backend));
+
+        assert_eq!(
+            strv(&parent, "folder-children"),
+            ["System", "Utilities", "YaST", "Pardus"]
+        );
+        let open = |id: &str| {
+            let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
+            gio::Settings::new_full(&folder_schema, Some(&backend), Some(&path))
+        };
+
+        let utilities = open("Utilities");
+        assert_eq!(
+            utilities.string("name"),
+            "X-GNOME-Shell-Utilities.directory"
+        );
+        assert!(
+            utilities.boolean("translate"),
+            "a seeded name is a .directory file, so it must be translated"
+        );
+        assert_eq!(strv(&utilities, "apps"), ["org.gnome.Loupe.desktop"]);
+
+        let yast = open("YaST");
+        assert_eq!(strv(&yast, "categories"), ["X-SuSE-YaST"]);
+        assert!(
+            strv(&yast, "apps").is_empty(),
+            "a category folder gets no app list"
+        );
+
+        // Second run: the user value the first left behind closes the door.
+        let parent2 = gio::Settings::new_full(&parent_schema, Some(&backend), None);
+        parent2.set_strv("folder-children", ["Mine"]).unwrap();
+        ensure_default_folders(&parent2, &folders, Some(&backend));
+        assert_eq!(strv(&parent2, "folder-children"), ["Mine"]);
     }
 
     /// The watcher re-reads the whole model whenever any key in any watched store
