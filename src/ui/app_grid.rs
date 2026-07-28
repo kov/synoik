@@ -267,10 +267,10 @@ pub enum PageAlign {
 
 /// `.overview-tile:focus`'s ring width — `focus_ring()`'s `box-shadow: inset 0 0 0 2px`
 /// (`_drawing.scss:57-66`).
-const FOCUS_RING_W: f64 = 2.;
+pub const FOCUS_RING_W: f64 = 2.;
 /// …and its color's alpha: `st-transparentize($accent_color, $focus_border_opacity)` with
 /// `$focus_border_opacity: .2` (`_default-colors.scss:41`).
-const FOCUS_RING_ALPHA: f32 = 0.8;
+pub const FOCUS_RING_ALPHA: f32 = 0.8;
 
 /// The focused tile's background — `focus_bg_color(transparentize($system_base_color, .75))`
 /// for a flat `tile_button` (`_drawing.scss:317-323`), i.e. `st-mix($accent, rgba(#222226,

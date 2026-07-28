@@ -12,10 +12,13 @@
 //! pagination, dots, navigation arrows, batched icon uploads) comes along for free.
 //!
 //! Divergences from gnome-shell, deliberate:
-//! - **Read-only.** Folder *editing* is out of scope for this slice, so there is no rename entry
-//!   and no edit button beside the name. GNOME centers its label by balancing the edit button with
-//!   an equally-sized ghost actor (`_addFolderNameEntry`, `appDisplay.js:2531-2601`); with neither
-//!   present the label is simply centered in the band, which is the same place.
+//! - **Caret at the end only** in the rename entry, the same divergence the overview search
+//!   records: no mid-string editing and no selection but the select-all GNOME opens with (which
+//!   *is* modeled — it is what makes typing over the old name work). GNOME centers the label by
+//!   balancing the edit button with an equally-sized ghost actor (`_addFolderNameEntry`,
+//!   `appDisplay.js:2531-2601`); centering it in the band puts it in the same place.
+//! - **Reordering inside a folder** (`FolderView.acceptDrop`) is not ported: a member dragged back
+//!   onto the folder's own view goes home. Dragging one *out* does remove it.
 //! - The panel is **clamped** to the space the container leaves it. GNOME allocates its natural
 //!   720² and lets a short screen clip it (which is why the container pads the top by the panel
 //!   height at all, `_app-grid.scss:53-56`); we would have no way to reach what fell off.
@@ -26,6 +29,7 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::Kind;
+use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
@@ -36,7 +40,9 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::app_grid::{AppGrid, AppGridEntry, FocusDir, PageArrow};
+use crate::ui::app_grid::{
+    AppGrid, AppGridEntry, FocusDir, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
+};
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::widget::{self, style, Align, Painter};
 
@@ -57,6 +63,19 @@ const NAME_PAD_X: f64 = 36.;
 /// The folder name is a `.folder-name-label`, i.e. `%title_1` — 20pt at weight 800
 /// (`_app-grid.scss:79-82`, `_common.scss:246-249`).
 const NAME_PT: f64 = 20.;
+/// The rename entry is `%system_entry` — `%entry_common`'s `$base_border_radius` 8 and
+/// `$base_padding * 1.5` = 9px of padding around the line (`_common.scss:175-181,337`).
+const ENTRY_RADIUS: f64 = 8.;
+const ENTRY_PAD: f64 = 9.;
+/// `.folder-name-entry { width: 12em; }` (`_app-grid.scss:86`), the em being the entry's
+/// own `%title_1` size.
+const ENTRY_EMS: f64 = 12.;
+/// The edit button is an `.icon-button`: a `$scalable_icon_size` glyph with
+/// `$scaled_padding * 2` all round, forced circular (`_buttons.scss:18-24`).
+const EDIT_ICON_PX: f64 = 16.;
+const EDIT_BUTTON_SIZE: f64 = EDIT_ICON_PX + 4. * 6.;
+/// The label↔entry cross-fade (`_switchActor`, `appDisplay.js:2603-2631`).
+const EDIT_FADE_MS: u64 = 300;
 /// `DIALOG_SHADE_NORMAL` (`appDisplay.js:57`): black at alpha 204/255.
 const SHADE: [f32; 4] = [0., 0., 0., 204. / 255.];
 /// `DIALOG_SHADE_HIGHLIGHT` (`appDisplay.js:58`) as a fraction of [`SHADE`] — both are pure
@@ -86,6 +105,8 @@ pub enum DialogHit {
     Page(usize),
     /// A page navigation arrow.
     Arrow(PageArrow),
+    /// The `.icon-button` that starts (or ends) a rename.
+    Edit,
     /// Inside the panel but not on a control — consumes the click, does nothing.
     Inside,
     /// Outside the panel: pop down.
@@ -102,6 +123,13 @@ pub struct DialogLayout {
     /// The folder view's box — everything below the name, which is what the inner
     /// [`AppGrid`] lays its page out in.
     pub grid_area: Rectangle<f64, Logical>,
+    /// The `.folder-name-entry` pill, centered in the band like the label it replaces.
+    pub name_entry: Rectangle<f64, Logical>,
+    /// The `.icon-button` that toggles the rename, at the band's trailing end. GNOME
+    /// balances it with an equally-sized ghost actor at the leading end so the label
+    /// stays centered on the band (`_addFolderNameEntry`, `appDisplay.js:2537-2600`) —
+    /// which is where centering it on the band already puts it.
+    pub edit_button: Rectangle<f64, Logical>,
 }
 
 /// Lay the dialog out over an output `view` (logical, output coordinates).
@@ -121,10 +149,29 @@ pub fn layout(view: Rectangle<f64, Logical>) -> DialogLayout {
         Size::from((w, h)),
     );
 
-    let name_h = crate::ui::line_height_px(NAME_PT);
+    // The name container holds a stack of the label and the entry plus the edit button, so
+    // it is as tall as the tallest of the three — the entry, once its padding is counted.
+    let line_h = crate::ui::line_height_px(NAME_PT);
+    let entry_h = line_h + 2. * ENTRY_PAD;
+    let name_h = line_h.max(entry_h).max(EDIT_BUTTON_SIZE);
     let name_band = Rectangle::new(
         Point::from((panel.loc.x + PAD_X + NAME_PAD_X, panel.loc.y + NAME_PAD_TOP)),
         Size::from(((w - 2. * (PAD_X + NAME_PAD_X)).max(0.), name_h)),
+    );
+    let entry_w = (ENTRY_EMS * crate::ui::pt_to_px(NAME_PT)).min(name_band.size.w);
+    let name_entry = Rectangle::new(
+        Point::from((
+            (name_band.loc.x + (name_band.size.w - entry_w) / 2.).round(),
+            (name_band.loc.y + (name_h - entry_h) / 2.).round(),
+        )),
+        Size::from((entry_w, entry_h)),
+    );
+    let edit_button = Rectangle::new(
+        Point::from((
+            name_band.loc.x + name_band.size.w - EDIT_BUTTON_SIZE,
+            (name_band.loc.y + (name_h - EDIT_BUTTON_SIZE) / 2.).round(),
+        )),
+        Size::from((EDIT_BUTTON_SIZE, EDIT_BUTTON_SIZE)),
     );
 
     // The name container has no bottom padding, so the view starts right under the label.
@@ -138,6 +185,8 @@ pub fn layout(view: Rectangle<f64, Logical>) -> DialogLayout {
         panel,
         name_band,
         grid_area,
+        name_entry,
+        edit_button,
     }
 }
 
@@ -173,6 +222,36 @@ struct OpenFolder {
     /// (`_setLighterBackground`, `appDisplay.js:2794-2805`): the shade lightens while a drag
     /// out of the folder is outside the panel, and settles back if it comes home.
     highlight: Animation,
+    /// The rename in progress: the entry's text, and whether the whole of it is still
+    /// selected (`set_selection(0, -1)` on open, `appDisplay.js:2645`). `None` while the
+    /// label is showing.
+    rename: Option<Rename>,
+    /// The label↔entry cross-fade, 0 = label, 1 = entry (`_switchActor`, 300 ms
+    /// `EASE_OUT_QUAD`, `appDisplay.js:2603-2631`). It outlives `rename`, which is how the
+    /// entry fades *out* after the edit is over.
+    edit_fade: Animation,
+    /// Pointer over the edit button.
+    edit_hovered: bool,
+}
+
+/// A folder name being edited.
+#[derive(Debug, Clone)]
+struct Rename {
+    text: String,
+    /// The initial select-all: the next character typed replaces the whole name.
+    select_all: bool,
+}
+
+/// What the rename entry did with a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameKey {
+    /// Not for the entry — the caller carries on with its own handling.
+    Ignored,
+    /// The entry took it; redraw.
+    Took,
+    /// Enter: the entry took it *and* the edit is over — the caller writes the name
+    /// [`FolderDialog::finish_rename`] hands back.
+    Commit,
 }
 
 /// How far along each of the transition's independently-curved quantities is.
@@ -258,6 +337,18 @@ fn ease_from(clock: &Clock, from: f64) -> Animation {
     let from = from.clamp(0., 1.);
     let remaining = ((1. - from) * ANIMATION_MS as f64).round() as u64;
     Animation::ease(clock.clone(), from, 1., 0., remaining.max(1), Curve::Linear)
+}
+
+/// A plain `EASE_OUT_QUAD` from `from` to `to` over the cross-fade's duration.
+fn ease_to(clock: &Clock, from: f64, to: f64) -> Animation {
+    Animation::ease(
+        clock.clone(),
+        from,
+        to,
+        0.,
+        EDIT_FADE_MS,
+        Curve::EaseOutQuad,
+    )
 }
 
 fn expo_x_for(y: f64) -> f64 {
@@ -349,9 +440,16 @@ impl Progress {
 
 #[derive(Default)]
 struct DialogCache {
-    /// The panel chrome — its rounded fill, inset border and name label. Keyed on the
-    /// name and the panel size, so it survives paging and hovering inside the folder.
+    /// The panel chrome — its rounded fill and inset border. Keyed on the panel size, so
+    /// it survives paging, hovering and renaming.
     panel: widget::BakeCache,
+    /// The `.folder-name-label`. Its own element, not part of the panel: it cross-fades
+    /// with the entry, and an alpha that moves every frame has no business in a bake.
+    name: widget::BakeCache,
+    /// The `.folder-name-entry` — pill, text, selection and caret.
+    entry: widget::BakeCache,
+    /// The `.icon-button` circle behind the edit glyph.
+    edit: widget::BakeCache,
 }
 
 struct OutputData {
@@ -419,6 +517,9 @@ impl FolderDialog {
             phase: Phase::Opening,
             timeline: ease_from(&self.clock, 0.),
             highlight: Animation::ease(self.clock.clone(), 0., 0., 0., 0, Curve::EaseOutQuad),
+            rename: None,
+            edit_fade: Animation::ease(self.clock.clone(), 0., 0., 0., 0, Curve::EaseOutQuad),
+            edit_hovered: false,
         });
     }
 
@@ -471,7 +572,10 @@ impl FolderDialog {
 
     /// Whether an open/close animation is still running (→ hold the redraw loop open).
     pub fn are_animations_ongoing(&self) -> bool {
-        self.highlight_ongoing()
+        self.open
+            .as_ref()
+            .is_some_and(|o| !o.edit_fade.is_clamped_done())
+            || self.highlight_ongoing()
             || self
                 .open
                 .as_ref()
@@ -563,6 +667,111 @@ impl FolderDialog {
         open.view.remove_entry(id)
     }
 
+    /// Whether the rename entry is up (`_showFolderEntry`, `appDisplay.js:2643-2648`).
+    pub fn is_renaming(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| o.rename.is_some())
+    }
+
+    /// The open folder's display name, as the dialog is showing it.
+    pub fn folder_name(&self) -> Option<&str> {
+        Some(self.open.as_ref()?.name.as_str())
+    }
+
+    /// The text in the rename entry, for a test to read back.
+    pub fn rename_text(&self) -> Option<&str> {
+        Some(self.open.as_ref()?.rename.as_ref()?.text.as_str())
+    }
+
+    /// Toggle the rename entry — the edit button's `notify::checked`
+    /// (`appDisplay.js:2591-2596`). Turning it off commits, exactly as
+    /// `_showFolderLabel` does; the committed name comes back for the caller to write.
+    pub fn toggle_rename(&mut self) -> Option<(String, String)> {
+        if self.is_renaming() {
+            return self.finish_rename();
+        }
+        let Some(open) = &mut self.open else {
+            return None;
+        };
+        open.rename = Some(Rename {
+            text: open.name.clone(),
+            select_all: true,
+        });
+        open.edit_fade = ease_to(&self.clock, open.edit_fade.clamped_value(), 1.);
+        None
+    }
+
+    /// Leave the entry and put the label back (`_showFolderLabel` → `_maybeUpdateFolderName`,
+    /// `appDisplay.js:2633-2657`). Returns `(folder id, new name)` when the name actually
+    /// changed — an empty entry, or one still holding the old name, writes nothing.
+    pub fn finish_rename(&mut self) -> Option<(String, String)> {
+        let clock = self.clock.clone();
+        let open = self.open.as_mut()?;
+        let rename = open.rename.take()?;
+        open.edit_fade = ease_to(&clock, open.edit_fade.clamped_value(), 0.);
+        let new = rename.text.trim();
+        if new.is_empty() || new == open.name {
+            return None;
+        }
+        let name = new.to_owned();
+        // The label follows immediately; the settings write comes back around later.
+        open.name = name.clone();
+        Some((open.id.clone(), name))
+    }
+
+    /// Feed a key to the rename entry.
+    ///
+    /// Divergence, shared with the search entry: the caret is at the end only, so there is
+    /// no mid-string editing and the arrow keys are left to the caller. The one selection
+    /// GNOME sets up — select-all on open — is modeled, because it is what makes typing
+    /// over the old name work.
+    pub fn rename_key(&mut self, keysym: Option<Keysym>, utf8: Option<&str>) -> RenameKey {
+        if !self.is_renaming() {
+            return RenameKey::Ignored;
+        }
+        match keysym {
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
+                return RenameKey::Commit
+            }
+            Some(Keysym::BackSpace) => {
+                let Some(rename) = self.open.as_mut().and_then(|o| o.rename.as_mut()) else {
+                    return RenameKey::Ignored;
+                };
+                if std::mem::take(&mut rename.select_all) {
+                    rename.text.clear();
+                } else {
+                    rename.text.pop();
+                }
+                return RenameKey::Took;
+            }
+            _ => {}
+        }
+        // Anything that produced no printable text (arrows, modifiers, Escape) is not ours.
+        let text = utf8.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+        let Some(text) = text else {
+            return RenameKey::Ignored;
+        };
+        let Some(rename) = self.open.as_mut().and_then(|o| o.rename.as_mut()) else {
+            return RenameKey::Ignored;
+        };
+        if std::mem::take(&mut rename.select_all) {
+            rename.text.clear();
+        }
+        rename.text.push_str(text);
+        RenameKey::Took
+    }
+
+    /// Track the pointer over the edit button. Returns whether it changed (→ redraw).
+    pub fn set_edit_hovered(&mut self, hovered: bool) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        if open.edit_hovered == hovered {
+            return false;
+        }
+        open.edit_hovered = hovered;
+        true
+    }
+
     /// The center of member tile `i` in output coordinates — where a drag of it is
     /// picked up, so the icon does not jump under the pointer.
     pub fn entry_center(
@@ -621,6 +830,9 @@ impl FolderDialog {
         if !l.panel.contains(pos) {
             return Some(DialogHit::Outside);
         }
+        if l.edit_button.contains(pos) {
+            return Some(DialogHit::Edit);
+        }
         if let Some(i) = open.view.hit_test(pos, l.grid_area) {
             return Some(DialogHit::App(i));
         }
@@ -652,6 +864,11 @@ impl FolderDialog {
         };
         let mut changed = open.view.set_hovered(tile);
         changed |= open.view.set_arrow_hovered(arrow);
+        let edit = pos.is_some_and(|pos| l.edit_button.contains(pos));
+        if open.edit_hovered != edit {
+            open.edit_hovered = edit;
+            changed = true;
+        }
         changed
     }
 
@@ -737,6 +954,171 @@ impl FolderDialog {
         self.open.as_ref()?.view.icon_center(k, grid_area)
     }
 
+    /// The `.folder-name-entry`: a `%system_entry` pill in its focus state (it is only
+    /// ever shown focused), the name in `%title_1`, the select-all highlight behind it
+    /// and a caret after it.
+    fn render_name_entry(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        l: &DialogLayout,
+        alpha: f32,
+        accent: [u8; 3],
+        content: &mut Vec<TextureRenderElement<VkTexture>>,
+    ) {
+        let Some(open) = &self.open else { return };
+        // The entry survives the fade-out with the rename already dropped, so fall back to
+        // the committed name rather than blinking to empty.
+        let rename = open.rename.clone().unwrap_or_else(|| Rename {
+            text: open.name.clone(),
+            select_all: false,
+        });
+        let size = l.name_entry.size;
+        let ring = [
+            f32::from(accent[0]) / 255.,
+            f32::from(accent[1]) / 255.,
+            f32::from(accent[2]) / 255.,
+            FOCUS_RING_ALPHA,
+        ];
+        // `selection-background-color: st-transparentize(-st-accent-color, 0.7)`
+        // (`_common.scss:179`).
+        let selection = [ring[0], ring[1], ring[2], 0.3];
+        // The caret bar (U+258F), as the search entry draws it.
+        let display = format!("{}\u{258f}", rename.text);
+        let select_all = rename.select_all && !rename.text.is_empty();
+        let revision = widget::Revision::new()
+            .of(&display)
+            .of(select_all)
+            .of(accent)
+            .px(size.w)
+            .px(size.h)
+            .done();
+        match widget::bake(
+            renderer,
+            &mut self.cache.borrow_mut().entry,
+            scale,
+            size,
+            revision,
+            move |r| {
+                let mut shaper = widget::TextShaper::new(r, scale);
+                shaper.shape(&display, widget::TextStyle::new(NAME_PT).bold())
+            },
+            move |frame, phys, text| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(ENTRY_RADIUS, style::ENTRY_BG)?;
+                p.stroke_rounded_full(ENTRY_RADIUS, FOCUS_RING_W, ring)?;
+                let center = Point::from((size.w / 2., size.h / 2.));
+                if select_all {
+                    let (_x, _y, w, h) = text.ink_bounds();
+                    let (w, h) = (f64::from(w) / scale, f64::from(h) / scale);
+                    let rect = Rectangle::new(
+                        Point::from((center.x - w / 2., center.y - h / 2.)),
+                        Size::from((w, h)),
+                    );
+                    p.fill_rounded(rect, 0., selection)?;
+                }
+                p.text(text, center, Align::CENTER, style::TEXT)?;
+                Ok(())
+            },
+        ) {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    vec![],
+                );
+                content.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    l.name_entry.loc,
+                    alpha,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => tracing::error!("error baking the folder name entry: {err:#}"),
+        }
+    }
+
+    /// The `.icon-button` beside the name: a circular `$system_overlay_bg_color` disc that
+    /// lightens on hover, with `document-edit-symbolic` in it (`_app-grid.scss:90-94`,
+    /// `_buttons.scss:18-24`).
+    #[allow(clippy::too_many_arguments)]
+    fn render_edit_button(
+        &self,
+        renderer: &mut VulkanRenderer,
+        sym_icons: &IconCache,
+        scale: f64,
+        l: &DialogLayout,
+        alpha: f32,
+        accent: [u8; 3],
+        content: &mut Vec<TextureRenderElement<VkTexture>>,
+    ) {
+        let Some(open) = &self.open else { return };
+        // GNOME's edit button is a toggle, but `.icon-button` inside the dialog only
+        // restyles normal/hover/active — so a checked one reads as hovered, which is what
+        // the wash below does.
+        let washed = open.rename.is_some() || open.edit_hovered;
+        let size = l.edit_button.size;
+        let _ = accent;
+        let revision = widget::Revision::new()
+            .of(washed)
+            .px(size.w)
+            .px(size.h)
+            .done();
+        match widget::bake(
+            renderer,
+            &mut self.cache.borrow_mut().edit,
+            scale,
+            size,
+            revision,
+            |_| Ok(()),
+            move |frame, phys, _: &()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(size.h / 2., style::OVERLAY_BG)?;
+                if washed {
+                    p.fill_rounded_full(size.h / 2., style::HOVER_WASH)?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    vec![],
+                );
+                content.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    l.edit_button.loc,
+                    alpha,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ));
+            }
+            Err(err) => tracing::error!("error baking the folder edit button: {err:#}"),
+        }
+        if let Some(el) = widget::icon_element(
+            renderer,
+            sym_icons,
+            &["document-edit-symbolic"],
+            EDIT_ICON_PX,
+            scale,
+            style::TEXT,
+            l.edit_button.loc,
+            Point::from((size.w / 2., size.h / 2.)),
+        ) {
+            content.push(el);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
@@ -773,16 +1155,9 @@ impl FolderDialog {
             accent,
         );
 
-        // The panel itself: the rounded overlay surface, its inset hairline border, and the
-        // folder name centered across the top.
+        // The panel itself: the rounded overlay surface and its inset hairline border.
         let panel_size = l.panel.size;
-        let name = open.name.clone();
-        let name_center = Point::from((
-            l.name_band.loc.x - l.panel.loc.x + l.name_band.size.w / 2.,
-            l.name_band.loc.y - l.panel.loc.y + l.name_band.size.h / 2.,
-        ));
         let revision = widget::Revision::new()
-            .of(&name)
             .px(panel_size.w)
             .px(panel_size.h)
             .done();
@@ -792,16 +1167,12 @@ impl FolderDialog {
             scale,
             panel_size,
             revision,
-            move |r| {
-                let mut shaper = widget::TextShaper::new(r, scale);
-                shaper.shape(&name, widget::TextStyle::new(NAME_PT).bold())
-            },
-            move |frame, phys, label| {
+            |_| Ok(()),
+            move |frame, phys, _: &()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
                 p.fill_rounded_full(RADIUS, style::OVERLAY_BG)?;
                 p.stroke_rounded_full(RADIUS, BORDER_W, style::BORDERS)?;
-                p.text(label, name_center, Align::CENTER, style::TEXT)?;
                 Ok(())
             },
         ) {
@@ -824,6 +1195,61 @@ impl FolderDialog {
             }
             Err(err) => tracing::error!("error baking the folder dialog: {err:#}"),
         }
+
+        // The name: label and entry stacked in the same band, cross-fading. The fade is on
+        // the *elements* — putting a per-frame alpha in either bake would re-shape the text
+        // every frame of the 300 ms.
+        let fade = open.edit_fade.clamped_value() as f32;
+        let name = open.name.clone();
+        let band = l.name_band.size;
+        let name_center = Point::from((band.w / 2., band.h / 2.));
+        if fade < 1. {
+            let revision = widget::Revision::new()
+                .of(&name)
+                .px(band.w)
+                .px(band.h)
+                .done();
+            match widget::bake(
+                renderer,
+                &mut self.cache.borrow_mut().name,
+                scale,
+                band,
+                revision,
+                move |r| {
+                    let mut shaper = widget::TextShaper::new(r, scale);
+                    shaper.shape(&name, widget::TextStyle::new(NAME_PT).bold())
+                },
+                move |frame, phys, label| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    p.text(label, name_center, Align::CENTER, style::TEXT)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    content.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        l.name_band.loc,
+                        alpha * (1. - fade),
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the folder name: {err:#}"),
+            }
+        }
+        if fade > 0. {
+            self.render_name_entry(renderer, scale, &l, alpha * fade, accent, &mut content);
+        }
+        self.render_edit_button(renderer, sym_icons, scale, &l, alpha, accent, &mut content);
 
         // --- The zoom ([`Zoom`]; `_zoomAndFadeIn`/`_zoomAndFadeOut`, `appDisplay.js:2660-2746`).
         //
@@ -1104,15 +1530,31 @@ mod tests {
     #[test]
     fn the_name_band_pads_the_top_and_the_grid_starts_under_it() {
         let l = layout(view());
-        let name_h = crate::ui::line_height_px(NAME_PT);
+        // The band is as tall as its tallest child — the entry, label plus its padding —
+        // because the stack holding the label and the entry is allocated for both.
+        let name_h = crate::ui::line_height_px(NAME_PT) + 2. * ENTRY_PAD;
 
         assert_eq!(l.name_band.loc.x, l.panel.loc.x + 1. + 36.);
         assert_eq!(l.name_band.loc.y, l.panel.loc.y + 24.);
         assert_eq!(l.name_band.size.w, 720. - 2. * (1. + 36.));
+        assert!((l.name_band.size.h - name_h).abs() < 1e-9);
 
         assert_eq!(l.grid_area.loc.x, l.panel.loc.x + 1.);
-        assert_eq!(l.grid_area.loc.y, l.panel.loc.y + 24. + name_h);
-        assert_eq!(l.grid_area.size.h, 720. - 24. - name_h);
+        assert!((l.grid_area.loc.y - (l.panel.loc.y + 24. + name_h)).abs() < 1e-9);
+        assert!((l.grid_area.size.h - (720. - 24. - name_h)).abs() < 1e-9);
+
+        // The entry is centered in the band and the edit button sits at its trailing end,
+        // the ghost actor's width away from the label's center on the other side.
+        assert!((l.name_entry.size.h - name_h).abs() < 1e-9);
+        assert_eq!(
+            l.name_entry.loc.x + l.name_entry.size.w / 2.,
+            (l.name_band.loc.x + l.name_band.size.w / 2.).round()
+        );
+        assert_eq!(
+            l.edit_button.loc.x + l.edit_button.size.w,
+            l.name_band.loc.x + l.name_band.size.w
+        );
+        assert_eq!(l.edit_button.size, Size::from((40., 40.)));
     }
 
     /// A screen too short for 720 + the panel strut clamps the dialog rather than letting it

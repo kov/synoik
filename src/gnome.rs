@@ -1100,6 +1100,28 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Rename the folder `id` (`_maybeUpdateFolderName`, `appDisplay.js:2650-2657`).
+    /// `translate` goes off with it: a user-typed name is the string to show, not a
+    /// `.directory` basename to look up.
+    pub fn rename_app_folder(&self, id: &str, name: String) {
+        let (folder_id, name) = (id.to_owned(), name);
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if s.app_folders.is_some() {
+                    if let Some(store) = folder_settings(&folder_id, None) {
+                        if let Err(err) = store.set_string("name", &name) {
+                            warn!("error renaming the app folder {folder_id}: {err}");
+                        } else {
+                            let _ = store.set_boolean("translate", false);
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Delete the folder `id` — what emptying it does (`FolderView.removeApp`'s
     /// `folderApps.length === 0` branch, `appDisplay.js:2245-2262`).
     pub fn delete_app_folder(&self, id: &str) {

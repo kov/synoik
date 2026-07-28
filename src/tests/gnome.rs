@@ -55,6 +55,7 @@ const KEY_PAGEUP: u32 = 104;
 const KEY_HOME: u32 = 102;
 const KEY_END: u32 = 107;
 const KEY_PAGEDOWN: u32 = 109;
+const KEY_O: u32 = 24;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 const BTN_LEFT: u32 = 0x110;
@@ -7100,6 +7101,69 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
         f.niri().folder_dialog.folder_id(),
         Some("Utilities"),
         "clicking a folder opens its dialog (`FolderIcon.vfunc_clicked`)"
+    );
+}
+
+/// Renaming a folder (`_addFolderNameEntry` + `_maybeUpdateFolderName`,
+/// `appDisplay.js:2531-2657`): the edit button swaps the label for an entry with the whole
+/// name selected, typing replaces it, and Enter commits — the label follows at once and the
+/// `name` key is written with `translate` off. An empty entry, or one still holding the old
+/// name, writes nothing.
+#[test]
+fn overview_folder_dialog_renames_the_folder() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let area = overview_controls(&mut f).app_display;
+    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert_eq!(f.niri().folder_dialog.folder_id(), Some("Utilities"));
+
+    // The edit button opens the entry, with the name selected whole.
+    let edit = crate::ui::folder_dialog::layout(view).edit_button;
+    let edit_center: Point<f64, smithay::utils::Logical> =
+        Point::from((edit.loc.x + edit.size.w / 2., edit.loc.y + edit.size.h / 2.));
+    pointer_motion_to(&mut f, edit_center.x, edit_center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert!(f.niri().folder_dialog.is_renaming());
+    assert_eq!(f.niri().folder_dialog.rename_text(), Some("Utilities"));
+    // Without this the overview never holds the key focus and the whole ladder is dead.
+    f.niri_state().update_keyboard_focus();
+
+    // Typing over the selection replaces the whole name, and the keys never reach the
+    // search entry behind.
+    tap(&mut f, KEY_T);
+    tap(&mut f, KEY_O);
+    assert_eq!(f.niri().folder_dialog.rename_text(), Some("to"));
+    assert!(
+        !f.niri().overview_search.is_active(),
+        "the rename entry holds the key focus, so the search never engages"
+    );
+
+    // Enter commits: the label follows immediately.
+    tap(&mut f, KEY_ENTER);
+    assert!(!f.niri().folder_dialog.is_renaming());
+    assert_eq!(f.niri().app_grid.entry_name(1), Some("Utilities"));
+    assert_eq!(
+        f.niri().folder_dialog.folder_name(),
+        Some("to"),
+        "the dialog shows the new name at once; the grid tile follows the settings reload"
     );
 }
 

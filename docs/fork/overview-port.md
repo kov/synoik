@@ -1186,4 +1186,17 @@ keeps a folder from forming every time a drag crosses an icon.
 
   **Not ported:** reordering *within* a folder (`FolderView.acceptDrop`, `:2213-2221`). A drop
   back inside the panel puts the icon home.
-* **E3 — rename.** The edit button and the entry in the dialog.
+* **E3 — rename.** ✅ The edit button and the entry in the dialog.
+
+  The name band now sizes to its tallest child (the entry, i.e. the line plus `%entry_common`'s
+  9px), because GNOME's stack is allocated for the label *and* the entry at once — so the grid
+  area starts 18px lower than it used to. The label left the panel bake and became its own
+  element: it cross-fades with the entry over 300 ms, and a per-frame alpha inside a bake is the
+  re-shape-every-frame trap.
+
+  **Divergences:** the caret is at the end only (as in the overview search), so there is no
+  mid-string editing; the one selection GNOME sets up — select-all on open — *is* modeled,
+  because typing over the old name depends on it. Escape still pops the dialog down rather than
+  just leaving the entry, which is what GNOME does too (the entry does not consume it, so the
+  dialog's grab does). A checked edit button draws like a hovered one: `.icon-button` inside
+  `.app-folder-dialog` restyles only normal/hover/active.

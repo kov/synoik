@@ -792,6 +792,31 @@ impl State {
                         let text = modified
                             .key_char()
                             .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        // The folder rename entry comes first: while it is up it holds the
+                        // key focus, so the search never sees a keystroke
+                        // (`_showFolderEntry`'s `grab_key_focus`, `appDisplay.js:2643-2648`).
+                        if this.niri.folder_dialog.is_renaming() {
+                            use crate::ui::folder_dialog::RenameKey;
+                            let typed = text.map(String::from);
+                            match this.niri.folder_dialog.rename_key(raw, typed.as_deref()) {
+                                RenameKey::Ignored => {}
+                                RenameKey::Took => {
+                                    this.niri.suppressed_keys.insert(key_code);
+                                    this.niri.queue_redraw_all();
+                                    return FilterResult::Intercept(None);
+                                }
+                                RenameKey::Commit => {
+                                    if let Some((folder, name)) =
+                                        this.niri.folder_dialog.finish_rename()
+                                    {
+                                        this.rename_folder(&folder, &name);
+                                    }
+                                    this.niri.suppressed_keys.insert(key_code);
+                                    this.niri.queue_redraw_all();
+                                    return FilterResult::Intercept(None);
+                                }
+                            }
+                        }
                         let active = this.niri.overview_search.is_active();
                         // A non-whitespace printable starts a search; once active, every key
                         // routes to the entry (Backspace/nav/Escape). Modifiers/Tab/arrows while
@@ -4518,6 +4543,15 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Write a renamed folder's `name`, with `translate` off — the name is now a literal
+    /// to show, not a `.directory` basename to look up (`_maybeUpdateFolderName`,
+    /// `appDisplay.js:2650-2657`).
+    fn rename_folder(&mut self, folder: &str, name: &str) {
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.rename_app_folder(folder, name.to_owned());
+        }
+    }
+
     /// Take the dragged app out of the folder it came from (`AppDisplay.acceptDrop`'s
     /// `view.removeApp`, `appDisplay.js:1688-1691`), deleting a folder the removal
     /// emptied.
@@ -4880,6 +4914,13 @@ impl State {
             // simply swallowed by the modal.
             OverviewHit::Folder(DialogHit::Outside) if primary => {
                 self.niri.folder_dialog.popdown();
+            }
+            // The edit button toggles the rename entry (`notify::checked`,
+            // `appDisplay.js:2591-2596`); turning it back off commits the name.
+            OverviewHit::Folder(DialogHit::Edit) if primary => {
+                if let Some((folder, name)) = self.niri.folder_dialog.toggle_rename() {
+                    self.rename_folder(&folder, &name);
+                }
             }
             OverviewHit::Folder(DialogHit::Page(page)) if primary => {
                 let view = Rectangle::from_size(output_size(output));
