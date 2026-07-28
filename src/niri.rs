@@ -2556,33 +2556,11 @@ impl State {
 
         for output in self.niri.global_space.outputs() {
             let name = output.user_data().get::<OutputName>().unwrap();
-            let applied = self.niri.applied_display_config.get(&name.connector);
+            let (scale, transform) = self
+                .niri
+                .derive_output_scale_transform(output, monitors_config.as_ref());
             let full_config = self.niri.config.borrow_mut();
             let config = full_config.outputs.find(name);
-            let saved = monitors_config
-                .as_ref()
-                .and_then(|m| m.setting_for(name, output.current_mode()));
-
-            let scale = applied
-                .and_then(|a| a.scale)
-                .or_else(|| saved.map(|s| s.scale))
-                .or_else(|| config.and_then(|c| c.scale).map(|s| s.0))
-                .unwrap_or_else(|| {
-                    let size_mm = output.physical_properties().size;
-                    let resolution = output.current_mode().unwrap().size;
-                    guess_monitor_scale(size_mm, resolution)
-                });
-            let scale = closest_representable_scale(scale.clamp(0.1, 10.));
-
-            let base_transform = applied
-                .and_then(|a| a.transform)
-                .or_else(|| saved.map(|s| s.transform))
-                .unwrap_or_else(|| {
-                    config
-                        .map(|c| ipc_transform_to_smithay(c.transform))
-                        .unwrap_or(Transform::Normal)
-                });
-            let transform = panel_orientation(output) + base_transform;
 
             if output.current_scale().fractional_scale() != scale
                 || output.current_transform() != transform
@@ -4195,21 +4173,23 @@ impl Niri {
         }
     }
 
-    pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
-        let global = output.create_global::<State>(&self.display_handle);
-
+    /// Derives an output's scale and transform from the precedence chain described in
+    /// [`State::reload_output_config`].
+    ///
+    /// Both the store lookup and the DPI guess read the output's *current mode*, so this must be
+    /// re-run whenever the mode changes — see the mode-change branch in
+    /// `Tty::on_output_config_changed`.
+    pub fn derive_output_scale_transform(
+        &self,
+        output: &Output,
+        monitors_config: Option<&crate::monitors_xml::MonitorsConfig>,
+    ) -> (f64, Transform) {
         let name = output.user_data().get::<OutputName>().unwrap();
-
+        let applied = self.applied_display_config.get(&name.connector);
         let config = self.config.borrow();
         let c = config.outputs.find(name);
-        // Same precedence as `reload_output_config` (see the rationale there): live-applied
-        // session config, then GNOME's `monitors.xml` store (so a saved scale is honored from the
-        // first frame, not just on reload), then the KDL config, then the DPI guess.
-        let applied = self.applied_display_config.get(&name.connector);
-        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
-        let saved = monitors_config
-            .as_ref()
-            .and_then(|m| m.setting_for(name, output.current_mode()));
+        let saved = monitors_config.and_then(|m| m.setting_for(name, output.current_mode()));
+
         let scale = applied
             .and_then(|a| a.scale)
             .or_else(|| saved.map(|s| s.scale))
@@ -4228,7 +4208,24 @@ impl Niri {
                 c.map(|c| ipc_transform_to_smithay(c.transform))
                     .unwrap_or(Transform::Normal)
             });
-        let transform = panel_orientation(&output) + base_transform;
+
+        (scale, panel_orientation(output) + base_transform)
+    }
+
+    pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
+        let global = output.create_global::<State>(&self.display_handle);
+
+        let name = output.user_data().get::<OutputName>().unwrap();
+
+        // Same precedence as `reload_output_config` (see the rationale there): live-applied
+        // session config, then GNOME's `monitors.xml` store (so a saved scale is honored from the
+        // first frame, not just on reload), then the KDL config, then the DPI guess.
+        let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+        let (scale, transform) =
+            self.derive_output_scale_transform(&output, monitors_config.as_ref());
+
+        let config = self.config.borrow();
+        let c = config.outputs.find(name);
 
         let mut backdrop_color = c
             .and_then(|c| c.backdrop_color)

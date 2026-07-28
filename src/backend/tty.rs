@@ -32,7 +32,7 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
-use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties};
+use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Dispatcher, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::atomic::AtomicModeReq;
@@ -2387,6 +2387,40 @@ impl Tty {
                         Some(refresh_interval(mode)),
                         surface.compositor.vrr_enabled(),
                     );
+
+                    // Re-derive scale and transform for the new mode: both the `monitors.xml`
+                    // lookup and the DPI guess are keyed on the current mode, so keeping the
+                    // previous values renders the new display at the old display's scale.
+                    //
+                    // If the mode wasn't asked for by config, the change came from the hardware
+                    // (this VM moving between displays, a dock swapping panels), so the
+                    // live-applied override goes with it — mutter likewise discards a current
+                    // config the new hardware can't satisfy and re-runs its config chain
+                    // (meta-monitor-manager.c `meta_monitor_manager_ensure_configured` →
+                    // `meta_monitor_manager_is_config_complete` → `is_config_applicable`).
+                    if config.mode.is_none() {
+                        niri.applied_display_config.remove(&surface.name.connector);
+                    }
+                    let monitors_config = crate::monitors_xml::MonitorsConfig::load();
+                    let (scale, transform) =
+                        niri.derive_output_scale_transform(&output, monitors_config.as_ref());
+                    if output.current_scale().fractional_scale() != scale
+                        || output.current_transform() != transform
+                    {
+                        debug!(
+                            "output {:?}: mode change re-derived scale {scale} transform \
+                             {transform:?}",
+                            surface.name.connector
+                        );
+                        output.change_current_state(
+                            None,
+                            Some(transform),
+                            Some(Scale::Fractional(scale)),
+                            None,
+                        );
+                        niri.ipc_outputs_changed = true;
+                    }
+
                     niri.output_resized(&output);
                 }
             }

@@ -9895,3 +9895,78 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
         "…where Right from the same icon crosses to the next page instead"
     );
 }
+
+/// A mode change re-derives the scale.
+///
+/// Moving this VM between the laptop panel and the external monitor swaps the virtual
+/// connector's mode in place. Both rungs of the scale chain below the live-applied override
+/// are keyed on the mode — `monitors.xml` stores a setting per mode, and the DPI guess reads
+/// the resolution — so the derivation has to be re-run, which is what the mode-change branch
+/// in `Tty::on_output_config_changed` now does.
+#[test]
+fn output_scale_is_derived_from_the_current_mode() {
+    use niri_config::OutputName;
+    use smithay::output::{Output, PhysicalProperties, Subpixel};
+
+    use crate::niri::AppliedDisplayConfig;
+
+    let mut f = Fixture::new();
+
+    // A 16" panel, so the mobile DPI target applies (utils/scale.rs, mutter's meta-monitor.c).
+    let output = Output::new(
+        "Virtual-1".to_owned(),
+        PhysicalProperties {
+            size: (344, 215).into(),
+            subpixel: Subpixel::Unknown,
+            make: "niri".to_owned(),
+            model: "test".to_owned(),
+            serial_number: "1".to_owned(),
+        },
+    );
+    output.user_data().insert_if_missing(|| OutputName {
+        connector: "Virtual-1".to_owned(),
+        make: None,
+        model: None,
+        serial: None,
+    });
+
+    let set_mode = |size: (i32, i32)| {
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: size.into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+    };
+
+    set_mode((2048, 1330));
+    let (hidpi, _) = f.niri().derive_output_scale_transform(&output, None);
+
+    set_mode((3840, 2160));
+    let (uhd, _) = f.niri().derive_output_scale_transform(&output, None);
+
+    assert!(
+        uhd > hidpi,
+        "the same panel at a denser mode wants a bigger scale ({hidpi} -> {uhd})"
+    );
+
+    // The live-applied config (GNOME Settings' ApplyMonitorsConfig) still outranks the guess —
+    // it is dropped on a *hardware* mode change, not consulted-and-ignored.
+    f.niri().applied_display_config.insert(
+        "Virtual-1".to_owned(),
+        AppliedDisplayConfig {
+            scale: Some(1.),
+            transform: None,
+        },
+    );
+    let (applied, _) = f.niri().derive_output_scale_transform(&output, None);
+    assert_eq!(applied, 1.);
+
+    f.niri().applied_display_config.remove("Virtual-1");
+    set_mode((2048, 1330));
+    let (back, _) = f.niri().derive_output_scale_transform(&output, None);
+    assert_eq!(back, hidpi, "dropping the override re-derives for the mode");
+}
