@@ -59,8 +59,7 @@
 //! **Divergences, revisited later.** The icon's context menu is [`crate::ui::app_menu`],
 //! which builds New Window, the `.desktop` action section and the favourite toggle; its
 //! own doc lists what is missing there and why (Open Windows and Quit want per-window
-//! identity, App Details an `org.gnome.Software` call). The nav arrows ride the centering
-//! gutter rather than a fixed `indicatorsPadding` band (differs only at narrow widths). A folder
+//! identity, App Details an `org.gnome.Software` call). A folder
 //! *dragged* carries the fallback icon rather than its
 //! own composition, since a drag proxy is one [`AppIconRef`]. Its hover uses the grid's
 //! shared [`style::HOVER_WASH`] (10% white) where GNOME lightens the raised fill 4%;
@@ -89,7 +88,7 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::widget::{self, style, AppIconUploads, Painter, Rgba, TileMetrics};
+use crate::ui::widget::{self, style, Painter, Rgba, SharedAppIconUploads, TileMetrics};
 
 /// Grid tile label point size, shared with the search results.
 ///
@@ -472,7 +471,7 @@ struct GridCache {
     /// when the previews go away, since they exist only for the length of a drag.
     peek_bakes: std::collections::HashMap<usize, widget::BakeCache>,
     /// Full-color icon uploads (shared key space with the dash's and search's).
-    icons: AppIconUploads,
+    icons: SharedAppIconUploads,
 }
 
 /// The app-grid model. Owned on `Niri`; fed by `sync_app_grid`.
@@ -821,16 +820,27 @@ impl AppGrid {
         true
     }
 
+    /// Draw from `shared` instead of this surface's own upload map, so an icon already
+    /// on the GPU for another surface is not uploaded again (see [`SharedAppIconUploads`]).
+    pub fn share_icon_uploads(&self, shared: &SharedAppIconUploads) {
+        self.cache.borrow_mut().icons = shared.clone();
+    }
+
+    /// The map this surface draws from.
+    pub fn icon_uploads(&self) -> SharedAppIconUploads {
+        self.cache.borrow().icons.clone()
+    }
+
     /// Drop cached icon uploads (icon-theme / installed change).
     pub fn clear_icon_uploads(&self) {
-        self.cache.borrow_mut().icons.clear();
+        self.cache.borrow_mut().icons.borrow_mut().clear();
     }
 
     /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
     /// decoded pixels — see [`widget::drop_app_icon_upload`].
     pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         crate::ui::widget::drop_app_icon_upload(
-            &mut self.cache.borrow_mut().icons,
+            &mut self.cache.borrow_mut().icons.borrow_mut(),
             icon,
             logical_px,
         );
@@ -2046,7 +2056,7 @@ impl AppGrid {
                 .collect();
             for (icon, px) in pending {
                 let key = (scale_key, icon.clone(), (px.round() as u16).max(1));
-                if cache.icons.contains_key(&key) || keys.contains(&key) {
+                if cache.icons.borrow().contains_key(&key) || keys.contains(&key) {
                     continue;
                 }
                 if let Some(buf) = app_icons.buffer(icon, px, scale) {
@@ -2069,7 +2079,7 @@ impl AppGrid {
                                 buf.transform(),
                                 Vec::new(),
                             );
-                            cache.icons.insert(key, tb);
+                            cache.icons.borrow_mut().insert(key, tb);
                         }
                     }
                     Err(err) => tracing::error!("error batch-uploading app icons: {err:#}"),
@@ -2166,7 +2176,7 @@ impl AppGrid {
             for (icon, px, center) in icons {
                 if let Some(el) = widget::app_icon_element(
                     renderer,
-                    &mut cache.icons,
+                    &mut cache.icons.borrow_mut(),
                     app_icons,
                     icon,
                     px,
@@ -2657,7 +2667,7 @@ impl AppGrid {
         let mut cache = self.cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
-            cache.icons.clear();
+            cache.icons.borrow_mut().clear();
             cache.context = Some(context);
         }
 
@@ -2828,7 +2838,7 @@ impl AppGrid {
                     }
                     if let Some(el) = widget::app_icon_element(
                         renderer,
-                        &mut cache.icons,
+                        &mut cache.icons.borrow_mut(),
                         app_icons,
                         &entry.icon,
                         metrics.icon_px,

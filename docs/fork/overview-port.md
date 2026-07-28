@@ -450,8 +450,9 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   - **S8 divergences / follow-ups (deferred, documented in `app_grid.rs`):** no touchpad **swipe**
     (continuous scroll over the grid is consumed but inert), no page-slide animation (snap),
     no keyboard paging (`Page_Up/Down`) or in-grid arrow/Enter keynav, no
-    `indicatorsPadding` (differs only at narrow widths), no folders/`app-picker-layout`/DnD reorder;
-    sort is `to_lowercase` not locale collation. The thumbnails' transient scale/translation shrink
+    `indicatorsPadding`, no folders/`app-picker-layout`/DnD reorder;
+    sort is `to_lowercase` not locale collation. (Every one of those has since landed; this entry
+    records what S8 shipped with.) The thumbnails' transient scale/translation shrink
     and the faded-strip non-reactivity (S8a) also remain. Floor/ceil vs transition-bracket
     interpolation noted in `overview_layout.rs` (`b6b3d86b`).
 - **S8c — App-grid performance + nav polish.**
@@ -463,8 +464,8 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     gutters (`carousel-arrow-{previous,next}-symbolic` chevron, 60px disc, flat at rest / `HOVER_WASH` on
     hover), shown only when a previous/next page exists, stepping the page ∓1 on click. Chevrons bundled
     into `resources/icons/` + `embedded_icon()` (gresource icons, not on-disk). Divergence: absent
-    `indicatorsPadding`, they ride the centering gutter, not a fixed 10% band. Render pins the chevron +
-    hover wash.
+    `indicatorsPadding` at the time, they rode the centering gutter rather than a fixed 10% band;
+    G1 has since reserved it, so they sit in the band. Render pins the chevron + hover wash.
   - **Icon-warmth performance (ACTIVE — reference-checked against GNOME 50.1).** GNOME never shows a
     blank tile because the AppDisplay is built at `ControlsManager` construction (`overviewControls.js:372`),
     kept resident, and its `_redisplay` runs off the **idle/deferred-work queue** at startup
@@ -497,12 +498,18 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
       Cogl texture per gicon+size shell-wide; we currently upload per surface (each keeps its own
       `AppIconUploads`). Fold the three surfaces' upload caches into one shared, gicon+size-keyed texture
       cache (dash included — if we do it at all, all three) so an app that appears in more than one
-      surface uploads once. Lower payoff (favorites are excluded from the grid, so cross-surface overlap
-      is mostly search∩grid), but clean; do after (1)+(2).
-  - **Next (deferred, pending live measurement):** touchpad **swipe**, page-slide animation, keyboard
-    paging (from S8b's deferred list); `indicatorsPadding` reserve so the arrows sit in a fixed side band
-    rather than the gutter; split theme-resolution (main) from decode (worker) per GNOME
-    `st-texture-cache.c:976` (marginal — resolution is cheap/cached).
+      surface uploads once. **✅ DONE:** one `SharedAppIconUploads` (`Rc<RefCell<AppIconUploads>>`)
+      that the dash, the grid, an open folder's view, the search results and the drag proxy all draw
+      from. Search and grid both ask for 96px, so typing a query no longer re-uploads what the grid
+      has resident. Each surface keeps its own renderer-context check and clears the shared map when
+      it sees a new context; the first one through does the work. Pinned by `Rc::ptr_eq` — which
+      icon is shared depends on the sizes each surface asks for, but the wiring is what can silently
+      come undone.
+  - **Next (deferred, pending live measurement):** split theme-resolution (main) from decode
+    (worker) per GNOME `st-texture-cache.c:976` (marginal — resolution is cheap/cached). Everything
+    else on this list has since landed: the touchpad swipe and the page slide (§10), keyboard
+    paging, and `indicatorsPadding` (`indicators_w`, reserved before the page padding, so the
+    arrows sit in a fixed side band).
 - **S8d — Overview chrome fidelity (reported live, 2026-07-24). ✅ DONE.** Three gaps Gustavo spotted
   against real GNOME, all reference-cited and live-checked on a headless seat:
   - **Panel background over the backdrop (`5ce62549`).** GNOME drops the top panel to

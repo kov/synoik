@@ -52,7 +52,9 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::overview_layout::ControlsLayout;
-use crate::ui::widget::{self, AppIcon, AppIconUploads, Entry, EntryHit, EntryLayout, Painter};
+use crate::ui::widget::{
+    self, AppIcon, Entry, EntryHit, EntryLayout, Painter, SharedAppIconUploads,
+};
 
 /// The built-in `AppSearchProvider` result cap (`this.maxResults = 6`,
 /// `appDisplay.js:1760`).
@@ -161,7 +163,7 @@ struct SearchCache {
     /// change never re-shapes them.
     results_bake: widget::BakeCache,
     /// Full-color result-icon uploads (shared key space with the dash's).
-    icons: AppIconUploads,
+    icons: SharedAppIconUploads,
 }
 
 /// The overview search model. Owned on `Niri`; fed results by `sync_overview_search`.
@@ -362,17 +364,27 @@ impl OverviewSearch {
         true
     }
 
+    /// Draw from `shared` instead of this surface's own upload map, so an icon already
+    /// on the GPU for another surface is not uploaded again (see [`SharedAppIconUploads`]).
+    pub fn share_icon_uploads(&self, shared: &SharedAppIconUploads) {
+        self.cache.borrow_mut().icons = shared.clone();
+    }
+
+    /// The map this surface draws from.
+    pub fn icon_uploads(&self) -> SharedAppIconUploads {
+        self.cache.borrow().icons.clone()
+    }
+
     /// Drop cached icon uploads (icon-theme / installed change).
     pub fn clear_icon_uploads(&self) {
-        let mut cache = self.cache.borrow_mut();
-        cache.icons.clear();
+        self.cache.borrow().icons.borrow_mut().clear();
     }
 
     /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
     /// decoded pixels — see [`widget::drop_app_icon_upload`].
     pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         crate::ui::widget::drop_app_icon_upload(
-            &mut self.cache.borrow_mut().icons,
+            &mut self.cache.borrow_mut().icons.borrow_mut(),
             icon,
             logical_px,
         );
@@ -519,7 +531,7 @@ impl OverviewSearch {
         let mut cache = self.cache.borrow_mut();
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
-            cache.icons.clear();
+            cache.icons.borrow_mut().clear();
             cache.context = Some(context);
         }
 
@@ -572,7 +584,7 @@ impl OverviewSearch {
             ));
             if let Some(el) = widget::app_icon_element(
                 renderer,
-                &mut cache.icons,
+                &mut cache.icons.borrow_mut(),
                 app_icons,
                 &entry.icon,
                 RESULT_ICON_PX,

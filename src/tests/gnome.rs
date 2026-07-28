@@ -7405,6 +7405,44 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
 
+/// Every app-icon surface draws from **one** GPU upload map, as gnome-shell keeps one
+/// Cogl texture per gicon+size shell-wide (`st-texture-cache.c:998`). Ours had one per
+/// surface, so a search result re-uploaded, at the same size, an icon the grid already
+/// had resident.
+///
+/// Pinned by identity rather than by counting uploads: whether a *particular* icon is
+/// shared depends on the sizes each surface happens to ask for, but the wiring — that
+/// they are the same map at all — is the thing that can silently come undone.
+#[test]
+fn overview_app_icon_uploads_are_one_shared_map() {
+    let (mut f, _recorder) = app_grid_fixture(&["a.desktop"], &["m.desktop"]);
+    let niri = f.niri();
+    let dash = niri.dash.icon_uploads();
+    for (name, other) in [
+        ("the app grid", niri.app_grid.icon_uploads()),
+        ("the search results", niri.overview_search.icon_uploads()),
+        ("the drag proxy", niri.app_icon_uploads.clone()),
+    ] {
+        assert!(
+            std::rc::Rc::ptr_eq(&dash, &other),
+            "{name} shares the dash's upload map"
+        );
+    }
+
+    // A folder's view is built when it opens, so it can only inherit the map if the
+    // dialog was told about it — the one path that is not wired at construction.
+    niri.folder_dialog
+        .popup("Utilities", "Utilities", Vec::new());
+    let folder = niri
+        .folder_dialog
+        .icon_uploads()
+        .expect("an open folder has a view");
+    assert!(
+        std::rc::Rc::ptr_eq(&dash, &folder),
+        "a folder's view shares it too"
+    );
+}
+
 /// The grid's name fallback is a *collation*, not a byte or case-folded compare: an
 /// accented initial belongs with its base letter, which is what `localeCompare`
 /// (`_compareItems`, `appDisplay.js:1475-1490`) gives GNOME and what a `to_lowercase()`

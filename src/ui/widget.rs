@@ -38,6 +38,17 @@ use crate::utils::to_physical_precise_round;
 /// the grid/search) so a hover re-bake doesn't re-upload the icon textures.
 pub type AppIconUploads = HashMap<(NotNan<f64>, AppIconRef, u16), TextureBuffer<VkTexture>>;
 
+/// One [`AppIconUploads`] shared by every surface that draws app icons.
+///
+/// gnome-shell keeps **one** Cogl texture per gicon+size for the whole shell
+/// (`st-texture-cache.c:998`, `POLICY_FOREVER`), so an app that appears in the dash, the
+/// grid and a search result is uploaded once. Ours were per surface, which meant typing a
+/// query re-uploaded, at the same size, icons the grid already had on the GPU.
+///
+/// Each surface still keeps its own renderer-context check and clears this when *it* sees
+/// a new context; the first one through does the work and the rest find it already empty.
+pub type SharedAppIconUploads = std::rc::Rc<std::cell::RefCell<AppIconUploads>>;
+
 /// Drop the uploads of one icon at one logical size, across every output scale.
 ///
 /// The upload key carries no notion of *which* decode produced the pixels, so a

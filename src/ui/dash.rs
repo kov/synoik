@@ -61,7 +61,7 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
-use crate::ui::widget::{self, AppIcon, AppIconUploads, Painter};
+use crate::ui::widget::{self, AppIcon, Painter, SharedAppIconUploads};
 
 /// Dash icon size, logical px (`this.iconSize = 64`, `dash.js:321`).
 pub(crate) const ICON_PX: f64 = 64.;
@@ -208,7 +208,7 @@ struct DashCache {
     /// while the pill chrome draws under them.
     dots: widget::BakeCache,
     /// Full-color favorite icon uploads.
-    icons: AppIconUploads,
+    icons: SharedAppIconUploads,
 }
 
 /// The overview dash. Owned on `Niri`; fed by `sync_dash_apps`.
@@ -487,18 +487,28 @@ impl Dash {
         true
     }
 
+    /// Draw from `shared` instead of this surface's own upload map, so an icon already
+    /// on the GPU for another surface is not uploaded again (see [`SharedAppIconUploads`]).
+    pub fn share_icon_uploads(&self, shared: &SharedAppIconUploads) {
+        self.cache.borrow_mut().icons = shared.clone();
+    }
+
+    /// The map this surface draws from.
+    pub fn icon_uploads(&self) -> SharedAppIconUploads {
+        self.cache.borrow().icons.clone()
+    }
+
     /// Drop cached icon uploads (e.g. on `installed-changed`, where an app's icon
     /// may now resolve differently).
     pub fn clear_icon_uploads(&self) {
-        let mut cache = self.cache.borrow_mut();
-        cache.icons.clear();
+        self.cache.borrow().icons.borrow_mut().clear();
     }
 
     /// Drop one icon's uploads, so the next frame re-uploads it from the freshly
     /// decoded pixels — see [`widget::drop_app_icon_upload`].
     pub fn drop_icon_upload(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         crate::ui::widget::drop_app_icon_upload(
-            &mut self.cache.borrow_mut().icons,
+            &mut self.cache.borrow_mut().icons.borrow_mut(),
             icon,
             logical_px,
         );
@@ -509,7 +519,7 @@ impl Dash {
     /// it blanks every tile in between, so a test needs to see the drop itself.
     #[cfg(test)]
     pub fn icon_upload_count(&self) -> usize {
-        self.cache.borrow().icons.len()
+        self.cache.borrow().icons.borrow().len()
     }
 
     /// Lay out the dash within its allocated `box` (logical, output coords;
@@ -739,7 +749,7 @@ impl Dash {
         // Cached uploads belong to one renderer context; drop them if it changed.
         let context = renderer.context_id();
         if cache.context.as_ref() != Some(&context) {
-            cache.icons.clear();
+            cache.icons.borrow_mut().clear();
             cache.context = Some(context);
         }
 
@@ -803,7 +813,7 @@ impl Dash {
         for (i, entry) in self.items.iter().enumerate() {
             if let Some(el) = widget::app_icon_element(
                 renderer,
-                &mut cache.icons,
+                &mut cache.icons.borrow_mut(),
                 app_icons,
                 &entry.icon,
                 ICON_PX,

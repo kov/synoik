@@ -456,6 +456,8 @@ struct OutputData {
 
 /// The app-folder dialog. Owned on `Niri`; opened by a click on a folder tile.
 pub struct FolderDialog {
+    /// The shared GPU upload map, kept so the view built on the next `popup` inherits it.
+    icon_uploads: Option<crate::ui::widget::SharedAppIconUploads>,
     open: Option<OpenFolder>,
     cache: RefCell<DialogCache>,
     clock: Clock,
@@ -464,6 +466,7 @@ pub struct FolderDialog {
 impl FolderDialog {
     pub fn new(clock: Clock) -> Self {
         Self {
+            icon_uploads: None,
             open: None,
             cache: RefCell::new(DialogCache::default()),
             clock,
@@ -507,6 +510,9 @@ impl FolderDialog {
             }
         }
         let mut view = AppGrid::folder_view(self.clock.clone());
+        if let Some(shared) = &self.icon_uploads {
+            view.share_icon_uploads(shared);
+        }
         view.set_entries(members);
         self.open = Some(OpenFolder {
             id: id.to_owned(),
@@ -566,6 +572,21 @@ impl FolderDialog {
                 open.phase = Phase::Visible;
             }
         }
+    }
+
+    /// The upload map a folder's view should draw from — kept so the view built on the
+    /// next `popup` inherits it (see [`crate::ui::widget::SharedAppIconUploads`]).
+    pub fn share_icon_uploads(&mut self, shared: &crate::ui::widget::SharedAppIconUploads) {
+        self.icon_uploads = Some(shared.clone());
+        if let Some(open) = &self.open {
+            open.view.share_icon_uploads(shared);
+        }
+    }
+
+    /// The open view's upload map, for a test to prove it is the shared one.
+    #[cfg(test)]
+    pub fn icon_uploads(&self) -> Option<crate::ui::widget::SharedAppIconUploads> {
+        Some(self.open.as_ref()?.view.icon_uploads())
     }
 
     /// Tick the inner view's per-tile eases (see [`AppGrid::advance_animations`]).

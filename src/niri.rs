@@ -190,7 +190,6 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
     OutputScreenshot, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
-use crate::ui::widget::AppIconUploads;
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -665,8 +664,10 @@ pub struct Niri {
     /// the menu is (`setForcedHighlight`, `appDisplay.js:3028`). Stale once the menu
     /// closes — read only while `panel_popover.is_app_menu()`.
     pub app_menu_source: Option<crate::input::OverviewHit>,
-    /// GPU uploads for the dragged icon.
-    pub app_drag_uploads: RefCell<AppIconUploads>,
+    /// The one GPU upload map every app-icon surface draws from — the dash, the grid, the
+    /// open folder, the search results and the drag proxy. Held here so the drag proxy,
+    /// which has no surface of its own, can reach it.
+    pub app_icon_uploads: crate::ui::widget::SharedAppIconUploads,
     /// The raised fill under a dragged *folder*'s composed icon. Held rather than rebuilt
     /// per frame so the element keeps its identity as the drag moves.
     app_drag_bg: RefCell<crate::render_helpers::rounded_solid::RoundedSolidBuffer>,
@@ -3956,7 +3957,7 @@ impl Niri {
             pending_launches: Vec::new(),
             app_drag: None,
             app_menu_source: None,
-            app_drag_uploads: RefCell::new(AppIconUploads::default()),
+            app_icon_uploads: crate::ui::widget::SharedAppIconUploads::default(),
             app_drag_bg: RefCell::new(
                 crate::render_helpers::rounded_solid::RoundedSolidBuffer::new(),
             ),
@@ -4010,6 +4011,15 @@ impl Niri {
         };
 
         niri.reset_pointer_inactivity_timer();
+
+        // One GPU upload map for every surface that draws app icons, as gnome-shell keeps
+        // one Cogl texture per gicon+size shell-wide (`st-texture-cache.c:998`). The dash's
+        // is the one they all take, so the drag proxy's map is the same object too.
+        let shared = niri.dash.icon_uploads();
+        niri.app_grid.share_icon_uploads(&shared);
+        niri.overview_search.share_icon_uploads(&shared);
+        niri.folder_dialog.share_icon_uploads(&shared);
+        niri.app_icon_uploads = shared;
 
         niri
     }
@@ -5907,7 +5917,7 @@ impl Niri {
             if drag.output == *output {
                 let scale = output.current_scale().fractional_scale();
                 let center = drag.pos + drag.grab_offset;
-                let mut uploads = self.app_drag_uploads.borrow_mut();
+                let mut uploads = self.app_icon_uploads.borrow_mut();
                 let mut icon_at = |icon: &AppIconRef, px: f64, at: Point<f64, Logical>| {
                     crate::ui::widget::app_icon_element(
                         ctx.renderer,
@@ -8966,7 +8976,7 @@ impl Niri {
         self.folder_dialog.drop_icon_upload(icon, logical_px);
         self.overview_search.drop_icon_upload(icon, logical_px);
         crate::ui::widget::drop_app_icon_upload(
-            &mut self.app_drag_uploads.borrow_mut(),
+            &mut self.app_icon_uploads.borrow_mut(),
             icon,
             logical_px,
         );
