@@ -6586,6 +6586,119 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
     );
 }
 
+/// On a canvas the adaptive chrome ramps down, the dash's **icons** shrink with its
+/// tiles. The lengths and the pixels are two different code paths — the layout derives
+/// every box from `DashMetrics`, but each icon is drawn at a size passed to
+/// `app_icon_element` — and when the second one kept GNOME's flat 64 the icons drew over
+/// each other on a shrunk pill, which is exactly what the seat showed. Nothing in the
+/// geometry corpus can see that: every *box* was right.
+#[test]
+fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_dash_icons_shrink_with_the_tiles: no Vulkan device ({e})");
+        return;
+    }
+
+    // Ink outside the tile boxes, on the row through the icon centres: the icons are
+    // wider than their tiles exactly when they were drawn at the un-ramped size.
+    let spill =
+        |size: (u16, u16)| -> u32 {
+            let mut f = Fixture::new();
+            f.niri_state()
+                .backend
+                .headless()
+                .add_renderer()
+                .expect("build the Vulkan renderer");
+            f.add_output(1, size);
+            let output = f.niri_output(1);
+
+            let apps = vec![
+                AppEntry::fake("a.desktop", "a.desktop"),
+                AppEntry::fake("b.desktop", "b.desktop"),
+            ];
+            f.niri().app_system = AppSystem::with_parts(
+                Box::new(FakeCatalog::new(apps)),
+                Box::new(RecordingLauncher::default()),
+            );
+            f.niri()
+                .app_system
+                .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
+            f.niri().sync_dash_favorites();
+
+            let controls = f
+                .niri()
+                .layout
+                .controls_layout_for_output(&output)
+                .expect("the output has a monitor");
+            let band = controls.dash;
+            let tiles: Vec<Rectangle<f64, Logical>> = (0..2)
+                .map(|i| f.niri().dash.tile_rect(i, band).expect("a dash tile"))
+                .collect();
+
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.dash.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        band,
+                        1.,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            let (pixels, w) = composited
+                .expect("a Vulkan device")
+                .expect("compositing the dash must not error");
+
+            // The pill fill is uniform, so "ink" is any pixel that differs from it. Sample
+            // the row through the icon centres, between the two tiles and outside them.
+            let row = (tiles[0].loc.y + tiles[0].size.h / 2.) as i32;
+            let bg = px(&pixels, w, (tiles[0].loc.x - 3.) as i32, row);
+            let mut spilled = 0;
+            let between = (tiles[0].loc.x + tiles[0].size.w) as i32..tiles[1].loc.x as i32;
+            for x in between {
+                let p = px(&pixels, w, x, row);
+                if (0..3).any(|c| (i16::from(p[c]) - i16::from(bg[c])).abs() > 12) {
+                    spilled += 1;
+                }
+            }
+            spilled
+        };
+
+    // 1920x1080 is above the reference canvas: GNOME's own 64px icon in a 76px tile,
+    // which is the control — the gap between two tiles is pill, not icon.
+    let big = spill((1920, 1080));
+    eprintln!("vulkan_dash_icons: spill at 1920x1080 = {big}");
+    assert_eq!(big, 0, "an unramped dash draws its icons inside its tiles");
+
+    // 1024x665 ramps the dash a rung down; the icons must follow.
+    let small = spill((1024, 665));
+    eprintln!("vulkan_dash_icons: spill at 1024x665 = {small}");
+    assert_eq!(
+        small, 0,
+        "a ramped dash must too — {small} px of icon drew between two tiles, which is a \
+         64px icon on a tile that is no longer 76 wide"
+    );
+}
+
 #[test]
 fn vulkan_dash_hover_lightens_the_tile() {
     use smithay::utils::Logical;

@@ -802,12 +802,15 @@ impl Dash {
     fn dot_box(
         tile: Rectangle<f64, Logical>,
         pill: Rectangle<f64, Logical>,
+        metrics: &DashMetrics,
     ) -> Rectangle<f64, Logical> {
         // `x_align: CENTER` on the tile, `y_align: END` in the pill-filling button,
         // then the `-$dash_padding` `offset-y` translation lifts it off the bottom.
-        let (x, w) = allocate_1d(tile.loc.x, tile.size.w, DOT_PX, Align1::Center);
-        let (y, h) = allocate_1d(pill.loc.y, pill.size.h, DOT_PX, Align1::End);
-        Rectangle::new(Point::from((x, y - DOT_OFFSET_Y)), Size::from((w, h)))
+        // Both lengths ride the icon size, like everything else in the pill.
+        let k = metrics.icon_px / ICON_PX;
+        let (x, w) = allocate_1d(tile.loc.x, tile.size.w, DOT_PX * k, Align1::Center);
+        let (y, h) = allocate_1d(pill.loc.y, pill.size.h, DOT_PX * k, Align1::End);
+        Rectangle::new(Point::from((x, y - DOT_OFFSET_Y * k)), Size::from((w, h)))
     }
 
     /// The running dot's box for app `i` within `area`, if it is running.
@@ -821,7 +824,7 @@ impl Dash {
         self.items
             .get(i)
             .filter(|e| e.running)
-            .map(|_| Self::dot_box(layout.tiles[i], layout.pill))
+            .map(|_| Self::dot_box(layout.tiles[i], layout.pill, &layout.metrics))
     }
 
     /// The currently-hovered element (for the conformance corpus).
@@ -869,7 +872,7 @@ impl Dash {
                 .enumerate()
                 .filter(|(_, e)| e.running)
                 .map(|(i, _)| {
-                    let d = Self::dot_box(layout.tiles[i], layout.pill);
+                    let d = Self::dot_box(layout.tiles[i], layout.pill, &layout.metrics);
                     Rectangle::new(d.loc - layout.pill.loc, d.size)
                 })
                 .collect();
@@ -884,7 +887,7 @@ impl Dash {
                     let mut p = Painter::new(frame, scale, phys);
                     p.clear(widget::style::TRANSPARENT)?;
                     for dot in &dots {
-                        p.fill_rounded(*dot, DOT_PX / 2., DOT_COLOR)?;
+                        p.fill_rounded(*dot, dot.size.w / 2., DOT_COLOR)?;
                     }
                     Ok(())
                 },
@@ -918,7 +921,7 @@ impl Dash {
                 &mut cache.icons.borrow_mut(),
                 app_icons,
                 &entry.icon,
-                ICON_PX,
+                metrics.icon_px,
                 scale,
                 Point::from((0., 0.)),
                 layout.icon_center(i),
@@ -931,9 +934,13 @@ impl Dash {
         // The show-apps symbolic glyph. Built by hand rather than via `icon_element`
         // because it fades with `progress` and `icon_element` hardcodes alpha 1.
         {
-            if let Some(tb) =
-                sym_icons.texture(renderer, SHOW_APPS_ICON, ICON_PX, scale, SHOW_APPS_FG)
-            {
+            if let Some(tb) = sym_icons.texture(
+                renderer,
+                SHOW_APPS_ICON,
+                metrics.icon_px,
+                scale,
+                SHOW_APPS_FG,
+            ) {
                 let logical = tb.logical_size();
                 let center = layout.icon_center(layout.n_items);
                 let loc = center - Point::from((logical.w / 2., logical.h / 2.));
@@ -1266,7 +1273,7 @@ mod tests {
         let tile = layout.tiles[1];
         assert_eq!(dot.loc.x + dot.size.w / 2., tile.loc.x + tile.size.w / 2.);
         // ...and strictly below the icon's canvas — in the gap, not on the icon.
-        let icon_bottom = layout.icon_center(1).y + ICON_PX / 2.;
+        let icon_bottom = layout.icon_center(1).y + layout.metrics.icon_px / 2.;
         assert!(
             dot.loc.y >= icon_bottom,
             "dot top {} must be at/below the icon bottom {icon_bottom}",

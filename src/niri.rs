@@ -8987,17 +8987,27 @@ impl Niri {
     /// anything. Separate from [`Self::prewarm_app_icons`] so it can be asserted without
     /// a decode worker (the prewarm itself no-ops without one).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn prewarm_variants(&self) -> Vec<(f64, f64, Option<f64>)> {
-        let mut variants: Vec<(f64, f64, Option<f64>)> = Vec::new();
+    pub(crate) fn prewarm_variants(&self) -> Vec<(f64, f64, Option<f64>, f64)> {
+        let mut variants: Vec<(f64, f64, Option<f64>, f64)> = Vec::new();
         for output in self.global_space.outputs() {
             let scale = output.current_scale().fractional_scale();
-            let metrics = self
-                .layout
-                .controls_layout_for_output(output)
+            let controls = self.layout.controls_layout_for_output(output);
+            let metrics = controls
                 .map(|c| self.app_grid.metrics_for(c.app_display))
                 .unwrap_or(crate::ui::widget::TileMetrics::OVERVIEW);
+            // The dash icon is chosen from its band too, for the same reason (the
+            // adaptive chrome ramp), so warming a flat 64 warms an entry a small canvas
+            // never asks for.
+            let dash_px = controls
+                .map(|c| crate::ui::dash::Dash::metrics(c.dash).icon_px)
+                .unwrap_or(crate::ui::dash::ICON_PX);
             let view = Rectangle::from_size(output_size(output));
-            let variant = (scale, metrics.icon_px, self.folder_dialog.icon_px(view));
+            let variant = (
+                scale,
+                metrics.icon_px,
+                self.folder_dialog.icon_px(view),
+                dash_px,
+            );
             if !variants.contains(&variant) {
                 variants.push(variant);
             }
@@ -9019,11 +9029,9 @@ impl Niri {
         // lazily the first time its page comes up — which is exactly what a one-time blink
         // on first reaching a page looks like. A handful of outputs at most, so a linear
         // dedup is fine.
-        for (scale, grid_px, folder_px) in self.prewarm_variants() {
+        for (scale, grid_px, folder_px, dash_px) in self.prewarm_variants() {
             for icon in self.dash.icon_refs() {
-                let _ = self
-                    .app_icon_cache
-                    .buffer(icon, crate::ui::dash::ICON_PX, scale);
+                let _ = self.app_icon_cache.buffer(icon, dash_px, scale);
             }
             for icon in self.app_grid.icon_refs() {
                 let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
