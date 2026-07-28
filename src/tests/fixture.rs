@@ -70,6 +70,29 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Pump the compositor's own event loop until `pred` holds, giving up after
+    /// `timeout`. This spends **real** wall-clock time: it is for the handful of
+    /// behaviours driven by a calloop timer rather than by the animation clock (drag
+    /// countdowns), which no amount of `niri_complete_animations` will fire. Returns
+    /// whether the predicate came true.
+    pub fn dispatch_until(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&mut crate::niri::State) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.state.server.dispatch();
+            if pred(&mut self.state.server.state) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn niri_state(&mut self) -> &mut crate::niri::State {
         &mut self.state.server.state
     }

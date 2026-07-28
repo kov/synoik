@@ -571,15 +571,17 @@ impl FolderDialog {
     }
 
     /// Whether an open/close animation is still running (→ hold the redraw loop open).
+    ///
+    /// The inner view counts: a folder with more apps than one page paginates, and its
+    /// page slide is *its* animation. Leaving it out left the slide advancing only on
+    /// whatever else happened to be asking for frames — i.e. it was fluid only while the
+    /// pointer was moving.
     pub fn are_animations_ongoing(&self) -> bool {
-        self.open
-            .as_ref()
-            .is_some_and(|o| !o.edit_fade.is_clamped_done())
-            || self.highlight_ongoing()
-            || self
-                .open
-                .as_ref()
-                .is_some_and(|o| o.phase != Phase::Visible && !o.timeline.is_clamped_done())
+        self.open.as_ref().is_some_and(|o| {
+            !o.edit_fade.is_clamped_done()
+                || o.view.are_animations_ongoing()
+                || (o.phase != Phase::Visible && !o.timeline.is_clamped_done())
+        }) || self.highlight_ongoing()
     }
 
     /// Where the transition currently is.
@@ -1631,6 +1633,32 @@ mod tests {
             );
             assert_eq!(dialog.entry_id(i), Some(format!("app{i}.desktop").as_str()));
         }
+    }
+
+    /// A page slide inside the folder is an animation of the *dialog*: the redraw loop
+    /// asks the dialog, never its inner view, so leaving the view out made the slide
+    /// advance only on frames something else had already asked for — visibly fluid only
+    /// while the pointer was moving.
+    #[test]
+    fn a_page_slide_inside_the_folder_holds_the_redraw_loop_open() {
+        let mut dialog = open_dialog(10);
+        at_ms(&mut dialog, ANIMATION_MS);
+        assert!(!dialog.are_animations_ongoing(), "settled after the zoom");
+
+        assert!(
+            dialog.set_page(1, view()),
+            "the tenth app made a second page"
+        );
+        assert!(
+            dialog.are_animations_ongoing(),
+            "the page slide holds the loop open"
+        );
+
+        at_ms(&mut dialog, 1000);
+        assert!(
+            !dialog.are_animations_ongoing(),
+            "…and lets it go when done"
+        );
     }
 
     /// Re-opening the folder that is already up keeps its page — `popup` is a no-op while

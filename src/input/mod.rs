@@ -3900,8 +3900,16 @@ impl State {
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
-        self.update_dash_drop_slot();
-        self.update_grid_drag();
+        //
+        // Same gate as the motion path above: a drag that *starts* inside the open folder
+        // belongs to the dialog. Driving the grid here reflowed the icons behind the
+        // dialog under a pointer that never left it.
+        if self.niri.folder_dialog.is_open() {
+            self.update_folder_dialog_drag();
+        } else {
+            self.update_dash_drop_slot();
+            self.update_grid_drag();
+        }
         self.niri.queue_redraw_all();
     }
 
@@ -4240,9 +4248,11 @@ impl State {
             return false;
         };
         let (source_id, output) = (drag.id.clone(), drag.output.clone());
-        let Some(over_id) = self.niri.app_grid.entry_id(target).map(str::to_owned) else {
-            return false;
-        };
+        // An app dragged out of a folder is a *move*, not a copy: whatever takes the drop,
+        // it leaves the folder it came from (`AppDisplay.acceptDrop`'s `view.removeApp`,
+        // `appDisplay.js:1688-1691`, which runs for every drop the app display accepts —
+        // folding and joining included).
+        let from_folder = drag.from_folder.clone();
 
         if self.niri.app_grid.entry_folder(target).is_some() {
             let Some(folder) = self.niri.app_grid.join_folder(target, &source_id) else {
@@ -4251,11 +4261,20 @@ impl State {
             if let Some(writer) = &self.niri.gnome_settings_writer {
                 writer.add_to_app_folder(&folder, &source_id);
             }
-            // No `_savePages` here: `addApp` writes only the folder's `apps`, and every
-            // tile the joined app left behind keeps the position it already had.
-            self.finish_grid_icon_drop(None);
+            // No `_savePages` for the join itself: `addApp` writes only the folder's
+            // `apps`, and every tile the joined app left behind keeps the position it
+            // already had. Emptying the *source* folder does remove a tile, though.
+            let save = from_folder.as_deref().map(|from| {
+                self.leave_folder(from, &source_id);
+                output.clone()
+            });
+            self.finish_grid_icon_drop(save.as_ref());
             return true;
         }
+
+        let Some(over_id) = self.niri.app_grid.entry_id(target).map(str::to_owned) else {
+            return false;
+        };
 
         // The hovered icon is the folder's first app, and so the one whose category list
         // is walked for the name (`createFolder` passes `[this.id, source.id]`).
@@ -4282,6 +4301,9 @@ impl State {
         };
         if let Some(writer) = &self.niri.gnome_settings_writer {
             writer.create_app_folder(&id, name, apps);
+        }
+        if let Some(from) = &from_folder {
+            self.leave_folder(from, &source_id);
         }
         self.finish_grid_icon_drop(Some(&output));
         true
