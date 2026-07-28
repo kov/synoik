@@ -7446,9 +7446,10 @@ fn overview_dropping_a_favourite_on_the_grid_unpins_it() {
         !f.niri().app_system.is_favorite("a.desktop"),
         "the drop unpinned it"
     );
-    assert!(
-        f.niri().app_grid.index_of("a.desktop").is_some(),
-        "and it is a grid tile now"
+    assert_eq!(
+        f.niri().app_grid.index_of("a.desktop"),
+        Some(1),
+        "and it stays in the slot it was dropped in, not at the name-ordered tail"
     );
 
     // Folding a favourite into a new folder unpins it too (`AppIcon.acceptDrop` reaches

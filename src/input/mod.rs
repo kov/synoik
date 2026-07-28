@@ -4730,10 +4730,13 @@ impl State {
                 if let Some(folder) = &from_folder {
                     self.leave_folder(folder, &drag_id);
                 }
+                // Persist *before* the unpin: `commit_favorites` re-derives the grid on
+                // the spot, and what it sorts from is the layout — so the arrangement
+                // has to be the one we are showing, drop position included.
+                self.save_app_picker_layout(&drag.output);
                 if was_favorite {
                     self.unpin_app(&drag_id);
                 }
-                self.save_app_picker_layout(&drag.output);
             } else {
                 self.niri.app_grid.remove_entry(&drag_id);
             }
@@ -4911,6 +4914,21 @@ impl State {
         };
         let per_page = self.niri.app_grid.items_per_page(area);
         let pages = self.niri.app_grid.pages(per_page);
+        // Step the in-memory model too. The write hops to the settings thread and only
+        // comes back through `changed`, but anything that re-derives the grid in between
+        // sorts from *this* map — and an app missing from it falls in after every placed
+        // app, by name (`_compareItems`, `appDisplay.js:1475-1490`). That is the tail an
+        // unpinned dash favourite used to snap to, since `commit_favorites` re-syncs the
+        // grid synchronously, one line after the drop placed it.
+        self.niri.gnome_settings.app_picker_layout = pages
+            .iter()
+            .enumerate()
+            .flat_map(|(page, ids)| {
+                ids.iter()
+                    .enumerate()
+                    .map(move |(i, id)| (id.clone(), (page, i as i32)))
+            })
+            .collect();
         if let Some(writer) = &self.niri.gnome_settings_writer {
             writer.set_app_picker_layout(pages);
         }
