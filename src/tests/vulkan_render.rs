@@ -7140,6 +7140,7 @@ fn vulkan_app_grid_draws_hovered_tile() {
                 &output,
                 area,
                 1.0,
+                crate::gnome::ACCENT_BLUE,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7264,6 +7265,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
                         &output,
                         area,
                         1.0,
+                        crate::gnome::ACCENT_BLUE,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7357,6 +7359,7 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
                         &output,
                         area,
                         1.0,
+                        crate::gnome::ACCENT_BLUE,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7469,6 +7472,7 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
                     &output,
                     area,
                     1.0,
+                    crate::gnome::ACCENT_BLUE,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7612,6 +7616,7 @@ fn vulkan_app_grid_composes_a_folder_tile() {
                     &output,
                     area,
                     1.0,
+                    crate::gnome::ACCENT_BLUE,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7718,6 +7723,7 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
                 &output,
                 area,
                 1.0,
+                crate::gnome::ACCENT_BLUE,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7816,6 +7822,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
                         &output,
                         area,
                         1.0,
+                        crate::gnome::ACCENT_BLUE,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8906,6 +8913,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
                     view,
                     None,
                     1.0,
+                    crate::gnome::ACCENT_BLUE,
                     &mut |element| elements.push(element),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
@@ -9050,6 +9058,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
                     view,
                     Some(source),
                     1.0,
+                    crate::gnome::ACCENT_BLUE,
                     &mut |element| elements.push(element),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
@@ -9171,6 +9180,7 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
                         &output,
                         area,
                         1.0,
+                        crate::gnome::ACCENT_BLUE,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9218,4 +9228,118 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
         "a fully faded tile must leave NOTHING behind, caption included — got {faded}, \
          which is the page-wide label bake drawing it at full alpha"
     );
+}
+
+/// The keyboard-focused tile draws `.overview-tile:focus` — a 2px inset accent ring over a
+/// faint accent-tinted fill (`focus_ring()` + `focus_bg_color`, `_drawing.scss:57-66,308-327`).
+/// The ring is the only thing that tells a keyboard user where they are, and it is a separate
+/// element from the page bake, so nothing else in the suite would notice it going missing.
+#[test]
+fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_rings_the_focused_tile: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let entry = |id: &str, name: &str| AppGridEntry {
+        id: id.into(),
+        name: name.into(),
+        icon: AppIconRef::Fallback,
+        folder: None,
+    };
+    f.niri()
+        .app_grid
+        .set_entries(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let rect_of = |f: &mut Fixture, i: usize| {
+        f.niri()
+            .app_grid
+            .entry_rect(i, area)
+            .expect("both tiles are on the first page")
+    };
+    let (a, b) = (rect_of(&mut f, 0), rect_of(&mut f, 1));
+
+    // One pixel inside the left edge, at mid height — on the ring, far from the corners.
+    let edge = |r: Rectangle<f64, Logical>| {
+        (
+            (r.loc.x + 1.) as i32,
+            (r.loc.y + r.size.h / 2.).round() as i32,
+        )
+    };
+
+    let shoot =
+        |f: &mut Fixture| -> (Vec<u8>, i32) {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                        crate::gnome::ACCENT_BLUE,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            composited
+                .expect("no Vulkan device")
+                .expect("compositing the grid must not error")
+        };
+
+    // Nothing focused: an app tile is flat and forced transparent at rest, so both edges
+    // are empty. This is the control that makes the ring assertion mean something.
+    let (pixels, w) = shoot(&mut f);
+    for (label, r) in [("first", a), ("second", b)] {
+        let (x, y) = edge(r);
+        let got = px(&pixels, w, x, y);
+        assert!(
+            got[3] < 8,
+            "an unfocused tile has no resting fill ({label}): {got:?}"
+        );
+    }
+
+    assert!(f.niri().app_grid.set_focused(Some(1)));
+    let (pixels, w) = shoot(&mut f);
+    let (x, y) = edge(b);
+    let ring = px(&pixels, w, x, y);
+    eprintln!("vulkan_app_grid_focus: ring={ring:?}");
+    // `$accent_color` #3584e4 at alpha .8 — blue-dominant and clearly opaque.
+    assert!(ring[3] > 150, "the focused tile draws its ring: {ring:?}");
+    assert!(
+        ring[2] > ring[0] + 40 && ring[2] > ring[1] + 20,
+        "…in the accent, not a neutral wash: {ring:?}"
+    );
+
+    let (x, y) = edge(a);
+    let other = px(&pixels, w, x, y);
+    assert!(other[3] < 8, "…and only on the focused tile: {other:?}");
 }

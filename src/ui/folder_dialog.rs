@@ -36,7 +36,7 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::app_grid::{AppGrid, AppGridEntry, PageArrow};
+use crate::ui::app_grid::{AppGrid, AppGridEntry, FocusDir, PageArrow};
 use crate::ui::panel::PANEL_HEIGHT;
 use crate::ui::widget::{self, style, Align, Painter};
 
@@ -599,6 +599,23 @@ impl FolderDialog {
         self.open.as_ref().map_or(0, |o| o.view.current_page())
     }
 
+    /// The keyboard-focused member of the open folder, if any (what Enter launches).
+    pub fn focused(&self) -> Option<usize> {
+        self.open.as_ref()?.view.focused()
+    }
+
+    /// Move the folder's keyboard focus one step. The dialog is its own focus group in
+    /// GNOME (`global.focus_manager.add_group(this)`, `appDisplay.js:2516`), so the
+    /// arrows stay inside it while it is up — which here is simply a matter of routing
+    /// them to this view instead of the one behind it.
+    pub fn focus_navigate(&mut self, dir: FocusDir, view: Rectangle<f64, Logical>) -> bool {
+        let l = layout(view);
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        open.view.focus_navigate(dir, l.grid_area)
+    }
+
     /// The logical center of the open folder's tile `k` on its current page — a geometry
     /// probe for the conformance corpus, which clicks real pixels.
     #[cfg(test)]
@@ -637,6 +654,7 @@ impl FolderDialog {
         view: Rectangle<f64, Logical>,
         source: Option<Rectangle<f64, Logical>>,
         alpha: f32,
+        accent: [u8; 3],
         push: &mut dyn FnMut(FolderDialogRenderElement),
     ) {
         let Some(open) = &self.open else { return };
@@ -652,9 +670,15 @@ impl FolderDialog {
         // The folder's own grid — its tiles, captions, hover wash, dots and arrows all come
         // from the same widget the app grid uses. Collected rather than pushed, because the
         // zoom below transforms every one of them as a set.
-        let mut content =
-            open.view
-                .render(renderer, app_icons, sym_icons, output, l.grid_area, alpha);
+        let mut content = open.view.render(
+            renderer,
+            app_icons,
+            sym_icons,
+            output,
+            l.grid_area,
+            alpha,
+            accent,
+        );
 
         // The panel itself: the rounded overlay surface, its inset hairline border, and the
         // folder name centered across the top.

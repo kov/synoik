@@ -55,7 +55,7 @@ use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
-    DragLocation, PageArrow, DELAYED_MOVE_MS, EDGE_BUMP_PX, PAGE_SWITCH_INITIAL_MS,
+    DragLocation, FocusDir, PageArrow, DELAYED_MOVE_MS, EDGE_BUMP_PX, PAGE_SWITCH_INITIAL_MS,
     PAGE_SWITCH_REPEAT_MS,
 };
 use crate::ui::dash::DashHit;
@@ -853,6 +853,14 @@ impl State {
                             return FilterResult::Intercept(None);
                         }
                         if raw == Some(Keysym::Escape) && this.niri.layout.close_app_grid() {
+                            this.niri.suppressed_keys.insert(key_code);
+                            this.niri.queue_redraw_all();
+                            return FilterResult::Intercept(None);
+                        }
+                        // Then the app grid's own keyboard navigation, which has to come
+                        // before the arrow binds below: those move *window* focus behind
+                        // the grid.
+                        if raw.is_some_and(|raw| this.overview_grid_key(raw)) {
                             this.niri.suppressed_keys.insert(key_code);
                             this.niri.queue_redraw_all();
                             return FilterResult::Intercept(None);
@@ -4305,6 +4313,100 @@ impl State {
     /// Activate an overview widget: the release half of a click on the chrome.
     /// `button` is the button that was lifted; the backgrounds (dash pill, search
     /// card, entry body) are hit-tested so they consume the click, but do nothing.
+    /// Keyboard navigation of the app grid, and of an open folder's grid (which is the
+    /// same widget). Returns whether the key was consumed.
+    ///
+    /// GNOME has no app-grid keynav code of its own: the arrows are St's spatial focus
+    /// navigation over the `can_focus` icons (`st-widget.c:1932-2030`, reproduced in
+    /// [`AppGrid::focus_navigate`]), and Enter/space is `St.Button`'s activation — which
+    /// here means routing the focused tile through the very same
+    /// [`Self::activate_overview_hit`] a click takes, so launching, opening a folder and
+    /// closing the overview cannot drift between mouse and keyboard.
+    ///
+    /// The caller has already given the search entry its shot at the key, so an active
+    /// search never reaches this.
+    fn overview_grid_key(&mut self, raw: Keysym) -> bool {
+        let folder_open = self.niri.folder_dialog.is_open();
+        let grid_open =
+            self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
+        if !folder_open && !grid_open {
+            return false;
+        }
+        let Some(output) = self.niri.layout.active_output().cloned() else {
+            return false;
+        };
+        let view = Rectangle::from_size(output_size(&output));
+        let area = self
+            .niri
+            .layout
+            .controls_layout_for_output(&output)
+            .map(|c| c.app_display);
+
+        let dir = match raw {
+            Keysym::Left => Some(FocusDir::Left),
+            Keysym::Right => Some(FocusDir::Right),
+            Keysym::Up => Some(FocusDir::Up),
+            Keysym::Down => Some(FocusDir::Down),
+            _ => None,
+        };
+        if let Some(dir) = dir {
+            // While the dialog is up it is its own focus group, so the arrows stay inside
+            // it and never reach the grid behind (`appDisplay.js:2516,2788-2789`).
+            if folder_open {
+                return self.niri.folder_dialog.focus_navigate(dir, view);
+            }
+            let Some(area) = area else { return false };
+            // Consume the arrow either way: a move that finds no candidate (Down on the
+            // last row) is still swallowed by the grid, not passed to the window binds.
+            self.niri.app_grid.focus_navigate(dir, area);
+            return true;
+        }
+
+        // The paging keys are `AppDisplay`'s own (`_onKeyPressEvent`,
+        // `appDisplay.js:1599-1618`). They do not move the focus — a page reached this way
+        // simply leaves the ring behind on the page it was on, which is what GNOME does too
+        // (`goToPage` touches no focus). While a folder is up they are swallowed rather
+        // than acted on: the dialog is a modal grab over the grid, and `AppDisplay` returns
+        // `EVENT_STOP` for every key while `_displayingDialog`.
+        let paging = matches!(
+            raw,
+            Keysym::Page_Up | Keysym::Page_Down | Keysym::Home | Keysym::End
+        );
+        if paging {
+            if folder_open {
+                return true;
+            }
+            let Some(area) = area else { return false };
+            let cur = self.niri.app_grid.current_page();
+            let last = self.niri.app_grid.page_count(area).saturating_sub(1);
+            let page = match raw {
+                Keysym::Page_Up => cur.saturating_sub(1),
+                Keysym::Page_Down => cur + 1,
+                Keysym::Home => 0,
+                _ => last,
+            };
+            self.niri.app_grid.set_page(page, area);
+            return true;
+        }
+
+        if !matches!(raw, Keysym::Return | Keysym::KP_Enter | Keysym::space) {
+            return false;
+        }
+        let hit = if folder_open {
+            let Some(i) = self.niri.folder_dialog.focused() else {
+                return false;
+            };
+            OverviewHit::Folder(DialogHit::App(i))
+        } else {
+            let Some(i) = self.niri.app_grid.focused() else {
+                return false;
+            };
+            OverviewHit::GridApp(i)
+        };
+        self.activate_overview_hit(&output, hit, Some(MouseButton::Left));
+        true
+    }
+
     fn activate_overview_hit(
         &mut self,
         output: &Output,

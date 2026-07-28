@@ -85,7 +85,7 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::widget::{self, style, AppIconUploads, Painter, TileMetrics};
+use crate::ui::widget::{self, style, AppIconUploads, Painter, Rgba, TileMetrics};
 
 /// Grid tile label point size, shared with the search results.
 ///
@@ -214,6 +214,38 @@ pub enum PageAlign {
     Center,
 }
 
+/// `.overview-tile:focus`'s ring width — `focus_ring()`'s `box-shadow: inset 0 0 0 2px`
+/// (`_drawing.scss:57-66`).
+const FOCUS_RING_W: f64 = 2.;
+/// …and its color's alpha: `st-transparentize($accent_color, $focus_border_opacity)` with
+/// `$focus_border_opacity: .2` (`_default-colors.scss:41`).
+const FOCUS_RING_ALPHA: f32 = 0.8;
+
+/// The focused tile's background — `focus_bg_color(transparentize($system_base_color, .75))`
+/// for a flat `tile_button` (`_drawing.scss:317-323`), i.e. `st-mix($accent, rgba(#222226,
+/// .25), 5%)`. `st-mix` is St's own premultiplied LERP toward the *second* color
+/// (`st-theme-node.c:637-693`), not Sass's alpha-weighted `mix()`, so it is spelled out
+/// here rather than approximated. `ring` supplies the accent RGB (its alpha is ignored).
+fn focus_bg(ring: Rgba) -> Rgba {
+    // `$system_base_color` #222226 at 25% — `transparentize` only subtracts alpha.
+    const BASE: Rgba = [0.133, 0.133, 0.149, 0.25];
+    // `factor = 1 - 0.05`: 5% of the accent, 95% of the base.
+    const F: f32 = 0.95;
+    let a = 1. + (BASE[3] - 1.) * F;
+    let ch = |i: usize| (ring[i] + (BASE[i] * BASE[3] - ring[i]) * F) / a;
+    [ch(0), ch(1), ch(2), a]
+}
+
+/// A keyboard navigation direction — St's four spatial directions
+/// (`StDirectionType` `ST_DIR_UP`/`DOWN`/`LEFT`/`RIGHT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 /// Which navigation arrow — the previous (left) or next (right) page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageArrow {
@@ -273,6 +305,8 @@ struct GridCache {
     /// The tile hover wash — a separate element so a hover change repositions it without
     /// re-baking (re-shaping) the labels (keeps the open animation smooth under the mouse).
     hover_bake: widget::BakeCache,
+    /// The `.overview-tile:focus` ring, likewise one tile's worth, moved as focus moves.
+    focus_bake: widget::BakeCache,
     /// Captions too long for one line, one bake each, keyed by page-relative tile index.
     ///
     /// They cannot live in the page bake: the hovered one expands to the full wrapped
@@ -311,6 +345,11 @@ pub struct AppGrid {
     /// The mouse-hovered navigation arrow — drives its `.page-navigation-arrow:hover`
     /// wash.
     hovered_arrow: Option<PageArrow>,
+    /// The keyboard-focused tile (an absolute entry index) — drives the
+    /// `.overview-tile:focus` ring, and expands its caption exactly like hover does
+    /// (`appDisplay.js:1901`). Independent of [`Self::hovered`]: moving the pointer
+    /// never moves key focus in GNOME, and both can be lit at once.
+    focused: Option<usize>,
     /// The current page (`AppDisplay` paginates; `iconGrid.js`). Clamped to the page
     /// count at layout time; reset to 0 on a fresh overview open.
     current_page: usize,
@@ -431,6 +470,7 @@ impl AppGrid {
             entries: Vec::new(),
             hovered: None,
             hovered_arrow: None,
+            focused: None,
             current_page: 0,
             content_rev: 0,
             reorder_restore: None,
@@ -508,9 +548,12 @@ impl AppGrid {
             return false;
         }
         self.entries = entries;
-        // Drop a now-stale hover rather than washing the wrong tile.
+        // Drop a now-stale hover / key focus rather than lighting the wrong tile.
         if self.hovered.is_some_and(|i| i >= self.entries.len()) {
             self.hovered = None;
+        }
+        if self.focused.is_some_and(|i| i >= self.entries.len()) {
+            self.focused = None;
         }
         self.content_rev += 1;
         true
@@ -589,6 +632,107 @@ impl AppGrid {
         }
         self.hovered = hovered;
         true
+    }
+
+    /// The keyboard-focused tile, if any (what Enter activates).
+    pub fn focused(&self) -> Option<usize> {
+        self.focused
+    }
+
+    /// Set (or clear) the keyboard-focused tile; returns whether it changed (→ redraw).
+    /// Like [`set_hovered`](Self::set_hovered) it does not bump `content_rev` — the focus
+    /// ring is its own element, and the caption expansion it drives already re-bakes on
+    /// its own per-tile revision (the shaped lines change).
+    pub fn set_focused(&mut self, focused: Option<usize>) -> bool {
+        let focused = focused.filter(|&i| i < self.entries.len());
+        if self.focused == focused {
+            return false;
+        }
+        self.focused = focused;
+        true
+    }
+
+    /// Move the keyboard focus one step in `dir`, paging the grid to follow it. Returns
+    /// whether anything moved (→ redraw).
+    ///
+    /// This is St's spatial navigation, not `index ± 1`: `filter_by_position` keeps only
+    /// the tiles strictly in `dir` (bbox thresholds with 0.1 px of slop) and
+    /// `sort_by_distance` takes the nearest by squared **midpoint** distance
+    /// (`st-widget.c:1932-2030`). GNOME runs it over the whole paginated viewport, whose
+    /// pages sit edge to edge, so [`Self::virtual_tile`] reconstructs that viewport from
+    /// the one page we lay out. Landing on another page then pages there —
+    /// `key-focus-in` → `_ensureItemIsVisible` (`iconGrid.js:1196-1208`).
+    ///
+    /// Divergence: with nothing focused this takes the current page's first tile. GNOME
+    /// arrives from the search entry through a stage-wide focus chain we do not have.
+    pub fn focus_navigate(&mut self, dir: FocusDir, area: Rectangle<f64, Logical>) -> bool {
+        let layout = self.layout(area);
+        if layout.tiles.is_empty() {
+            return false;
+        }
+        let Some(from) = self.focused.filter(|&i| i < self.entries.len()) else {
+            self.focused = Some(layout.first_index);
+            return true;
+        };
+        let from_box = self.virtual_tile(&layout, area, from);
+        let (fx1, fy1) = (from_box.loc.x, from_box.loc.y);
+        let (fx2, fy2) = (fx1 + from_box.size.w, fy1 + from_box.size.h);
+        let mid = |r: Rectangle<f64, Logical>| (r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.);
+        let (mx, my) = mid(from_box);
+
+        let target = (0..self.entries.len())
+            .filter(|&i| i != from)
+            .map(|i| (i, self.virtual_tile(&layout, area, i)))
+            .filter(|(_, b)| {
+                let (x1, y1) = (b.loc.x, b.loc.y);
+                let (x2, y2) = (x1 + b.size.w, y1 + b.size.h);
+                match dir {
+                    FocusDir::Up => y2 <= fy1 + 0.1,
+                    FocusDir::Down => y1 >= fy2 - 0.1,
+                    FocusDir::Left => x2 <= fx1 + 0.1,
+                    FocusDir::Right => x1 >= fx2 - 0.1,
+                }
+            })
+            .min_by(|(_, a), (_, b)| {
+                let d = |r: &Rectangle<f64, Logical>| {
+                    let (cx, cy) = mid(*r);
+                    (cx - mx).powi(2) + (cy - my).powi(2)
+                };
+                d(a).total_cmp(&d(b))
+            })
+            .map(|(i, _)| i);
+
+        let Some(target) = target else {
+            return false;
+        };
+        self.focused = Some(target);
+        self.set_page(target / layout.per_page, area);
+        true
+    }
+
+    /// The box of absolute entry `i` in the *paginated viewport* — its in-page cell rect
+    /// shifted by one band width per page away from the current one. Our layout only
+    /// places the visible page; GNOME's grid is one actor holding every page side by side,
+    /// and the spatial navigation above is defined against that.
+    fn virtual_tile(
+        &self,
+        layout: &GridLayout,
+        area: Rectangle<f64, Logical>,
+        i: usize,
+    ) -> Rectangle<f64, Logical> {
+        let tile = layout.metrics.size();
+        let cell = tile.h;
+        let origin = layout.tiles[0].loc;
+        let k = i % layout.per_page;
+        let (r, c) = (k / layout.cols, k % layout.cols);
+        let page_dx = (i / layout.per_page) as f64 - layout.page as f64;
+        Rectangle::new(
+            Point::from((
+                origin.x + c as f64 * (cell + layout.h_sp) + page_dx * area.size.w,
+                origin.y + r as f64 * (cell + layout.v_sp),
+            )),
+            tile,
+        )
     }
 
     /// Fade one tile (by id) to `alpha`, or clear the fade. Returns whether anything
@@ -1174,6 +1318,7 @@ impl AppGrid {
     /// Icons are pushed first (topmost within the grid); the tile chrome (wash +
     /// labels) bakes last (below the icons) — the dash/search order. The grid as a
     /// whole is pushed below the dash and search in `Niri::render`.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -1182,6 +1327,7 @@ impl AppGrid {
         output: &Output,
         area: Rectangle<f64, Logical>,
         alpha: f32,
+        accent: [u8; 3],
     ) -> Vec<TextureRenderElement<VkTexture>> {
         if alpha <= 0. {
             return Vec::new();
@@ -1310,7 +1456,10 @@ impl AppGrid {
         //     page bake would make the page depend on the hover again. ---
         let label_w = metrics.label_w();
         let page_range = first..first + layout.tiles.len();
-        let expanded_at = self.hovered.filter(|i| page_range.contains(i));
+        // `expand = _forcedHighlight || hover || has_key_focus()` (`appDisplay.js:1901`) —
+        // hover and key focus expand independently, and may sit on different tiles.
+        let hovered_at = self.hovered.filter(|i| page_range.contains(i));
+        let focused_at = self.focused.filter(|i| page_range.contains(i));
         let collapsed: Vec<Vec<String>> = page_entries
             .iter()
             .map(|e| widget::tile_label_lines(&e.name, LABEL_PT, label_w, false))
@@ -1333,14 +1482,17 @@ impl AppGrid {
         cache
             .long_labels
             .retain(|k, _| fits.get(*k).is_some_and(|fits| !fits));
-        // How much taller the expanded caption made the hovered tile — GNOME's tile
-        // allocation follows its label, so the `:hover` background grows with it.
-        let mut expanded_extra_h = 0.;
+        // How much taller the expanded caption made the hovered / focused tile — GNOME's
+        // tile allocation follows its label, so the `:hover` wash and the `:focus` ring
+        // each grow with the one they sit on.
+        let mut hover_extra_h = 0.;
+        let mut focus_extra_h = 0.;
         for (k, entry) in page_entries.iter().enumerate() {
             if fits[k] {
                 continue;
             }
-            let expanded = expanded_at == Some(first + k);
+            let i = first + k;
+            let expanded = hovered_at == Some(i) || focused_at == Some(i);
             let lines = if expanded {
                 widget::tile_label_lines(&entry.name, LABEL_PT, label_w, true)
             } else {
@@ -1348,7 +1500,13 @@ impl AppGrid {
             };
             let line_h = metrics.label_h;
             if expanded {
-                expanded_extra_h = line_h * (lines.len() as f64 - 1.);
+                let extra = line_h * (lines.len() as f64 - 1.);
+                if hovered_at == Some(i) {
+                    hover_extra_h = extra;
+                }
+                if focused_at == Some(i) {
+                    focus_extra_h = extra;
+                }
             }
             let size = Size::from((label_w, line_h * lines.len() as f64));
             let revision = widget::Revision::new().each(&lines).done();
@@ -1457,6 +1615,64 @@ impl AppGrid {
             Err(err) => tracing::error!("error baking the app grid: {err:#}"),
         }
 
+        // --- The keyboard focus ring (`.overview-tile:focus`, `_drawing.scss:308-327`):
+        //     a 2px inset accent stroke over a faint accent-tinted fill. Pushed *before*
+        //     the hover wash, i.e. above it, because GNOME's `box-shadow: inset` paints
+        //     over the background a `:focus:hover` tile still lightens. Same
+        //     bake-one-tile-and-move-it shape as the wash; the accent rides its revision
+        //     so a live accent change re-strokes it. ---
+        if let Some((mut tile, ring_alpha)) = self
+            .focused
+            .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
+            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
+        {
+            tile.size.h += focus_extra_h;
+            let radius = metrics.radius;
+            let ring = [
+                f32::from(accent[0]) / 255.,
+                f32::from(accent[1]) / 255.,
+                f32::from(accent[2]) / 255.,
+                FOCUS_RING_ALPHA,
+            ];
+            let bg = focus_bg(ring);
+            let revision = widget::Revision::new().of(accent).done();
+            match widget::bake(
+                renderer,
+                &mut cache.focus_bake,
+                scale,
+                tile.size,
+                revision,
+                |_| Ok(()),
+                move |frame, phys, _: &()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    let rect = Rectangle::from_size(tile.size);
+                    p.fill_rounded(rect, radius, bg)?;
+                    p.stroke_rounded(rect, radius, FOCUS_RING_W, ring)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        tile.loc,
+                        ring_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the app-grid focus ring: {err:#}"),
+            }
+        }
+
         // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten
         //     element under the labels/icons. Baked at one tile's size and just
         //     repositioned as the pointer moves between tiles, so it costs no re-shape. ---
@@ -1467,7 +1683,7 @@ impl AppGrid {
         {
             // An expanded caption is taller than the one line the tile box reserves;
             // GNOME re-allocates the tile around it, so the wash covers the extra lines.
-            tile.size.h += expanded_extra_h;
+            tile.size.h += hover_extra_h;
             let radius = metrics.radius;
             match widget::bake(
                 renderer,

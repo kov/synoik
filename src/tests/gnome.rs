@@ -51,6 +51,9 @@ const KEY_F4: u32 = 62;
 const KEY_UP: u32 = 103;
 const KEY_LEFT: u32 = 105;
 const KEY_DOWN: u32 = 108;
+const KEY_PAGEUP: u32 = 104;
+const KEY_HOME: u32 = 102;
+const KEY_END: u32 = 107;
 const KEY_PAGEDOWN: u32 = 109;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
@@ -7089,6 +7092,170 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
         "and the overview closed"
     );
     assert!(!f.niri().folder_dialog.is_open(), "with the folder");
+}
+
+/// An open folder takes the arrows for itself — it is its own focus group in gnome-shell
+/// (`global.focus_manager.add_group(this)` + `navigate_from_event`,
+/// `appDisplay.js:2516,2788-2789`), so navigation stays inside the dialog and never reaches
+/// the grid behind it, and Enter launches the member it lands on.
+#[test]
+fn overview_folder_dialog_navigates_with_the_keyboard() {
+    use crate::gnome::AppFolder;
+
+    let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+    f.niri_state().update_keyboard_focus();
+    assert!(f.niri().keyboard_focus.is_overview());
+
+    // Reach the folder tile by keyboard too: it sorts after "a.desktop", so one Right
+    // from the first tile lands on it, and Enter opens it rather than launching.
+    tap(&mut f, KEY_RIGHT);
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(f.niri().app_grid.focused(), Some(1));
+    tap(&mut f, KEY_ENTER);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri().folder_dialog.folder_id(),
+        Some("Utilities"),
+        "Enter on a folder tile opens it"
+    );
+    assert!(recorder.calls.borrow().is_empty(), "…and launches nothing");
+
+    // The arrows now belong to the dialog: the grid behind keeps the focus it had.
+    let before = f.niri().app_grid.focused();
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(f.niri().folder_dialog.focused(), Some(0));
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(f.niri().folder_dialog.focused(), Some(1));
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        before,
+        "the grid behind the modal did not move"
+    );
+    // Enter launches the focused member and takes the overview with it.
+    tap(&mut f, KEY_ENTER);
+    f.niri_complete_animations();
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one app launched");
+    assert_eq!(calls[0].0.id, "z.desktop", "the focused member launched");
+    drop(calls);
+    assert!(!f.niri().layout.is_overview_open());
+    assert!(!f.niri().folder_dialog.is_open());
+}
+
+/// The app grid navigates by keyboard. gnome-shell has no keynav code of its own here:
+/// the arrows are St's *spatial* focus navigation over the `can_focus` icons — everything
+/// strictly in the direction asked for, nearest by midpoint distance
+/// (`filter_by_position` + `sort_by_distance`, `st-widget.c:1932-2030`) — moving focus
+/// pages the view to follow it (`key-focus-in` → `_ensureItemIsVisible`,
+/// `iconGrid.js:1196-1208`), Enter is `St.Button`'s activation, and `Page_Up`/`Page_Down`/
+/// `Home`/`End` are `AppDisplay._onKeyPressEvent` (`appDisplay.js:1599-1618`).
+#[test]
+fn overview_app_grid_navigates_with_the_keyboard() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, recorder) = app_grid_fixture(&[], &others);
+    // The overview must actually hold keyboard focus or none of its key tiers run.
+    f.niri_state().update_keyboard_focus();
+    assert!(f.niri().keyboard_focus.is_overview());
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(
+        f.niri().app_grid.page_count(area),
+        2,
+        "30 apps span two pages"
+    );
+    let center = |f: &mut Fixture, i: usize| {
+        f.niri()
+            .app_grid
+            .entry_center(i, area)
+            .expect("the tile is on the visible page")
+    };
+
+    // Nothing is lit until a key asks for it, and the first arrow takes the page's first
+    // tile whichever way it points — our divergence: GNOME reaches the grid from the
+    // search entry through a stage-wide focus chain we do not have.
+    assert_eq!(f.niri().app_grid.focused(), None);
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(f.niri().app_grid.focused(), Some(0));
+
+    // Right moves along the row; Down drops a row in the same column.
+    tap(&mut f, KEY_RIGHT);
+    let right = f.niri().app_grid.focused().expect("Right moved the focus");
+    assert!(right > 0);
+    assert_eq!(
+        center(&mut f, right).y,
+        center(&mut f, 0).y,
+        "Right stays in the row"
+    );
+    assert!(center(&mut f, right).x > center(&mut f, 0).x);
+
+    tap(&mut f, KEY_DOWN);
+    let down = f.niri().app_grid.focused().expect("Down moved the focus");
+    assert_eq!(
+        center(&mut f, down).x,
+        center(&mut f, right).x,
+        "Down stays in the column"
+    );
+    assert!(center(&mut f, down).y > center(&mut f, right).y);
+
+    // …and back the way we came.
+    tap(&mut f, KEY_UP);
+    assert_eq!(f.niri().app_grid.focused(), Some(right));
+    tap(&mut f, KEY_LEFT);
+    assert_eq!(f.niri().app_grid.focused(), Some(0));
+    // Nothing lies left of the first column of the first page. The key is still consumed
+    // — it must not fall through to the window binds behind the grid.
+    tap(&mut f, KEY_LEFT);
+    assert_eq!(f.niri().app_grid.focused(), Some(0));
+    assert!(f.niri().layout.is_app_grid_open());
+
+    // Right off the end of a row crosses to the next page in the *same row*: the pages
+    // sit side by side in one viewport, so that tile really is the nearest one to the
+    // right. The view pages over to follow the focus.
+    let row_y = center(&mut f, 0).y;
+    for _ in 0..12 {
+        tap(&mut f, KEY_RIGHT);
+        if f.niri().app_grid.current_page() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "the page followed the focus across"
+    );
+    let crossed = f.niri().app_grid.focused().unwrap();
+    let per_page = f.niri().app_grid.items_per_page(area);
+    assert!(crossed >= per_page, "…onto the second page");
+    assert_eq!(center(&mut f, crossed).y, row_y, "…staying in its row");
+
+    // The paging keys move the page and leave the focus where it was.
+    tap(&mut f, KEY_PAGEUP);
+    assert_eq!(f.niri().app_grid.current_page(), 0);
+    assert_eq!(f.niri().app_grid.focused(), Some(crossed));
+    tap(&mut f, KEY_END);
+    assert_eq!(f.niri().app_grid.current_page(), 1);
+    tap(&mut f, KEY_HOME);
+    assert_eq!(f.niri().app_grid.current_page(), 0);
+    tap(&mut f, KEY_PAGEDOWN);
+    assert_eq!(f.niri().app_grid.current_page(), 1);
+
+    // Enter launches the focused tile and closes the overview, exactly as a click does.
+    tap(&mut f, KEY_ENTER);
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one app launched");
+    assert_eq!(calls[0].0.id, ids[crossed], "the focused app launched");
+    drop(calls);
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and the overview closed"
+    );
 }
 
 /// With more apps than fit one page, the grid paginates: a wheel scroll over it and a

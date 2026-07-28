@@ -5936,6 +5936,7 @@ impl Niri {
                     Rectangle::from_size(output_size(output)),
                     source,
                     progress as f32,
+                    self.gnome_settings.accent_color,
                     &mut |element| push(element.into()),
                 );
                 for element in self.dash.render(
@@ -5984,6 +5985,7 @@ impl Niri {
                         output,
                         controls.app_display,
                         alpha,
+                        self.gnome_settings.accent_color,
                     ) {
                         push(element.into());
                     }
@@ -9096,6 +9098,10 @@ impl Niri {
         // being modal the moment the close starts, and retires itself when it ends.
         if !self.layout.is_app_grid_open() {
             self.folder_dialog.hide();
+            // A grid that is not on screen holds no key focus — a re-opened grid starts
+            // over from its first page (`goToPage(0)`, `appDisplay.js:1342`) with nothing
+            // lit, exactly as a fresh `AppDisplay` does.
+            self.app_grid.set_focused(None);
         }
         self.folder_dialog.advance();
         // The source tile fades out under the opening dialog and back in as it shrinks

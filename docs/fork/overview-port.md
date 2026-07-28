@@ -930,3 +930,66 @@ the per-folder writes that go with a drag.
 interactive editing, and without it the feature is invisible on any profile that has never run stock
 gnome-shell — which is exactly what happened on the live seat, where `folder-children` read `@as []`
 while a profile that had run gnome-shell read `['Utilities', 'YaST']`. Landed with F2's follow-up.
+
+## 9. App-grid keyboard navigation (cited plan, 2026-07-28)
+
+The grid is mouse-only today: arrows in the overview still run niri's window binds
+(`hardcoded_overview_bind`, `input/mod.rs`), so with the app grid open Left/Right move *window*
+focus behind it and nothing can be launched without the pointer.
+
+### 9.1 Where the behavior actually lives
+
+There is no keyboard-navigation code in `appDisplay.js` — arrows are **St's spatial focus
+navigation** over the `can_focus` icons, and `AppDisplay` only adds the paging keys:
+
+* `appDisplay.js:1599-1618` `_onKeyPressEvent`: `if (this._displayingDialog) return EVENT_STOP;`
+  then `Page_Up` → `goToPage(currentPage - 1)`, `Page_Down` → `+1`, `Home` → `goToPage(0)`,
+  `End` → `goToPage(nPages - 1)`; anything else propagates.
+* `appDisplay.js:2788-2789` `AppFolderDialog.vfunc_key_press_event` → `navigate_from_event`, and
+  `:2516` `global.focus_manager.add_group(this)` — the dialog is its own focus group, which is why
+  the paging keys above are swallowed while it is up but the arrows still work inside it.
+* `can_focus: true` on `AppIcon` (`:1855`) and `FolderIcon` (`:2289`); activation is `St.Button`'s
+  own Enter/space.
+* `st-widget.c:1932-2030`: `filter_by_position` keeps the children **strictly** in the requested
+  direction (bbox thresholds `x1 >= rbox.x2 - 0.1` for RIGHT, etc. — 0.1 px of slop, and *no*
+  overlap test despite the comment), then `sort_by_distance` picks the nearest by **midpoint**
+  squared distance. So "right" is genuinely spatial, not `index + 1`.
+* `iconGrid.js:1196-1208`: every child gets a `key-focus-in` handler calling
+  `_ensureItemIsVisible` → `goToPage(getItemPage(item))` — **focus drags the page with it**.
+* `appDisplay.js:1901` `const expand = this._forcedHighlight || this.hover || this.has_key_focus();`
+  with `vfunc_key_focus_in/out` → `_updateMultiline` (`:2010-2017`): key focus expands the caption
+  exactly like hover, and the two are independent (hovering does not move key focus).
+* The focus *look* is `.overview-tile:focus` → `tile_button` flat → `button(focus, …, flat)`
+  (`_drawing.scss:308-327`, `:361-372`): `focus_ring()` = `box-shadow: inset 0 0 0 2px` in
+  `st-transparentize($accent_color, .2)` (i.e. accent @ 0.8 — the same ring `widget::Button`
+  already draws), over `background-color: focus_bg_color(transparentize($system_base_color, .75))`
+  = `st-mix($accent, rgba(#222226, .25), 5%)`. `st-mix` is St's own premultiplied LERP
+  (`st-theme-node.c:637-693`), not Sass's, so that resolves to ≈ `rgba(37, 51, 71, 0.29)` at the
+  default blue.
+
+### 9.2 How it maps onto our grid
+
+Our grid lays out only the current page, so the spatial rule needs the viewport it is a window
+onto. Reconstruct it: the virtual rect of absolute entry `i` is its in-page cell rect shifted by
+`(i / per_page - current_page) * area.width` — pages are laid out edge to edge at the band's own
+width. With that, GNOME's filter-then-nearest runs verbatim and every edge case comes out right for
+free: Right from the last column lands on the same row of the next page; Down on the last row finds
+no candidate and does nothing; a short last page falls back to *its* nearest tile rather than a
+hole. Then `set_page(i / per_page)`, which is `_ensureItemIsVisible`.
+
+Because the folder dialog's inner view **is** the app-grid widget (§8.5 F3), all of this lands in
+the dialog at the same time, including its own pagination past nine apps.
+
+### 9.3 Slices
+
+* **K1 — the focus cursor.** *(landed.)* `AppGrid` gains `focused: Option<usize>` plus `focus_navigate(dir)`
+  (the spatial rule above, paging as it goes), the ring/wash element, and the caption expansion
+  under key focus. Input: Left/Right/Up/Down drive the grid instead of `FocusColumnLeft`/… while
+  the grid or a folder is open, and Enter/space activates the focused tile — launching an app or
+  opening its folder, the same two paths a click takes.
+* **K2 — the paging keys.** *(landed, with K1.)* `Page_Up`/`Page_Down`/`Home`/`End`, swallowed while a folder is up.
+
+**Divergences to state:** GNOME reaches the grid from the search entry, whose own focus is the
+starting point of the first arrow press; we have no stage-wide focus chain, so the first arrow with
+nothing focused takes the first tile of the current page. Tab is left alone in this slice — it moves
+between *focus groups* (dash ↔ grid ↔ search) in GNOME, which needs the chain we do not have.
