@@ -8875,6 +8875,9 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
             })
             .collect(),
     );
+    // The open zooms out of the source tile over 200 ms; settle it, or every sample below
+    // reads the first frame (shade alpha 0). See the headless-animation-clock trap.
+    f.settle_animations();
 
     let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
     let l = crate::ui::folder_dialog::layout(view);
@@ -8901,6 +8904,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
                     &niri.icon_cache,
                     &output,
                     view,
+                    None,
                     1.0,
                     &mut |element| elements.push(element),
                 );
@@ -8980,4 +8984,238 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
             );
         }
     }
+}
+
+/// Mid-close, the dialog really is drawn shrunk toward its source tile: a point inside the
+/// resting panel but outside the shrunken one shows what is *behind* the dialog, not panel
+/// chrome. Sampled at a pinned instant — the end states are structurally blind to this (both
+/// ends look right whichever direction the zoom runs).
+#[test]
+fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+    use crate::ui::folder_dialog::{FolderDialogRenderElement, Zoom};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_folder_dialog_shrinks_toward_its_source_tile: no Vulkan ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    f.niri().folder_dialog.popup(
+        "Utilities",
+        "Utilities",
+        vec![AppGridEntry {
+            id: "m0.desktop".into(),
+            name: "M0".into(),
+            icon: AppIconRef::Fallback,
+            folder: None,
+        }],
+    );
+    f.settle_animations();
+    assert!(f.niri().folder_dialog.popdown(), "start the shrink");
+
+    let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
+    // A source tile in the top-left quadrant, so the shrink travels somewhere obvious.
+    let source: Rectangle<f64, Logical> = Rectangle::new((200., 200.).into(), (144., 144.).into());
+    let panel = crate::ui::folder_dialog::layout(view).panel;
+
+    // Sample a third of the way into the 200 ms close.
+    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(66);
+    f.niri().clock.set_unadjusted(at);
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
+                niri.folder_dialog.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    view,
+                    Some(source),
+                    1.0,
+                    &mut |element| elements.push(element),
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_folder_dialog_shrinks_toward_its_source_tile: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the shrinking dialog must not error");
+
+    // Where the panel actually is at this instant, per the same transform the renderer used.
+    let zoom = f.niri().folder_dialog.zoom_for_test();
+    let shrunk = Zoom::new(view, source, zoom).map(panel);
+    eprintln!("vulkan_folder_dialog_shrink: zoom={zoom} panel={panel:?} shrunk={shrunk:?}");
+    assert!(
+        zoom > 0.02 && zoom < 0.9,
+        "the sample must land mid-shrink, got {zoom}"
+    );
+    assert!(
+        shrunk.size.w < panel.size.w * 0.9 && shrunk.size.h < panel.size.h * 0.9,
+        "it should have shrunk by now: {shrunk:?}"
+    );
+
+    // The resting panel's centre is no longer covered by panel chrome — the box moved away.
+    let vacated = Point::<f64, Logical>::from((
+        panel.loc.x + panel.size.w - 20.,
+        panel.loc.y + panel.size.h - 20.,
+    ));
+    assert!(
+        !shrunk.contains(vacated),
+        "pick a point the shrunk panel has left: {vacated:?} vs {shrunk:?}"
+    );
+    let got = px(&pixels, w, vacated.x as i32, vacated.y as i32);
+    eprintln!("vulkan_folder_dialog_shrink: vacated={got:?}");
+    for ch in 0..3 {
+        let panel_ch = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        assert!(
+            (got[ch] as i32 - panel_ch).abs() > 8,
+            "the vacated corner still reads as panel fill — the zoom did not move it: {got:?}"
+        );
+    }
+
+    // …and the shade has begun to lift with it.
+    let shade = px(&pixels, w, 40, 40);
+    eprintln!("vulkan_folder_dialog_shrink: shade={shade:?}");
+    assert!(
+        shade[3] > 0 && shade[3] < 204,
+        "the shade fades out over the close: {shade:?}"
+    );
+}
+
+/// The tile the open folder zoomed out of fades as ONE actor: its caption goes with its
+/// background and its icons. The caption is the part that can silently stay behind — it
+/// normally lives in the page-wide label bake, which has no per-tile alpha, so the fade
+/// only works if the faded tile is routed out of that bake and drawn on its own.
+#[test]
+fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_fades_a_folder_tile_caption: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let member = AppGridEntry {
+        id: "m0.desktop".into(),
+        name: "M0".into(),
+        icon: AppIconRef::Fallback,
+        folder: None,
+    };
+    f.niri().app_grid.set_entries(vec![AppGridEntry {
+        id: "Utilities".into(),
+        name: "Utilities".into(),
+        icon: AppIconRef::Fallback,
+        folder: Some(vec![member]),
+    }]);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let tile = f
+        .niri()
+        .app_grid
+        .entry_rect(0, area)
+        .expect("the folder tile");
+
+    // The brightest pixel anywhere in the tile's caption band — glyph ink if the caption
+    // is drawn, nothing at all if it faded away with the rest of the tile.
+    let brightest_caption =
+        |f: &mut Fixture| -> u8 {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            let (pixels, w) = composited
+                .expect("no Vulkan device")
+                .expect("compositing the grid must not error");
+            // The caption sits under the icon: scan the tile's bottom third, full width.
+            let y0 = (tile.loc.y + tile.size.h * 2. / 3.) as i32;
+            let y1 = (tile.loc.y + tile.size.h) as i32;
+            let mut max = 0u8;
+            for y in y0..y1 {
+                for x in tile.loc.x as i32..(tile.loc.x + tile.size.w) as i32 {
+                    max = max.max(px(&pixels, w, x, y)[3]);
+                }
+            }
+            max
+        };
+
+    let lit = brightest_caption(&mut f);
+    eprintln!("vulkan_app_grid_fade: unfaded caption peak alpha = {lit}");
+    assert!(
+        lit > 100,
+        "the control: an unfaded folder tile draws its caption ({lit})"
+    );
+
+    assert!(f
+        .niri()
+        .app_grid
+        .set_tile_fade(Some(("Utilities".to_owned(), 0.))));
+    let faded = brightest_caption(&mut f);
+    eprintln!("vulkan_app_grid_fade: faded caption peak alpha = {faded}");
+    assert!(
+        faded < 8,
+        "a fully faded tile must leave NOTHING behind, caption included — got {faded}, \
+         which is the page-wide label bake drawing it at full alpha"
+    );
 }

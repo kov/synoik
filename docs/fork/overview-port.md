@@ -889,8 +889,26 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
   button (editing is deferred — the label centers on its own where GNOME balances the button
   with a ghost actor), the panel is *clamped* to the work area rather than allowed to overflow a
   short screen, and it draws on every output like the rest of our overview chrome.
-* **F4 — the zoom-and-fade.** The 200 ms popup/popdown against the source tile's rect, the shade
-  ramp, and the source icon's half-duration fade.
+* **F4 — the zoom-and-fade.** *(landed.)* The 200 ms popup/popdown against the source tile's rect,
+  the shade ramp, and the source icon's half-duration fade. gnome-shell moves exactly one actor —
+  the `.app-folder-dialog-container`, which fills the monitor — translating it onto the source
+  icon's top-left and scaling it by `source.width / child.width` **per axis**, so the scale is
+  deliberately non-uniform; everything inside rides along, which for a flat set of axis-aligned
+  quads is the same as mapping each element's box through the transform (`ui::folder_dialog::Zoom`,
+  the same `set_location`/`set_size` trick the popover's open scale uses). The shade is the dialog
+  *actor's* own `background_color`, not part of that container, so it only fades.
+  The three quantities are independently curved off one duration — transform `EASE_OUT_EXPO`,
+  shade `EASE_OUT_QUAD`, panel opacity riding the transform's ease in and its own quad out — so the
+  animation is a **linear** timeline with the curves applied per quantity, not one eased value.
+  The source tile fades out over `TIME/2` as the dialog opens and back in over the *second* half of
+  the close, which is what makes the shrinking panel appear to become the icon again; in the grid
+  that tile leaves the shared label and folder-background bakes and is re-emitted on its own, with
+  the fading *id* in the bake revision and the alpha deliberately not (else the page's text
+  re-shapes every frame).
+  Divergences: an interrupted transition runs only the time it has left, where Clutter re-eases
+  from the current value over a full duration (they agree whenever nothing is interrupted); and
+  leaving the app grid drops the dialog outright rather than letting it fade with the overview
+  group, so a re-opened overview can never catch a ghost still shrinking inside it.
 
 **Deferrals** (state them, don't silently skip): no drag-to-create a folder, no drag in/out of one, no
 rename entry (so `translate` is only ever written by the seed, never by the user), and no auto-delete

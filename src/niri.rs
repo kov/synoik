@@ -5921,12 +5921,20 @@ impl Niri {
                 // parents it to the `overviewGroup` and raises it above every sibling
                 // (`addFolderDialog` + `popup`, `appDisplay.js:1621-1622,2888`), so it is
                 // pushed first — nothing else in the overview draws over it.
+                // The zoom animates out of (and back into) the source folder's tile, so the
+                // dialog needs that tile's box on *this* output — `None` while the tile is
+                // on another page, which draws it untransformed.
+                let source = self.folder_dialog.folder_id().and_then(|id| {
+                    let i = self.app_grid.index_of(id)?;
+                    self.app_grid.entry_rect(i, controls.app_display)
+                });
                 self.folder_dialog.render(
                     ctx.renderer,
                     &self.app_icon_cache,
                     &self.icon_cache,
                     output,
                     Rectangle::from_size(output_size(output)),
+                    source,
                     progress as f32,
                     &mut |element| push(element.into()),
                 );
@@ -6448,6 +6456,7 @@ impl Niri {
             // to generate the frames it needs.
             state.unfinished_animations_remain |= self.dash.are_animations_ongoing();
             state.unfinished_animations_remain |= self.app_grid.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.folder_dialog.are_animations_ongoing();
             // The overview search cross-fade lives on `Niri` (not the layout), so it
             // must keep the redraw loop alive here too — otherwise the fade only
             // advances when another event (e.g. pointer motion) forces a frame, and
@@ -9081,12 +9090,22 @@ impl Niri {
             // (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
             self.app_grid.reset_page();
         }
-        // Leaving the app grid takes any open folder with it: the dialog's source icon
-        // unmaps, which releases its grab and hides it outright (`_zoomAndFadeOut`,
-        // `appDisplay.js:2691-2704`). That covers hiding the whole overview and
-        // returning to the window picker alike.
+        // Leaving the app grid takes any open folder with it — hiding the whole overview
+        // and returning to the window picker alike. It *animates* out rather than being
+        // dropped, so the shrink runs alongside the grid's own fade; the dialog stops
+        // being modal the moment the close starts, and retires itself when it ends.
         if !self.layout.is_app_grid_open() {
-            self.folder_dialog.popdown();
+            self.folder_dialog.hide();
+        }
+        self.folder_dialog.advance();
+        // The source tile fades out under the opening dialog and back in as it shrinks
+        // home, so the panel appears to *become* the icon (`appDisplay.js:2441-2451`).
+        let fade = self
+            .folder_dialog
+            .source_fade()
+            .map(|(id, a)| (id.to_owned(), a));
+        if self.app_grid.set_tile_fade(fade) {
+            self.queue_redraw_all();
         }
         self.overview_search_was_visible = open;
     }

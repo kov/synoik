@@ -29,7 +29,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
-use crate::animation::Clock;
+use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::niri_render_elements;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
@@ -59,6 +59,8 @@ const NAME_PAD_X: f64 = 36.;
 const NAME_PT: f64 = 20.;
 /// `DIALOG_SHADE_NORMAL` (`appDisplay.js:57`): black at alpha 204/255.
 const SHADE: [f32; 4] = [0., 0., 0., 204. / 255.];
+/// `FOLDER_DIALOG_ANIMATION_TIME` (`appDisplay.js:43`) — the whole open/close.
+const ANIMATION_MS: u64 = 200;
 
 niri_render_elements! {
     FolderDialogRenderElement => {
@@ -133,6 +135,19 @@ pub fn layout(view: Rectangle<f64, Logical>) -> DialogLayout {
     }
 }
 
+/// Where the dialog is in its open/close animation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Zooming out of the source tile. Already modal — GNOME takes the grab in `popup`,
+    /// before the animation starts (`appDisplay.js:2875-2893`).
+    Opening,
+    Visible,
+    /// Shrinking back into the source tile. The grab is already released, so a click or
+    /// an Escape during it goes to whatever is underneath, exactly as in GNOME
+    /// (`popdown` ungrabs and *then* animates, `appDisplay.js:2896-2915`).
+    Closing,
+}
+
 /// The folder currently on screen.
 struct OpenFolder {
     /// The `folder-children` id — what the grid tile that opened it is keyed by.
@@ -141,6 +156,156 @@ struct OpenFolder {
     name: String,
     /// The folder's own view: an [`AppGrid`] in its `FolderGrid` configuration.
     view: AppGrid,
+    phase: Phase,
+    /// A **linear** 0→1 ramp over [`ANIMATION_MS`] — the transition's timeline, not its
+    /// motion. gnome-shell runs three eases with different curves off one duration (the
+    /// transform `EASE_OUT_EXPO`, the shade `EASE_OUT_QUAD`, the source icon a delayed
+    /// half-length quad), so the curves are applied per-quantity in [`Progress`] rather
+    /// than baked into the animation.
+    timeline: Animation,
+}
+
+/// How far along each of the transition's independently-curved quantities is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Progress {
+    /// 0 = the panel sits exactly on the source tile, 1 = its resting place
+    /// (`EASE_OUT_EXPO`, `appDisplay.js:2686,2729`).
+    zoom: f64,
+    /// The backdrop's ramp to `DIALOG_SHADE_NORMAL` (`EASE_OUT_QUAD`, `:2677,2714`).
+    shade: f64,
+    /// The panel's own opacity — part of the transform's ease on the way in, its own quad
+    /// on the way out (`:2684-2686` vs `:2717-2721`).
+    content: f64,
+    /// What the *source tile in the grid* should be drawn at: it fades out over
+    /// `TIME / 2` while the dialog opens and back in over the second half of the close,
+    /// so the shrinking panel appears to turn back into the icon
+    /// (`_ensureFolderDialog`'s `open-state-changed` handler, `appDisplay.js:2441-2451`).
+    source: f64,
+}
+
+/// The timeline position at which [`Curve::EaseOutExpo`] reaches `y` — the inverse of
+/// `1 - 2^(-10x)` (`animation::Curve::y`).
+///
+/// This is what lets an interrupted transition resume from where it *looks* like it is
+/// rather than from where its clock is. Clutter gets that for free, because `ease()`
+/// animates a property from its current value; our timeline runs 0→1 under the curve, so
+/// reversing it means asking the curve where the current value sits.
+/// The affine an in-flight zoom applies to everything inside the dialog's container.
+///
+/// gnome-shell moves ONE actor: the `.app-folder-dialog-container`, which fills the
+/// monitor. It is translated so its top-left lands on the source icon's, and scaled by
+/// `source.width / child.width` — per axis, so the scale is deliberately **not** uniform
+/// (`_zoomAndFadeIn`, `appDisplay.js:2666-2672`). Everything inside rides along, which for
+/// a flat set of axis-aligned quads is the same as mapping each one's box through this.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zoom {
+    view: Rectangle<f64, Logical>,
+    sx: f64,
+    sy: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl Zoom {
+    /// The transform at `zoom` (0 = sitting on `source`, 1 = identity), over an output
+    /// `view`. Both endpoints are interpolated linearly because Clutter eases the
+    /// translation and the scale as independent properties under one curve.
+    pub fn new(view: Rectangle<f64, Logical>, source: Rectangle<f64, Logical>, zoom: f64) -> Self {
+        let lerp = |a: f64, b: f64| a + (b - a) * zoom;
+        Self {
+            view,
+            sx: lerp(source.size.w / view.size.w, 1.),
+            sy: lerp(source.size.h / view.size.h, 1.),
+            tx: lerp(source.loc.x - view.loc.x, 0.),
+            ty: lerp(source.loc.y - view.loc.y, 0.),
+        }
+    }
+
+    /// Where a box in view coordinates lands.
+    pub fn map(&self, rect: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        Rectangle::new(
+            Point::from((
+                self.view.loc.x + self.tx + (rect.loc.x - self.view.loc.x) * self.sx,
+                self.view.loc.y + self.ty + (rect.loc.y - self.view.loc.y) * self.sy,
+            )),
+            Size::from((rect.size.w * self.sx, rect.size.h * self.sy)),
+        )
+    }
+}
+
+/// The transition timeline, started `from` (0..1) of the way through — a linear ramp, since
+/// the curves are applied per-quantity in [`Progress`].
+///
+/// An interrupted transition runs only the time it has *left*, which keeps each curve's
+/// shape exact. Clutter instead re-eases from the current value over a full duration; the
+/// two agree whenever nothing is interrupted, which is every ordinary open and close.
+fn ease_from(clock: &Clock, from: f64) -> Animation {
+    let from = from.clamp(0., 1.);
+    let remaining = ((1. - from) * ANIMATION_MS as f64).round() as u64;
+    Animation::ease(clock.clone(), from, 1., 0., remaining.max(1), Curve::Linear)
+}
+
+fn expo_x_for(y: f64) -> f64 {
+    if y <= 0. {
+        0.
+    } else if y >= 1. {
+        1.
+    } else {
+        -(1. - y).log2() / 10.
+    }
+}
+
+impl Progress {
+    /// Everything at rest — the dialog fully open.
+    const OPEN: Self = Self {
+        zoom: 1.,
+        shade: 1.,
+        content: 1.,
+        source: 0.,
+    };
+
+    /// Fully shrunk onto the source tile — a finished close.
+    const SHUT: Self = Self {
+        zoom: 0.,
+        shade: 0.,
+        content: 0.,
+        source: 1.,
+    };
+
+    fn at(phase: Phase, x: f64) -> Self {
+        let x = x.clamp(0., 1.);
+        // Pin the endpoints rather than trusting the curve at them: `Curve::EaseOutExpo`
+        // is `1 - 2^(-10x)` with no endpoint clamp, so `y(1)` is 0.99902, not 1.
+        // `Animation` normally hides that behind its own "past the end" early-return,
+        // which applying the curve by hand goes around.
+        if x >= 1. {
+            return match phase {
+                Phase::Visible | Phase::Opening => Self::OPEN,
+                Phase::Closing => Self::SHUT,
+            };
+        }
+        // GNOME has no ease-*in* curve in our `Curve` set; the close's source-icon fade is
+        // the only user of one, and quad in is just `x²`.
+        let ease_in_quad = |u: f64| u * u;
+        match phase {
+            Phase::Visible => Self::OPEN,
+            Phase::Opening => Self {
+                zoom: Curve::EaseOutExpo.y(x),
+                shade: Curve::EaseOutQuad.y(x),
+                content: Curve::EaseOutExpo.y(x),
+                source: 1. - Curve::EaseOutQuad.y((x * 2.).min(1.)),
+            },
+            // Closing runs the same eases *forward* from the open state to the source, so
+            // each quantity is its opening counterpart mirrored — not the opening curve
+            // evaluated backwards, which would ease from the wrong end.
+            Phase::Closing => Self {
+                zoom: 1. - Curve::EaseOutExpo.y(x),
+                shade: 1. - Curve::EaseOutQuad.y(x),
+                content: 1. - Curve::EaseOutQuad.y(x),
+                source: ease_in_quad((x * 2. - 1.).max(0.)),
+            },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -170,20 +335,41 @@ impl FolderDialog {
         }
     }
 
+    /// Whether the dialog holds the modal grab — i.e. whether it is up *and* not already
+    /// on its way out. A closing dialog is still drawn but no longer takes input, which is
+    /// what `popdown` ungrabbing before it animates means (`appDisplay.js:2896-2915`).
     pub fn is_open(&self) -> bool {
+        matches!(
+            self.open.as_ref().map(|o| o.phase),
+            Some(Phase::Opening | Phase::Visible)
+        )
+    }
+
+    /// Whether anything is on screen, including the close animation.
+    pub fn is_visible(&self) -> bool {
         self.open.is_some()
     }
 
-    /// The open folder's id, if any.
+    /// The open folder's id, if any (including while it closes — the source tile's fade
+    /// runs to the end of that animation).
     pub fn folder_id(&self) -> Option<&str> {
         self.open.as_ref().map(|o| o.id.as_str())
     }
 
     /// Pop the dialog up on `id` with `members` (`FolderIcon.open`, `appDisplay.js:2334-2343`).
-    /// Re-opening the folder that is already up is a no-op, as `popup` is when `_isOpen`.
+    /// Re-opening the folder that is already up is a no-op, as `popup` is when `_isOpen` —
+    /// but one caught mid-*close* re-opens from wherever it had shrunk to, rather than
+    /// snapping back to the source tile first.
     pub fn popup(&mut self, id: &str, name: &str, members: Vec<AppGridEntry>) {
-        if self.folder_id() == Some(id) {
-            return;
+        if let Some(open) = &mut self.open {
+            if open.id == id {
+                if open.phase == Phase::Closing {
+                    let from = Progress::at(Phase::Closing, open.timeline.clamped_value()).zoom;
+                    open.phase = Phase::Opening;
+                    open.timeline = ease_from(&self.clock, expo_x_for(from));
+                }
+                return;
+            }
         }
         let mut view = AppGrid::folder_view(self.clock.clone());
         view.set_entries(members);
@@ -191,13 +377,77 @@ impl FolderDialog {
             id: id.to_owned(),
             name: name.to_owned(),
             view,
+            phase: Phase::Opening,
+            timeline: ease_from(&self.clock, 0.),
         });
     }
 
     /// Pop the dialog down. Returns whether it had been open (→ redraw, and the caller's
-    /// Escape stops there rather than falling through to closing the grid).
+    /// Escape stops there rather than falling through to closing the grid). A dialog
+    /// already closing returns `false`, so a second Escape falls through to the grid.
     pub fn popdown(&mut self) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        if open.phase == Phase::Closing {
+            return false;
+        }
+        // Interrupting the open: carry the zoom it had reached into the close, so it
+        // shrinks from where it is instead of jumping out to full size first.
+        let from = Progress::at(open.phase, open.timeline.clamped_value()).zoom;
+        open.phase = Phase::Closing;
+        open.timeline = ease_from(&self.clock, expo_x_for(1. - from));
+        true
+    }
+
+    /// Drop the dialog outright, with no shrink. This is GNOME's `_zoomAndFadeOut`
+    /// early-out for a source icon that is no longer mapped (`appDisplay.js:2701-2704`) —
+    /// which is what leaving the app grid does to it.
+    ///
+    /// Divergence: gnome-shell's dialog lives in the `overviewGroup` and so keeps fading
+    /// with it until the grid actually unmaps, where ours goes the frame the grid's *state*
+    /// flips. The visible difference is the shade ending one fade earlier on the way out.
+    /// Taken deliberately: animating into a vanishing overview leaves a ghost shrinking over
+    /// a re-opened one if the overview comes back inside the 200 ms.
+    pub fn hide(&mut self) -> bool {
         self.open.take().is_some()
+    }
+
+    /// Retire a finished close. Called once a frame from `Niri`'s refresh — the dialog
+    /// keeps drawing itself until the shrink is over, so it cannot drop its own state.
+    pub fn advance(&mut self) {
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.phase == Phase::Closing && o.timeline.is_clamped_done())
+        {
+            self.open = None;
+        } else if let Some(open) = &mut self.open {
+            if open.phase == Phase::Opening && open.timeline.is_clamped_done() {
+                open.phase = Phase::Visible;
+            }
+        }
+    }
+
+    /// Whether an open/close animation is still running (→ hold the redraw loop open).
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.phase != Phase::Visible && !o.timeline.is_clamped_done())
+    }
+
+    /// Where the transition currently is.
+    fn progress(&self) -> Progress {
+        self.open.as_ref().map_or(Progress::OPEN, |o| {
+            Progress::at(o.phase, o.timeline.clamped_value())
+        })
+    }
+
+    /// The grid tile that should be faded, and to what — the source folder's id and the
+    /// alpha its tile draws at. `None` when nothing is up.
+    pub fn source_fade(&self) -> Option<(&str, f64)> {
+        let open = self.open.as_ref()?;
+        Some((open.id.as_str(), self.progress().source))
     }
 
     /// Re-seat the open folder against a fresh grid: `members` as they now resolve, or
@@ -249,6 +499,12 @@ impl FolderDialog {
         pos: Point<f64, Logical>,
         view: Rectangle<f64, Logical>,
     ) -> Option<DialogHit> {
+        // Not `self.open`: a *closing* dialog is still drawn but has already released its
+        // grab, so it must not swallow the click that a point over it would otherwise
+        // reach. Without this the whole screen stays modal for the 200 ms of the shrink.
+        if !self.is_open() {
+            return None;
+        }
         let open = self.open.as_ref()?;
         let l = layout(view);
         if !l.panel.contains(pos) {
@@ -325,6 +581,13 @@ impl FolderDialog {
         self.open.as_ref()?.view.tile_center(k, grid_area)
     }
 
+    /// The zoom the next render will apply — a probe for the render test, which has to
+    /// reproduce the transform to know where the panel went.
+    #[cfg(test)]
+    pub fn zoom_for_test(&self) -> f64 {
+        self.progress().zoom
+    }
+
     /// The same for tile `k`'s **icon** — the render test samples the drawn pixels there.
     #[cfg(test)]
     pub fn icon_center(
@@ -343,6 +606,7 @@ impl FolderDialog {
         sym_icons: &IconCache,
         output: &Output,
         view: Rectangle<f64, Logical>,
+        source: Option<Rectangle<f64, Logical>>,
         alpha: f32,
         push: &mut dyn FnMut(FolderDialogRenderElement),
     ) {
@@ -354,15 +618,14 @@ impl FolderDialog {
 
         let scale = output.current_scale().fractional_scale();
         let l = layout(view);
+        let progress = self.progress();
 
-        // The folder's own grid, topmost (pushed first) — its tiles, captions, hover wash,
-        // dots and arrows all come from the same widget the app grid uses.
-        for element in open
-            .view
-            .render(renderer, app_icons, sym_icons, output, l.grid_area, alpha)
-        {
-            push(FolderDialogRenderElement::Texture(element));
-        }
+        // The folder's own grid — its tiles, captions, hover wash, dots and arrows all come
+        // from the same widget the app grid uses. Collected rather than pushed, because the
+        // zoom below transforms every one of them as a set.
+        let mut content =
+            open.view
+                .render(renderer, app_icons, sym_icons, output, l.grid_area, alpha);
 
         // The panel itself: the rounded overlay surface, its inset hairline border, and the
         // folder name centered across the top.
@@ -404,18 +667,44 @@ impl FolderDialog {
                     Transform::Normal,
                     vec![],
                 );
-                push(FolderDialogRenderElement::Texture(
-                    TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        l.panel.loc,
-                        alpha,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ),
+                content.push(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    l.panel.loc,
+                    alpha,
+                    None,
+                    None,
+                    Kind::Unspecified,
                 ));
             }
             Err(err) => tracing::error!("error baking the folder dialog: {err:#}"),
+        }
+
+        // --- The zoom ([`Zoom`]; `_zoomAndFadeIn`/`_zoomAndFadeOut`, `appDisplay.js:2660-2746`).
+        //
+        // The shade below is the dialog *actor's* own `background_color`, not part of the
+        // container this moves, so it only fades — it is never transformed.
+        //
+        // Transformed geometry is not reflected in `opaque_regions`, which is sound here
+        // for the same reason it is in the popover's open/close scale: this branch only
+        // runs while the content is translucent, and a translucent element reports no
+        // opaque regions anyway.
+        if progress.zoom < 1. {
+            if let Some(src) = source {
+                let zoom = Zoom::new(view, src, progress.zoom);
+                for el in &mut content {
+                    let mapped = zoom.map(Rectangle::new(el.location(), el.logical_size()));
+                    el.set_location(mapped.loc);
+                    el.set_size(mapped.size);
+                }
+            }
+            // The panel's opacity rides the transform's ease on the way in and its own on
+            // the way out; either way it multiplies the overview's fade.
+            for el in &mut content {
+                el.set_alpha(alpha * progress.content as f32);
+            }
+        }
+        for element in content {
+            push(FolderDialogRenderElement::Texture(element));
         }
 
         // The shade over everything behind, bottom-most.
@@ -428,7 +717,12 @@ impl FolderDialog {
         let mut data = data.lock().unwrap();
         data.shade.resize(size);
         push(FolderDialogRenderElement::SolidColor(
-            SolidColorRenderElement::from_buffer(&data.shade, view.loc, alpha, Kind::Unspecified),
+            SolidColorRenderElement::from_buffer(
+                &data.shade,
+                view.loc,
+                alpha * progress.shade as f32,
+                Kind::Unspecified,
+            ),
         ));
     }
 }
@@ -454,7 +748,140 @@ mod tests {
         let mut dialog = FolderDialog::new(Clock::with_time(std::time::Duration::ZERO));
         let members: Vec<_> = (0..n).map(|i| entry(&format!("app{i}.desktop"))).collect();
         dialog.popup("Utilities", "Utilities", members);
+        // Land on the open state: every geometry/hit-test assertion below is about the
+        // resting dialog, not its first animation frame.
+        at_ms(&mut dialog, ANIMATION_MS);
         dialog
+    }
+
+    /// Move the dialog's clock to `ms` past zero and retire whatever that finishes — the
+    /// pinned-clock idiom, since nothing here advances a clock on its own.
+    fn at_ms(dialog: &mut FolderDialog, ms: u64) {
+        dialog
+            .clock
+            .set_unadjusted(std::time::Duration::from_millis(ms));
+        dialog.advance();
+    }
+
+    /// The phase ladder, on a pinned clock. The grab is taken with `popup` and released
+    /// with `popdown`, so `is_open()` (which gates hit-testing and the Escape tier) is
+    /// true through the whole *opening* animation and false through the whole *closing*
+    /// one, while `is_visible()` covers both.
+    #[test]
+    fn the_phases_run_open_then_shut_and_the_grab_matches() {
+        let mut d = FolderDialog::new(Clock::with_time(std::time::Duration::ZERO));
+        d.popup("Utilities", "Utilities", vec![entry("a.desktop")]);
+
+        assert!(d.is_open(), "the grab is taken before the zoom starts");
+        assert!(d.are_animations_ongoing(), "…and the zoom is running");
+
+        at_ms(&mut d, 100);
+        assert!(d.is_open() && d.are_animations_ongoing(), "halfway open");
+
+        at_ms(&mut d, ANIMATION_MS);
+        assert!(d.is_open());
+        assert!(
+            !d.are_animations_ongoing(),
+            "settled — the redraw loop can idle"
+        );
+        assert_eq!(d.progress(), Progress::OPEN);
+
+        assert!(d.popdown(), "the first popdown closes it");
+        assert!(
+            !d.is_open(),
+            "the grab is released at once, before the shrink"
+        );
+        assert!(d.is_visible(), "…but it is still on screen, shrinking");
+        assert_eq!(
+            d.hit_test(Point::from((5., 5.)), view()),
+            None,
+            "and it is no longer modal: a click over it reaches the grid behind"
+        );
+        assert!(!d.popdown(), "a second Escape falls through to the grid");
+        assert!(d.are_animations_ongoing());
+
+        at_ms(&mut d, ANIMATION_MS * 2);
+        assert!(!d.is_visible(), "a finished close retires itself");
+        assert!(!d.are_animations_ongoing());
+    }
+
+    /// Clicking the same folder again while it shrinks re-opens it — GNOME's `_isOpen` is
+    /// already false during the zoom-out, so `popup` runs — and it re-opens from where it
+    /// had shrunk to rather than snapping back to the tile first.
+    #[test]
+    fn reopening_mid_close_resumes_from_where_it_shrank_to() {
+        let mut d = open_dialog(4);
+        assert!(d.popdown());
+        at_ms(&mut d, ANIMATION_MS + 40);
+        let caught = d.progress().zoom;
+        assert!(
+            caught > 0.05 && caught < 0.95,
+            "the test must catch it mid-shrink, got {caught}"
+        );
+
+        d.popup("Utilities", "Utilities", vec![entry("a.desktop")]);
+        assert!(
+            d.is_open(),
+            "the click re-opens rather than being swallowed"
+        );
+        assert!(
+            (d.progress().zoom - caught).abs() < 1e-6,
+            "and it resumes from the size it had reached, not from the tile: \
+             {} vs {caught}",
+            d.progress().zoom
+        );
+    }
+
+    /// The curves, sampled *between* the endpoints — where a direction flip or a swapped
+    /// curve actually shows. Endpoints are structurally blind to both.
+    #[test]
+    fn the_close_eases_out_from_the_open_state_not_backwards_into_it() {
+        let open = Progress::at(Phase::Opening, 0.25);
+        let close = Progress::at(Phase::Closing, 0.25);
+
+        // EASE_OUT_EXPO is front-loaded: a quarter of the way in, the open is nearly
+        // done travelling and the close has nearly arrived at the tile.
+        assert!(open.zoom > 0.8, "opening rushes out: {}", open.zoom);
+        assert!(close.zoom < 0.2, "closing rushes home: {}", close.zoom);
+        // The shade is the gentler quad, so it lags the transform on both legs.
+        assert!(open.shade < open.zoom, "the shade trails the zoom in");
+        assert!(close.shade > close.zoom, "…and trails it out");
+
+        // The source tile fades OUT over the first half of the open and back IN over the
+        // second half of the close — the delay is what makes the panel become the icon.
+        assert_eq!(Progress::at(Phase::Opening, 0.).source, 1.);
+        assert_eq!(Progress::at(Phase::Opening, 0.5).source, 0.);
+        assert_eq!(Progress::at(Phase::Closing, 0.5).source, 0.);
+        assert_eq!(Progress::at(Phase::Closing, 1.).source, 1.);
+        assert!(Progress::at(Phase::Closing, 0.75).source < 0.5, "ease-in");
+    }
+
+    /// The zoom maps the container so that at 0 it sits exactly on the source tile, per
+    /// axis — the scale is deliberately non-uniform, as Clutter's is.
+    #[test]
+    fn at_zero_the_zoom_lands_the_view_on_the_source_tile() {
+        let v = view();
+        let src = Rectangle::new(Point::from((300., 500.)), Size::from((144., 144.)));
+
+        let z = Zoom::new(v, src, 0.);
+        assert_eq!(z.map(v), src, "the whole view collapses onto the tile");
+        // A box inside the view lands proportionally inside the tile.
+        let panel = layout(v).panel;
+        let mapped = z.map(panel);
+        assert!(src.contains_rect(mapped), "{mapped:?} outside {src:?}");
+        // Non-uniform, as Clutter's is: each axis scales by its own ratio, so a square
+        // panel inside a 16:9 view mapped onto a square tile comes out 16:9-squashed.
+        assert!(
+            (panel.size.w - panel.size.h).abs() < 1e-9 && (src.size.w - src.size.h).abs() < 1e-9,
+            "the premise: both boxes are square"
+        );
+        let want = v.size.h / v.size.w;
+        assert!(
+            (mapped.size.w / mapped.size.h - want).abs() < 1e-9,
+            "a uniform scale would keep it square: {mapped:?}"
+        );
+
+        assert_eq!(Zoom::new(v, src, 1.).map(panel), panel, "1 is identity");
     }
 
     /// The panel is `$app_folder_size` square, centered in the work area — the screen with

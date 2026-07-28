@@ -287,6 +287,10 @@ struct GridCache {
     /// element, below `hover_bake`, so a hovered folder still lightens (an opaque fill
     /// baked into the page texture would sit on top of the wash and swallow it).
     folder_bake: widget::BakeCache,
+    /// The resting background of the ONE tile that is fading (the folder whose dialog is
+    /// open), kept apart from `folder_bake` so its alpha can move per frame without
+    /// touching a bake shared with the rest of the page.
+    fade_bake: widget::BakeCache,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
     /// The two page-preview hint bands, previous then next.
@@ -322,6 +326,11 @@ pub struct AppGrid {
     peek: Animation,
     /// Which hint band the drag is over, if any — the `.dnd` flat fill.
     hint_hovered: Option<PageArrow>,
+    /// A tile that must draw at reduced opacity, and how much: the folder whose dialog is
+    /// up fades its source tile out while the dialog zooms out of it and back in as it
+    /// shrinks home (`appDisplay.js:2441-2451`). The *id* is folded into the bake
+    /// revision, the alpha deliberately is not — see [`Self::set_tile_fade`].
+    tile_fade: Option<(String, f64)>,
     /// The page modes this grid may re-flow to, and what a page does with its slack.
     ///
     /// GNOME builds the folder's inner view from the *same* `AppGrid` as the top-level
@@ -427,6 +436,7 @@ impl AppGrid {
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
             hint_hovered: None,
+            tile_fade: None,
             modes,
             align,
             clock,
@@ -526,6 +536,12 @@ impl AppGrid {
         self.entries.get(i).map(|e| e.id.as_str())
     }
 
+    /// The index of the entry with `id`, if it is in the grid — how the folder dialog
+    /// finds the tile it must zoom out of.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.id == id)
+    }
+
     /// The display name of tile `i` — a folder's is the title its dialog carries.
     pub fn entry_name(&self, i: usize) -> Option<&str> {
         self.entries.get(i).map(|e| e.name.as_str())
@@ -572,6 +588,28 @@ impl AppGrid {
             return false;
         }
         self.hovered = hovered;
+        true
+    }
+
+    /// Fade one tile (by id) to `alpha`, or clear the fade. Returns whether anything
+    /// changed (→ redraw).
+    ///
+    /// Changing *which* tile fades re-bakes the page — the faded tile leaves the shared
+    /// label/background bakes and is re-emitted on its own, so the shared bakes' contents
+    /// really do change. Changing only the *alpha* must not: it moves every frame of a
+    /// 200 ms animation, and folding it into the revision would re-shape the whole page's
+    /// text per frame — the bug class in [`crate::ui::app_grid`]'s sibling widgets that a
+    /// per-frame bake always turns out to be.
+    pub fn set_tile_fade(&mut self, fade: Option<(String, f64)>) -> bool {
+        let was = self.tile_fade.as_ref().map(|(id, _)| id.clone());
+        let now = fade.as_ref().map(|(id, _)| id.clone());
+        if self.tile_fade == fade {
+            return false;
+        }
+        self.tile_fade = fade;
+        if was != now {
+            self.content_rev += 1;
+        }
         true
     }
 
@@ -1222,6 +1260,18 @@ impl AppGrid {
             }
         }
 
+        // The tile the open folder dialog zoomed out of, page-relative, and the alpha it
+        // draws at. It leaves both shared bakes below and is re-emitted on its own, so its
+        // whole tile — background, caption and icons — fades as one actor does in GNOME.
+        let faded: Option<(usize, f32)> = self.tile_fade.as_ref().and_then(|(id, fade)| {
+            let k = page_entries.iter().position(|e| &e.id == id)?;
+            Some((k, alpha * *fade as f32))
+        });
+        let tile_alpha = |k: usize| match faded {
+            Some((f, a)) if f == k => a,
+            _ => alpha,
+        };
+
         // --- App icons (topmost, over their tiles). A folder has no icon of its own:
         //     its tile composes its first four members into a 2×2 instead
         //     (`createFolderIcon`, `appDisplay.js:2138-2162`). ---
@@ -1246,7 +1296,7 @@ impl AppGrid {
                     scale,
                     Point::from((0., 0.)),
                     center,
-                    alpha,
+                    tile_alpha(k),
                 ) {
                     elements.push(el);
                 }
@@ -1267,11 +1317,18 @@ impl AppGrid {
             .collect();
         // Hover-independent by construction: whether a name fits is a property of the
         // name and the label box, so the page bake's contents still never move on hover.
-        let fits: Vec<bool> = collapsed
+        let mut fits: Vec<bool> = collapsed
             .iter()
             .zip(page_entries)
             .map(|(lines, e)| lines.first().is_none_or(|line| *line == e.name))
             .collect();
+        // A faded tile takes the *per-tile* caption path even though its name fits: that
+        // path already bakes one tile's label as its own element, which is exactly what
+        // letting it fade on its own needs. It drops out of the shared page bake below by
+        // the same `fits` filter.
+        if let Some((k, _)) = faded {
+            fits[k] = false;
+        }
 
         cache
             .long_labels
@@ -1332,7 +1389,7 @@ impl AppGrid {
             elements.push(TextureRenderElement::from_texture_buffer(
                 buffer,
                 at,
-                alpha,
+                tile_alpha(k),
                 None,
                 None,
                 Kind::Unspecified,
@@ -1403,10 +1460,10 @@ impl AppGrid {
         // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten
         //     element under the labels/icons. Baked at one tile's size and just
         //     repositioned as the pointer moves between tiles, so it costs no re-shape. ---
-        if let Some(mut tile) = self
+        if let Some((mut tile, wash_alpha)) = self
             .hovered
             .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
-            .map(|i| layout.tiles[i - first])
+            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
         {
             // An expanded caption is taller than the one line the tile box reserves;
             // GNOME re-allocates the tile around it, so the wash covers the extra lines.
@@ -1437,7 +1494,7 @@ impl AppGrid {
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         tile.loc,
-                        alpha,
+                        wash_alpha,
                         None,
                         None,
                         Kind::Unspecified,
@@ -1454,8 +1511,9 @@ impl AppGrid {
         let folder_rects: Vec<Rectangle<f64, Logical>> = page_entries
             .iter()
             .zip(&layout.tiles)
-            .filter(|(e, _)| e.folder.is_some())
-            .map(|(_, t)| Rectangle::new(t.loc - origin, t.size))
+            .enumerate()
+            .filter(|(k, (e, _))| e.folder.is_some() && faded.is_none_or(|(f, _)| f != *k))
+            .map(|(_, (_, t))| Rectangle::new(t.loc - origin, t.size))
             .collect();
         if !folder_rects.is_empty() {
             let radius = metrics.radius;
@@ -1493,6 +1551,47 @@ impl AppGrid {
                     ));
                 }
                 Err(err) => tracing::error!("error baking the app-grid folder tiles: {err:#}"),
+            }
+        }
+
+        // --- The faded tile's own resting fill. Same `.app-folder` background as the bake
+        //     above, alone in its own element so the fade can move every frame. Only a
+        //     folder has a resting fill, and only a folder is ever the faded tile. ---
+        if let Some((k, fade_alpha)) = faded.filter(|(k, _)| page_entries[*k].folder.is_some()) {
+            let tile = layout.tiles[k];
+            let radius = metrics.radius;
+            match widget::bake(
+                renderer,
+                &mut cache.fade_bake,
+                scale,
+                tile.size,
+                0,
+                |_| Ok(()),
+                move |frame, phys, _: &()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    p.fill_rounded(Rectangle::from_size(tile.size), radius, style::FOLDER_BG)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        tile.loc,
+                        fade_alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the faded folder tile: {err:#}"),
             }
         }
 
@@ -2194,6 +2293,43 @@ mod tests {
         assert_eq!(grid_n(0).visible_len(wide()), 0);
         // A band too small for the padding + one tile.
         assert_eq!(grid_n(1).layout(rect(0., 0., 20., 20.)).tiles.len(), 0);
+    }
+
+    #[test]
+    fn a_moving_tile_fade_does_not_bump_the_bake_revision() {
+        // The folder dialog's source tile fades over 200ms, i.e. a new alpha every frame.
+        // Which tile fades changes what the shared bakes contain (the faded one leaves
+        // them), so that bumps the revision; the alpha alone must not, or the page's text
+        // re-shapes on every frame of the animation — the per-frame-bake bug class.
+        let mut g = grid_n(30);
+        let rev = g.content_rev();
+
+        assert!(g.set_tile_fade(Some(("app02.desktop".to_owned(), 1.))));
+        assert_ne!(
+            g.content_rev(),
+            rev,
+            "a tile joining the fade leaves the shared bakes, so they must re-bake"
+        );
+
+        let rev = g.content_rev();
+        for alpha in [0.75, 0.5, 0.25, 0.] {
+            assert!(
+                g.set_tile_fade(Some(("app02.desktop".to_owned(), alpha))),
+                "a new alpha still reports a change (→ redraw)"
+            );
+            assert_eq!(
+                g.content_rev(),
+                rev,
+                "…but must not re-bake: it moves every frame"
+            );
+        }
+
+        assert!(g.set_tile_fade(Some(("app03.desktop".to_owned(), 0.5))));
+        assert_ne!(g.content_rev(), rev, "a different tile re-bakes");
+        let rev = g.content_rev();
+        assert!(g.set_tile_fade(None));
+        assert_ne!(g.content_rev(), rev, "and so does clearing it");
+        assert!(!g.set_tile_fade(None), "an unchanged fade is not a change");
     }
 
     #[test]

@@ -4366,7 +4366,9 @@ impl State {
                     if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
                         tracing::warn!("folder launch of {id} failed: {err:?}");
                     }
-                    self.niri.folder_dialog.popdown();
+                    // The overview is going with it, which is GNOME's source-unmapped
+                    // path — no shrink to watch.
+                    self.niri.folder_dialog.hide();
                     self.niri.layout.close_overview();
                 }
             }
