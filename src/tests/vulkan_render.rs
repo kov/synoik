@@ -9921,6 +9921,118 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
     );
 }
 
+/// A folder tile's bubble covers its caption — including a resting caption that runs to
+/// [`crate::ui::widget::TILE_LABEL_LINES`], which hangs past the one line the tile box
+/// reserves. Reported live: "Sound & Video" wrapped to two lines and the second one sat
+/// outside the folder's own bubble. GNOME's tile allocation follows its label, so the
+/// bubble has to grow by what *this* name uses.
+#[test]
+fn vulkan_folder_tile_bubble_covers_a_two_line_caption() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_folder_tile_bubble_covers_two_lines: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let member = AppGridEntry {
+        id: "m0.desktop".into(),
+        name: "M0".into(),
+        icon: AppIconRef::Fallback,
+        folder: None,
+    };
+    // Two folders: one whose name needs the second line, one that fits on the first.
+    f.niri().app_grid.set_entries(vec![
+        AppGridEntry {
+            id: "sound".into(),
+            name: "Sound & Video Recorders".into(),
+            icon: AppIconRef::Fallback,
+            folder: Some(vec![member.clone()]),
+        },
+        AppGridEntry {
+            id: "utils".into(),
+            name: "Tools".into(),
+            icon: AppIconRef::Fallback,
+            folder: Some(vec![member]),
+        },
+    ]);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let mut rect = |i: usize| {
+        f.niri()
+            .app_grid
+            .entry_rect(i, area)
+            .expect("a folder tile")
+    };
+    let (wide_name, short_name) = (rect(0), rect(1));
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let elements = niri.app_grid.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    area,
+                    1.0,
+                    crate::gnome::ACCENT_BLUE,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let (pixels, w) = composited
+        .expect("no Vulkan device")
+        .expect("compositing the grid must not error");
+
+    // Is the bubble present on the second caption line's row, at the tile's centre?
+    // Sampled at the tile's centre x — clear of the bubble's rounded corners — just
+    // *below* the tile box, which is where the second caption line hangs and where a
+    // bubble that did not grow simply is not.
+    let bubble_below_the_tile = |t: Rectangle<f64, Logical>| -> u8 {
+        let y = (t.loc.y + t.size.h + 3.) as i32;
+        px(&pixels, w, (t.loc.x + t.size.w / 2.) as i32, y)[3]
+    };
+
+    let two_line = bubble_below_the_tile(wide_name);
+    let one_line = bubble_below_the_tile(short_name);
+    eprintln!("vulkan_folder_bubble: two_line={two_line} one_line={one_line}");
+    assert!(
+        two_line > 0,
+        "the bubble must reach the second caption line it is holding ({two_line})"
+    );
+    assert_eq!(
+        one_line, 0,
+        "…and a folder whose name fits one line must NOT grow ({one_line}) — the bubble \
+         follows the caption, it is not simply taller now"
+    );
+}
+
 /// A resting tile whose name does not fit one line draws **two** lines of caption
 /// ([`crate::ui::widget::TILE_LABEL_LINES`] — our divergence from GNOME's single
 /// ellipsized line). The second line hangs below the tile box, so it is exactly the row

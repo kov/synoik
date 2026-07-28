@@ -331,6 +331,19 @@ impl TileMetrics {
         Size::from((side, side))
     }
 
+    /// How far a caption of `lines` hangs below the tile box.
+    ///
+    /// The tile is sized for **one** caption line — that is the `Shell.SquareBin` rule
+    /// and it is what keeps the cell square, so reserving our resting
+    /// [`TILE_LABEL_LINES`] in the box instead would cost a rung of the icon ladder on
+    /// exactly the small canvases where the second line was supposed to help. So the
+    /// extra line hangs into the row gap (6px of it, the rest is the tile's own bottom
+    /// padding) and whatever is *drawn* around the caption — a hover wash, a focus ring,
+    /// a folder tile's bubble — grows by this much instead.
+    pub fn caption_overhang(&self, lines: usize) -> f64 {
+        self.label_h * (lines.max(1) as f64 - 1.)
+    }
+
     /// The width the caption is laid out in: the `Shell.SquareBin` box, i.e. the tile
     /// minus its padding (see [`Self::size`] for why that box is square).
     pub fn label_w(&self) -> f64 {
@@ -1884,11 +1897,16 @@ mod tests {
     };
     use crate::render_helpers::vulkan::VulkanRenderer;
 
-    /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so it is square
-    /// and its width follows the *content height* — icon + spacing + one caption line
+    /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so its **width**
+    /// follows the *content height* — icon + spacing + one caption line
     /// (`shell-square-bin.c:14-30`, `iconGrid.js:62`). Deriving it from the icon alone
     /// made it 120 wide against GNOME's 144. Pinned in numbers because the whole grid
     /// and the search results card size off it.
+    ///
+    /// A resting caption past the first line hangs *below* the tile — the tile stays
+    /// square (reserving the second line in the box would cost a rung of the icon ladder
+    /// on the small canvases the second line exists for), so the chrome drawn around a
+    /// caption grows by the overhang instead.
     #[test]
     fn an_overview_tile_is_a_square_around_its_caption_box() {
         let m = TileMetrics::OVERVIEW;
@@ -1896,6 +1914,16 @@ mod tests {
         assert_eq!(m.label_w(), 120.);
         assert_eq!(m.size(), Size::from((144., 144.)));
         assert_eq!(m.size().w, m.label_w() + 2. * m.pad);
+
+        // One line fits the box exactly; each further line hangs below it.
+        assert_eq!(m.caption_overhang(1), 0.);
+        assert_eq!(m.caption_overhang(2), m.label_h);
+        let tile = Rectangle::new(Point::from((0., 0.)), m.size());
+        assert_eq!(
+            m.label_top(tile) + m.label_h,
+            tile.size.h - m.pad,
+            "one line ends at the tile's bottom padding"
+        );
     }
 
     /// A folder tile's icon is a homogeneous 2×2 over the same icon box an app icon

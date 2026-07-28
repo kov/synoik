@@ -2527,12 +2527,19 @@ impl AppGrid {
         //     the hover wash so a hovered folder still lightens. `.app-folder` is a
         //     raised tile_button (`_app-grid.scss:41`) where an app tile is flat and
         //     transparent at rest, so this is the only resting fill in the grid. ---
+        // A folder's bubble covers its caption, and a resting caption may run past the one
+        // line the tile box reserves ([`TileMetrics::caption_overhang`]) — so the bubble
+        // grows by what *this* folder's name actually uses, as GNOME's tile allocation
+        // does. Without it a two-line folder name hangs out the bottom of its own bubble.
         let folder_rects: Vec<Rectangle<f64, Logical>> = page_entries
             .iter()
             .zip(&layout.tiles)
             .enumerate()
             .filter(|(k, (e, _))| e.folder.is_some() && !has_actor(*k))
-            .map(|(_, (_, t))| Rectangle::new(t.loc - origin, t.size))
+            .map(|(k, (_, t))| {
+                let extra = metrics.caption_overhang(collapsed[k].len());
+                Rectangle::new(t.loc - origin, Size::from((t.size.w, t.size.h + extra)))
+            })
             .collect();
         if !folder_rects.is_empty() {
             let radius = metrics.radius;
@@ -2542,11 +2549,19 @@ impl AppGrid {
                 .of(self.content_rev)
                 .each((0..page_entries.len()).map(has_actor))
                 .done();
+            // The bubbles reach past the block by the deepest caption overhang on the
+            // page, so the bake has to as well — a rounded fill outside its own buffer is
+            // simply not drawn (the same trap the page-peek bake has).
+            let deepest = folder_rects
+                .iter()
+                .map(|r| r.loc.y + r.size.h)
+                .fold(0., f64::max);
+            let folder_bake_size = Size::from((block.size.w, block.size.h.max(deepest.ceil())));
             match widget::bake(
                 renderer,
                 cache.folder_bakes.entry(page).or_default(),
                 scale,
-                block.size,
+                folder_bake_size,
                 revision,
                 |_| Ok(()),
                 move |frame, phys, _: &()| {
@@ -2587,7 +2602,9 @@ impl AppGrid {
             if !has_actor(k) || entry.folder.is_none() {
                 continue;
             }
-            let tile = layout.tiles[k];
+            // Same bubble, same caption overhang as the resting bake above.
+            let mut tile = layout.tiles[k];
+            tile.size.h += metrics.caption_overhang(collapsed[k].len());
             let radius = metrics.radius;
             match widget::bake(
                 renderer,

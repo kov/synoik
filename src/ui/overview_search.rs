@@ -105,15 +105,13 @@ const TILE_PAD: f64 = AppIcon::OVERVIEW_TILE_PADDING;
 const TILE_SIDE: f64 = TILE_PAD + RESULT_ICON_PX + 6. + 18. + TILE_PAD; // 144
 const TILE_W: f64 = TILE_SIDE;
 const TILE_H: f64 = TILE_SIDE;
-/// How far a resting caption hangs below its tile box: every line past the first, at the
-/// shared label height. The tile is sized for one line (that is the `Shell.SquareBin`
-/// rule above), so a card holding [`widget::TILE_LABEL_LINES`] of caption has to reserve
-/// the rest itself or the last line is clipped by the card's own bake.
+/// How far a resting caption hangs below its tile ([`widget::TileMetrics::caption_overhang`]).
+/// The card is one bake, so it reserves this or the last line is simply not drawn.
 ///
-/// A result caption is otherwise the app grid's: GNOME's is one ellipsized line on both
-/// surfaces (`expandTitleOnHover: false` only stops results *expanding* on hover — the
-/// resting line count is `StLabel`'s, `st-label.c:331`), so the divergence the grid takes
-/// is the same divergence here, and letting the two disagree would be the odd choice.
+/// A result caption is the grid's: GNOME's is one ellipsized line on both surfaces
+/// (`expandTitleOnHover: false` only stops results *expanding* on hover — the resting
+/// line count is `StLabel`'s, `st-label.c:331`), so the divergence the grid takes is the
+/// same divergence here.
 const LABEL_OVERHANG: f64 = 18. * (widget::TILE_LABEL_LINES as f64 - 1.);
 /// Gap between grid tiles (`.grid-search-results` `spacing: $base_padding*5`=30).
 const GRID_SPACING: f64 = 30.;
