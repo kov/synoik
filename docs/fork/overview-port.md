@@ -1163,7 +1163,27 @@ keeps a folder from forming every time a drag crosses an icon.
   The two drop states share a field (`AppGrid::drop_hover`) but not a schedule: a folder takes
   `:drop` the instant the drag reaches it, an app only after 500 ms, because on an app the state
   *is* the offer to make a folder and every icon a drag crosses would otherwise flash it.
-* **E2b — leave.** Dragging an app out of the open folder dialog removes it, with the
+* **E2b — leave.** ✅ Dragging an app out of the open folder dialog removes it, with the
   emptied-folder delete (reset every relocatable key, drop the id from `folder-children`) and the
   `excluded-apps` push that a categories-based folder needs to make the removal stick.
+
+  The app is not in the top-level grid while it lives in a folder, so the drag begins by putting
+  a **placeholder** there (`_ensurePlaceholder`, `:1434-1448`) — withdrawn if the drop goes
+  nowhere, and the real tile if it lands. Only a landing *in the grid* takes the app out of the
+  folder: pinned to the dash or dropped on a workspace it stays put, which is what GNOME's
+  `AppDisplay.acceptDrop` (and only that one) calling `removeApp` amounts to.
+
+  While the dialog is up it owns the drag — the grid under it is covered and resolves no target
+  (`_onDragMotion` returns CONTINUE when `_currentDialog`). Leaving the panel lightens the shade
+  and starts a 500 ms countdown to popdown; a drop before that fires is the dialog's own
+  `acceptDrop`, which pops down, removes and focuses the app in the grid.
+
+  **Divergence (deliberate):** GNOME deletes the folder when its **`apps` key** empties
+  (`:2245-2262`). For a categories-based folder that means removing a single swept-in member
+  destroys the whole folder, because `apps` was empty to begin with. We delete when the folder
+  has no *members* left — identical for every explicit-apps folder, and what the user is
+  actually asking for.
+
+  **Not ported:** reordering *within* a folder (`FolderView.acceptDrop`, `:2213-2221`). A drop
+  back inside the panel puts the icon home.
 * **E3 — rename.** The edit button and the entry in the dialog.

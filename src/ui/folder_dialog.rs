@@ -59,6 +59,12 @@ const NAME_PAD_X: f64 = 36.;
 const NAME_PT: f64 = 20.;
 /// `DIALOG_SHADE_NORMAL` (`appDisplay.js:57`): black at alpha 204/255.
 const SHADE: [f32; 4] = [0., 0., 0., 204. / 255.];
+/// `DIALOG_SHADE_HIGHLIGHT` (`appDisplay.js:58`) as a fraction of [`SHADE`] — both are pure
+/// black, so the lighter shade is the same buffer at less alpha.
+const SHADE_HIGHLIGHT_FACTOR: f32 = 85. / 204.;
+/// `POPDOWN_DIALOG_TIMEOUT` (`appDisplay.js:29`): how long a drag has to stay outside the
+/// panel before the dialog gets out of its way.
+pub const POPDOWN_DIALOG_MS: u64 = 500;
 /// `FOLDER_DIALOG_ANIMATION_TIME` (`appDisplay.js:43`) — the whole open/close.
 const ANIMATION_MS: u64 = 200;
 
@@ -163,6 +169,10 @@ struct OpenFolder {
     /// half-length quad), so the curves are applied per-quantity in [`Progress`] rather
     /// than baked into the animation.
     timeline: Animation,
+    /// The backdrop's drag highlight, 0 = `DIALOG_SHADE_NORMAL`, 1 = `DIALOG_SHADE_HIGHLIGHT`
+    /// (`_setLighterBackground`, `appDisplay.js:2794-2805`): the shade lightens while a drag
+    /// out of the folder is outside the panel, and settles back if it comes home.
+    highlight: Animation,
 }
 
 /// How far along each of the transition's independently-curved quantities is.
@@ -408,6 +418,7 @@ impl FolderDialog {
             view,
             phase: Phase::Opening,
             timeline: ease_from(&self.clock, 0.),
+            highlight: Animation::ease(self.clock.clone(), 0., 0., 0., 0, Curve::EaseOutQuad),
         });
     }
 
@@ -460,9 +471,11 @@ impl FolderDialog {
 
     /// Whether an open/close animation is still running (→ hold the redraw loop open).
     pub fn are_animations_ongoing(&self) -> bool {
-        self.open
-            .as_ref()
-            .is_some_and(|o| o.phase != Phase::Visible && !o.timeline.is_clamped_done())
+        self.highlight_ongoing()
+            || self
+                .open
+                .as_ref()
+                .is_some_and(|o| o.phase != Phase::Visible && !o.timeline.is_clamped_done())
     }
 
     /// Where the transition currently is.
@@ -497,6 +510,68 @@ impl FolderDialog {
             changed = true;
         }
         changed
+    }
+
+    /// Lighten the backdrop while a drag out of the folder is outside the panel, or let
+    /// it settle back (`_setLighterBackground`, `appDisplay.js:2794-2805`). Returns
+    /// whether it changed (→ redraw).
+    pub fn set_drag_outside(&mut self, outside: bool) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        let to = f64::from(u8::from(outside));
+        if open.highlight.to() == to {
+            return false;
+        }
+        let from = open.highlight.clamped_value();
+        open.highlight = Animation::ease(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            ANIMATION_MS,
+            Curve::EaseOutQuad,
+        );
+        true
+    }
+
+    /// Whether the backdrop is still easing between its two shades (→ hold the redraw loop).
+    fn highlight_ongoing(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| !o.highlight.is_clamped_done())
+    }
+
+    /// The icon of member `i` — what a drag of that tile carries.
+    pub fn entry_icon(&self, i: usize) -> Option<&AppIconRef> {
+        self.open.as_ref()?.view.entry_icon(i)
+    }
+
+    /// How many members the open folder still shows.
+    pub fn member_count(&self) -> usize {
+        self.open.as_ref().map_or(0, |o| o.view.entry_count())
+    }
+
+    /// Take member `id` out of the open folder's view — the local half of
+    /// `FolderView.removeApp` (`appDisplay.js:2239-2272`), so the tile goes the moment the
+    /// drop is accepted rather than when the settings reload catches up. Returns whether
+    /// it was there.
+    pub fn remove_member(&mut self, id: &str) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        open.view.remove_entry(id)
+    }
+
+    /// The center of member tile `i` in output coordinates — where a drag of it is
+    /// picked up, so the icon does not jump under the pointer.
+    pub fn entry_center(
+        &self,
+        i: usize,
+        view: Rectangle<f64, Logical>,
+    ) -> Option<Point<f64, Logical>> {
+        let open = self.open.as_ref()?;
+        open.view.entry_center(i, layout(view).grid_area)
     }
 
     /// The id of the app at tile `i` inside the folder.
@@ -787,11 +862,17 @@ impl FolderDialog {
         });
         let mut data = data.lock().unwrap();
         data.shade.resize(size);
+        // Both shades are pure black, so the drag highlight is just less of this one.
+        let highlight = self
+            .open
+            .as_ref()
+            .map_or(0., |o| o.highlight.clamped_value()) as f32;
+        let shade_alpha = 1. - highlight * (1. - SHADE_HIGHLIGHT_FACTOR);
         push(FolderDialogRenderElement::SolidColor(
             SolidColorRenderElement::from_buffer(
                 &data.shade,
                 view.loc,
-                alpha * progress.shade as f32,
+                alpha * progress.shade as f32 * shade_alpha,
                 Kind::Unspecified,
             ),
         ));

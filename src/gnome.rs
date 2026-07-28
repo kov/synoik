@@ -1083,6 +1083,38 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Take `app` out of the folder `id` (`FolderView.removeApp`, `appDisplay.js:2239-2272`).
+    /// A read-modify-write for the same reason [`Self::add_to_app_folder`] is; a folder
+    /// with `categories` also gets the app pushed onto `excluded-apps`, which is the only
+    /// thing that keeps a swept-in app out.
+    pub fn remove_from_app_folder(&self, id: &str, app: &str) {
+        let (folder_id, app) = (id.to_owned(), app.to_owned());
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if s.app_folders.is_some() {
+                    remove_from_app_folder(&folder_id, &app, None);
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Delete the folder `id` — what emptying it does (`FolderView.removeApp`'s
+    /// `folderApps.length === 0` branch, `appDisplay.js:2245-2262`).
+    pub fn delete_app_folder(&self, id: &str) {
+        let folder_id = id.to_owned();
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(app_folders) = &s.app_folders {
+                    delete_app_folder(app_folders, &folder_id, None);
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {
@@ -1675,6 +1707,80 @@ fn add_to_app_folder(id: &str, app: &str, backend: Option<&gio::SettingsBackend>
         let _ = store.set_strv("excluded-apps", kept);
     }
     true
+}
+
+/// Take `app` off the folder `id`'s `apps`, and — for a categories-based folder — push it
+/// onto `excluded-apps`, which is the only thing that keeps the sweep from bringing it
+/// straight back (`FolderView.removeApp`, `appDisplay.js:2263-2271`).
+fn remove_from_app_folder(id: &str, app: &str, backend: Option<&gio::SettingsBackend>) -> bool {
+    let Some(store) = folder_settings(id, backend) else {
+        return false;
+    };
+    let apps = strv(&store, "apps");
+    let kept: Vec<&str> = apps
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != app)
+        .collect();
+    if kept.len() != apps.len() {
+        if let Err(err) = store.set_strv("apps", kept) {
+            warn!("error removing {app} from the app folder {id}: {err}");
+            return false;
+        }
+    }
+    if !strv(&store, "categories").is_empty() {
+        let mut excluded = strv(&store, "excluded-apps");
+        if !excluded.iter().any(|a| a == app) {
+            excluded.push(app.to_owned());
+            let refs: Vec<&str> = excluded.iter().map(String::as_str).collect();
+            let _ = store.set_strv("excluded-apps", refs);
+        }
+    }
+    true
+}
+
+/// Delete the folder `id`: reset every key of its relocatable store — which is what makes
+/// the store itself go away — and drop the id from `folder-children`
+/// (`appDisplay.js:2245-2262`).
+fn delete_app_folder(
+    app_folders: &gio::Settings,
+    id: &str,
+    backend: Option<&gio::SettingsBackend>,
+) -> bool {
+    if !settings_has_key(app_folders, "folder-children") {
+        return false;
+    }
+    if let Some(store) = folder_settings(id, backend) {
+        for key in store
+            .settings_schema()
+            .map(|s| s.list_keys())
+            .unwrap_or_default()
+        {
+            store.reset(&key);
+        }
+    }
+    let children = strv(app_folders, "folder-children");
+    let kept: Vec<&str> = children
+        .iter()
+        .map(String::as_str)
+        .filter(|c| *c != id)
+        .collect();
+    if kept.len() == children.len() {
+        return false;
+    }
+    if let Err(err) = app_folders.set_strv("folder-children", kept) {
+        warn!("error removing the app folder {id} from folder-children: {err}");
+        return false;
+    }
+    true
+}
+
+/// The relocatable store for one folder id, or `None` if the schema is not installed.
+fn folder_settings(id: &str, backend: Option<&gio::SettingsBackend>) -> Option<gio::Settings> {
+    let source = gio::SettingsSchemaSource::default()?;
+    let schema = source.lookup(APP_FOLDER_SCHEMA, true)?;
+    let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
+    Some(gio::Settings::new_full(&schema, backend, Some(&path)))
 }
 
 /// The relocatable per-folder schema, one instance per `folder-children` id

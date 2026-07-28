@@ -733,6 +733,35 @@ impl AppGrid {
         self.entries.get(i).map(|e| e.id.as_str())
     }
 
+    /// How many tiles the grid holds.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Take the entry `id` out — the local half of a removal whose settings write is the
+    /// caller's, and the way a drag's placeholder is withdrawn. Returns whether it was
+    /// there.
+    pub fn remove_entry(&mut self, id: &str) -> bool {
+        let Some(i) = self.entries.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        self.entries.remove(i);
+        self.hovered = None;
+        self.drop_hover = None;
+        self.focused = self.focused.filter(|&f| f < self.entries.len());
+        self.content_rev += 1;
+        true
+    }
+
+    /// Put `entry` at the end of the grid — GNOME's drag placeholder, the stand-in icon
+    /// `_ensurePlaceholder` adds to the `AppDisplay` so an app dragged *out of a folder*
+    /// has something to reorder (`appDisplay.js:1434-1448`). It is temporary: either the
+    /// drop makes it real, or [`Self::remove_entry`] takes it away again.
+    pub fn add_placeholder(&mut self, entry: AppGridEntry) {
+        self.entries.push(entry);
+        self.content_rev += 1;
+    }
+
     /// The index of the entry with `id`, if it is in the grid — how the folder dialog
     /// finds the tile it must zoom out of.
     pub fn index_of(&self, id: &str) -> Option<usize> {
@@ -1269,6 +1298,29 @@ impl AppGrid {
         self.hovered = None;
         self.content_rev += 1;
         true
+    }
+
+    /// Take the app `app_id` out of the folder `folder_id`, and take the folder itself
+    /// out if that emptied it (`FolderView.removeApp`, `appDisplay.js:2239-2272`).
+    /// Returns how many members the folder has left — `Some(0)` meaning the folder is
+    /// gone from the grid — or `None` if there was nothing to remove.
+    pub fn remove_folder_member(&mut self, folder_id: &str, app_id: &str) -> Option<usize> {
+        let i = self.entries.iter().position(|e| e.id == folder_id)?;
+        let members = self.entries[i].folder.as_mut()?;
+        let k = members.iter().position(|m| m.id == app_id)?;
+        members.remove(k);
+        let left = members.len();
+        if left == 0 {
+            self.entries.remove(i);
+        } else {
+            // The folder's drag proxy is its first member; that may be the one that left.
+            self.entries[i].icon = self.entries[i].folder.as_ref()?[0].icon.clone();
+        }
+        self.hovered = None;
+        self.drop_hover = None;
+        self.focused = self.focused.filter(|&f| f < self.entries.len());
+        self.content_rev += 1;
+        Some(left)
     }
 
     /// Move the app `source_id` into the folder at tile `target` — the model half of

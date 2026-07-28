@@ -7103,6 +7103,118 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
     );
 }
 
+/// Dragging an app out of the open folder takes it out of the folder
+/// (`AppFolderDialog.acceptDrop` -> `FolderView.removeApp`, `appDisplay.js:2857-2865`,
+/// `:2239-2272`): the dialog pops down, the app becomes a top-level tile, and the folder
+/// keeps the rest. The tile it becomes is GNOME's placeholder, added to the grid when the
+/// drag began (`_ensurePlaceholder`, `:1434-1448`).
+///
+/// Dropping it back *inside* the panel is not a removal — GNOME reorders within the folder
+/// there, which we do not port yet, so the icon simply goes home.
+#[test]
+fn overview_dragging_an_app_out_of_a_folder_removes_it() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let open_it = |f: &mut Fixture| {
+        let area = overview_controls(f).app_display;
+        let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+        pointer_motion_to(f, center.x, center.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.niri_complete_animations();
+    };
+    let panel = crate::ui::folder_dialog::layout(view).panel;
+    let outside: Point<f64, smithay::utils::Logical> =
+        Point::from((panel.loc.x - 40., panel.loc.y + panel.size.h / 2.));
+
+    // First, a drag that ends back inside the panel: nothing moves.
+    open_it(&mut f);
+    let member = f
+        .niri()
+        .folder_dialog
+        .entry_center(0, view)
+        .expect("member tile 0");
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, outside.x, outside.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert_eq!(
+        f.niri().app_grid.index_of("m.desktop"),
+        Some(2),
+        "the placeholder joins the grid for the duration of the drag"
+    );
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    assert_eq!(
+        f.niri().app_grid.index_of("m.desktop"),
+        None,
+        "a drop back inside the folder withdraws the placeholder"
+    );
+    assert_eq!(f.niri().folder_dialog.member_count(), 2);
+
+    // Then the real thing.
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, outside.x, outside.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        !f.niri().folder_dialog.is_open(),
+        "the dialog takes the drop and pops down"
+    );
+    assert_eq!(
+        f.niri().app_grid.index_of("m.desktop"),
+        Some(2),
+        "the app is a top-level tile now, where its placeholder sat"
+    );
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(2),
+        "and it takes the key focus (`selectApp`)"
+    );
+    let members: Vec<&str> = f
+        .niri()
+        .app_grid
+        .entry_folder(1)
+        .expect("the folder is still there with what is left")
+        .iter()
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(members, vec!["z.desktop"]);
+
+    // Taking the last app out takes the folder with it (`removeApp`'s empty branch).
+    open_it(&mut f);
+    let member = f
+        .niri()
+        .folder_dialog
+        .entry_center(0, view)
+        .expect("the one member left");
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, outside.x, outside.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(
+        f.niri().app_grid.index_of("Utilities"),
+        None,
+        "an emptied folder is deleted, not shown empty"
+    );
+    assert_eq!(f.niri().app_grid.index_of("z.desktop"), Some(2));
+}
+
 /// The app-folder dialog (`AppFolderDialog`, `appDisplay.js:2463-2916`): opening a folder
 /// puts its apps in their own view, launching one from inside works exactly as it does at
 /// the top level, and the dialog is *modal* — a click anywhere off the 720² panel pops it

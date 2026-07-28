@@ -278,6 +278,11 @@ pub struct AppDrag {
     /// Where the pointer sat inside the icon when the drag began, so it doesn't
     /// jump to the center as it is picked up.
     pub grab_offset: Point<f64, Logical>,
+    /// The folder this icon was dragged *out of*, if it came from an open folder dialog.
+    /// GNOME tracks it as `_getViewFromIcon(source) instanceof FolderView`, which is what
+    /// makes the drop remove the app from the folder (`AppDisplay.acceptDrop`,
+    /// `appDisplay.js:1680-1697`) and what puts a placeholder in the grid to reorder.
+    pub from_folder: Option<String>,
     /// Whether the pointer is over the dash's unpin target (the show-apps button,
     /// which offers removal for the duration of the drag — `Dash::unpin_target_at`).
     /// Drives both the button's hover feedback and what the drop does.
@@ -677,6 +682,10 @@ pub struct Niri {
     /// before it shows.
     pub grid_drop_target: Option<usize>,
     pub grid_drop_timer: Option<RegistrationToken>,
+    /// Counts out `POPDOWN_DIALOG_TIMEOUT` while a drag out of the open folder dialog is
+    /// outside its panel; when it fires the dialog pops down and the drag carries on over
+    /// the grid (`_setupPopdownTimeout`, `appDisplay.js:2832-2841`).
+    pub folder_popdown_timer: Option<RegistrationToken>,
     /// The timer that flips the grid's page while a drag hovers a preview band or leans
     /// on the screen edge (`appDisplay.js:827-921`) — first the initial delay, then the
     /// repeat.
@@ -3950,6 +3959,7 @@ impl Niri {
             grid_move_timer: None,
             grid_drop_target: None,
             grid_drop_timer: None,
+            folder_popdown_timer: None,
             grid_page_switch_timer: None,
             grid_page_switch_overshoot: None,
             app_grid_last_page_flip: None,
