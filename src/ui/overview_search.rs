@@ -666,13 +666,15 @@ impl OverviewSearch {
                     .collect();
                 // A search result's caption never expands — the provider builds its icons
                 // with `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is
-                // always the collapsed, end-ellipsized line.
+                // always the collapsed, end-ellipsized line. **One** line: the grid's
+                // two-line resting caption is a divergence of the grid's own, and a card
+                // laid out for one line has nowhere to put a second.
                 let label_w = widget::TileMetrics::OVERVIEW.label_w();
                 let names: Vec<String> = self
                     .results
                     .iter()
                     .map(|e| {
-                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, false)
+                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, 1)
                             .into_iter()
                             .next()
                             .unwrap_or_default()
@@ -698,7 +700,7 @@ impl OverviewSearch {
                         for (rel, label) in label_rects.iter().zip(labels.iter()) {
                             p.labelled_tile(
                                 *rel,
-                                label,
+                                std::slice::from_ref(label),
                                 &widget::TileMetrics::OVERVIEW,
                                 false,
                                 style::TEXT,

@@ -391,25 +391,40 @@ pub const FOLDER_SUBICON_FRACTION: f64 = 0.4;
 /// and [`tile_label_lines`] ellipsizes past it rather than dropping text silently.
 pub const TILE_LABEL_EXPAND_LINES: usize = 3;
 
+/// How many lines a *resting* app-grid caption may use.
+///
+/// **Divergence (chosen).** GNOME's is one: `StLabel` puts `PANGO_ELLIPSIZE_END` on its
+/// `ClutterText` (`st-label.c:331`) and the collapsed state turns wrapping off outright
+/// (`_updateMultiline`, `appDisplay.js:1891-1924`), so a two-word name is cut at rest and
+/// only readable on hover. Two lines read most names without hovering, and the tile has
+/// the room: a second line takes the tile's bottom padding and 6 px of the row gap, which
+/// is at minimum spacing still 18 px clear of the icon below.
+///
+/// Search results are **not** this: they keep GNOME's single line (see the call site).
+pub const TILE_LABEL_LINES: usize = 2;
+
 /// The caption lines of a `.overview-tile`, top to bottom, for a label box `wrap_w`
 /// wide (see [`TileMetrics::label_w`]).
 ///
 /// GNOME's two states (`AppViewItem._updateMultiline`, `appDisplay.js:1891-1924`):
 ///
-/// * **collapsed** — one line, ellipsized at the end. That is not something the app grid opts into:
-///   `StLabel` sets `PANGO_ELLIPSIZE_END` on its `ClutterText` (`st-label.c:331`), so it is what
-///   *every* caption does, search results included (they pass `expandTitleOnHover: false`,
-///   `appDisplay.js:1837-1841`, and so never leave this state).
+/// * **collapsed** — ellipsized at the end. That is not something the app grid opts into: `StLabel`
+///   sets `PANGO_ELLIPSIZE_END` on its `ClutterText` (`st-label.c:331`), so it is what *every*
+///   caption does, search results included (they pass `expandTitleOnHover: false`,
+///   `appDisplay.js:1837-1841`, and so never leave this state). GNOME's collapsed label is one
+///   line; the grid passes [`TILE_LABEL_LINES`], which is the divergence recorded there.
 /// * **expanded** — hover, key focus, or the forced highlight of an open context menu
 ///   (`appDisplay.js:1901`): wrapping on (`Pango.WrapMode.WORD_CHAR`), ellipsis off, so the whole
 ///   name is readable.
 ///
 /// Break points are computed in **logical** px, so they do not move with the output
 /// scale; the result is memoized in [`niri_vk::text::wrap_lines_weighted`].
-pub fn tile_label_lines(name: &str, pt: f64, wrap_w: f64, expanded: bool) -> Vec<String> {
+/// `max_lines` is which of the two states this is: [`TILE_LABEL_LINES`] collapsed,
+/// [`TILE_LABEL_EXPAND_LINES`] expanded — or 1 for a caption that is neither, like a
+/// search result's.
+pub fn tile_label_lines(name: &str, pt: f64, wrap_w: f64, max_lines: usize) -> Vec<String> {
     let px = crate::ui::pt_to_px(pt) as f32;
-    let max = if expanded { TILE_LABEL_EXPAND_LINES } else { 1 };
-    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max)
+    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1))
 }
 
 /// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
@@ -1489,7 +1504,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     pub fn labelled_tile(
         &mut self,
         rel: Rectangle<f64, Logical>,
-        label: &ShapedText,
+        label: &[ShapedText],
         metrics: &TileMetrics,
         active: bool,
         text_color: Rgba,
@@ -1504,19 +1519,24 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
                 style::HOVER_WASH,
             )?;
         }
-        // Label centered under the icon, clipped to the tile so a long name doesn't
-        // widen the grid.
+        // Label centered under the icon. A second line goes below the tile box, so the
+        // clip is the tile widened downward by the lines past the first — clipping to
+        // the box itself would cut a two-line caption in half.
         let lx = rel.loc.x + rel.size.w / 2.;
         let ly = rel.loc.y + metrics.pad + metrics.icon_px + metrics.label_gap;
-        self.text_band(
-            label,
-            lx,
-            HAlign::Center,
-            ly,
-            metrics.label_h,
-            text_color,
-            rel,
-        )?;
+        let extra = metrics.label_h * (label.len().max(1) as f64 - 1.);
+        let clip = Rectangle::new(rel.loc, Size::from((rel.size.w, rel.size.h + extra)));
+        for (i, line) in label.iter().enumerate() {
+            self.text_band(
+                line,
+                lx,
+                HAlign::Center,
+                ly + i as f64 * metrics.label_h,
+                metrics.label_h,
+                text_color,
+                clip,
+            )?;
+        }
         Ok(())
     }
 
@@ -1845,7 +1865,10 @@ mod tests {
     use smithay::backend::renderer::{Bind, ExportMem, Texture};
     use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
 
-    use super::{bake_uncached_sized, tile_label_lines, Painter, Revision, TileMetrics};
+    use super::{
+        bake_uncached_sized, tile_label_lines, Painter, Revision, TileMetrics,
+        TILE_LABEL_EXPAND_LINES, TILE_LABEL_LINES,
+    };
     use crate::render_helpers::vulkan::VulkanRenderer;
 
     /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so it is square
@@ -1899,8 +1922,9 @@ mod tests {
         );
     }
 
-    /// A name that does not fit is ellipsized on one line collapsed, and wrapped
-    /// whole (no ellipsis) expanded — `_updateMultiline`, `appDisplay.js:1891-1924`.
+    /// A name that does not fit is wrapped to [`TILE_LABEL_LINES`] and ellipsized past
+    /// them at rest, and wrapped whole (no ellipsis) expanded — `_updateMultiline`,
+    /// `appDisplay.js:1891-1924`, with the resting line count our own divergence.
     /// Before this, a long name was hard-clipped mid-glyph by the label band.
     #[test]
     fn a_long_tile_caption_ellipsizes_collapsed_and_wraps_expanded() {
@@ -1908,12 +1932,28 @@ mod tests {
         let w = TileMetrics::OVERVIEW.label_w();
         let pt = crate::ui::BASE_FONT_PT;
 
-        let collapsed = tile_label_lines(name, pt, w, false);
-        assert_eq!(collapsed.len(), 1, "collapsed is a single line");
-        assert_ne!(collapsed[0], name, "…which this name does not fit on");
-        assert!(collapsed[0].ends_with('…'), "so it ends in an ellipsis");
+        let collapsed = tile_label_lines(name, pt, w, TILE_LABEL_LINES);
+        assert_eq!(collapsed.len(), 2, "at rest a long name wraps to two lines");
+        assert!(
+            !collapsed.concat().contains('…'),
+            "which this name fits in whole: {collapsed:?}"
+        );
+        // Longer than two lines still ends in an ellipsis rather than losing text.
+        let long = tile_label_lines(
+            "Passwords and Keys and Certificates",
+            pt,
+            w,
+            TILE_LABEL_LINES,
+        );
+        assert_eq!(long.len(), 2);
+        assert!(long[1].ends_with('…'), "cut past the last line: {long:?}");
 
-        let expanded = tile_label_lines(name, pt, w, true);
+        // One line is still one line — what a search result asks for.
+        let one = tile_label_lines(name, pt, w, 1);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].ends_with('…'));
+
+        let expanded = tile_label_lines(name, pt, w, TILE_LABEL_EXPAND_LINES);
         assert!(expanded.len() > 1, "expanded wraps: {expanded:?}");
         assert!(!expanded.concat().contains('…'), "and drops the ellipsis");
         assert_eq!(
@@ -1923,8 +1963,14 @@ mod tests {
         );
 
         // A name that fits is untouched in both states — it stays in the page bake.
-        assert_eq!(tile_label_lines("Files", pt, w, false), vec!["Files"]);
-        assert_eq!(tile_label_lines("Files", pt, w, true), vec!["Files"]);
+        assert_eq!(
+            tile_label_lines("Files", pt, w, TILE_LABEL_LINES),
+            vec!["Files"]
+        );
+        assert_eq!(
+            tile_label_lines("Files", pt, w, TILE_LABEL_EXPAND_LINES),
+            vec!["Files"]
+        );
     }
 
     /// The gaussian drop-shadow verb: a black shadow over a white buffer must darken the

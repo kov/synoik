@@ -7201,9 +7201,10 @@ fn vulkan_app_grid_draws_hovered_tile() {
 /// was hard-clipped to the tile box, so the tail of a long name was cut mid-glyph and
 /// hovering did nothing.
 ///
-/// Sampled on the *second* caption line, which only exists when expanded: at rest that
-/// band is empty, hovered it carries glyph ink (bright, well past the 10% hover wash
-/// that also grows over it).
+/// Sampled on the line past [`crate::ui::widget::TILE_LABEL_LINES`], which only exists
+/// when expanded: at rest that band is empty, hovered it carries glyph ink (bright, well
+/// past the 10% hover wash that also grows over it). The name is long enough to need it —
+/// a resting caption is two lines here, so a name that fits in two would expand to nothing.
 #[test]
 fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     use smithay::utils::Logical;
@@ -7229,7 +7230,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     let output = f.niri_output(1);
 
     // Tile 1's name does not fit the caption box; tile 0's does.
-    let long = "Passwords and Keys";
+    let long = "Passwords and Keys and Certificates";
     f.niri().app_grid.set_entries(
         ["Files", long]
             .iter()
@@ -7245,12 +7246,13 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
     let m = TileMetrics::OVERVIEW;
-    // Tile top from its center, then the middle of the SECOND caption line's band.
+    // Tile top from its center, then the middle of the first band expansion adds.
     let tile_top = t1.y - m.size().h / 2.;
-    let row_y = (tile_top + m.pad + m.icon_px + m.label_gap + m.label_h * 1.5) as i32;
+    let line = crate::ui::widget::TILE_LABEL_LINES as f64;
+    let row_y = (tile_top + m.pad + m.icon_px + m.label_gap + m.label_h * (line + 0.5)) as i32;
     let first_x = (t1.x - m.label_w() / 2.) as i32;
 
-    // Brightest pixel across the second caption line of tile 1.
+    // Brightest pixel across that line of tile 1.
     let mut peak =
         |hovered: Option<usize>| -> u8 {
             f.niri().app_grid.set_hovered(hovered);
@@ -7294,7 +7296,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     eprintln!("vulkan_app_grid caption: at_rest={at_rest} expanded={expanded}");
     assert_eq!(
         at_rest, 0,
-        "a collapsed caption is one line — nothing may paint below it"
+        "a resting caption stops at TILE_LABEL_LINES — nothing may paint below it"
     );
     assert!(
         expanded > 128,
@@ -9678,6 +9680,116 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
         faded < 8,
         "a fully faded tile must leave NOTHING behind, caption included — got {faded}, \
          which is the page-wide label bake drawing it at full alpha"
+    );
+}
+
+/// A resting tile whose name does not fit one line draws **two** lines of caption
+/// ([`crate::ui::widget::TILE_LABEL_LINES`] — our divergence from GNOME's single
+/// ellipsized line). The second line hangs below the tile box, so it is exactly the row
+/// a clip can eat silently: the per-tile bake, the shared page bake and the peek bake all
+/// size themselves from the tile, and only one of them is exercised per drawn page.
+#[test]
+fn vulkan_app_grid_draws_two_caption_lines_at_rest() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_draws_two_caption_lines: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Two entries: a name that needs two lines, and a short one as the control.
+    f.niri().app_grid.set_entries(vec![
+        AppGridEntry {
+            id: "long.desktop".into(),
+            name: "Passwords and Keys".into(),
+            icon: AppIconRef::Fallback,
+            folder: None,
+        },
+        AppGridEntry {
+            id: "short.desktop".into(),
+            name: "Files".into(),
+            icon: AppIconRef::Fallback,
+            folder: None,
+        },
+    ]);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let metrics = f.niri().app_grid.metrics_for(area);
+    let mut rect = |i: usize| f.niri().app_grid.entry_rect(i, area).expect("a tile");
+    let (long_tile, short_tile) = (rect(0), rect(1));
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let elements = niri.app_grid.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    area,
+                    1.0,
+                    crate::gnome::ACCENT_BLUE,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let (pixels, w) = composited
+        .expect("no Vulkan device")
+        .expect("compositing the grid must not error");
+
+    // Peak ink in one caption line band of a tile.
+    let line_ink = |tile: Rectangle<f64, Logical>, line: usize| -> u8 {
+        let top = metrics.label_top(tile) + line as f64 * metrics.label_h;
+        let mut max = 0u8;
+        for y in top as i32..(top + metrics.label_h) as i32 {
+            for x in tile.loc.x as i32..(tile.loc.x + tile.size.w) as i32 {
+                max = max.max(px(&pixels, w, x, y)[3]);
+            }
+        }
+        max
+    };
+
+    let (first, second) = (line_ink(long_tile, 0), line_ink(long_tile, 1));
+    eprintln!("vulkan_app_grid_two_lines: long tile line0={first} line1={second}");
+    assert!(first > 100, "the first caption line draws ({first})");
+    assert!(
+        second > 100,
+        "…and so does the second, below the tile box ({second}) — a clip sized to the \
+         tile would eat it"
+    );
+
+    // The control: a name that fits leaves the second band empty, so this is the name
+    // wrapping and not some other ink down there.
+    let short_second = line_ink(short_tile, 1);
+    eprintln!("vulkan_app_grid_two_lines: short tile line1={short_second}");
+    assert!(
+        short_second < 8,
+        "a name that fits one line draws nothing on the second ({short_second})"
     );
 }
 

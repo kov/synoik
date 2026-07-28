@@ -1106,6 +1106,22 @@ the threshold overshoots and is decided by the clamp: a flick moves exactly one 
 direction of travel. We reproduce that outcome rather than the arithmetic that reaches it,
 because the arithmetic only works by way of the clamp.
 
+## 10.4 Resting caption height — chosen divergence (2026-07-28)
+
+GNOME's collapsed tile caption is **one** line: `StLabel` puts `PANGO_ELLIPSIZE_END` on its
+`ClutterText` (`st-label.c:331`) and `_updateMultiline` turns wrapping off outright until the
+tile is hovered/focused (`appDisplay.js:1891-1924`). Ours rests at **two**
+(`widget::TILE_LABEL_LINES`), so most two-word names are readable without hovering; hover still
+expands, now up to `TILE_LABEL_EXPAND_LINES` (3), and anything past that ellipsizes rather than
+losing text — the cap itself stays a divergence, deliberately (a bake needs a size up front, and
+a pathological name should not be able to grow a tile without bound).
+
+The room comes from the tile's own box: a second line takes the bottom padding plus 6px of the
+row gap, which at minimum row spacing is still 18px clear of the icon below. **Search results
+keep GNOME's single line** — they pass `expandTitleOnHover: false` (`appDisplay.js:1837-1841`)
+and their card is laid out for one. Two clips had to grow with it: `Painter::labelled_tile`
+(which clipped to the tile box) and the neighbouring-page peek bake (sized from the block).
+
 ## 11. App-folder editing (cited plan, 2026-07-28)
 
 §8 landed folders read-only. This is the other half: making them, filling them, emptying them

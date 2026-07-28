@@ -61,7 +61,9 @@
 //! own doc lists what is missing there and why (Open Windows and Quit want per-window
 //! identity, App Details an `org.gnome.Software` call). A folder
 //! *dragged* carries the fallback icon rather than its
-//! own composition, since a drag proxy is one [`AppIconRef`]. Its hover uses the grid's
+//! own composition, since a drag proxy is one [`AppIconRef`]. A **resting** caption runs to
+//! [`widget::TILE_LABEL_LINES`] where GNOME's is one line (a chosen divergence — most names
+//! are then readable without hovering). Its hover uses the grid's
 //! shared [`style::HOVER_WASH`] (10% white) where GNOME lightens the raised fill 4%;
 //! about 5/255 apart. Pages here are always
 //! **full**: our order is a flat list chunked by the page size, where GNOME's grid is
@@ -2206,7 +2208,7 @@ impl AppGrid {
         let focused_at = self.focused.filter(|i| page_range.contains(i));
         let collapsed: Vec<Vec<String>> = page_entries
             .iter()
-            .map(|e| widget::tile_label_lines(&e.name, LABEL_PT, label_w, false))
+            .map(|e| widget::tile_label_lines(&e.name, LABEL_PT, label_w, widget::TILE_LABEL_LINES))
             .collect();
         // Hover-independent by construction: whether a name fits is a property of the
         // name and the label box, so the page bake's contents still never move on hover.
@@ -2250,7 +2252,12 @@ impl AppGrid {
             let i = first + k;
             let expanded = hovered_at == Some(i) || focused_at == Some(i);
             let lines = if expanded {
-                widget::tile_label_lines(&entry.name, LABEL_PT, label_w, true)
+                widget::tile_label_lines(
+                    &entry.name,
+                    LABEL_PT,
+                    label_w,
+                    widget::TILE_LABEL_EXPAND_LINES,
+                )
             } else {
                 collapsed[k].clone()
             };
@@ -2358,7 +2365,13 @@ impl AppGrid {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
                 for (rel, label) in rel_rects.iter().zip(labels.iter()) {
-                    p.labelled_tile(*rel, label, &metrics, false, style::TEXT)?;
+                    p.labelled_tile(
+                        *rel,
+                        std::slice::from_ref(label),
+                        &metrics,
+                        false,
+                        style::TEXT,
+                    )?;
                 }
                 Ok(())
             },
@@ -2868,28 +2881,44 @@ impl AppGrid {
 
                 // The captions ride one bake per neighbouring page, keyed on the page
                 // and the catalog — so the whole slide repositions a cached texture.
-                let names: Vec<String> = page_entries
+                let names: Vec<Vec<String>> = page_entries
                     .iter()
                     .map(|e| {
-                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, false)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_default()
+                        widget::tile_label_lines(
+                            &e.name,
+                            LABEL_PT,
+                            label_w,
+                            widget::TILE_LABEL_LINES,
+                        )
                     })
                     .collect();
                 let revision = widget::Revision::new().of(page).of(self.content_rev).done();
                 let paint_rects = rel.clone();
+                // A resting caption may run to [`widget::TILE_LABEL_LINES`], and every
+                // line past the first hangs below its tile — so the bake is the block
+                // plus that overhang, or the bottom row's caption is cut by the buffer.
+                let bake_size = Size::from((
+                    block.size.w,
+                    block.size.h + metrics.label_h * (widget::TILE_LABEL_LINES.max(1) as f64 - 1.),
+                ));
                 match widget::bake(
                     renderer,
                     cache.peek_bakes.entry(page).or_default(),
                     scale,
-                    block.size,
+                    bake_size,
                     revision,
                     move |r| {
                         let mut shaper = widget::TextShaper::new(r, scale);
                         names
                             .iter()
-                            .map(|name| shaper.shape(name, widget::TextStyle::new(LABEL_PT)))
+                            .map(|lines| {
+                                lines
+                                    .iter()
+                                    .map(|line| {
+                                        shaper.shape(line, widget::TextStyle::new(LABEL_PT))
+                                    })
+                                    .collect::<anyhow::Result<Vec<_>>>()
+                            })
                             .collect::<anyhow::Result<Vec<_>>>()
                     },
                     move |frame, phys, labels| {
