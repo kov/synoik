@@ -1049,6 +1049,23 @@ impl GnomeSettingsWriter {
         });
     }
 
+    /// Create a folder with id `id` holding `apps`, named `name`. The write hops onto
+    /// the watcher thread like every other one, so the caller sees it through the usual
+    /// reload — which is why the id is the caller's ([`new_folder_id`]): it has to place
+    /// the folder in its own model long before the reload gets back.
+    pub fn create_app_folder(&self, id: &str, name: String, apps: Vec<String>) {
+        let (folder_id, name, apps) = (id.to_owned(), name, apps);
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(app_folders) = &s.app_folders {
+                    create_app_folder(app_folders, &folder_id, &name, &apps, None);
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
     /// Dark Style tile: `org.gnome.desktop.interface color-scheme`
     /// (`prefer-dark` on, `default` off — matching gnome-shell's tile).
     pub fn set_dark_style(&self, dark: bool) {
@@ -1560,6 +1577,53 @@ fn ensure_default_folders(
     }
 }
 
+/// Make a folder: append `id` to `folder-children` and write its name and apps into the
+/// relocatable store at its own path (`createFolder`, `appDisplay.js:1699-1742`).
+///
+/// `translate` stays **false** — the name is either a category's already-translated
+/// `.directory` title or the literal "Unnamed Folder", and in both cases it is the string
+/// to show, not a `.directory` basename to look up (which is what `translate` means, and
+/// what the *seeded* default folders set).
+fn create_app_folder(
+    app_folders: &gio::Settings,
+    id: &str,
+    name: &str,
+    apps: &[String],
+    backend: Option<&gio::SettingsBackend>,
+) -> bool {
+    if !settings_has_key(app_folders, "folder-children") {
+        return false;
+    }
+    let Some(source) = gio::SettingsSchemaSource::default() else {
+        return false;
+    };
+    let Some(schema) = source.lookup(APP_FOLDER_SCHEMA, true) else {
+        return false;
+    };
+    let path = format!("/org/gnome/desktop/app-folders/folders/{id}/");
+    let store = gio::Settings::new_full(&schema, backend, Some(&path));
+    let apps: Vec<&str> = apps.iter().map(String::as_str).collect();
+    if let Err(err) = store.set_string("name", name) {
+        warn!("error naming the new app folder {id}: {err}");
+        return false;
+    }
+    let _ = store.set_boolean("translate", false);
+    if let Err(err) = store.set_strv("apps", apps) {
+        warn!("error filling the new app folder {id}: {err}");
+        return false;
+    }
+    // Last: the folder only exists once it is a child, so a half-written store is never
+    // visible as an empty folder.
+    let mut children = strv(app_folders, "folder-children");
+    children.push(id.to_owned());
+    let children: Vec<&str> = children.iter().map(String::as_str).collect();
+    if let Err(err) = app_folders.set_strv("folder-children", children) {
+        warn!("error adding {id} to folder-children: {err}");
+        return false;
+    }
+    true
+}
+
 /// The relocatable per-folder schema, one instance per `folder-children` id
 /// (`appDisplay.js:2295-2299`).
 const APP_FOLDER_SCHEMA: &str = "org.gnome.desktop.app-folders.folder";
@@ -1601,6 +1665,31 @@ fn xdg_data_dirs() -> Vec<PathBuf> {
         .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
     dirs.extend(std::env::split_paths(&data_dirs));
     dirs
+}
+
+/// A fresh folder id — a random uuid, as in `createFolder` (`appDisplay.js:1700`).
+pub fn new_folder_id() -> String {
+    glib::uuid_string_random().to_string()
+}
+
+/// The name for a folder made out of `apps` — the first category common to **every**
+/// one of them whose `<category>.directory` has a translated title, else `None` for the
+/// caller's "Unnamed Folder" (`_findBestFolderName`, `appDisplay.js:114-144`).
+///
+/// "First" is in the order the *first* app lists them, which is what GNOME's reduce
+/// produces: a category is pushed the moment its counter reaches the app count, so the
+/// order is that of the last app to complete each one — for two apps, the second app's
+/// order. Ours walks the first app's list, which agrees whenever the categories are
+/// listed in the same order (the usual case) and is otherwise an arbitrary tie-break
+/// between equally-common categories.
+pub fn best_folder_name(apps: &[Vec<String>]) -> Option<String> {
+    let first = apps.first()?;
+    first.iter().find_map(|category| {
+        if category.is_empty() || !apps.iter().all(|a| a.contains(category)) {
+            return None;
+        }
+        translated_folder_name(&format!("{category}.directory"))
+    })
 }
 
 /// The translated display name of an app folder whose `translate` key is set —

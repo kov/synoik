@@ -1099,3 +1099,61 @@ gesture began. Those units do not agree, and the consequence is that **any** vel
 the threshold overshoots and is decided by the clamp: a flick moves exactly one page in the
 direction of travel. We reproduce that outcome rather than the arithmetic that reaches it,
 because the arithmetic only works by way of the clamp.
+
+## 11. App-folder editing (cited plan, 2026-07-28)
+
+§8 landed folders read-only. This is the other half: making them, filling them, emptying them
+and naming them. All four are drag-and-drop plus a gsettings write, and we already have the
+drag machinery — [`DragLocation::OnIcon`] is exactly GNOME's "over the body of another icon,
+outside the divider leeways", which today means "not an insertion point".
+
+### 11.1 The four operations
+
+* **Create** (`AppIcon.acceptDrop`, `appDisplay.js:3152-3160`): dropping app A on app B calls
+  `view.createFolder([B.id, A.id])` — the *hovered* icon first, which is where the folder is
+  placed. `createFolder` (`:1699-1751`) appends a fresh `GLib.uuid_string_random()` to
+  `folder-children`, writes `name` + `apps` into the new relocatable store, redisplays, then
+  moves the folder to B's old `(page, position)` — adjusted down by however many of the folded
+  apps sat before it on that page — and saves the layout.
+* **Name it** (`_findBestFolderName`, `:114-144`): the first category common to *every* app,
+  whose `<category>.directory` has a translated name; otherwise "Unnamed Folder". Note the
+  categories come from the apps, so this is the same data §8's folder reading already parses.
+* **Join** (`FolderIcon.acceptDrop`, `:2400-2409` → `FolderView.addApp`, `:2223-2237`): append
+  the id to `apps`, and drop it from `excluded-apps` if it was there (only categories-based
+  folders can have it). `_canAccept` (`:2385-2397`) refuses a source already in the folder.
+* **Leave** (`AppDisplay.acceptDrop`, `:1680-1696` → `FolderView.removeApp`, `:2239-2272`):
+  dragging an icon out of the dialog onto the grid removes it from `apps` and pops the dialog
+  down. **If it was the last app the folder is deleted**: every key of the relocatable schema
+  is reset (which is how a relocatable store is removed) and the id comes out of
+  `folder-children`. For a categories-based folder the app is instead added to `excluded-apps`,
+  because it would otherwise come straight back from its category.
+* **Rename** (`_addFolderNameEntry`, `:2531-2601`): an `icon-button` toggles a
+  `.folder-name-entry` in place of the `.folder-name-label`; `activate` commits and shows the
+  label again. The button is balanced by an equally-sized ghost actor so the label stays
+  centred — the divergence §8 recorded, now to be undone.
+
+### 11.2 The hover affordance
+
+Creating a folder is the one drop that is *not* announced by an insertion gap, so GNOME gives
+it its own: after **500 ms** of hovering another icon's body, that icon takes the `:drop`
+pseudo-class and its own icon eases down to `FOLDER_SUBICON_FRACTION` (0.4) with its label
+hidden — a preview of the 2×2 it is about to become (`_setHoveringByDnd` + `_showFolderPreview`,
+`appDisplay.js:3102-3149`). Leaving before the timeout fires cancels it. This is the same
+"hold still to commit" idiom as the 200 ms reflow delay §7 already implements, and it is what
+keeps a folder from forming every time a drag crosses an icon.
+
+### 11.3 Slices
+
+* **E1 — create.** ✅ The `OnIcon` drop makes a folder: the 500 ms preview, the uuid + name +
+  `apps` write, and the folder landing in the target's slot.
+
+  Two things worth carrying forward. The id is **minted by the caller** (`gnome::new_folder_id`)
+  rather than by the writer, because the model has to place the folder in the grid *now* — the
+  gsettings write only comes back through the watcher reload, and by then `_savePages` has
+  already had to name the folder to give it the hovered icon's slot. And the position correction
+  (`:1725-1733`) is a per-page `reduce` in GNOME; over one flat list it is just "did the source
+  sit earlier", which agrees with GNOME within a page and is right, rather than one slot off,
+  across pages.
+* **E2 — join and leave.** Dropping on a folder tile adds; dragging out of the dialog removes,
+  with the emptied-folder delete.
+* **E3 — rename.** The edit button and the entry in the dialog.

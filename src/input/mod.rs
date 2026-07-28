@@ -56,7 +56,7 @@ use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
     DragLocation, FocusDir, PageArrow, SwipeSource, DELAYED_MOVE_MS, EDGE_BUMP_PX,
-    PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
+    FOLDER_PREVIEW_MS, PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
 };
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
@@ -4006,6 +4006,7 @@ impl State {
         // the drop belongs to it, exactly as the drag monitor's ordering has it.
         if drag.unpin || self.niri.dash.drop_slot().is_some() {
             self.clear_grid_pending_move();
+            self.clear_grid_folder_preview();
             return;
         }
         let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
@@ -4016,15 +4017,38 @@ impl State {
             .map(|c| c.app_display)
         else {
             self.clear_grid_pending_move();
+            self.clear_grid_folder_preview();
             return;
         };
         if !self.niri.layout.is_app_grid_open() {
             self.clear_grid_pending_move();
+            self.clear_grid_folder_preview();
             return;
         }
 
         let per_page = self.niri.app_grid.items_per_page(area);
         let target = self.niri.app_grid.drop_target_at(pos, area, &id);
+
+        // Resting on the *body* of another app icon offers to fold the two into a folder
+        // (`AppIcon._canAccept` + `_setHoveringByDnd`, `appDisplay.js:3118-3149`) after
+        // `FOLDER_PREVIEW_MS`. Only app-on-app: dropping an app on a *folder* joins it
+        // instead, and a folder is not a drag source `_canAccept` will take.
+        let folder_target = target
+            .filter(|t| t.location == DragLocation::OnIcon)
+            .and_then(|t| {
+                let over = self.niri.app_grid.entry_id_at(t, per_page)?;
+                (over != id).then(|| self.niri.app_grid.index_of(over))?
+            })
+            .filter(|&i| {
+                self.niri.app_grid.entry_folder(i).is_none()
+                    && self
+                        .niri
+                        .app_grid
+                        .index_of(&id)
+                        .is_some_and(|src| self.niri.app_grid.entry_folder(src).is_none())
+            });
+        self.arm_grid_folder_preview(folder_target);
+
         // Over the body of an icon, or over the dragged icon's own slot, there is
         // nothing to reflow around.
         let target = target.filter(|t| {
@@ -4051,6 +4075,101 @@ impl State {
             })
             .unwrap();
         self.niri.grid_move_timer = Some(token);
+    }
+
+    /// Arm (or re-arm, or cancel) the folder-preview countdown on `target`. Moving to a
+    /// different icon restarts it; leaving cancels it and takes the preview away, exactly
+    /// as `_setHoveringByDnd(false)` does.
+    fn arm_grid_folder_preview(&mut self, target: Option<usize>) {
+        if self.niri.grid_pending_folder == target {
+            return; // unchanged — let the armed timer run out
+        }
+        self.clear_grid_folder_preview();
+        let Some(target) = target else { return };
+        self.niri.grid_pending_folder = Some(target);
+        let timer = Timer::from_duration(Duration::from_millis(FOLDER_PREVIEW_MS));
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.grid_folder_timer = None;
+                if state.niri.app_grid.set_folder_hover(Some(target)) {
+                    state.niri.queue_redraw_all();
+                }
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.niri.grid_folder_timer = Some(token);
+    }
+
+    /// Take a drop that landed on another app icon by folding the two into a new folder
+    /// (`AppIcon.acceptDrop` → `AppDisplay.createFolder`, `appDisplay.js:3152-3160`,
+    /// `:1699-1751`). Returns whether it took the drop; `false` leaves the reorder path
+    /// to handle it.
+    ///
+    /// The armed target is the whole test — it is only set while the pointer rests on an
+    /// app icon the drag can fold with — so, as in GNOME, the 500 ms preview is an
+    /// affordance and not a condition: a quick drop onto an icon still makes the folder.
+    fn create_dragged_folder(&mut self) -> bool {
+        let Some(target) = self.niri.grid_pending_folder else {
+            return false;
+        };
+        let Some(drag) = &self.niri.app_drag else {
+            return false;
+        };
+        let (source_id, output) = (drag.id.clone(), drag.output.clone());
+        let Some(over_id) = self.niri.app_grid.entry_id(target).map(str::to_owned) else {
+            return false;
+        };
+        // The hovered icon is the folder's first app, and so the one whose category list
+        // is walked for the name (`createFolder` passes `[this.id, source.id]`).
+        let categories = |id: &str| {
+            self.niri
+                .app_system
+                .lookup(id)
+                .map(|e| e.categories)
+                .unwrap_or_default()
+        };
+        let name = crate::gnome::best_folder_name(&[categories(&over_id), categories(&source_id)])
+            .unwrap_or_else(|| "Unnamed Folder".to_owned());
+
+        let id = crate::gnome::new_folder_id();
+        // Place it first: nothing is written unless the pair really folds, and the local
+        // order is what `_savePages` then persists — which is how the folder keeps the
+        // hovered icon's slot across the reload that brings it back from gsettings.
+        let Some(apps) =
+            self.niri
+                .app_grid
+                .fold_into_folder(target, &source_id, id.clone(), name.clone())
+        else {
+            return false;
+        };
+        if let Some(writer) = &self.niri.gnome_settings_writer {
+            writer.create_app_folder(&id, name, apps);
+        }
+
+        self.clear_grid_pending_move();
+        self.clear_grid_folder_preview();
+        self.reset_drag_page_switch();
+        self.niri.app_drag = None;
+        self.niri.dash.set_drop_slot(None);
+        self.niri.dash.set_drag_active(false);
+        self.niri.app_grid.set_drag_active(false);
+        self.niri.app_grid.finish_reorder();
+        self.save_app_picker_layout(&output);
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    /// Drop the countdown and any preview it produced.
+    fn clear_grid_folder_preview(&mut self) {
+        self.niri.grid_pending_folder = None;
+        if let Some(token) = self.niri.grid_folder_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        if self.niri.app_grid.set_folder_hover(None) {
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// Forget any armed move (the target left the grid, or the drag ended).
@@ -4115,11 +4234,20 @@ impl State {
     /// that nobody accepted is *cancelled*, and gnome-shell redisplays the grid from
     /// the saved layout (`_onDragCancelled`, `appDisplay.js:979-984`).
     fn end_app_drag(&mut self) {
+        // A drop on an icon that has been hovered long enough to show the folder preview
+        // makes a folder of the two (`AppIcon.acceptDrop`, `appDisplay.js:3152-3160`) —
+        // and takes precedence over the reorder, whose target the same pointer position
+        // also resolves.
+        if self.create_dragged_folder() {
+            return;
+        }
+
         // A drop that beat the delayed-move timer still commits the move
         // (`acceptDrop`, `appDisplay.js:1014-1020`). Before `app_drag` is taken — that
         // is where the id comes from.
         self.apply_grid_pending_move();
         self.clear_grid_pending_move();
+        self.clear_grid_folder_preview();
         self.reset_drag_page_switch();
 
         let Some(drag) = self.niri.app_drag.take() else {

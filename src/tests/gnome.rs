@@ -6830,6 +6830,54 @@ fn overview_dragging_a_grid_icon_reorders_the_grid() {
     );
 }
 
+/// Dropping a dragged icon on the *body* of another app icon folds the two into a new
+/// folder (`AppIcon.acceptDrop` → `AppDisplay.createFolder`, `appDisplay.js:3152-3160`,
+/// `:1699-1751`). The hovered icon is the folder's first app and gives it its slot; the
+/// name falls back to "Unnamed Folder" when the two share no category with a
+/// `.directory` title (`_findBestFolderName`, `:114-144`).
+///
+/// This is the drop half only. The 500 ms preview that offers it is real-time and is
+/// pinned in `ui::app_grid` instead.
+#[test]
+fn overview_dropping_a_grid_icon_on_another_makes_a_folder() {
+    let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+
+    let area = overview_controls(&mut f).app_display;
+    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.niri().app_grid.entry_center(2, area).expect("tile 2");
+    pointer_motion_to(&mut f, start.x, start.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // The centre of the third tile: its body, not the divider a reorder would take.
+    pointer_motion_to(&mut f, third.x, third.y);
+    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(
+        f.niri().app_grid.entry_id(0),
+        Some("m.desktop"),
+        "the app that took no part stays where it was"
+    );
+    let members: Vec<&str> = f
+        .niri()
+        .app_grid
+        .entry_folder(1)
+        .expect("the folder took the hovered icon's slot, less the source pulled out ahead of it")
+        .iter()
+        .map(|e| e.id.as_str())
+        .collect();
+    assert_eq!(
+        members,
+        vec!["z.desktop", "a.desktop"],
+        "the hovered app comes first, then the dragged one (`[this.id, source.id]`)"
+    );
+    assert_eq!(f.niri().app_grid.entry_name(1), Some("Unnamed Folder"));
+    assert_eq!(
+        f.niri().app_grid.entry_id(2),
+        None,
+        "both apps left the top level"
+    );
+}
+
 /// Dropping a dragged icon on a page-preview band sends it to that page and follows it
 /// there (`acceptDrop`'s hint branch, `appDisplay.js:1004-1013`). Stepping past the last
 /// page is allowed — that is how a new page gets made.

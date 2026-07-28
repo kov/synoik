@@ -152,6 +152,13 @@ const DIVIDER_LEEWAY: f64 = 20.;
 /// the drop commits it, a drag that ends elsewhere throws it away.
 pub const DELAYED_MOVE_MS: u64 = 200;
 
+/// How long a drag must hold over another icon's *body* before it offers to fold the two
+/// into a folder (`_setHoveringByDnd`'s `timeout_add_once(…, 500, …)`,
+/// `appDisplay.js:3136-3142`). Creating a folder is the one drop with no insertion gap to
+/// announce it, so the preview is its entire affordance — and the delay is what stops a
+/// folder forming every time a drag merely crosses an icon.
+pub const FOLDER_PREVIEW_MS: u64 = 500;
+
 /// Bump the pointer within this many px of the grid's edge during a drag and the page
 /// switches at once (`DRAG_PAGE_SWITCH_IMMEDIATELY_THRESHOLD_PX`, `appDisplay.js:51`).
 /// It is also the distance the pointer must come back inside before another bump
@@ -432,6 +439,11 @@ pub struct AppGrid {
     peek: Animation,
     /// Which hint band the drag is over, if any — the `.dnd` flat fill.
     hint_hovered: Option<PageArrow>,
+    /// The tile a drag is hovering long enough to fold into a folder — it takes the
+    /// `:drop` state and previews the 2x2 it is about to become, its own icon eased down
+    /// to [`widget::FOLDER_SUBICON_FRACTION`] with its caption hidden
+    /// (`_showFolderPreview`, `appDisplay.js:3102-3108`). An absolute entry index.
+    folder_hover: Option<usize>,
     /// A tile that must draw at reduced opacity, and how much: the folder whose dialog is
     /// up fades its source tile out while the dialog zooms out of it and back in as it
     /// shrinks home (`appDisplay.js:2441-2451`). The *id* is folded into the bake
@@ -549,6 +561,7 @@ impl AppGrid {
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
             hint_hovered: None,
+            folder_hover: None,
             tile_fade: None,
             modes,
             align,
@@ -838,6 +851,27 @@ impl AppGrid {
             )),
             tile,
         )
+    }
+
+    /// Mark the tile a drag has hovered long enough to fold into a folder, or clear it.
+    /// Returns whether it changed (→ redraw).
+    ///
+    /// Bumps `content_rev`: unlike a hover wash this changes what the *page bake* holds —
+    /// the previewed tile's caption goes away — so the shared bake really does differ.
+    /// It only moves on a 500 ms timer, never per frame, so a re-bake here is cheap.
+    pub fn set_folder_hover(&mut self, hover: Option<usize>) -> bool {
+        let hover = hover.filter(|&i| i < self.entries.len());
+        if self.folder_hover == hover {
+            return false;
+        }
+        self.folder_hover = hover;
+        self.content_rev += 1;
+        true
+    }
+
+    /// The tile currently previewing a folder, if any.
+    pub fn folder_hover(&self) -> Option<usize> {
+        self.folder_hover
     }
 
     /// Fade one tile (by id) to `alpha`, or clear the fade. Returns whether anything
@@ -1167,6 +1201,56 @@ impl AppGrid {
         self.hovered = None;
         self.content_rev += 1;
         true
+    }
+
+    /// Fold the app `source_id` into a new folder over tile `target` — the *model* half
+    /// of `AppDisplay.createFolder` (`appDisplay.js:1699-1751`); the settings write is
+    /// the caller's. Both apps leave the top level and the folder lands where the
+    /// hovered icon was, with its members in GNOME's `[this.id, source.id]` order.
+    ///
+    /// Returns `None` when the pair is not foldable (either id missing, either one
+    /// already a folder, or the same tile twice), so the caller writes nothing.
+    ///
+    /// GNOME corrects the target position only for a dragged icon on the *same page*
+    /// (the `reduce` at `:1725-1733`). Our order is one flat list, so the correction is
+    /// simply "did the source sit earlier" — which agrees with GNOME within a page and
+    /// is right, rather than one slot off, across pages.
+    pub fn fold_into_folder(
+        &mut self,
+        target: usize,
+        source_id: &str,
+        folder_id: String,
+        name: String,
+    ) -> Option<Vec<String>> {
+        let source = self.entries.iter().position(|e| e.id == source_id)?;
+        if source == target
+            || self.entries.get(target)?.folder.is_some()
+            || self.entries[source].folder.is_some()
+        {
+            return None;
+        }
+        let members = vec![self.entries[target].clone(), self.entries[source].clone()];
+        let apps = members.iter().map(|e| e.id.clone()).collect();
+        // Remove the later index first so the earlier one still points at its entry.
+        let (lo, hi) = (source.min(target), source.max(target));
+        self.entries.remove(hi);
+        self.entries.remove(lo);
+        // The hovered icon's slot, less the source if it was pulled from ahead of it.
+        let to = if source < target { target - 1 } else { target };
+        self.entries.insert(
+            to,
+            AppGridEntry {
+                id: folder_id,
+                name,
+                // The folder tile composes its members; this is only the drag proxy.
+                icon: members[0].icon.clone(),
+                folder: Some(members),
+            },
+        );
+        self.hovered = None;
+        self.folder_hover = None;
+        self.content_rev += 1;
+        Some(apps)
     }
 
     /// Snapshot the current order so a drag that ends nowhere can put it back
@@ -1660,8 +1744,16 @@ impl AppGrid {
         //     (`createFolderIcon`, `appDisplay.js:2138-2162`). ---
         for (k, entry) in page_entries.iter().enumerate() {
             let tile = layout.tiles[k];
+            // The tile a drag is about to fold into a folder previews the 2x2 by easing
+            // its own icon down to the sub-icon fraction (`_showFolderPreview`).
+            let previewing = self.folder_hover == Some(first + k);
+            let icon_px = if previewing {
+                (widget::FOLDER_SUBICON_FRACTION * metrics.icon_px).floor()
+            } else {
+                metrics.icon_px
+            };
             let icons: Vec<(&AppIconRef, f64, Point<f64, Logical>)> = match &entry.folder {
-                None => vec![(&entry.icon, metrics.icon_px, metrics.icon_center(tile))],
+                None => vec![(&entry.icon, icon_px, metrics.icon_center(tile))],
                 Some(members) => members
                     .iter()
                     .take(FOLDER_SUBICONS)
@@ -1715,6 +1807,15 @@ impl AppGrid {
         if let Some((k, _)) = faded {
             fits[k] = false;
         }
+        // The previewing tile's caption is hidden outright (`icon.label.opacity = 0`), so
+        // it simply leaves the shared bake and nothing is emitted in its place.
+        let hidden = self
+            .folder_hover
+            .filter(|i| page_range.contains(i))
+            .map(|i| i - first);
+        if let Some(k) = hidden {
+            fits[k] = false;
+        }
 
         cache
             .long_labels
@@ -1725,7 +1826,7 @@ impl AppGrid {
         let mut hover_extra_h = 0.;
         let mut focus_extra_h = 0.;
         for (k, entry) in page_entries.iter().enumerate() {
-            if fits[k] {
+            if fits[k] || hidden == Some(k) {
                 continue;
             }
             let i = first + k;
@@ -2719,6 +2820,54 @@ mod tests {
         assert!(g.move_entry("app00.desktop", target, 24));
         assert!(g.finish_reorder(), "a real move is worth persisting");
         assert!(!g.cancel_reorder(), "…and cannot then be undone");
+    }
+
+    /// The model half of `createFolder` (`appDisplay.js:1699-1751`): both apps leave the
+    /// top level and the folder takes the *hovered* icon's slot — the same slot whichever
+    /// side the dragged app came from, which is what GNOME's `folderPosition` correction
+    /// is for.
+    #[test]
+    fn folding_two_apps_puts_the_folder_where_the_hovered_icon_was() {
+        let ids = |g: &AppGrid| -> Vec<String> { g.entries.iter().map(|e| e.id.clone()).collect() };
+
+        // Dragged from ahead of the target: everything after it shifts down one, so the
+        // folder lands one slot earlier than the icon it swallowed.
+        let mut g = grid_n(4);
+        let apps = g
+            .fold_into_folder(2, "app00.desktop", "folder-1".into(), "Utilities".into())
+            .expect("two plain apps fold");
+        assert_eq!(
+            apps,
+            ["app02.desktop", "app00.desktop"],
+            "hovered app first"
+        );
+        assert_eq!(ids(&g), ["app01.desktop", "folder-1", "app03.desktop"]);
+        assert_eq!(g.entry_name(1), Some("Utilities"));
+        assert_eq!(
+            g.entry_folder(1).map(<[_]>::len),
+            Some(2),
+            "the folder tile draws its two members"
+        );
+
+        // Dragged from behind it: the target's own slot is untouched.
+        let mut g = grid_n(4);
+        g.fold_into_folder(1, "app03.desktop", "folder-2".into(), "Utilities".into())
+            .expect("two plain apps fold");
+        assert_eq!(ids(&g), ["app00.desktop", "folder-2", "app02.desktop"]);
+
+        // Neither an icon onto itself nor anything involving a folder folds — GNOME's
+        // `_canAccept` takes only another `AppIcon` (`appDisplay.js:3118-3124`), so the
+        // drop falls through to the reorder.
+        assert!(g
+            .fold_into_folder(1, "app00.desktop", "folder-3".into(), "x".into())
+            .is_none());
+        assert!(g
+            .fold_into_folder(0, "folder-2", "folder-3".into(), "x".into())
+            .is_none());
+        assert!(g
+            .fold_into_folder(0, "app00.desktop", "folder-3".into(), "x".into())
+            .is_none());
+        assert_eq!(ids(&g), ["app00.desktop", "folder-2", "app02.desktop"]);
     }
 
     /// `_savePages` writes one dict per page, in display order.
