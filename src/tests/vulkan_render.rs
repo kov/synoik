@@ -9343,3 +9343,136 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
     let other = px(&pixels, w, x, y);
     assert!(other[3] < 8, "…and only on the focused tile: {other:?}");
 }
+
+/// A page change slides: GNOME's grid is one scroll view over every page, and `goToPage`
+/// eases its adjustment to `pageIndex * pageWidth` over `PAGE_SWITCH_TIME`
+/// (`iconGrid.js:1348-1377`), so mid-transition the outgoing and incoming pages are BOTH
+/// on screen, a page width apart. That is the part no state test can see — the grid used
+/// to draw exactly one page, and would happily "slide" by cutting.
+#[test]
+fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_slides_both_pages: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Enough apps for two pages at this size (24 per page).
+    let entries: Vec<AppGridEntry> = (0..30)
+        .map(|i| AppGridEntry {
+            id: format!("o{i:02}.desktop"),
+            name: format!("O{i:02}"),
+            icon: AppIconRef::Fallback,
+            folder: None,
+        })
+        .collect();
+    f.niri().app_grid.set_entries(entries);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    assert_eq!(f.niri().app_grid.page_count(area), 2, "two pages");
+    let tile0 = f
+        .niri()
+        .app_grid
+        .entry_rect(0, area)
+        .expect("the first tile");
+    let row_y = (tile0.loc.y + tile0.size.h / 2.).round() as i32;
+
+    let shoot =
+        |f: &mut Fixture| -> (Vec<u8>, i32) {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                        crate::gnome::ACCENT_BLUE,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            composited
+                .expect("no Vulkan device")
+                .expect("compositing the grid must not error")
+        };
+
+    // The horizontal span of drawn content along the row of icon centers.
+    let span = |pixels: &[u8], w: i32| -> (i32, i32) {
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for x in 0..w {
+            if px(pixels, w, x, row_y)[3] > 20 {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+        (lo, hi)
+    };
+
+    let (pixels, w) = shoot(&mut f);
+    let (rest_lo, rest_hi) = span(&pixels, w);
+    eprintln!("vulkan_app_grid_slide: settled span {rest_lo}..{rest_hi}");
+    assert!(rest_lo < rest_hi, "the settled page draws something");
+
+    // Start the slide and sample a fifth of the way in, before either page has arrived.
+    assert!(f.niri().app_grid.set_page(1, area));
+    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(60);
+    f.niri().clock.set_unadjusted(at);
+    let (pixels, w) = shoot(&mut f);
+    let (mid_lo, mid_hi) = span(&pixels, w);
+    eprintln!("vulkan_app_grid_slide: mid-slide span {mid_lo}..{mid_hi}");
+
+    assert!(
+        mid_lo < rest_lo,
+        "the outgoing page has moved left, past where the resting page starts \
+         ({mid_lo} vs {rest_lo})"
+    );
+    assert!(
+        mid_hi > rest_hi,
+        "…and the incoming page is entering from the right ({mid_hi} vs {rest_hi}) — \
+         both pages must be on screen at once"
+    );
+
+    // Once it lands, the destination page sits exactly where the first one did.
+    f.settle_animations();
+    let (pixels, w) = shoot(&mut f);
+    let (end_lo, end_hi) = span(&pixels, w);
+    eprintln!("vulkan_app_grid_slide: settled-on-page-1 span {end_lo}..{end_hi}");
+    // The last page holds 6 of the 30 apps, so its row is legitimately shorter — what
+    // has to match is where it comes to *rest*: the block origin, with nothing left
+    // hanging past the resting page's right edge.
+    assert_eq!(
+        end_lo, rest_lo,
+        "the slide comes to rest at the same block origin the first page had"
+    );
+    assert!(
+        end_hi <= rest_hi,
+        "…with nothing still hanging off to the right ({end_hi} vs {rest_hi})"
+    );
+}

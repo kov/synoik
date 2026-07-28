@@ -184,6 +184,9 @@ const HINT_RADIUS: f64 = 24.;
 /// empty; one with more shows no hint that it has them, same as GNOME.
 const FOLDER_SUBICONS: usize = 4;
 
+/// `PAGE_SWITCH_TIME` (`iconGrid.js:13`) — how long the view takes to slide one page.
+const PAGE_SWITCH_MS: u64 = 300;
+
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
 const PAGE_PREVIEW_RATIO: f64 = 0.20;
@@ -299,7 +302,9 @@ pub struct AppGridEntry {
 #[derive(Default)]
 struct GridCache {
     context: Option<ContextId<VkTexture>>,
-    bake: widget::BakeCache,
+    /// The page chrome + short captions, **one bake per page**: a slide has two pages on
+    /// screen at once, so a single texture would have them fighting over it.
+    bakes: std::collections::HashMap<usize, widget::BakeCache>,
     /// The page-indicator dots row.
     dots_bake: widget::BakeCache,
     /// The tile hover wash — a separate element so a hover change repositions it without
@@ -307,7 +312,7 @@ struct GridCache {
     hover_bake: widget::BakeCache,
     /// The `.overview-tile:focus` ring, likewise one tile's worth, moved as focus moves.
     focus_bake: widget::BakeCache,
-    /// Captions too long for one line, one bake each, keyed by page-relative tile index.
+    /// Captions too long for one line, one bake each, keyed by `(page, page-relative tile)`.
     ///
     /// They cannot live in the page bake: the hovered one expands to the full wrapped
     /// name (`_updateMultiline`, `appDisplay.js:1891-1924`), so the page bake would
@@ -315,14 +320,15 @@ struct GridCache {
     /// Giving each its own element means a hover change re-bakes one caption-sized
     /// texture and leaves the other ~23 labels alone. Names that fit stay in the page
     /// bake, so a typical page adds only a handful of elements.
-    long_labels: std::collections::HashMap<usize, widget::BakeCache>,
+    long_labels: std::collections::HashMap<(usize, usize), widget::BakeCache>,
     /// The resting backgrounds of the page's folder tiles — `.app-folder` is the one
     /// *raised* tile in the grid, so unlike an app tile it has a fill at rest. Its own
     /// element, below `hover_bake`, so a hovered folder still lightens (an opaque fill
-    /// baked into the page texture would sit on top of the wash and swallow it).
-    folder_bake: widget::BakeCache,
+    /// baked into the page texture would sit on top of the wash and swallow it). One per
+    /// page, like [`Self::bakes`].
+    folder_bakes: std::collections::HashMap<usize, widget::BakeCache>,
     /// The resting background of the ONE tile that is fading (the folder whose dialog is
-    /// open), kept apart from `folder_bake` so its alpha can move per frame without
+    /// open), kept apart from `folder_bakes` so its alpha can move per frame without
     /// touching a bake shared with the rest of the page.
     fade_bake: widget::BakeCache,
     /// The (constant) navigation-arrow hover-wash disc.
@@ -352,7 +358,17 @@ pub struct AppGrid {
     focused: Option<usize>,
     /// The current page (`AppDisplay` paginates; `iconGrid.js`). Clamped to the page
     /// count at layout time; reset to 0 on a fresh overview open.
+    ///
+    /// This is the **destination**: `goToPage` assigns `_currentPage` up front and only
+    /// eases the view after it (`iconGrid.js:1364-1377`), so hit-testing, key focus and
+    /// drop targets all follow the page being moved to, mid-slide included.
     current_page: usize,
+    /// Where the view actually is, in pages — GNOME's scroll adjustment, whose value
+    /// divided by the page size is a *fractional* page (`appDisplay.js:721-724`). One
+    /// continuous quantity so the slide animation and a swipe are the same state, driven
+    /// from either end. `None` while a gesture holds it directly.
+    slide: Animation,
+    gesture: Option<f64>,
     /// Bumped on any change that affects the bake (entries/hover/page).
     content_rev: u64,
     /// The order as it was when a drag started, so an unsuccessful drop can put it
@@ -472,6 +488,8 @@ impl AppGrid {
             hovered_arrow: None,
             focused: None,
             current_page: 0,
+            slide: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
+            gesture: None,
             content_rev: 0,
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
@@ -536,9 +554,10 @@ impl AppGrid {
         layout.hints[1].contains(pos).then_some(PageArrow::Next)
     }
 
-    /// Whether the preview slide is still running (→ hold the redraw loop open).
+    /// Whether the preview slide or a page slide is still running (→ hold the redraw
+    /// loop open).
     pub fn are_animations_ongoing(&self) -> bool {
-        !self.peek.is_done()
+        !self.peek.is_done() || (self.gesture.is_none() && !self.slide.is_done())
     }
 
     /// Replace the grid's apps (`AppDisplay._redisplay`). Returns whether anything
@@ -779,6 +798,10 @@ impl AppGrid {
     }
 
     /// Go to `page` (clamped to `[0, n_pages)` for `area`); returns whether it moved.
+    ///
+    /// `goToPage` (`iconGrid.js:1348-1377`): the page changes **now** and the view eases
+    /// after it, so everything reading [`Self::current_page`] — hit-testing, key focus,
+    /// drop targets — is already on the destination while the slide is still running.
     pub fn set_page(&mut self, page: usize, area: Rectangle<f64, Logical>) -> bool {
         let n_pages = self.page_count(area);
         let page = page.min(n_pages.saturating_sub(1));
@@ -786,19 +809,31 @@ impl AppGrid {
             return false;
         }
         self.current_page = page;
-        self.content_rev += 1;
+        self.slide_to(page as f64, PAGE_SWITCH_MS);
         true
     }
 
     /// Reset to the first page (a fresh overview open, `Main.overview 'hidden'` →
     /// `goToPage(0)`, `appDisplay.js:1342`); returns whether it moved.
     pub fn reset_page(&mut self) -> bool {
-        if self.current_page == 0 {
+        if self.current_page == 0 && self.page_pos() == 0. {
             return false;
         }
         self.current_page = 0;
-        self.content_rev += 1;
+        // Off screen: `goToPage` skips the ease when the grid is not mapped
+        // (`iconGrid.js:1366-1367`), and this only ever runs while it is hidden.
+        self.gesture = None;
+        self.slide = Animation::ease(self.clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic);
         true
+    }
+
+    /// Ease the view to `to` (in pages) over `ms`, from wherever it is now — an
+    /// interrupted slide keeps its position rather than snapping
+    /// (`adjustment.ease`, `iconGrid.js:1371-1375`).
+    fn slide_to(&mut self, to: f64, ms: u64) {
+        let from = self.page_pos();
+        self.gesture = None;
+        self.slide = Animation::ease(self.clock.clone(), from, to, 0., ms, Curve::EaseOutCubic);
     }
 
     /// Tiles per page for `area` — what a `(page, position)` pair counts in.
@@ -992,6 +1027,16 @@ impl AppGrid {
     /// size that fits, distribute the spacing, and position the current page's tiles
     /// in square cells. A dots strip is reserved at the bottom.
     fn layout(&self, area: Rectangle<f64, Logical>) -> GridLayout {
+        self.layout_at(area, self.current_page, 0.)
+    }
+
+    /// [`Self::layout`] for an arbitrary `page`, its tiles shifted `dx_pages` page widths
+    /// sideways — how a page that is sliding in or out is placed. GNOME lays every page
+    /// out side by side in one scroll view and moves the view; the shift here is the same
+    /// thing seen from the page's end. Only the *tiles* move: the dots and the navigation
+    /// arrows live outside the scroll view and stay where they are
+    /// (`appDisplay.js:1251-1252`).
+    fn layout_at(&self, area: Rectangle<f64, Logical>, page: usize, dx_pages: f64) -> GridLayout {
         let empty = GridLayout {
             tiles: Vec::new(),
             block: Rectangle::from_size(Size::from((0., 0.))),
@@ -1062,7 +1107,7 @@ impl AppGrid {
 
         let per_page = cols * rows;
         let n_pages = n.div_ceil(per_page);
-        let page = self.current_page.min(n_pages - 1);
+        let page = page.min(n_pages - 1);
 
         // Distribute spacing + centering per axis, then place the current page.
         let (x_off, h_sp) = distribute(
@@ -1085,6 +1130,10 @@ impl AppGrid {
         );
         let origin_x = area.loc.x + x_off;
         let origin_y = area.loc.y + y_off;
+
+        // The page's own offset in the scroll view.
+        let dx = dx_pages * area.size.w;
+        let origin_x = origin_x + dx;
 
         let first_index = page * per_page;
         let end = (first_index + per_page).min(n);
@@ -1325,42 +1374,25 @@ impl AppGrid {
         )))
     }
 
-    /// The grid render elements for `output`, into the `app_display` box, at `alpha`.
-    /// Icons are pushed first (topmost within the grid); the tile chrome (wash +
-    /// labels) bakes last (below the icons) — the dash/search order. The grid as a
-    /// whole is pushed below the dash and search in `Niri::render`.
+    /// One page's elements — its icons, captions, chrome, focus ring, hover wash and
+    /// folder fills — with `layout` already placed (see [`Self::layout_at`]). Called once
+    /// when the grid is settled, and twice while a page slide is running.
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    fn render_page(
         &self,
         renderer: &mut VulkanRenderer,
         app_icons: &AppIconCache,
-        sym_icons: &IconCache,
-        output: &Output,
-        area: Rectangle<f64, Logical>,
-        alpha: f32,
+        scale: f64,
         accent: [u8; 3],
-    ) -> Vec<TextureRenderElement<VkTexture>> {
-        if alpha <= 0. {
-            return Vec::new();
-        }
-        let layout = self.layout(area);
-        if layout.tiles.is_empty() {
-            return Vec::new();
-        }
-
-        let scale = output.current_scale().fractional_scale();
+        alpha: f32,
+        layout: &GridLayout,
+        cache: &mut GridCache,
+        elements: &mut Vec<TextureRenderElement<VkTexture>>,
+    ) {
         let metrics = layout.metrics;
         let first = layout.first_index;
+        let page = layout.page;
         let page_entries = &self.entries[first..first + layout.tiles.len()];
-
-        let mut cache = self.cache.borrow_mut();
-        let context = renderer.context_id();
-        if cache.context.as_ref() != Some(&context) {
-            cache.icons.clear();
-            cache.context = Some(context);
-        }
-
-        let mut elements = Vec::new();
 
         // --- Batch-upload any page icons whose decode is ready but not yet on the GPU, so the
         //     first open pays ONE submit+fence for the whole page instead of ~24 (a real Venus
@@ -1492,7 +1524,7 @@ impl AppGrid {
 
         cache
             .long_labels
-            .retain(|k, _| fits.get(*k).is_some_and(|fits| !fits));
+            .retain(|(p, k), _| *p != page || fits.get(*k).is_some_and(|fits| !fits));
         // How much taller the expanded caption made the hovered / focused tile — GNOME's
         // tile allocation follows its label, so the `:hover` wash and the `:focus` ring
         // each grow with the one they sit on.
@@ -1524,7 +1556,7 @@ impl AppGrid {
             let shape_lines = lines.clone();
             let bake = match widget::bake(
                 renderer,
-                cache.long_labels.entry(k).or_default(),
+                cache.long_labels.entry((page, k)).or_default(),
                 scale,
                 size,
                 revision,
@@ -1586,7 +1618,7 @@ impl AppGrid {
             .collect();
         match widget::bake(
             renderer,
-            &mut cache.bake,
+            cache.bakes.entry(page).or_default(),
             scale,
             block.size,
             self.content_rev,
@@ -1746,7 +1778,7 @@ impl AppGrid {
             let radius = metrics.radius;
             match widget::bake(
                 renderer,
-                &mut cache.folder_bake,
+                cache.folder_bakes.entry(page).or_default(),
                 scale,
                 block.size,
                 self.content_rev,
@@ -1821,6 +1853,106 @@ impl AppGrid {
                 Err(err) => tracing::error!("error baking the faded folder tile: {err:#}"),
             }
         }
+    }
+
+    /// Where the view sits, in pages — a gesture's live position if one is in flight,
+    /// otherwise the slide animation's (`adjustment.value / page_size`,
+    /// `appDisplay.js:723`).
+    pub fn page_pos(&self) -> f64 {
+        self.gesture.unwrap_or_else(|| self.slide.value())
+    }
+
+    /// The pages the view currently spans and how far each is from its resting place, in
+    /// page widths. Settled that is one entry at 0; mid-slide it is the outgoing page and
+    /// the incoming one, a page apart.
+    fn visible_pages(&self, n_pages: usize) -> Vec<(usize, f64)> {
+        let pos = self.page_pos();
+        let lo = pos.floor().max(0.) as usize;
+        let mut out = Vec::with_capacity(2);
+        for page in [lo, lo + 1] {
+            if page >= n_pages {
+                continue;
+            }
+            let dx = page as f64 - pos;
+            // A page a full width away is off the screen; skip it rather than bake it.
+            if dx.abs() >= 1. {
+                continue;
+            }
+            out.push((page, dx));
+        }
+        out
+    }
+
+    /// The grid render elements for `output`, into the `app_display` box, at `alpha`.
+    /// Icons are pushed first (topmost within the grid); the tile chrome (wash +
+    /// labels) bakes last (below the icons) — the dash/search order. The grid as a
+    /// whole is pushed below the dash and search in `Niri::render`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        app_icons: &AppIconCache,
+        sym_icons: &IconCache,
+        output: &Output,
+        area: Rectangle<f64, Logical>,
+        alpha: f32,
+        accent: [u8; 3],
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        if alpha <= 0. {
+            return Vec::new();
+        }
+        let layout = self.layout(area);
+        if layout.tiles.is_empty() {
+            return Vec::new();
+        }
+
+        let scale = output.current_scale().fractional_scale();
+        let metrics = layout.metrics;
+
+        let mut cache = self.cache.borrow_mut();
+        let context = renderer.context_id();
+        if cache.context.as_ref() != Some(&context) {
+            cache.icons.clear();
+            cache.context = Some(context);
+        }
+
+        let mut elements = Vec::new();
+
+        // The pages the slide spans, and where each sits. Settled, that is just the
+        // current page at rest; mid-slide it is the outgoing and incoming pair, a page
+        // width apart. The band is the full output width, so a page on its way out
+        // leaves the screen on its own — which is the clip GNOME gets from the scroll
+        // view's own allocation.
+        let visible = self.visible_pages(layout.n_pages);
+        cache
+            .bakes
+            .retain(|p, _| visible.iter().any(|(v, _)| v == p));
+        cache
+            .folder_bakes
+            .retain(|p, _| visible.iter().any(|(v, _)| v == p));
+        cache
+            .long_labels
+            .retain(|(p, _), _| visible.iter().any(|(v, _)| v == p));
+        for (page, dx_pages) in visible {
+            let page_layout = self.layout_at(area, page, dx_pages);
+            if page_layout.tiles.is_empty() {
+                continue;
+            }
+            self.render_page(
+                renderer,
+                app_icons,
+                scale,
+                accent,
+                alpha,
+                &page_layout,
+                &mut cache,
+                &mut elements,
+            );
+        }
+        // The resting page's block and caption box, which the drag peek below places
+        // its neighbours relative to.
+        let block = layout.block;
+        let label_w = metrics.label_w();
 
         // --- The page-preview hint bands (`.page-navigation-hint`), below everything
         //     else in the grid. They slide in from the screen edge while an item drag
@@ -2563,7 +2695,9 @@ mod tests {
     fn hover_does_not_bump_the_bake_revision() {
         // The label bake is keyed on `content_rev`; a hover change must not touch it, or
         // every mouse move during the open animation re-shapes the page's labels (the
-        // stutter). Page/entry changes, which DO change the labels, still bump it.
+        // stutter). A *page* change no longer touches it either — each page has its own
+        // bake now (a slide has two on screen at once), so switching back and forth
+        // re-bakes nothing after the first visit. Only the entries changing does.
         let mut g = grid_n(30);
         let area = wide();
         let rev = g.content_rev();
@@ -2578,12 +2712,12 @@ mod tests {
             "tile/arrow hover must not invalidate the label bake"
         );
         assert!(g.set_page(1, area));
-        assert_ne!(
+        assert_eq!(
             g.content_rev(),
             rev,
-            "a page change re-bakes (labels differ)"
+            "a page change must not invalidate the other page's bake — each page keeps \
+             its own, which is what lets both be on screen during a slide"
         );
-        let rev = g.content_rev();
         assert!(g.set_entries(vec![entry("a", "a")]));
         assert_ne!(g.content_rev(), rev, "an entries change re-bakes");
     }

@@ -993,3 +993,61 @@ the dialog at the same time, including its own pagination past nine apps.
 starting point of the first arrow press; we have no stage-wide focus chain, so the first arrow with
 nothing focused takes the first tile of the current page. Tab is left alone in this slice — it moves
 between *focus groups* (dash ↔ grid ↔ search) in GNOME, which needs the chain we do not have.
+
+## 10. App-grid page slide & swipe (cited plan, 2026-07-28)
+
+Paging works (dots, arrows, wheel, keys) but every page change is a hard cut: the grid draws
+exactly one page and swaps it in a single frame. GNOME slides, and the *same* state that
+slides is what a touchpad swipe drags — which is why these are one plan, not two.
+
+### 10.1 The state GNOME animates
+
+The grid is a scroll view over all pages laid side by side, and the page position is one
+continuous adjustment value:
+
+* `iconGrid.js:1348-1378` `goToPage`: sets `_currentPage = pageIndex` **immediately**, then
+  eases the adjustment to `pageIndex * pageWidth`, `EASE_OUT_CUBIC` over `PAGE_SWITCH_TIME`
+  **300 ms** (`iconGrid.js:13`). So the logical page changes at once — hit-testing, key focus
+  and drop targets all follow the destination — and only the *view* lags.
+* `appDisplay.js:706-735`: `_swipeBegin` cancels the running transition and confirms snap
+  points `0..nPages-1` at the current fractional progress with `Math.round(progress)` as the
+  cancel target; `_swipeUpdate` sets `adjustment.value = progress * page_size` **1:1**;
+  `_swipeEnd` eases to `endProgress * page_size` with the same `EASE_OUT_CUBIC` over a
+  velocity-derived duration, then `goToPage(endProgress, false)` to settle the bookkeeping.
+* `swipeTracker.js`: one page is `TOUCHPAD_BASE_WIDTH` **400 px** of horizontal travel
+  (`:14,183`); scroll events are scaled by `SCROLL_MULTIPLIER` **10** (`:18`). The end point
+  is `_getEndProgress` (`:601-631`): below `VELOCITY_THRESHOLD_TOUCHPAD` **0.6** it snaps to
+  the nearest point, otherwise it projects with `DECELERATION_TOUCHPAD` **0.997** (a parabola
+  past `VELOCITY_CURVE_THRESHOLD` 2) and takes the point that projection lands on. The settle
+  duration is `|Δprogress| / velocity * DURATION_MULTIPLIER` (3, the derivative of
+  `easeOutCubic` at 0) clamped to `[100, 400·log2(1+nPoints)]` (`:642-655`).
+* The **wheel is not the swipe.** `_onScroll` (`appDisplay.js:658-704`) is only reached when
+  the tracker declines the event; it does a whole `goToPage` behind a `SCROLL_TIMEOUT_TIME`
+  cooldown. We already have that half, and the continuous-scroll branch beside it is already
+  consumed and reserved for exactly this.
+* What does **not** slide: the page indicators and the navigation arrows are in `_box`,
+  outside the scroll view — `goToPage` tells `_appGridLayout` separately
+  (`appDisplay.js:1251-1252`).
+
+### 10.2 How it maps onto our grid
+
+`AppGrid::current_page` keeps its meaning — the destination, which everything logical reads —
+and gains a continuous `page_pos` beside it, in pages. `render` draws the pages `page_pos`
+spans (one when settled, two mid-slide), each offset by `(page - page_pos) * area.size.w`.
+The `app_display` band is the full output width, so a page sliding out leaves the screen on
+its own; there is nothing to clip against.
+
+The catch is the caches. `bake` (the page's labels + chrome) and `folder_bake` are one each
+and keyed by `content_rev`, which *bumps on a page change* — so two pages on screen at once
+would fight over one texture. They become keyed by page, and `long_labels` by `(page, tile)`;
+`content_rev` then stops bumping on a page change at all, which is a small win in its own
+right: after the first visit a page switch re-bakes nothing.
+
+### 10.3 Slices
+
+* **P1 — the slide.** *(landed.)* `page_pos`, the two-page render, the per-page caches, `EASE_OUT_CUBIC`
+  over 300 ms. Dots and arrows stay put. Wheel/dot/arrow/key paging all inherit it.
+* **P2 — the swipe.** The reserved continuous-scroll branch drives `page_pos` 1:1 at 400 px
+  per page, and the release projects to a snap point and eases there. Reuses the existing
+  `ScrollSwipeGesture` (begin/update/end from axis events) and `SwipeTracker`
+  (velocity + `projected_end_pos`), the same pair the overview's own scroll swipe uses.
