@@ -1117,10 +1117,17 @@ losing text — the cap itself stays a divergence, deliberately (a bake needs a 
 a pathological name should not be able to grow a tile without bound).
 
 The room comes from the tile's own box: a second line takes the bottom padding plus 6px of the
-row gap, which at minimum row spacing is still 18px clear of the icon below. **Search results
-keep GNOME's single line** — they pass `expandTitleOnHover: false` (`appDisplay.js:1837-1841`)
-and their card is laid out for one. Two clips had to grow with it: `Painter::labelled_tile`
-(which clipped to the tile box) and the neighbouring-page peek bake (sized from the block).
+row gap, which at minimum row spacing is still 18px clear of the icon below.
+
+**Search results rest at the same count.** They are the same `.overview-tile` (`search.js:142`),
+and `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) only stops them *expanding* on hover —
+the resting line count is `StLabel`'s, so it is the same one line in GNOME and the same divergence
+here. Their card reserves the overhang (`LABEL_OVERHANG`) and the selection wash grows with the
+caption it covers, as the grid's does for an expanded one.
+
+Three clips had to grow with the second line: `Painter::labelled_tile` (which clipped to the tile
+box), the neighbouring-page peek bake (sized from the block) and the results card (one bake, so a
+line past its edge is simply not drawn).
 
 ## 11. App-folder editing (cited plan, 2026-07-28)
 

@@ -6928,6 +6928,131 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
     }
 }
 
+/// A search result rests at the same caption height as a grid tile
+/// ([`crate::ui::widget::TILE_LABEL_LINES`]) — the two are the same `.overview-tile`
+/// (`search.js:142`), and letting them disagree would be the odd choice. The second line
+/// hangs below the tile box, so the card has to reserve room for it: the card is one
+/// bake, and a line past its edge is simply not there.
+#[test]
+fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::overview_search::SearchResultEntry;
+    use crate::ui::widget::TileMetrics;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_search_result_caption_rests: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // A name that needs the second line, and a short one as the control.
+    {
+        let s = &mut f.niri().overview_search;
+        s.handle_key(None, Some('a'), true, false);
+        s.set_results(vec![
+            SearchResultEntry {
+                id: "long.desktop".into(),
+                name: "Passwords and Keys".into(),
+                icon: AppIconRef::Fallback,
+            },
+            SearchResultEntry {
+                id: "short.desktop".into(),
+                name: "Files".into(),
+                icon: AppIconRef::Fallback,
+            },
+        ]);
+    }
+
+    let controls = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let area: crate::ui::overview_search::SearchArea = controls.into();
+    let mut tile = |i: usize| {
+        f.niri()
+            .overview_search
+            .result_tile(i, area)
+            .expect("a result tile")
+    };
+    let (long_tile, short_tile) = (tile(0), tile(1));
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let elements = niri.overview_search.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    area,
+                    crate::ui::overview_search::SearchFade {
+                        overview: 1.0,
+                        search: 1.0,
+                    },
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_search_result_caption_rests: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the search through Vulkan must not error");
+
+    let m = TileMetrics::OVERVIEW;
+    // Peak glyph ink across one caption line band of a tile. The card fill sits under it,
+    // so this reads brightness, not alpha: the ink is near-white over a dark card.
+    let line_ink = |t: Rectangle<f64, Logical>, line: usize| -> u8 {
+        let top = m.label_top(t) + line as f64 * m.label_h;
+        let mut max = 0u8;
+        for y in top as i32..(top + m.label_h) as i32 {
+            for x in t.loc.x as i32..(t.loc.x + t.size.w) as i32 {
+                max = max.max(px(&pixels, w, x, y)[0]);
+            }
+        }
+        max
+    };
+
+    let (first, second) = (line_ink(long_tile, 0), line_ink(long_tile, 1));
+    let control = line_ink(short_tile, 1);
+    eprintln!("vulkan_search_caption: long l0={first} l1={second} short l1={control}");
+    assert!(first > 150, "the first caption line draws ({first})");
+    assert!(
+        second > 150,
+        "…and so does the second, past the tile box ({second}) — a card sized for one \
+         line would clip it"
+    );
+    assert!(
+        control < 90,
+        "a name that fits draws nothing on the second line ({control}) — so the ink \
+         above is the wrap, not the card"
+    );
+}
+
 #[test]
 fn vulkan_overview_search_draws_entry_and_selection() {
     use smithay::utils::Logical;

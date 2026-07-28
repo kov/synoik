@@ -95,6 +95,16 @@ const TILE_PAD: f64 = AppIcon::OVERVIEW_TILE_PADDING;
 const TILE_SIDE: f64 = TILE_PAD + RESULT_ICON_PX + 6. + 18. + TILE_PAD; // 144
 const TILE_W: f64 = TILE_SIDE;
 const TILE_H: f64 = TILE_SIDE;
+/// How far a resting caption hangs below its tile box: every line past the first, at the
+/// shared label height. The tile is sized for one line (that is the `Shell.SquareBin`
+/// rule above), so a card holding [`widget::TILE_LABEL_LINES`] of caption has to reserve
+/// the rest itself or the last line is clipped by the card's own bake.
+///
+/// A result caption is otherwise the app grid's: GNOME's is one ellipsized line on both
+/// surfaces (`expandTitleOnHover: false` only stops results *expanding* on hover — the
+/// resting line count is `StLabel`'s, `st-label.c:331`), so the divergence the grid takes
+/// is the same divergence here, and letting the two disagree would be the odd choice.
+const LABEL_OVERHANG: f64 = 18. * (widget::TILE_LABEL_LINES as f64 - 1.);
 /// Gap between grid tiles (`.grid-search-results` `spacing: $base_padding*5`=30).
 const GRID_SPACING: f64 = 30.;
 /// `.search-section-content` padding (`$base_padding*2`=12).
@@ -412,7 +422,7 @@ impl OverviewSearch {
                 let n = self.results.len() as f64;
                 n * TILE_W + (n - 1.) * GRID_SPACING + 2. * CARD_PAD
             };
-            let card_h = TILE_H + 2. * CARD_PAD;
+            let card_h = TILE_H + LABEL_OVERHANG + 2. * CARD_PAD;
             let card_x = (area.results.loc.x + (area.results.size.w - card_w) / 2.).round();
             let card_y = (area.results.loc.y + SECTION_SPACING).round();
             let card = Rectangle::new(Point::from((card_x, card_y)), Size::from((card_w, card_h)));
@@ -666,18 +676,19 @@ impl OverviewSearch {
                     .collect();
                 // A search result's caption never expands — the provider builds its icons
                 // with `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is
-                // always the collapsed, end-ellipsized line. **One** line: the grid's
-                // two-line resting caption is a divergence of the grid's own, and a card
-                // laid out for one line has nowhere to put a second.
+                // always the resting, end-ellipsized form, at the same line count the grid
+                // rests at (see [`LABEL_OVERHANG`], which is what makes room for it).
                 let label_w = widget::TileMetrics::OVERVIEW.label_w();
-                let names: Vec<String> = self
+                let names: Vec<Vec<String>> = self
                     .results
                     .iter()
                     .map(|e| {
-                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, 1)
-                            .into_iter()
-                            .next()
-                            .unwrap_or_default()
+                        widget::tile_label_lines(
+                            &e.name,
+                            LABEL_PT,
+                            label_w,
+                            widget::TILE_LABEL_LINES,
+                        )
                     })
                     .collect();
                 let label_rects = rel_rects.clone();
@@ -691,7 +702,14 @@ impl OverviewSearch {
                         let mut shaper = widget::TextShaper::new(r, scale);
                         names
                             .iter()
-                            .map(|name| shaper.shape(name, widget::TextStyle::new(LABEL_PT)))
+                            .map(|lines| {
+                                lines
+                                    .iter()
+                                    .map(|line| {
+                                        shaper.shape(line, widget::TextStyle::new(LABEL_PT))
+                                    })
+                                    .collect::<anyhow::Result<Vec<_>>>()
+                            })
                             .collect::<anyhow::Result<Vec<_>>>()
                     },
                     move |frame, phys, labels| {
@@ -700,7 +718,7 @@ impl OverviewSearch {
                         for (rel, label) in label_rects.iter().zip(labels.iter()) {
                             p.labelled_tile(
                                 *rel,
-                                std::slice::from_ref(label),
+                                label,
                                 &widget::TileMetrics::OVERVIEW,
                                 false,
                                 style::TEXT,
@@ -717,6 +735,23 @@ impl OverviewSearch {
                 //     Re-bakes on a highlight change, but only rounded fills — no re-shape.
                 let selected = self.selected;
                 let hovered = self.hovered;
+                // The wash covers the caption, which may run past the tile box — GNOME's
+                // tile allocation follows its label, so the highlight grows with it (the
+                // app grid does the same for an expanded caption).
+                let wash_extra: Vec<f64> = self
+                    .results
+                    .iter()
+                    .map(|e| {
+                        let lines = widget::tile_label_lines(
+                            &e.name,
+                            LABEL_PT,
+                            label_w,
+                            widget::TILE_LABEL_LINES,
+                        )
+                        .len();
+                        18. * (lines as f64 - 1.)
+                    })
+                    .collect();
                 // Highlight packed into the bake revision so a move re-bakes the wash.
                 let hover_idx = match hovered {
                     Some(SearchHit::Result(i)) => i as u64 + 1,
@@ -749,8 +784,15 @@ impl OverviewSearch {
                         // Selection always washes; a hovered result adds/overlaps one.
                         for (i, rel) in rel_rects.iter().enumerate() {
                             if i == selected || hovered == Some(SearchHit::Result(i)) {
+                                let grown = Rectangle::new(
+                                    rel.loc,
+                                    Size::from((
+                                        rel.size.w,
+                                        rel.size.h + wash_extra.get(i).copied().unwrap_or(0.),
+                                    )),
+                                );
                                 p.fill_rounded(
-                                    *rel,
+                                    grown,
                                     widget::TileMetrics::OVERVIEW.radius,
                                     style::HOVER_WASH,
                                 )?;
@@ -1078,7 +1120,8 @@ mod tests {
              this pins (the dash keeps %tile, the app grid and search do not)"
         );
 
-        // The card grows with the bigger tiles, and still centers them.
+        // The card grows with the bigger tiles, and still centers them — plus the room a
+        // resting caption needs below its tile box ([`LABEL_OVERHANG`]).
         let mut s = OverviewSearch::new();
         s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
@@ -1088,7 +1131,7 @@ mod tests {
             card.size,
             Size::from((
                 2. * TILE_W + GRID_SPACING + 2. * CARD_PAD,
-                TILE_H + 2. * CARD_PAD
+                TILE_H + LABEL_OVERHANG + 2. * CARD_PAD
             ))
         );
         assert_eq!(l.tiles[0].size, Size::from((TILE_W, TILE_H)));
