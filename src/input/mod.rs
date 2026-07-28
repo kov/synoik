@@ -860,7 +860,7 @@ impl State {
                         // Then the app grid's own keyboard navigation, which has to come
                         // before the arrow binds below: those move *window* focus behind
                         // the grid.
-                        if raw.is_some_and(|raw| this.overview_grid_key(raw)) {
+                        if raw.is_some_and(|raw| this.overview_grid_key(raw, *mods)) {
                             this.niri.suppressed_keys.insert(key_code);
                             this.niri.queue_redraw_all();
                             return FilterResult::Intercept(None);
@@ -4375,7 +4375,7 @@ impl State {
     ///
     /// The caller has already given the search entry its shot at the key, so an active
     /// search never reaches this.
-    fn overview_grid_key(&mut self, raw: Keysym) -> bool {
+    fn overview_grid_key(&mut self, raw: Keysym, mods: ModifiersState) -> bool {
         let folder_open = self.niri.folder_dialog.is_open();
         let grid_open =
             self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
@@ -4391,6 +4391,22 @@ impl State {
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.app_display);
+
+        // Tab walks the icons in plain child order, wrapping — a *different* traversal
+        // from the arrows' spatial one (`st_widget_get_focus_chain`, `st-widget.c:2086-2103`;
+        // `wrap_around` is set for Tab at `st-focus-manager.c:96-106`). With nothing
+        // focused it enters the grid instead, at the first icon or, backwards, the last
+        // (`overviewControls.js:464-470` — the handler that gets Tab precisely when the
+        // focus manager found no group to move within).
+        if matches!(raw, Keysym::Tab | Keysym::ISO_Left_Tab) {
+            let forward = !mods.shift && raw != Keysym::ISO_Left_Tab;
+            if folder_open {
+                return self.niri.folder_dialog.focus_tab(forward, view);
+            }
+            let Some(area) = area else { return false };
+            self.niri.app_grid.focus_tab(forward, area);
+            return true;
+        }
 
         let dir = match raw {
             Keysym::Left => Some(FocusDir::Left),

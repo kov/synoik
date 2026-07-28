@@ -8686,3 +8686,154 @@ fn overview_app_grid_pages_by_dragging_its_background() {
     );
     assert!(f.niri().layout.is_app_grid_open());
 }
+
+/// Tab walks the app grid's icons in **child order**, wrapping — a different traversal
+/// from the arrows' spatial one. `st_widget_real_navigate_focus` uses
+/// `st_widget_get_focus_chain` for `TAB_FORWARD`/`TAB_BACKWARD` (`st-widget.c:2086-2103`)
+/// and `st_widget_navigate_focus` retries from the start when it runs off the end
+/// (`:2214-2224`; the focus manager sets `wrap_around` for Tab, `st-focus-manager.c:96-106`).
+/// The grid is a focus group because `ctrlAltTabManager.addGroup` registers it
+/// (`overviewControls.js:392`, `ctrlAltTab.js:43`). With nothing focused, Tab *enters* the
+/// grid at the first icon and Shift+Tab at the last (`overviewControls.js:464-470`).
+#[test]
+fn overview_app_grid_tab_walks_the_icons_in_order() {
+    let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
+    let others: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&[], &others);
+    f.niri_state().update_keyboard_focus();
+    assert!(f.niri().keyboard_focus.is_overview());
+    let area = overview_controls(&mut f).app_display;
+    let per_page = f.niri().app_grid.items_per_page(area);
+    assert_eq!(f.niri().app_grid.page_count(area), 2);
+
+    // Nothing focused: Tab enters at the very first icon.
+    assert_eq!(f.niri().app_grid.focused(), None);
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(0),
+        "Tab enters at the start"
+    );
+
+    // …then steps one at a time, in catalog order — not spatially.
+    tap(&mut f, KEY_TAB);
+    assert_eq!(f.niri().app_grid.focused(), Some(1));
+
+    // Entering is from the *start of the grid*, not of the page you happen to be looking
+    // at: `navigate_focus(null, TAB_FORWARD)` walks the focus chain from its beginning,
+    // and the page then follows the focus back.
+    f.niri().app_grid.set_focused(None);
+    assert!(f.niri().app_grid.set_page(1, area));
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(0),
+        "Tab enters at the grid's first icon even from another page"
+    );
+    assert_eq!(f.niri().app_grid.current_page(), 0, "…paging back to it");
+
+    // Entering *backwards* takes the other end — `TAB_BACKWARD` reverses the focus chain
+    // before taking its first entry (`st-widget.c:2089-2090`).
+    f.niri().app_grid.set_focused(None);
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(29),
+        "Shift+Tab enters at the grid's last icon"
+    );
+
+    // Back to the front for the wrap checks below.
+    f.niri().app_grid.set_focused(Some(0));
+    assert!(f.niri().app_grid.set_page(0, area));
+
+    // Shift+Tab steps back, and off the front it wraps to the very last icon — which
+    // pages the view with it. (Focus is on the first icon after the entry above.)
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(29),
+        "Shift+Tab off the front wraps to the last icon"
+    );
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        29 / per_page,
+        "…and the page follows the focus there"
+    );
+
+    // Forward off the end wraps back to the start, paging back with it.
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(0),
+        "and forward wraps too"
+    );
+    assert_eq!(f.niri().app_grid.current_page(), 0);
+
+    // An open folder is its own focus group (`appDisplay.js:2516`), so Tab cycles inside
+    // it and the grid behind keeps whatever focus it had.
+    f.niri().app_grid.set_focused(Some(0));
+    f.niri().gnome_settings.app_folders = vec![crate::gnome::AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec![ids[1].clone(), ids[2].clone()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+    let folder = f
+        .niri()
+        .app_grid
+        .index_of("Utilities")
+        .expect("the folder tile");
+    f.niri().app_grid.set_focused(Some(folder));
+    tap(&mut f, KEY_ENTER);
+    f.niri_complete_animations();
+    assert!(f.niri().folder_dialog.is_open());
+
+    tap(&mut f, KEY_TAB);
+    assert_eq!(f.niri().folder_dialog.focused(), Some(0));
+    tap(&mut f, KEY_TAB);
+    assert_eq!(f.niri().folder_dialog.focused(), Some(1));
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().folder_dialog.focused(),
+        Some(0),
+        "Tab wraps inside the folder — it does not escape into the grid"
+    );
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(folder),
+        "…and the grid behind the modal kept its own focus"
+    );
+    tap(&mut f, KEY_ESC);
+    assert!(!f.niri().folder_dialog.is_open());
+
+    // Tab is a genuinely *different* traversal from the arrows, and the end of a row is
+    // where they part: Tab takes the next icon in order (the row below), where Right
+    // leaves for the same row of the next page.
+    let row0_y = f.niri().app_grid.entry_center(0, area).unwrap().y;
+    let cols = (1..per_page)
+        .find(|&i| f.niri().app_grid.entry_center(i, area).unwrap().y != row0_y)
+        .expect("the page has more than one row");
+    let row_end = cols - 1;
+
+    f.niri().app_grid.set_focused(Some(row_end));
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(row_end + 1),
+        "Tab wraps onto the next row"
+    );
+
+    f.niri().app_grid.set_focused(Some(row_end));
+    f.niri().app_grid.set_page(0, area);
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(
+        f.niri().app_grid.focused(),
+        Some(per_page),
+        "…where Right from the same icon crosses to the next page instead"
+    );
+}

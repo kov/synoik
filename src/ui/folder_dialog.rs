@@ -606,6 +606,17 @@ impl FolderDialog {
         self.open.as_ref().map_or(0, |o| o.view.current_page())
     }
 
+    /// Tab through the open folder's members. The dialog is its own focus group
+    /// (`global.focus_manager.add_group(this)`, `appDisplay.js:2516`), so Tab cycles
+    /// inside it and never reaches the grid behind.
+    pub fn focus_tab(&mut self, forward: bool, view: Rectangle<f64, Logical>) -> bool {
+        let l = layout(view);
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        open.view.focus_tab(forward, l.grid_area)
+    }
+
     /// The keyboard-focused member of the open folder, if any (what Enter launches).
     pub fn focused(&self) -> Option<usize> {
         self.open.as_ref()?.view.focused()

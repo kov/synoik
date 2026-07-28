@@ -784,6 +784,37 @@ impl AppGrid {
         true
     }
 
+    /// Move the keyboard focus one step in **tab order**, wrapping — which is a different
+    /// traversal from the arrows' spatial one: `st_widget_real_navigate_focus` walks
+    /// `st_widget_get_focus_chain` for `TAB_FORWARD`/`TAB_BACKWARD` (`st-widget.c:2086-2103`),
+    /// i.e. plain child order, and `st_widget_navigate_focus` retries from the start when
+    /// it falls off the end (`:2214-2224`, `wrap_around` is set for Tab). Returns whether
+    /// anything moved.
+    ///
+    /// With nothing focused this *enters* the grid: `navigate_focus(null, TAB_FORWARD)`
+    /// takes the first item, backward the last (`overviewControls.js:464-470`, the handler
+    /// that gets Tab when the focus manager found no group to move within).
+    pub fn focus_tab(&mut self, forward: bool, area: Rectangle<f64, Logical>) -> bool {
+        let n = self.entries.len();
+        if n == 0 {
+            return false;
+        }
+        let target = match self.focused.filter(|&i| i < n) {
+            None if forward => 0,
+            None => n - 1,
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+        };
+        if self.focused == Some(target) {
+            return false;
+        }
+        self.focused = Some(target);
+        // Focus drags the page with it, as ever (`_ensureItemIsVisible`).
+        let per_page = self.layout(area).per_page.max(1);
+        self.set_page(target / per_page, area);
+        true
+    }
+
     /// The box of absolute entry `i` in the *paginated viewport* — its in-page cell rect
     /// shifted by one band width per page away from the current one. Our layout only
     /// places the visible page; GNOME's grid is one actor holding every page side by side,

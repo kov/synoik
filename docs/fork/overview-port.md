@@ -989,10 +989,36 @@ the dialog at the same time, including its own pagination past nine apps.
   opening its folder, the same two paths a click takes.
 * **K2 — the paging keys.** *(landed, with K1.)* `Page_Up`/`Page_Down`/`Home`/`End`, swallowed while a folder is up.
 
+* **K3 — Tab.** *(landed.)* Tab and Shift+Tab walk the icons, entering the grid when nothing
+  is focused.
+
 **Divergences to state:** GNOME reaches the grid from the search entry, whose own focus is the
 starting point of the first arrow press; we have no stage-wide focus chain, so the first arrow with
-nothing focused takes the first tile of the current page. Tab is left alone in this slice — it moves
-between *focus groups* (dash ↔ grid ↔ search) in GNOME, which needs the chain we do not have.
+nothing focused takes the first tile of the *current page*. Tab, which GNOME does define here, keeps
+GNOME's entry point instead: the first icon of the whole grid, paging back to it.
+
+### 9.4 What Tab actually is (K3)
+
+Not group cycling — that is **Ctrl+Alt+Tab**, a separate accessibility switcher with its own popup
+(`ctrlAltTab.js`). Plain Tab in the overview is two behaviours that meet at the focus manager:
+
+* `StFocusManager` walks **up** from the focused actor for a registered group and navigates within it,
+  with `wrap_around` set for Tab and `ISO_Left_Tab` (`st-focus-manager.c:82-124`). The app grid **is**
+  such a group — not registered directly, but through `ctrlAltTabManager.addGroup(this.appDisplay, …)`
+  (`overviewControls.js:392`), which calls `focus_manager.add_group` for any `St.Widget`
+  (`ctrlAltTab.js:41-43`). This is also what makes the *arrows* of §9.3 work, so the two share a
+  foundation.
+* When the focus manager finds no group — focus on the search entry, or nowhere — the event reaches
+  `ControlsManager`'s `connect_after` stage handler, which uses Tab (**and Down**) to *enter* the
+  grid at its first icon and `ISO_Left_Tab` to enter at its last (`overviewControls.js:441-473`).
+
+Tab's traversal is **child order**, not the arrows' spatial one: `st_widget_real_navigate_focus`
+walks `st_widget_get_focus_chain` for the tab directions (`st-widget.c:2086-2103`) and reverses it
+for backward. So at the end of a row Tab goes to the row below where Right goes to the next page —
+the sharpest test of having ported two traversals rather than one.
+
+An open folder is its own group (`appDisplay.js:2516`), so Tab cycles inside it and never escapes to
+the grid behind.
 
 ## 10. App-grid page slide & swipe (cited plan, 2026-07-28)
 
