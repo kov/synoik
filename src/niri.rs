@@ -8607,9 +8607,10 @@ impl Niri {
             .collect();
         // gnome-shell's `AppDisplay._compareItems` (`appDisplay.js:1475-1490`): apps the
         // user has placed sort by their saved `(page, position)`; everything else falls
-        // in *after* them, by name. So a fresh profile is alphabetical, and rearranging
-        // the grid in GNOME is honoured here — the arrangement lives in
-        // `org.gnome.shell app-picker-layout`, not in any state of ours.
+        // in *after* them, by name. The arrangement lives in `org.gnome.shell
+        // app-picker-layout`, not in any state of ours — and gnome-shell writes that key
+        // itself on every layout pass, so a real profile's grid reflects install order
+        // plus manual moves, never plain alphabetical.
         let layout = &self.gnome_settings.app_picker_layout;
         entries.sort_by(|a, b| {
             // localeCompare, approximated by a case-folded compare (std has no collator;
