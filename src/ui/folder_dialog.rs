@@ -1151,15 +1151,25 @@ impl FolderDialog {
         // The folder's own grid — its tiles, captions, hover wash, dots and arrows all come
         // from the same widget the app grid uses. Collected rather than pushed, because the
         // zoom below transforms every one of them as a set.
-        let mut content = open.view.render(
-            renderer,
-            app_icons,
-            sym_icons,
-            output,
-            l.grid_area,
-            alpha,
-            accent,
-        );
+        let mut content: Vec<_> = open
+            .view
+            .render(
+                renderer,
+                app_icons,
+                sym_icons,
+                output,
+                l.grid_area,
+                alpha,
+                accent,
+            )
+            // Clipped to the view it lives in (`clip_to_allocation` on the grid's scroll
+            // view). The app grid gets this for free — its pages slide off the *output*,
+            // and nothing draws past that — but a folder's page is a 700-odd-px island in
+            // the middle of the screen, so without the cut the incoming and outgoing pages
+            // are drawn sliding across the desktop on either side of the panel.
+            .into_iter()
+            .filter_map(|el| el.cropped(l.grid_area))
+            .collect();
 
         // The name row, the entry and the edit button — pushed **before** the panel, which
         // is what puts them above it: the first element pushed is the topmost.

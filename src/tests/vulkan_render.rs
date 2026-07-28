@@ -9053,6 +9053,149 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     );
 }
 
+/// A folder that paginates clips its pages to its own view (`clip_to_allocation` on the
+/// grid's scroll view). The top-level app grid gets this for free — its pages slide off the
+/// output, and nothing draws past the output edge — but the folder's view is an island in
+/// the middle of the screen, so mid-slide the outgoing and incoming pages were drawn
+/// travelling across the desktop on either side of the panel.
+///
+/// The only way to see this is to composite mid-slide and look *outside* the panel: every
+/// geometry test passes either way, because the tiles' rects were right all along.
+#[test]
+fn vulkan_folder_dialog_clips_its_pages_to_the_panel() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+    use crate::ui::folder_dialog::FolderDialogRenderElement;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_folder_dialog_clips_its_pages_to_the_panel: no Vulkan ({e})");
+        return;
+    }
+
+    // A saturated icon nothing else on screen comes near: the shade is black and the panel
+    // is dark grey, so any green outside the panel is a tile that escaped the clip.
+    let path = std::env::temp_dir().join(format!("niri-folder-clip-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([20, 230, 20, 255]))
+        .save(&path)
+        .expect("write member icon");
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Ten members: nine to a page, so the tenth paginates it.
+    f.niri().folder_dialog.popup(
+        "Utilities",
+        "Utilities",
+        (0..10)
+            .map(|i| AppGridEntry {
+                id: format!("m{i}.desktop"),
+                name: format!("M{i}"),
+                icon: AppIconRef::File(path.clone()),
+                folder: None,
+            })
+            .collect(),
+    );
+    f.settle_animations();
+
+    let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
+    let l = crate::ui::folder_dialog::layout(view);
+    assert!(
+        f.niri().folder_dialog.set_page(1, view),
+        "ten members make a second page"
+    );
+    // Halfway through the 300 ms slide, where both pages are off-centre and the travel is
+    // at its widest.
+    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(150);
+    f.niri().clock.set_unadjusted(at);
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
+                niri.folder_dialog.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    view,
+                    None,
+                    1.0,
+                    crate::gnome::ACCENT_BLUE,
+                    &mut |element| elements.push(element),
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+
+    let _ = std::fs::remove_file(&path);
+
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_folder_dialog_clips_its_pages_to_the_panel: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the folder dialog through Vulkan must not error");
+
+    // The slide is mid-flight: something green is inside the panel, or this samples a
+    // settled view and proves nothing.
+    let inside_green = (l.grid_area.loc.y as i32..(l.grid_area.loc.y + l.grid_area.size.h) as i32)
+        .step_by(4)
+        .flat_map(|y| {
+            (l.grid_area.loc.x as i32..(l.grid_area.loc.x + l.grid_area.size.w) as i32)
+                .step_by(4)
+                .map(move |x| (x, y))
+        })
+        .filter(|&(x, y)| {
+            let p = px(&pixels, w, x, y);
+            p[1] > 120 && p[0] < 120
+        })
+        .count();
+    assert!(
+        inside_green > 100,
+        "the tiles are drawn inside the panel mid-slide: {inside_green} green samples"
+    );
+
+    // …and nothing green anywhere outside it, on either side.
+    let mut escaped = Vec::new();
+    for y in (0..1080).step_by(2) {
+        for x in (0..1920).step_by(2) {
+            if l.panel.contains((f64::from(x), f64::from(y))) {
+                continue;
+            }
+            let p = px(&pixels, w, x, y);
+            if p[1] > 60 && i32::from(p[1]) - i32::from(p[0]) > 30 {
+                escaped.push((x, y, p));
+            }
+        }
+    }
+    assert!(
+        escaped.is_empty(),
+        "a page slid outside the folder's own view: {} samples, first {:?}",
+        escaped.len(),
+        escaped.first()
+    );
+}
+
 /// Mid-close, the dialog really is drawn shrunk toward its source tile: a point inside the
 /// resting panel but outside the shrunken one shows what is *behind* the dialog, not panel
 /// chrome. Sampled at a pinned instant — the end states are structurally blind to this (both

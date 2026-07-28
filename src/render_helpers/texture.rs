@@ -172,6 +172,46 @@ impl<T: Texture> TextureRenderElement<T> {
         self.size = Some(size);
     }
 
+    /// This element cut down to the part of it inside `clip`, or `None` when it falls
+    /// outside entirely. The visible part keeps its position and its scale: only the
+    /// source rectangle narrows, so this is a true clip and not a squeeze.
+    ///
+    /// This is what a container that scrolls or paginates its children needs — a widget
+    /// whose content travels a whole viewport width relies on *something* cutting it off,
+    /// and only a full-screen surface gets that for free from the output edge.
+    pub fn cropped(mut self, clip: Rectangle<f64, Logical>) -> Option<Self> {
+        let geo = Rectangle::new(self.location, self.logical_size());
+        let visible = geo.intersection(clip)?;
+        if visible.size.w <= 0. || visible.size.h <= 0. {
+            return None;
+        }
+        if visible == geo {
+            return Some(self);
+        }
+        // The source travels with the destination: an element already cropped or resized
+        // samples its buffer at some ratio, and the same ratio applies to the cut. Read
+        // from the field, not `logical_src`, whose fallback is the *size override*.
+        let src = self
+            .src
+            .unwrap_or_else(|| Rectangle::from_size(self.buffer.logical_size()));
+        let ratio = (
+            src.size.w / geo.size.w.max(f64::EPSILON),
+            src.size.h / geo.size.h.max(f64::EPSILON),
+        );
+        let offset = visible.loc - geo.loc;
+        let src = Rectangle::new(
+            Point::from((
+                src.loc.x + offset.x * ratio.0,
+                src.loc.y + offset.y * ratio.1,
+            )),
+            Size::from((visible.size.w * ratio.0, visible.size.h * ratio.1)),
+        );
+        self.location = visible.loc;
+        self.src = Some(src);
+        self.size = Some(visible.size);
+        Some(self)
+    }
+
     pub fn logical_src(&self) -> Rectangle<f64, Logical> {
         self.src
             .unwrap_or_else(|| Rectangle::from_size(self.logical_size()))
