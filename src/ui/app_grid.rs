@@ -48,16 +48,12 @@
 //! within [`EDGE_BUMP_PX`] of the grid's edge flips it at once. Dropping *on* a band
 //! sends the app to that page, creating one past the end.
 //!
-//! **Divergences, revisited later.** No page-slide animation (snap),
-//! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
-//! 1:1 swipe is deferred), and no keyboard paging (`Page_Up/Down`). Folders are read
-//! only: a folder takes a grid slot, hides its members from the top level and draws
-//! them as a raised `.app-folder` tile ([`AppGridEntry::folder`]) that opens
-//! [`crate::ui::folder_dialog`] on a click, but nothing here creates, renames or edits
-//! one — a drag can never make a folder, and dropping an app on one does nothing.
-//! (The one write is the once-per-profile default-folder seed,
-//! [`crate::gnome::GnomeSettingsWriter::ensure_default_folders`], which is what makes
-//! any folder exist at all on a profile that never ran gnome-shell.) A folder
+//! **Divergences, revisited later.** No **context menu** on an icon (`AppIconMenu`,
+//! `appDisplay.js:3170-3340`): a right-click is consumed inertly, so New Window / app
+//! details / the open-windows list are all unreachable here and in the dash. Inside a
+//! folder a drag cannot **change the page**: the edge bump and the preview bands are
+//! wired for the top-level grid only. The nav arrows ride the centering gutter rather
+//! than a fixed `indicatorsPadding` band (differs only at narrow widths). A folder
 //! *dragged* carries the fallback icon rather than its
 //! own composition, since a drag proxy is one [`AppIconRef`]. Its hover uses the grid's
 //! shared [`style::HOVER_WASH`] (10% white) where GNOME lightens the raised fill 4%;
