@@ -51,9 +51,13 @@
 //! **Divergences, revisited later.** No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
 //! 1:1 swipe is deferred), and no keyboard paging (`Page_Up/Down`). Folders are read
-//! only: a folder takes a grid slot and hides its members from the top level
-//! ([`AppGridEntry::folder`]), but nothing here creates, renames or edits one — a drag
-//! can never make a folder, and dropping an app on one does nothing. Pages here are always
+//! only: a folder takes a grid slot, hides its members from the top level and draws
+//! them as a raised `.app-folder` tile ([`AppGridEntry::folder`]), but nothing here
+//! creates, renames or edits one — a drag can never make a folder, and dropping an app
+//! on one does nothing. A folder *dragged* carries the fallback icon rather than its
+//! own composition, since a drag proxy is one [`AppIconRef`]. Its hover uses the grid's
+//! shared [`style::HOVER_WASH`] (10% white) where GNOME lightens the raised fill 4%;
+//! about 5/255 apart. Pages here are always
 //! **full**: our order is a flat list chunked by the page size, where GNOME's grid is
 //! built with `allow_incomplete_pages: true` (`appDisplay.js:655`) and can leave holes.
 //! The name fallback sort is a case-folded `to_lowercase` compare rather
@@ -168,6 +172,11 @@ const HINT_DND_COLOR: [f32; 4] = [1., 1., 1., 0.1];
 /// [`widget::Painter::fill_rounded_faded`] for how that is expressed.
 const HINT_RADIUS: f64 = 24.;
 
+/// How many members a folder tile composes into its icon — the fixed `i < 4` loop of
+/// `createFolderIcon` (`appDisplay.js:2153`). A folder with fewer simply leaves cells
+/// empty; one with more shows no hint that it has them, same as GNOME.
+const FOLDER_SUBICONS: usize = 4;
+
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
 const PAGE_PREVIEW_RATIO: f64 = 0.20;
@@ -224,8 +233,9 @@ pub struct AppGridEntry {
     /// `app-picker-layout` id space.
     pub id: String,
     pub name: String,
-    /// The app's icon. Unused for a folder, whose tile composes its members'
-    /// icons instead ([`Self::folder`]).
+    /// The app's icon. A folder's tile does *not* draw this — it composes its members'
+    /// icons ([`Self::folder`]) — so for a folder it is only the single-icon proxy a
+    /// drag of it carries.
     pub icon: AppIconRef,
     /// `Some` for a folder: its members in display order, resolved by
     /// [`crate::app_system::AppSystem::folder_members`]. Never empty — an empty
@@ -251,6 +261,11 @@ struct GridCache {
     /// texture and leaves the other ~23 labels alone. Names that fit stay in the page
     /// bake, so a typical page adds only a handful of elements.
     long_labels: std::collections::HashMap<usize, widget::BakeCache>,
+    /// The resting backgrounds of the page's folder tiles — `.app-folder` is the one
+    /// *raised* tile in the grid, so unlike an app tile it has a fill at rest. Its own
+    /// element, below `hover_bake`, so a hovered folder still lightens (an opaque fill
+    /// baked into the page texture would sit on top of the wash and swallow it).
+    folder_bake: widget::BakeCache,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
     /// The two page-preview hint bands, previous then next.
@@ -463,9 +478,25 @@ impl AppGrid {
         self.entries.get(i).map(|e| &e.icon)
     }
 
-    /// Every entry's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
+    /// Every app entry's icon — for the startup decode prewarm
+    /// (`Niri::prewarm_app_icons`). Folders have none of their own; theirs is
+    /// [`Self::folder_icon_refs`], which decodes at a different size.
     pub fn icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
-        self.entries.iter().map(|e| &e.icon)
+        self.entries
+            .iter()
+            .filter(|e| e.folder.is_none())
+            .map(|e| &e.icon)
+    }
+
+    /// The icons a folder tile composes — the members that fit its 2×2, drawn at
+    /// [`widget::TileMetrics::folder_subicon_px`] rather than the full tile icon size,
+    /// so the prewarm has to warm them at that size separately.
+    pub fn folder_icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.folder.as_ref())
+            .flat_map(|members| members.iter().take(FOLDER_SUBICONS))
+            .map(|m| &m.icon)
     }
 
     /// Set the mouse-hovered tile (an absolute entry index); returns whether it
@@ -986,6 +1017,23 @@ impl AppGrid {
         layout.tiles.get(k).map(|t| layout.metrics.icon_center(*t))
     }
 
+    /// The logical center of sub-icon `sub` of the current page's folder tile `k`, and
+    /// the sub-icon's side — the same probe for a folder's 2×2 composition.
+    #[cfg(test)]
+    pub fn folder_subicon_center(
+        &self,
+        k: usize,
+        sub: usize,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<(Point<f64, Logical>, f64)> {
+        let layout = self.layout(area);
+        let tile = layout.tiles.get(k)?;
+        Some((
+            layout.metrics.folder_subicon_center(*tile, sub),
+            layout.metrics.folder_subicon_px(),
+        ))
+    }
+
     /// The center of a navigation arrow's disc — a geometry probe for the conformance
     /// corpus (which clicks real pixels routed through [`arrow_hit`](Self::arrow_hit)).
     #[cfg(test)]
@@ -1045,16 +1093,29 @@ impl AppGrid {
         //     stutter). `app_icon_element` below then finds them cached; an icon still decoding
         //     stays a miss and is simply drawn on a later frame, exactly as before. Only worth a
         //     batch for 2+ pending uploads — a lone miss uploads fine on its own. ---
+        let subicon_px = metrics.folder_subicon_px();
         if let Ok(scale_key) = NotNan::new(scale) {
-            let logical = (metrics.icon_px.round() as u16).max(1);
             let mut keys: Vec<(NotNan<f64>, AppIconRef, u16)> = Vec::new();
             let mut buffers = Vec::new();
-            for entry in page_entries {
-                let key = (scale_key, entry.icon.clone(), logical);
+            // A folder tile draws its members instead of an icon of its own, at the
+            // smaller sub-icon size — so it contributes up to four uploads, not one.
+            let pending: Vec<(&AppIconRef, f64)> = page_entries
+                .iter()
+                .flat_map(|entry| match &entry.folder {
+                    None => vec![(&entry.icon, metrics.icon_px)],
+                    Some(members) => members
+                        .iter()
+                        .take(FOLDER_SUBICONS)
+                        .map(|m| (&m.icon, subicon_px))
+                        .collect(),
+                })
+                .collect();
+            for (icon, px) in pending {
+                let key = (scale_key, icon.clone(), (px.round() as u16).max(1));
                 if cache.icons.contains_key(&key) || keys.contains(&key) {
                     continue;
                 }
-                if let Some(buf) = app_icons.buffer(&entry.icon, metrics.icon_px, scale) {
+                if let Some(buf) = app_icons.buffer(icon, px, scale) {
                     keys.push(key);
                     buffers.push(buf);
                 }
@@ -1082,21 +1143,34 @@ impl AppGrid {
             }
         }
 
-        // --- App icons (topmost, over their tiles). ---
+        // --- App icons (topmost, over their tiles). A folder has no icon of its own:
+        //     its tile composes its first four members into a 2×2 instead
+        //     (`createFolderIcon`, `appDisplay.js:2138-2162`). ---
         for (k, entry) in page_entries.iter().enumerate() {
-            let center = metrics.icon_center(layout.tiles[k]);
-            if let Some(el) = widget::app_icon_element(
-                renderer,
-                &mut cache.icons,
-                app_icons,
-                &entry.icon,
-                metrics.icon_px,
-                scale,
-                Point::from((0., 0.)),
-                center,
-                alpha,
-            ) {
-                elements.push(el);
+            let tile = layout.tiles[k];
+            let icons: Vec<(&AppIconRef, f64, Point<f64, Logical>)> = match &entry.folder {
+                None => vec![(&entry.icon, metrics.icon_px, metrics.icon_center(tile))],
+                Some(members) => members
+                    .iter()
+                    .take(FOLDER_SUBICONS)
+                    .enumerate()
+                    .map(|(i, m)| (&m.icon, subicon_px, metrics.folder_subicon_center(tile, i)))
+                    .collect(),
+            };
+            for (icon, px, center) in icons {
+                if let Some(el) = widget::app_icon_element(
+                    renderer,
+                    &mut cache.icons,
+                    app_icons,
+                    icon,
+                    px,
+                    scale,
+                    Point::from((0., 0.)),
+                    center,
+                    alpha,
+                ) {
+                    elements.push(el);
+                }
             }
         }
 
@@ -1291,6 +1365,55 @@ impl AppGrid {
                     ));
                 }
                 Err(err) => tracing::error!("error baking the app-grid hover wash: {err:#}"),
+            }
+        }
+
+        // --- Folder tile backgrounds (`.app-folder`), one bake for the page, *below*
+        //     the hover wash so a hovered folder still lightens. `.app-folder` is a
+        //     raised tile_button (`_app-grid.scss:41`) where an app tile is flat and
+        //     transparent at rest, so this is the only resting fill in the grid. ---
+        let folder_rects: Vec<Rectangle<f64, Logical>> = page_entries
+            .iter()
+            .zip(&layout.tiles)
+            .filter(|(e, _)| e.folder.is_some())
+            .map(|(_, t)| Rectangle::new(t.loc - origin, t.size))
+            .collect();
+        if !folder_rects.is_empty() {
+            let radius = metrics.radius;
+            match widget::bake(
+                renderer,
+                &mut cache.folder_bake,
+                scale,
+                block.size,
+                self.content_rev,
+                |_| Ok(()),
+                move |frame, phys, _: &()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    for rect in &folder_rects {
+                        p.fill_rounded(*rect, radius, style::FOLDER_BG)?;
+                    }
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        block.loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the app-grid folder tiles: {err:#}"),
             }
         }
 

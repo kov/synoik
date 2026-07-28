@@ -8625,10 +8625,14 @@ impl Niri {
                 continue;
             }
             inside_folders.extend(members.iter().map(|e| e.id.clone()));
+            // A folder tile draws its members, not this — it is only what a *drag* of
+            // the folder carries, and a drag proxy is a single icon. GNOME drags the
+            // composed 2×2; the first member is the closest single icon to it.
+            let proxy = members[0].icon.clone();
             folders.push(AppGridEntry {
                 id: folder.id.clone(),
                 name: folder.name.clone(),
-                icon: AppIconRef::Fallback,
+                icon: proxy,
                 folder: Some(
                     members
                         .into_iter()
@@ -8818,6 +8822,9 @@ impl Niri {
         // The dash renders its icons at `dash::ICON_PX`; the grid (and search) at the
         // `.overview-tile` BaseIcon size. Warm each at the sizes it can appear.
         let grid_px = crate::ui::widget::TileMetrics::OVERVIEW.icon_px;
+        // A folder tile draws its members at the smaller sub-icon size, which is its
+        // own decode-cache key.
+        let subicon_px = crate::ui::widget::TileMetrics::OVERVIEW.folder_subicon_px();
         for scale in scales {
             for icon in self.dash.icon_refs() {
                 let _ = self
@@ -8826,6 +8833,9 @@ impl Niri {
             }
             for icon in self.app_grid.icon_refs() {
                 let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
+            }
+            for icon in self.app_grid.folder_icon_refs() {
+                let _ = self.app_icon_cache.buffer(icon, subicon_px, scale);
             }
         }
     }

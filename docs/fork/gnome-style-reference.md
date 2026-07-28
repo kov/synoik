@@ -553,7 +553,7 @@ Icon-grid layout, app/folder tiles, folder popup, page indicators, system-action
 |---|---|---|---|---|---|---|---|
 | Grid layout | `.icon-grid` | — | — | — | row/col spacing 12px (max 36); page-pad 24px/18px | — | _app-grid.scss:7-16 |
 | App icon tile | `.overview-tile` (`%tile`+flat dark tile_button) | inherit | fg #fff; bg transparent flat (from #222226) | 24px (`base*3`) | padding 12px; spacing 6px; centered; 100ms | — | _app-grid.scss:21-37 |
-| App folder tile | `.app-folder` (raised tile_button) | inherit | fg #fff; raised button bg | 16px | padding 6px; spacing 6px | — | _app-grid.scss:41 |
+| App folder tile | `.app-folder` (raised tile_button) | inherit | fg #fff; bg `mix($system_fg_color,$system_base_color,9%)` **#353539** — raised, so unlike the flat app tile it has a resting fill | 24px + padding 12px (the class is `overview-tile app-folder`, `appDisplay.js:2288`) | icon = 2×2 of members at 0.4× (`appDisplay.js:2138-2162`) | — | _app-grid.scss:41 |
 | Running-app dot | `.app-grid-running-dot` | — | bg #fff | 5px | 5×5px; offset-y 6px | — | _app-grid.scss:45-51 |
 | Folder popup dialog | `.app-folder-dialog` | inherit | fg #fff; bg `$system_overlay_bg_color`; border 1px `$system_borders_color` | 64px (`$modal_radius*4`) | 720×720px; inset shadow | — | _app-grid.scss:59-73 |
 | Folder name (`%title_1`) | `.folder-name-label`/`.folder-name-entry` | 20/800 | system entry | | | — | _app-grid.scss:79-87 |

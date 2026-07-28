@@ -872,10 +872,11 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
 
 ### 8.5 Slices
 
-* **F1 — the model.** `GnomeSettings` reads `folder-children` + each relocatable folder schema + the
-  `.directory` name translation; `AppEntry` gains `categories`; `Niri::sync_app_grid` resolves
-  membership *before* the sort, drops members from the top level, drops empty folders, and gives each
-  folder entry its `app-picker-layout` slot. No chrome — fully headless-testable.
+* **F1 — the model.** *(landed `5296ead7`.)* `GnomeSettings` reads `folder-children` + each
+  relocatable folder schema + the `.directory` name translation; `AppEntry` gains `categories`;
+  `Niri::sync_app_grid` resolves membership *before* the sort, drops members from the top level,
+  drops empty folders, and gives each folder entry its `app-picker-layout` slot. No chrome — fully
+  headless-testable.
 * **F2 — the folder tile.** A grid entry becomes app-or-folder; render the raised `.app-folder` tile
   with the 2×2 sub-icon composition at 0.4×. Click opens (no dialog yet — assert the state).
 * **F3 — the dialog.** The 720² panel with its title, its own 3×3 paginated grid, launching from

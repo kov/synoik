@@ -7505,6 +7505,164 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
     );
 }
 
+/// A folder tile draws its first four members as a 2×2 over a **raised** background
+/// (`createFolderIcon` + `.app-folder`'s `tile_button($raised: true)`,
+/// `appDisplay.js:2138-2162`, `_app-grid.scss:41`), where an app tile draws one icon
+/// over nothing — `tile_button`'s flat branch forces the resting background
+/// transparent (`_drawing.scss:362-365`).
+///
+/// Sampling four member colors at their own quadrants is what separates a real
+/// composition from a single icon centered in the tile, and sampling the tile corner
+/// separates the raised folder from its flat neighbour.
+#[test]
+fn vulkan_app_grid_composes_a_folder_tile() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_composes_a_folder_tile: no Vulkan device ({e})");
+        return;
+    }
+
+    let dir = std::env::temp_dir();
+    // Four distinguishable members plus a plain app tile to contrast against.
+    let colors = [
+        [220u8, 20, 20],
+        [20, 220, 20],
+        [20, 20, 220],
+        [220, 220, 20],
+    ];
+    let paths: Vec<std::path::PathBuf> = colors
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let path = dir.join(format!("niri-folder-{}-{i}.png", std::process::id()));
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([c[0], c[1], c[2], 255]))
+                .save(&path)
+                .expect("write member icon");
+            path
+        })
+        .collect();
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    {
+        let g = &mut f.niri().app_grid;
+        g.set_entries(vec![
+            AppGridEntry {
+                id: "plain.desktop".into(),
+                name: "Plain".into(),
+                icon: AppIconRef::Fallback,
+                folder: None,
+            },
+            AppGridEntry {
+                id: "Utilities".into(),
+                name: "Utilities".into(),
+                icon: AppIconRef::Fallback,
+                folder: Some(
+                    paths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, path)| AppGridEntry {
+                            id: format!("m{i}.desktop"),
+                            name: format!("M{i}"),
+                            icon: AppIconRef::File(path.clone()),
+                            folder: None,
+                        })
+                        .collect(),
+                ),
+            },
+        ]);
+    }
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let subs: Vec<_> = (0..4)
+        .map(|i| {
+            f.niri()
+                .app_grid
+                .folder_subicon_center(1, i, area)
+                .expect("folder sub-icon")
+        })
+        .collect();
+    // A tile corner, inside the folder's rounded box but well clear of its icons.
+    let folder_rect = f.niri().app_grid.entry_rect(1, area).expect("folder tile");
+    let plain_rect = f.niri().app_grid.entry_rect(0, area).expect("app tile");
+    let corner = |r: Rectangle<f64, Logical>| (r.loc.x + r.size.w - 12., r.loc.y + 12.);
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let elements = niri.app_grid.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    area,
+                    1.0,
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+
+    for path in &paths {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_app_grid_composes_a_folder_tile: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the folder tile through Vulkan must not error");
+
+    for (i, ((center, _), want)) in subs.iter().zip(&colors).enumerate() {
+        let got = px(&pixels, w, center.x as i32, center.y as i32);
+        eprintln!("vulkan_app_grid_folder: sub{i} at {center:?} = {got:?}");
+        for ch in 0..3 {
+            assert!(
+                (got[ch] as i32 - want[ch] as i32).abs() < 40,
+                "sub-icon {i} must draw its own color in its own quadrant: got {got:?}, \
+                 want {want:?} — a single centered icon or a wrong cell order fails here"
+            );
+        }
+    }
+
+    let (fx, fy) = corner(folder_rect);
+    let (px_, py) = corner(plain_rect);
+    let folder_corner = px(&pixels, w, fx as i32, fy as i32);
+    let plain_corner = px(&pixels, w, px_ as i32, py as i32);
+    eprintln!("vulkan_app_grid_folder: folder={folder_corner:?} plain={plain_corner:?}");
+    assert!(
+        folder_corner[3] > 200,
+        "the folder tile is raised: it has an opaque resting fill: {folder_corner:?}"
+    );
+    assert_eq!(
+        plain_corner[3], 0,
+        "the app tile beside it is flat: nothing at rest"
+    );
+}
+
 /// With more apps than one page holds, the app grid bakes its page-indicator dots:
 /// the active page's dot is a full-opacity white circle, an inactive one is dimmer,
 /// and the gap between dots is transparent.

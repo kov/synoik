@@ -126,6 +126,15 @@ pub mod style {
     /// bakes as its pill (kept in sync via this one constant).
     pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
 
+    /// `.app-folder` fill — the one tile in the grid that is **raised** rather than
+    /// flat: `tile_button($bg:$system_base_color, $raised:true)` (`_app-grid.scss:41`)
+    /// resolves to `button(normal)`'s `st-mix($system_fg_color, $system_base_color, 9%)`
+    /// = `mix(#fafafb, #222226, 9%)` ≈ `#353539` (`_drawing.scss:353-354`,
+    /// `$background_mix_factor` `_default-colors.scss:33`). An app tile in the same grid
+    /// is `$style: flat` and forced transparent at rest, which is why only folders show
+    /// a resting background.
+    pub const FOLDER_BG: Rgba = [0.210, 0.210, 0.224, 1.];
+
     /// Modal-dialog corner radius, logical px — GNOME `$alert_radius` (`_common.scss:43`,
     /// applied at `_dialogs.scss:6`). Note this is 18px, not `$modal_radius` (16px).
     pub const DIALOG_RADIUS: f64 = 18.;
@@ -324,7 +333,38 @@ impl TileMetrics {
             rect.loc.y + self.pad + self.icon_px / 2.,
         ))
     }
+
+    /// One folder sub-icon's side, in logical px — [`FOLDER_SUBICON_FRACTION`] of the
+    /// tile's icon box (`createFolderIcon`, `appDisplay.js:2149`).
+    pub fn folder_subicon_px(&self) -> f64 {
+        (FOLDER_SUBICON_FRACTION * self.icon_px).floor()
+    }
+
+    /// The center of folder sub-icon `i` (`0..4`, filled left-to-right then top-to-
+    /// bottom) within a tile box `rect`.
+    ///
+    /// `createFolderIcon` (`appDisplay.js:2138-2162`) composes the folder's icon as a
+    /// **homogeneous** 2×2 `Clutter.GridLayout` over an icon-box-sized widget, one
+    /// member per cell at `(i % 2, i / 2)`. Homogeneous means each cell is half the
+    /// box; the member icon is smaller than its cell and paints centered in it
+    /// (`st-icon.c:478-479` center-aligns the texture inside the actor), which is what
+    /// leaves the gap down the middle of a folder tile.
+    pub fn folder_subicon_center(
+        &self,
+        rect: Rectangle<f64, Logical>,
+        i: usize,
+    ) -> Point<f64, Logical> {
+        let center = self.icon_center(rect);
+        let quarter = self.icon_px / 4.;
+        let dx = if i % 2 == 0 { -quarter } else { quarter };
+        let dy = if i / 2 == 0 { -quarter } else { quarter };
+        Point::from((center.x + dx, center.y + dy))
+    }
 }
+
+/// The share of a folder tile's icon box that one member sub-icon takes
+/// (`FOLDER_SUBICON_FRACTION`, `appDisplay.js:31`).
+pub const FOLDER_SUBICON_FRACTION: f64 = 0.4;
 
 /// How many lines an *expanded* tile caption may use.
 ///
@@ -1803,6 +1843,43 @@ mod tests {
         assert_eq!(m.label_w(), 120.);
         assert_eq!(m.size(), Size::from((144., 144.)));
         assert_eq!(m.size().w, m.label_w() + 2. * m.pad);
+    }
+
+    /// A folder tile's icon is a homogeneous 2×2 over the same icon box an app icon
+    /// fills (`createFolderIcon`, `appDisplay.js:2138-2162`): four half-box cells,
+    /// each with one member icon at 0.4× the box centered in it. The centering is the
+    /// part worth pinning — it is what leaves the cross-shaped gap that reads as a
+    /// folder, and cell-filling instead would make the four icons touch.
+    #[test]
+    fn a_folder_tile_composes_four_sub_icons_centered_in_a_two_by_two() {
+        let m = TileMetrics::OVERVIEW;
+        let tile = Rectangle::new(Point::from((0., 0.)), m.size());
+        let sub = m.folder_subicon_px();
+        assert_eq!(sub, 38., "floor(0.4 * 96)");
+
+        let centers: Vec<Point<f64, Logical>> =
+            (0..4).map(|i| m.folder_subicon_center(tile, i)).collect();
+        let icon = m.icon_center(tile);
+        // Left-to-right then top-to-bottom, a quarter box out from the icon center.
+        let q = m.icon_px / 4.;
+        assert_eq!(centers[0], Point::from((icon.x - q, icon.y - q)));
+        assert_eq!(centers[1], Point::from((icon.x + q, icon.y - q)));
+        assert_eq!(centers[2], Point::from((icon.x - q, icon.y + q)));
+        assert_eq!(centers[3], Point::from((icon.x + q, icon.y + q)));
+
+        // Centered in their half-box cells, so the composition sits inside the icon
+        // box with a gap down the middle rather than filling it edge to edge.
+        let left = centers[0].x - sub / 2.;
+        let right = centers[1].x + sub / 2.;
+        assert!(left > icon.x - m.icon_px / 2., "inset from the box: {left}");
+        assert!(
+            right < icon.x + m.icon_px / 2.,
+            "inset from the box: {right}"
+        );
+        assert!(
+            centers[1].x - sub / 2. > centers[0].x + sub / 2.,
+            "the two columns do not touch"
+        );
     }
 
     /// A name that does not fit is ellipsized on one line collapsed, and wrapped
