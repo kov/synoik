@@ -6954,7 +6954,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     // Drive the model directly into an active state with two results, tile 0 selected.
     {
         let s = &mut f.niri().overview_search;
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![
             SearchResultEntry {
                 id: "a.desktop".into(),

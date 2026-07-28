@@ -825,7 +825,10 @@ impl State {
                         if active || starts {
                             use crate::ui::overview_search::SearchOutcome;
                             let plain = !mods.ctrl && !mods.alt && !mods.logo;
-                            let outcome = this.niri.overview_search.handle_key(raw, text, plain);
+                            let outcome = this
+                                .niri
+                                .overview_search
+                                .handle_key(raw, text, plain, mods.shift);
                             // Ignored = a key the search doesn't handle (bare modifier, F-key);
                             // let it fall through to the hardcoded overview binds, unconsumed.
                             if !matches!(outcome, SearchOutcome::Ignored) {

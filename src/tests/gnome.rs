@@ -8442,6 +8442,33 @@ fn overview_search_arrow_then_enter_launches_second() {
     );
 }
 
+/// Tab walks the search results forward, Shift+Tab back.
+///
+/// The one that was broken is Shift+Tab: `ISO_Left_Tab` is the *modified* keysym, and the
+/// key path hands surfaces the **raw** one, so what arrives is a plain `Tab` and the
+/// select-prev arm matching `ISO_Left_Tab` was dead for real input. Only a test that goes
+/// through the input path can see that — calling `handle_key(ISO_Left_Tab, …)` directly
+/// passes against the bug.
+#[test]
+fn overview_search_shift_tab_steps_back() {
+    let (mut f, recorder) = search_overview(&[&["a.desktop", "b.desktop", "c.desktop"]]);
+
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_TAB);
+    tap(&mut f, KEY_TAB);
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_ENTER);
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.id, "b.desktop",
+        "two forward then one back lands on the second result"
+    );
+}
+
 /// A click on a result tile launches it and closes the overview.
 #[test]
 fn overview_search_click_result_launches() {

@@ -653,15 +653,14 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
 - **S9+ — Incremental search + polish.** Remote `SearchProvider2` (with the §4 process seam),
   `SystemActions` results, `Shell.AppUsage` ordering, favorites DnD reorder / add-remove, folders,
   usage stats.
-- **S10 — Keyboard-navigation pass (deferred, 2026-07-24).** Reported live: in the search results
-  **Tab steps forward but Shift+Tab also steps forward** instead of backward. Cause is pinned, not a
-  logic bug in the search: `overview_search.rs:262` already treats `Keysym::ISO_Left_Tab` as
-  select-prev, but `input/mod.rs:734` hands `handle_key` the **raw** keysym, and xkb only yields
-  `ISO_Left_Tab` as the *modified* sym — so Shift+Tab arrives as plain `Tab` and falls into the
-  select-next arm, leaving that `ISO_Left_Tab` match dead for real input. (`modified` is already in
-  scope at that call site, used for `key_char`.) Fix belongs in a full keyboard-nav pass rather than
-  a one-key patch: audit every UI surface that keys off `raw` for the same shifted-keysym blind spot,
-  and pin Shift+Tab per surface. GNOME reference: `js/ui/search.js` / `st-focus-manager`.
+- **S10 — Shifted-keysym blind spot. ✅ FIXED.** Reported live: in the search results **Tab stepped
+  forward but so did Shift+Tab**. Not a logic bug in the search — `ISO_Left_Tab` is the *modified*
+  keysym and the key path hands surfaces the **raw** one, so Shift+Tab arrives as a plain `Tab` and
+  that match was dead for real input. The search now takes the shift state and decides the direction
+  from it. Audited the other two surfaces that key off `raw` for Tab: the app grid already reads
+  `mods.shift`, and the end-session dialog has two buttons and toggles either way. Pinned by a test
+  that drives Shift+Tab through the input path — a unit call with `ISO_Left_Tab` passes against the
+  bug, which is why it survived.
 - **S11 — Overview scale on the internal display (ROOT-CAUSED + FIXED, 2026-07-26; live validation
   pending).** Reported live: on the laptop's **internal** display the overview's **rounded corners
   and the relative scale of its elements look quite off** — sizes that read correctly on the

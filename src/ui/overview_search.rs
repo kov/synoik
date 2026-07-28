@@ -241,6 +241,7 @@ impl OverviewSearch {
         raw: Option<Keysym>,
         text: Option<char>,
         plain: bool,
+        shift: bool,
     ) -> SearchOutcome {
         if !plain {
             return SearchOutcome::Ignored;
@@ -261,6 +262,16 @@ impl OverviewSearch {
                     Some(id) if self.is_active() => SearchOutcome::Activate(id.to_owned()),
                     _ => SearchOutcome::Handled,
                 }
+            }
+            // Shift+Tab is `ISO_Left_Tab` only as a *modified* keysym; what reaches us is
+            // the raw sym, which is a plain `Tab` — so the shift state is what actually
+            // decides the direction, and matching `ISO_Left_Tab` alone stepped forward.
+            // Shift+Tab is `ISO_Left_Tab` only as a *modified* keysym; what reaches us is
+            // the raw sym, which is a plain `Tab` — so the shift state is what actually
+            // decides the direction, and matching `ISO_Left_Tab` alone stepped forward.
+            Some(Keysym::Tab) if shift => {
+                self.select_prev();
+                SearchOutcome::Handled
             }
             Some(
                 Keysym::Left | Keysym::Up | Keysym::KP_Left | Keysym::KP_Up | Keysym::ISO_Left_Tab,
@@ -823,21 +834,21 @@ mod tests {
         // stutter that bites once providers make the result set large). Query/result
         // changes, which DO change the labels, still bump it.
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let rev = s.content_rev();
         assert!(
             s.set_hovered(Some(SearchHit::Result(1))),
             "a new hover reports a change"
         );
-        s.handle_key(Some(Keysym::Down), None, true); // move the keyboard selection
+        s.handle_key(Some(Keysym::Down), None, true, false); // move the keyboard selection
         assert_eq!(
             s.content_rev(),
             rev,
             "hover + selection must not invalidate the label bake"
         );
         // A query change re-shapes (the labels differ).
-        s.handle_key(None, Some('b'), true);
+        s.handle_key(None, Some('b'), true, false);
         assert_ne!(s.content_rev(), rev, "a query change re-bakes");
     }
 
@@ -846,11 +857,11 @@ mod tests {
         let mut s = OverviewSearch::new();
         assert!(!s.is_active());
         assert_eq!(
-            s.handle_key(None, Some('f'), true),
+            s.handle_key(None, Some('f'), true, false),
             SearchOutcome::QueryChanged
         );
         assert_eq!(
-            s.handle_key(None, Some('i'), true),
+            s.handle_key(None, Some('i'), true, false),
             SearchOutcome::QueryChanged
         );
         assert!(s.is_active());
@@ -858,7 +869,7 @@ mod tests {
 
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, true),
+            s.handle_key(Some(Keysym::Return), None, true, false),
             SearchOutcome::Activate("a.desktop".to_owned())
         );
     }
@@ -866,30 +877,30 @@ mod tests {
     #[test]
     fn arrow_moves_selection_and_clamps() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         // Right → index 1, then clamp at the last.
-        s.handle_key(Some(Keysym::Right), None, true);
+        s.handle_key(Some(Keysym::Right), None, true, false);
         assert_eq!(s.selected_id(), Some("b.desktop"));
-        s.handle_key(Some(Keysym::Right), None, true);
+        s.handle_key(Some(Keysym::Right), None, true, false);
         assert_eq!(s.selected_id(), Some("b.desktop"));
         // Left back to 0, saturating.
-        s.handle_key(Some(Keysym::Left), None, true);
-        s.handle_key(Some(Keysym::Left), None, true);
+        s.handle_key(Some(Keysym::Left), None, true, false);
+        s.handle_key(Some(Keysym::Left), None, true, false);
         assert_eq!(s.selected_id(), Some("a.desktop"));
     }
 
     #[test]
     fn selection_never_underflows_on_empty() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), true);
+        s.handle_key(None, Some('z'), true, false);
         // No results seeded.
-        s.handle_key(Some(Keysym::Right), None, true);
-        s.handle_key(Some(Keysym::Left), None, true);
+        s.handle_key(Some(Keysym::Right), None, true, false);
+        s.handle_key(Some(Keysym::Left), None, true, false);
         assert_eq!(s.selected_id(), None);
         // Enter with no results is consumed, not an activate.
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, true),
+            s.handle_key(Some(Keysym::Return), None, true, false),
             SearchOutcome::Handled
         );
     }
@@ -899,15 +910,15 @@ mod tests {
         let mut s = OverviewSearch::new();
         // Inactive Escape → Close (normally unreachable via the input gate).
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, true),
+            s.handle_key(Some(Keysym::Escape), None, true, false),
             SearchOutcome::Close
         );
 
-        s.handle_key(None, Some('x'), true);
+        s.handle_key(None, Some('x'), true, false);
         s.set_results(vec![entry("a.desktop", "A")]);
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, true),
+            s.handle_key(Some(Keysym::Escape), None, true, false),
             SearchOutcome::Cleared
         );
         assert!(!s.is_active());
@@ -918,10 +929,10 @@ mod tests {
     #[test]
     fn backspace_empties_and_deactivates() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::BackSpace), None, true),
+            s.handle_key(Some(Keysym::BackSpace), None, true, false),
             SearchOutcome::QueryChanged
         );
         assert!(!s.is_active());
@@ -930,22 +941,22 @@ mod tests {
     #[test]
     fn query_change_resets_selection_to_first() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        s.handle_key(Some(Keysym::Right), None, true);
+        s.handle_key(Some(Keysym::Right), None, true, false);
         assert_eq!(s.selected_id(), Some("b.desktop"));
         // Typing another char resets selection to the first.
-        s.handle_key(None, Some('b'), true);
+        s.handle_key(None, Some('b'), true, false);
         assert_eq!(s.selected(), 0);
     }
 
     #[test]
     fn unhandled_key_is_ignored_not_consumed() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true); // active
-                                             // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
+        s.handle_key(None, Some('a'), true, false); // active
+                                                    // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
         assert_eq!(
-            s.handle_key(Some(Keysym::F5), None, true),
+            s.handle_key(Some(Keysym::F5), None, true, false),
             SearchOutcome::Ignored
         );
     }
@@ -990,7 +1001,7 @@ mod tests {
         // Well away from the entry: no hit at all.
         assert_eq!(s.hit_test(Point::from((10., 600.)), area), None);
 
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let layout = s.layout(area);
         assert_eq!(
@@ -1012,7 +1023,7 @@ mod tests {
     #[test]
     fn modified_keys_are_ignored_while_active() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
 
         for raw in [
@@ -1022,7 +1033,7 @@ mod tests {
             Keysym::BackSpace,
         ] {
             assert_eq!(
-                s.handle_key(Some(raw), None, false),
+                s.handle_key(Some(raw), None, false, false),
                 SearchOutcome::Ignored,
                 "{raw:?} with a modifier held must be ignored, not acted on"
             );
@@ -1055,7 +1066,7 @@ mod tests {
 
         // The card grows with the bigger tiles, and still centers them.
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true);
+        s.handle_key(None, Some('a'), true, false);
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let l = s.layout(area_1080());
         let card = l.card.expect("an active search has a card");
@@ -1088,7 +1099,7 @@ mod tests {
     #[test]
     fn empty_results_card_is_wide_enough_for_the_status_text() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), true);
+        s.handle_key(None, Some('z'), true, false);
         let card = s
             .layout(area_1080())
             .card
