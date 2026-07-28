@@ -52,9 +52,10 @@
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
 //! 1:1 swipe is deferred), and no keyboard paging (`Page_Up/Down`). Folders are read
 //! only: a folder takes a grid slot, hides its members from the top level and draws
-//! them as a raised `.app-folder` tile ([`AppGridEntry::folder`]), but nothing here
-//! creates, renames or edits one — a drag can never make a folder, and dropping an app
-//! on one does nothing. (The one write is the once-per-profile default-folder seed,
+//! them as a raised `.app-folder` tile ([`AppGridEntry::folder`]) that opens
+//! [`crate::ui::folder_dialog`] on a click, but nothing here creates, renames or edits
+//! one — a drag can never make a folder, and dropping an app on one does nothing.
+//! (The one write is the once-per-profile default-folder seed,
 //! [`crate::gnome::GnomeSettingsWriter::ensure_default_folders`], which is what makes
 //! any folder exist at all on a profile that never ran gnome-shell.) A folder
 //! *dragged* carries the fallback icon rather than its
@@ -108,6 +109,9 @@ const PAGE_PAD_V: f64 = 24.; // page-padding-top/bottom: $base_padding*4
 /// chosen by whichever `columns/rows` ratio is closest to the page's aspect ratio
 /// (`_findBestModeForSize`, `iconGrid.js:1224`). A wide `app_display` picks 8×3.
 const GRID_MODES: [(usize, usize); 4] = [(3, 8), (4, 6), (6, 4), (8, 3)];
+/// The one mode a folder's inner grid offers (`FolderGrid.setGridModes`,
+/// `appDisplay.js:2077-2082`) — a folder never re-flows to the box it is given.
+const FOLDER_GRID_MODES: [(usize, usize); 1] = [(3, 3)];
 /// The icon-size ladder, largest first (`IconSize`, `iconGrid.js:16-23`); the grid
 /// shrinks the icon to the largest size whose page fits (`_findBestIconSize`).
 const ICON_SIZES: [f64; 6] = [96., 64., 48., 32., 24., 16.];
@@ -194,6 +198,20 @@ const PAGE_PREVIEW_RATIO: f64 = 0.20;
 /// icons slide into when a drag makes the previews appear.
 fn indicators_w(band_w: f64) -> f64 {
     (band_w * PAGE_PREVIEW_RATIO / 2.).max(ARROW_DISC + 2. * ARROW_MARGIN)
+}
+
+/// What a page does with the space its cells do not fill (`pageHalign`/`pageValign`,
+/// applied by `_calculateSpacing`, `iconGrid.js:591-635`). Both axes of one grid use
+/// the same value in GNOME's two grids, so this is one knob rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAlign {
+    /// The slack is handed to the *spacing*, which grows from its base up to the max
+    /// and only then centers what is left — the app grid's default
+    /// (`IconGrid._init`, `iconGrid.js:1171`).
+    Fill,
+    /// The spacing stays at its base and the slack becomes leading padding, so the
+    /// cells sit as a centered block (`FolderGrid`, `appDisplay.js:2073-2074`).
+    Center,
 }
 
 /// Which navigation arrow — the previous (left) or next (right) page.
@@ -304,6 +322,14 @@ pub struct AppGrid {
     peek: Animation,
     /// Which hint band the drag is over, if any — the `.dnd` flat fill.
     hint_hovered: Option<PageArrow>,
+    /// The page modes this grid may re-flow to, and what a page does with its slack.
+    ///
+    /// GNOME builds the folder's inner view from the *same* `AppGrid` as the top-level
+    /// one — `FolderGrid extends AppGrid` (`appDisplay.js:2066-2084`) — differing only
+    /// in these two parameters, so the folder dialog reuses this whole widget (hover,
+    /// captions, pagination, dots, arrows, icon uploads) instead of re-deriving it.
+    modes: &'static [(usize, usize)],
+    align: PageAlign,
     clock: Clock,
     cache: RefCell<GridCache>,
 }
@@ -341,11 +367,28 @@ struct GridLayout {
     next_arrow: Option<Rectangle<f64, Logical>>,
 }
 
-/// The FILL spacing distribution for one axis (`iconGrid.js` `_calculateSpacing`):
-/// the inter-cell spacing grows from `base` to absorb slack, and once it hits `max`
-/// the remaining slack centers the run. Returns `(origin_offset, spacing)` where the
-/// offset is measured from the page edge (it already includes `pad`).
-fn distribute(page_size: f64, n: usize, cell: f64, base: f64, max: f64, pad: f64) -> (f64, f64) {
+/// The spacing distribution for one axis (`iconGrid.js` `_calculateSpacing`).
+///
+/// Under [`PageAlign::Fill`] the inter-cell spacing grows from `base` to absorb the
+/// slack, and once it hits `max` the remaining slack centers the run; under
+/// [`PageAlign::Center`] the spacing stays at `base` and *all* the slack becomes
+/// leading padding. Returns `(origin_offset, spacing)` where the offset is measured
+/// from the page edge (it already includes `pad`).
+fn distribute(
+    page_size: f64,
+    n: usize,
+    cell: f64,
+    base: f64,
+    max: f64,
+    pad: f64,
+    align: PageAlign,
+) -> (f64, f64) {
+    if align == PageAlign::Center {
+        // `leftEmptySpace += Math.floor(emptyHSpace / 2)`, `hSpacing = columnSpacing`.
+        let nf = n as f64;
+        let empty = page_size - cell * nf - base * (nf - 1.) - 2. * pad;
+        return (pad + (empty / 2.).floor().max(0.), base);
+    }
     if n <= 1 {
         let empty = page_size - cell - 2. * pad;
         return (pad + (empty / 2.).max(0.), 0.);
@@ -365,6 +408,16 @@ fn distribute(page_size: f64, n: usize, cell: f64, base: f64, max: f64, pad: f64
 
 impl AppGrid {
     pub fn new(clock: Clock) -> Self {
+        Self::with_modes(clock, &GRID_MODES, PageAlign::Fill)
+    }
+
+    /// A folder's inner grid — `FolderGrid` (`appDisplay.js:2066-2084`): the one 3×3
+    /// mode, its cells centered as a block rather than spread to fill the page.
+    pub fn folder_view(clock: Clock) -> Self {
+        Self::with_modes(clock, &FOLDER_GRID_MODES, PageAlign::Center)
+    }
+
+    fn with_modes(clock: Clock, modes: &'static [(usize, usize)], align: PageAlign) -> Self {
         Self {
             entries: Vec::new(),
             hovered: None,
@@ -374,6 +427,8 @@ impl AppGrid {
             reorder_restore: None,
             peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
             hint_hovered: None,
+            modes,
+            align,
             clock,
             cache: RefCell::new(GridCache::default()),
         }
@@ -469,6 +524,11 @@ impl AppGrid {
     /// The id of tile `i`, if present (what a click launches).
     pub fn entry_id(&self, i: usize) -> Option<&str> {
         self.entries.get(i).map(|e| e.id.as_str())
+    }
+
+    /// The display name of tile `i` — a folder's is the title its dialog carries.
+    pub fn entry_name(&self, i: usize) -> Option<&str> {
+        self.entries.get(i).map(|e| e.name.as_str())
     }
 
     /// Tile `i`'s folder members, if it is a folder rather than an app.
@@ -789,7 +849,8 @@ impl AppGrid {
 
         // Grid mode: the (columns, rows) whose ratio is closest to the content's.
         let ratio = content_w / content_h;
-        let &(cols, rows) = GRID_MODES
+        let &(cols, rows) = self
+            .modes
             .iter()
             .min_by(|a, b| {
                 let da = (a.0 as f64 / a.1 as f64 - ratio).abs();
@@ -822,9 +883,24 @@ impl AppGrid {
         let page = self.current_page.min(n_pages - 1);
 
         // Distribute spacing + centering per axis, then place the current page.
-        let (x_off, h_sp) = distribute(page_w, cols, cell, COL_SPACING, MAX_COL_SPACING, pad_h);
-        let (y_off, v_sp) =
-            distribute(page_h, rows, cell, ROW_SPACING, MAX_ROW_SPACING, PAGE_PAD_V);
+        let (x_off, h_sp) = distribute(
+            page_w,
+            cols,
+            cell,
+            COL_SPACING,
+            MAX_COL_SPACING,
+            pad_h,
+            self.align,
+        );
+        let (y_off, v_sp) = distribute(
+            page_h,
+            rows,
+            cell,
+            ROW_SPACING,
+            MAX_ROW_SPACING,
+            PAGE_PAD_V,
+            self.align,
+        );
         let origin_x = area.loc.x + x_off;
         let origin_y = area.loc.y + y_off;
 

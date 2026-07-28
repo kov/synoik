@@ -6953,7 +6953,7 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
     f.niri().sync_app_grid();
     assert_eq!(ids(&mut f), vec!["Utilities", "a.desktop"]);
 
-    // Clicking it launches nothing and leaves the overview up.
+    // Clicking it launches nothing and leaves the overview up — it opens instead.
     let area = overview_controls(&mut f).app_display;
     let center = f
         .niri()
@@ -6973,6 +6973,122 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
         f.niri().layout.is_app_grid_open(),
         "clicking a folder must not close the overview"
     );
+    assert_eq!(
+        f.niri().folder_dialog.folder_id(),
+        Some("Utilities"),
+        "clicking a folder opens its dialog (`FolderIcon.vfunc_clicked`)"
+    );
+}
+
+/// The app-folder dialog (`AppFolderDialog`, `appDisplay.js:2463-2916`): opening a folder
+/// puts its apps in their own view, launching one from inside works exactly as it does at
+/// the top level, and the dialog is *modal* — a click anywhere off the 720² panel pops it
+/// down rather than reaching the grid, and Escape closes it before it closes anything else.
+#[test]
+fn overview_folder_dialog_opens_launches_and_pops_down() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::gnome::AppFolder;
+
+    let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
+    f.niri().gnome_settings.app_folders = vec![AppFolder {
+        id: "Utilities".to_owned(),
+        name: "Utilities".to_owned(),
+        apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
+        ..Default::default()
+    }];
+    f.niri().sync_app_grid();
+
+    let view: Rectangle<f64, smithay::utils::Logical> =
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
+    let open_it = |f: &mut Fixture| {
+        let area = overview_controls(f).app_display;
+        // The folder sorts after "a.desktop" by name, so it is tile 1.
+        let center = f
+            .niri()
+            .app_grid
+            .tile_center(1, area)
+            .expect("the folder tile is in range");
+        pointer_motion_to(f, center.x, center.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.niri_complete_animations();
+    };
+
+    open_it(&mut f);
+    assert_eq!(f.niri().folder_dialog.folder_id(), Some("Utilities"));
+    assert_eq!(
+        (0..2)
+            .filter_map(|i| f.niri().folder_dialog.entry_id(i).map(str::to_owned))
+            .collect::<Vec<_>>(),
+        vec!["m.desktop", "z.desktop"],
+        "the dialog shows the folder's members"
+    );
+
+    // A click off the panel pops the dialog down and does NOT fall through to the grid
+    // tile that happens to be under it.
+    let panel = crate::ui::folder_dialog::layout(view).panel;
+    let outside: Point<f64, smithay::utils::Logical> =
+        Point::from((panel.loc.x - 40., panel.loc.y + panel.size.h / 2.));
+    pointer_motion_to(&mut f, outside.x, outside.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().folder_dialog.is_open(),
+        "a click outside pops down"
+    );
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "the modal swallowed the click; nothing under it launched"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "the grid is still there"
+    );
+
+    // Escape closes the folder first, leaving the grid open — the innermost tier of the
+    // overview's Escape ladder. (The overview has to actually hold keyboard focus for the
+    // ladder to be reachable at all.)
+    open_it(&mut f);
+    f.niri_state().update_keyboard_focus();
+    assert!(f.niri().keyboard_focus.is_overview());
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.niri().folder_dialog.is_open(),
+        "Escape pops the folder down"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "…and stops there rather than also leaving the grid"
+    );
+
+    // Launching from inside behaves exactly like a top-level tile: activate, then hide.
+    open_it(&mut f);
+    let grid_area = crate::ui::folder_dialog::layout(view).grid_area;
+    let member = f
+        .niri()
+        .folder_dialog
+        .tile_center(1, grid_area)
+        .expect("the second member is in range");
+    pointer_motion_to(&mut f, member.x, member.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one app launched");
+    assert_eq!(
+        calls[0].0.id, "z.desktop",
+        "the app inside the folder launched"
+    );
+    assert_eq!(calls[0].1, crate::app_system::ResolvedLaunch::Default);
+    drop(calls);
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and the overview closed"
+    );
+    assert!(!f.niri().folder_dialog.is_open(), "with the folder");
 }
 
 /// With more apps than fit one page, the grid paginates: a wheel scroll over it and a

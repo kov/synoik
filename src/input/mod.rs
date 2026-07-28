@@ -60,6 +60,7 @@ use crate::ui::app_grid::{
 };
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
+use crate::ui::folder_dialog::DialogHit;
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::overview_search::SearchHit;
 use crate::ui::popover::PopoverSide;
@@ -117,6 +118,8 @@ pub enum OverviewHit {
     GridPage(usize),
     /// A page navigation arrow.
     GridArrow(PageArrow),
+    /// The open app-folder dialog, which is modal over the rest of the overview.
+    Folder(DialogHit),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -837,10 +840,18 @@ impl State {
 
                     // If we didn't find any bind, try other hardcoded keys.
                     if this.niri.keyboard_focus.is_overview() && pressed {
-                        // Escape returns the app grid to the window picker first (the
-                        // grid tier of GNOME's overview Escape, `searchController.js:
-                        // 153-159`); only when already in the picker does it fall
-                        // through to the CloseOverview bind below.
+                        // Escape closes an open folder first — the dialog holds a
+                        // `GrabHelper` grab whose `onUngrab` pops it down
+                        // (`appDisplay.js:2879-2883`), so it is the innermost tier of
+                        // the overview's Escape ladder. Then the app grid returns to the
+                        // window picker (`searchController.js:153-159`); only when
+                        // already in the picker does it fall through to the
+                        // CloseOverview bind below.
+                        if raw == Some(Keysym::Escape) && this.niri.folder_dialog.popdown() {
+                            this.niri.suppressed_keys.insert(key_code);
+                            this.niri.queue_redraw_all();
+                            return FilterResult::Intercept(None);
+                        }
                         if raw == Some(Keysym::Escape) && this.niri.layout.close_app_grid() {
                             this.niri.suppressed_keys.insert(key_code);
                             this.niri.queue_redraw_all();
@@ -3160,7 +3171,12 @@ impl State {
         // and the one thing that lights up is the show-apps button while it is offering
         // to unpin the app being dragged (`ShowAppsIcon.setDragApp`, `dash.js:236-247`,
         // called from `_onItemDragMotion`, `dash.js:447-450`).
-        let (dash_hit, search_hit, grid_hit, arrow_hit) = if let Some(drag) = &self.niri.app_drag {
+        // An open app-folder dialog is modal over the overview, so nothing beneath it
+        // tracks `:hover` either — its own view does, below.
+        let folder_open = self.niri.folder_dialog.is_open();
+        let (dash_hit, search_hit, grid_hit, arrow_hit) = if folder_open {
+            (None, None, None, None)
+        } else if let Some(drag) = &self.niri.app_drag {
             (drag.unpin.then_some(DashHit::ShowApps), None, None, None)
         } else if self.niri.panel_popover.is_open() {
             // An open menu holds a `Clutter.Grab` (`PopupMenuManager`), so motion never
@@ -3213,6 +3229,19 @@ impl State {
         }
         if self.niri.app_grid.set_arrow_hovered(arrow_hit) {
             self.niri.queue_redraw_all();
+        }
+        if folder_open {
+            let under = self
+                .niri
+                .output_under(pos)
+                .map(|(output, p)| (output_size(output), p));
+            let (view, p) = match under {
+                Some((size, p)) => (Rectangle::from_size(size), Some(p)),
+                None => (Rectangle::default(), None),
+            };
+            if self.niri.folder_dialog.set_pointer(p, view) {
+                self.niri.queue_redraw_all();
+            }
         }
 
         // Hovering a window preview in the overview's picker grows it and raises it
@@ -4223,6 +4252,16 @@ impl State {
             return Some(OverviewHit::PreviewClose(window));
         }
 
+        // An open folder dialog is modal: it covers the monitor, so once it is up every
+        // point on the output belongs to it (`grabHelper.grab`, `appDisplay.js:2879`).
+        if let Some(hit) = self
+            .niri
+            .folder_dialog
+            .hit_test(pos, Rectangle::from_size(output_size(output)))
+        {
+            return Some(OverviewHit::Folder(hit));
+        }
+
         let controls = self.niri.layout.controls_layout_for_output(output)?;
 
         if let Some(hit) = self.niri.dash.hit_test(pos, controls.dash) {
@@ -4320,12 +4359,49 @@ impl State {
                 self.niri.overview_search.clear();
                 self.niri.sync_overview_search();
             }
+            // An app inside an open folder launches exactly like a top-level one, and
+            // the dialog goes down with the overview.
+            OverviewHit::Folder(DialogHit::App(i)) if launches => {
+                if let Some(id) = self.niri.folder_dialog.entry_id(i).map(str::to_owned) {
+                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
+                        tracing::warn!("folder launch of {id} failed: {err:?}");
+                    }
+                    self.niri.folder_dialog.popdown();
+                    self.niri.layout.close_overview();
+                }
+            }
+            // A click that misses the panel pops the dialog down (`clickGesture`,
+            // `appDisplay.js:2480-2487`); one that lands on it and hits no control is
+            // simply swallowed by the modal.
+            OverviewHit::Folder(DialogHit::Outside) if primary => {
+                self.niri.folder_dialog.popdown();
+            }
+            OverviewHit::Folder(DialogHit::Page(page)) if primary => {
+                let view = Rectangle::from_size(output_size(output));
+                self.niri.folder_dialog.set_page(page, view);
+            }
+            OverviewHit::Folder(DialogHit::Arrow(arrow)) if primary => {
+                let view = Rectangle::from_size(output_size(output));
+                self.niri.folder_dialog.step_page(arrow, view);
+            }
             // An app grid tile launches the app and closes the overview
             // (`AppIcon.activate`, `appDisplay.js:3060,3077`).
-            // A folder tile opens instead of launching (`FolderIcon.vfunc_clicked`,
-            // `appDisplay.js:2343`) — the dialog is slice F3, so for now a click on
-            // one does nothing rather than trying to launch a folder id.
+            // A folder tile opens its dialog instead of launching
+            // (`FolderIcon.vfunc_clicked` → `open()`, `appDisplay.js:2334-2343,2456`).
             OverviewHit::GridApp(i) if launches && self.niri.app_grid.entry_folder(i).is_some() => {
+                let Some(members) = self.niri.app_grid.entry_folder(i).map(<[_]>::to_vec) else {
+                    return;
+                };
+                let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) else {
+                    return;
+                };
+                let name = self
+                    .niri
+                    .app_grid
+                    .entry_name(i)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| id.clone());
+                self.niri.folder_dialog.popup(&id, &name, members);
             }
             OverviewHit::GridApp(i) if launches => {
                 if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {

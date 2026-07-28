@@ -2005,9 +2005,10 @@ const WC_ROW_GAP: f64 = 6.;
 const WC_COL_GAP: f64 = 12.;
 
 /// A logical text line height (the file's `pt * 1.3` convention, see
-/// [`placeholder_centers`]).
+/// [`placeholder_centers`]) — now the shared [`crate::ui::line_height_px`], which this
+/// file's convention became.
 fn line_h(pt: f64) -> f64 {
-    crate::ui::pt_to_px(pt) * 1.3
+    crate::ui::line_height_px(pt)
 }
 
 /// One formatted event row: the summary over its time string.

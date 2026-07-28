@@ -5,6 +5,7 @@ pub mod config_error_notification;
 pub mod dash;
 pub mod end_session_dialog;
 pub mod exit_confirm_dialog;
+pub mod folder_dialog;
 pub mod hotkey_overlay;
 pub mod input_source_menu;
 pub mod mru;
@@ -121,6 +122,17 @@ fn pt_to_px_at(base_pt: f64, pt: f64) -> f64 {
 /// `$base_border_radius` 8px, 1px borders) stay literal px — they are NOT em-relative.
 pub fn em(mult: f64) -> f64 {
     mult * pt_to_px(BASE_FONT_PT)
+}
+
+/// The logical height of one line of text at `pt` — the box a single-line label
+/// occupies, which is what a container's height is measured from.
+///
+/// St gets this from Pango's font metrics; we approximate with the `pt * 1.3` factor
+/// the calendar has used since it was ported (its `line_h`), so a band sized here and
+/// one sized there cannot drift. It is deliberately a *typographic* line box, not the
+/// glyph ink extents — [`widget::ShapedText`] carries those for centering within it.
+pub fn line_height_px(pt: f64) -> f64 {
+    pt_to_px(pt) * 1.3
 }
 
 #[cfg(test)]

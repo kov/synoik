@@ -879,8 +879,16 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
   headless-testable.
 * **F2 — the folder tile.** A grid entry becomes app-or-folder; render the raised `.app-folder` tile
   with the 2×2 sub-icon composition at 0.4×. Click opens (no dialog yet — assert the state).
-* **F3 — the dialog.** The 720² panel with its title, its own 3×3 paginated grid, launching from
-  inside, click-outside/Esc/Super to close.
+* **F3 — the dialog.** *(landed.)* The 720² panel with its title, its own 3×3 paginated grid,
+  launching from inside, click-outside/Esc to close. The inner view is **the app-grid widget
+  itself**: GNOME's `FolderGrid extends AppGrid` (`appDisplay.js:2066-2084`) differs only in the
+  page modes (one 3×3, no re-flow) and the page alignment (`CENTER` — the spacing stays at its
+  base and the slack becomes leading padding, where the top-level grid's `FILL` grows the
+  spacing), so `AppGrid::folder_view` sets those two and hover, captions, pagination, dots,
+  arrows and the batched icon uploads all come along. Divergences: no rename entry or edit
+  button (editing is deferred — the label centers on its own where GNOME balances the button
+  with a ghost actor), the panel is *clamped* to the work area rather than allowed to overflow a
+  short screen, and it draws on every output like the rest of our overview chrome.
 * **F4 — the zoom-and-fade.** The 200 ms popup/popdown against the source tile's rect, the shade
   ramp, and the source icon's half-duration fade.
 

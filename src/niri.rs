@@ -619,6 +619,8 @@ pub struct Niri {
     pub overview_search: OverviewSearch,
     /// The overview app grid (installed apps minus favorites).
     pub app_grid: AppGrid,
+    /// The app-folder dialog a click on a folder tile opens.
+    pub folder_dialog: crate::ui::folder_dialog::FolderDialog,
     /// GPU caches for the window picker's per-preview chrome (the close button).
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
@@ -3896,6 +3898,7 @@ impl Niri {
             dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
             app_grid: AppGrid::new(animation_clock.clone()),
+            folder_dialog: crate::ui::folder_dialog::FolderDialog::new(animation_clock.clone()),
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
             pending_launches: Vec::new(),
@@ -5914,6 +5917,19 @@ impl Niri {
                 .monitor_for_output(output)
                 .and_then(|mon| Some((mon.expose_progress()?, mon.controls_layout())))
             {
+                // The app-folder dialog is modal over the whole overview: gnome-shell
+                // parents it to the `overviewGroup` and raises it above every sibling
+                // (`addFolderDialog` + `popup`, `appDisplay.js:1621-1622,2888`), so it is
+                // pushed first — nothing else in the overview draws over it.
+                self.folder_dialog.render(
+                    ctx.renderer,
+                    &self.app_icon_cache,
+                    &self.icon_cache,
+                    output,
+                    Rectangle::from_size(output_size(output)),
+                    progress as f32,
+                    &mut |element| push(element.into()),
+                );
                 for element in self.dash.render(
                     ctx.renderer,
                     &self.app_icon_cache,
@@ -8693,7 +8709,21 @@ impl Niri {
                 (None, None) => by_name(),
             }
         });
-        self.app_grid.set_entries(entries)
+        // An open folder follows the model it was opened from: its members are re-resolved,
+        // and a folder that no longer resolves to anything takes its dialog down with it
+        // (GNOME destroys the `FolderIcon`, and the dialog is destroyed with its source,
+        // `appDisplay.js:2320-2325`).
+        let mut changed = if let Some(id) = self.folder_dialog.folder_id() {
+            let members = entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| Some((e.name.clone(), e.folder.clone()?)));
+            self.folder_dialog.resync(members)
+        } else {
+            false
+        };
+        changed |= self.app_grid.set_entries(entries);
+        changed
     }
 
     /// Note that the app catalog changed, and reload it once the pings stop.
@@ -8807,6 +8837,7 @@ impl Niri {
     pub fn drop_app_icon_uploads(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         self.dash.drop_icon_upload(icon, logical_px);
         self.app_grid.drop_icon_upload(icon, logical_px);
+        self.folder_dialog.drop_icon_upload(icon, logical_px);
         self.overview_search.drop_icon_upload(icon, logical_px);
         crate::ui::widget::drop_app_icon_upload(
             &mut self.app_drag_uploads.borrow_mut(),
@@ -8847,6 +8878,10 @@ impl Niri {
             }
             for icon in self.app_grid.folder_icon_refs() {
                 let _ = self.app_icon_cache.buffer(icon, subicon_px, scale);
+            }
+            // An open folder's own view draws its members at the full tile icon size.
+            for icon in self.folder_dialog.icon_refs() {
+                let _ = self.app_icon_cache.buffer(icon, grid_px, scale);
             }
         }
     }
@@ -9045,6 +9080,13 @@ impl Niri {
             // A fresh overview open starts the app grid on page 0
             // (`Main.overview 'hidden'` → `goToPage(0)`, `appDisplay.js:1342`).
             self.app_grid.reset_page();
+        }
+        // Leaving the app grid takes any open folder with it: the dialog's source icon
+        // unmaps, which releases its grab and hides it outright (`_zoomAndFadeOut`,
+        // `appDisplay.js:2691-2704`). That covers hiding the whole overview and
+        // returning to the window picker alike.
+        if !self.layout.is_app_grid_open() {
+            self.folder_dialog.popdown();
         }
         self.overview_search_was_visible = open;
     }
@@ -9621,6 +9663,7 @@ niri_render_elements! {
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,
+        FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).

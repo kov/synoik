@@ -8820,3 +8820,164 @@ fn the_attributed_union_stays_inside_the_work_it_measures() {
          phase would report itself as entirely unexplained"
     );
 }
+
+/// The app-folder dialog draws its three layers, bottom to top: the `DIALOG_SHADE_NORMAL`
+/// shade over the whole output, the opaque `.app-folder-dialog` panel (rounded to
+/// `$modal_radius * 4` — its square corner is *not* filled), and the folder's members in
+/// their own view inside it.
+#[test]
+fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+    use crate::ui::folder_dialog::FolderDialogRenderElement;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_folder_dialog_draws_its_panel_over_a_shade: no Vulkan ({e})");
+        return;
+    }
+
+    let dir = std::env::temp_dir();
+    let colors = [[220u8, 20, 20], [20, 220, 20]];
+    let paths: Vec<std::path::PathBuf> = colors
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let path = dir.join(format!("niri-folder-dlg-{}-{i}.png", std::process::id()));
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([c[0], c[1], c[2], 255]))
+                .save(&path)
+                .expect("write member icon");
+            path
+        })
+        .collect();
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    f.niri().folder_dialog.popup(
+        "Utilities",
+        "Utilities",
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| AppGridEntry {
+                id: format!("m{i}.desktop"),
+                name: format!("M{i}"),
+                icon: AppIconRef::File(path.clone()),
+                folder: None,
+            })
+            .collect(),
+    );
+
+    let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
+    let l = crate::ui::folder_dialog::layout(view);
+    let icons: Vec<_> = (0..2)
+        .map(|i| {
+            f.niri()
+                .folder_dialog
+                .icon_center(i, l.grid_area)
+                .expect("member icon center")
+        })
+        .collect();
+
+    let state = f.niri_state();
+    let composited =
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let niri = &mut state.niri;
+                let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
+                niri.folder_dialog.render(
+                    vk,
+                    &niri.app_icon_cache,
+                    &niri.icon_cache,
+                    &output,
+                    view,
+                    1.0,
+                    &mut |element| elements.push(element),
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            });
+
+    for path in &paths {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let Some(result) = composited else {
+        eprintln!("skipping vulkan_folder_dialog_draws_its_panel_over_a_shade: no Vulkan device");
+        return;
+    };
+    let (pixels, w) = result.expect("compositing the folder dialog through Vulkan must not error");
+
+    // Well clear of the panel: the shade, `rgba(0,0,0,204)`.
+    let shade = px(&pixels, w, 40, 40);
+    eprintln!("vulkan_folder_dialog: shade={shade:?}");
+    assert!(
+        shade[0] < 12 && shade[1] < 12 && shade[2] < 12,
+        "the shade is black: {shade:?}"
+    );
+    assert!(
+        (shade[3] as i32 - 204).abs() <= 3,
+        "the shade is DIALOG_SHADE_NORMAL's 204/255: {shade:?}"
+    );
+
+    // Inside the panel, below the grid and clear of every tile: the opaque overlay fill.
+    let inside = px(
+        &pixels,
+        w,
+        (l.panel.loc.x + 20.) as i32,
+        (l.panel.loc.y + l.panel.size.h - 20.) as i32,
+    );
+    eprintln!("vulkan_folder_dialog: panel={inside:?}");
+    assert_eq!(inside[3], 255, "the panel is opaque: {inside:?}");
+    for ch in 0..3 {
+        let want = (crate::ui::widget::style::OVERLAY_BG[ch] * 255.).round() as i32;
+        assert!(
+            (inside[ch] as i32 - want).abs() <= 4,
+            "the panel is $system_overlay_bg_color: {inside:?}"
+        );
+    }
+
+    // The panel's *square* corner is outside its 64px rounding, so the shade shows there.
+    let corner = px(
+        &pixels,
+        w,
+        (l.panel.loc.x + 3.) as i32,
+        (l.panel.loc.y + 3.) as i32,
+    );
+    eprintln!("vulkan_folder_dialog: corner={corner:?}");
+    assert_eq!(
+        corner, shade,
+        "the corner is cut by `$modal_radius * 4`, so the shade shows through: {corner:?}"
+    );
+
+    // And the members are drawn in the folder's own view.
+    for (i, (center, want)) in icons.iter().zip(&colors).enumerate() {
+        let got = px(&pixels, w, center.x as i32, center.y as i32);
+        eprintln!("vulkan_folder_dialog: member{i} at {center:?} = {got:?}");
+        for ch in 0..3 {
+            assert!(
+                (got[ch] as i32 - want[ch] as i32).abs() < 40,
+                "member {i} draws its own icon inside the dialog: got {got:?}, want {want:?}"
+            );
+        }
+    }
+}
