@@ -568,6 +568,13 @@ impl FolderDialog {
         }
     }
 
+    /// Tick the inner view's per-tile eases (see [`AppGrid::advance_animations`]).
+    pub fn advance_grid_animations(&mut self) {
+        if let Some(open) = &mut self.open {
+            open.view.advance_animations();
+        }
+    }
+
     /// Whether an open/close animation is still running (→ hold the redraw loop open).
     ///
     /// The inner view counts: a folder with more apps than one page paginates, and its
@@ -697,6 +704,14 @@ impl FolderDialog {
         let open = self.open.as_ref()?;
         open.view
             .drop_target_at(pos, layout(view).grid_area, dragged)
+    }
+
+    /// Mark a member as the one being dragged, so its tile scales and fades out of the
+    /// folder's view like a grid tile does (see [`AppGrid::set_dragged`]).
+    pub fn set_dragged(&mut self, id: Option<&str>) {
+        if let Some(open) = &mut self.open {
+            open.view.set_dragged(id);
+        }
     }
 
     /// Move a member to `target` within the folder. Returns whether anything moved.

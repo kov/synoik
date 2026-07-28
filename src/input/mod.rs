@@ -3879,6 +3879,7 @@ impl State {
         {
             self.niri.app_grid.add_placeholder(entry);
         }
+        let drag_id = id.clone();
         self.niri.app_drag = Some(AppDrag {
             id,
             icon,
@@ -3899,6 +3900,12 @@ impl State {
         // folder's view reorders on the same terms, and takes the same snapshot.
         self.niri.app_grid.begin_reorder();
         self.niri.folder_dialog.begin_reorder();
+        // The tile the drag picked up scales to half and fades away where it sits, so the
+        // slot it still occupies reads as empty while the drag is in flight
+        // (`_onDragBegin` → `scaleAndFade`, `appDisplay.js:1930-1934`). For a drag out of
+        // a folder that is the placeholder just added (`:1446`), which is the same call.
+        self.niri.app_grid.set_dragged(Some(&drag_id));
+        self.niri.folder_dialog.set_dragged(Some(&drag_id));
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
@@ -4416,6 +4423,9 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        // …and the tile it took eases back to full size (`undoScaleAndFade`).
+        self.niri.app_grid.set_dragged(None);
+        self.niri.folder_dialog.set_dragged(None);
         self.niri.app_grid.finish_reorder();
         if let Some(output) = save {
             self.save_app_picker_layout(output);
@@ -4550,6 +4560,9 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        // …and the tile it took eases back to full size (`undoScaleAndFade`).
+        self.niri.app_grid.set_dragged(None);
+        self.niri.folder_dialog.set_dragged(None);
 
         if let (Some(direction), Some(area)) = (hint, grid_area) {
             self.drop_onto_page(&drag.id, direction, area);
@@ -4657,6 +4670,9 @@ impl State {
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
         self.niri.app_grid.set_drag_active(false);
+        // …and the tile it took eases back to full size (`undoScaleAndFade`).
+        self.niri.app_grid.set_dragged(None);
+        self.niri.folder_dialog.set_dragged(None);
 
         let from_folder = drag.from_folder.clone();
         match drag.from_folder.filter(|_| !over_view) {

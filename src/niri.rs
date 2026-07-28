@@ -9240,6 +9240,11 @@ impl Niri {
             self.app_grid.set_focused(None);
         }
         self.folder_dialog.advance();
+        // The grid's tile eases (a reorder's reflow, the dragged tile's scale-fade) are
+        // per-tile animations with their own stagger delays, so they need a tick of their
+        // own rather than riding a single timeline.
+        self.app_grid.advance_animations();
+        self.folder_dialog.advance_grid_animations();
         // The source tile fades out under the opening dialog and back in as it shrinks
         // home, so the panel appears to *become* the icon (`appDisplay.js:2441-2451`).
         let fade = self

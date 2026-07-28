@@ -9196,6 +9196,233 @@ fn vulkan_folder_dialog_clips_its_pages_to_the_panel() {
     );
 }
 
+/// A reorder does not snap: every tile whose slot changed *eases* to it
+/// (`_shouldEaseItems` → `animateIconPosition`, `iconGrid.js:849,224-241`), and the
+/// dragged tile scales to half and fades away where it sits so its slot reads as empty
+/// (`scaleAndFade`, `appDisplay.js:1960-1966`).
+///
+/// Only a composite can see this: the model's entry order flips the instant the move
+/// commits either way, so every geometry assertion passes against a grid that snaps.
+#[test]
+fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::{AppGridEntry, DragLocation, GridDropTarget};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_app_grid_eases_tiles: no Vulkan device ({e})");
+        return;
+    }
+
+    // One saturated icon, so "where is that tile" is a pixel question. The rest are the
+    // fallback, which is what everything around it draws as.
+    let dir = std::env::temp_dir();
+    let marked = dir.join(format!("niri-grid-ease-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([230, 20, 20, 255]))
+        .save(&marked)
+        .expect("write the marker icon");
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Six apps on one page; the *second* is the marked one, so it has neighbours either
+    // side to be pushed past.
+    let entries: Vec<AppGridEntry> = (0..6)
+        .map(|i| AppGridEntry {
+            id: format!("e{i}.desktop"),
+            name: format!("E{i}"),
+            icon: if i == 1 {
+                AppIconRef::File(marked.clone())
+            } else {
+                AppIconRef::Fallback
+            },
+            folder: None,
+        })
+        .collect();
+    f.niri().app_grid.set_entries(entries);
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    let center = |f: &mut Fixture, i: usize| -> Point<f64, Logical> {
+        let t = f.niri().app_grid.entry_rect(i, area).expect("a tile");
+        Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.))
+    };
+    let (slot1, slot3) = (center(&mut f, 1), center(&mut f, 3));
+
+    /// A composite, its stride, and every element's center with its width.
+    type Shot = (Vec<u8>, i32, Vec<(Point<f64, Logical>, f64)>);
+    let shoot = |f: &mut Fixture| -> Shot {
+        let state = f.niri_state();
+        let composited =
+            state
+                .backend
+                .headless()
+                .with_vulkan_renderer(|vk| -> anyhow::Result<Shot> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                        crate::gnome::ACCENT_BLUE,
+                    );
+                    // A tile is more than its icon: a caption left behind while the icon
+                    // moves is invisible to a probe aimed at the icon, and the caption is
+                    // emitted by a different branch, so it is exactly the piece that can
+                    // be dropped unnoticed.
+                    let centers: Vec<(Point<f64, Logical>, f64)> = elements
+                        .iter()
+                        .map(|el| {
+                            let (loc, size) = (el.location(), el.logical_size());
+                            (
+                                Point::from((loc.x + size.w / 2., loc.y + size.h / 2.)),
+                                size.w,
+                            )
+                        })
+                        .collect();
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w, centers))
+                });
+        composited
+            .expect("no Vulkan device")
+            .expect("compositing the grid must not error")
+    };
+
+    // Where the marked icon is: the mean x of every red pixel across the icon row.
+    let red_x = |pixels: &[u8], w: i32, y: i32| -> Option<f64> {
+        let (mut sum, mut n) = (0i64, 0i64);
+        for x in 0..w {
+            let p = px(pixels, w, x, y);
+            if p[0] > 120 && p[1] < 90 && p[2] < 90 && p[3] > 120 {
+                sum += i64::from(x);
+                n += 1;
+            }
+        }
+        (n > 0).then(|| sum as f64 / n as f64)
+    };
+    let row_y = slot1.y.round() as i32;
+
+    let (pixels, w, _) = shoot(&mut f);
+    let at_rest = red_x(&pixels, w, row_y).expect("the marked icon draws at rest");
+    assert!(
+        (at_rest - slot1.x).abs() < 8.,
+        "it starts in slot 1: {at_rest} vs {}",
+        slot1.x
+    );
+
+    // Move it to slot 3 the way a drop does.
+    let per_page = f.niri().app_grid.items_per_page(area);
+    assert!(f.niri().app_grid.move_entry(
+        "e1.desktop",
+        GridDropTarget {
+            page: 0,
+            position: Some(3),
+            location: DragLocation::EndEdge,
+        },
+        per_page,
+    ));
+    assert!(
+        f.niri().app_grid.are_animations_ongoing(),
+        "the reflow holds the redraw loop open"
+    );
+
+    // Halfway through the 250 ms ease (plus this tile's stagger share). Measured on the
+    // *elements*, not the pixels: mid-flight the tiles pass through each other and the one
+    // on top hides part of the one below, so a colour probe reads a clipped shape.
+    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(130);
+    f.niri().clock.set_unadjusted(at);
+    f.niri().app_grid.advance_animations();
+    let (pixels, w, centers) = shoot(&mut f);
+    assert!(
+        red_x(&pixels, w, row_y).is_some(),
+        "the marked icon is still drawn mid-ease"
+    );
+
+    // Per-tile elements only: the page's shared bake spans the whole block and belongs to
+    // no single tile.
+    let tile_w = f
+        .niri()
+        .app_grid
+        .entry_rect(0, area)
+        .expect("a tile")
+        .size
+        .w;
+    let centers: Vec<Point<f64, Logical>> = centers
+        .into_iter()
+        .filter(|(_, w)| *w <= tile_w)
+        .map(|(c, _)| c)
+        .collect();
+    let slots: Vec<f64> = (0..6).map(|i| center(&mut f, i).x).collect();
+    let travelling: Vec<f64> = centers
+        .iter()
+        .map(|c| c.x)
+        .filter(|x| !slots.iter().any(|s| (s - x).abs() < 2.))
+        .collect();
+    eprintln!("vulkan_app_grid_ease: travelling {travelling:?} between {slots:?}");
+    assert!(
+        travelling
+            .iter()
+            .any(|x| *x > slot1.x + 20. && *x < slot3.x - 20.),
+        "mid-ease a tile is between slots, not snapped to one: {travelling:?}"
+    );
+    // Each travelling position must carry a *pair* of elements — the icon and its caption.
+    // A caption left behind still draws (it leaves the page bake either way), just at the
+    // slot, so it shows up as an unpaired position: exactly the failure mode of forgetting
+    // to move one of a tile's elements.
+    for x in &travelling {
+        let n = centers.iter().filter(|c| (c.x - x).abs() < 1.).count();
+        assert!(
+            n >= 2,
+            "the tile travelling at {x} carries its caption as well as its icon, got {n}: \
+             {centers:?}"
+        );
+    }
+
+    // And it arrives.
+    f.settle_animations();
+    f.niri().app_grid.advance_animations();
+    let (pixels, w, _) = shoot(&mut f);
+    let landed = red_x(&pixels, w, row_y).expect("the marked icon lands");
+    assert!(
+        (landed - slot3.x).abs() < 8.,
+        "it comes to rest in slot 3: {landed} vs {}",
+        slot3.x
+    );
+    assert!(
+        !f.niri().app_grid.are_animations_ongoing(),
+        "…and lets the redraw loop idle again"
+    );
+
+    // The dragged tile leaves a hole: picked up, it scales to half and fades to nothing.
+    f.niri().app_grid.set_dragged(Some("e1.desktop"));
+    f.settle_animations();
+    f.niri().app_grid.advance_animations();
+    let (pixels, w, _) = shoot(&mut f);
+    assert!(
+        red_x(&pixels, w, row_y).is_none(),
+        "the dragged tile has faded out of the grid it still holds a slot in"
+    );
+
+    let _ = std::fs::remove_file(&marked);
+}
+
 /// Mid-close, the dialog really is drawn shrunk toward its source tile: a point inside the
 /// resting panel but outside the shrunken one shows what is *behind* the dialog, not panel
 /// chrome. Sampled at a pinned instant — the end states are structurally blind to this (both

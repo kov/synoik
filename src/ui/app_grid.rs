@@ -48,6 +48,14 @@
 //! within [`EDGE_BUMP_PX`] of the grid's edge flips it at once. Dropping *on* a band
 //! sends the app to that page, creating one past the end.
 //!
+//! A reorder does not snap: every tile whose slot changed eases to it over
+//! [`TILE_EASE_MS`], staggered by [`ICON_POSITION_DELAY_MS`] in item order
+//! (`_shouldEaseItems` → `animateIconPosition`, `iconGrid.js:849,224-241`), and the
+//! dragged tile scales to [`DRAG_TILE_SCALE`] and fades away where it sits so its slot
+//! reads as empty (`scaleAndFade`, `appDisplay.js:1960-1971`). A tile that is moving,
+//! scaling or fading leaves the page's shared bakes and is emitted as its own elements —
+//! see [`TileActor`]; at rest there are none and a page costs exactly what it did.
+//!
 //! **Divergences, revisited later.** The icon's context menu is [`crate::ui::app_menu`],
 //! which builds New Window, the `.desktop` action section and the favourite toggle; its
 //! own doc lists what is missing there and why (Open Windows and Quit want per-window
@@ -70,6 +78,7 @@
 //! it on the primary only); hit-testing stays per-output.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
@@ -155,6 +164,26 @@ pub const DELAYED_MOVE_MS: u64 = 200;
 /// announce it, so the preview is its entire affordance — and the delay is what stops a
 /// folder forming every time a drag merely crosses an icon.
 pub const FOLDER_PREVIEW_MS: u64 = 500;
+
+/// How long a tile takes to reach a slot the reorder gave it, and how long the dragged
+/// tile takes to scale-and-fade out of the grid.
+///
+/// Neither `animateIconPosition` (`iconGrid.js:224-241`) nor `scaleAndFade`
+/// (`appDisplay.js:1960-1966`) names a duration: both go through
+/// `clutter_actor_save_easing_state`, which starts a *fresh* easing state at Clutter's
+/// defaults — 250 ms, `EASE_OUT_CUBIC`. `animateIconPosition` then overrides the mode to
+/// `EASE_OUT_QUAD`; `scaleAndFade` overrides nothing, so it keeps the cubic.
+const TILE_EASE_MS: u64 = 250;
+
+/// Stagger between successive tiles reflowing (`ICON_POSITION_DELAY`, `iconGrid.js:28`):
+/// the *n*-th tile whose box changed waits `n * 10 ms`, so a reorder ripples along the
+/// row instead of every icon jumping at once. Counted in item order, not by distance.
+const ICON_POSITION_DELAY_MS: u64 = 10;
+
+/// What the dragged tile shrinks to while its drag is in flight (`scaleAndFade`'s
+/// `scale_x/scale_y: 0.5`); it fades to nothing at the same time, so the slot it still
+/// occupies reads as empty.
+const DRAG_TILE_SCALE: f64 = 0.5;
 
 /// Bump the pointer within this many px of the grid's edge during a drag and the page
 /// switches at once (`DRAG_PAGE_SWITCH_IMMEDIATELY_THRESHOLD_PX`, `appDisplay.js:51`).
@@ -513,6 +542,14 @@ pub struct AppGrid {
     /// shrinks home (`appDisplay.js:2441-2451`). The *id* is folded into the bake
     /// revision, the alpha deliberately is not — see [`Self::set_tile_fade`].
     tile_fade: Option<(String, f64)>,
+    /// Tiles easing to a slot the reorder moved them to, keyed by app id
+    /// (`animateIconPosition`, `iconGrid.js:224-241`). Empty when the grid is at rest.
+    motions: std::collections::HashMap<String, TileMotion>,
+    /// The dragged tile and how far it has scaled-and-faded out of the grid: 0 = normal,
+    /// 1 = `DRAG_TILE_SCALE` and invisible (`scaleAndFade` / `undoScaleAndFade`,
+    /// `appDisplay.js:1960-1971`). Kept after the drag ends so the tile can ease *back*,
+    /// which is why this outlives [`Self::set_dragged`]`(None)`.
+    drag_fade: Option<(String, Animation)>,
     /// The page modes this grid may re-flow to, and what a page does with its slack.
     ///
     /// GNOME builds the folder's inner view from the *same* `AppGrid` as the top-level
@@ -523,6 +560,71 @@ pub struct AppGrid {
     align: PageAlign,
     clock: Clock,
     cache: RefCell<GridCache>,
+}
+
+/// A tile drawn as its own actor for a frame, because something about it is moving.
+///
+/// It leaves the page's shared bakes and its elements are transformed together: the
+/// offset carries a reorder's ease, the scale and alpha the dragged tile's `scaleAndFade`
+/// (and the alpha also the source tile's fade under an open folder dialog).
+#[derive(Debug)]
+struct TileActor {
+    offset: Point<f64, Logical>,
+    scale: f64,
+    alpha: f32,
+}
+
+/// One tile easing from the slot it had to the slot a reorder gave it
+/// (`animateIconPosition`, `iconGrid.js:224-241`).
+///
+/// The position is carried as a **continuous entry index** rather than a point, for two
+/// reasons: the model has no geometry (the layout is derived per render, from the area),
+/// and an ease interrupted by the next delayed move — which happens constantly, the move
+/// firing every 200 ms against a 250 ms ease — can then re-base on the value it had
+/// reached, the way a Clutter transition re-bases on the actor's current allocation.
+///
+/// **Divergence:** interpolating the index walks the tile *through* the slots between,
+/// where Clutter interpolates the allocation box and so travels in a straight line. They
+/// only differ for a move of more than one slot, and the only tile that ever makes one is
+/// the dragged tile, which is scaled and faded to nothing while it does.
+#[derive(Debug)]
+struct TileMotion {
+    /// The index it eases from — the fractional one it had reached, when a move
+    /// interrupts a move.
+    from: f64,
+    /// The index it is easing to.
+    target: usize,
+    /// When the ease starts: armed time plus this tile's `ICON_POSITION_DELAY` share.
+    /// Held still at `from` until then.
+    start_at: Duration,
+}
+
+impl TileMotion {
+    /// The entry index this tile draws at, now.
+    ///
+    /// Evaluated from the clock rather than driven by an [`Animation`] because the delay
+    /// has to be *skipped over*, not waited through: with a lazily-started animation, a
+    /// frame that arrives well after `start_at` would restart the ease from zero, and the
+    /// tile would jump back. (It also means a motion armed while the compositor is idle
+    /// is already partly done on the frame that first draws it, which is what Clutter's
+    /// clock-driven transitions do too.)
+    fn at(&self, clock: &Clock) -> f64 {
+        if clock.should_complete_instantly() {
+            return self.target as f64;
+        }
+        let now = clock.now();
+        if now <= self.start_at {
+            return self.from;
+        }
+        let elapsed = (now - self.start_at).as_secs_f64() * 1000.;
+        let p = (elapsed / TILE_EASE_MS as f64).clamp(0., 1.);
+        self.from + (self.target as f64 - self.from) * Curve::EaseOutQuad.y(p)
+    }
+
+    fn is_done(&self, clock: &Clock) -> bool {
+        clock.should_complete_instantly()
+            || clock.now() >= self.start_at + Duration::from_millis(TILE_EASE_MS)
+    }
 }
 
 /// Computed geometry for the app grid in one `app_display` box: the current page's
@@ -543,6 +645,9 @@ struct GridLayout {
     v_sp: f64,
     /// Tiles per page (`cols * rows`), which is what a `(page, position)` pair means.
     per_page: usize,
+    /// One page's pitch — the band width, since pages sit side by side. A tile easing to
+    /// a slot on the *next* page travels this far sideways as well.
+    page_w: f64,
     /// Total page count (0 when there are no apps).
     n_pages: usize,
     /// The page these `tiles` belong to (clamped `current_page`).
@@ -627,6 +732,8 @@ impl AppGrid {
             hint_hovered: None,
             drop_hover: None,
             tile_fade: None,
+            motions: std::collections::HashMap::new(),
+            drag_fade: None,
             modes,
             align,
             clock,
@@ -689,7 +796,13 @@ impl AppGrid {
     /// Whether the preview slide or a page slide is still running (→ hold the redraw
     /// loop open).
     pub fn are_animations_ongoing(&self) -> bool {
-        !self.peek.is_done() || (self.gesture.is_none() && !self.slide.is_done())
+        !self.peek.is_done()
+            || (self.gesture.is_none() && !self.slide.is_done())
+            || !self.motions.is_empty()
+            || self
+                .drag_fade
+                .as_ref()
+                .is_some_and(|(_, anim)| !anim.is_clamped_done())
     }
 
     /// Replace the grid's apps (`AppDisplay._redisplay`). Returns whether anything
@@ -1279,6 +1392,7 @@ impl AppGrid {
         let Some(from) = self.entries.iter().position(|e| e.id == id) else {
             return false;
         };
+        let before = self.order();
         let entry = self.entries.remove(from);
         let page_start = (target.page * per_page).min(self.entries.len());
         let page_end = (page_start + per_page).min(self.entries.len());
@@ -1294,6 +1408,7 @@ impl AppGrid {
         // app; a drag suppresses the wash anyway, so just drop it.
         self.hovered = None;
         self.content_rev += 1;
+        self.ease_to_new_slots(&before);
         true
     }
 
@@ -1400,6 +1515,91 @@ impl AppGrid {
         Some(apps)
     }
 
+    /// The ids in their current order — the `before` a reorder is diffed against.
+    fn order(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.id.clone()).collect()
+    }
+
+    /// Ease every tile whose slot changed to its new one — the whole of what GNOME gets
+    /// from `_shouldEaseItems` plus `animateIconPosition` (`iconGrid.js:849,224-241`),
+    /// which `moveItem`, `removeItem` and `addItem` all set for the next allocation.
+    ///
+    /// The stagger is `nChangedIcons * ICON_POSITION_DELAY` counted in *item order*, so
+    /// a reorder ripples along the row rather than snapping as a block.
+    fn ease_to_new_slots(&mut self, before: &[String]) {
+        let now = self.clock.now();
+        let mut rank = 0u32;
+        for (to, entry) in self.entries.iter().enumerate() {
+            let Some(from) = before.iter().position(|id| *id == entry.id) else {
+                continue; // new here — GNOME's `addItem` fades it in, we just place it
+            };
+            // Where the tile is *drawing* right now, which is what an interrupted ease
+            // has to continue from — not the slot it nominally occupied.
+            let at = match self.motions.get(&entry.id) {
+                Some(m) => m.at(&self.clock),
+                None => from as f64,
+            };
+            if (at - to as f64).abs() < f64::EPSILON {
+                self.motions.remove(&entry.id);
+                continue;
+            }
+            self.motions.insert(
+                entry.id.clone(),
+                TileMotion {
+                    from: at,
+                    target: to,
+                    start_at: now + Duration::from_millis(u64::from(rank) * ICON_POSITION_DELAY_MS),
+                },
+            );
+            rank += 1;
+        }
+    }
+
+    /// Retire the eases that are over. Called once a frame, like every other UI widget's
+    /// `advance` — the eases themselves are evaluated from the clock, so this only keeps
+    /// the map (and [`Self::are_animations_ongoing`]) honest.
+    pub fn advance_animations(&mut self) {
+        let clock = self.clock.clone();
+        self.motions.retain(|_, m| !m.is_done(&clock));
+        if let Some((_, anim)) = &self.drag_fade {
+            if anim.is_clamped_done() && anim.to() == 0. {
+                self.drag_fade = None;
+            }
+        }
+    }
+
+    /// The tile being dragged, which scales to [`DRAG_TILE_SCALE`] and fades out for as
+    /// long as the drag is in flight (`_onDragBegin` → `scaleAndFade`,
+    /// `appDisplay.js:1930-1934`). `None` eases it back (`undoScaleAndFade`), which is
+    /// why the state survives the call.
+    pub fn set_dragged(&mut self, id: Option<&str>) {
+        let to = if id.is_some() { 1. } else { 0. };
+        let id = match (id, &self.drag_fade) {
+            (Some(id), _) => id.to_owned(),
+            // Ending a drag we never started tracking: nothing to ease back.
+            (None, Some((id, _))) => id.clone(),
+            (None, None) => return,
+        };
+        let from = match &self.drag_fade {
+            Some((held, anim)) if *held == id => anim.value(),
+            _ => 1. - to,
+        };
+        if from == to {
+            return;
+        }
+        self.drag_fade = Some((
+            id,
+            Animation::ease(
+                self.clock.clone(),
+                from,
+                to,
+                0.,
+                TILE_EASE_MS,
+                Curve::EaseOutCubic,
+            ),
+        ));
+    }
+
     /// Snapshot the current order so a drag that ends nowhere can put it back
     /// (`_onDragCancelled` → `_redisplay`, `appDisplay.js:979-984`).
     pub fn begin_reorder(&mut self) {
@@ -1427,6 +1627,9 @@ impl AppGrid {
         self.entries = restored;
         self.hovered = None;
         self.content_rev += 1;
+        // A cancel is a `_redisplay`, and every grid call it makes eases too — the icons
+        // flow back rather than snapping.
+        self.ease_to_new_slots(&order);
         true
     }
 
@@ -1471,6 +1674,7 @@ impl AppGrid {
             h_sp: 0.,
             v_sp: 0.,
             per_page: 1,
+            page_w: 0.,
             n_pages: 0,
             page: 0,
             indicators: None,
@@ -1618,6 +1822,7 @@ impl AppGrid {
             h_sp,
             v_sp,
             per_page,
+            page_w,
             n_pages,
             page,
             indicators,
@@ -1874,17 +2079,68 @@ impl AppGrid {
             }
         }
 
-        // The tile the open folder dialog zoomed out of, page-relative, and the alpha it
-        // draws at. It leaves both shared bakes below and is re-emitted on its own, so its
-        // whole tile — background, caption and icons — fades as one actor does in GNOME.
-        let faded: Option<(usize, f32)> = self.tile_fade.as_ref().and_then(|(id, fade)| {
-            let k = page_entries.iter().position(|e| &e.id == id)?;
-            Some((k, alpha * *fade as f32))
-        });
-        let tile_alpha = |k: usize| match faded {
-            Some((f, a)) if f == k => a,
-            _ => alpha,
+        // --- Per-tile actors. Most of the page is drawn as two shared bakes, which is
+        //     what keeps a page cheap — but a tile that is *moving* (easing to a slot the
+        //     reorder gave it), *scaling out* (being dragged) or *fading* (the folder
+        //     whose dialog is open) has to move independently of the rest. Such a tile
+        //     leaves both bakes and is re-emitted as its own elements, which are then
+        //     transformed together — background, caption and icons — exactly as one
+        //     Clutter actor moves in GNOME. With nothing animating there are no actors
+        //     and the page costs what it always did. ---
+        let slot_origin = |idx: f64| -> Option<Point<f64, Logical>> {
+            // A slot's origin comes from *this* page's geometry plus the page offset:
+            // every page is laid out identically, a page pitch apart.
+            let at = |i: usize| -> Option<Point<f64, Logical>> {
+                let t = layout.tiles.get(i % layout.per_page)?;
+                let dx = (i / layout.per_page) as f64 - layout.page as f64;
+                Some(t.loc + Point::from((dx * layout.page_w, 0.)))
+            };
+            let i = idx.max(0.).floor() as usize;
+            let f = idx - i as f64;
+            let a = at(i)?;
+            if f <= 0. {
+                return Some(a);
+            }
+            let b = at(i + 1)?;
+            Some(a + (b - a).downscale(1. / f))
         };
+        let actors: Vec<Option<TileActor>> = page_entries
+            .iter()
+            .enumerate()
+            .map(|(k, entry)| {
+                let motion = self.motions.get(&entry.id).and_then(|m| {
+                    let from = slot_origin(m.at(&self.clock))?;
+                    let to = layout.tiles[k].loc;
+                    (from != to).then_some(from - to)
+                });
+                // `scaleAndFade`: the dragged tile keeps its slot but shrinks to half and
+                // fades away, so the gap it leaves reads as empty.
+                let dragged = self
+                    .drag_fade
+                    .as_ref()
+                    .filter(|(id, _)| *id == entry.id)
+                    .map(|(_, anim)| anim.clamped_value());
+                let fade = self
+                    .tile_fade
+                    .as_ref()
+                    .filter(|(id, _)| *id == entry.id)
+                    .map(|(_, f)| *f);
+                if motion.is_none() && dragged.is_none() && fade.is_none() {
+                    return None;
+                }
+                let d = dragged.unwrap_or(0.);
+                Some(TileActor {
+                    offset: motion.unwrap_or_default(),
+                    scale: 1. - (1. - DRAG_TILE_SCALE) * d,
+                    alpha: alpha * (1. - d) as f32 * fade.unwrap_or(1.) as f32,
+                })
+            })
+            .collect();
+        let has_actor = |k: usize| actors[k].is_some();
+        let tile_alpha = |k: usize| actors[k].as_ref().map_or(alpha, |a| a.alpha);
+        // Every element an actor tile owns, so the transform can be applied to the set
+        // once they are all built.
+        let mut actor_elements: Vec<(usize, usize)> = Vec::new();
 
         // --- App icons (topmost, over their tiles). A folder has no icon of its own:
         //     its tile composes its first four members into a 2×2 instead
@@ -1921,6 +2177,9 @@ impl AppGrid {
                     center,
                     tile_alpha(k),
                 ) {
+                    if has_actor(k) {
+                        actor_elements.push((k, elements.len()));
+                    }
                     elements.push(el);
                 }
             }
@@ -1948,12 +2207,14 @@ impl AppGrid {
             .zip(page_entries)
             .map(|(lines, e)| lines.first().is_none_or(|line| *line == e.name))
             .collect();
-        // A faded tile takes the *per-tile* caption path even though its name fits: that
+        // An actor tile takes the *per-tile* caption path even when its name fits: that
         // path already bakes one tile's label as its own element, which is exactly what
-        // letting it fade on its own needs. It drops out of the shared page bake below by
-        // the same `fits` filter.
-        if let Some((k, _)) = faded {
-            fits[k] = false;
+        // letting it move or fade on its own needs. It drops out of the shared page bake
+        // below by the same `fits` filter.
+        for (k, fits) in fits.iter_mut().enumerate() {
+            if has_actor(k) {
+                *fits = false;
+            }
         }
         // The previewing tile's caption is hidden outright (`icon.label.opacity = 0`), so
         // it simply leaves the shared bake and nothing is emitted in its place. Only an
@@ -2031,6 +2292,9 @@ impl AppGrid {
             ));
             let buffer =
                 TextureBuffer::from_texture(renderer, bake, scale, Transform::Normal, vec![]);
+            if has_actor(k) {
+                actor_elements.push((k, elements.len()));
+            }
             elements.push(TextureRenderElement::from_texture_buffer(
                 buffer,
                 at,
@@ -2115,12 +2379,13 @@ impl AppGrid {
         //     2px accent ring as the focus one, over a plainly transparentized accent
         //     fill rather than the focus background's mix. Under the focus ring, since a
         //     drag has no keyboard focus to fight with anyway. ---
-        if let Some((tile, ring_alpha)) = self
+        if let Some((k, tile, ring_alpha)) = self
             .drop_hover
             .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
-            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
+            .map(|i| (i - first, layout.tiles[i - first], tile_alpha(i - first)))
         {
             let ring = accent_f(FOCUS_RING_ALPHA);
+            let ring_at = elements.len();
             push_tile_ring(
                 renderer,
                 &mut cache.drop_bake,
@@ -2133,6 +2398,9 @@ impl AppGrid {
                 elements,
                 "drop ring",
             );
+            if has_actor(k) && elements.len() > ring_at {
+                actor_elements.push((k, ring_at));
+            }
         }
 
         // --- The keyboard focus ring (`.overview-tile:focus`, `_drawing.scss:308-327`):
@@ -2141,13 +2409,14 @@ impl AppGrid {
         //     over the background a `:focus:hover` tile still lightens. Same
         //     bake-one-tile-and-move-it shape as the wash; the accent rides its revision
         //     so a live accent change re-strokes it. ---
-        if let Some((mut tile, ring_alpha)) = self
+        if let Some((k, mut tile, ring_alpha)) = self
             .focused
             .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
-            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
+            .map(|i| (i - first, layout.tiles[i - first], tile_alpha(i - first)))
         {
             tile.size.h += focus_extra_h;
             let ring = accent_f(FOCUS_RING_ALPHA);
+            let ring_at = elements.len();
             push_tile_ring(
                 renderer,
                 &mut cache.focus_bake,
@@ -2160,15 +2429,18 @@ impl AppGrid {
                 elements,
                 "focus ring",
             );
+            if has_actor(k) && elements.len() > ring_at {
+                actor_elements.push((k, ring_at));
+            }
         }
 
         // --- The tile hover wash (`.overview-tile:hover`), a separate rounded-lighten
         //     element under the labels/icons. Baked at one tile's size and just
         //     repositioned as the pointer moves between tiles, so it costs no re-shape. ---
-        if let Some((mut tile, wash_alpha)) = self
+        if let Some((k, mut tile, wash_alpha)) = self
             .hovered
             .filter(|&i| (first..first + layout.tiles.len()).contains(&i))
-            .map(|i| (layout.tiles[i - first], tile_alpha(i - first)))
+            .map(|i| (i - first, layout.tiles[i - first], tile_alpha(i - first)))
         {
             // An expanded caption is taller than the one line the tile box reserves;
             // GNOME re-allocates the tile around it, so the wash covers the extra lines.
@@ -2196,6 +2468,9 @@ impl AppGrid {
                         Transform::Normal,
                         vec![],
                     );
+                    if has_actor(k) {
+                        actor_elements.push((k, elements.len()));
+                    }
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         tile.loc,
@@ -2217,7 +2492,7 @@ impl AppGrid {
             .iter()
             .zip(&layout.tiles)
             .enumerate()
-            .filter(|(k, (e, _))| e.folder.is_some() && faded.is_none_or(|(f, _)| f != *k))
+            .filter(|(k, (e, _))| e.folder.is_some() && !has_actor(*k))
             .map(|(_, (_, t))| Rectangle::new(t.loc - origin, t.size))
             .collect();
         if !folder_rects.is_empty() {
@@ -2259,10 +2534,14 @@ impl AppGrid {
             }
         }
 
-        // --- The faded tile's own resting fill. Same `.app-folder` background as the bake
-        //     above, alone in its own element so the fade can move every frame. Only a
-        //     folder has a resting fill, and only a folder is ever the faded tile. ---
-        if let Some((k, fade_alpha)) = faded.filter(|(k, _)| page_entries[*k].folder.is_some()) {
+        // --- The actor tiles' own resting fills. Same `.app-folder` background as the
+        //     bake above, one element each so they can move and fade every frame. Only a
+        //     folder has a resting fill at all. The bake is the same rounded rect for
+        //     every one of them, so they share the cache rather than fight over it. ---
+        for (k, entry) in page_entries.iter().enumerate() {
+            if !has_actor(k) || entry.folder.is_none() {
+                continue;
+            }
             let tile = layout.tiles[k];
             let radius = metrics.radius;
             match widget::bake(
@@ -2287,16 +2566,38 @@ impl AppGrid {
                         Transform::Normal,
                         vec![],
                     );
+                    actor_elements.push((k, elements.len()));
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         tile.loc,
-                        fade_alpha,
+                        tile_alpha(k),
                         None,
                         None,
                         Kind::Unspecified,
                     ));
                 }
-                Err(err) => tracing::error!("error baking the faded folder tile: {err:#}"),
+                Err(err) => tracing::error!("error baking an actor folder tile: {err:#}"),
+            }
+        }
+
+        // --- Finally, move the actor tiles. Each one's elements were built at its resting
+        //     slot; this slides them to where the ease has got to and, for the dragged
+        //     tile, scales them about the slot's center. Their alpha is already the
+        //     actor's, applied as each element was pushed. ---
+        for (k, i) in actor_elements {
+            let Some(actor) = &actors[k] else { continue };
+            let el = &mut elements[i];
+            if actor.scale != 1. {
+                let tile = layout.tiles[k];
+                let center = tile.loc + Point::from((tile.size.w / 2., tile.size.h / 2.));
+                let (loc, size) = (el.location(), el.logical_size());
+                el.set_location(center + (loc - center).upscale(actor.scale) + actor.offset);
+                // Sound only because a scaled tile is also translucent (it is scaling
+                // *out*), and a translucent element reports no opaque regions anyway —
+                // the same reasoning the folder dialog's zoom records.
+                el.set_size(size.upscale(actor.scale));
+            } else if actor.offset != Point::default() {
+                el.set_location(el.location() + actor.offset);
             }
         }
     }
