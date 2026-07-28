@@ -1064,6 +1064,22 @@ impl FolderDialog {
         let washed = open.rename.is_some() || open.edit_hovered;
         let size = l.edit_button.size;
         let _ = accent;
+
+        // The pencil goes in FIRST: the first element pushed is the topmost, so pushing the
+        // disc before it buries the glyph inside its own button.
+        if let Some(el) = widget::icon_element(
+            renderer,
+            sym_icons,
+            &["document-edit-symbolic"],
+            EDIT_ICON_PX,
+            scale,
+            style::TEXT,
+            l.edit_button.loc,
+            Point::from((size.w / 2., size.h / 2.)),
+        ) {
+            content.push(el);
+        }
+
         let revision = widget::Revision::new()
             .of(washed)
             .px(size.w)
@@ -1104,18 +1120,6 @@ impl FolderDialog {
                 ));
             }
             Err(err) => tracing::error!("error baking the folder edit button: {err:#}"),
-        }
-        if let Some(el) = widget::icon_element(
-            renderer,
-            sym_icons,
-            &["document-edit-symbolic"],
-            EDIT_ICON_PX,
-            scale,
-            style::TEXT,
-            l.edit_button.loc,
-            Point::from((size.w / 2., size.h / 2.)),
-        ) {
-            content.push(el);
         }
     }
 

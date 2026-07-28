@@ -9033,6 +9033,24 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
             .any(|(a, b)| a.abs_diff(*b) > 10),
         "…and so it is visible against the panel: disc={disc:?}, panel={inside:?}"
     );
+
+    // …and the pencil is drawn ON the disc. Same trap one level down: the glyph is a
+    // separate element from the button chrome, so pushing the chrome first hides it inside
+    // its own button. Scanned over the glyph's box rather than sampled at the exact center,
+    // where `document-edit-symbolic` has a gap between strokes.
+    let cx = (l.edit_button.loc.x + l.edit_button.size.w / 2.) as i32;
+    let cy = (l.edit_button.loc.y + l.edit_button.size.h / 2.) as i32;
+    let brightest = (cy - 8..=cy + 8)
+        .flat_map(|y| (cx - 8..=cx + 8).map(move |x| (x, y)))
+        .map(|(x, y)| px(&pixels, w, x, y)[0])
+        .max()
+        .unwrap();
+    eprintln!("vulkan_folder_dialog: brightest over the edit glyph={brightest}");
+    assert!(
+        i32::from(brightest) - i32::from(disc[0]) > 60,
+        "the pencil draws over its disc: brightest {brightest} vs disc {}",
+        disc[0]
+    );
 }
 
 /// Mid-close, the dialog really is drawn shrunk toward its source tile: a point inside the
