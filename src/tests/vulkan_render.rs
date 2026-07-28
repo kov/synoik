@@ -7299,6 +7299,100 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     );
 }
 
+/// While a drag is in flight the grid's side bands carry the `.page-navigation-hint`
+/// gradient and the *next page's* first column slides into the right one
+/// (`_syncPageIndicators` + `_translateNextPageIcons`, `appDisplay.js:311-397`). At rest
+/// the bands are empty — the grid content never reaches into them.
+#[test]
+fn vulkan_app_grid_previews_the_next_page_while_dragging() {
+    use smithay::utils::Logical;
+
+    use crate::app_system::AppIconRef;
+    use crate::ui::app_grid::AppGridEntry;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!(
+            "skipping vulkan_app_grid_previews_the_next_page_while_dragging: no device ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    // Enough apps to paginate, so there is a next page to preview.
+    f.niri().app_grid.set_entries(
+        (0..30)
+            .map(|i| AppGridEntry {
+                id: format!("app{i:02}.desktop"),
+                name: format!("App {i:02}"),
+                icon: AppIconRef::Fallback,
+            })
+            .collect(),
+    );
+
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+    // The right band is 10% of the width, so 1728..1920. Sample the *first* row of
+    // tiles: the next-page arrow lives in this band too, vertically centred, and it is
+    // there whether or not anything is being dragged.
+    let sample =
+        |f: &mut Fixture| -> u8 {
+            let state = f.niri_state();
+            let composited = state.backend.headless().with_vulkan_renderer(
+                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                    let niri = &mut state.niri;
+                    let elements = niri.app_grid.render(
+                        vk,
+                        &niri.app_icon_cache,
+                        &niri.icon_cache,
+                        &output,
+                        area,
+                        1.0,
+                    );
+                    let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                    let scale = Scale::from(output.current_scale().fractional_scale());
+                    let pixels = render_to_vec(
+                        vk,
+                        phys,
+                        scale,
+                        Transform::Normal,
+                        Fourcc::Abgr8888,
+                        elements.iter().rev(),
+                    )?;
+                    Ok((pixels, phys.w))
+                },
+            );
+            let (pixels, w) = composited
+                .expect("a Vulkan device")
+                .expect("compositing the app grid through Vulkan must not error");
+            // Brightest alpha anywhere over the band, across the first row of tiles.
+            (200..340)
+                .flat_map(|y| (1728..1918).map(move |x| (x, y)))
+                .map(|(x, y)| px(&pixels, w, x, y)[3])
+                .max()
+                .unwrap_or(0)
+        };
+
+    let at_rest = sample(&mut f);
+    assert_eq!(at_rest, 0, "with no drag the side bands are empty");
+
+    f.niri().app_grid.set_drag_active(true);
+    f.settle_animations();
+    let peeking = sample(&mut f);
+    eprintln!("vulkan_app_grid preview: {peeking}");
+    assert!(
+        peeking > 128,
+        "the next page's first column must slide into the band — the 5% hint gradient \
+         alone could not reach this: {peeking}"
+    );
+}
+
 /// The grid's batch icon upload path: two distinct icons (so the page has >1 pending upload,
 /// tripping `import_memory_batch`) must both draw, each with its own colors — proving the single
 /// submit uploaded every texture correctly, not a swapped/blank one.

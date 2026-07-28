@@ -40,6 +40,14 @@
 //! drop persists the arrangement to `app-picker-layout` (`_savePages`). A drag nobody
 //! accepted puts the order back.
 //!
+//! **Page previews.** While any overview item drag is in flight the two reserved side
+//! bands fade in as `.page-navigation-hint` gradients and the adjacent pages' tiles
+//! slide into them ([`AppGrid::set_drag_active`], `_syncPageIndicators`,
+//! `appDisplay.js:364-397`). Hovering a band for [`PAGE_SWITCH_INITIAL_MS`] flips the
+//! page and then keeps flipping every [`PAGE_SWITCH_REPEAT_MS`]; bumping the pointer
+//! within [`EDGE_BUMP_PX`] of the grid's edge flips it at once. Dropping *on* a band
+//! sends the app to that page, creating one past the end.
+//!
 //! **Divergences, revisited later.** No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
 //! 1:1 swipe is deferred), no keyboard paging (`Page_Up/Down`), and no folders — so the
@@ -62,6 +70,7 @@ use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
+use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -129,6 +138,32 @@ const DIVIDER_LEEWAY: f64 = 20.;
 /// (`DELAYED_MOVE_TIMEOUT`, `appDisplay.js:55`). The reflow is live and provisional —
 /// the drop commits it, a drag that ends elsewhere throws it away.
 pub const DELAYED_MOVE_MS: u64 = 200;
+
+/// Bump the pointer within this many px of the grid's edge during a drag and the page
+/// switches at once (`DRAG_PAGE_SWITCH_IMMEDIATELY_THRESHOLD_PX`, `appDisplay.js:51`).
+/// It is also the distance the pointer must come back inside before another bump
+/// counts, so leaning on the edge switches once, not continuously.
+pub const EDGE_BUMP_PX: f64 = 20.;
+/// Hovering a hint band this long switches the page
+/// (`DRAG_PAGE_SWITCH_INITIAL_TIMEOUT`, `appDisplay.js:50`).
+pub const PAGE_SWITCH_INITIAL_MS: u64 = 1000;
+/// …and it keeps switching at this interval afterwards, from either mechanism
+/// (`DRAG_PAGE_SWITCH_REPEAT_TIMEOUT`, `appDisplay.js:53`).
+pub const PAGE_SWITCH_REPEAT_MS: u64 = 1000;
+
+/// How long the page previews take to slide in and out (`PAGE_PREVIEW_ANIMATION_TIME`,
+/// `appDisplay.js:45`; `EASE_OUT_CUBIC`, `appDisplay.js:445-448`).
+const PAGE_PREVIEW_MS: u64 = 150;
+
+/// `.page-navigation-hint`'s gradient stop (`_app-grid.scss:152,157`): `$system_fg_color`
+/// at 5%, fading to transparent toward the screen edge.
+const HINT_COLOR: [f32; 4] = [1., 1., 1., 0.05];
+/// The same band while a drag is over it (`.page-navigation-hint.dnd`,
+/// `_app-grid.scss:151-153`) — a flat 10% fill, no gradient.
+const HINT_DND_COLOR: [f32; 4] = [1., 1., 1., 0.1];
+/// `$modal_radius * 1.5` (`_app-grid.scss:160,168`). Only the band's **inner** corners
+/// are cut; see [`widget::Painter::fill_rounded_faded`] for how that is expressed.
+const HINT_RADIUS: f64 = 36.;
 
 /// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
 /// `appDisplay.js:47`) — half of it on each side.
@@ -205,6 +240,11 @@ struct GridCache {
     long_labels: std::collections::HashMap<usize, widget::BakeCache>,
     /// The (constant) navigation-arrow hover-wash disc.
     arrow_bake: widget::BakeCache,
+    /// The two page-preview hint bands, previous then next.
+    hint_bakes: [widget::BakeCache; 2],
+    /// Captions of the pages peeking in during a drag, one bake per page — dropped
+    /// when the previews go away, since they exist only for the length of a drag.
+    peek_bakes: std::collections::HashMap<usize, widget::BakeCache>,
     /// Full-color icon uploads (shared key space with the dash's and search's).
     icons: AppIconUploads,
 }
@@ -226,13 +266,15 @@ pub struct AppGrid {
     /// The order as it was when a drag started, so an unsuccessful drop can put it
     /// back — the live reflow is provisional (`_onDragCancelled`, `appDisplay.js:979`).
     reorder_restore: Option<Vec<String>>,
+    /// 0→1 while an item drag is in flight: how far the page previews have slid in
+    /// (`_pageIndicatorsAdjustment`, `appDisplay.js:441-468`). Shown for *any* overview
+    /// item drag, not only a grid one — the bands are also how an icon reaches a page
+    /// it can't see.
+    peek: Animation,
+    /// Which hint band the drag is over, if any — the `.dnd` flat fill.
+    hint_hovered: Option<PageArrow>,
+    clock: Clock,
     cache: RefCell<GridCache>,
-}
-
-impl Default for AppGrid {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Computed geometry for the app grid in one `app_display` box: the current page's
@@ -259,6 +301,9 @@ struct GridLayout {
     page: usize,
     /// The dot centers below the grid, one per page — `None` when `n_pages <= 1`.
     indicators: Option<Vec<Point<f64, Logical>>>,
+    /// The reserved side bands, previous then next ([`indicators_w`]) — the navigation
+    /// arrows sit in them and the page previews slide into them.
+    hints: [Rectangle<f64, Logical>; 2],
     /// The previous-page arrow's disc box — `Some` only when a previous page exists.
     prev_arrow: Option<Rectangle<f64, Logical>>,
     /// The next-page arrow's disc box — `Some` only when a next page exists.
@@ -288,7 +333,7 @@ fn distribute(page_size: f64, n: usize, cell: f64, base: f64, max: f64, pad: f64
 }
 
 impl AppGrid {
-    pub fn new() -> Self {
+    pub fn new(clock: Clock) -> Self {
         Self {
             entries: Vec::new(),
             hovered: None,
@@ -296,8 +341,68 @@ impl AppGrid {
             current_page: 0,
             content_rev: 0,
             reorder_restore: None,
+            peek: Animation::ease(clock.clone(), 0., 0., 0., 0, Curve::EaseOutCubic),
+            hint_hovered: None,
+            clock,
             cache: RefCell::new(GridCache::default()),
         }
+    }
+
+    /// Slide the page previews in or out (`showPageIndicators` / `hidePageIndicators`,
+    /// `appDisplay.js:441-468`). Returns whether it started moving (→ redraw).
+    pub fn set_drag_active(&mut self, active: bool) -> bool {
+        let to = if active { 1. } else { 0. };
+        if self.peek.to() == to {
+            return false;
+        }
+        self.peek = Animation::ease(
+            self.clock.clone(),
+            self.peek.value(),
+            to,
+            0.,
+            PAGE_PREVIEW_MS,
+            Curve::EaseOutCubic,
+        );
+        if !active {
+            self.hint_hovered = None;
+        }
+        true
+    }
+
+    /// Mark which hint band a drag is over — its `.dnd` fill. Returns whether it
+    /// changed (→ redraw).
+    pub fn set_hint_hovered(&mut self, hint: Option<PageArrow>) -> bool {
+        if self.hint_hovered == hint {
+            return false;
+        }
+        self.hint_hovered = hint;
+        true
+    }
+
+    /// The hint band `pos` is inside, if the previews are showing and that band leads
+    /// anywhere. The *next* band is live even on the last page — dropping there is how
+    /// a new page gets made (`appDisplay.js:270-274`).
+    pub fn hint_at(
+        &self,
+        pos: Point<f64, Logical>,
+        area: Rectangle<f64, Logical>,
+    ) -> Option<PageArrow> {
+        if self.peek.value() <= 0. {
+            return None;
+        }
+        let layout = self.layout(area);
+        if layout.n_pages == 0 {
+            return None;
+        }
+        if layout.page > 0 && layout.hints[0].contains(pos) {
+            return Some(PageArrow::Prev);
+        }
+        layout.hints[1].contains(pos).then_some(PageArrow::Next)
+    }
+
+    /// Whether the preview slide is still running (→ hold the redraw loop open).
+    pub fn are_animations_ongoing(&self) -> bool {
+        !self.peek.is_done()
     }
 
     /// Replace the grid's apps (`AppDisplay._redisplay`). Returns whether anything
@@ -607,6 +712,7 @@ impl AppGrid {
             indicators: None,
             prev_arrow: None,
             next_arrow: None,
+            hints: [Rectangle::default(); 2],
         };
         let n = self.entries.len();
         // The grid page is the band minus the reserved dots strip.
@@ -733,6 +839,7 @@ impl AppGrid {
             indicators,
             prev_arrow,
             next_arrow,
+            hints,
         }
     }
 
@@ -1169,6 +1276,207 @@ impl AppGrid {
             }
         }
 
+        // --- The page-preview hint bands (`.page-navigation-hint`), below everything
+        //     else in the grid. They slide in from the screen edge while an item drag
+        //     is in flight (`_syncPageIndicators`, `appDisplay.js:364-397`): at peek 0
+        //     each sits fully outside its own band, at 1 it fills it. ---
+        let peek = self.peek.clamped_value();
+        if peek > 0. {
+            // The previous band leads nowhere from page 0; the next one is live even on
+            // the last page, because dropping there is what makes a new page
+            // (`appDisplay.js:270-274`).
+            let live = [layout.page > 0, layout.n_pages > 0];
+            for (i, band) in layout.hints.iter().enumerate() {
+                if !live[i] {
+                    continue;
+                }
+                let prev = i == 0;
+                let dnd = self.hint_hovered
+                    == Some(if prev {
+                        PageArrow::Prev
+                    } else {
+                        PageArrow::Next
+                    });
+                let (color, ramp) = if dnd {
+                    (HINT_DND_COLOR, (0., 0.))
+                } else if prev {
+                    // Brightest at the band's inner (right) edge, fading to the screen
+                    // edge — `.previous:ltr` runs transparent → colour left to right.
+                    (HINT_COLOR, (1., 0.))
+                } else {
+                    (HINT_COLOR, (0., 1.))
+                };
+                // Only the *inner* corners are cut (`border-radius: 0 36 36 0` on the
+                // previous band, `36 0 0 36` on the next), so run the rect past the
+                // buffer's outer edge and let those corners clip away.
+                let fill = Rectangle::new(
+                    Point::from((if prev { -HINT_RADIUS } else { 0. }, 0.)),
+                    Size::from((band.size.w + HINT_RADIUS, band.size.h)),
+                );
+                let revision = widget::Revision::new().of(dnd).of(prev).done();
+                match widget::bake(
+                    renderer,
+                    &mut cache.hint_bakes[i],
+                    scale,
+                    band.size,
+                    revision,
+                    |_| Ok(()),
+                    move |frame, phys, _: &()| {
+                        let mut p = Painter::new(frame, scale, phys);
+                        p.clear(style::TRANSPARENT)?;
+                        if ramp == (0., 0.) {
+                            p.fill_rounded(fill, HINT_RADIUS, color)?;
+                        } else {
+                            p.fill_rounded_faded(fill, HINT_RADIUS, color, ramp.0, ramp.1)?;
+                        }
+                        Ok(())
+                    },
+                ) {
+                    Ok(texture) => {
+                        let buffer = TextureBuffer::from_texture(
+                            renderer,
+                            texture,
+                            scale,
+                            Transform::Normal,
+                            vec![],
+                        );
+                        // Off its own outer edge at peek 0, in place at 1.
+                        let slide = (1. - peek) * band.size.w * if prev { -1. } else { 1. };
+                        elements.push(TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            Point::from((band.loc.x + slide, band.loc.y)),
+                            alpha,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ));
+                    }
+                    Err(err) => tracing::error!("error baking a page-preview hint: {err:#}"),
+                }
+            }
+
+            // --- The preview itself: the adjacent pages' tiles, translated so that the
+            //     previous page's last column and the next page's first come to rest
+            //     just inside their band (`_translatePreviousPageIcons` /
+            //     `_translateNextPageIcons`, `appDisplay.js:311-362`). They travel a
+            //     whole page width, so at peek 0 they are off the output entirely —
+            //     which is the clip GNOME gets from `clip_to_allocation`. ---
+            let cell = layout.metrics.size().h;
+            let neighbours = [
+                (layout.page.checked_sub(1), {
+                    // Last column's right edge one spacing short of the band's inside.
+                    let at =
+                        layout.hints[0].loc.x + layout.hints[0].size.w - layout.h_sp - block.size.w;
+                    at - (1. - peek) * area.size.w
+                }),
+                (
+                    (layout.page + 1 < layout.n_pages).then(|| layout.page + 1),
+                    layout.hints[1].loc.x + layout.h_sp + (1. - peek) * area.size.w,
+                ),
+            ];
+            for (page, block_x) in neighbours {
+                let Some(page) = page else { continue };
+                let first = page * layout.per_page;
+                let Some(page_entries) = self
+                    .entries
+                    .get(first..(first + layout.per_page).min(self.entries.len()))
+                else {
+                    continue;
+                };
+                let rel: Vec<Rectangle<f64, Logical>> = (0..page_entries.len())
+                    .map(|k| {
+                        let (r, c) = (k / layout.cols, k % layout.cols);
+                        Rectangle::new(
+                            Point::from((
+                                c as f64 * (cell + layout.h_sp),
+                                r as f64 * (cell + layout.v_sp),
+                            )),
+                            layout.metrics.size(),
+                        )
+                    })
+                    .collect();
+                let origin = Point::from((block_x, block.loc.y));
+
+                for (k, entry) in page_entries.iter().enumerate() {
+                    let tile = Rectangle::new(origin + rel[k].loc, rel[k].size);
+                    // Everything but the edge column is off the output; skip it.
+                    if !tile.overlaps(area) {
+                        continue;
+                    }
+                    if let Some(el) = widget::app_icon_element(
+                        renderer,
+                        &mut cache.icons,
+                        app_icons,
+                        &entry.icon,
+                        metrics.icon_px,
+                        scale,
+                        Point::from((0., 0.)),
+                        metrics.icon_center(tile),
+                        alpha,
+                    ) {
+                        elements.push(el);
+                    }
+                }
+
+                // The captions ride one bake per neighbouring page, keyed on the page
+                // and the catalog — so the whole slide repositions a cached texture.
+                let names: Vec<String> = page_entries
+                    .iter()
+                    .map(|e| {
+                        widget::tile_label_lines(&e.name, LABEL_PT, label_w, false)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let revision = widget::Revision::new().of(page).of(self.content_rev).done();
+                let paint_rects = rel.clone();
+                match widget::bake(
+                    renderer,
+                    cache.peek_bakes.entry(page).or_default(),
+                    scale,
+                    block.size,
+                    revision,
+                    move |r| {
+                        let mut shaper = widget::TextShaper::new(r, scale);
+                        names
+                            .iter()
+                            .map(|name| shaper.shape(name, widget::TextStyle::new(LABEL_PT)))
+                            .collect::<anyhow::Result<Vec<_>>>()
+                    },
+                    move |frame, phys, labels| {
+                        let mut p = Painter::new(frame, scale, phys);
+                        p.clear(style::TRANSPARENT)?;
+                        for (rect, label) in paint_rects.iter().zip(labels.iter()) {
+                            p.labelled_tile(*rect, label, &metrics, false, style::TEXT)?;
+                        }
+                        Ok(())
+                    },
+                ) {
+                    Ok(texture) => {
+                        let buffer = TextureBuffer::from_texture(
+                            renderer,
+                            texture,
+                            scale,
+                            Transform::Normal,
+                            vec![],
+                        );
+                        elements.push(TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            origin,
+                            alpha,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ));
+                    }
+                    Err(err) => tracing::error!("error baking a page preview: {err:#}"),
+                }
+            }
+        } else {
+            cache.peek_bakes.clear();
+        }
+
         // --- The page-indicator dots, below the grid (a single baked strip). ---
         if let Some(centers) = &layout.indicators {
             let page = layout.page;
@@ -1324,8 +1632,14 @@ mod tests {
         }
     }
 
+    use std::time::Duration;
+
     fn grid_n(n: usize) -> AppGrid {
-        let mut g = AppGrid::new();
+        grid_with_clock(n, Clock::with_time(Duration::ZERO))
+    }
+
+    fn grid_with_clock(n: usize, clock: Clock) -> AppGrid {
+        let mut g = AppGrid::new(clock);
         g.set_entries(
             (0..n)
                 .map(|i| entry(&format!("app{i:02}.desktop"), &format!("App {i:02}")))
@@ -1543,6 +1857,53 @@ mod tests {
                 vec!["app04.desktop".to_owned()],
             ]
         );
+    }
+
+    /// The preview bands are only a target while a drag is in flight, and only in a
+    /// direction that leads somewhere — except the *next* one, which stays live on the
+    /// last page because dropping there is what makes a new page
+    /// (`_syncPageIndicatorsVisibility`, `appDisplay.js:270-274`).
+    #[test]
+    fn the_preview_bands_are_targets_only_while_a_drag_is_in_flight() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut g = grid_with_clock(30, clock.clone());
+        let area = wide();
+        let mid_y = area.loc.y + area.size.h / 2.;
+        let band = indicators_w(area.size.w);
+        let left = Point::from((area.loc.x + band / 2., mid_y));
+        let right = Point::from((area.loc.x + area.size.w - band / 2., mid_y));
+
+        assert_eq!(g.hint_at(left, area), None, "no drag, no bands");
+        assert_eq!(g.hint_at(right, area), None);
+
+        assert!(g.set_drag_active(true));
+        assert!(g.are_animations_ongoing(), "the previews slide in");
+        clock.set_unadjusted(Duration::from_millis(PAGE_PREVIEW_MS));
+        assert!(!g.are_animations_ongoing());
+
+        assert_eq!(
+            g.hint_at(left, area),
+            None,
+            "page 0 has no previous page to preview"
+        );
+        assert_eq!(g.hint_at(right, area), Some(PageArrow::Next));
+        assert_eq!(
+            g.hint_at(Point::from((area.loc.x + area.size.w / 2., mid_y)), area),
+            None,
+            "the middle of the grid is not a band"
+        );
+
+        g.set_page(1, area);
+        assert_eq!(g.hint_at(left, area), Some(PageArrow::Prev));
+        assert_eq!(
+            g.hint_at(right, area),
+            Some(PageArrow::Next),
+            "the last page still previews forward — that is how a page is created"
+        );
+
+        assert!(g.set_drag_active(false));
+        clock.set_unadjusted(Duration::from_millis(2 * PAGE_PREVIEW_MS));
+        assert_eq!(g.hint_at(right, area), None, "the drag ended");
     }
 
     /// `indicatorsPadding`: 10% of the band on each side, floored at an arrow's own

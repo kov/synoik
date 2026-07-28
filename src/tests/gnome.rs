@@ -6827,6 +6827,41 @@ fn overview_dragging_a_grid_icon_reorders_the_grid() {
     );
 }
 
+/// Dropping a dragged icon on a page-preview band sends it to that page and follows it
+/// there (`acceptDrop`'s hint branch, `appDisplay.js:1004-1013`). Stepping past the last
+/// page is allowed — that is how a new page gets made.
+#[test]
+fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
+    let apps: Vec<String> = (0..30).map(|i| format!("app{i:02}.desktop")).collect();
+    let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
+    let (mut f, _recorder) = app_grid_fixture(&[], &refs);
+
+    let area = overview_controls(&mut f).app_display;
+    assert_eq!(f.niri().app_grid.page_count(area), 2, "30 apps paginate");
+    assert_eq!(f.niri().app_grid.entry_id(0), Some("app00.desktop"));
+
+    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    pointer_motion_to(&mut f, start.x, start.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // Out to the right band. It only becomes a target once the previews have slid in.
+    let right = area.loc.x + area.size.w - 20.;
+    pointer_motion_to(&mut f, right, start.y);
+    f.settle_animations();
+    pointer_motion_to(&mut f, right - 1., start.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(
+        f.niri().app_grid.current_page(),
+        1,
+        "the view must follow the app to its new page"
+    );
+    assert_eq!(
+        f.niri().app_grid.entry_id(29),
+        Some("app00.desktop"),
+        "the app appends to the page it was dropped onto"
+    );
+}
+
 /// The grid holds the installed apps minus favorites, name-sorted.
 #[test]
 fn overview_app_grid_click_launches_and_closes() {

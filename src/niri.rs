@@ -639,6 +639,13 @@ pub struct Niri {
     pub grid_pending_move: Option<(crate::ui::app_grid::GridDropTarget, usize)>,
     /// The timer arming that move; dropped and re-armed whenever the target changes.
     pub grid_move_timer: Option<RegistrationToken>,
+    /// The timer that flips the grid's page while a drag hovers a preview band or leans
+    /// on the screen edge (`appDisplay.js:827-921`) — first the initial delay, then the
+    /// repeat.
+    pub grid_page_switch_timer: Option<RegistrationToken>,
+    /// Where the pointer was when an edge bump last fired, so leaning on the edge
+    /// switches once rather than continuously (`_lastOvershootCoord`).
+    pub grid_page_switch_overshoot: Option<f64>,
     /// When the app grid last flipped a page on a wheel notch, to debounce a fast
     /// spin (`SCROLL_TIMEOUT_TIME`=150ms, `appDisplay.js:696-701`).
     pub app_grid_last_page_flip: Option<Duration>,
@@ -3877,7 +3884,7 @@ impl Niri {
             overview_was_open: false,
             dash: Dash::new(animation_clock.clone()),
             overview_search: OverviewSearch::new(),
-            app_grid: AppGrid::new(),
+            app_grid: AppGrid::new(animation_clock.clone()),
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
             pending_launches: Vec::new(),
@@ -3886,6 +3893,8 @@ impl Niri {
             app_drag_uploads: RefCell::new(AppIconUploads::default()),
             grid_pending_move: None,
             grid_move_timer: None,
+            grid_page_switch_timer: None,
+            grid_page_switch_overshoot: None,
             app_grid_last_page_flip: None,
             overview_search_was_visible: false,
             overview_search_fade: None,
@@ -6411,6 +6420,7 @@ impl Niri {
             // The dash's drop gap eases shut after a drop, with no pointer motion left
             // to generate the frames it needs.
             state.unfinished_animations_remain |= self.dash.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.app_grid.are_animations_ongoing();
             // The overview search cross-fade lives on `Niri` (not the layout), so it
             // must keep the redraw loop alive here too — otherwise the fade only
             // advances when another event (e.g. pointer motion) forces a frame, and

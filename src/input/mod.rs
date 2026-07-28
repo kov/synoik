@@ -54,7 +54,10 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
-use crate::ui::app_grid::{DragLocation, PageArrow, DELAYED_MOVE_MS};
+use crate::ui::app_grid::{
+    DragLocation, PageArrow, DELAYED_MOVE_MS, EDGE_BUMP_PX, PAGE_SWITCH_INITIAL_MS,
+    PAGE_SWITCH_REPEAT_MS,
+};
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::mru::{WindowMru, WindowMruUi};
@@ -3680,7 +3683,7 @@ impl State {
             drag.output = output;
             drag.pos = pos_within_output;
             self.update_dash_drop_slot();
-            self.update_grid_drop_target();
+            self.update_grid_drag();
             self.niri.queue_redraw_all();
             return;
         }
@@ -3739,6 +3742,7 @@ impl State {
         // any slot is computed — with nothing in the run there would otherwise be
         // nothing to aim at (`_onItemDragBegin`, `dash.js:410-414`).
         self.niri.dash.set_drag_active(true);
+        self.niri.app_grid.set_drag_active(true);
         // The live grid reflow is provisional: remember where everything was, so a drag
         // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`).
         self.niri.app_grid.begin_reorder();
@@ -3746,8 +3750,158 @@ impl State {
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
         self.update_dash_drop_slot();
-        self.update_grid_drop_target();
+        self.update_grid_drag();
         self.niri.queue_redraw_all();
+    }
+
+    /// Drive the app grid's side of a drag: page switching first, then the drop target
+    /// (`_onDragMotion`, `appDisplay.js:932-959` — that order, because a switch changes
+    /// which page a target would even mean).
+    fn update_grid_drag(&mut self) {
+        let Some(drag) = &self.niri.app_drag else {
+            return;
+        };
+        let (output, pos) = (drag.output.clone(), drag.pos);
+        let area = self
+            .niri
+            .layout
+            .controls_layout_for_output(&output)
+            .map(|c| c.app_display)
+            .filter(|_| self.niri.layout.is_app_grid_open());
+
+        if let Some(area) = area {
+            // Two ways to switch pages mid-drag: bumping the screen edge switches at
+            // once, and hovering a preview band switches after a beat.
+            if !self.drag_maybe_switch_page_immediately(area, pos) {
+                let hint = self.niri.app_grid.hint_at(pos, area);
+                self.niri.app_grid.set_hint_hovered(hint);
+                match hint {
+                    Some(direction) => self.arm_drag_page_switch(direction),
+                    None => self.reset_drag_page_switch(),
+                }
+            }
+        } else {
+            self.niri.app_grid.set_hint_hovered(None);
+            self.reset_drag_page_switch();
+        }
+
+        self.update_grid_drop_target();
+    }
+
+    /// The edge bump (`_dragMaybeSwitchPageImmediately`, `appDisplay.js:854-904`): a
+    /// pointer within [`EDGE_BUMP_PX`] of the grid's left/right edge flips the page
+    /// straight away and then repeats, latched so that *leaning* on the edge is one
+    /// switch — the pointer has to come back that far inside to arm another.
+    ///
+    /// Disabled with more than one output, where the gesture would fight dragging onto
+    /// the adjacent monitor (`appDisplay.js:856-858`).
+    fn drag_maybe_switch_page_immediately(
+        &mut self,
+        area: Rectangle<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        if self.niri.global_space.outputs().count() > 1 {
+            return false;
+        }
+        let start = area.loc.x + EDGE_BUMP_PX;
+        let end = area.loc.x + area.size.w - EDGE_BUMP_PX;
+        if pos.x > start && pos.x < end {
+            let moved_back = self
+                .niri
+                .grid_page_switch_overshoot
+                .is_some_and(|last| (last - pos.x).abs() > EDGE_BUMP_PX);
+            if moved_back {
+                self.reset_drag_page_switch();
+            }
+            return false;
+        }
+        // Still sitting in the overshoot region the last bump fired from.
+        if self.niri.grid_page_switch_overshoot.is_some() {
+            return false;
+        }
+
+        let direction = if pos.x <= start {
+            PageArrow::Prev
+        } else {
+            PageArrow::Next
+        };
+        self.step_grid_page(direction);
+        self.setup_drag_page_switch_repeat(direction);
+        self.niri.grid_page_switch_overshoot = Some(pos.x);
+        true
+    }
+
+    /// Start the initial hover delay over a preview band; when it fires, the page flips
+    /// and the repeat takes over (`_maybeSetupDragPageSwitchInitialTimeout`,
+    /// `appDisplay.js:906-921`). A timer already running is left alone.
+    fn arm_drag_page_switch(&mut self, direction: PageArrow) {
+        if self.niri.grid_page_switch_timer.is_some() {
+            return;
+        }
+        let timer = Timer::from_duration(Duration::from_millis(PAGE_SWITCH_INITIAL_MS));
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                // Clear the slot first: this source is mid-dispatch and about to be
+                // dropped, and the repeat setup would otherwise try to remove it.
+                state.niri.grid_page_switch_timer = None;
+                state.step_grid_page(direction);
+                state.setup_drag_page_switch_repeat(direction);
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.niri.grid_page_switch_timer = Some(token);
+    }
+
+    /// Keep flipping the page every [`PAGE_SWITCH_REPEAT_MS`] for as long as the drag
+    /// stays where it is (`_setupDragPageSwitchRepeat`, `appDisplay.js:841-852`).
+    fn setup_drag_page_switch_repeat(&mut self, direction: PageArrow) {
+        self.reset_drag_page_switch();
+        let repeat = Duration::from_millis(PAGE_SWITCH_REPEAT_MS);
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(Timer::from_duration(repeat), move |_, _, state| {
+                state.step_grid_page(direction);
+                TimeoutAction::ToDuration(repeat)
+            })
+            .unwrap();
+        self.niri.grid_page_switch_timer = Some(token);
+    }
+
+    /// Cancel any armed page switch and the edge-bump latch with it
+    /// (`_resetDragPageSwitch`, `appDisplay.js:827-839`).
+    fn reset_drag_page_switch(&mut self) {
+        if let Some(token) = self.niri.grid_page_switch_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        self.niri.grid_page_switch_overshoot = None;
+    }
+
+    /// Step the grid one page in `direction`, on the output the drag is over.
+    fn step_grid_page(&mut self, direction: PageArrow) {
+        let Some(output) = self.niri.app_drag.as_ref().map(|d| d.output.clone()) else {
+            return;
+        };
+        let Some(area) = self
+            .niri
+            .layout
+            .controls_layout_for_output(&output)
+            .map(|c| c.app_display)
+        else {
+            return;
+        };
+        let page = self.niri.app_grid.current_page();
+        let page = match direction {
+            PageArrow::Prev => page.saturating_sub(1),
+            PageArrow::Next => page + 1,
+        };
+        if self.niri.app_grid.set_page(page, area) {
+            // The target was resolved against the page that just left.
+            self.clear_grid_pending_move();
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// Track where a drag would land in the app grid and arm the delayed move
@@ -3879,11 +4033,23 @@ impl State {
         // is where the id comes from.
         self.apply_grid_pending_move();
         self.clear_grid_pending_move();
+        self.reset_drag_page_switch();
 
         let Some(drag) = self.niri.app_drag.take() else {
             self.niri.app_grid.cancel_reorder();
             return;
         };
+
+        // A drop *on* a preview band sends the app to that page rather than reordering
+        // within this one (`acceptDrop`, `appDisplay.js:1004-1013`). Read before the
+        // previews are told to slide away, since that is what makes a band a target.
+        let grid_area = self
+            .niri
+            .layout
+            .controls_layout_for_output(&drag.output)
+            .map(|c| c.app_display)
+            .filter(|_| self.niri.layout.is_app_grid_open());
+        let hint = grid_area.and_then(|area| self.niri.app_grid.hint_at(drag.pos, area));
 
         // A drop on the dash pins the app there, or moves it if it was already pinned
         // (`Dash.acceptDrop`, `dash.js:942-987`). The gap that was tracking the pointer
@@ -3891,6 +4057,16 @@ impl State {
         let slot = self.niri.dash.drop_slot();
         self.niri.dash.set_drop_slot(None);
         self.niri.dash.set_drag_active(false);
+        self.niri.app_grid.set_drag_active(false);
+
+        if let (Some(direction), Some(area)) = (hint, grid_area) {
+            self.drop_onto_page(&drag.id, direction, area);
+            if self.niri.app_grid.finish_reorder() {
+                self.save_app_picker_layout(&drag.output);
+            }
+            self.niri.queue_redraw_all();
+            return;
+        }
 
         // A drop on the show-apps button unpins instead (`ShowAppsIcon.acceptDrop`,
         // `dash.js:256-270`). `drag.unpin` already carries `_canRemoveApp`, so this is
@@ -3940,6 +4116,28 @@ impl State {
         }
 
         self.niri.queue_redraw_all();
+    }
+
+    /// Move `id` onto the adjacent page and follow it there (`acceptDrop`'s hint branch,
+    /// `appDisplay.js:1004-1013`): it appends to an existing page, and stepping past the
+    /// last one makes a new page with the app first on it.
+    fn drop_onto_page(&mut self, id: &str, direction: PageArrow, area: Rectangle<f64, Logical>) {
+        let per_page = self.niri.app_grid.items_per_page(area);
+        let n_pages = self.niri.app_grid.page_count(area);
+        let current = self.niri.app_grid.current_page();
+        let page = match direction {
+            PageArrow::Prev => current.saturating_sub(1),
+            PageArrow::Next => (current + 1).min(n_pages),
+        };
+        let target = crate::ui::app_grid::GridDropTarget {
+            page,
+            position: if page < n_pages { None } else { Some(0) },
+            location: DragLocation::EmptySpace,
+        };
+        self.niri.app_grid.move_entry(id, target, per_page);
+        // Where it actually landed: a full page pushes it on to the next one.
+        let page = page.min(self.niri.app_grid.page_count(area).saturating_sub(1));
+        self.niri.app_grid.set_page(page, area);
     }
 
     /// Persist the grid arrangement (`AppDisplay._savePages`, `appDisplay.js:1387-1404`).
