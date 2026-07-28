@@ -723,3 +723,82 @@ any icon rendering; S7 is independent and small.
   first daily-drivable win.
 - **D-D — Dash is favorites-only in v1.** Running apps + running dots deferred to S6 (they need the
   fiddly window↔`.desktop` StartupWMClass matching).
+
+---
+
+## 7. App-grid drag-reorder & page peeks (cited plan, 2026-07-28)
+
+Goal: dragging an app *within* the grid reorders it, and the left/right page previews appear during a
+drag so hovering (or bumping) an edge switches pages. Everything below is 50.1 as shipped.
+
+### 7.1 The four moving parts
+
+**(a) The reserved side bands — `indicatorsPadding`.** `BaseAppViewGridLayout.vfunc_allocate`
+(`appDisplay.js:405-430`) sets `grid.indicatorsPadding` to `_getIndicatorsWidth(box)` on both sides,
+which is `max(width * PAGE_PREVIEW_RATIO / 2, widest arrow's min width)` — `PAGE_PREVIEW_RATIO` is
+`0.20` (`appDisplay.js:47`), so **10% of the app-display width per side**. `AppGrid._updatePadding`
+(`appDisplay.js:162-171`) *adds* it to the `.icon-grid` `page-padding-left/right`, so the reserve is
+permanent, not drag-only: the grid content box is `page-padding` **plus** 10% each side, and the
+navigation arrows live in the reserve rather than in centering slack. We skipped this (listed as a
+divergence in `ui/app_grid.rs`); the peek cannot be built without it, since it is the room the
+adjacent page's icons slide into.
+
+**(b) The hint bands.** `_prevPageIndicator` / `_nextPageIndicator` are plain `St.Widget`s styled
+`.page-navigation-hint {previous,next}` (`appDisplay.js:528-549`), allocated to exactly the reserve
+box. `_app-grid.scss:150-170`: a horizontal gradient from `rgba(255,255,255,0.05)` to transparent,
+running *inward*, with `$modal_radius * 1.5` (36px) rounding on the two **outer** corners only; while
+a drag hovers one it gains `.dnd`, a flat `rgba(255,255,255,0.1)`. They fade in over
+`PAGE_INDICATOR_FADE_TIME` 200 ms and are shown on **item-drag-begin** — any overview item drag, not
+only a grid one (`_onDragBegin` → `showPageIndicators`, `appDisplay.js:923-930`). The *next* hint is
+always shown during a drag even on the last page, because dropping there creates a page
+(`appDisplay.js:270-274`).
+
+**(c) The peek itself.** `showPageIndicators` eases a 0→1 adjustment over
+`PAGE_PREVIEW_ANIMATION_TIME` 150 ms `EASE_OUT_CUBIC` and drops the grid's clip
+(`appDisplay.js:441-453`). `_syncPageIndicators` (`:364-397`) then translates, by that value: the
+hints inward from `∓indicatorsWidth`, the arrows outward, and — the visible part —
+`_translatePreviousPageIcons` / `_translateNextPageIcons` (`:311-362`) slide the *adjacent page's*
+icons so that the previous page's last-column icon and the next page's first-column icon come to rest
+just inside the reserve. Current-page icons are pinned at 0.
+
+**(d) The reorder.** `_getDropTarget` (`appDisplay.js:1156-1201`) wraps
+`IconGrid.getDropTarget` (`iconGrid.js:1032-1120`), which walks the page's items, rejects a point
+outside the grid rows entirely (`INVALID`), returns `EMPTY_SPACE` past the last item, and otherwise
+classifies the hit as `START_EDGE` / `ON_ICON` / `END_EDGE` against a 20 px `*_DIVIDER_LEEWAY` at each
+tile edge. The wrapper then nudges the target to the adjacent item when the reflow would push the
+*wrong* way (an insertion that can't "naturally push the item away"), except in the first/last column.
+`_maybeMoveItem` (`:768-810`) ignores `INVALID`, `ON_ICON`, the source's own slot and any target on
+another page, and otherwise commits the move after `DELAYED_MOVE_TIMEOUT` **200 ms** of the target
+holding still — the grid reflows live, mid-drag. `acceptDrop` (`:997-1023`) commits a pending delayed
+move if the drop beat the timer. `_onDragCancelled` `_redisplay()`s, i.e. the live reflow is
+provisional until the drop. Persistence is `_savePages` (`:1387-1404`) writing
+`org.gnome.shell app-picker-layout` as one `{id: {position}}` dict per page — which we already *read*
+(`3e6c5f41`).
+
+**(e) Page switching during a drag.** Two mechanisms, `_onDragMotion` (`:932-959`):
+1. **Edge bump** — `_dragMaybeSwitchPageImmediately` (`:854-904`): within
+   `DRAG_PAGE_SWITCH_IMMEDIATELY_THRESHOLD_PX` **20 px** of the container's left/right edge, switch at
+   once, then repeat every `DRAG_PAGE_SWITCH_REPEAT_TIMEOUT` **1000 ms**. Latched by
+   `_lastOvershootCoord` so one bump is one switch until the pointer moves >20 px back inside.
+   **Disabled when there is more than one monitor** (`:856-858`), where it would fight dragging to the
+   next monitor.
+2. **Hint hover** — hovering a hint band arms `DRAG_PAGE_SWITCH_INITIAL_TIMEOUT` **1000 ms**
+   (`:906-921`), then the same 1000 ms repeat.
+Dropping *on* a hint band moves the item to that page (`acceptDrop`, `:1004-1013`).
+
+### 7.2 Slices
+
+* **G1 — `indicatorsPadding`.** Reserve `max(10% of the band, arrow disc + margins)` on each side; lay
+  the grid inside the remainder; move the navigation arrows into the reserve. Pure layout; closes a
+  listed divergence. Watch: it changes mode/icon-size selection, which is the point.
+* **G2 — drop target + live reorder.** `AppGrid::drop_target_at` → `(page, position, DragLocation)`
+  with the leeway + the reflow nudge; the 200 ms delayed move; reordering `entries` provisionally;
+  committing on drop by writing `app-picker-layout`; reverting on cancel.
+* **G3 — the peek.** Hint bands (gradient + outer-corner rounding + `.dnd` fill), the 150 ms
+  0→1 adjustment, and the adjacent pages' icons translated into the reserve.
+* **G4 — page switching.** Hint-hover 1 s + 1 s repeat, edge-bump immediate + repeat (single monitor
+  only), and drop-on-a-hint moving the item to that page.
+
+**Known deferrals** (state them, don't silently skip): no page-*slide* animation, so a switch is a
+snap; no folders, so a drop can never make one; and the reorder is grid-internal — dragging a grid
+icon onto the dash still pins it, which is the existing behaviour.

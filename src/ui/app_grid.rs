@@ -22,19 +22,19 @@
 //! picks 8×3. The icon shrinks to the largest `IconSize` whose square cells fit
 //! (`_findBestIconSize`, tiles laid in a `max(w,h)` square cell). Column/row spacing
 //! grows from `.icon-grid`'s 12 to a max of 36 to absorb slack, then the remainder
-//! centers the page (`_calculateSpacing`, FILL). Overflow paginates: a dots row below
-//! the grid (`.page-indicator`, 10px, inactive at 2/3 scale + half opacity) plus flat
-//! circular **navigation arrows** in the side gutters (`.page-navigation-arrow`,
-//! `carousel-arrow-{previous,next}-symbolic`, `appDisplay.js:553-575`; shown when a
-//! previous/next page exists, `appDisplay.js:255-302`). Either dot, arrow, a wheel
-//! notch (debounced 150ms), or a reset to page 0 on a fresh overview open (`'hidden'` →
-//! `goToPage(0)`, `appDisplay.js:1342`) changes the page.
+//! centers the page (`_calculateSpacing`, FILL). A band of [`indicators_w`] — 10% of
+//! the width, floored at an arrow — is reserved on each side *before* that
+//! (`indicatorsPadding`, `appDisplay.js:162-171,405-430`); it holds the navigation
+//! arrows and is where the adjacent pages peek in during a drag. Overflow paginates: a
+//! dots row below the grid (`.page-indicator`, 10px, inactive at 2/3 scale + half
+//! opacity) plus flat circular **navigation arrows** in those bands
+//! (`.page-navigation-arrow`, `carousel-arrow-{previous,next}-symbolic`,
+//! `appDisplay.js:553-575`; shown when a previous/next page exists,
+//! `appDisplay.js:255-302`). Either dot, arrow, a wheel notch (debounced 150ms), or a
+//! reset to page 0 on a fresh overview open (`'hidden'` → `goToPage(0)`,
+//! `appDisplay.js:1342`) changes the page.
 //!
-//! **Divergences, revisited later.** No `indicatorsPadding` (the ~10% side reserve for
-//! the DnD peek/arrows, `appDisplay.js:162-171`): geometry-identical at 1920, but it
-//! shifts mode/icon-size selection at narrow widths, and (lacking that reserve) the
-//! navigation arrows sit in the grid's centering gutter rather than a fixed 10% band —
-//! they can crowd the edge tiles at very narrow widths. No page-slide animation (snap),
+//! **Divergences, revisited later.** No page-slide animation (snap),
 //! no touchpad **swipe** (continuous scroll over the grid is consumed but inert — the
 //! 1:1 swipe is deferred), no keyboard paging
 //! (`Page_Up/Down`), and no folders/drag-reorder — so `app-picker-layout` is read but
@@ -110,6 +110,25 @@ const INACTIVE_DOT_ALPHA: f32 = 0.5;
 const ARROW_ICON_PX: f64 = 24.;
 const ARROW_PAD: f64 = 18.;
 const ARROW_DISC: f64 = ARROW_ICON_PX + 2. * ARROW_PAD;
+/// `.page-navigation-arrow` `margin: $base_padding` — so the band an arrow needs is
+/// the disc plus a margin each side.
+const ARROW_MARGIN: f64 = 6.;
+
+/// Share of the band reserved for the two page-preview strips (`PAGE_PREVIEW_RATIO`,
+/// `appDisplay.js:47`) — half of it on each side.
+const PAGE_PREVIEW_RATIO: f64 = 0.20;
+
+/// Width of one reserved side band (`_getIndicatorsWidth`, `appDisplay.js:221-237`):
+/// the preview share, but never narrower than a navigation arrow.
+///
+/// This is `AppGrid.indicatorsPadding` and it is **permanent**, not drag-only — it is
+/// *added* to the `.icon-grid` page padding (`_updatePadding`, `appDisplay.js:162-171`),
+/// so the grid content box is always inset by it, the navigation arrows sit inside it
+/// rather than in the grid's centering slack, and it is the room the adjacent page's
+/// icons slide into when a drag makes the previews appear.
+fn indicators_w(band_w: f64) -> f64 {
+    (band_w * PAGE_PREVIEW_RATIO / 2.).max(ARROW_DISC + 2. * ARROW_MARGIN)
+}
 
 /// Which navigation arrow — the previous (left) or next (right) page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +372,18 @@ impl AppGrid {
         // The grid page is the band minus the reserved dots strip.
         let page_w = area.size.w;
         let page_h = (area.size.h - INDICATORS_STRIP_H).max(0.);
-        let content_w = page_w - 2. * PAGE_PAD_H;
+        // The side bands are reserved out of the page before anything else, and the
+        // grid's own page padding sits inside them (`_updatePadding` *adds* the two).
+        let hint_w = indicators_w(page_w);
+        let pad_h = PAGE_PAD_H + hint_w;
+        let hints = [
+            Rectangle::new(area.loc, Size::from((hint_w, page_h))),
+            Rectangle::new(
+                Point::from((area.loc.x + page_w - hint_w, area.loc.y)),
+                Size::from((hint_w, page_h)),
+            ),
+        ];
+        let content_w = page_w - 2. * pad_h;
         let content_h = page_h - 2. * PAGE_PAD_V;
         if n == 0 || content_w <= 0. || content_h <= 0. {
             return empty;
@@ -394,8 +424,7 @@ impl AppGrid {
         let page = self.current_page.min(n_pages - 1);
 
         // Distribute spacing + centering per axis, then place the current page.
-        let (x_off, h_sp) =
-            distribute(page_w, cols, cell, COL_SPACING, MAX_COL_SPACING, PAGE_PAD_H);
+        let (x_off, h_sp) = distribute(page_w, cols, cell, COL_SPACING, MAX_COL_SPACING, pad_h);
         let (y_off, v_sp) =
             distribute(page_h, rows, cell, ROW_SPACING, MAX_ROW_SPACING, PAGE_PAD_V);
         let origin_x = area.loc.x + x_off;
@@ -434,24 +463,21 @@ impl AppGrid {
                 .collect()
         });
 
-        // Navigation arrows, centered in each side gutter and vertically on the block
-        // (`.page-navigation-arrow`; shown when a previous / next page exists). Absent
-        // the ~10% `indicatorsPadding` reserve, they ride the grid's centering slack.
-        let disc = |cx: f64| {
-            let cy = block.loc.y + block.size.h / 2.;
+        // Navigation arrows, centered in their reserved band on both axes
+        // (`allocate_align_fill(box, 0.5, 0.5)`, `appDisplay.js:422-427`; shown when a
+        // previous / next page exists). The band, not the block: it does not move when
+        // the last page has fewer rows.
+        let disc = |band: Rectangle<f64, Logical>| {
             Rectangle::new(
                 Point::from((
-                    (cx - ARROW_DISC / 2.).round(),
-                    (cy - ARROW_DISC / 2.).round(),
+                    (band.loc.x + (band.size.w - ARROW_DISC) / 2.).round(),
+                    (band.loc.y + (band.size.h - ARROW_DISC) / 2.).round(),
                 )),
                 Size::from((ARROW_DISC, ARROW_DISC)),
             )
         };
-        let block_right = block.loc.x + block.size.w;
-        let area_right = area.loc.x + area.size.w;
-        let prev_arrow = (page > 0).then(|| disc(area.loc.x + (block.loc.x - area.loc.x) / 2.));
-        let next_arrow =
-            (page + 1 < n_pages).then(|| disc(block_right + (area_right - block_right) / 2.));
+        let prev_arrow = (page > 0).then(|| disc(hints[0]));
+        let next_arrow = (page + 1 < n_pages).then(|| disc(hints[1]));
 
         GridLayout {
             tiles,
@@ -1139,6 +1165,33 @@ mod tests {
         // A single page shows neither.
         let l = grid_n(10).layout(area);
         assert!(l.prev_arrow.is_none() && l.next_arrow.is_none());
+    }
+
+    /// `indicatorsPadding`: 10% of the band on each side, floored at an arrow's own
+    /// width, reserved *outside* the grid's page padding and permanently — not only
+    /// while something is being dragged (`appDisplay.js:162-171,405-430`). The grid
+    /// content lays out inside the remainder and the arrows sit in the bands.
+    #[test]
+    fn the_page_preview_bands_are_reserved_out_of_the_grid() {
+        let area = wide(); // 1920 wide
+        let l = grid_n(30).layout(area);
+        let band = 1920. * 0.20 / 2.;
+        assert_eq!(indicators_w(area.size.w), band);
+        let right_band_x = area.loc.x + area.size.w - band;
+        // Nothing of the grid reaches into a band, and the page padding is on top of it.
+        assert!(l.block.loc.x >= area.loc.x + band + PAGE_PAD_H);
+        assert!(l.block.loc.x + l.block.size.w <= right_band_x - PAGE_PAD_H);
+        // The next arrow is centered in its band, on both axes.
+        let arrow = l.next_arrow.expect("30 apps paginate");
+        assert_eq!(arrow.loc.x + ARROW_DISC / 2., right_band_x + band / 2.);
+        let page_h = area.size.h - INDICATORS_STRIP_H;
+        assert_eq!(
+            arrow.loc.y + ARROW_DISC / 2.,
+            (area.loc.y + page_h / 2.).round()
+        );
+
+        // On a narrow band the share would be thinner than an arrow, so the arrow wins.
+        assert_eq!(indicators_w(500.), ARROW_DISC + 2. * ARROW_MARGIN);
     }
 
     #[test]
