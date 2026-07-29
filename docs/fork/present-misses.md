@@ -1203,9 +1203,11 @@ fixes. The standard measurement instead found the aim-1 miss rate up 5-30x again
 post-0051 baseline. One day of controlled A/Bs decomposed that into **three independent,
 quantified factors**:
 
-1. **The VMM's present path regressed ~5x** (binary and scale held).
-2. **Guest work landed since the baseline adds ~2.5x on top** (VMM, boot, scale held) — ours to
-   fix, with a lead in hand.
+1. **The VMM's present path regressed ~5x** (binary and scale held). A stationarity test
+   (§21.4) adds structure: a steady miss floor plus 10-30 s *episodes* of GPU-tail inflation
+   under constant guest load.
+2. **Guest work landed since the baseline adds ~2.5x on top** (VMM, boot, scale held) — the new
+   overview chrome costs more GPU per frame; ours to shave.
 3. **Scale 1 is anomalous on this VMM**: 3-4x more misses than scale 1.5/2 *on cheaper frames*,
    same binary, same boot — the strongest single discriminator this report hands the host side.
 
@@ -1246,10 +1248,10 @@ Reading the axes:
   matched scale — the GPU work itself got ~33% slower.
 - **Binary axis** (rows 3→5, VMM/boot/scale/populate held): 6.98% → 17.16%, ~2.5x. This half is
   ours: ~30 commits of overview visuals (doubled thumbnail strip with glow shadows, adaptive
-  chrome, per-preview icons/captions) landed between the arms. It also carries the one behavioral
-  fingerprint: the new binary's warm run is *worse* than its cold one (21.42% vs 17.16% at 200+),
-  while the old binary warms down in every cell — something in the new guest code degrades over
-  a run. Guest bug, ours to hunt.
+  chrome, per-preview icons/captions) landed between the arms — the new overview costs ~500
+  draws / gpu p50 ~9.3 ms where the old one cost ~330 / ~8.3 ms. (An earlier draft read the new
+  binary's worse warm run as guest-side degradation over time; §21.4's stationarity test
+  falsified that.)
 - **Scale axis** (rows 2-4, everything else held, one knob flipped live between sweeps): scale
   1.5 and 2 are within noise of each other; **scale 1 misses 3-4x more on the cheapest frames of
   the sweep** (gpu p50 6.05 ms vs 7.34/8.05; draws p50 143 vs 189/226). On this VMM the miss
@@ -1269,7 +1271,27 @@ of headroom; e.g. 1580/1587 in the scale-1 cell, 1263/1264 in the new-binary cel
 - It means whatever changed did not change the miss *mechanism* — the §10.6/§19 miss (a flip
   sliding one vblank) simply happens 5-30x more often, depending on the cell.
 
-### 21.4 Asks and next steps
+### 21.4 Stationarity test: no guest accumulation — the misses come in episodes
+
+To hunt the suspected warm-run degradation, the new binary ran one *uninterrupted* 4-minute
+overview hold (continuous toggling + pointer churn; a stationary workload) with process RSS
+sampled alongside. Result, in 5-second bins:
+
+- **Nothing guest-side accumulates.** RSS flat (120 MB, ±0.2%), draws p50 flat (476-515),
+  elements flat (275), bake and texture-creation rates flat, for the entire hold.
+- **The misses arrive in episodes**: 10-30 s stretches where gpu p90 jumps ~10 → 13-15 ms and
+  the miss rate goes from a ~8-9% floor to 35-50%, separated by 20-40 s of calm. The guest's
+  submitted work is identical in and out of an episode; the same frames just take 3-5 ms longer
+  on the GPU during one.
+- The earlier "warm run worse than cold" observation was these episodes sampled by 70-second
+  measurement phases — luck of the draw, not degradation. The claim is withdrawn.
+
+Two components to explain, both consistent with everything above: a **floor** (~8-9% during
+this workload; ~1% on the old VMM for comparable cost) and **episodes** (periodic 3-5 ms GPU
+tail inflation under constant guest load — DVFS, host-side housekeeping, journal/compaction
+activity, something in that family).
+
+### 21.5 Asks and next steps
 
 **Host side (you):**
 - Is the two-lane journal build (0051) and the ring-relax ladder (0049) actually in this VMM?
@@ -1279,12 +1301,15 @@ of headroom; e.g. 1580/1587 in the scale-1 cell, 1263/1264 in the new-binary cel
 - The scale-1 discriminator: same guest binary, same boot, one scale flip, 3-4x on cheaper
   frames. Whatever the present path keys on, it is not command volume — worth checking what the
   host does differently when the guest's logical size equals the physical mode.
+- The episode structure (§21.5): what host-side activity has a 10-30 s duty cycle under a
+  steady guest load? The guest cannot see it; the episodes are where most of the misses live.
 
 **Guest side (us):**
-- Hunt the warm-run degradation in `d4c7a61d` — it is the newest code's own bug regardless of
-  the VMM story.
 - A/B `NIRI_VK_ASYNC_SCANOUT` off on the new binary, to separate "the new chrome costs too
   much" from "async scanout mishandles a late fence".
+- Shave the new overview's GPU cost (~500 draws / ~9.3 ms vs the old ~330 / ~8.3 ms): with
+  episodes inflating the tail by 3-5 ms, every millisecond of headroom converts directly into
+  survived episodes.
 
 Raw data: run ledger `present-misses-runs.md` (journal slices for every cell; the journal is
 persistent — `journalctl -b a8a1fbce` covers all of today's cells, 14:26-15:34).

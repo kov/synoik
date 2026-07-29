@@ -178,3 +178,14 @@ Result (200+ draws / gpu 6-12 ms / overall): scale 2 → 5.77% / 5.03% / 2.82%; 
 the VMM leg (matched scale 2: 1.11% → 5.77%), and scale 1 misses 3-4x more on the *cheapest*
 frames of the sweep (gpu p50 6.05 vs 7.34/8.05 ms) — the miss driver on this VMM is not guest
 GPU cost. Analysis in `present-misses.md` §21.7.
+
+## Stationarity hold, new binary (boot a8a1fbce, restart 15:45, 2026-07-29)
+
+Seat restarted onto `d4c7a61d` (scale restored to 1.5 by monitors.xml). 8-kitty populate, then
+one uninterrupted 4-minute overview hold (continuous Super_L toggling + pointer churn),
+15:47:53-15:51:54, pid 2289737, RSS sampled every 10 s.
+
+Result: no guest-side accumulation (RSS/draws/elements/bakes all flat); misses arrive in
+10-30 s episodes (gpu p90 ~10 → 13-15 ms, rate 8-9% floor → 35-50%) with 20-40 s gaps. The
+"warm run worse" fingerprint from the morning cells was these episodes under-sampled — claim
+withdrawn in `present-misses.md` §21.2/§21.4.
