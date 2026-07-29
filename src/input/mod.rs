@@ -45,6 +45,7 @@ use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
 use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
+use self::thumb_grab::ThumbGrab;
 use crate::app_system::LaunchMode;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
@@ -52,6 +53,7 @@ use crate::gnome::{
     Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, TileSide,
 };
 use crate::layout::scrolling::ScrollDirection;
+use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
@@ -80,6 +82,7 @@ pub mod scroll_tracker;
 pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod synthetic;
+pub mod thumb_grab;
 pub mod touch_overview_grab;
 pub mod touch_resize_grab;
 
@@ -3990,6 +3993,48 @@ impl State {
     /// delayed move. `FolderView` is a `BaseAppView` like the app display, so it inherits
     /// the same `_maybeMoveItem` — including the [`DELAYED_MOVE_MS`] wait, which is what
     /// keeps a drag that merely sweeps across the folder from shuffling it.
+    /// Activating a workspace by clicking it in the overview (gnome-shell's `Workspace`
+    /// click rules): clicking the *active* workspace's empty area leaves the overview,
+    /// clicking another one switches to it and stays.
+    fn activate_overview_workspace(&mut self, output: &Output, ws_id: WorkspaceId) {
+        let Some((ws_idx, _)) = self.niri.layout.find_workspace_by_id(ws_id) else {
+            return;
+        };
+
+        self.niri.layout.focus_output(output);
+
+        let gnome_mode =
+            self.niri.config.borrow().layout.windowing_mode == niri_config::WindowingMode::Floating;
+        let is_active = self
+            .niri
+            .layout
+            .active_workspace()
+            .is_some_and(|active| active.id() == ws_id);
+        if gnome_mode && !is_active {
+            self.niri.layout.switch_workspace(ws_idx);
+        } else {
+            self.niri.layout.toggle_overview_to_workspace(ws_idx);
+        }
+
+        // FIXME: granular.
+        self.niri.queue_redraw_all();
+    }
+
+    /// The same, addressed by position along the thumbnails strip — what a click on a
+    /// thumbnail resolves to once [`ThumbGrab`] has decided it was not a drag.
+    pub fn activate_overview_workspace_at(&mut self, output: &Output, idx: usize) {
+        let Some(ws_id) = self
+            .niri
+            .layout
+            .monitor_for_output(output)
+            .and_then(|mon| mon.workspace_at(idx))
+            .map(|ws| ws.id())
+        else {
+            return;
+        };
+        self.activate_overview_workspace(output, ws_id);
+    }
+
     fn update_folder_drop_target(&mut self) {
         let Some(drag) = &self.niri.app_drag else {
             return;
@@ -5756,6 +5801,27 @@ impl State {
                 }
             }
 
+            // A press on a strip thumbnail takes a grab, so the release can tell a
+            // workspace reorder from a plain click (divergence, see `ThumbGrab`). It comes
+            // before the window check because a thumbnail is drawn over the picker, and
+            // after the modifier gestures above, which stay in charge of their buttons.
+            if button == Some(MouseButton::Left) && !pointer.is_grabbed() && is_overview_open {
+                let hit = self
+                    .niri
+                    .thumbnail_under(pointer.current_location())
+                    .map(|(output, _, idx)| (output, idx));
+                if let Some((output, idx)) = hit {
+                    let start_data = PointerGrabStartData {
+                        focus: None,
+                        button: button_code,
+                        location: pointer.current_location(),
+                    };
+                    let grab = ThumbGrab::new(start_data, output, idx);
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                    return;
+                }
+            }
+
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
@@ -5878,28 +5944,7 @@ impl State {
                 .flatten()
             {
                 let ws_id = ws.id();
-                let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
-
-                self.niri.layout.focus_output(&output);
-
-                // GNOME (gnome-shell Workspace click): clicking the empty
-                // active workspace leaves the overview; clicking another
-                // workspace switches to it and stays in the overview.
-                let gnome_mode = self.niri.config.borrow().layout.windowing_mode
-                    == niri_config::WindowingMode::Floating;
-                let is_active = self
-                    .niri
-                    .layout
-                    .active_workspace()
-                    .is_some_and(|active| active.id() == ws_id);
-                if gnome_mode && !is_active {
-                    self.niri.layout.switch_workspace(ws_idx);
-                } else {
-                    self.niri.layout.toggle_overview_to_workspace(ws_idx);
-                }
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.activate_overview_workspace(&output, ws_id);
             } else if let Some(output) = self.niri.output_under_cursor() {
                 self.niri.layout.focus_output(&output);
 

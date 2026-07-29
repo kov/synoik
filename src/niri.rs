@@ -4689,11 +4689,39 @@ impl Niri {
         self.thumbnail_workspace_under(pos)
     }
 
+    /// The overview strip thumbnail under the position: its output, the position in that
+    /// output's coordinates, and the index of the workspace it stands for.
+    pub fn thumbnail_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Output, Point<f64, Logical>, usize)> {
+        let (output, pos_within_output) = self.thumbnail_strip_under(pos)?;
+        let idx = self
+            .layout
+            .monitor_for_output(&output)?
+            .thumbnail_strip()?
+            .thumb_under(pos_within_output)?;
+        Some((output, pos_within_output, idx))
+    }
+
     /// The workspace whose overview strip thumbnail is under the position.
     pub fn thumbnail_workspace_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(Output, &Workspace<Mapped>)> {
+        let (output, pos_within_output) = self.thumbnail_strip_under(pos)?;
+        let ws = self
+            .layout
+            .thumbnail_workspace_under(&output, pos_within_output)?;
+        Some((output, ws))
+    }
+
+    /// The output whose strip is reactive at this position, and the position in its
+    /// coordinates — the gating both strip hit tests share.
+    fn thumbnail_strip_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Output, Point<f64, Logical>)> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
@@ -4715,10 +4743,7 @@ impl Niri {
             return None;
         }
 
-        let ws = self
-            .layout
-            .thumbnail_workspace_under(output, pos_within_output)?;
-        Some((output.clone(), ws))
+        Some((output.clone(), pos_within_output))
     }
 
     /// Returns the window under the position to be activated.

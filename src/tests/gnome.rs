@@ -3027,6 +3027,124 @@ fn thumbnail_center(f: &mut Fixture, idx: usize) -> (f64, f64) {
     (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.)
 }
 
+/// **Divergence (approved 2026-07-28).** Dragging a *thumbnail* along the strip reorders
+/// the workspaces, macOS Mission Control style. gnome-shell's thumbnails never reorder — a
+/// drag there is only ever a window being moved — and that gesture is kept, because the two
+/// are told apart by what the press landed on.
+#[test]
+fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.niri()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, _)| idx)
+            .expect("the window must be on a workspace")
+    };
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (0, 1)
+    );
+
+    // The at-rest row, captured before the press: the drag re-lays it underneath.
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+
+    // Grab the first thumbnail and carry it just past the second one's center.
+    pointer_motion_to(&mut f, t0x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t1x + 1., t0y);
+
+    // Mid-drag the row parts: the dragged thumbnail follows the pointer, and the one it
+    // passed has closed up into the slot it left.
+    {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let strip = mon.unwrap().thumbnail_strip().unwrap();
+        assert_eq!(
+            strip.thumbs[0].loc.x + strip.thumbs[0].size.w / 2.,
+            t1x + 1.,
+            "the dragged thumbnail must hang off the pointer"
+        );
+        assert_eq!(
+            strip.thumbs[1].loc.x,
+            t0x - strip.thumbs[1].size.w / 2.,
+            "the passed thumbnail must close up into the slot the drag left"
+        );
+    }
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (1, 0),
+        "dropping a thumbnail past its neighbour must swap the workspaces"
+    );
+    assert_eq!(
+        f.niri().layout.workspaces().count(),
+        3,
+        "reordering must not add or drop a workspace"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "reordering must not leave the overview"
+    );
+}
+
+/// …and under the movement threshold the same press is still a plain click, which is what
+/// makes the reorder gesture free: a thumbnail activates its workspace as it always did.
+#[test]
+fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let active = |f: &mut Fixture| f.niri().layout.active_workspace().unwrap().id();
+    let ws_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.niri()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, ws)| (idx, ws.id()))
+            .expect("the window must be on a workspace")
+    };
+    let (idx_a, _) = ws_of(&mut f, &win_a);
+    let (idx_b, id_b) = ws_of(&mut f, &win_b);
+    assert_ne!(active(&mut f), id_b, "B's desktop must not start active");
+
+    // Press, twitch by less than the threshold, release.
+    let (t1x, t1y) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, t1x, t1y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(3., 0.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        active(&mut f),
+        id_b,
+        "a click on a thumbnail must switch to its workspace"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "…and stay in the overview, as clicking a non-active workspace does"
+    );
+    assert_eq!(
+        (ws_of(&mut f, &win_a).0, ws_of(&mut f, &win_b).0),
+        (idx_a, idx_b),
+        "a click must not reorder anything"
+    );
+}
+
 /// gnome-shell's ThumbnailsBox visibility rule with dynamic workspaces: the
 /// strip appears only once there are more than two workspaces, i.e. once a
 /// second desktop is populated.

@@ -133,6 +133,8 @@ pub struct Monitor<W: LayoutElement> {
     /// The strip's new-workspace drop placeholder pill (gnome-shell's
     /// `.placeholder`).
     thumb_placeholder: FocusRing,
+    /// A thumbnail being dragged along the strip to reorder the workspaces.
+    thumb_drag: Option<ThumbDrag>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -233,6 +235,39 @@ struct InsertHintRenderLoc {
 pub(super) enum OverviewProgress {
     Animation(Animation),
     Value(f64),
+}
+
+/// A workspace thumbnail being dragged along the overview strip.
+///
+/// **Divergence (approved 2026-07-28).** gnome-shell's thumbnails do not reorder — a drag
+/// on that strip is only ever a *window* being moved to another workspace, which we keep.
+/// This adds macOS Mission Control's other gesture on top: grab the thumbnail itself and
+/// the workspaces reorder. The two never collide, because they are told apart by what the
+/// press landed on.
+#[derive(Debug, Clone, Copy)]
+struct ThumbDrag {
+    /// The workspace the drag picked up.
+    from: usize,
+    /// Where in the thumbnail the pointer grabbed it, so it doesn't jump on the
+    /// first motion.
+    grab_offset: f64,
+    /// The pointer's current position, in view coordinates.
+    pos: Point<f64, Logical>,
+}
+
+/// The index an armed drag would drop at: how many of the *other* thumbnails the dragged
+/// one's center has passed. Taken against the strip at rest, so the row parting out of the
+/// way underneath cannot feed back into the answer and make the target oscillate.
+fn thumb_drag_target(strip: &Strip, drag: ThumbDrag) -> usize {
+    let width = strip.thumbs[drag.from].size.w;
+    let center = drag.pos.x - drag.grab_offset + width / 2.;
+    strip
+        .thumbs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != drag.from)
+        .take_while(|(_, rect)| rect.loc.x + rect.size.w / 2. < center)
+        .count()
 }
 
 /// Where to put a newly added window.
@@ -431,6 +466,7 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
             thumb_indicator: FocusRing::new(thumbnail_indicator_config(crate::gnome::ACCENT_BLUE)),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
+            thumb_drag: None,
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
@@ -476,6 +512,12 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn active_workspace_ref(&self) -> &Workspace<W> {
         &self.workspaces[self.active_workspace_idx]
+    }
+
+    /// The workspace at this index on the monitor, which is also its index along the
+    /// overview thumbnails strip.
+    pub fn workspace_at(&self, idx: usize) -> Option<&Workspace<W>> {
+        self.workspaces.get(idx)
     }
 
     pub fn find_named_workspace(&self, workspace_name: &str) -> Option<&Workspace<W>> {
@@ -2070,9 +2112,18 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// The thumbnails strip, laid out in the band [`Self::controls_layout`]
-    /// allocates it below the search entry. While a drag hovers one of its
-    /// gaps, the strip makes room for the new-workspace drop placeholder there.
+    /// allocates it. While a drag hovers one of its gaps, the strip makes room
+    /// for the new-workspace drop placeholder there; while a *thumbnail* is
+    /// being dragged, the row parts around where it would land.
     pub fn thumbnail_strip(&self) -> Option<Strip> {
+        let strip = self.thumbnail_strip_at_rest()?;
+        Some(self.apply_thumb_drag(strip))
+    }
+
+    /// The strip as laid out with no reorder drag applied. Every drag
+    /// computation works off this, so the row it re-lays does not feed back into
+    /// where the drag thinks the slots are.
+    fn thumbnail_strip_at_rest(&self) -> Option<Strip> {
         if !self.thumbnails_visible() {
             return None;
         }
@@ -2091,6 +2142,90 @@ impl<W: LayoutElement> Monitor<W> {
             self.workspaces.len(),
             placeholder,
         ))
+    }
+
+    /// Re-lays a strip around a reorder drag: the dragged thumbnail follows the
+    /// pointer, and the others close up and part around the slot it would land
+    /// in.
+    ///
+    /// The returned `thumbs` stay in **workspace order** (`thumbs[i]` belongs to
+    /// `workspaces[i]`), which is what every consumer — rendering, `thumb_under`,
+    /// `drop_target` — assumes.
+    fn apply_thumb_drag(&self, mut strip: Strip) -> Strip {
+        let Some(drag) = self.thumb_drag else {
+            return strip;
+        };
+        if drag.from >= strip.thumbs.len() {
+            return strip;
+        }
+
+        // Where it would land, and hence the order the others take.
+        let target = thumb_drag_target(&strip, drag);
+        let mut order: Vec<usize> = (0..strip.thumbs.len())
+            .filter(|i| *i != drag.from)
+            .collect();
+        order.insert(target.min(order.len()), drag.from);
+
+        let slots: Vec<_> = strip.thumbs.clone();
+        for (slot, ws) in order.into_iter().enumerate() {
+            strip.thumbs[ws].loc = slots[slot].loc;
+        }
+        // …and the dragged one is wherever the pointer holds it.
+        strip.thumbs[drag.from].loc.x = drag.pos.x - drag.grab_offset;
+
+        strip
+    }
+
+    /// Picks up the thumbnail at `idx` for reordering (**divergence**, see
+    /// [`ThumbDrag`]). Returns whether there was a thumbnail there to pick up.
+    pub fn begin_thumb_drag(&mut self, idx: usize, pos: Point<f64, Logical>) -> bool {
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return false;
+        };
+        let Some(rect) = strip.thumbs.get(idx) else {
+            return false;
+        };
+        self.thumb_drag = Some(ThumbDrag {
+            from: idx,
+            grab_offset: pos.x - rect.loc.x,
+            pos,
+        });
+        true
+    }
+
+    /// Follows the pointer.
+    pub fn update_thumb_drag(&mut self, pos: Point<f64, Logical>) {
+        if let Some(drag) = &mut self.thumb_drag {
+            drag.pos = pos;
+        }
+    }
+
+    /// Ends the drag, reordering the workspaces to where the thumbnail was
+    /// dropped. Returns whether anything moved.
+    pub fn finish_thumb_drag(&mut self) -> bool {
+        let Some(drag) = self.thumb_drag.take() else {
+            return false;
+        };
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return false;
+        };
+        let target = thumb_drag_target(&strip, drag);
+        if target == drag.from {
+            return false;
+        }
+        self.move_workspace_to_idx(drag.from, target);
+        true
+    }
+
+    /// Drops the drag without reordering (the overview closing under it, a
+    /// cancelled grab).
+    pub fn cancel_thumb_drag(&mut self) {
+        self.thumb_drag = None;
+    }
+
+    /// Whether a reorder drag is under way.
+    pub fn thumb_drag_active(&self) -> bool {
+        self.thumb_drag.is_some()
     }
 
     /// The strip slides in from above the screen with the overview

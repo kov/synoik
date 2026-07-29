@@ -4944,6 +4944,11 @@ impl<W: LayoutElement> Layout<W> {
 
         for mon in monitors {
             mon.overview_open = self.overview_open;
+            if !self.overview_open {
+                // The strip is gone, so a reorder drag on it has nothing left to drop
+                // onto — it must not survive to be applied when the overview reopens.
+                mon.cancel_thumb_drag();
+            }
             mon.set_overview_progress(self.overview_progress.as_ref());
         }
     }
