@@ -298,13 +298,16 @@ impl<'a, W: LayoutElement> Clone for MonitorAddWindowTarget<'a, W> {
 niri_render_elements! {
     MonitorInnerRenderElement => {
         Workspace = CropRenderElement<WorkspaceRenderElement>,
+        // The insert hint, and the thumbnail-strip rings clipped to their band.
         InsertHint = CropRenderElement<InsertHintRenderElement>,
         // Insert hint between workspaces, and the thumbnail-strip indicator.
         Ring = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
+        CroppedSolidColor = CropRenderElement<SolidColorRenderElement>,
         // The wallpaper in a workspace thumbnail.
         RoundedTexture = RoundedTextureRenderElement<VkTexture>,
+        CroppedRoundedTexture = CropRenderElement<RoundedTextureRenderElement<VkTexture>>,
     }
 }
 
@@ -1888,11 +1891,7 @@ impl<W: LayoutElement> Monitor<W> {
                 search_entry_height: crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
                 search_entry_width: entry_w,
                 dash_preferred_height: crate::ui::dash::preferred_height(self.view_size),
-                thumbnails_preferred_height: thumbnails::preferred_height(
-                    self.view_size,
-                    overview_layout::thumbnails_available_width(self.view_size, entry_w),
-                    self.workspaces.len(),
-                ),
+                thumbnails_preferred_height: thumbnails::preferred_height(self.view_size),
             },
             self.thumbnails_expand_fraction(),
             state,
@@ -2142,6 +2141,7 @@ impl<W: LayoutElement> Monitor<W> {
             self.controls_layout().thumbnails,
             self.workspaces.len(),
             placeholder,
+            self.workspace_render_idx(),
         ))
     }
 
@@ -2707,39 +2707,53 @@ impl<W: LayoutElement> Monitor<W> {
         let scale = self.scale.fractional_scale();
         let slide = Point::from((0., self.thumbnail_slide_offset(&strip, progress)));
 
+        // A scrolled row runs past the band it was allocated, and past that band is
+        // where the floating search entry sits — so everything the strip draws is
+        // clipped to it. The band slides with the row, or the clip would eat the whole
+        // strip on the way in.
+        let band = Rectangle::new(strip.band.loc + slide, strip.band.size);
+        let band_physical = band.to_physical_precise_round(scale);
+        // Each ring is in view coordinates already, so it clips against the band directly.
+        let mut push_ring = |elem| {
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, band_physical) {
+                let elem = MonitorInnerRenderElement::InsertHint(elem);
+                let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                let elem =
+                    RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
+                push(elem);
+            }
+        };
+
         // First pushed = topmost: the indicator ring sits above the
         // thumbnails (gnome-shell keeps it as the top sibling).
         let indicator_loc = self.thumbnail_indicator_rect(&strip).loc + slide;
-        self.thumb_indicator.render(indicator_loc, &mut |elem| {
-            let elem = MonitorInnerRenderElement::Ring(elem);
-            let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-            let elem =
-                RelocateRenderElement::from_element(elem, Point::default(), Relocate::Relative);
-            push(elem);
-        });
+        self.thumb_indicator.render(indicator_loc, &mut push_ring);
 
         // The new-workspace drop placeholder, while a drag hovers a gap.
         if let Some(rect) = strip.placeholder {
             self.thumb_placeholder
-                .render(rect.loc + slide, &mut |elem| {
-                    let elem = MonitorInnerRenderElement::Ring(elem);
-                    let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
-                    let elem = RelocateRenderElement::from_element(
-                        elem,
-                        Point::default(),
-                        Relocate::Relative,
-                    );
-                    push(elem);
-                });
+                .render(rect.loc + slide, &mut push_ring);
         }
-
-        // Clip each miniature to its workspace.
-        let crop_bounds = Rectangle::from_size(self.view_size).to_physical_precise_round(scale);
 
         for (ws, thumb) in zip(&self.workspaces, &strip.thumbs) {
             let thumb = Rectangle::new(thumb.loc + slide, thumb.size);
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
             let xray_pos = XrayPos::new(thumb.loc, strip.scale);
+
+            // Clip each miniature to its workspace, and to the part of it the band
+            // leaves visible. Both live in *workspace* coordinates, because the crop
+            // is applied before the thumbnail's rescale and relocate.
+            let x0 = ((band.loc.x - thumb.loc.x) / strip.scale).max(0.);
+            let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / strip.scale).min(self.view_size.w);
+            if x1 <= x0 {
+                // Scrolled entirely out of the band.
+                continue;
+            }
+            let crop_bounds = Rectangle::new(
+                Point::from((x0, 0.)),
+                Size::from((x1 - x0, self.view_size.h)),
+            )
+            .to_physical_precise_round(scale);
 
             macro_rules! push_thumb {
                 () => {{
@@ -2790,7 +2804,28 @@ impl<W: LayoutElement> Monitor<W> {
                     radius,
                     Scale::from(scale * strip.scale),
                 ) {
-                    let elem = MonitorInnerRenderElement::RoundedTexture(elem);
+                    if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_bounds) {
+                        let elem = MonitorInnerRenderElement::CroppedRoundedTexture(elem);
+                        let elem = RescaleRenderElement::from_element(
+                            elem,
+                            Point::from((0, 0)),
+                            strip.scale,
+                        );
+                        let elem = RelocateRenderElement::from_element(
+                            elem,
+                            thumb_loc_physical,
+                            Relocate::Relative,
+                        );
+                        push(elem);
+                    }
+                    wallpapered = true;
+                }
+            }
+            if !wallpapered {
+                if let Some(elem) =
+                    CropRenderElement::from_element(ws.render_background(), scale, crop_bounds)
+                {
+                    let elem = MonitorInnerRenderElement::CroppedSolidColor(elem);
                     let elem =
                         RescaleRenderElement::from_element(elem, Point::from((0, 0)), strip.scale);
                     let elem = RelocateRenderElement::from_element(
@@ -2799,19 +2834,7 @@ impl<W: LayoutElement> Monitor<W> {
                         Relocate::Relative,
                     );
                     push(elem);
-                    wallpapered = true;
                 }
-            }
-            if !wallpapered {
-                let elem = MonitorInnerRenderElement::SolidColor(ws.render_background());
-                let elem =
-                    RescaleRenderElement::from_element(elem, Point::from((0, 0)), strip.scale);
-                let elem = RelocateRenderElement::from_element(
-                    elem,
-                    thumb_loc_physical,
-                    Relocate::Relative,
-                );
-                push(elem);
             }
         }
     }

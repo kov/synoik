@@ -3,9 +3,10 @@
 //!
 //! The strip shows every workspace as a miniature, horizontally centered in
 //! the band [`crate::ui::overview_layout`] allocates it just below the search
-//! entry. With dynamic workspaces it only appears once there are more than
-//! [`NUM_WORKSPACES_THRESHOLD`] workspaces, i.e. once a second desktop is
-//! populated.
+//! entry — or, once there are more workspaces than the band holds, scrolled to
+//! follow the active one and clipped to the band. With dynamic workspaces it
+//! only appears once there are more than [`NUM_WORKSPACES_THRESHOLD`]
+//! workspaces, i.e. once a second desktop is populated.
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -42,65 +43,63 @@ pub const PLACEHOLDER_WIDTH: f64 = 18.;
 pub struct Strip {
     /// Scale from workspace to thumbnail coordinates.
     pub scale: f64,
-    /// Per-workspace thumbnail rects, in view coordinates, workspace order.
+    /// Per-workspace thumbnail rects, in view coordinates, workspace order. A
+    /// scrolled row puts some of these partly or wholly outside [`Self::band`];
+    /// they are clipped to it when drawn and are not hit-testable beyond it.
     pub thumbs: Vec<Rectangle<f64, Logical>>,
     /// The new-workspace drop placeholder, when a drag hovers a gap.
     pub placeholder: Option<Rectangle<f64, Logical>>,
-}
-
-/// The thumbnail scale: [`MAX_THUMBNAIL_SCALE`] of the view, shrinking below the cap once
-/// `n` thumbnails plus spacing no longer fit `avail_w` (gnome-shell's
-/// `vfunc_get_preferred_height`).
-///
-/// `avail_w` is the width of the *band*, not of the view: the floating search entry keeps a
-/// zone clear at either edge ([`crate::ui::overview_layout::thumbnails_available_width`]),
-/// and the row has to fit what is left. gnome-shell measures against the full width because
-/// its entry sits in a row of its own.
-fn thumb_scale(view_size: Size<f64, Logical>, avail_w: f64, n: usize) -> f64 {
-    let avail = avail_w - SPACING * 2.;
-    f64::min(
-        (avail - SPACING * (n - 1) as f64) / (view_size.w * n as f64),
-        MAX_THUMBNAIL_SCALE,
-    )
-    .max(0.)
+    /// The band the strip was allocated: the row's viewport, and the clip.
+    pub band: Rectangle<f64, Logical>,
 }
 
 /// How tall a band the strip needs — gnome-shell's
 /// `ThumbnailsBox.get_preferred_height`, which is what
 /// [`crate::ui::overview_layout`] allocates it.
 ///
+/// **Divergence (approved 2026-07-29).** gnome-shell shrinks the thumbnails below
+/// [`MAX_THUMBNAIL_SCALE`] once the row no longer fits its width
+/// (`vfunc_get_preferred_height`), so a strip of many workspaces becomes a row of
+/// specks. Ours holds the cap and [`strip_geometry`] scrolls the row instead, so the
+/// height is a constant and the band never changes size with the workspace count.
+///
 /// Divergence: gnome-shell measures against the work-area porthole
 /// (`workspaceThumbnail.js:1248-1255`); our miniature is the whole view,
 /// including the strip under the top panel, so we measure against the view.
-pub fn preferred_height(view_size: Size<f64, Logical>, avail_w: f64, n: usize) -> f64 {
-    (view_size.h * thumb_scale(view_size, avail_w, n)).round()
+pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
+    (view_size.h * MAX_THUMBNAIL_SCALE).round()
 }
 
-/// Lays out the strip inside its allocated `band`: each thumbnail is the
-/// workspace at 5% scale (smaller if the row wouldn't fit the view width),
-/// the row horizontally centered in the band and anchored to its top —
-/// gnome-shell allocates the box exactly `get_preferred_height` tall
-/// (`overviewControls.js:184-196`), so at rest the two coincide. A
-/// `placeholder` index makes room for the new-workspace drop placeholder
-/// before that thumbnail (gnome-shell's drop placeholder).
+/// Lays out the strip inside its allocated `band`: each thumbnail is the workspace at
+/// [`MAX_THUMBNAIL_SCALE`], anchored to the band's top — gnome-shell allocates the box
+/// exactly `get_preferred_height` tall (`overviewControls.js:184-196`), so at rest the two
+/// coincide. A `placeholder` index makes room for the new-workspace drop placeholder before
+/// that thumbnail (gnome-shell's drop placeholder).
+///
+/// A row that fits is centered in the band, as gnome-shell's is. One that does not
+/// **scrolls to follow `focus`** — the fractional active-workspace index, so it tracks a
+/// workspace switch as it animates — clamped so the row never leaves a gap at either end.
+/// This is the same rule the overflowing workspace row follows
+/// ([`crate::layout::monitor::scroll_to_follow`]), and it replaces gnome-shell's
+/// shrink-to-fit (see [`preferred_height`]).
 pub fn strip_geometry(
     view_size: Size<f64, Logical>,
     band: Rectangle<f64, Logical>,
     n: usize,
     placeholder: Option<usize>,
+    focus: f64,
 ) -> Strip {
-    let scale = thumb_scale(view_size, band.size.w, n);
-
-    let thumb_h = (view_size.h * scale).round();
+    let thumb_h = (view_size.h * MAX_THUMBNAIL_SCALE).round();
     let thumb_w = (thumb_h * (view_size.w / view_size.h)).round();
     let thumb = Size::from((thumb_w, thumb_h));
 
     let extra = placeholder.map_or(0., |_| PLACEHOLDER_WIDTH + SPACING);
     let total_w = thumb_w * n as f64 + SPACING * (n - 1) as f64 + extra;
-    let x0 = (band.loc.x + (band.size.w - total_w) / 2.).round();
     let y = band.loc.y.round();
 
-    let mut x = x0;
+    // Laid out from the row's own origin first, so the scroll can be computed from
+    // where the focused thumbnail actually landed — the placeholder displaces it.
+    let mut x = 0.;
     let mut placeholder_rect = None;
     let mut place = |i: usize, x: &mut f64| {
         if placeholder == Some(i) {
@@ -119,12 +118,30 @@ pub fn strip_geometry(
     }
     place(n, &mut x);
 
+    // Where the active workspace's thumbnail sits along the row, interpolated between
+    // its neighbours exactly as the indicator ring is, so the two scroll together.
+    let idx = focus.clamp(0., (n - 1) as f64);
+    let (lo, hi) = (idx.floor() as usize, idx.ceil() as usize);
+    let t = idx.fract();
+    let focus_x = thumbs[lo].loc.x + (thumbs[hi].loc.x - thumbs[lo].loc.x) * t;
+
+    let x0 = (band.loc.x
+        + super::monitor::scroll_to_follow(band.size.w, total_w, focus_x + thumb_w / 2.))
+    .round();
+    for rect in &mut thumbs {
+        rect.loc.x += x0;
+    }
+    if let Some(rect) = &mut placeholder_rect {
+        rect.loc.x += x0;
+    }
+
     Strip {
         // The exact scale the rounded thumbnail size implies, so contents
         // fill it precisely.
         scale: thumb_h / view_size.h,
         thumbs,
         placeholder: placeholder_rect,
+        band,
     }
 }
 
@@ -145,8 +162,14 @@ impl Strip {
         )
     }
 
-    /// The workspace whose thumbnail contains the position.
+    /// The workspace whose thumbnail contains the position. A scrolled row is clipped
+    /// to the band, so only what is drawn can be hit — the part of a thumbnail past the
+    /// edge is not there to aim at, and the space beyond the band belongs to the
+    /// floating search entry.
     pub fn thumb_under(&self, pos: Point<f64, Logical>) -> Option<usize> {
+        if !self.band.contains(pos) {
+            return None;
+        }
         self.thumbs.iter().position(|rect| rect.contains(pos))
     }
 
@@ -156,7 +179,7 @@ impl Strip {
     /// gaps insert.
     pub fn drop_target(&self, pos: Point<f64, Logical>) -> Option<DropTarget> {
         let bounds = self.bounds();
-        if !bounds.contains(pos) {
+        if !bounds.contains(pos) || !self.band.contains(pos) {
             return None;
         }
 
@@ -205,21 +228,27 @@ mod tests {
     /// Where that band starts.
     const BAND_X: f64 = 376.;
 
-    /// The band [`crate::ui::overview_layout`] allocates for `n` thumbnails at
-    /// the 1920×1080 / 35px-strut reference: y = 35 + 13 (the entry floats and
-    /// no longer displaces the strip).
-    fn band(n: usize) -> Rectangle<f64, Logical> {
+    /// The band [`crate::ui::overview_layout`] allocates the strip at the 1920×1080 /
+    /// 35px-strut reference: y = 35 + 13 (the entry floats and no longer displaces the
+    /// strip). Its height no longer depends on the workspace count — the row scrolls.
+    fn band() -> Rectangle<f64, Logical> {
         Rectangle::new(
             Point::from((BAND_X, 48.)),
-            Size::from((AVAIL_W, preferred_height(view(), AVAIL_W, n))),
+            Size::from((AVAIL_W, preferred_height(view()))),
         )
+    }
+
+    /// The strip with the first workspace active, which is where every test that is
+    /// not about scrolling wants to be.
+    fn strip(n: usize, placeholder: Option<usize>) -> Strip {
+        strip_geometry(view(), band(), n, placeholder, 0.)
     }
 
     /// The cap is our doubled one, not gnome-shell's 5%: 10% of 1080 = 108 tall, 192 wide
     /// (the output's aspect), so a thumbnail covers four times the area GNOME gives it.
     #[test]
     fn three_thumbnails_at_the_doubled_cap() {
-        let strip = strip_geometry(view(), band(3), 3, None);
+        let strip = strip(3, None);
         assert_eq!(strip.scale, 108. / 1080.);
         // Centered in the band, which is itself centered in the view.
         let expected_x0 = BAND_X + (AVAIL_W - (192. * 3. + 8. * 2.)) / 2.;
@@ -236,23 +265,73 @@ mod tests {
         );
     }
 
-    /// The row has to fit the band, not the view: with the floating entry's zone reserved
-    /// the strip runs out of room sooner, and the cap gives way rather than the pill being
-    /// overrun.
+    /// The row scrolls to follow the active workspace instead of shrinking to fit
+    /// (the approved divergence). The scale is the cap whatever the count, and
+    /// whichever workspace is active is fully inside the band the entry left.
     #[test]
-    fn the_row_fits_the_band_the_entry_left_it() {
-        // Wide enough at the cap: 10 thumbs of 192 plus gaps = 1992 > 1168, so it shrinks.
+    fn the_row_scrolls_to_the_active_workspace() {
+        // 10 thumbs of 192 plus gaps = 1992, well past the 1168-wide band.
         let n = 10;
-        let strip = strip_geometry(view(), band(n), n, None);
-        assert!(strip.scale < MAX_THUMBNAIL_SCALE);
-        let bounds = strip.bounds();
-        assert!(bounds.loc.x >= BAND_X);
-        assert!(bounds.loc.x + bounds.size.w <= BAND_X + AVAIL_W);
+        for active in 0..n {
+            let strip = strip_geometry(view(), band(), n, None, active as f64);
+            assert_eq!(
+                strip.scale, MAX_THUMBNAIL_SCALE,
+                "the cap must not give way"
+            );
+            let rect = strip.thumbs[active];
+            assert!(
+                rect.loc.x >= BAND_X && rect.loc.x + rect.size.w <= BAND_X + AVAIL_W,
+                "thumbnail {active} is outside the band at {rect:?}"
+            );
+            // Rigid: the scroll moves the row, it never re-spaces it.
+            for pair in strip.thumbs.windows(2) {
+                assert_eq!(pair[1].loc.x - pair[0].loc.x, 192. + SPACING);
+            }
+        }
 
-        // The same row against the *full* view width would have fit at a bigger scale —
-        // i.e. the inset is what binds, and it is not being ignored.
-        let full = Rectangle::new(Point::from((0., 48.)), Size::from((1920., 108.)));
-        assert!(strip_geometry(view(), full, n, None).scale > strip.scale);
+        // The ends stay flush against the band — the clamp, not just the centering.
+        let first = strip_geometry(view(), band(), n, None, 0.);
+        assert_eq!(first.thumbs[0].loc.x, BAND_X);
+        let last = strip_geometry(view(), band(), n, None, (n - 1) as f64);
+        let tail = last.thumbs[n - 1];
+        assert_eq!(tail.loc.x + tail.size.w, BAND_X + AVAIL_W);
+
+        // A fractional focus scrolls smoothly between the two, so the row tracks a
+        // workspace switch as it animates rather than jumping at the halfway point.
+        let mid = strip_geometry(view(), band(), n, None, 4.5);
+        let (a, b) = (
+            strip_geometry(view(), band(), n, None, 4.).thumbs[0].loc.x,
+            strip_geometry(view(), band(), n, None, 5.).thumbs[0].loc.x,
+        );
+        assert!(
+            (mid.thumbs[0].loc.x - (a + b) / 2.).abs() <= 1.,
+            "a half-step focus must scroll half a step"
+        );
+    }
+
+    /// Only what is drawn can be hit: a scrolled row is clipped to the band, and past
+    /// the band's edge is where the floating search entry lives.
+    #[test]
+    fn a_scrolled_thumbnail_is_not_hit_outside_the_band() {
+        let n = 10;
+        let strip = strip_geometry(view(), band(), n, None, 0.);
+        let y = 100.;
+
+        // The row runs off the right edge; the first thumbnail past it is not clickable
+        // even though its rect contains the point.
+        let outside = strip
+            .thumbs
+            .iter()
+            .position(|r| r.loc.x >= BAND_X + AVAIL_W)
+            .expect("the row must overflow the band");
+        let rect = strip.thumbs[outside];
+        let pos = Point::from((rect.loc.x + rect.size.w / 2., y));
+        assert!(rect.contains(pos), "the probe must be inside the rect");
+        assert_eq!(strip.thumb_under(pos), None);
+        assert_eq!(strip.drop_target(pos), None);
+
+        // …while the one at the band's edge still is, on its visible part.
+        assert_eq!(strip.thumb_under(Point::from((BAND_X + 4., y))), Some(0));
     }
 
     /// The strip fills the band it was allocated, so the allocator is the only
@@ -261,14 +340,14 @@ mod tests {
     /// from the workspace zoom and had to re-derive the panel strut itself.)
     #[test]
     fn the_strip_fills_its_allocated_band() {
-        let strip = strip_geometry(view(), band(3), 3, None);
-        assert_eq!(preferred_height(view(), AVAIL_W, 3), 108.);
+        let strip = strip(3, None);
+        assert_eq!(preferred_height(view()), 108.);
         assert_eq!(strip.thumbs[0].loc.y, 48.);
-        assert_eq!(strip.thumbs[0].size.h, band(3).size.h);
+        assert_eq!(strip.thumbs[0].size.h, band().size.h);
 
         // Move the band and the whole row follows, with no re-centering.
         let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., 108.)));
-        let strip = strip_geometry(view(), moved, 3, None);
+        let strip = strip_geometry(view(), moved, 3, None, 0.);
         assert_eq!(strip.thumbs[0].loc.y, 300.);
         // 800 is still wide enough for three at the cap, so they stay 108 × 192.
         let total_w = 192. * 3. + 8. * 2.;
@@ -277,8 +356,8 @@ mod tests {
 
     #[test]
     fn placeholder_spreads_the_thumbnails_apart() {
-        let at_rest = strip_geometry(view(), band(3), 3, None);
-        let strip = strip_geometry(view(), band(3), 3, Some(1));
+        let at_rest = strip(3, None);
+        let strip = strip(3, Some(1));
 
         let rect = strip
             .placeholder
@@ -303,17 +382,8 @@ mod tests {
     }
 
     #[test]
-    fn many_thumbnails_shrink_to_fit() {
-        let n = 25;
-        let strip = strip_geometry(view(), band(n), n, None);
-        assert!(strip.scale < MAX_THUMBNAIL_SCALE);
-        let bounds = strip.bounds();
-        assert!(bounds.loc.x >= BAND_X && bounds.loc.x + bounds.size.w <= BAND_X + AVAIL_W);
-    }
-
-    #[test]
     fn drop_targets_split_thumbs_and_gaps() {
-        let strip = strip_geometry(view(), band(3), 3, None);
+        let strip = strip(3, None);
         let y = 130.;
         let first = strip.thumbs[0];
         let second = strip.thumbs[1];

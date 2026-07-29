@@ -1312,19 +1312,47 @@ slop and, whatever the slop, the whole close rect. Only previews *already* showi
 count, so it can only hold a hover the slot started — it never steals one from a neighbour and
 cannot arm one from outside, where the button is not drawn to be aimed at.
 
-### 12.2 The app-grid state's workspace strip does not scale to fit (reported 2026-07-28, NOT started)
+### 12.2 Both overview workspace rows overflow rather than shrink, and scroll ✅
 
-Gustavo, from live use: the thumbnail strip auto-scales to fit as workspaces are added (it
-shrinks below `MAX_THUMBNAIL_SCALE` once the row no longer fits its band — `thumb_scale`,
-`src/layout/thumbnails.rs`), but the workspaces shown in the **app-grid** state do not, so with
-enough workspaces some become unreachable.
+Gustavo, from live use: the thumbnail strip auto-scaled to fit as workspaces were added, but the
+workspaces shown in the **app-grid** state did not, so with enough of them some became
+unreachable. Asked which way to settle it, he chose **scrolling for both** — and the thumbnail
+strip's shrink-to-fit went with it: "scrolling is actually better, we can do the same for the
+thumb strip (both should not overlap the search box btw), and the scroll offset should follow
+the selected workspace."
 
-That is the `SMALL_WORKSPACE_RATIO` strip — the picker box at `state::APP_GRID`
-(`_computeWorkspacesBoxForState`, `overviewControls.js:80-110`, ported in
-`ui/overview_layout.rs`) — which is laid out by the same workspace *row* code as the window
-picker, and that row scrolls rather than fitting. Decide whether it should fit-to-width like the
-strip does, or gain the scrolling affordance GNOME's does; either way what is on screen has to
-be reachable.
+**Divergence (approved 2026-07-29), in both directions.** gnome-shell fits, at both sites: the
+fit-all row narrows every box to `availableWidth / n` (`_getFirstFitAllWorkspaceBox`,
+`workspacesView.js:127-169`) and `ThumbnailsBox.vfunc_get_preferred_height` shrinks the
+thumbnails below `MAX_THUMBNAIL_SCALE` until the row fits. Fitting past a certain count means
+specks; we scroll instead. One rule, one helper — `layout::monitor::scroll_to_follow`: a row
+that fits is centered (which reduces to gnome-shell's centering exactly, so nothing moves below
+the overflow point), and one that does not scrolls to center the active workspace, clamped so
+the run never leaves a gap at either end.
+
+- **The app-grid row** (`fit_all_row`, `src/layout/monitor.rs`). The overflow itself was already
+  a recorded divergence — we keep one aspect-locked zoom per monitor, so the run overflows where
+  gnome-shell would have narrowed it. What made the tail unreachable was pinning that run at the
+  left gap. Now it follows the selection. Nothing clips it: the row sits below the floating entry
+  and runs off the screen edges, where there is nothing to overlap.
+- **The thumbnail strip** (`thumbnails::strip_geometry`). The scale is now the cap, full stop, so
+  `preferred_height` is a constant and the band no longer changes size with the workspace count.
+  The row scrolls inside the band, on the *fractional* active index, so it tracks a workspace
+  switch as it animates and stays locked to the indicator ring.
+
+**The strip is clipped to its band**, which is what keeps a scrolled row off the floating search
+entry. That needed the crop to reach three more layers — the wallpaper, the solid-color backing
+and the two rings — so `MonitorInnerRenderElement` gained `CroppedSolidColor` and
+`CroppedRoundedTexture`, and the rings now go through the existing `InsertHint` (cropped) variant.
+The crop for a thumbnail's *contents* is expressed in workspace coordinates, because it is applied
+before the rescale and relocate that place the miniature; the rings are already in view
+coordinates and clip against the band directly. The band slides with the row on the way in, or the
+clip would eat the whole strip during the open transition. Hit-testing follows the clip:
+`Strip::thumb_under` and `drop_target` require the band, so only what is drawn can be aimed at.
+
+Live-validated on the headless seat at 13 workspaces: the strip scrolls with a partial thumbnail
+peeking at each band edge, the pill is untouched, and the app grid's row keeps the active
+workspace on screen.
 
 ### 12.3 Panel / quick-settings buttons that launch apps must leave the overview ✅
 

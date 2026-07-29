@@ -2647,6 +2647,83 @@ fn overview_entry_floats_right_of_a_doubled_thumbnail_strip() {
     }
 }
 
+/// Past the point where the row fills its band, the strip scrolls to follow the
+/// active workspace instead of shrinking to fit (**divergence**, approved
+/// 2026-07-29 — gnome-shell's `vfunc_get_preferred_height` shrinks below
+/// `MAX_THUMBNAIL_SCALE` until everything fits, which turns a long strip into a
+/// row of specks). Whatever the count, a thumbnail is the same size, the active
+/// one is on screen, and nothing draws over the floating search entry.
+#[test]
+fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    setup_n_desktops(&mut f, id, 12);
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+
+    let controls = overview_controls(&mut f);
+    let pill = f.niri().overview_search.entry_pill(controls.into());
+    let band = controls.thumbnails;
+
+    let strip_now = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .thumbnail_strip()
+            .expect("many workspaces must show the strip")
+    };
+
+    let strip = strip_now(&mut f);
+    let n = strip.thumbs.len();
+    assert!(
+        n >= 12,
+        "expected the populated workspaces plus a spare, got {n}"
+    );
+    // The row genuinely overflows — otherwise there is nothing to scroll.
+    assert!(
+        strip.bounds().size.w > band.size.w,
+        "this test is vacuous unless the row overflows its band"
+    );
+    // …and the thumbnails are still the full doubled cap, not shrunk to fit.
+    assert_eq!(
+        strip.thumbs[0].size.h,
+        (1080. * crate::layout::thumbnails::MAX_THUMBNAIL_SCALE).round(),
+        "the cap must not give way to the workspace count"
+    );
+
+    // Walk down the strip: the active workspace's thumbnail is inside the band
+    // every step of the way, and the band is clear of the floating entry.
+    assert!(
+        band.loc.x + band.size.w <= pill.loc.x,
+        "the band must stay clear of the entry pill"
+    );
+    for _ in 0..n {
+        let active = f
+            .niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx();
+        let strip = strip_now(&mut f);
+        let rect = strip.thumbs[active];
+        assert!(
+            rect.loc.x >= band.loc.x && rect.loc.x + rect.size.w <= band.loc.x + band.size.w,
+            "thumbnail {active} is outside the band at {rect:?}"
+        );
+        // The visible row is exactly what can be clicked: a thumbnail scrolled out
+        // is not hit-testable where it would otherwise be.
+        let center = smithay::utils::Point::from((
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        ));
+        assert_eq!(strip.thumb_under(center), Some(active));
+
+        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+        f.settle_animations();
+    }
+}
+
 /// The thumbnails strip fills the band the overview layout allocates it, just
 /// below the search entry — not a band derived from the workspace zoom.
 #[test]
