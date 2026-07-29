@@ -236,6 +236,62 @@ pub fn app_icon_element(
     ))
 }
 
+/// GNOME's `%tooltip` (`_common.scss:225-238`) — the black pill behind a short
+/// label. Shared by `.window-caption` (the overview preview title,
+/// `_window-picker.scss:24-26`), `.dash-label` (`_dash.scss:103-106`) and the
+/// screenshot UI's tip (`_screenshot.scss:200`), so it lands here rather than in
+/// the first caller.
+///
+/// The widget owns its box model and its paint; the caller owns placement and the
+/// bake cache (captions differ per instance, so one cache per *text* is the
+/// natural key).
+#[derive(Debug, Clone, Copy)]
+pub struct Tooltip;
+
+impl Tooltip {
+    /// `padding: $base_padding $base_padding * 2` (`_common.scss:231`).
+    pub const PAD_V: f64 = 6.;
+    pub const PAD_H: f64 = 12.;
+    /// `border: 1px solid transparentize($light_1, 0.9)` (`:227`).
+    pub const BORDER: f64 = 1.;
+    /// `background-color: transparentize(black, 0.1)` (`:226`).
+    pub const BG: Rgba = [0., 0., 0., 0.9];
+    /// The 1px border — white at 10%.
+    pub const BORDER_COLOR: Rgba = style::BORDERS;
+    /// The label inherits the stage's 11pt body size; `%tooltip` sets no font.
+    pub const TEXT_PT: f64 = 11.;
+
+    /// The pill's box for `text`, at the shared body size. Height is fixed by the
+    /// box model (it is a single line), width is the label plus padding.
+    pub fn size(text: &str) -> Size<f64, Logical> {
+        let px = crate::ui::pt_to_px(Self::TEXT_PT);
+        let w = niri_vk::text::measure_line_width_weighted(text, px as f32, false);
+        Size::from((w + 2. * Self::PAD_H, px.ceil() + 2. * Self::PAD_V))
+    }
+
+    /// `border-radius: $forced_circular_radius` — a pill, so half the height.
+    pub fn radius(size: Size<f64, Logical>) -> f64 {
+        size.h / 2.
+    }
+}
+
+impl Painter<'_, '_, '_> {
+    /// Paint a [`Tooltip`] filling the whole buffer, with `label` centred in it.
+    /// `text-align: center` (`_common.scss:232`).
+    pub fn tooltip(&mut self, size: Size<f64, Logical>, label: &ShapedText) -> anyhow::Result<()> {
+        let radius = Tooltip::radius(size);
+        self.clear(style::TRANSPARENT)?;
+        self.fill_rounded_full(radius, Tooltip::BG)?;
+        self.stroke_rounded_full(radius, Tooltip::BORDER, Tooltip::BORDER_COLOR)?;
+        self.text(
+            label,
+            Point::from((size.w / 2., size.h / 2.)),
+            Align::CENTER,
+            style::TEXT,
+        )
+    }
+}
+
 /// GNOME's `.overview-icon` tile (`%tile`, `_common.scss:84-90`): a rounded square
 /// holding an icon, with a hover state. The reusable geometry + state shared by the
 /// dash (S3) and, later, the app grid and grid search results — GNOME shares it the

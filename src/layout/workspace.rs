@@ -2075,8 +2075,11 @@ impl<W: LayoutElement> Workspace<W> {
         self.expose_hover.clear();
     }
 
-    /// Every window whose picker overlay is showing, with its progress — the
-    /// hovered one plus any still easing back down.
+    /// Every window with an overlay showing, and how far it has faded in. The
+    /// render path wants *all* previews (the app icon is not hover-gated) and goes
+    /// through [`Self::expose_hover_value`] instead; this stays as the "is anything
+    /// hovered at all" query.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn expose_hovers(&self) -> impl Iterator<Item = (&W::Id, f64)> + '_ {
         self.expose_hover.iter().filter_map(|(id, anim)| {
             let value = anim.clamped_value().clamp(0., 1.);
@@ -2085,7 +2088,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     /// The picker-overlay progress of one window: 0 idle, 1 fully hovered.
-    fn expose_hover_value(&self, window: &W::Id) -> f64 {
+    pub(super) fn expose_hover_value(&self, window: &W::Id) -> f64 {
         self.expose_hover
             .iter()
             .find(|(id, _)| id == window)

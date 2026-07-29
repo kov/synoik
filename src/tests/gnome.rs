@@ -2264,6 +2264,67 @@ fn overview_picker_slots_stay_out_of_a_bottom_strut() {
     );
 }
 
+/// **Lifecycle L3.** The preview's app icon is not hover chrome: it shows for every
+/// preview in the window picker, and its *scale* — not its opacity — ramps with the
+/// overview axis (`_updateIconScale`, `windowPreview.js:238-252`). It must therefore
+/// survive the app-grid transition, shrinking to nothing, rather than being dropped
+/// the way the hover overlay is (`_syncOverlay`, `workspace.js:775-777`).
+#[test]
+fn overview_preview_icon_scales_out_into_the_app_grid() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let icon_scale = |f: &mut Fixture| -> f64 {
+        let output = f.niri_output(1);
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .preview_icon_scale()
+    };
+    let previews = |f: &mut Fixture| -> usize {
+        let output = f.niri_output(1);
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .preview_rects()
+            .len()
+    };
+
+    assert_eq!(icon_scale(&mut f), 0., "no icon with the overview closed");
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    assert_eq!(icon_scale(&mut f), 1., "full size in the window picker");
+    assert_eq!(previews(&mut f), 1);
+
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    assert_eq!(
+        icon_scale(&mut f),
+        0.,
+        "the icon has scaled away in the app grid"
+    );
+    assert_eq!(
+        previews(&mut f),
+        1,
+        "but the preview is still drawn — the icon shrinks, it is not dropped"
+    );
+    let output = f.niri_output(1);
+    assert!(
+        f.niri()
+            .layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .preview_overlays()
+            .is_empty(),
+        "the hover overlay, unlike the icon, is dropped outright"
+    );
+}
+
 /// The close button half-overhangs its preview (`windowPreview.js:203-218`), so reaching for
 /// that half takes the pointer *off* the picker slot. gnome-shell doesn't care — the button
 /// is a child actor, so it is inside the preview's own reactive box — but ours are separate

@@ -6322,23 +6322,40 @@ impl Niri {
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(ws_zoom, geo));
             }
 
-            // Topmost in the group: the hovered preview's close button. It is a
-            // child of the preview in gnome-shell (so it fades with the search like
-            // everything else here), but drawn in screen pixels — the workspace zoom
-            // is baked into the previews' allocations there, not applied to them.
+            // Topmost in the group: each preview's chrome — close button, caption
+            // and app icon. They are children of the preview in gnome-shell (so
+            // they fade with the search like everything else here), but drawn in
+            // screen pixels — the workspace zoom is baked into the previews'
+            // allocations there, not applied to them.
             {
+                // The icon is not hover-gated, so the source is every drawn
+                // preview; `preview_overlays` is the hover-gated subset, and a
+                // preview missing from it simply carries alpha 0.
+                let hovered: Vec<_> = mon.preview_overlays();
+                let icon_scale = mon.preview_icon_scale();
                 let overlays: Vec<_> = mon
-                    .preview_overlays()
+                    .preview_rects()
                     .into_iter()
-                    .map(|(window, preview, hover)| PreviewOverlay {
-                        preview,
-                        alpha: hover as f32,
-                        hovered: self.preview_close_hovered.as_ref() == Some(&window),
+                    .map(|(window, preview, _)| {
+                        let alpha = hovered
+                            .iter()
+                            .find(|(w, _, _)| *w == window)
+                            .map_or(0., |(_, _, hover)| *hover);
+                        let (icon, caption) = self.preview_app_chrome(&window);
+                        PreviewOverlay {
+                            preview,
+                            alpha: alpha as f32,
+                            hovered: self.preview_close_hovered.as_ref() == Some(&window),
+                            icon,
+                            caption,
+                            icon_scale,
+                        }
                     })
                     .collect();
                 for element in self.preview_chrome.render(
                     ctx.renderer,
                     &self.icon_cache,
+                    &self.app_icon_cache,
                     fade_scale,
                     &overlays,
                 ) {
@@ -8980,11 +8997,39 @@ impl Niri {
     /// would otherwise be served forever. Dropping per-icon as each decode lands is
     /// what lets an invalidation keep drawing the old icons instead of nothing:
     /// nothing has to clear the whole map up front.
+    /// A window preview's app icon and caption — `Shell.WindowTracker.get_window_app`
+    /// plus `_getCaption` (`windowPreview.js:133-135,259-266`): the window's title,
+    /// falling back to the app's name.
+    ///
+    /// The icon is `None` when the window resolves to no installed app; gnome-shell
+    /// always has one because it synthesizes a window-backed `ShellApp`, a
+    /// divergence already recorded on `AppSystem::recompute_running`.
+    fn preview_app_chrome(
+        &self,
+        window: &smithay::desktop::Window,
+    ) -> (Option<crate::app_system::AppIconRef>, String) {
+        let Some((_, mapped)) = self.layout.windows().find(|(_, m)| &m.window == window) else {
+            return (None, String::new());
+        };
+        let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
+            (role.app_id.clone(), role.title.clone())
+        });
+        let entry = app_id
+            .as_deref()
+            .and_then(|app_id| self.app_system.app_for_window(app_id));
+        let caption = title
+            .filter(|t| !t.is_empty())
+            .or_else(|| entry.as_ref().map(|e| e.name.clone()))
+            .unwrap_or_default();
+        (entry.map(|e| e.icon), caption)
+    }
+
     pub fn drop_app_icon_uploads(&self, icon: &crate::app_system::AppIconRef, logical_px: u16) {
         self.dash.drop_icon_upload(icon, logical_px);
         self.app_grid.drop_icon_upload(icon, logical_px);
         self.folder_dialog.drop_icon_upload(icon, logical_px);
         self.overview_search.drop_icon_upload(icon, logical_px);
+        self.preview_chrome.drop_icon_upload(icon, logical_px);
         crate::ui::widget::drop_app_icon_upload(
             &mut self.app_icon_uploads.borrow_mut(),
             icon,
@@ -9866,6 +9911,8 @@ niri_render_elements! {
         RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
         // A group of elements composited at one alpha — the overview's search cross-fade.
         Offscreen = OffscreenRenderElement,
+        // The window picker's per-preview chrome: close button, caption, app icon.
+        PreviewChrome = crate::ui::window_preview::PreviewChromeRenderElement,
     }
 }
 

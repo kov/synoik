@@ -2526,22 +2526,47 @@ impl<W: LayoutElement> Monitor<W> {
     /// window, where it draws in output coordinates, and how far the overlay has
     /// faded in (`showOverlay`, `windowPreview.js:310`).
     pub fn preview_overlays(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
-        let Some(progress) = self.expose_progress() else {
-            return Vec::new();
-        };
         // Overlays are a property of the state, not of the last pointer motion: opening the app
         // grid drops them even if the pointer never moves (`_syncOverlay`, `workspace.js:775-777`
         // — see `window_under`).
         if self.app_grid_fraction() > 0. {
             return Vec::new();
         }
+        // Only previews actually *showing* an overlay: two hit tests rely on that
+        // (`preview_hover_under`, `preview_close_under`) to avoid arming a hover
+        // from a button that is not drawn.
+        let mut overlays = self.preview_rects();
+        overlays.retain(|(_, _, hover)| *hover > 0.);
+        overlays
+    }
+
+    /// The app icon's scale on the overview axis — `_updateIconScale`
+    /// (`windowPreview.js:238-252`): `1 - |WINDOW_PICKER - currentState|`, which on
+    /// our two legs is the open progress times what is left of the app-grid one. 0
+    /// draws no icon, which is also the reference's "the transition never touches
+    /// WINDOW_PICKER" case.
+    pub fn preview_icon_scale(&self) -> f64 {
+        self.expose_progress().unwrap_or(0.) * (1. - self.app_grid_fraction())
+    }
+
+    /// Every drawn window preview and its hover alpha — the shared source of
+    /// [`preview_overlays`](Self::preview_overlays) (hover-gated chrome) and of the
+    /// app icon, which is *not* hover-gated and survives into the app-grid
+    /// transition while its scale ramps out.
+    pub fn preview_rects(&self) -> Vec<(W::Id, Rectangle<f64, Logical>, f64)> {
+        let Some(progress) = self.expose_progress() else {
+            return Vec::new();
+        };
 
         let zoom = self.overview_zoom();
         let mut overlays = Vec::new();
         for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
             let ws_zoom = zoom * self.workspace_render_scale(idx);
-            for (window, hover) in ws.expose_hovers() {
-                let Some(rect) = ws.expose_drawn_rect(window, progress, ws_zoom) else {
+            // Every window, not just the hovered ones: the app icon is drawn for
+            // all of them, and a hover of 0 is exactly what an un-hovered
+            // preview's chrome should fade to.
+            for window in ws.windows().map(|w| w.id().clone()).collect::<Vec<_>>() {
+                let Some(rect) = ws.expose_drawn_rect(&window, progress, ws_zoom) else {
                     continue;
                 };
                 overlays.push((
@@ -2550,7 +2575,7 @@ impl<W: LayoutElement> Monitor<W> {
                         geo.loc + rect.loc.upscale(ws_zoom),
                         rect.size.upscale(ws_zoom),
                     ),
-                    hover * progress,
+                    ws.expose_hover_value(&window) * progress,
                 ));
             }
         }
