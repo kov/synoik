@@ -98,11 +98,15 @@ before shows the same shape, 25% → 4.5%), so the warm-only row is the fairest 
 
 ## New VMM (boot a8a1fbce, 2026-07-29)
 
-First measurement on the newly deployed VMM ("brings some more performance fixes"). Same guest
-binary as the post-0051 arms (nothing in `src/` touched), same display mode (3840x2160, pixel
-clock 583400), same seat environment (`environment.d` files all predate the post-0051 arm;
-`VN_PERF` already absent for both), virtio-gpu feature flags identical across boots,
-`/tmp/disable-limina-fence-present` absent on both.
+First measurement on the newly deployed VMM ("brings some more performance fixes"). Same display
+mode (3840x2160, pixel clock 583400), same seat environment (`environment.d` files all predate
+the post-0051 arm; `VN_PERF` already absent for both), virtio-gpu feature flags identical across
+boots, `/tmp/disable-limina-fence-present` absent on both.
+
+**NOT the same guest binary** — the first version of this entry claimed it was; wrong. The arms
+are ~30 `src/` commits apart (old arm `b808c5bb`, new arm `d4c7a61d`, built 13:42), most of them
+overview visuals (doubled thumbnail strip + glow shadows, adaptive chrome, preview icons). The
+binary A/B that closes this confound is §21.5 of `present-misses.md`.
 
 | when | what | notes |
 |---|---|---|
@@ -126,11 +130,11 @@ clock 583400), same seat environment (`environment.d` files all predate the post
 No warmup story: the warm-only run is *worse*, not better. The regression is a level shift across
 the whole draw/gpu range, largest at the heavy end.
 
-**The guest is exonerated by queue timing.** Of the new VMM's misses, 1263/1264 were queued an
-average of **15.13 ms EARLY** — a full frame of headroom; the host presented them a vblank late
-anyway. Post-0051 had the identical shape (49/50 queued 15.63 ms early), just ~25x less often.
-Lateness distribution is also the same shape on both arms: p50 16.7 ms, max 33.3 ms — exactly 1-2
-vblanks. Every guest-visible knob (binary, mode, env, virtio-gpu features) is unchanged; what
-changed is the VMM. **Conclusion: the new VMM's present path drops frames that arrived in time —
-either the 0051/0049 wins did not carry over, or the new performance fixes regressed presentation.**
-This is a host-side question; the guest has nothing left to vary.
+**Queue timing rules out a slow CPU-side guest, and no more.** Of the new VMM's misses,
+1263/1264 were queued an average of **15.13 ms EARLY**; post-0051 had the identical shape (49/50
+at 15.63 ms early), just ~25x less often. Lateness is the same shape on both arms: p50 16.7 ms,
+max 33.3 ms — exactly 1-2 vblanks. But under `NIRI_VK_ASYNC_SCANOUT=1` the flip is queued before
+the render fence signals, so an early queue does not prove the pixels were ready — and the new
+binary's scenes ARE heavier (heavy gpu p50 7.16 ms vs 5.53 ms). **Conclusion: OPEN, not
+attributed.** Host-side present regression and guest-side "new overview work × async scanout"
+both fit; the `b808c5bb` binary A/B on this boot (present-misses.md §21.5) decides it.
