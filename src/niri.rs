@@ -8763,7 +8763,10 @@ impl Niri {
         let mut items: Vec<DashEntry> = favorites
             .into_iter()
             .map(|e| DashEntry {
-                running: self.app_system.is_running(&e.id),
+                // The dot is "not stopped", not "has windows": a favorite that is
+                // still launching shows one (`_updateRunningStyle`,
+                // `appDisplay.js:3007-3012`).
+                running: self.app_system.shows_running_dot(&e.id),
                 id: e.id,
                 name: e.name,
                 icon: e.icon,
@@ -9117,7 +9120,10 @@ impl Niri {
     /// focus order could have moved, which is cheap (a walk of the window list)
     /// and immune to a missed edge.
     ///
-    /// Returns whether the resolved running list changed.
+    /// Returns whether anything the dash reads changed — the running list, or an
+    /// app's *state* (our `app-state-changed`, `dash.js:383`). The second half
+    /// matters because a launch moves an app to STARTING, which shows a running dot,
+    /// without touching a single window.
     pub fn sync_running_apps(&mut self) -> bool {
         use crate::app_system::RunningWindow;
         use crate::utils::with_toplevel_role;
@@ -9125,8 +9131,9 @@ impl Niri {
         // Sweep timed-out startup sequences here too — mutter runs a timeout source
         // for the same purpose (`startup_sequence_timeout`,
         // `startup-notification.c:483`). A launch that never produced a window would
-        // otherwise keep its running dot forever.
-        let expired = self.app_system.expire_startups(get_monotonic_time());
+        // otherwise keep its running dot forever. The sweep marks the state changed
+        // itself, so its result is picked up below with everything else.
+        self.app_system.expire_startups(get_monotonic_time());
 
         let mut windows = Vec::new();
         self.layout.with_windows(|mapped, _, _, _| {
@@ -9140,7 +9147,11 @@ impl Niri {
                 last_focus: mapped.get_focus_timestamp(),
             });
         });
-        self.app_system.set_windows(windows) || expired
+        // Both sides evaluated before the `||`: short-circuiting would leave
+        // `state_changed` set and fire it at some unrelated later window change.
+        let windows_changed = self.app_system.set_windows(windows);
+        let state_changed = self.app_system.take_state_changed();
+        windows_changed || state_changed
     }
 
     /// Whether the overview chrome (dash, search) is actually on screen: the GNOME

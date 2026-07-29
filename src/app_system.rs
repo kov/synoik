@@ -271,6 +271,13 @@ pub struct AppSystem {
     /// [`app_state`](Self::app_state). Keyed by id rather than by token because
     /// that is the lookup every consumer does; the token is matched inside.
     starting: HashMap<String, StartupSequence>,
+    /// Set whenever [`starting`](Self::starting) changes, cleared by
+    /// [`take_state_changed`](Self::take_state_changed). GNOME emits
+    /// `app-state-changed` from `shell_app_state_transition` (`shell-app.c:921`) and
+    /// the dash redisplays on it (`dash.js:383`); the window half of that signal is
+    /// covered by [`set_windows`](Self::set_windows)'s return, but a launch moves an
+    /// app to STARTING without touching a single window.
+    state_changed: bool,
 }
 
 /// Desktop-id prefixes tried when a bare `WM_CLASS`-derived basename misses
@@ -291,6 +298,7 @@ impl AppSystem {
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
+            state_changed: false,
         }
     }
 
@@ -311,6 +319,7 @@ impl AppSystem {
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
+            state_changed: false,
         };
         system.refresh();
 
@@ -365,6 +374,7 @@ impl AppSystem {
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
+            state_changed: false,
         };
         system.refresh();
         system
@@ -628,6 +638,7 @@ impl AppSystem {
                 expires: now + STARTUP_TIMEOUT,
             },
         );
+        self.state_changed = true;
     }
 
     /// Complete the sequence a mapping window belongs to, returning the workspace
@@ -662,7 +673,9 @@ impl AppSystem {
                 .then_some(desktop_id)
         })?;
 
-        self.starting.remove(&key).and_then(|seq| seq.workspace)
+        let seq = self.starting.remove(&key);
+        self.state_changed |= seq.is_some();
+        seq.and_then(|seq| seq.workspace)
     }
 
     /// Drop sequences past `STARTUP_TIMEOUT` — `startup_sequence_timeout`
@@ -671,7 +684,17 @@ impl AppSystem {
     pub fn expire_startups(&mut self, now: Duration) -> bool {
         let before = self.starting.len();
         self.starting.retain(|_, seq| seq.expires > now);
-        self.starting.len() != before
+        let changed = self.starting.len() != before;
+        self.state_changed |= changed;
+        changed
+    }
+
+    /// Whether an app changed state since this was last called, and clear the flag —
+    /// our `app-state-changed` (`shell-app.c:921`), for the surfaces that redisplay
+    /// on it. Only the *sequence* half: the window half is
+    /// [`set_windows`](Self::set_windows)'s return value.
+    pub fn take_state_changed(&mut self) -> bool {
+        std::mem::take(&mut self.state_changed)
     }
 
     /// The apps with an open startup sequence — for the corpus, and for whoever

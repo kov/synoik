@@ -10141,6 +10141,67 @@ fn launching_an_app_marks_it_starting_until_its_window_maps() {
     );
 }
 
+/// The dash's running dot reads `state !== STOPPED`, not "has windows"
+/// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007-3012`), so a favorite shows
+/// one from the moment it is launched. That needs the *state* change to reach the
+/// dash on its own: a launch touches no window, so the window snapshot alone would
+/// leave the dot until the app mapped.
+#[test]
+fn a_launching_favorite_shows_its_running_dot_before_its_window_maps() {
+    use crate::app_system::{
+        AppEntry, AppSystem, FakeCatalog, LaunchContext, LaunchMode, RecordingLauncher,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "a.desktop",
+            "A",
+            "a",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
+    f.niri().sync_dash_favorites();
+
+    let dot = |f: &mut Fixture| f.niri().dash.item_shows_running_dot(0).unwrap();
+    assert!(!dot(&mut f), "a stopped favorite shows no dot");
+
+    f.niri()
+        .app_system
+        .launch(
+            "a.desktop",
+            LaunchMode::Activate,
+            &LaunchContext::bare(get_monotonic_time()),
+        )
+        .expect("launch");
+    assert!(
+        f.niri().sync_running_apps(),
+        "a state change must report as a change, or the dash never redisplays"
+    );
+    f.niri().sync_dash_favorites();
+    assert!(
+        dot(&mut f),
+        "a STARTING favorite already shows the dot, before any window exists"
+    );
+
+    // And it survives the window arriving (STARTING -> RUNNING).
+    let window = f.client(client).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("a");
+    window.commit();
+    f.roundtrip(client);
+    let window = f.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(client);
+    assert!(dot(&mut f), "and stays lit once it is running");
+}
+
 /// A launch that never produces a window stops being `STARTING` after mutter's
 /// `STARTUP_TIMEOUT_MS` (`startup-notification.c:38,483-512`) — otherwise a failed
 /// spawn would leave a permanent running dot.

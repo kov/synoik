@@ -559,6 +559,12 @@ impl Dash {
         self.items.get(i).map(|e| e.id.as_str())
     }
 
+    /// Whether app `i` draws its running dot (`AppIcon._updateRunningStyle`,
+    /// `appDisplay.js:3007`) — for the corpus.
+    pub fn item_shows_running_dot(&self, i: usize) -> Option<bool> {
+        self.items.get(i).map(|e| e.running)
+    }
+
     /// The icon of app `i`, if present (what a drag of that tile carries).
     pub fn item_icon(&self, i: usize) -> Option<&crate::app_system::AppIconRef> {
         self.items.get(i).map(|e| &e.icon)

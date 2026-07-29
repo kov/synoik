@@ -214,11 +214,29 @@ Each slice: headless corpus tests in `src/tests/gnome.rs` (model, verbs, sequenc
 ([[headless-animation-clock-trap]]); their endpoints are pinned, and all four slices were eyeballed
 on the headless self-iteration harness.
 
+- **L5 — the running dot follows the state. ✅ DONE.** The dash's dot reads
+  `shows_running_dot` (state ≠ STOPPED), so a launching favorite lights up before its window
+  exists. That needed a state-change signal of its own: a launch touches no window, so
+  `sync_running_apps` now also reports `AppSystem::take_state_changed()` — our
+  `app-state-changed` (`shell-app.c:921`, consumed at `dash.js:383`).
+
 ### Still open
 - The `RUNNING`+`Ctrl`/middle-click = new window refinement of `AppIcon.activate`
   (`appDisplay.js:3060-3075`) — the dash still always `Activate`s.
 - `animateLaunch` (`appDisplay.js:3080`), the icon's zoom-out on launch.
-- The running dot does not yet read `shows_running_dot`, so a STARTING app shows none.
+
+### Asked for but NOT in 50.1: a launch-feedback cursor
+Gustavo expected the pointer to show a loading/progress cursor while an app starts. **GNOME 50.1
+does not do this.** Nothing in mutter or gnome-shell links a startup sequence to a cursor: the only
+route to `CLUTTER_CURSOR_PROGRESS` is a *client* asking through `wp_cursor_shape_device_v1`
+(`meta-wayland-cursor-shape.c:52`). mutter *used* to have it — `META_CURSOR_BUSY`, added in
+`cb27f0c4be` ("Add 'busy cursor on app startup' support, conditionally") — and it is gone as of
+`92c6452753` (Jan 2025, the css/cursor-shape rework).
+
+So building it is an **addition**, not a port, and needs a decision. If taken, the shape is small:
+the startup-sequence table already knows when any app is starting, so it is one cursor override
+while `starting_apps()` is non-empty, using the `progress` xcursor name. The judgement call is
+whether the fork wants a behavior GNOME deliberately dropped.
 
 ## 5. Accepted divergences
 
