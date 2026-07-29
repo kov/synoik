@@ -196,17 +196,29 @@ the dash label and the screenshot UI (`_dash.scss:104`, `_screenshot.scss:200`),
 
 ## 4. Slices
 
-- **L1 — model.** `RunningWindow` id + title, `RunningApp.windows`, `AppState`, sequence table moved
-  into `AppSystem` with tokens. `sync_running_apps` feeds ids and titles.
-- **L2 — startup notification.** Token minted and exported on launch; sequence completed by the
-  mapping window; `claim_pending_launch` re-expressed over the table. STARTING now observable.
-- **L3 — preview icon + caption.** `widget::Tooltip`, the two actors, the WINDOW_PICKER scale ramp.
-- **L4 — menu verbs.** Open Windows section, Quit, App Details (+ the `can_open_new_window` /
-  `RUNNING` refinement of the icon-activate path).
+- **L1 — model. ✅ DONE** (`10731236`). `RunningWindow` id + title, `RunningApp.windows`, `AppState`
+  derived from the sequence table + the window snapshot, `can_open_new_window`, `shows_running_dot`.
+  `sync_running_apps` feeds ids and titles.
+- **L2 — startup notification. ✅ DONE** (same commit). Token minted per launch in
+  `State::launch_app` and exported by `GioLauncher` as `XDG_ACTIVATION_TOKEN`/`DESKTOP_STARTUP_ID`;
+  sequence completed by the mapping window (token first, then app id); `Niri::pending_launches`
+  deleted in favour of the table; expiry swept from `sync_running_apps`.
+- **L3 — preview icon + caption. ✅ DONE** (`112fff5c`). `widget::Tooltip`, `Monitor::preview_rects`
+  (every drawn preview, not just the hovered ones) + `preview_icon_scale`, the icon uploaded once and
+  rescaled on the GPU.
+- **L4 — menu verbs. ✅ DONE.** Open Windows section (a labelled separator + one row per window),
+  Quit, App Details; `AppMenuContext` carries the app snapshot into the menu.
 
-Each slice: headless corpus tests in `src/tests/gnome.rs` (model, verbs, sequence lifetime) and — for
-L3 — a Vulkan render test plus the `NIRI_VK_VALIDATION=1` gate. The icon *scale* ramp and the caption
-*fade* are animations, so they are live-only ([[headless-animation-clock-trap]]); pin their endpoints.
+Each slice: headless corpus tests in `src/tests/gnome.rs` (model, verbs, sequence lifetime). The icon
+*scale* ramp and the caption *fade* are animations, so they are live-only
+([[headless-animation-clock-trap]]); their endpoints are pinned, and all four slices were eyeballed
+on the headless self-iteration harness.
+
+### Still open
+- The `RUNNING`+`Ctrl`/middle-click = new window refinement of `AppIcon.activate`
+  (`appDisplay.js:3060-3075`) — the dash still always `Activate`s.
+- `animateLaunch` (`appDisplay.js:3080`), the icon's zoom-out on launch.
+- The running dot does not yet read `shows_running_dot`, so a STARTING app shows none.
 
 ## 5. Accepted divergences
 

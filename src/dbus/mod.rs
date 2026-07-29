@@ -339,3 +339,36 @@ fn try_start<I: Start>(iface: I) -> Option<Connection> {
         }
     }
 }
+
+/// Ask GNOME Software to show `app_id`'s page — the "App Details" menu row
+/// (`js/ui/appMenu.js:84-95`), which activates Software's `details` action over
+/// `org.gtk.Actions` rather than launching it with an argument.
+///
+/// Runs on its own thread: the call D-Bus *activates* Software, so waiting for the
+/// reply on the compositor thread would stall the frame loop for as long as it takes
+/// to start. gnome-shell's handler is `async` for the same reason. The empty second
+/// element of the parameter is gnome-shell's — it is the search term to preselect.
+pub fn show_app_details(app_id: String) {
+    std::thread::spawn(move || {
+        if let Err(err) = call_app_details(app_id) {
+            warn!("error asking Software for app details: {err:?}");
+        }
+    });
+}
+
+fn call_app_details(app_id: String) -> zbus::Result<()> {
+    let conn = Connection::session()?;
+    let args = zbus::zvariant::Value::from((app_id, String::new()));
+    conn.call_method(
+        Some("org.gnome.Software"),
+        "/org/gnome/Software",
+        Some("org.gtk.Actions"),
+        "Activate",
+        &(
+            "details",
+            vec![args],
+            std::collections::HashMap::<String, zbus::zvariant::Value<'_>>::new(),
+        ),
+    )?;
+    Ok(())
+}

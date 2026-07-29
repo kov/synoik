@@ -145,6 +145,14 @@ pub enum PopoverAction {
     /// rows this does *not* leave the overview — gnome-shell only hides it for the
     /// items that raise a window.
     AppToggleFavorite(String),
+    /// An "Open Windows" row (`appMenu.js:284-286`): raise that window and leave
+    /// the overview, which is what `Main.activateWindow` does.
+    AppActivateWindow(crate::window::mapped::MappedId),
+    /// "App Details" (`appMenu.js:84-95`): ask `org.gnome.Software` to show the app.
+    AppDetails(String),
+    /// "Quit" (`appMenu.js:99-100`) — `shell_app_request_quit`. Unlike the launch
+    /// rows this does *not* leave the overview: gnome-shell's handler is bare.
+    AppQuit(String),
 }
 
 impl PopoverAction {
@@ -173,6 +181,9 @@ impl PopoverAction {
                 | PopoverAction::AppNewWindow(_)
                 | PopoverAction::AppLaunchAction { .. }
                 | PopoverAction::AppToggleFavorite(_)
+                | PopoverAction::AppActivateWindow(_)
+                | PopoverAction::AppDetails(_)
+                | PopoverAction::AppQuit(_)
         )
     }
 }
@@ -463,18 +474,14 @@ impl PanelPopover {
         output: Output,
         anchor: Rectangle<f64, Logical>,
         side: PopoverSide,
-        entry: &crate::app_system::AppEntry,
-        is_favorite: bool,
+        ctx: &crate::ui::app_menu::AppMenuContext<'_>,
     ) {
         self.open = true;
         self.closing = false;
         self.output = Some(output);
         self.anchor = anchor;
         self.side = side;
-        self.content = Some(PopoverContent::App(Box::new(AppMenu::new(
-            entry,
-            is_favorite,
-        ))));
+        self.content = Some(PopoverContent::App(Box::new(AppMenu::new(ctx))));
         self.anim = Some(self.make_anim(0., 1.));
     }
 

@@ -9,19 +9,22 @@
 //!
 //! **Scope.** gnome-shell's menu has, in order: an "Open Windows" section, "New
 //! Window", the `.desktop` action section, a discrete-GPU launch item, the favourite
-//! toggle, "App Details", and "Quit". We build the middle three:
+//! toggle, "App Details", and "Quit". We build all but the GPU item:
 //!
+//! - **Open Windows** — a labelled separator heading one row per window of a running app, labelled
+//!   with its title (`_updateWindowsSection`, `appMenu.js:262-291`). Shown from one window, which
+//!   is what an app-grid / dash icon asks for (`showSingleWindows: true`, `appDisplay.js:3033`).
 //! - **New Window** — shown only when the app has no `new-window` desktop action, since that action
 //!   would be a duplicate of it (`_updateNewWindowItem`, `appMenu.js:140-144`).
 //! - **The action section** — one row per `.desktop` action, labelled with its display name
 //!   (`setApp`, `appMenu.js:229-242`).
 //! - **Pin to Dash / Unpin** — the favourite toggle (`_updateFavoriteItem`, `appMenu.js:146-162`).
+//! - **App Details** — an `org.gtk.Actions` call into `org.gnome.Software`, shown only when
+//!   Software is installed (`_updateDetailsVisibility`, `appMenu.js:182-185`).
+//! - **Quit** — shown only for a RUNNING app (`_updateQuitItem`, `appMenu.js:136-138`).
 //!
-//! Deferred, each because it needs a capability the fork does not have yet:
-//! **Open Windows** and **Quit** need per-window identity for a running app (we track
-//! a window *count*, not a list — see `AppSystem::running`); **App Details** needs an
-//! `org.gtk.Actions` call into `org.gnome.Software`; the **GPU** item needs
-//! `switcheroo-control`, which this hardware does not have.
+//! The **GPU** item stays deferred: it needs `switcheroo-control`, which this hardware
+//! does not have.
 //!
 //! Separators are inserted between *populated* groups only, which is what
 //! gnome-shell's `_updateSeparatorVisibility` (`popupMenu.js`) arrives at by hiding
@@ -32,13 +35,14 @@ use std::cell::RefCell;
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
-use crate::app_system::AppEntry;
+use crate::app_system::{AppEntry, AppState, RunningWindow};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{
     self, style, Align, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
 };
+use crate::window::mapped::MappedId;
 
 /// `.popup-menu-content` padding — `$base_padding` (`_popovers.scss:28`).
 const CONTENT_PAD: f64 = 6.;
@@ -62,6 +66,13 @@ const SEP_H: f64 = 2. * ITEM_PAD_V + 1.;
 const SEPARATOR: [f32; 4] = [1., 1., 1., 0.1];
 /// `.popup-menu-content` `border-radius: $modal_radius * 1.25` (`_popovers.scss:30`).
 const RADIUS: f64 = 20.;
+/// Between a section header's label and the rule that follows it. gnome-shell gets
+/// this from the `PopupBaseMenuItem` box layout's spacing; ours is the same
+/// `$base_padding` the rest of the box model uses.
+const HEADER_RULE_GAP: f64 = 6.;
+/// The shortest a section header's rule may get before it stops reading as one —
+/// what the menu widens to keep.
+const HEADER_RULE_MIN: f64 = 24.;
 
 /// Row text: `.popup-menu` inherits the 11pt body size (`_popovers.scss:16-24`).
 const TEXT_PT: f64 = 11.;
@@ -86,13 +97,25 @@ enum RowAction {
     NewWindow,
     LaunchAction(String),
     ToggleFavorite,
+    /// Raise one of the app's open windows — `Main.activateWindow(window)`
+    /// (`appMenu.js:285`).
+    ActivateWindow(MappedId),
+    AppDetails,
+    Quit,
 }
 
 /// One built row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
-    Item { label: String, action: RowAction },
+    Item {
+        label: String,
+        action: RowAction,
+    },
+    /// A bare rule between groups.
     Separator,
+    /// `PopupSeparatorMenuItem(text)` (`popupMenu.js:300-324`): a label followed by
+    /// the rule, which expands to fill the rest of the row.
+    SectionHeader(String),
 }
 
 /// The app context menu's content.
@@ -105,14 +128,49 @@ pub struct AppMenu {
     bg_cache: RefCell<BakeCache>,
 }
 
+/// What the menu needs to know about the app beyond its catalog entry — the model
+/// reads gnome-shell's `AppMenu` does at open time (app state, window list, whether
+/// Software is installed). Snapshotted once, because activating any row closes the
+/// menu.
+pub struct AppMenuContext<'a> {
+    pub entry: &'a AppEntry,
+    pub is_favorite: bool,
+    /// `shell_app_get_state()` — gates Quit and the new-window verb.
+    pub state: AppState,
+    /// `shell_app_get_windows()`, most recently used first.
+    pub windows: &'a [RunningWindow],
+    /// Whether `org.gnome.Software.desktop` resolves — gates App Details.
+    pub has_software: bool,
+}
+
 impl AppMenu {
-    /// Build the menu for `entry`. `is_favorite` picks the toggle's label; it is read
-    /// once at open time because activating any item closes the menu.
-    pub fn new(entry: &AppEntry, is_favorite: bool) -> Self {
+    /// Build the menu from a snapshot of the app.
+    pub fn new(ctx: &AppMenuContext<'_>) -> Self {
+        let entry = ctx.entry;
+
+        // Group 0: the open windows. gnome-shell labels each row with the window
+        // title and falls back to the app's name for an untitled one
+        // (`appMenu.js:283`), and heads the section with a labelled separator.
+        let mut windows = Vec::new();
+        if !ctx.windows.is_empty() {
+            windows.push(Row::SectionHeader("Open Windows".to_owned()));
+            windows.extend(ctx.windows.iter().map(|w| {
+                Row::Item {
+                    label: w
+                        .title
+                        .clone()
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| entry.name.clone()),
+                    action: RowAction::ActivateWindow(w.id),
+                }
+            }));
+        }
+
         // Group 1: the launch verbs. "New Window" is suppressed when a `new-window`
-        // action would restate it (`appMenu.js:140-144`).
+        // action would restate it (`appMenu.js:140-144`), and when the app can't be
+        // asked for one at all (`_updateNewWindowItem`, `:142-143`).
         let mut launch = Vec::new();
-        if !entry.actions.iter().any(|a| a.id == "new-window") {
+        if !entry.actions.iter().any(|a| a.id == "new-window") && ctx.state != AppState::Starting {
             launch.push(Row::Item {
                 label: "New Window".to_owned(),
                 action: RowAction::NewWindow,
@@ -125,12 +183,37 @@ impl AppMenu {
 
         // Group 2: the favourite toggle.
         let favorite = vec![Row::Item {
-            label: if is_favorite { "Unpin" } else { "Pin to Dash" }.to_owned(),
+            label: if ctx.is_favorite {
+                "Unpin"
+            } else {
+                "Pin to Dash"
+            }
+            .to_owned(),
             action: RowAction::ToggleFavorite,
         }];
 
+        // Group 3: App Details, only with Software installed.
+        let details = if ctx.has_software {
+            vec![Row::Item {
+                label: "App Details".to_owned(),
+                action: RowAction::AppDetails,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        // Group 4: Quit, only for a running app.
+        let quit = if ctx.state == AppState::Running {
+            vec![Row::Item {
+                label: "Quit".to_owned(),
+                action: RowAction::Quit,
+            }]
+        } else {
+            Vec::new()
+        };
+
         let mut rows = Vec::new();
-        for group in [launch, favorite] {
+        for group in [windows, launch, favorite, details, quit] {
             if group.is_empty() {
                 continue;
             }
@@ -155,7 +238,7 @@ impl AppMenu {
             + self.rows[..k]
                 .iter()
                 .map(|r| match r {
-                    Row::Item { .. } => ROW_H,
+                    Row::Item { .. } | Row::SectionHeader(_) => ROW_H,
                     Row::Separator => SEP_H,
                 })
                 .sum::<f64>()
@@ -165,7 +248,7 @@ impl AppMenu {
     /// band worth hitting but keeps the same rect so indexing stays uniform.
     fn row_rect(&self, k: usize, width: f64) -> Rectangle<f64, Logical> {
         let h = match self.rows[k] {
-            Row::Item { .. } => ROW_H,
+            Row::Item { .. } | Row::SectionHeader(_) => ROW_H,
             Row::Separator => SEP_H,
         };
         Rectangle::new(
@@ -179,11 +262,17 @@ impl AppMenu {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Item { label, .. } => Some(niri_vk::text::measure_line_width_weighted(
-                    label,
-                    text_px() as f32,
-                    false,
-                )),
+                // A section header's label shares the row with the rule, so it needs
+                // room for both — the gap keeps the shortest rule from vanishing.
+                Row::Item { label, .. } | Row::SectionHeader(label) => {
+                    let w =
+                        niri_vk::text::measure_line_width_weighted(label, text_px() as f32, false);
+                    Some(if matches!(r, Row::SectionHeader(_)) {
+                        w + HEADER_RULE_GAP + HEADER_RULE_MIN
+                    } else {
+                        w
+                    })
+                }
                 Row::Separator => None,
             })
             .fold(0., f64::max);
@@ -203,7 +292,7 @@ impl AppMenu {
         self.rows
             .iter()
             .filter_map(|r| match r {
-                Row::Item { label, .. } => Some(label.as_str()),
+                Row::Item { label, .. } | Row::SectionHeader(label) => Some(label.as_str()),
                 Row::Separator => None,
             })
             .collect()
@@ -242,6 +331,9 @@ impl AppMenu {
                         action: a.clone(),
                     },
                     RowAction::ToggleFavorite => PopoverAction::AppToggleFavorite(id),
+                    RowAction::ActivateWindow(w) => PopoverAction::AppActivateWindow(*w),
+                    RowAction::AppDetails => PopoverAction::AppDetails(id),
+                    RowAction::Quit => PopoverAction::AppQuit(id),
                 };
             }
         }
@@ -276,7 +368,9 @@ impl AppMenu {
         self.rows
             .iter()
             .map(|row| match row {
-                Row::Item { label, .. } => shaper.shape(label, style).map(Some),
+                Row::Item { label, .. } | Row::SectionHeader(label) => {
+                    shaper.shape(label, style).map(Some)
+                }
                 Row::Separator => Ok(None),
             })
             .collect()
@@ -305,6 +399,31 @@ impl AppMenu {
                         Size::from((rect.size.w, 1.)),
                     );
                     p.fill_rounded(rule, 0., SEPARATOR)?;
+                }
+                // A section header: its label at the row's left, then the rule
+                // filling what is left, vertically centred (`popupMenu.js:317-323`).
+                Some(run) if matches!(&self.rows[k], Row::SectionHeader(_)) => {
+                    let Row::SectionHeader(label) = &self.rows[k] else {
+                        unreachable!()
+                    };
+                    let label_x = rect.loc.x + ITEM_PAD_H;
+                    p.text(
+                        run,
+                        Point::from((label_x, rect.loc.y + rect.size.h / 2.)),
+                        Align::LEFT_MIDDLE,
+                        style::TEXT,
+                    )?;
+                    let label_w =
+                        niri_vk::text::measure_line_width_weighted(label, text_px() as f32, false);
+                    let rule_x = label_x + label_w + HEADER_RULE_GAP;
+                    let rule_end = rect.loc.x + rect.size.w - ITEM_PAD_H;
+                    if rule_end > rule_x {
+                        let rule = Rectangle::new(
+                            Point::from((rule_x, rect.loc.y + (rect.size.h - 1.) / 2.)),
+                            Size::from((rule_end - rule_x, 1.)),
+                        );
+                        p.fill_rounded(rule, 0., SEPARATOR)?;
+                    }
                 }
                 Some(run) => {
                     if self.hovered == Some(k) {

@@ -1307,6 +1307,19 @@ impl State {
             PopoverAction::AppLaunchAction { id, action } => {
                 self.launch_from_app_menu(&id, LaunchMode::Action(action));
             }
+            // Raising a window from the "Open Windows" section is `Main.activateWindow`,
+            // which leaves the overview.
+            PopoverAction::AppActivateWindow(window) => {
+                self.activate_window_by_id(window);
+                self.niri.layout.close_overview();
+            }
+            // `shell_app_request_quit` (`shell-app.c:1210-1243`) minus its first
+            // branch: we have no `org.gtk.Application` action muxer, so an app that
+            // exports `app.quit` is closed the same way as one that does not — by
+            // closing every window (the fallback GNOME takes for every non-GTK app).
+            // Recorded in `docs/fork/app-lifecycle-port.md` §5.
+            PopoverAction::AppQuit(id) => self.request_app_quit(&id),
+            PopoverAction::AppDetails(id) => self.show_app_details(&id),
             // Pinning does *not* leave the overview — gnome-shell hides it only for
             // the rows that raise a window.
             PopoverAction::AppToggleFavorite(id) => {
@@ -1358,12 +1371,78 @@ impl State {
             return false;
         };
         let is_favorite = self.niri.app_system.is_favorite(&id);
+        let state = self.niri.app_system.app_state(&id);
+        // `showSingleWindows: true` for an app-grid / dash icon
+        // (`appDisplay.js:3033`), so one window is already a section.
+        let windows = self
+            .niri
+            .app_system
+            .running_app(&id)
+            .map(|a| a.windows.clone())
+            .unwrap_or_default();
+        // `_updateDetailsVisibility` (`appMenu.js:182-185`).
+        let has_software = self
+            .niri
+            .app_system
+            .lookup("org.gnome.Software.desktop")
+            .is_some();
+        let ctx = crate::ui::app_menu::AppMenuContext {
+            entry: &entry,
+            is_favorite,
+            state,
+            windows: &windows,
+            has_software,
+        };
         self.niri
             .panel_popover
-            .open_app_menu(output.clone(), anchor, side, &entry, is_favorite);
+            .open_app_menu(output.clone(), anchor, side, &ctx);
         // Remembered so the icon can stay highlighted for as long as its menu is up.
         self.niri.app_menu_source = Some(hit);
         true
+    }
+
+    /// Raise a window by id — `Main.activateWindow(window)` (`appMenu.js:285`).
+    fn activate_window_by_id(&mut self, id: crate::window::mapped::MappedId) {
+        let window = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, m)| m.id() == id)
+            .map(|(_, m)| m.window.clone());
+        if let Some(window) = window {
+            self.focus_window(&window);
+        }
+    }
+
+    /// `shell_app_request_quit` (`shell-app.c:1210-1243`), fallback branch: close
+    /// every window of the app. GNOME tries an exported `app.quit` action first; we
+    /// have no action muxer, so this is the only branch — and it is the one GNOME
+    /// itself takes for every app that does not export one.
+    ///
+    /// Not running is a no-op, matching the early return at `:1216`; the menu row is
+    /// hidden in that case anyway.
+    fn request_app_quit(&mut self, id: &str) {
+        let Some(app) = self.niri.app_system.running_app(id) else {
+            return;
+        };
+        let ids: Vec<_> = app.windows.iter().map(|w| w.id).collect();
+        for window_id in ids {
+            let window = self
+                .niri
+                .layout
+                .windows()
+                .find(|(_, m)| m.id() == window_id);
+            if let Some((_, mapped)) = window {
+                mapped.toplevel().send_close();
+            }
+        }
+    }
+
+    /// "App Details" (`appMenu.js:84-95`): activate `org.gnome.Software`'s `details`
+    /// action over `org.gtk.Actions`, then leave the overview.
+    fn show_app_details(&mut self, id: &str) {
+        crate::dbus::show_app_details(id.to_owned());
+        self.niri.layout.close_overview();
     }
 
     /// Launch `id` from a context-menu row and leave the overview.

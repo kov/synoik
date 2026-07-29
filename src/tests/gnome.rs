@@ -7015,6 +7015,201 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     );
 }
 
+/// **Lifecycle L4.** A *running* app's menu grows the rows only a running app has:
+/// the "Open Windows" section, one row per window labelled with its title
+/// (`_updateWindowsSection`, `appMenu.js:262-291`), and "Quit" (`_updateQuitItem`,
+/// `:136-138`). Picking a window row raises it and leaves the overview
+/// (`Main.activateWindow`, `:285`); "Quit" closes the app's windows and does *not*
+/// leave the overview — gnome-shell's handler is bare (`:99-100`).
+#[test]
+fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "a.desktop",
+            "A",
+            "a",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
+    f.niri().sync_dash_favorites();
+
+    // Two windows of the app, the second titled.
+    let mut surfaces = Vec::new();
+    for title in ["First doc", ""] {
+        let window = f.client(client).create_window();
+        let surface = window.surface.clone();
+        window.set_app_id("a");
+        if !title.is_empty() {
+            window.set_title(title);
+        }
+        window.commit();
+        f.roundtrip(client);
+        let window = f.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(400, 300);
+        window.ack_last_and_commit();
+        f.double_roundtrip(client);
+        surfaces.push(surface);
+    }
+    assert_eq!(f.niri().app_system.running()[0].n_windows(), 2);
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    let labels = f.niri().panel_popover.app_menu().unwrap().labels();
+    assert_eq!(
+        labels[0], "Open Windows",
+        "the window section leads the menu, headed by its labelled separator"
+    );
+    assert!(
+        labels.contains(&"First doc"),
+        "a window row is labelled with its title, got {labels:?}"
+    );
+    assert!(
+        labels.iter().filter(|l| **l == "A").count() == 1,
+        "an untitled window falls back to the app's name, got {labels:?}"
+    );
+    assert_eq!(
+        labels.last(),
+        Some(&"Quit"),
+        "Quit closes the menu, and only a running app has it"
+    );
+
+    // Quit closes every window of the app, and stays in the overview.
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let origin = f.niri().panel_popover.content_location(&output);
+    let row = f
+        .niri()
+        .panel_popover
+        .app_menu()
+        .unwrap()
+        .row_center("Quit")
+        .expect("the menu has a Quit row");
+    let at = origin + row;
+    pointer_motion_to(&mut f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(client);
+
+    for surface in &surfaces {
+        assert!(
+            f.client(client).window(surface).close_requested,
+            "Quit must ask every window of the app to close"
+        );
+    }
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "Quit does not leave the overview — gnome-shell's handler has no hide()"
+    );
+}
+
+/// An "Open Windows" row raises that window and leaves the overview —
+/// `Main.activateWindow(window)` (`appMenu.js:284-286`), which is one of the
+/// `AppMenu` handlers that does hide it.
+#[test]
+fn overview_the_context_menu_raises_the_window_row_you_pick() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "a.desktop",
+            "A",
+            "a",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
+    f.niri().sync_dash_favorites();
+
+    let mut windows = Vec::new();
+    for title in ["First doc", "Second doc"] {
+        let window = f.client(client).create_window();
+        let surface = window.surface.clone();
+        window.set_app_id("a");
+        window.set_title(title);
+        window.commit();
+        f.roundtrip(client);
+        let window = f.client(client).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(400, 300);
+        window.ack_last_and_commit();
+        f.double_roundtrip(client);
+        windows.push(f.niri().layout.focus().unwrap().window.clone());
+    }
+    // The second one is focused; the row must move focus to the first.
+    assert_eq!(f.niri().layout.focus().unwrap().window, windows[1]);
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let origin = f.niri().panel_popover.content_location(&output);
+    let row = f
+        .niri()
+        .panel_popover
+        .app_menu()
+        .unwrap()
+        .row_center("First doc")
+        .expect("the menu lists the first window");
+    let at = origin + row;
+    pointer_motion_to(&mut f, at.x, at.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+
+    assert_eq!(
+        f.niri().layout.focus().unwrap().window,
+        windows[0],
+        "the row must raise the window it names"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "raising a window leaves the overview"
+    );
+}
+
+/// A *stopped* app's menu has neither of those rows: Quit is hidden below RUNNING
+/// (`appMenu.js:137`), and there are no windows to list.
+#[test]
+fn overview_the_context_menu_of_a_stopped_app_has_no_windows_and_no_quit() {
+    let (mut f, _recorder) = favorites_and_grid_fixture(&["a.desktop"], &["a.desktop"]);
+
+    let first = dash_tile_center(&mut f, 0);
+    pointer_motion_to(&mut f, first.x, first.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    let labels = f.niri().panel_popover.app_menu().unwrap().labels();
+    assert!(
+        !labels.contains(&"Open Windows"),
+        "a stopped app has no window section, got {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"Quit"),
+        "and nothing to quit, got {labels:?}"
+    );
+}
+
 /// Picking the favourite toggle pins or unpins, and — unlike the launch rows — leaves
 /// the overview up (`appMenu.js:74-80` has no `Main.overview.hide()`).
 #[test]
