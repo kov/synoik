@@ -1315,6 +1315,25 @@ activity, something in that family).
   episodes inflating the tail by 3-5 ms, every millisecond of headroom converts directly into
   survived episodes. This is now the one guest-side lever.
 
+**A caution on the metric itself, from the async A/B's side-by-side.** The operator watched
+both arms live and called the *losing* one smoother — and the frame cadence agrees with him.
+Like-for-like overview phases, 5 s bins:
+
+| | aim-1 miss | fps mean | fps sd | fps min |
+|---|---|---|---|---|
+| async on | 16.2% | 49.1 | 9.4 | **14** |
+| async off | 27.5% | 47.3 | **3.5** | **41** |
+
+Sync scanout backpressures the frame loop into a steady 41-52 fps band; async runs ahead at
+full speed and slips unpredictably when a fence is late, down to 14 fps stutter-storms inside
+the §21.4 episodes. Fast-changing content at an *uneven* cadence reads far worse to the eye
+than a uniformly slower one. Two takeaways: (1) **the aim-1 miss rate is the right instrument
+for the fence-latency hunt — it counts exactly the late fences — but it is NOT a smoothness
+proxy across scanout modes**; don't rank configurations by it alone. (2) A guest-side design
+item, queued behind the GPU-cost work: **frame pacing on top of async scanout** — keep the
+fence off the frame loop but never run more than one frame ahead, aiming for sync-mode's
+cadence stability without re-paying the CPU park.
+
 Raw data: run ledger `present-misses-runs.md` (journal slices for every cell; the journal is
 persistent — `journalctl -b a8a1fbce` covers all of today's cells, 14:26-15:34).
 

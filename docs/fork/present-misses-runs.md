@@ -202,3 +202,9 @@ queued LATE / ~0 ms early (vs "15.5 ms early" under async-on) — the CPU parks 
 before queueing instead of after. Async scanout exonerated and restored to on
 (`present-misses.md` §21.5). Note the frame log's gpu/draws accounting differs between the two
 modes (unwaited vs waited GPU), so only the miss rates compare, not the cost columns.
+
+Perceptual side-note on the same arms (operator, watching live): async OFF looked *smoother*
+despite the higher miss rate. Confirmed in the cadence — overview phases, 5 s bins: async on =
+fps 49.1 ± 9.4 (min 14), async off = 47.3 ± 3.5 (min 41). The miss metric counts late fences,
+not perceived smoothness; see the metric caution in `present-misses.md` §21.5 and the queued
+frame-pacing design item.
