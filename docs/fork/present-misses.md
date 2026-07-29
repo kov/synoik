@@ -1315,3 +1315,51 @@ Raw data: run ledger `present-misses-runs.md` (journal slices for every cell; th
 persistent — `journalctl -b a8a1fbce` covers all of today's cells, 14:26-15:34).
 
 *— the gnome-shell-rs guest session.*
+
+## 22. The same day's endnote: a never-signaling fence wedged KMS outright (2026-07-29, guest session)
+
+At 15:56 the operator logged the measurement session out. The logout completed cleanly
+userspace-side (session removed, compositor exited), and then the display froze: the GDM
+greeter never painted and VT switching died. The machine stayed alive; the wedge is fully
+diagnosed and it belongs in this report because it looks like the terminal case of the same
+disease.
+
+Three kernel stacks, one chain:
+
+```
+kworker/u40:9+events_unbound (D):
+  dma_fence_default_wait / dma_fence_wait_timeout
+  drm_atomic_helper_wait_for_fences
+  commit_tail / commit_work            <- the compositor's last atomic flip,
+                                          waiting on an IN_FENCE that never signals
+
+(sd-close) (D):
+  __flush_work / flush_work
+  drm_fb_release / drm_file_free / drm_release
+  close()                              <- systemd closing the dead compositor's DRM fd,
+                                          stuck behind that commit worker
+
+gnome-shell --mode=gdm, KMS thread:
+  drm_modeset_lock
+  drm_helper_probe_single_connector_modes
+  drm_mode_getconnector                <- the greeter, blocked behind the locks the
+                                          stuck commit holds; main thread waits in
+                                          meta_backend_native_resume forever
+```
+
+The compositor session that exited was running async scanout (`NIRI_VK_ASYNC_SCANOUT=1`): flips
+are queued with the render fence as `IN_FENCE_FD`. The process exited with one such flip
+pending; its fence is a virtio-gpu/venus fence, and **when the guest context died, the host
+never retired it**. The dma-fence contract (signal in finite time, no matter what) is broken —
+nothing in guest userspace can recover; only a VM reboot clears it.
+
+Why it belongs in §21's report: the miss floor is fences arriving a little late, the episodes
+are fences arriving 3-5 ms late in bursts, and this is a fence arriving **never**. One
+mechanism, three severities. If the VMM-side hunt finds where fence delivery got slow, it
+should also check what happens to a context's in-flight fences on destruction.
+
+Guest-side hardening we owe ourselves regardless (and will do): drain or fence-wait pending
+async flips on the compositor's exit path, so a guest logout can never leave an unsignaled
+in-fence parked in a commit even on a buggy host.
+
+*— the gnome-shell-rs guest session.*
