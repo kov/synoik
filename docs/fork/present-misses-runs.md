@@ -95,3 +95,42 @@ before shows the same shape, 25% → 4.5%), so the warm-only row is the fairest 
   now produce.
 - **The residual.** The scene-cost gradient survived 0051 (0.05% → 3.04% across the draw range). The
   level dropped roughly an order of magnitude; the shape did not.
+
+## New VMM (boot a8a1fbce, 2026-07-29)
+
+First measurement on the newly deployed VMM ("brings some more performance fixes"). Same guest
+binary as the post-0051 arms (nothing in `src/` touched), same display mode (3840x2160, pixel
+clock 583400), same seat environment (`environment.d` files all predate the post-0051 arm;
+`VN_PERF` already absent for both), virtio-gpu feature flags identical across boots,
+`/tmp/disable-limina-fence-present` absent on both.
+
+| when | what | notes |
+|---|---|---|
+| ~14:05 | first mixed arm | **DISCARDED** — gsrs VT inactive (kov held tty2); DRM paused, summaries show bogus ~330 fps / p50 0.00 ms with **no `aim` clause**. That signature = nothing was rendering; check `loginctl … Active` before trusting an arm |
+| 14:24 | populate | 8 windows across ws1/ws2 to match the post-0051 desktop (elements p50 159) |
+| 14:26:55-14:38:35 | `drive-workload.sh` runs 1-5 (mixed) | VT confirmed active |
+| 14:38:40-14:41:07 | `drive-workload.sh … heavy` run 1 | cold |
+| 14:41:12-14:43:39 | `drive-workload.sh … heavy` run 2 | warm |
+
+## Results vs post-0051
+
+| slice | post-0051 | new VMM | ratio |
+|---|---|---|---|
+| mixed, all | 0.23% | 1.26% | 5.5x worse |
+| mixed, draws 0-40 | 0.05% | 0.28% | 5.6x |
+| heavy, all | 0.58% | 7.48% | 13x |
+| heavy, draws 200+ | 1.11% | 17.16% | 15x |
+| heavy, draws 200+, warm only | 0.67% | 21.42% | 32x |
+| matched gpu band 6-12 ms | 1.11% | 12.22% | 11x |
+
+No warmup story: the warm-only run is *worse*, not better. The regression is a level shift across
+the whole draw/gpu range, largest at the heavy end.
+
+**The guest is exonerated by queue timing.** Of the new VMM's misses, 1263/1264 were queued an
+average of **15.13 ms EARLY** — a full frame of headroom; the host presented them a vblank late
+anyway. Post-0051 had the identical shape (49/50 queued 15.63 ms early), just ~25x less often.
+Lateness distribution is also the same shape on both arms: p50 16.7 ms, max 33.3 ms — exactly 1-2
+vblanks. Every guest-visible knob (binary, mode, env, virtio-gpu features) is unchanged; what
+changed is the VMM. **Conclusion: the new VMM's present path drops frames that arrived in time —
+either the 0051/0049 wins did not carry over, or the new performance fixes regressed presentation.**
+This is a host-side question; the guest has nothing left to vary.
