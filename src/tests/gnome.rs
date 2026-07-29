@@ -4979,9 +4979,12 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
     let (to_fdo, fdo_emitted) = async_channel::unbounded();
     f.niri_state().niri.notifications_emit = Some(to_fdo);
 
-    f.niri_state()
-        .niri
-        .emit_notification_action(id, "reply".to_owned());
+    assert!(
+        f.niri_state()
+            .niri
+            .emit_notification_action(id, "reply".to_owned()),
+        "the shell activates the app itself on the Gtk path, so it reports the overview should go"
+    );
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::ActionInvoked {
             app_id,
@@ -5001,9 +5004,10 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
     );
 
     // The body-click pseudo-key resolves to the payload's default-action.
-    f.niri_state()
+    assert!(f
+        .niri_state()
         .niri
-        .emit_notification_action(id, "default".to_owned());
+        .emit_notification_action(id, "default".to_owned()));
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::ActionInvoked { action, .. } => assert_eq!(action, "app.open"),
         _ => panic!("expected ActionInvoked"),
@@ -5052,11 +5056,71 @@ fn notifications_gtk_body_click_without_default_activates_app() {
 
     let (to_gtk, gtk_emitted) = async_channel::unbounded();
     f.niri_state().niri.gtk_notifications_emit = Some(to_gtk);
-    f.niri_state().niri.open_notification_app(id);
+    assert!(f.niri_state().niri.open_notification_app(id));
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::Activate { app_id, .. } => assert_eq!(app_id, "org.example.App"),
         _ => panic!("expected Activate"),
     }
+}
+
+/// Every shell surface that starts an app leaves the overview first. gnome-shell
+/// writes `Main.overview.hide()` into each such handler by hand — the quick-settings
+/// system rows (`js/ui/status/system.js:53-57,150-154`), `addSettingsAction`
+/// (`js/ui/popupMenu.js:709-720`), the dateMenu cards (`js/ui/dateMenu.js:300-302,
+/// 376-381,597-600`) — and ours all resolve to one `PopoverAction::Spawn`.
+///
+/// The two neighbours are pinned here too, because both look like they should hide it
+/// and gnome-shell says otherwise: `Main.screenshotUI.open()` carries no hide at all
+/// (`js/ui/status/system.js:120-127`), and the fdo notification path only emits
+/// `ActionInvoked` — the hide lives in the *Gtk* daemon's `activateAction`
+/// (`js/ui/notificationDaemon.js:512-519`), which has really activated the app.
+#[test]
+fn overview_closes_when_a_panel_button_launches_an_app() {
+    use crate::ui::popover::PopoverAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let open_overview = |f: &mut Fixture| {
+        f.niri_state().do_action(Action::OpenOverview, false);
+        f.niri_complete_animations();
+        assert!(f.niri().layout.is_overview_open());
+    };
+
+    // An *empty* command: `spawn` returns early on it (`utils::spawning`), so this
+    // exercises the choke point without a test really launching gnome-control-center.
+    open_overview(&mut f);
+    f.niri_state()
+        .apply_popover_action(PopoverAction::Spawn(Vec::new()));
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "a panel/quick-settings button that starts an app must leave the overview"
+    );
+
+    // A toggle that changes a setting stays put — GNOME hides only for the rows that
+    // raise a window.
+    open_overview(&mut f);
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetDarkStyle(true));
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "a quick-settings toggle must not close the overview"
+    );
+
+    // An fdo notification action is a signal to the app, not an activation by us.
+    let id = banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.niri_state()
+        .apply_popover_action(PopoverAction::InvokeNotificationAction {
+            id,
+            key: "reply".to_owned(),
+        });
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "the fdo path only emits ActionInvoked, so the overview stays up"
+    );
 }
 
 // ---- Notification banner (slice 2) ----

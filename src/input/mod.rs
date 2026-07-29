@@ -1069,29 +1069,35 @@ impl State {
         let Some(id) = self.niri.notification_banner.content_id() else {
             return;
         };
+        let mut activated = false;
         let effects = match hit {
             BannerHit::Close => self.niri.notifications.close(id, CloseReason::Dismissed),
             BannerHit::Action(idx) => {
                 let Some(action) = self.niri.notification_banner.action_key(idx) else {
                     return;
                 };
-                self.niri.emit_notification_action(id, action);
+                activated = self.niri.emit_notification_action(id, action);
                 self.niri.notifications.activate(id)
             }
             BannerHit::Body => {
                 if self.niri.notification_banner.has_default_action() {
-                    self.niri.emit_notification_action(id, "default".to_owned());
+                    activated = self.niri.emit_notification_action(id, "default".to_owned());
                     self.niri.notifications.activate(id)
                 } else {
-                    self.niri.open_notification_app(id);
+                    activated = self.niri.open_notification_app(id);
                     self.niri.notifications.activate_source(id)
                 }
             }
         };
+        if activated {
+            self.niri.layout.close_overview();
+        }
         self.niri.apply_notification_effects(effects);
     }
 
-    fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
+    /// `pub(crate)` so the corpus can drive an action straight in: several of them are
+    /// only reachable through a click that would really launch something.
+    pub(crate) fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
         use crate::ui::popover::PopoverAction;
 
         let set_toggle = |state: &mut Self, f: fn(&mut crate::gnome::QuickToggles, bool), v| {
@@ -1128,8 +1134,21 @@ impl State {
                 }
                 set_toggle(self, |t, v| t.night_light = v, v);
             }
+            // The screenshot UI deliberately does NOT leave the overview: gnome-shell's
+            // screenshot button only closes the quick-settings menu and calls
+            // `Main.screenshotUI.open()` (`js/ui/status/system.js:120-127`), which has no
+            // `Main.overview.hide()` anywhere in it.
             PopoverAction::Screenshot => self.open_screenshot_ui(true, None),
-            PopoverAction::Spawn(command) => spawn(command, None),
+            // Every shell surface that starts an app leaves the overview first —
+            // `Main.overview.hide(); Main.panel.close…(); app.activate()`, in the
+            // quick-settings system rows (`js/ui/status/system.js:53-57,150-154`), the
+            // settings actions (`js/ui/popupMenu.js:709-720`) and the dateMenu's cards
+            // (`js/ui/dateMenu.js:300-302,376-381,597-600`). Ours all funnel through
+            // `Spawn`, so this one call covers them.
+            PopoverAction::Spawn(command) => {
+                spawn(command, None);
+                self.niri.layout.close_overview();
+            }
             #[cfg(feature = "pipewire")]
             PopoverAction::SetVolume(volume) => {
                 if let Some(pw) = self.niri.pw_audio.as_ref() {
@@ -1256,17 +1275,22 @@ impl State {
                 self.niri.apply_notification_effects(effects);
             }
             PopoverAction::ActivateNotification { id, has_default } => {
-                let effects = if has_default {
-                    self.niri.emit_notification_action(id, "default".to_owned());
-                    self.niri.notifications.activate(id)
+                let (activated, effects) = if has_default {
+                    let activated = self.niri.emit_notification_action(id, "default".to_owned());
+                    (activated, self.niri.notifications.activate(id))
                 } else {
-                    self.niri.open_notification_app(id);
-                    self.niri.notifications.activate_source(id)
+                    let activated = self.niri.open_notification_app(id);
+                    (activated, self.niri.notifications.activate_source(id))
                 };
+                if activated {
+                    self.niri.layout.close_overview();
+                }
                 self.niri.apply_notification_effects(effects);
             }
             PopoverAction::InvokeNotificationAction { id, key } => {
-                self.niri.emit_notification_action(id, key);
+                if self.niri.emit_notification_action(id, key) {
+                    self.niri.layout.close_overview();
+                }
                 let effects = self.niri.notifications.activate(id);
                 self.niri.apply_notification_effects(effects);
             }

@@ -1326,7 +1326,7 @@ picker, and that row scrolls rather than fitting. Decide whether it should fit-t
 strip does, or gain the scrolling affordance GNOME's does; either way what is on screen has to
 be reachable.
 
-### 12.3 Panel / quick-settings buttons that launch apps must leave the overview (reported 2026-07-28, NOT started)
+### 12.3 Panel / quick-settings buttons that launch apps must leave the overview ✅
 
 Gustavo, from live use: a button on the panel or in quick settings that starts an application
 should exit the overview, the way launching from the dash or a search result does. Today it
@@ -1340,8 +1340,31 @@ Clocks cards (`src/ui/calendar.rs`, currently hardcoded `gtk-launch` — see the
 revisit note) and the quick-settings rows that spawn a session command
 (`src/ui/quick_settings.rs`).
 
-GNOME gets this for free because activation goes through the app system, and
-`AppInfo.launch`/`app.activate()` hides the overview. Worth checking the neighbours while there:
-`PopoverAction::Screenshot` raises the screenshot UI over an open overview, which may want the
-same treatment, and the panel's own launch-ish intercepts should be audited for the same gap
-rather than fixing only the two dateMenu cards.
+**✅ DONE.** The premise that GNOME gets this for free was wrong, and that mattered for the
+neighbours: `app.activate()` does *not* hide the overview. gnome-shell writes
+`Main.overview.hide(); Main.panel.close…(); app.activate()` by hand into every handler that
+starts an app — the quick-settings system rows (`js/ui/status/system.js:53-57,150-154`),
+`addSettingsAction` (`js/ui/popupMenu.js:709-720`), the dateMenu's three cards
+(`js/ui/dateMenu.js:300-302,376-381,597-600`), `AppMenu` (`js/ui/appMenu.js:60,69,94,240`, which
+we already matched). So the rule is per-handler, and it is exactly "did the shell itself start
+something".
+
+Landed as `close_overview()` on `PopoverAction::Spawn` — the single choke point every panel/QS
+launcher resolves to — plus the notification paths, where the same rule cuts a *finer* line than
+"a notification was clicked":
+
+- `open_notification_app` and the Gtk `activateAction` do activate the app, so both hide
+  (`js/ui/notificationDaemon.js:375-381,512-519`). Both now return whether they really dispatched,
+  and the caller closes on that. GNOME's hide sits *after* `openApp`'s `app == null` early return,
+  so a source we can't resolve leaves the overview up — ours falls out the same way.
+- The **fdo** action path only emits `ActionInvoked` and leaves raising to the app, so it does
+  **not** hide.
+
+Two neighbours audited and deliberately left alone: `PopoverAction::Screenshot` (GNOME's
+screenshot button closes the QS menu and calls `Main.screenshotUI.open()`, which contains no
+`Main.overview.hide()` — `js/ui/status/system.js:120-127`), and `AppToggleFavorite` (pinning
+raises nothing). Pinned by `overview_closes_when_a_panel_button_launches_an_app`, which asserts
+all three answers — close, stay, stay — since two of them look like they should close.
+
+Still open next door: the dateMenu cards spawn `gtk-launch <app>` instead of resolving the
+default handler (the app-system revisit note). They leave the overview correctly now either way.

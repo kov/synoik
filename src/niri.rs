@@ -9444,10 +9444,16 @@ impl Niri {
     ///   `"default"` resolves to the payload's stored default-action string; the resulting key
     ///   routes to the app (`app.` prefix, slice 2) or broadcasts `ActionInvoked` — the server
     ///   decides.
-    pub fn emit_notification_action(&mut self, id: u32, action: String) {
+    ///
+    /// Returns whether the shell itself activated the app, so the caller can leave the
+    /// overview: gnome-shell hides it from `GtkNotificationDaemonAppSource.activateAction`
+    /// (`:512-519`) but *not* from the fdo path, which only emits a signal and leaves
+    /// raising to the app.
+    #[must_use]
+    pub fn emit_notification_action(&mut self, id: u32, action: String) -> bool {
         use crate::notifications::{GtkToNotifications, NiriToNotifications, NotifKind};
         let Some(notification) = self.notifications.find(id) else {
-            return;
+            return false;
         };
         let kind = notification.kind.clone();
         let sender = notification.sender.clone();
@@ -9464,6 +9470,7 @@ impl Niri {
                         sender,
                     });
                 }
+                false
             }
             NotifKind::Gtk {
                 app_id,
@@ -9474,7 +9481,7 @@ impl Niri {
                 let action = if action == "default" {
                     match default_action {
                         Some(action) => action,
-                        None => return,
+                        None => return false,
                     }
                 } else {
                     action
@@ -9486,7 +9493,9 @@ impl Niri {
                         action,
                         token,
                     });
+                    return true;
                 }
+                false
             }
         }
     }
@@ -9495,18 +9504,25 @@ impl Niri {
     /// `source.open()`. For an `org.gtk.Notifications` source this D-Bus-activates
     /// the app (`js/ui/notificationDaemon.js:539`); fdo app-focus is deferred (no
     /// window tracker). Call BEFORE `activate_source`, which destroys the card.
-    pub fn open_notification_app(&mut self, id: u32) {
+    ///
+    /// Returns whether the app was actually activated, so the caller can leave the
+    /// overview. gnome-shell hides it inside `openApp`, *after* the `app == null`
+    /// early return (`:375-381`) — no app to raise, no reason to leave.
+    #[must_use]
+    pub fn open_notification_app(&mut self, id: u32) -> bool {
         use crate::notifications::{GtkToNotifications, NotifKind};
         let Some(NotifKind::Gtk { app_id, .. }) =
             self.notifications.find(id).map(|n| n.kind.clone())
         else {
-            return;
+            return false;
         };
         let (token, _) = self.activation_state.create_external_token(None);
         let token = token.as_str().to_owned();
         if let Some(tx) = &self.gtk_notifications_emit {
             let _ = tx.send_blocking(GtkToNotifications::Activate { app_id, token });
+            return true;
         }
+        false
     }
 
     /// Pop and show the next queued banner if the surface is free (hidden, no
