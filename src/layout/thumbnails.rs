@@ -35,14 +35,6 @@ pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 /// `.placeholder`).
 pub const PLACEHOLDER_WIDTH: f64 = 18.;
 
-/// How far inside its band the row is allowed to come to rest.
-///
-/// The scroll clamps the row against this inset rather than against the band itself, so the
-/// first and last workspaces keep room for their shadow — the active one's accent glow was
-/// cut off flat where the row sat flush against the band edge. Comfortably more than the
-/// glow's own reach. **Adaptive chrome, rule 1 — ramped.**
-pub const EDGE_INSET: f64 = 32.;
-
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {
@@ -72,12 +64,12 @@ pub struct Strip {
 /// Ours are the size of the app-grid row's workspaces, whatever the count, and the row
 /// scrolls.
 ///
-/// A row that fits is centered in the band, as gnome-shell's is. One that does not
-/// **scrolls to follow `focus`** — the fractional active-workspace index, so it tracks a
-/// workspace switch as it animates — clamped so the row never leaves a gap at either end.
-/// This is the same rule the overflowing workspace row follows
-/// ([`crate::layout::monitor::scroll_to_follow`]), and it replaces gnome-shell's
-/// shrink-to-fit (see [`preferred_height`]).
+/// A row that fits is centered in the band, as gnome-shell's is, and stays put. One that
+/// does not **pins `focus` to the band's center** — the fractional active-workspace index,
+/// so it tracks a workspace switch as it animates — all the way to either end
+/// ([`crate::layout::monitor::center_on_focus`]). Keeping the active thumbnail in the
+/// middle is what makes the overflowing side end on a workspace *poking in* at the band
+/// edge, which is the strip's "there is more this way" affordance.
 pub fn strip_geometry(
     view_size: Size<f64, Logical>,
     band: Rectangle<f64, Logical>,
@@ -123,11 +115,8 @@ pub fn strip_geometry(
     let t = idx.fract();
     let focus_x = thumbs[lo].loc.x + (thumbs[hi].loc.x - thumbs[lo].loc.x) * t;
 
-    let inset = (EDGE_INSET * crate::ui::overview_layout::chrome_ramp(view_size)).round();
-    let span = (band.size.w - inset * 2.).max(1.);
     let x0 = (band.loc.x
-        + inset
-        + super::monitor::scroll_to_follow(span, total_w, focus_x + thumb_w / 2.))
+        + super::monitor::center_on_focus(band.size.w, total_w, focus_x + thumb_w / 2.))
     .round();
     for rect in &mut thumbs {
         rect.loc.x += x0;
@@ -274,10 +263,11 @@ mod tests {
     }
 
     /// The row scrolls to follow the active workspace instead of shrinking to fit
-    /// (the approved divergence). The scale is the cap whatever the count, and
-    /// whichever workspace is active is fully inside the band the entry left.
+    /// (the approved divergence). The size holds whatever the count, and the active
+    /// workspace is pinned to the band's center — which is what leaves a workspace
+    /// poking in at the overflowing edge.
     #[test]
-    fn the_row_scrolls_to_the_active_workspace() {
+    fn the_row_centers_the_active_workspace() {
         // 10 thumbs of 279 plus gaps = 3006, well past the 1168-wide band.
         let n = 10;
         for active in 0..n {
@@ -298,14 +288,35 @@ mod tests {
             }
         }
 
-        // The ends stay flush against the band — the clamp, not just the centering.
-        // Flush against the row's resting inset, not the band edge: the first and last
-        // workspaces keep room for their shadow (see `EDGE_INSET`).
+        // Centered, not clamped, even at the ends: at the first workspace the band has
+        // dead space to its left, which is what "nothing further this way" looks like.
+        // Its shadow therefore never meets the clip, which is what the clamp used to do.
+        let center = BAND_X + AVAIL_W / 2.;
+        for active in [0, n / 2, n - 1] {
+            let strip = strip_geometry(view(), band(), THUMB_H, n, None, active as f64);
+            let rect = strip.thumbs[active];
+            assert!(
+                (rect.loc.x + rect.size.w / 2. - center).abs() <= 1.,
+                "workspace {active} must sit on the band's center, got {rect:?}"
+            );
+        }
         let first = strip_geometry(view(), band(), THUMB_H, n, None, 0.);
-        assert_eq!(first.thumbs[0].loc.x, BAND_X + EDGE_INSET);
-        let last = strip_geometry(view(), band(), THUMB_H, n, None, (n - 1) as f64);
-        let tail = last.thumbs[n - 1];
-        assert_eq!(tail.loc.x + tail.size.w, BAND_X + AVAIL_W - EDGE_INSET);
+        assert!(
+            first.thumbs[0].loc.x > BAND_X,
+            "the first workspace must not sit flush against the band edge"
+        );
+
+        // …and the overflowing side ends on a partial thumbnail, not a whole one: the
+        // affordance the centering buys.
+        let edge = BAND_X + AVAIL_W;
+        assert!(
+            first
+                .thumbs
+                .iter()
+                .any(|t| t.loc.x < edge && t.loc.x + t.size.w > edge),
+            "a workspace must poke in at the overflowing edge, got {:?}",
+            first.thumbs
+        );
 
         // A fractional focus scrolls smoothly between the two, so the row tracks a
         // workspace switch as it animates rather than jumping at the halfway point.
@@ -345,10 +356,16 @@ mod tests {
         assert_eq!(strip.thumb_under(pos), None);
         assert_eq!(strip.drop_target(pos), None);
 
-        // …while the one at the row's resting edge still is, on its visible part.
+        // …while a thumbnail that straddles the band edge still is, on its visible part.
+        let edge = BAND_X + AVAIL_W;
+        let straddling = strip
+            .thumbs
+            .iter()
+            .position(|t| t.loc.x < edge && t.loc.x + t.size.w > edge)
+            .expect("the overflowing edge must end on a partial thumbnail");
         assert_eq!(
-            strip.thumb_under(Point::from((BAND_X + EDGE_INSET + 4., y))),
-            Some(0)
+            strip.thumb_under(Point::from((edge - 4., y))),
+            Some(straddling)
         );
     }
 
@@ -367,11 +384,11 @@ mod tests {
         let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., THUMB_H)));
         let strip = strip_geometry(view(), moved, THUMB_H, 3, None, 0.);
         assert_eq!(strip.thumbs[0].loc.y, 300.);
-        // 800 is not wide enough for three at 279 + 24, so the row scrolls: with the
-        // first workspace active it starts flush at the band's left edge.
+        // 800 is not wide enough for three at 279 + 24, so the row centers the active
+        // workspace in the moved band rather than fitting into it.
         let total_w = THUMB_W * 3. + SPACING * 2.;
         assert!(total_w > 800.);
-        assert_eq!(strip.thumbs[0].loc.x, 40. + EDGE_INSET);
+        assert_eq!(strip.thumbs[0].loc.x, (40. + (800. - THUMB_W) / 2.).round());
     }
 
     #[test]

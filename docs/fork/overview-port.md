@@ -1354,42 +1354,6 @@ Live-validated on the headless seat at 13 workspaces: the strip scrolls with a p
 peeking at each band edge, the pill is untouched, and the app grid's row keeps the active
 workspace on screen.
 
-### 12.4 The thumbnail strip is the app-grid row's twin ✅
-
-Gustavo, having seen the two rows side by side: *"would it be possible to replace the thumb strip
-with the same widget used for the workspaces while in app grid mode? I like how they behave a lot
-and their spacing and size … I do like the idea of the cursor you added to the thumb strip, but I
-am thinking perhaps we could make it be the drop shadow being stronger and accent-colored?"*
-
-**Not the same widget instance — that one is impossible.** In the window-picker state the
-workspace row *is* the big picker; the strip is a second, simultaneous drawing of the same
-workspaces at a different size. Two live views of one row, on screen at once, cannot be one
-actor. What is shareable is everything that made the app-grid row look right, and that is what
-landed:
-
-- **Size.** A thumbnail is `overview_layout::small_workspace_height` — one expression, used by the
-  app-grid picker box *and* the strip, so the two can't drift. 157px at the 1920×1080/35 reference,
-  against the 108 of yesterday's doubled cap. Pinned by asserting the strip's thumbnail against the
-  *rendered* app-grid workspace, so a change on either side has to move both.
-- **Spacing.** `WORKSPACE_MIN_SPACING` (24), ramped, instead of the theme's `$base_padding` (8).
-- **Corner + shadow.** `Monitor::thumbnail_corner_radius` is the picker's own background curve
-  evaluated at the thumbnail's height, and the wallpaper, the shadow and the clip all read it from
-  that one accessor — the same reason `workspace_background_radius` is one accessor.
-- **The inactive shrink.** `WORKSPACE_INACTIVE_SCALE` about the slot's center, exactly as
-  `_updateWorkspacesState` does it for the row (`workspacesView.js:243-266`).
-
-**The indicator ring is gone**, replaced by the accent glow: `thumb_active_shadow`, the same
-shadow geometry spread wider, at full alpha, in the system accent color, which
-`set_gnome_accent_color` now recolors instead of the ring. gnome-shell's
-`.workspace-thumbnail-indicator` border is dropped.
-
-**Trap worth keeping.** The band clip from §12.2 is a *horizontal* concern — it exists to keep the
-row out of the floating entry's column. Clipping the shadow to the band as well cut the glow flat
-along the thumbnail's top and bottom edges, so the active workspace read as two accent side
-stripes. Shadows keep the band's x range and get the band's height plus `SHADOW_GLOW_MARGIN`,
-still sliding with the band so the entrance clips correctly. It looked *fine* in the geometry
-tests and wrong on the first screenshot.
-
 ### 12.3 Panel / quick-settings buttons that launch apps must leave the overview ✅
 
 Gustavo, from live use: a button on the panel or in quick settings that starts an application
@@ -1432,3 +1396,90 @@ all three answers — close, stay, stay — since two of them look like they sho
 
 Still open next door: the dateMenu cards spawn `gtk-launch <app>` instead of resolving the
 default handler (the app-system revisit note). They leave the overview correctly now either way.
+
+### 12.4 The thumbnail strip is the app-grid row's twin ✅
+
+Gustavo, having seen the two rows side by side: *"would it be possible to replace the thumb strip
+with the same widget used for the workspaces while in app grid mode? I like how they behave a lot
+and their spacing and size … I do like the idea of the cursor you added to the thumb strip, but I
+am thinking perhaps we could make it be the drop shadow being stronger and accent-colored?"*
+
+**Not the same widget instance — that one is impossible.** In the window-picker state the
+workspace row *is* the big picker; the strip is a second, simultaneous drawing of the same
+workspaces at a different size. Two live views of one row, on screen at once, cannot be one
+actor. What is shareable is everything that made the app-grid row look right, and that is what
+landed:
+
+- **Size.** A thumbnail is `overview_layout::small_workspace_height` — one expression, used by the
+  app-grid picker box *and* the strip, so the two can't drift. 157px at the 1920×1080/35 reference,
+  against the 108 of yesterday's doubled cap. Pinned by asserting the strip's thumbnail against the
+  *rendered* app-grid workspace, so a change on either side has to move both.
+- **Spacing.** `WORKSPACE_MIN_SPACING` (24), ramped, instead of the theme's `$base_padding` (8).
+- **Corner + shadow.** `Monitor::thumbnail_corner_radius` is the picker's own background curve
+  evaluated at the thumbnail's height, and the wallpaper, the shadow and the clip all read it from
+  that one accessor — the same reason `workspace_background_radius` is one accessor.
+- **The inactive shrink.** `WORKSPACE_INACTIVE_SCALE` about the slot's center, exactly as
+  `_updateWorkspacesState` does it for the row (`workspacesView.js:243-266`).
+
+**The indicator ring is gone**, replaced by the accent glow: `thumb_active_shadow`, the same
+shadow geometry spread wider, at full alpha, in the system accent color, which
+`set_gnome_accent_color` now recolors instead of the ring. gnome-shell's
+`.workspace-thumbnail-indicator` border is dropped.
+
+**The row centers the active workspace rather than clamping at its ends** (Gustavo, once the
+strip was workspace-sized): with the active thumbnail pinned to the band's center, the
+overflowing side almost always ends on a workspace *poking in* at the band edge, which is the
+"there is more this way" affordance for free — and it is the picker's own fit-single behaviour
+(`center_on_focus`, beside the clamped `scroll_to_follow` the app-grid row keeps; a full-width
+row with no clamp would leave most of a screen empty beside the last workspace). A row that
+still *fits* is centered as a whole and stays put, so a two- or three-workspace strip does not
+slide about on every switch. **The tradeoff to keep in mind:** at the first or last workspace
+roughly half the band is empty. That is what "nothing further this way" looks like, and it is
+the price of never ending on a whole thumbnail.
+
+**Trap worth keeping.** The band clip from §12.2 is a *horizontal* concern — it exists to keep the
+row out of the floating entry's column. Clipping the shadow to the band as well cut the glow flat
+along the thumbnail's top and bottom edges, so the active workspace read as two accent side
+stripes. Shadows keep the band's x range and get the band's height plus `SHADOW_GLOW_MARGIN`,
+still sliding with the band so the entrance clips correctly. It looked *fine* in the geometry
+tests and wrong on the first screenshot.
+
+### 12.5 An edge fade at the ends of the strip (reported 2026-07-29, NOT started)
+
+The overflowing edge of the strip currently ends on a hard cut. gnome-shell has a canonical
+effect for exactly this and we should use it rather than invent one: **`StScrollViewFade`**
+(`src/st/st-scroll-view-fade.c`), applied through the `hfade` / `vfade` style classes. Two
+details worth copying — it is a plain **linear alpha ramp**, `ratio *= distance_from_edge /
+fade_offset`, and it fades **only the edge that has more content past it**
+(`fade_edges_left`/`_right` come from the adjustment's position). The offset is `68px`
+(`_scrollbars.scss:4-5`, and `DEFAULT_FADE_OFFSET` in the C). `hfade` on a horizontal strip has
+precedent in the switcher popup (`switcherPopup.js:414`).
+
+**How to build it — decided (Gustavo, 2026-07-29): extend the renderer, do NOT bake offscreen.**
+The obvious cheap route is to render the strip to an offscreen and draw *that* through the fade
+pipeline we already have (`GradientFadeTextureRenderElement`, which the MRU switcher uses on
+clipped thumbnails, `render_gradient_fade` in `vulkan/frame.rs`). It was rejected: "offscreen
+baking has bitten us many times in terms of performance and out of date content." The remaining
+route is a general **edge-fade verb** every strip pipeline honours, alongside the crop — the
+existing fade pipeline is texture-only, and the strip draws windows, wallpaper and solid colors
+through different ones.
+
+**Do NOT paint a gradient "fog" rect in the backdrop color.** It looks identical while the
+overview is settled and wrong during the open animation, when the backdrop is still blending
+with the desktop.
+
+Lower priority than it was: the centering in §12.4 means the overflowing side already ends on a
+partial thumbnail, so the fade is polish on an affordance that works, not the affordance itself.
+
+### 12.6 Workspace previews want wallpaper padding on every side (reported 2026-07-29, NOT started)
+
+Gustavo, from live use: a preview shows wallpaper along its top, where the panel's strut leaves
+room, but a workspace whose window is maximized runs its window right to the other three edges.
+He wants that padding on **all** sides, so every preview has some wallpaper poking out around
+its contents — it is what separates a workspace from the dark overview backdrop.
+
+Note this is *not* the same as §12 divergence 4 (`Workspace::expose_area`), which symmetrized the
+**slot** the preview is laid out in. This is about padding *inside* the preview, between its
+background and the windows drawn on it, and it will interact with that symmetrization — check
+both together, and check it against a maximized window, which is the case that shows nothing
+today.
