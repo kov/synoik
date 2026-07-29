@@ -1635,7 +1635,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // list and are freed once the queue timeline passes this submit; `should_defer_finish`
             // has already established that nothing issued after this can execute alongside it.
             if let (true, Some(timeline)) = (defer, timeline) {
-                let fence = VkSubmitFence::new(self.renderer.gpu.clone(), fence);
+                let fence = VkSubmitFence::new(
+                    self.renderer.gpu.clone(),
+                    fence,
+                    self.renderer.exported_scanout_fences.clone(),
+                );
                 let held = std::mem::take(&mut self.held);
                 // What we render *into* is not in `held` and is not ours: the target may be a
                 // present-blit shadow the renderer's LRU can evict, or an imported dmabuf its

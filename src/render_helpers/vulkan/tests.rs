@@ -4223,6 +4223,95 @@ fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
     );
 }
 
+/// **Teardown proves every fence handed to KMS signaled before the device dies.**
+///
+/// A `SYNC_FD` export resets the `VkFence` and the in-flight record retires on the queue
+/// timeline, so once a scanout fence has been exported nothing else in-process can observe the
+/// dma-fence the kernel waits on — while exiting with it unsignaled parks the pending atomic
+/// commit on a fence whose venus context is about to die. A host that fails to retire it then
+/// wedges KMS for every later DRM master until reboot: the 2026-07-29 logout wedge,
+/// `docs/fork/present-misses.md` §22. The renderer therefore keeps a dup of each exported FD
+/// ([`super::fence::ExportedFenceRegistry`]) and [`VulkanRenderer::drain_exported_scanout_fences`]
+/// — run on drop, before the device goes — waits (bounded) until they are all signaled.
+///
+/// Needs GBM (a real scanout dmabuf), so it is Venus-only and skips elsewhere.
+#[test]
+fn teardown_waits_for_the_scanout_fences_kms_holds() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    let skip = |why: &str| eprintln!("skipping teardown_waits_for_the_scanout_fences: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no Vulkan device ({e})")),
+    };
+    if !vk.gpu.orders_submits() {
+        return skip("no timeline semaphore, so deferring would be unsafe");
+    }
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    else {
+        return skip("no render node");
+    };
+    let Ok(gbm) = GbmDevice::new(file) else {
+        return skip("no GBM");
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+        return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
+    };
+    let mut dmabuf = bo.export().expect("export scanout dmabuf");
+
+    vk.set_defer_scanout(true);
+    vk.set_finish_may_defer(true);
+
+    let size = Size::<i32, Physical>::from((64, 64));
+    let mut fb = vk.bind(&mut dmabuf).expect("bind scanout dmabuf");
+    let sync = {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(
+                Color32F::new(0., 0., 1., 1.),
+                &[Rectangle::from_size((64, 64).into())],
+            )
+            .expect("clear");
+        frame.finish().expect("finish")
+    };
+
+    assert_eq!(
+        vk.exported_scanout_fence_count(),
+        0,
+        "nothing has been exported yet, so the registry watching FDs means export() double-books"
+    );
+    // What DrmCompositor does with the sync point: export the fence for IN_FENCE_FD. The FD it
+    // gets is dropped here, standing in for the kernel consuming it — after this, the registry's
+    // dup is the only handle this process has left.
+    drop(sync.export().expect("exporting the fence as a sync_file"));
+    assert_eq!(
+        vk.exported_scanout_fence_count(),
+        1,
+        "the export did not leave the renderer a dup, so teardown has nothing to wait on and an \
+         exit can abandon an unsignaled fence to KMS"
+    );
+
+    // Teardown order, as in Drop: queue idle first, then the fence drain. It must come back with
+    // the registry empty — on a healthy stack the dma-fence signals once the queue is idle, and
+    // a bounded-timeout return with it still pending would be the §22 wedge in the making.
+    drop(fb);
+    vk.drain_in_flight();
+    vk.drain_exported_scanout_fences();
+    assert_eq!(
+        vk.exported_scanout_fence_count(),
+        0,
+        "the queue is idle but the exported fence never signaled (or the drain lost track of it)"
+    );
+}
+
 /// The present-blit path renders into a *cached* shadow and blits into a *cached* dmabuf, and both
 /// caches drop entries on their own schedule — the shadow on an LRU eviction, the target when its
 /// weak handle goes. A deferred submit must hold both, or the frame it is still writing can have

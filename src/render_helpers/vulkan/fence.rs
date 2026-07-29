@@ -15,11 +15,23 @@
 //! in-flight record is only dropped once the queue timeline has passed the submit.
 
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use niri_vk::gpu::Gpu;
 use smithay::backend::renderer::sync::{Fence, Interrupted};
+
+/// The renderer's copies of every sync FD handed to KMS that has not yet signaled.
+///
+/// A `SYNC_FD` export has copy transference and resets the `VkFence`, and the in-flight record
+/// retires on the queue timeline — so once a fence has been exported, nothing else in this
+/// process can observe the dma-fence the kernel is actually waiting on. These dups can. They
+/// exist for teardown: exiting while one is unsignaled parks the pending atomic commit on a
+/// fence whose owning context is about to die, and a host that fails to retire it wedges KMS
+/// for every later DRM master (`docs/fork/present-misses.md` §22). Pruned as they signal
+/// ([`VulkanRenderer::retire_completed`](super::renderer::VulkanRenderer)), drained with a
+/// bounded wait on drop.
+pub type ExportedFenceRegistry = Arc<Mutex<Vec<OwnedFd>>>;
 
 /// The completion of one `vkQueueSubmit`. See the [module docs](self).
 ///
@@ -36,14 +48,21 @@ struct Inner {
     /// across frames), and destroying the fence needs the device it came from.
     gpu: Arc<Gpu>,
     fence: vk::Fence,
+    /// Where [`Fence::export`] deposits a dup of the FD it hands out. See
+    /// [`ExportedFenceRegistry`].
+    exported: ExportedFenceRegistry,
 }
 
 impl VkSubmitFence {
     /// Takes ownership of `fence`, which must have been created by
     /// [`Gpu::create_exportable_fence`] and submitted.
-    pub fn new(gpu: Arc<Gpu>, fence: vk::Fence) -> Self {
+    pub fn new(gpu: Arc<Gpu>, fence: vk::Fence, exported: ExportedFenceRegistry) -> Self {
         Self {
-            inner: Arc::new(Inner { gpu, fence }),
+            inner: Arc::new(Inner {
+                gpu,
+                fence,
+                exported,
+            }),
         }
     }
 }
@@ -92,7 +111,17 @@ impl Fence for VkSubmitFence {
         // Once per fence: a `SYNC_FD` export has copy transference and resets the fence. Smithay
         // memoizes the FD in the plane config, so it asks once.
         match self.inner.gpu.export_fence_sync_fd(self.inner.fence) {
-            Ok(fd) => Some(fd),
+            Ok(fd) => {
+                // Keep a dup: this is the last moment anything in-process can still get a handle
+                // on the dma-fence KMS is about to wait on. See [`ExportedFenceRegistry`].
+                match fd.try_clone() {
+                    Ok(dup) => self.inner.exported.lock().unwrap().push(dup),
+                    Err(err) => {
+                        tracing::warn!("could not dup the exported fence FD: {err}");
+                    }
+                }
+                Some(fd)
+            }
             Err(err) => {
                 tracing::warn!("could not export the frame's fence, KMS will have to block: {err}");
                 None

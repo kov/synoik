@@ -31,7 +31,7 @@ use tracing::warn;
 use super::blur_chain::SharedBlurChain;
 use super::custom::{compile_custom, CustomShaderType};
 use super::error::VulkanError;
-use super::fence::VkSubmitFence;
+use super::fence::{ExportedFenceRegistry, VkSubmitFence};
 use super::frame::VulkanFrame;
 use super::types::{
     import_format, is_rgba8888, GlyphRun, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
@@ -123,6 +123,10 @@ pub struct VulkanRenderer {
     gpu_timer: Option<GpuTimer>,
     /// Submits left running, oldest first. See [`Self::retire_completed`].
     in_flight: Vec<InFlightSubmit>,
+    /// Dups of the scanout fence FDs handed to KMS, until they signal. See
+    /// [`ExportedFenceRegistry`] for why they exist; pruned in [`Self::retire_completed`],
+    /// drained in [`Self::drain_exported_scanout_fences`] on drop.
+    pub(super) exported_scanout_fences: ExportedFenceRegistry,
     /// Whether the frame being finished is the one going to KMS, set by the tty backend around
     /// `DrmCompositor::render_frame`. Only that frame has somewhere to hand its fence; a
     /// screencopy or screencast render into a dmabuf looks identical from in here, and deferring
@@ -522,6 +526,7 @@ impl VulkanRenderer {
             command_pool,
             gpu_timer: GpuTimer::if_requested(&gpu_for_timer)?,
             in_flight: Vec::new(),
+            exported_scanout_fences: ExportedFenceRegistry::default(),
             finish_may_defer: false,
             defer_scanout: deferred_scanout_requested(),
             readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
@@ -1858,6 +1863,7 @@ impl VulkanRenderer {
         if self.retire_paused {
             return;
         }
+        self.prune_exported_scanout_fences();
         if self.in_flight.is_empty() {
             return;
         }
@@ -1885,6 +1891,77 @@ impl VulkanRenderer {
         // is borrowed mutably above.
         if let Some(slot) = measured {
             self.gpu_timer_collect_through(slot);
+        }
+    }
+
+    /// Drop every exported scanout FD whose dma-fence has signaled. Never blocks.
+    ///
+    /// Uses [`ZERO_TIMEOUT`]; see [`SCANOUT_FENCE_DRAIN_TIMEOUT`] for the teardown bound.
+    fn prune_exported_scanout_fences(&self) {
+        use smithay::reexports::rustix::event::{poll, PollFd, PollFlags};
+        let mut fds = self.exported_scanout_fences.lock().unwrap();
+        fds.retain(|fd| {
+            let mut pfd = [PollFd::new(fd, PollFlags::IN)];
+            match poll(&mut pfd, Some(&ZERO_TIMEOUT)) {
+                // Not readable yet: the fence is still pending, keep watching it.
+                Ok(0) => true,
+                // Readable means signaled; an unpollable FD can only stall teardown, so a poll
+                // error drops it too (with a note — it should not happen to a sync file).
+                Ok(_) => false,
+                Err(err) => {
+                    warn!("could not poll an exported scanout fence, dropping it: {err}");
+                    false
+                }
+            }
+        });
+    }
+
+    /// Wait, bounded, for every scanout fence KMS is still holding to signal. For teardown:
+    /// exiting with one unsignaled leaves the pending atomic commit parked on a fence whose
+    /// venus context is about to die — if the host then fails to retire it, KMS wedges for
+    /// every later DRM master until reboot (`docs/fork/present-misses.md` §22). On a healthy
+    /// host these signal within milliseconds of the queue idling, so the normal cost is zero.
+    pub(super) fn drain_exported_scanout_fences(&mut self) {
+        use smithay::reexports::rustix::event::{poll, PollFd, PollFlags};
+        self.prune_exported_scanout_fences();
+        let mut fds = std::mem::take(&mut *self.exported_scanout_fences.lock().unwrap());
+        if fds.is_empty() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + SCANOUT_FENCE_DRAIN_TIMEOUT;
+        while !fds.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let timeout = smithay::reexports::rustix::time::Timespec {
+                tv_sec: remaining.as_secs() as _,
+                tv_nsec: remaining.subsec_nanos() as _,
+            };
+            let mut pfds: Vec<PollFd> = fds
+                .iter()
+                .map(|fd| PollFd::new(fd, PollFlags::IN))
+                .collect();
+            match poll(&mut pfds, Some(&timeout)) {
+                Ok(0) => break, // timed out with fences still pending
+                Ok(_) => {
+                    let signaled: Vec<bool> =
+                        pfds.iter().map(|p| !p.revents().is_empty()).collect();
+                    let mut it = signaled.into_iter();
+                    fds.retain(|_| !it.next().unwrap());
+                }
+                Err(err) => {
+                    warn!("could not poll the exported scanout fences: {err}");
+                    break;
+                }
+            }
+        }
+        if !fds.is_empty() {
+            error!(
+                "{} scanout fence(s) never signaled within {:?}; a pending KMS commit may wedge \
+                 the next DRM master (docs/fork/present-misses.md §22)",
+                fds.len(),
+                SCANOUT_FENCE_DRAIN_TIMEOUT,
+            );
         }
     }
 
@@ -2012,6 +2089,12 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// How many exported scanout fence FDs the renderer is still watching.
+    #[cfg(test)]
+    pub(crate) fn exported_scanout_fence_count(&self) -> usize {
+        self.exported_scanout_fences.lock().unwrap().len()
     }
 
     /// How many render targets the in-flight records are keeping alive. The count *is* the
@@ -2251,6 +2334,19 @@ pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> TimestampSamp
 /// Opt-in because the win it targets can only be confirmed on a real seat: headless there is no
 /// KMS plane to take the fence, so nothing here exercises the part that pays off. See
 /// `docs/fork/renderer-synchronous-submits.md`.
+/// A `poll` timeout of "answer now": the pruning path must never block a frame.
+const ZERO_TIMEOUT: smithay::reexports::rustix::time::Timespec =
+    smithay::reexports::rustix::time::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+/// How long teardown will wait for KMS's scanout fences before exiting anyway. On a healthy
+/// host they signal within milliseconds of `vkDeviceWaitIdle` returning; a host that has not
+/// delivered by now is the §22 failure, which waiting longer does not fix — the point of the
+/// bound is to log it loudly and not hang the logout.
+const SCANOUT_FENCE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn deferred_scanout_requested() -> bool {
     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQUESTED.get_or_init(|| {
@@ -2264,6 +2360,9 @@ impl Drop for VulkanRenderer {
         // Before anything is destroyed: an in-flight submit still references its command buffer,
         // and the pool it came from is about to go.
         self.drain_in_flight();
+        // And before the device (and with it the venus context) dies: KMS may still be waiting
+        // on a fence we exported, and only this process can prove it signaled.
+        self.drain_exported_scanout_fences();
         unsafe {
             let dev = &self.gpu.device;
             let _ = dev.device_wait_idle();
