@@ -10006,3 +10006,84 @@ fn output_scale_is_derived_from_the_current_mode() {
     let (back, _) = f.niri().derive_output_scale_transform(&output, None);
     assert_eq!(back, hidpi, "dropping the override re-derives for the mode");
 }
+
+/// With the app grid up, the shrunken workspaces are scenery, not a picker.
+///
+/// gnome-shell's workspace mode is 0 in the `APP_GRID` state (`workspacesView.js:236`), and a
+/// window preview's overlay — the hover growth, the close button, the title — is enabled only at
+/// mode 1 (`workspace.js:775-777` `_syncOverlay`); the keyboard focus chain is empty there too
+/// (`workspace.js:889-891`). Gustavo, 2026-07-28: the small workspaces still raised windows on
+/// hover.
+#[test]
+fn app_grid_makes_the_shrunken_workspaces_inert() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _win = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    f.niri_state().do_action(Action::ToggleOverview, false);
+    f.niri_state().update_keyboard_focus();
+    f.settle_animations();
+
+    // In the picker, hovering a preview is live: it hovers, and a click would activate it.
+    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let center = rect.loc + rect.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, center.x, center.y);
+    assert!(
+        f.niri().window_under_cursor().is_some(),
+        "the picker must be live before the app grid opens"
+    );
+    // The overlay fades in, so it is only on screen once its animation has run — and settling has
+    // to come after the last input roundtrip (the headless animation-clock trap).
+    f.settle_animations();
+    let hovered = |f: &mut Fixture| {
+        let out = f.niri_output(1);
+        f.niri()
+            .layout
+            .monitor_for_output(&out)
+            .unwrap()
+            .preview_overlays()
+            .into_iter()
+            .filter(|(_, _, hover)| *hover > 0.)
+            .count()
+    };
+    assert_eq!(hovered(&mut f), 1, "the hovered preview shows its overlay");
+
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+
+    // Sample where the preview *now* is: the row shrank, so the old point would miss it and the
+    // test would pass without proving anything. The hover and the click both resolve through
+    // `Layout::window_under` — not through `Niri::window_under`, which would answer None here
+    // anyway because the app grid covers the layout. This is the path that was still handing a
+    // window over.
+    let small = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    assert!(
+        small.size.w < rect.size.w,
+        "premise: the app grid shrinks the workspaces ({:?} -> {:?})",
+        rect.size,
+        small.size
+    );
+    let small_center = small.loc + small.size.downscale(2.).to_point();
+    let out = f.niri_output(1);
+    assert!(
+        f.niri().layout.window_under(&out, small_center).is_none(),
+        "a shrunken workspace must not hand a window to the pointer"
+    );
+    assert_eq!(
+        hovered(&mut f),
+        0,
+        "the overlay must go with the state, even though the pointer never moved"
+    );
+
+    // …and it comes back when the app grid closes.
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    pointer_motion_to(&mut f, center.x, center.y);
+    let out = f.niri_output(1);
+    assert!(
+        f.niri().layout.window_under(&out, center).is_some(),
+        "closing the app grid makes the picker live again"
+    );
+}

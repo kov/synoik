@@ -2350,6 +2350,12 @@ impl<W: LayoutElement> Monitor<W> {
         let Some(progress) = self.expose_progress() else {
             return Vec::new();
         };
+        // Overlays are a property of the state, not of the last pointer motion: opening the app
+        // grid drops them even if the pointer never moves (`_syncOverlay`, `workspace.js:775-777`
+        // — see `window_under`).
+        if self.app_grid_fraction() > 0. {
+            return Vec::new();
+        }
 
         let zoom = self.overview_zoom();
         let mut overlays = Vec::new();
@@ -2373,6 +2379,16 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn window_under(&self, pos_within_output: Point<f64, Logical>) -> Option<(&W, HitType)> {
+        // With the app grid showing, the workspaces shrink into a row that is scenery, not a
+        // picker: gnome-shell's workspace mode is 0 in the APP_GRID state
+        // (`workspacesView.js:236`), and a preview's overlay — the hover growth, the close button,
+        // the title — is enabled only at mode 1 (`workspace.js:775-777` `_syncOverlay`), with the
+        // keyboard focus chain empty there too (`workspace.js:889-891`). The comparison is against
+        // exactly 1, so the row goes inert the moment the transition starts.
+        if self.app_grid_fraction() > 0. {
+            return None;
+        }
+
         let (ws, geo) = self.workspace_under(pos_within_output)?;
 
         if self.overview_progress.is_some() {
