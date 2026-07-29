@@ -2226,25 +2226,26 @@ fn overview_workspace_fills_its_allocated_picker_box() {
 
     // Two workspaces (active + trailing empty) is at the strip threshold, so no
     // thumbnails band is reserved. Work area 1045 tall ⇒ spacing round(20.9) = 21,
-    // round(21·0.6) = 13 above the (zero-height) band; the picker box is then
-    //   y = 35 + 58 + 13                                = 106
-    //   h = 1045 − 112(dash) − 21 − 58(entry) − 13     = 841
+    // round(21·0.6) = 13 above the (zero-height) band. The search entry floats
+    // (approved divergence), so it costs the picker nothing:
+    //   y = 35 + 13                            = 48
+    //   h = 1045 − 112(dash) − 21 − 13        = 899
     let controls = overview_controls(&mut f);
-    assert_eq!(controls.workspaces.loc.y, 106.);
-    assert_eq!(controls.workspaces.size.h, 841.);
+    assert_eq!(controls.workspaces.loc.y, 48.);
+    assert_eq!(controls.workspaces.size.h, 899.);
 
     // The row is fit by height into that box, and centered on what width is left.
-    let zoom: f64 = 841. / 1080.;
-    let ws_w = (1920. * zoom).ceil(); // 1496
-    let offset_x = ((1920. - ws_w) / 2.).round(); // 212
+    let zoom: f64 = 899. / 1080.;
+    let ws_w = (1920. * zoom).ceil(); // 1599
+    let offset_x = ((1920. - ws_w) / 2.).round(); // 161
 
     // Workspace-local slot (see expose::tests): 760 × 570 centered in the work
     // area — the top panel insets it to 1920×1045, so the slot sits at
-    // (580, 35 + (1045−570)/2) = (580, 272).
+    // (580, 35 + (1045−570)/2) = (580, 272), scaled into the picker box at y = 48.
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 106. + 272. * zoom),
+        (offset_x + 580. * zoom, 48. + 272. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(
@@ -2404,6 +2405,64 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
     assert_eq!(row_y(&mut f), 0.);
 }
 
+/// **Divergence (approved 2026-07-28).** The search entry floats at the top right instead
+/// of taking a full-width row, and the thumbnails strip is at twice gnome-shell's band
+/// height. Judged on both the reference canvas and the 1024×665 one the adaptive chrome
+/// ramp was written for (`docs/fork/adaptive-overview-chrome.md`), because that is the
+/// canvas the sizes actually have to work on.
+#[test]
+fn overview_entry_floats_right_of_a_doubled_thumbnail_strip() {
+    for size in [(1920u16, 1080u16), (1024, 665)] {
+        let mut f = Fixture::new();
+        f.add_output(1, size);
+        let id = f.add_client();
+        let (_a, _b) = setup_two_desktops_in_overview_on(&mut f, id, size);
+        f.settle_animations();
+
+        let controls = overview_controls(&mut f);
+        let pill = f.niri().overview_search.entry_pill(controls.into());
+        let band = controls.thumbnails;
+        let view_w = f64::from(size.0);
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let strip = mon
+            .expect("workspaces must be on a monitor")
+            .thumbnail_strip()
+            .expect("three workspaces must show the strip");
+
+        // The pill hugs the right edge rather than centering — and by less than it is
+        // wide, so this is genuinely "floating right" and not a re-centered box.
+        let right_gap = view_w - (pill.loc.x + pill.size.w);
+        assert!(
+            right_gap > 0. && right_gap < pill.size.w,
+            "{size:?}: the entry must float at the right edge, gap {right_gap}"
+        );
+
+        // It costs the strip no vertical space: the band starts within one spacing of
+        // the panel, where GNOME would have had the entry's whole row above it.
+        assert!(
+            band.loc.y - crate::ui::panel::PANEL_HEIGHT
+                < crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
+            "{size:?}: the entry still displaces the strip (band at {})",
+            band.loc.y
+        );
+
+        // The strip is at the doubled cap: a thumbnail is a tenth of the view tall.
+        assert_eq!(
+            strip.thumbs[0].size.h,
+            (f64::from(size.1) * crate::layout::thumbnails::MAX_THUMBNAIL_SCALE).round(),
+            "{size:?}: the strip must sit at the doubled cap"
+        );
+
+        // And the two never collide: the row is clear of the pill's column.
+        let strip_right = strip.bounds().loc.x + strip.bounds().size.w;
+        assert!(
+            strip_right <= pill.loc.x,
+            "{size:?}: the strip runs under the floating entry ({strip_right} vs {})",
+            pill.loc.x
+        );
+    }
+}
+
 /// The thumbnails strip fills the band the overview layout allocates it, just
 /// below the search entry — not a band derived from the workspace zoom.
 #[test]
@@ -2415,8 +2474,9 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     f.settle_animations();
 
     let band = overview_controls(&mut f).thumbnails;
-    // 35 + 58 + round(21 × 0.6) = 106, and 1080 × MAX_THUMBNAIL_SCALE = 54.
-    assert_eq!((band.loc.y, band.size.h), (106., 54.));
+    // 35 + round(21 × 0.6) = 48 (the entry floats and takes no row), and
+    // 1080 × MAX_THUMBNAIL_SCALE = 108 (our doubled cap).
+    assert_eq!((band.loc.y, band.size.h), (48., 108.));
 
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     let strip = mon
@@ -2454,7 +2514,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
     f.niri().advance_animations();
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (168., 779.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (164., 783.));
 
     // Back to one populated desktop: the emptied workspace is only reaped once the
     // switch settles, and the collapse ease arms on that frame.
@@ -2469,7 +2529,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
 
     let mid = overview_controls(&mut f).workspaces;
     assert!(
-        mid.size.h > expanded.size.h && mid.size.h < 841.,
+        mid.size.h > expanded.size.h && mid.size.h < 899.,
         "mid-collapse picker height must be between the two rest states, got {}",
         mid.size.h
     );
@@ -2484,7 +2544,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
 
     f.settle_animations();
     let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!((collapsed.loc.y, collapsed.size.h), (106., 841.));
+    assert_eq!((collapsed.loc.y, collapsed.size.h), (48., 899.));
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     assert!(!mon.unwrap().thumbnails_visible());
 }
@@ -2506,7 +2566,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
 
     // Two workspaces: no band, so the picker has the whole space.
     let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!(collapsed.size.h, 841.);
+    assert_eq!(collapsed.size.h, 899.);
 
     // Populate a second desktop, which brings the strip in. The ease starts on
     // the next frame, so advance once to arm it and once more to sample it.
@@ -2532,7 +2592,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
     // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (168., 779.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (164., 783.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a
@@ -2552,10 +2612,10 @@ fn overview_click_neighbor_switches_and_stays() {
     f.niri_complete_animations();
 
     // The trailing empty workspace peeks at the right edge of the row:
-    // the active workspace spans 192..1728, spacing clamps to 24, so the
-    // neighbor is visible from 1752 on (gnome-shell keeps the spacing at
+    // the active workspace spans 161..1760 and the neighbor, drawn a touch
+    // smaller, is visible from 1832 on (gnome-shell keeps the spacing at
     // its minimum exactly so neighbors peek in).
-    f.pointer_motion(1800., 540.);
+    f.pointer_motion(1850., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
@@ -2917,6 +2977,17 @@ fn setup_two_desktops_in_overview(
     f: &mut Fixture,
     id: ClientId,
 ) -> (smithay::desktop::Window, smithay::desktop::Window) {
+    setup_two_desktops_in_overview_on(f, id, (1920, 1080))
+}
+
+/// [`setup_two_desktops_in_overview`] on an output of an arbitrary size: the drop point
+/// is the peeking neighbour at the right edge, which is where it is on any canvas.
+fn setup_two_desktops_in_overview_on(
+    f: &mut Fixture,
+    id: ClientId,
+    size: (u16, u16),
+) -> (smithay::desktop::Window, smithay::desktop::Window) {
+    let (drop_x, drop_y) = (f64::from(size.0) - 20., f64::from(size.1) / 2.);
     let _a = map_window_sized(f, id, (800, 600), None);
     let win_a = f.niri().layout.focus().unwrap().window.clone();
     let _b = map_window_sized(f, id, (640, 480), None);
@@ -2931,7 +3002,7 @@ fn setup_two_desktops_in_overview(
     f.pointer_motion(grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
-    f.pointer_motion(1800. - grab.0, 540. - grab.1 - 10.);
+    f.pointer_motion(drop_x - grab.0, drop_y - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
     f.double_roundtrip(id);
@@ -7461,12 +7532,29 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
     );
     assert_eq!(s_entry, 282., "the entry keeps its share of the screen");
     assert!(
-        s_radius < radius && s_radius >= 8.,
-        "the corner follows the preview down but stays a corner: {s_radius}"
-    );
-    assert!(
         s_gap < 80.,
         "the gap is no longer pegged at the un-ramped maximum: {s_gap}"
+    );
+    // The corner does *not* ramp here any more: since the search entry floats (approved
+    // divergence) the picker got its 58px row back, so the preview on this canvas is
+    // taller than the 520px the flat 30 is written for. The rule is unchanged — it just
+    // bites lower down now.
+    assert_eq!(
+        s_radius, radius,
+        "the preview is big enough to keep GNOME's corner"
+    );
+
+    // 900x600, where the preview finally is smaller than that reference.
+    let (_, _, t_radius, _) = measure((900, 600));
+    assert!(
+        t_radius < radius && t_radius >= 8.,
+        "the corner follows the preview down but stays a corner: {t_radius}"
+    );
+    // …and it keeps following, rather than stepping once and stopping.
+    let (_, _, u_radius, _) = measure((800, 500));
+    assert!(
+        u_radius < t_radius && u_radius >= 8.,
+        "the corner keeps following the preview: {u_radius} after {t_radius}"
     );
 }
 

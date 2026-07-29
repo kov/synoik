@@ -6993,9 +6993,13 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
 
     // A column with no panel content in either state: left of the centered clock,
     // right of the Activities button, and clear of the right-hand status cluster.
-    // Below the bar it is backdrop in the overview — the search entry is centred
-    // and much narrower than the output.
     let x = 300;
+    // Where the backdrop is sampled. The picker box now starts one spacing under the
+    // panel (the search entry floats, so it no longer pushes the row down), which puts
+    // the workspace preview under x = 300; x = 80 is left of the row, so it is backdrop
+    // — a uniform fill, which is why sampling it in a different column is still a fair
+    // comparison against the bar.
+    let backdrop_x = 80;
     let bar_y = (crate::ui::panel::PANEL_HEIGHT / 2.) as i32;
     let below_y = (crate::ui::panel::PANEL_HEIGHT + 8.) as i32;
 
@@ -7021,7 +7025,7 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
 
     let (pixels, ..) = render_output_vulkan(&mut f, &output);
     let bar = px(&pixels, w, x, bar_y);
-    let backdrop = px(&pixels, w, x, below_y);
+    let backdrop = px(&pixels, w, backdrop_x, below_y);
     eprintln!("vulkan_overview_panel_bg: desktop={desktop:?} bar={bar:?} backdrop={backdrop:?}");
 
     assert!(

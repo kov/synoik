@@ -60,8 +60,10 @@ use crate::ui::widget::{
 /// `appDisplay.js:1760`).
 pub const MAX_RESULTS: usize = 6;
 
-/// The entry pill's width on a canvas with this chrome ramp.
-fn entry_width(ramp: f64) -> f64 {
+/// The entry pill's width on a canvas with this chrome ramp. Public because the entry now
+/// floats rather than centering in a full-width bin, so [`crate::ui::overview_layout`] has
+/// to know how wide it is to anchor it (and to keep the thumbnails strip clear of it).
+pub fn entry_width(ramp: f64) -> f64 {
     (ENTRY_WIDTH * ramp).round()
 }
 
@@ -1043,9 +1045,14 @@ mod tests {
         let controls = crate::ui::overview_layout::layout(
             Size::from((1920., 1080.)),
             35.,
-            PREFERRED_ENTRY_HEIGHT,
-            crate::ui::dash::preferred_height(Size::from((1920., 1080.))),
-            54.,
+            crate::ui::overview_layout::Measured {
+                search_entry_height: PREFERRED_ENTRY_HEIGHT,
+                search_entry_width: entry_width(1.),
+                dash_preferred_height: crate::ui::dash::preferred_height(Size::from((
+                    1920., 1080.,
+                ))),
+                thumbnails_preferred_height: 108.,
+            },
             1.,
             crate::ui::overview_layout::state::WINDOW_PICKER,
         );

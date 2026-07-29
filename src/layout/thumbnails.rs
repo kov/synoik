@@ -9,8 +9,14 @@
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
-/// The thumbnail cap: 5% of the screen (`MAX_THUMBNAIL_SCALE`).
-pub const MAX_THUMBNAIL_SCALE: f64 = 0.05;
+/// The thumbnail cap.
+///
+/// **Divergence (approved 2026-07-28).** gnome-shell's `MAX_THUMBNAIL_SCALE` is `0.05`
+/// (`workspaceThumbnail.js:24`), which on a laptop panel makes a thumbnail too small to
+/// read or to aim a drag at — and the strip is now a *reorder* target, not only a drop
+/// target ([`crate::layout::monitor::ThumbDrag`]). We give the band twice the height, so a
+/// thumbnail (which keeps the output's aspect) covers four times the area.
+pub const MAX_THUMBNAIL_SCALE: f64 = 0.10;
 
 /// With dynamic workspaces the strip shows only when there are more
 /// workspaces than this (`NUM_WORKSPACES_THRESHOLD`).
@@ -42,15 +48,21 @@ pub struct Strip {
     pub placeholder: Option<Rectangle<f64, Logical>>,
 }
 
-/// The thumbnail scale: 5% of the view, shrinking below the cap once `n`
-/// thumbnails plus spacing no longer fit the width (gnome-shell's
+/// The thumbnail scale: [`MAX_THUMBNAIL_SCALE`] of the view, shrinking below the cap once
+/// `n` thumbnails plus spacing no longer fit `avail_w` (gnome-shell's
 /// `vfunc_get_preferred_height`).
-fn thumb_scale(view_size: Size<f64, Logical>, n: usize) -> f64 {
-    let avail = view_size.w - SPACING * 2.;
+///
+/// `avail_w` is the width of the *band*, not of the view: the floating search entry keeps a
+/// zone clear at either edge ([`crate::ui::overview_layout::thumbnails_available_width`]),
+/// and the row has to fit what is left. gnome-shell measures against the full width because
+/// its entry sits in a row of its own.
+fn thumb_scale(view_size: Size<f64, Logical>, avail_w: f64, n: usize) -> f64 {
+    let avail = avail_w - SPACING * 2.;
     f64::min(
         (avail - SPACING * (n - 1) as f64) / (view_size.w * n as f64),
         MAX_THUMBNAIL_SCALE,
     )
+    .max(0.)
 }
 
 /// How tall a band the strip needs — gnome-shell's
@@ -60,8 +72,8 @@ fn thumb_scale(view_size: Size<f64, Logical>, n: usize) -> f64 {
 /// Divergence: gnome-shell measures against the work-area porthole
 /// (`workspaceThumbnail.js:1248-1255`); our miniature is the whole view,
 /// including the strip under the top panel, so we measure against the view.
-pub fn preferred_height(view_size: Size<f64, Logical>, n: usize) -> f64 {
-    (view_size.h * thumb_scale(view_size, n)).round()
+pub fn preferred_height(view_size: Size<f64, Logical>, avail_w: f64, n: usize) -> f64 {
+    (view_size.h * thumb_scale(view_size, avail_w, n)).round()
 }
 
 /// Lays out the strip inside its allocated `band`: each thumbnail is the
@@ -77,7 +89,7 @@ pub fn strip_geometry(
     n: usize,
     placeholder: Option<usize>,
 ) -> Strip {
-    let scale = thumb_scale(view_size, n);
+    let scale = thumb_scale(view_size, band.size.w, n);
 
     let thumb_h = (view_size.h * scale).round();
     let thumb_w = (thumb_h * (view_size.w / view_size.h)).round();
@@ -186,27 +198,61 @@ mod tests {
         Size::from((1920., 1080.))
     }
 
+    /// The band width [`crate::ui::overview_layout`] allocates the strip at the 1920×1080
+    /// reference: the view minus the floating search entry's zone (12 + 352 + 12) at each
+    /// edge.
+    const AVAIL_W: f64 = 1168.;
+    /// Where that band starts.
+    const BAND_X: f64 = 376.;
+
     /// The band [`crate::ui::overview_layout`] allocates for `n` thumbnails at
-    /// the 1920×1080 / 35px-strut reference: y = 35 + 58 + 13.
+    /// the 1920×1080 / 35px-strut reference: y = 35 + 13 (the entry floats and
+    /// no longer displaces the strip).
     fn band(n: usize) -> Rectangle<f64, Logical> {
         Rectangle::new(
-            Point::from((0., 106.)),
-            Size::from((1920., preferred_height(view(), n))),
+            Point::from((BAND_X, 48.)),
+            Size::from((AVAIL_W, preferred_height(view(), AVAIL_W, n))),
         )
     }
 
+    /// The cap is our doubled one, not gnome-shell's 5%: 10% of 1080 = 108 tall, 192 wide
+    /// (the output's aspect), so a thumbnail covers four times the area GNOME gives it.
     #[test]
-    fn three_thumbnails_at_the_gnome_cap() {
-        // 5% of 1080 = 54 tall, 96 wide; row of three centered.
+    fn three_thumbnails_at_the_doubled_cap() {
         let strip = strip_geometry(view(), band(3), 3, None);
-        assert_eq!(strip.scale, 54. / 1080.);
-        let expected_x0 = (1920. - (96. * 3. + 8. * 2.)) / 2.;
+        assert_eq!(strip.scale, 108. / 1080.);
+        // Centered in the band, which is itself centered in the view.
+        let expected_x0 = BAND_X + (AVAIL_W - (192. * 3. + 8. * 2.)) / 2.;
         assert_eq!(
             strip.thumbs[0],
-            Rectangle::new(Point::from((expected_x0, 106.)), Size::from((96., 54.)))
+            Rectangle::new(Point::from((expected_x0, 48.)), Size::from((192., 108.)))
         );
-        assert_eq!(strip.thumbs[1].loc.x, expected_x0 + 96. + 8.);
-        assert_eq!(strip.thumbs[2].loc.x, expected_x0 + (96. + 8.) * 2.);
+        assert_eq!(strip.thumbs[1].loc.x, expected_x0 + 192. + 8.);
+        assert_eq!(strip.thumbs[2].loc.x, expected_x0 + (192. + 8.) * 2.);
+        // Still centered on the *view*, because the entry's zone is reserved at both edges.
+        assert_eq!(
+            strip.bounds().loc.x,
+            1920. - (expected_x0 + 192. * 3. + 16.)
+        );
+    }
+
+    /// The row has to fit the band, not the view: with the floating entry's zone reserved
+    /// the strip runs out of room sooner, and the cap gives way rather than the pill being
+    /// overrun.
+    #[test]
+    fn the_row_fits_the_band_the_entry_left_it() {
+        // Wide enough at the cap: 10 thumbs of 192 plus gaps = 1992 > 1168, so it shrinks.
+        let n = 10;
+        let strip = strip_geometry(view(), band(n), n, None);
+        assert!(strip.scale < MAX_THUMBNAIL_SCALE);
+        let bounds = strip.bounds();
+        assert!(bounds.loc.x >= BAND_X);
+        assert!(bounds.loc.x + bounds.size.w <= BAND_X + AVAIL_W);
+
+        // The same row against the *full* view width would have fit at a bigger scale —
+        // i.e. the inset is what binds, and it is not being ignored.
+        let full = Rectangle::new(Point::from((0., 48.)), Size::from((1920., 108.)));
+        assert!(strip_geometry(view(), full, n, None).scale > strip.scale);
     }
 
     /// The strip fills the band it was allocated, so the allocator is the only
@@ -216,15 +262,16 @@ mod tests {
     #[test]
     fn the_strip_fills_its_allocated_band() {
         let strip = strip_geometry(view(), band(3), 3, None);
-        assert_eq!(preferred_height(view(), 3), 54.);
-        assert_eq!(strip.thumbs[0].loc.y, 106.);
+        assert_eq!(preferred_height(view(), AVAIL_W, 3), 108.);
+        assert_eq!(strip.thumbs[0].loc.y, 48.);
         assert_eq!(strip.thumbs[0].size.h, band(3).size.h);
 
         // Move the band and the whole row follows, with no re-centering.
-        let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., 54.)));
+        let moved = Rectangle::new(Point::from((40., 300.)), Size::from((800., 108.)));
         let strip = strip_geometry(view(), moved, 3, None);
         assert_eq!(strip.thumbs[0].loc.y, 300.);
-        let total_w = 96. * 3. + 8. * 2.;
+        // 800 is still wide enough for three at the cap, so they stay 108 × 192.
+        let total_w = 192. * 3. + 8. * 2.;
         assert_eq!(strip.thumbs[0].loc.x, 40. + (800. - total_w) / 2.);
     }
 
@@ -236,9 +283,9 @@ mod tests {
         let rect = strip
             .placeholder
             .expect("placeholder rect must be laid out");
-        assert_eq!(rect.size, Size::from((PLACEHOLDER_WIDTH, 54.)));
+        assert_eq!(rect.size, Size::from((PLACEHOLDER_WIDTH, 108.)));
         // It sits between the first two thumbnails, with normal spacing.
-        assert_eq!(rect.loc.x, strip.thumbs[0].loc.x + 96. + SPACING);
+        assert_eq!(rect.loc.x, strip.thumbs[0].loc.x + 192. + SPACING);
         assert_eq!(
             strip.thumbs[1].loc.x,
             rect.loc.x + PLACEHOLDER_WIDTH + SPACING
@@ -261,7 +308,7 @@ mod tests {
         let strip = strip_geometry(view(), band(n), n, None);
         assert!(strip.scale < MAX_THUMBNAIL_SCALE);
         let bounds = strip.bounds();
-        assert!(bounds.loc.x >= 0. && bounds.loc.x + bounds.size.w <= 1920.);
+        assert!(bounds.loc.x >= BAND_X && bounds.loc.x + bounds.size.w <= BAND_X + AVAIL_W);
     }
 
     #[test]

@@ -1836,12 +1836,21 @@ impl<W: LayoutElement> Monitor<W> {
     /// — how the geometry of an *endpoint* state is asked for while a transition
     /// is in flight (`getWorkspacesBoxForState`, `overviewControls.js:196-215`).
     fn controls_layout_at(&self, state: f64) -> ControlsLayout {
+        let entry_w =
+            crate::ui::overview_search::entry_width(overview_layout::chrome_ramp(self.view_size));
         overview_layout::layout(
             self.view_size,
             self.working_area.loc.y,
-            crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
-            crate::ui::dash::preferred_height(self.view_size),
-            thumbnails::preferred_height(self.view_size, self.workspaces.len()),
+            overview_layout::Measured {
+                search_entry_height: crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
+                search_entry_width: entry_w,
+                dash_preferred_height: crate::ui::dash::preferred_height(self.view_size),
+                thumbnails_preferred_height: thumbnails::preferred_height(
+                    self.view_size,
+                    overview_layout::thumbnails_available_width(self.view_size, entry_w),
+                    self.workspaces.len(),
+                ),
+            },
             self.thumbnails_expand_fraction(),
             state,
         )
