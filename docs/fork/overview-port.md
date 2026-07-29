@@ -1265,3 +1265,46 @@ keeps a folder from forming every time a drag crosses an icon.
   just leaving the entry, which is what GNOME does too (the entry does not consume it, so the
   dialog's grab does). A checked edit button draws like a hovered one: `.icon-button` inside
   `.app-folder-dialog` restyles only normal/hover/active.
+
+## 12. Chrome divergences on the thumbnail strip (landed 2026-07-28)
+
+Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
+
+* **The search entry floats right.** ✅ It no longer takes a full-width row at the top of the
+  work area (`ControlsLayout::search_entry` is now pill-wide and right-anchored), so the strip
+  and the picker start one `spacing_top` below the panel instead of a whole entry height
+  further down. The two full-width content surfaces — the search results strip and the app
+  grid — still reserve the entry's height, because they would otherwise render underneath it.
+* **The strip gets double the band.** ✅ `MAX_THUMBNAIL_SCALE` 0.05 → 0.10, so a thumbnail
+  (which keeps the output's aspect) covers four times the area. The row now fits itself to the
+  *band* rather than the view, and the band keeps the floating entry's zone clear at **both**
+  edges (`overview_layout::thumbnails_available_width`) so a centered row can never run under
+  the pill. Judged live at 1024×665 (`NIRI_HEADLESS_MODE=2048x1330` + scale 2).
+* **Dragging a thumbnail reorders the workspaces.** ✅ macOS Mission Control's gesture, on top
+  of gnome-shell's window-onto-thumbnail drop, which is kept — the two are told apart by what
+  the press landed on. `ThumbGrab` (`src/input/thumb_grab.rs`) recognizes like `MoveGrab`: under
+  8px the release is the plain click that activates the workspace.
+* **Picker slots keeping clear of the workspace edges.** ⏳ NOT started. From Gustavo's live
+  validation: a window's bottom sits very close to the workspace bottom, so the two edges read
+  as touching. GNOME's equivalent takes the work area **minus the container's theme-node
+  padding** (`workspace.js:573-581` `_getAdjustedWorkarea`) and caps a preview at
+  `WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95` (`workspace.js:18`), while `.window-picker` itself
+  carries only `spacing: $base_padding` (`_window-picker.scss:5-8`) — so check whether we are
+  missing the work-area inset or the 0.95 cap before inventing a padding constant, and whatever
+  lands must ride the chrome ramp.
+
+### 12.1 Preview close button is unforgiving to hit (reported 2026-07-28, NOT started)
+
+Gustavo, from live use: the close button on a hovered picker preview can only be clicked on the
+part of it that overlaps the window. The button *overhangs* its preview
+(`window_preview::close_rect`, hit-tested first in `State::overview_hit`), but moving the pointer
+onto the overhanging part leaves the preview's own hover region — so the preview de-emphasizes
+and the button fades out from under the pointer.
+
+The bug is therefore in what counts as "still hovering this preview", not in the button's hit
+rect: the hover test must include the close button's overhang (gnome-shell gets this for free
+because the button is a *child actor* of the preview, so it is inside the preview's own reactive
+box). Look at whatever computes the preview hover in `src/input/mod.rs` alongside
+`preview_close_under`, and union the close rect into it. Pin it with a corpus test that hovers a
+preview, moves onto the overhanging half of the close button, and asserts the preview is still
+hovered and the click lands.
