@@ -24,6 +24,11 @@ pub struct CursorManager {
     theme: CursorTheme,
     size: u8,
     current_cursor: CursorImageStatus,
+    /// A compositor-wide cursor that wins over whatever the pointer is actually
+    /// over — mutter's `MetaCompositor:global_cursor`, applied through the backend's
+    /// `override-cursor` hook (`compositor.c:1104-1132`). Its only user is
+    /// launch feedback: any startup sequence still pending shows `wait`.
+    global_override: Option<CursorIcon>,
     named_cursor_cache: RefCell<XCursorCache>,
 }
 
@@ -37,6 +42,7 @@ impl CursorManager {
             theme,
             size,
             current_cursor: CursorImageStatus::default_named(),
+            global_override: None,
             named_cursor_cache: Default::default(),
         }
     }
@@ -58,8 +64,40 @@ impl CursorManager {
         }
     }
 
+    /// Set the compositor-wide cursor override (`None` clears it). Returns whether
+    /// it changed — the caller owes a redraw if so.
+    pub fn set_global_override(&mut self, icon: Option<CursorIcon>) -> bool {
+        if self.global_override == icon {
+            return false;
+        }
+        self.global_override = icon;
+        true
+    }
+
+    /// The compositor-wide override currently in force, if any.
+    pub fn global_override(&self) -> Option<CursorIcon> {
+        self.global_override
+    }
+
+    /// The icon actually drawn, override included. `Hidden` still wins: a client
+    /// that hid the pointer (a video player, a game) should not have one put back
+    /// under it by a launch happening elsewhere.
+    fn effective_named(&self) -> Option<CursorIcon> {
+        match (&self.current_cursor, self.global_override) {
+            (CursorImageStatus::Hidden, _) => None,
+            (_, Some(icon)) => Some(icon),
+            (CursorImageStatus::Named(icon), None) => Some(*icon),
+            (CursorImageStatus::Surface(_), None) => None,
+        }
+    }
+
     /// Get the current rendering cursor.
     pub fn get_render_cursor(&self, scale: i32) -> RenderCursor {
+        if let Some(icon) = self.global_override {
+            if !matches!(self.current_cursor, CursorImageStatus::Hidden) {
+                return self.get_render_cursor_named(icon, scale);
+            }
+        }
         match self.current_cursor.clone() {
             CursorImageStatus::Hidden => RenderCursor::Hidden,
             CursorImageStatus::Surface(surface) => {
@@ -94,11 +132,12 @@ impl CursorManager {
     }
 
     pub fn is_current_cursor_animated(&self, scale: i32) -> bool {
-        match &self.current_cursor {
-            CursorImageStatus::Hidden => false,
-            CursorImageStatus::Surface(_) => false,
-            CursorImageStatus::Named(icon) => self
-                .get_cursor_with_name(*icon, scale)
+        // Through `effective_named`, so an animated `wait` keeps the redraw loop
+        // running while it is overriding a still cursor.
+        match self.effective_named() {
+            None => false,
+            Some(icon) => self
+                .get_cursor_with_name(icon, scale)
                 .unwrap_or_else(|| self.get_default_cursor(scale))
                 .is_animated_cursor(),
         }

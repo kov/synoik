@@ -10202,6 +10202,89 @@ fn a_launching_favorite_shows_its_running_dot_before_its_window_maps() {
     assert!(dot(&mut f), "and stays lit once it is running");
 }
 
+/// Launch feedback: while any app is starting, the pointer shows `wait`
+/// compositor-wide, whatever it happens to be over. That is mutter's, not
+/// gnome-shell's — `meta_startup_notification_has_pending_sequences`
+/// (`startup-notification.c:120-132`) drives `MetaCompositor:global_cursor`
+/// (`compositor.c:1103-1117`), applied through the backend's `override-cursor` hook.
+#[test]
+fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
+    use smithay::input::pointer::CursorIcon;
+
+    use crate::app_system::{
+        AppEntry, AppSystem, FakeCatalog, LaunchContext, LaunchMode, RecordingLauncher,
+        STARTUP_TIMEOUT,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "a.desktop",
+            "A",
+            "a",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let cursor = |f: &mut Fixture| f.niri().cursor_manager.global_override();
+    f.niri().sync_running_apps();
+    assert_eq!(cursor(&mut f), None, "nothing starting, no override");
+
+    f.niri()
+        .app_system
+        .launch(
+            "a.desktop",
+            LaunchMode::Activate,
+            &LaunchContext::bare(get_monotonic_time()),
+        )
+        .expect("launch");
+    f.niri().sync_running_apps();
+    assert_eq!(
+        cursor(&mut f),
+        Some(CursorIcon::Wait),
+        "a pending startup sequence shows the wait cursor"
+    );
+
+    // Its window arriving completes the sequence and takes the cursor away.
+    let window = f.client(client).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("a");
+    window.commit();
+    f.roundtrip(client);
+    let window = f.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(client);
+    f.niri().sync_running_apps();
+    assert_eq!(
+        cursor(&mut f),
+        None,
+        "the window completing the sequence clears it"
+    );
+
+    // And a launch that never maps clears it on the timeout, rather than leaving the
+    // pointer stuck as a watch forever.
+    let now = get_monotonic_time();
+    f.niri()
+        .app_system
+        .begin_startup("a.desktop", None, None, now);
+    f.niri().sync_running_apps();
+    assert_eq!(cursor(&mut f), Some(CursorIcon::Wait));
+    f.niri()
+        .app_system
+        .expire_startups(now + STARTUP_TIMEOUT + Duration::from_millis(1));
+    f.niri().sync_running_apps();
+    assert_eq!(
+        cursor(&mut f),
+        None,
+        "an expired sequence releases the cursor"
+    );
+}
+
 /// A launch that never produces a window stops being `STARTING` after mutter's
 /// `STARTUP_TIMEOUT_MS` (`startup-notification.c:38,483-512`) — otherwise a failed
 /// spawn would leave a permanent running dot.

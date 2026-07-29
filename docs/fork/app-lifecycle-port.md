@@ -5,7 +5,8 @@ a **window list**, and the verbs that act on a *running* app (activate a particu
 `src/app_system.rs` today is the catalog half only — `RunningApp` carries a window *count*, and an
 app has no state at all. Every gap below traces back to that.
 
-Reference: `~/Projects/gnome-shell` and `~/Projects/mutter`, both 50.1.
+Reference: `~/Projects/gnome-shell` and `~/Projects/mutter`, both **50.3** (the checkouts were moved
+up from 50.1 during this port; every citation below was re-read there).
 
 ## 1. What the gap actually blocks
 
@@ -220,23 +221,35 @@ on the headless self-iteration harness.
   `sync_running_apps` now also reports `AppSystem::take_state_changed()` — our
   `app-state-changed` (`shell-app.c:921`, consumed at `dash.js:383`).
 
+- **L6 — launch-feedback cursor. ✅ DONE.** See §2.6. Live-checked on the harness: the Adwaita
+  `wait` ring shows from the click until the app maps, and the 15 s timeout releases it for a launch
+  that never produces a window.
+
 ### Still open
 - The `RUNNING`+`Ctrl`/middle-click = new window refinement of `AppIcon.activate`
   (`appDisplay.js:3060-3075`) — the dash still always `Activate`s.
 - `animateLaunch` (`appDisplay.js:3080`), the icon's zoom-out on launch.
 
-### Asked for but NOT in 50.1: a launch-feedback cursor
-Gustavo expected the pointer to show a loading/progress cursor while an app starts. **GNOME 50.1
-does not do this.** Nothing in mutter or gnome-shell links a startup sequence to a cursor: the only
-route to `CLUTTER_CURSOR_PROGRESS` is a *client* asking through `wp_cursor_shape_device_v1`
-(`meta-wayland-cursor-shape.c:52`). mutter *used* to have it — `META_CURSOR_BUSY`, added in
-`cb27f0c4be` ("Add 'busy cursor on app startup' support, conditionally") — and it is gone as of
-`92c6452753` (Jan 2025, the css/cursor-shape rework).
+### 2.6 Launch feedback is a compositor-wide cursor override
 
-So building it is an **addition**, not a port, and needs a decision. If taken, the shape is small:
-the startup-sequence table already knows when any app is starting, so it is one cursor override
-while `starting_apps()` is non-empty, using the `progress` xcursor name. The judgement call is
-whether the fork wants a behavior GNOME deliberately dropped.
+While any startup sequence is pending, mutter forces `CLUTTER_CURSOR_WAIT` over *everything* —
+not on a particular actor, and nothing to do with libstartup-notification or the client:
+
+- `meta_startup_notification_has_pending_sequences` (`startup-notification.c:120-132`) — true when
+  any sequence has an `application_id` and is not completed.
+- `meta_compositor_update_global_cursor` (`compositor.c:1103-1117`) reads that predicate and stores
+  `MetaCompositor:global_cursor`, recomputed from the `MetaStartupNotification::changed` signal.
+- `on_override_cursor` (`:1125-1132`) hands it to the backend's `override-cursor` hook, so it wins
+  over whatever the pointer is actually over.
+
+`CLUTTER_CURSOR_WAIT` is the xcursor `"wait"` (legacy `"watch"`), *not* `PROGRESS`/`left_ptr_watch`
+(`meta-cursor-xcursor.c:114-115,198-201`).
+
+**Ported (L6).** `CursorManager::set_global_override`, recomputed in `sync_running_apps` from
+`starting_apps()` rather than at the launch/complete sites, so no path can leave it stuck on.
+`application_id` is vacuously true for us — every sequence is keyed by a desktop id. One divergence:
+a client that *hid* the pointer keeps it hidden; we do not put a cursor back under it because a
+launch is happening elsewhere.
 
 ## 5. Accepted divergences
 

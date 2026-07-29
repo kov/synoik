@@ -9151,6 +9151,24 @@ impl Niri {
         // `state_changed` set and fire it at some unrelated later window change.
         let windows_changed = self.app_system.set_windows(windows);
         let state_changed = self.app_system.take_state_changed();
+
+        // Launch feedback: mutter drives a compositor-wide `wait` cursor off exactly
+        // this predicate — `meta_startup_notification_has_pending_sequences`
+        // (`startup-notification.c:120-132`) → `MetaCompositor:global_cursor`
+        // (`compositor.c:1103-1117`). Its `application_id` requirement is vacuous for
+        // us: every sequence is keyed by a desktop id.
+        //
+        // Recomputed here rather than at the launch/complete sites so it cannot be
+        // left stuck on by a path that forgets to clear it — the same reason this
+        // whole function re-snapshots instead of taking invalidation hooks.
+        let starting = self.app_system.starting_apps().next().is_some();
+        let icon = starting.then_some(CursorIcon::Wait);
+        if self.cursor_manager.set_global_override(icon) {
+            // The `&&` below this call can swallow a `true`, and the cursor is drawn
+            // per frame, so it queues its own redraw.
+            self.queue_redraw_all();
+        }
+
         windows_changed || state_changed
     }
 
