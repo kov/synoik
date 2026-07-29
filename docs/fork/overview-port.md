@@ -1325,3 +1325,23 @@ That is the `SMALL_WORKSPACE_RATIO` strip — the picker box at `state::APP_GRID
 picker, and that row scrolls rather than fitting. Decide whether it should fit-to-width like the
 strip does, or gain the scrolling affordance GNOME's does; either way what is on screen has to
 be reachable.
+
+### 12.3 Panel / quick-settings buttons that launch apps must leave the overview (reported 2026-07-28, NOT started)
+
+Gustavo, from live use: a button on the panel or in quick settings that starts an application
+should exit the overview, the way launching from the dash or a search result does. Today it
+launches behind an overview that stays up.
+
+There is one choke point: every such button resolves to `PopoverAction::Spawn`, and the handler
+(`src/input/mod.rs:1132`) is `PopoverAction::Spawn(command) => spawn(command, None)` — no
+`close_overview()`, unlike the dash/search/grid launch paths which all call it
+(`:5266,5280,5297,5345`). The launchers that reach it today are the dateMenu's Events and World
+Clocks cards (`src/ui/calendar.rs`, currently hardcoded `gtk-launch` — see the app-system
+revisit note) and the quick-settings rows that spawn a session command
+(`src/ui/quick_settings.rs`).
+
+GNOME gets this for free because activation goes through the app system, and
+`AppInfo.launch`/`app.activate()` hides the overview. Worth checking the neighbours while there:
+`PopoverAction::Screenshot` raises the screenshot UI over an open overview, which may want the
+same treatment, and the panel's own launch-ish intercepts should be audited for the same gap
+rather than fixing only the two dateMenu cards.
