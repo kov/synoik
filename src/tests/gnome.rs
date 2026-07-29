@@ -2145,6 +2145,71 @@ fn overview_hovering_a_preview_grows_it() {
     );
 }
 
+/// The close button half-overhangs its preview (`windowPreview.js:203-218`), so reaching for
+/// that half takes the pointer *off* the picker slot. gnome-shell doesn't care — the button
+/// is a child actor, so it is inside the preview's own reactive box — but ours are separate
+/// rects hit-tested against the slot, and the preview used to de-emphasize and fade the
+/// button out from under the pointer aiming at it (reported from live use, 2026-07-28).
+///
+/// The whole button is on the preview as far as hover is concerned, however long you take.
+#[test]
+fn overview_preview_stays_hovered_over_the_close_button_overhang() {
+    use crate::ui::window_preview::{close_rect, CLOSE_SIZE};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let overlay_alpha = |f: &mut Fixture| -> f64 {
+        let output = f.niri_output(1);
+        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        mon.preview_overlays()
+            .into_iter()
+            .find(|(w, _, _)| *w == win)
+            .map_or(0., |(_, _, alpha)| alpha)
+    };
+
+    // Hover the preview and let the overlay fade all the way in.
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let inside = slot.loc + slot.size.downscale(2.).to_point();
+    pointer_motion_to(&mut f, inside.x, inside.y);
+    f.settle_animations();
+    assert_eq!(overlay_alpha(&mut f), 1., "hovering must show the overlay");
+
+    // Now move onto the overhanging half of the button — outside the slot on both axes —
+    // and let everything settle, which is what a human aiming at it does.
+    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let button = close_rect(drawn);
+    let overhang = button.loc + smithay::utils::Point::from((CLOSE_SIZE * 0.75, CLOSE_SIZE * 0.25));
+    assert!(
+        !drawn.contains(overhang),
+        "the sample point must be off the preview, or this pins nothing"
+    );
+    pointer_motion_to(&mut f, overhang.x, overhang.y);
+    f.settle_animations();
+
+    assert_eq!(
+        overlay_alpha(&mut f),
+        1.,
+        "the preview must stay hovered while the pointer is on its close button"
+    );
+
+    // …and the button is still there to be clicked.
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "a click on the overhanging half of the button must still close the window"
+    );
+}
+
 /// Hovering a preview also reveals its close button — the other half of
 /// `showOverlay` (`windowPreview.js:326-337`). It is centered on the preview's
 /// top-right corner (`:203-218`) and asks the window to close (`_deleteAll`),

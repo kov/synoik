@@ -3297,7 +3297,9 @@ impl State {
         // Hovering a window preview in the overview's picker grows it and raises it
         // above its neighbours (`showOverlay`, `windowPreview.js:310-352`). The
         // hit is the picker slot the click would activate, so what grows is always
-        // what a click would pick.
+        // what a click would pick — falling back to the preview whose overlay the
+        // pointer is on, which is what keeps the close button from fading out from
+        // under a pointer that has left the slot to reach its overhanging half.
         let hovered = self
             .niri
             .layout
@@ -3305,8 +3307,11 @@ impl State {
             .then(|| {
                 let (output, p) = self.niri.output_under(pos)?;
                 let output = output.clone();
-                let (window, _) = self.niri.layout.window_under(&output, p)?;
-                Some(LayoutElement::id(window).clone())
+                match self.niri.layout.window_under(&output, p) {
+                    Some((window, _)) => Some(LayoutElement::id(window).clone()),
+                    // `preview_overlays` already yields the layout id.
+                    None => self.preview_hover_under(&output, p),
+                }
             })
             .flatten();
         if self.niri.layout.set_expose_hover(hovered.as_ref()) {
@@ -5075,6 +5080,25 @@ impl State {
         }
 
         None
+    }
+
+    /// The window whose preview is *still* hovered at `pos` even though the picker slot
+    /// under the pointer is not it — the pointer being on the part of its close button that
+    /// overhangs the slot, or within [`window_preview::hover_rect`]'s slop of it.
+    ///
+    /// Only previews already showing an overlay are considered, so this can only ever *hold*
+    /// a hover the slot hit test started; it never steals one from a neighbour, and it cannot
+    /// arm a hover from outside (where the button is not drawn and so cannot be aimed at).
+    fn preview_hover_under(
+        &self,
+        output: &Output,
+        pos: Point<f64, Logical>,
+    ) -> Option<smithay::desktop::Window> {
+        let mon = self.niri.layout.monitor_for_output(output)?;
+        mon.preview_overlays()
+            .into_iter()
+            .find(|(_, preview, _)| window_preview::hover_rect(*preview).contains(pos))
+            .map(|(window, _, _)| window)
     }
 
     /// The window whose picker close button is at `pos`, if any. Only a preview

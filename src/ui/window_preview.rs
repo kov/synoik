@@ -62,6 +62,28 @@ pub fn close_rect(preview: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
     )
 }
 
+/// How far outside its slot a preview still counts as hovered, logical px.
+///
+/// **Divergence.** gnome-shell needs no such slop: its overlay actors are *children* of the
+/// preview, so a pointer on the half of the close button that overhangs the preview is still
+/// inside the preview's own reactive box. Ours are separate rects hit-tested against the slot,
+/// so without this the pointer leaving the slot drops the hover — and the fade takes the
+/// button away from under the pointer that was aiming at it.
+const HOVER_SLOP: f64 = 8.;
+
+/// The region that counts as "on" this preview for hover purposes: its slot plus a little
+/// slop, and — whatever the slop — the whole of [`close_rect`], so the button can never fade
+/// out from under a pointer that is on it.
+pub fn hover_rect(preview: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    let grown = Rectangle::new(
+        preview.loc - Point::from((HOVER_SLOP, HOVER_SLOP)),
+        preview.size + Size::from((HOVER_SLOP * 2., HOVER_SLOP * 2.)),
+    );
+    // `Rectangle::merge` is the bounding box of the two, which is what we want: the button
+    // sits on a corner, so the union is the slot grown to swallow it.
+    grown.merge(close_rect(preview))
+}
+
 /// One preview's overlay, as the renderer needs it: where the preview draws, how
 /// far its overlay has faded in, and whether the pointer is on the button itself.
 #[derive(Debug, Clone, Copy)]
