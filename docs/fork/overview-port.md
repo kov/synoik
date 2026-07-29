@@ -1455,14 +1455,28 @@ treating the shadow as a thing sized *near* its caster rather than *by* it:
   change reaches the config and not just the bake, which is also what lets the accent color
   change under us.
 
-**Not a bug: a row that fits does not follow the selection.** Reported alongside as "the
-centering does not happen" after a scale change. Measured on the live compositor at 1024×665: the
-band is 302+420 and the active thumbnail 439..585, centered on 512 — the centering is exact. What
-changes with scale is *when it engages*: a smaller canvas gives a smaller band but proportionally
-smaller thumbnails, and with few workspaces the row fits, so it is centered as a whole and stays
-put (§12.4). Two workspaces at 1024×665 need 308 of a 420 band. That is deliberate — a
-two-workspace strip sliding on every switch would be worse — but it is the thing to re-check
-before believing a centering report.
+**The active workspace is centered even when the whole row fits** (fixed 2026-07-29). Reported
+twice as "the centering does not happen"; the first diagnosis — that a scale change was the
+trigger — was **wrong**, and the second report narrowed it correctly: adding a workspace to a
+short row. The cause was an exception this port invented, not gnome-shell's: a row that *fit* its
+band was centered as a whole and stayed put, on the reasoning that a two-workspace strip sliding
+on every switch would be worse. That leaves the active workspace off center by up to half the
+row, and on a big canvas it is glaring — four workspaces on Gustavo's 3072×1728 give a run of
+1880 in a band of 2320, so the row fits and the active one sits **714px left of the middle**
+(computed `x0 = 596`, which matched the screenshot's leftmost thumbnail exactly).
+
+`center_on_focus` now pins the focus to the band's center unconditionally, which is what was
+asked for in the first place ("the selected workspace stick to the center of the strip"). Two
+consequences to know about, both inherent:
+- A short strip **slides on every switch**, and clicking a non-active thumbnail slides it out from
+  under the pointer — so a second click on the same spot hits a different workspace. The corpus
+  test re-aims between the two clicks, and that is a real interaction note, not just a test detail.
+- Workspaces that *would* have fit can now scroll past the band edge, because the row is anchored
+  to the active one rather than packed. With four workspaces on that canvas, the fourth is fully
+  outside the band while the active one is first.
+
+`scroll_to_follow` — the app-grid row — keeps gnome-shell's centering for a run that fits; only
+the strip diverges.
 
 **Trap worth keeping.** The band clip from §12.2 is a *horizontal* concern — it exists to keep the
 row out of the floating entry's column. Clipping the shadow to the band as well cut the glow flat

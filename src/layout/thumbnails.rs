@@ -64,10 +64,9 @@ pub struct Strip {
 /// Ours are the size of the app-grid row's workspaces, whatever the count, and the row
 /// scrolls.
 ///
-/// A row that fits is centered in the band, as gnome-shell's is, and stays put. One that
-/// does not **pins `focus` to the band's center** — the fractional active-workspace index,
-/// so it tracks a workspace switch as it animates — all the way to either end
-/// ([`crate::layout::monitor::center_on_focus`]). Keeping the active thumbnail in the
+/// The row **pins `focus` to the band's center** — whether or not the whole row would fit — the
+/// fractional active-workspace index, so it tracks a workspace switch as it animates — all the way
+/// to either end ([`crate::layout::monitor::center_on_focus`]). Keeping the active thumbnail in the
 /// middle is what makes the overflowing side end on a workspace *poking in* at the band
 /// edge, which is the strip's "there is more this way" affordance.
 pub fn strip_geometry(
@@ -83,8 +82,6 @@ pub fn strip_geometry(
     let thumb_w = (thumb_h * (view_size.w / view_size.h)).round();
     let thumb = Size::from((thumb_w, thumb_h));
 
-    let extra = placeholder.map_or(0., |_| PLACEHOLDER_WIDTH + spacing);
-    let total_w = thumb_w * n as f64 + spacing * (n - 1) as f64 + extra;
     let y = band.loc.y.round();
 
     // Laid out from the row's own origin first, so the scroll can be computed from
@@ -115,9 +112,8 @@ pub fn strip_geometry(
     let t = idx.fract();
     let focus_x = thumbs[lo].loc.x + (thumbs[hi].loc.x - thumbs[lo].loc.x) * t;
 
-    let x0 = (band.loc.x
-        + super::monitor::center_on_focus(band.size.w, total_w, focus_x + thumb_w / 2.))
-    .round();
+    let x0 =
+        (band.loc.x + super::monitor::center_on_focus(band.size.w, focus_x + thumb_w / 2.)).round();
     for rect in &mut thumbs {
         rect.loc.x += x0;
     }
@@ -243,8 +239,8 @@ mod tests {
     fn three_thumbnails_at_the_app_grid_size() {
         let strip = strip(3, None);
         assert_eq!(strip.scale, THUMB_H / 1080.);
-        // Centered in the band, which is itself centered in the view.
-        let expected_x0 = (BAND_X + (AVAIL_W - (THUMB_W * 3. + SPACING * 2.)) / 2.).round();
+        // The *active* workspace is centered in the band, not the run: workspace 0 here.
+        let expected_x0 = (BAND_X + AVAIL_W / 2. - THUMB_W / 2.).round();
         assert_eq!(
             strip.thumbs[0],
             Rectangle::new(
@@ -257,9 +253,9 @@ mod tests {
             strip.thumbs[2].loc.x,
             expected_x0 + (THUMB_W + SPACING) * 2.
         );
-        // Still centered on the *view*, because the entry's zone is reserved at both edges.
-        let right_gap = 1920. - (expected_x0 + THUMB_W * 3. + SPACING * 2.);
-        assert!((strip.bounds().loc.x - right_gap).abs() <= 1.);
+        // And the band it is centered in is itself centered on the view, because the
+        // entry's zone is reserved at both edges.
+        assert!(((BAND_X + AVAIL_W / 2.) - 1920. / 2.).abs() <= 1.);
     }
 
     /// The row scrolls to follow the active workspace instead of shrinking to fit
@@ -406,13 +402,10 @@ mod tests {
             strip.thumbs[1].loc.x,
             rect.loc.x + PLACEHOLDER_WIDTH + SPACING
         );
-        // The row stays centered: it grew by the placeholder plus one gap.
-        assert!(
-            (strip.thumbs[0].loc.x
-                - (at_rest.thumbs[0].loc.x - (PLACEHOLDER_WIDTH + SPACING) / 2.))
-                .abs()
-                <= 1.
-        );
+        // The active workspace does not move: it is pinned to the band's center, and the
+        // placeholder opens up after it. (Re-centering the whole row instead would slide
+        // the workspace you are on out from under the pointer mid-drag.)
+        assert_eq!(strip.thumbs[0].loc.x, at_rest.thumbs[0].loc.x);
 
         // A pointer over the placeholder still maps to the same insertion
         // point, so the hover is stable.

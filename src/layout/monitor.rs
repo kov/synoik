@@ -3560,34 +3560,34 @@ fn fit_single_row(view_w: f64, ws_w: f64, gap: f64, render_idx: f64) -> (f64, f6
 /// ([`fit_all_row`]) and the thumbnail strip
 /// ([`crate::layout::thumbnails::strip_geometry`]).
 pub(super) fn scroll_to_follow(span: f64, run: f64, focus: f64) -> f64 {
-    let x = center_on_focus(span, run, focus);
     if run <= span {
-        // Centered, and there is nothing to clamp against — `span - run` is the *upper*
-        // bound here, so clamping would be inverted.
-        return x;
-    }
-    x.clamp(span - run, 0.)
-}
-
-/// [`scroll_to_follow`] without the end clamp: an overflowing row keeps the focused item
-/// on the viewport's center all the way to either end, so the ends have dead space rather
-/// than sitting flush.
-///
-/// This is what the thumbnail strip does, and it is the picker's own fit-single behaviour
-/// ([`fit_single_row`]). It buys the strip its "there is more this way" affordance for
-/// free: with the active thumbnail pinned to the middle, the overflowing side almost
-/// always has a workspace *poking in* at the band edge rather than ending on a whole one.
-/// Dead space at an end reads, correctly, as "nothing further this way".
-///
-/// The app-grid row keeps the clamp instead: it spans the whole screen, so an unclamped
-/// end would leave most of a screen width empty beside the last workspace.
-pub(super) fn center_on_focus(span: f64, run: f64, focus: f64) -> f64 {
-    if run <= span {
-        // A row that fits is centered as a whole and stays put — which is gnome-shell's
-        // centering exactly, and keeps a two- or three-workspace strip from sliding
-        // about on every switch.
+        // gnome-shell's centering: `Math.max((availableWidth - workspaceWidth * n) / 2, 0)`.
+        // There is also nothing to clamp against here — `span - run` is the *upper* bound,
+        // so the clamp below would be inverted.
         return (span - run) / 2.;
     }
+    center_on_focus(span, focus).clamp(span - run, 0.)
+}
+
+/// The offset that puts `focus` (a distance from the row's start) on the viewport's center,
+/// whatever the row's length: the focused item sticks to the middle, and the ends carry dead
+/// space rather than being pulled flush.
+///
+/// This is what the thumbnail strip does, and it is the picker's own fit-single behaviour
+/// ([`fit_single_row`]). It buys the strip its "there is more this way" affordance for free:
+/// with the active thumbnail pinned to the middle, an overflowing side almost always has a
+/// workspace *poking in* at the band edge rather than ending on a whole one, and dead space
+/// at an end reads, correctly, as "nothing further this way".
+///
+/// **It applies even when the whole row fits.** Centering a short row *as a whole* instead —
+/// which is what gnome-shell does, and what [`scroll_to_follow`] keeps — leaves the active
+/// workspace off center by up to half the row, which is very visible: four workspaces on a
+/// 3072-wide canvas fit their band comfortably and put the active one 714px left of the
+/// middle. The cost is that a two- or three-workspace strip now slides on every switch.
+///
+/// The app-grid row uses [`scroll_to_follow`] instead: it spans the whole screen, so an
+/// unclamped end would leave most of a screen width empty beside the last workspace.
+pub(super) fn center_on_focus(span: f64, focus: f64) -> f64 {
     span / 2. - focus
 }
 

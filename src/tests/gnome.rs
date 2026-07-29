@@ -3627,7 +3627,11 @@ fn thumbnail_click_switches_workspace_and_stays() {
     let active = f.niri().layout.active_workspace().unwrap().id();
     assert_ne!(active, ws1_id, "clicking a thumbnail must switch to it");
 
-    // Click it again (now active): leave the overview.
+    // Click it again (now active): leave the overview. The pointer has to be re-aimed —
+    // the row keeps the active workspace on the band's center, so switching to a
+    // thumbnail slides it out from under wherever it was clicked.
+    let (x, y) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, x, y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.niri_complete_animations();
