@@ -1284,16 +1284,19 @@ Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
   of gnome-shell's window-onto-thumbnail drop, which is kept — the two are told apart by what
   the press landed on. `ThumbGrab` (`src/input/thumb_grab.rs`) recognizes like `MoveGrab`: under
   8px the release is the plain click that activates the workspace.
-* **Picker slots keeping clear of the workspace edges.** ⏳ NOT started. From Gustavo's live
-  validation: a window's bottom sits very close to the workspace bottom, so the two edges read
-  as touching. GNOME's equivalent takes the work area **minus the container's theme-node
-  padding** (`workspace.js:573-581` `_getAdjustedWorkarea`) and caps a preview at
-  `WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95` (`workspace.js:18`), while `.window-picker` itself
-  carries only `spacing: $base_padding` (`_window-picker.scss:5-8`) — so check whether we are
-  missing the work-area inset or the 0.95 cap before inventing a padding constant, and whatever
-  lands must ride the chrome ramp.
+* **Picker slots keeping clear of the workspace edges.** ✅ `82c5c4c4`. Neither suspect was
+  missing — we already inset by the work area and already apply
+  `WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95` (`workspace.js:18`). What made the bottom tight is that
+  gnome-shell lays out over the raw work area (`_getAdjustedWorkarea`, `:573-581`) while the
+  background the previews sit on is the whole monitor, so the top panel's strut is clearance
+  the top edge gets and the bottom does not: 40px at the sides, 51 above, **22 below**.
+  `Workspace::expose_area` now symmetrizes the working area about the view — each axis inset by
+  the *larger* of its two struts, which is still a subset of the working area (so a bottom dock
+  is respected, just matched at the top) and costs the preview no size, because the cap still
+  binds and the slot only moves. **A padding constant would have been a no-op**: it has to
+  exceed the slack under that cap (~26px at 1920×1080) before it moves anything at all.
 
-### 12.1 Preview close button is unforgiving to hit (reported 2026-07-28, NOT started)
+### 12.1 Preview close button is unforgiving to hit ✅ `00cd6ff6`
 
 Gustavo, from live use: the close button on a hovered picker preview can only be clicked on the
 part of it that overlaps the window. The button *overhangs* its preview
@@ -1301,10 +1304,24 @@ part of it that overlaps the window. The button *overhangs* its preview
 onto the overhanging part leaves the preview's own hover region — so the preview de-emphasizes
 and the button fades out from under the pointer.
 
-The bug is therefore in what counts as "still hovering this preview", not in the button's hit
-rect: the hover test must include the close button's overhang (gnome-shell gets this for free
-because the button is a *child actor* of the preview, so it is inside the preview's own reactive
-box). Look at whatever computes the preview hover in `src/input/mod.rs` alongside
-`preview_close_under`, and union the close rect into it. Pin it with a corpus test that hovers a
-preview, moves onto the overhanging half of the close button, and asserts the preview is still
-hovered and the click lands.
+The bug was in what counts as "still hovering this preview", not in the button's hit rect —
+gnome-shell gets it for free because the button is a *child actor* of the preview and so is
+inside its own reactive box. The slot hit test now falls back to `preview_hover_under`, which
+takes the preview whose `window_preview::hover_rect` holds the pointer: the slot plus a little
+slop and, whatever the slop, the whole close rect. Only previews *already* showing an overlay
+count, so it can only hold a hover the slot started — it never steals one from a neighbour and
+cannot arm one from outside, where the button is not drawn to be aimed at.
+
+### 12.2 The app-grid state's workspace strip does not scale to fit (reported 2026-07-28, NOT started)
+
+Gustavo, from live use: the thumbnail strip auto-scales to fit as workspaces are added (it
+shrinks below `MAX_THUMBNAIL_SCALE` once the row no longer fits its band — `thumb_scale`,
+`src/layout/thumbnails.rs`), but the workspaces shown in the **app-grid** state do not, so with
+enough workspaces some become unreachable.
+
+That is the `SMALL_WORKSPACE_RATIO` strip — the picker box at `state::APP_GRID`
+(`_computeWorkspacesBoxForState`, `overviewControls.js:80-110`, ported in
+`ui/overview_layout.rs`) — which is laid out by the same workspace *row* code as the window
+picker, and that row scrolls rather than fitting. Decide whether it should fit-to-width like the
+strip does, or gain the scrolling affordance GNOME's does; either way what is on screen has to
+be reachable.
