@@ -130,6 +130,8 @@ binary A/B that closes this confound is §21.5 of `present-misses.md`.
 No warmup story: the warm-only run is *worse*, not better. The regression is a level shift across
 the whole draw/gpu range, largest at the heavy end.
 
+**RESOLVED same day — it is both; see the A/B section below and `present-misses.md` §21.6.**
+
 **Queue timing rules out a slow CPU-side guest, and no more.** Of the new VMM's misses,
 1263/1264 were queued an average of **15.13 ms EARLY**; post-0051 had the identical shape (49/50
 at 15.63 ms early), just ~25x less often. Lateness is the same shape on both arms: p50 16.7 ms,
@@ -138,3 +140,23 @@ the render fence signals, so an early queue does not prove the pixels were ready
 binary's scenes ARE heavier (heavy gpu p50 7.16 ms vs 5.53 ms). **Conclusion: OPEN, not
 attributed.** Host-side present regression and guest-side "new overview work × async scanout"
 both fit; the `b808c5bb` binary A/B on this boot (present-misses.md §21.5) decides it.
+
+## Binary A/B on the new VMM (boot a8a1fbce, 2026-07-29, 15:09-15:14)
+
+`b808c5bb` (the §19 arm's commit) rebuilt against smithay `e1c10415` (also pinned — the fork
+gained the rescale-rounding patch `83175a56` after the §19 arm), seat restarted onto it at
+15:07:12, VT verified active. Built via paired worktrees under `~/Projects/ab-b808/` with
+`CARGO_TARGET_DIR` pointed at the main repo so the binary landed at the seat's `ExecStart`
+path; the `d4c7a61d` binary saved as `target/debug/niri.d4c7a61d`.
+
+| when | what |
+|---|---|
+| 15:08:56-15:09:16 | populate: 8 kitty windows across ws1/ws2 |
+| 15:09:16-15:11:43 | `drive-workload.sh 1002 1 heavy` run 1 (cold) |
+| 15:11:48-15:14:15 | heavy run 2 (warm) |
+
+Result (heavy): overall 4.08%, draws 200+ 6.98%, gpu 6-12 ms 4.24%; warm run *decays* to 3.24%
+(the new binary's warm run got *worse*, 21.42%). Misses still queued ~15.5 ms early (657/659),
+presented 1-2 vblanks late. **Verdict: both effects are real — VMM ~4-6x with the binary held,
+our new overview work ~2.5x on top with the VMM held, and the warm-up anomaly is entirely
+ours.** Full decomposition in `present-misses.md` §21.6.

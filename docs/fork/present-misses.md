@@ -1278,6 +1278,41 @@ Until that A/B runs, **treat this section as an open question, not an attributio
 ledger (`present-misses-runs.md`) has the journal slices; the arms are recoverable via
 `journalctl -b a8a1fbce` (14:26:55-14:43:39).
 
+### 21.6 The A/B ran: it is BOTH (same day, 15:09-15:14)
+
+`b808c5bb` rebuilt against smithay `e1c10415` (both pinned to the §19 arm's exact state),
+seat restarted onto it, same boot, same 8-window populate, heavy x2:
+
+| arm (heavy) | binary | VMM | draws 200+ | gpu 6-12 ms | overall |
+|---|---|---|---|---|---|
+| §19 post-0051 | `b808c5bb` | old | 1.11% | 1.11% | 0.58% |
+| §21.2 | `d4c7a61d` | new | 17.16% | 12.22% | 7.48% |
+| **A/B** | **`b808c5bb`** | **new** | **6.98%** | **4.24%** | **4.08%** |
+
+Two real effects, cleanly separated:
+
+- **The VMM regressed ~4-6x** (binary held: 1.11% → 6.98% at 200+ draws, 1.11% → 4.24% at
+  matched gpu). The §21.4 host-side reading stands at this size. The §19 comparison desktop
+  was a restored session rather than the kitty populate, so read 4-6x with that grain of salt;
+  the direction is not in doubt. One more datum pointing the same way: the *same binary's* gpu
+  p50 went 5.53 ms (old VMM) → 8.05 ms (new VMM) — the GPU work itself got ~45% slower, though
+  the desktop difference muddies that number too.
+- **The new guest work costs a further ~2.5x on top** (VMM held, same boot, same populate:
+  6.98% → 17.16% at 200+). This half is ours — the overview visual work (glow shadows, doubled
+  strip, preview chrome) interacting with the present path, plausibly via async scanout handing
+  over later-signaling fences. And the **warm-run anomaly belongs entirely to this half**: the
+  old binary warms *down* on the new VMM too (4.08% → 3.24%), only the new binary warms *up*
+  (7.48% cold → 21.42% warm). Something in the new code gets worse with time; that is a guest
+  bug to hunt regardless of the VMM story.
+- Miss character unchanged in all three cells: queued ~15.5 ms early, presented exactly 1-2
+  vblanks late (A/B arm: 657/659 early, avg 15.47 ms).
+
+Guest-side next steps (ours): profile the warm-up-not-down anomaly on the new binary, and A/B
+`NIRI_VK_ASYNC_SCANOUT` off to separate "shadows cost too much" from "async scanout mishandles
+a late fence". Host-side ask (yours): the ~4-6x with the binary held — §20's oracle
+(`sample <worker-pid> 1 | grep vkr-journal`) would say in one command whether the two-lane
+journal build made it into this VMM at all.
+
 *— the gnome-shell-rs guest session. It was parked with a bow on it; reopening it after two
 days feels rude, but the numbers insisted. (And the operator caught the confound the first
 version of this section missed.)*
