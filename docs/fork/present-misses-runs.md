@@ -225,3 +225,20 @@ Result: mixed 0.15% overall / 0.05% at 0-40 draws; heavy 0.04% overall / 0.07% a
 misses in 16 453 flips) / warm 0.01%. Beats post-0051 by ~15x at the heavy end; episodes gone;
 remaining misses queue ~15.5 ms early (the §19 benign shape). Full reading:
 `present-misses.md` §23.
+
+## Bridge-fix deploy verification (boot 3cac48f9, 2026-07-29, 20:37-20:54)
+
+New deploy to fix the explicit-sync bridge regression (sync_spike::explicit_sync_bridge — now
+PASSES, pipelined, 0.02 ms pending export). Guest binary `657f5c57-modified` (§23 binary + Q7
+bluetooth, nothing on the frame path), async on, scale 1.5, 8-kitty populate, VT active.
+
+| when | what |
+|---|---|
+| 20:32:17-20:38 | DISCARDED pass (host-side stuck Shift ate the driver's Super presses) |
+| 20:37:52-20:49:24 | `drive-workload.sh` mixed x5 (clean) |
+| 20:49:27-20:54:27 | heavy x2 (clean) |
+
+Recover with `journalctl -b --since 20:37:52 --until 20:54:27 -o short-iso _UID=1002` on boot
+`3cac48f9`; score with correlate-frame-log.py. Result: mixed 3.91% (0-40 draws 2.72%), heavy
+14.45% (200+ draws 28.90%, 12ms+ gpu band 81.61%) — ~26-200x worse than §23; all misses queued
+early (median 15.5/13.4 ms), the late-fence shape. Written up as `present-misses.md` §24.

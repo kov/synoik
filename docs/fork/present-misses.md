@@ -1461,3 +1461,43 @@ stationarity hold — and §21.5's caution (the miss metric is not a smoothness 
 the bug that taught it.
 
 *— the gnome-shell-rs guest session.*
+
+## 24. The bridge-fix deploy: explicit-sync bridge FIXED, present path regressed again (2026-07-29 evening, guest session)
+
+Context: after §23, the guest's `niri-vk sync_spike::explicit_sync_bridge` test started failing
+on that same clean deploy — the fence→sync_file bridge classified as NOT pipelined
+(semaphore→sync_file export *blocking* ~240 ms, "detached-driver"). The operator identified
+another WIP-deploy mishap and rebooted into a fix. This section is the guest's verification
+pass on that new boot (`3cac48f9`, ~20:30).
+
+**The bridge is fixed.** `explicit_sync_bridge` passes: fence→sync_file export 0.02 ms with the
+fence pending, downstream wait blocks the full calibrated busy-work (265 ms of 274 ms) —
+verdict PIPELINED. Operator also reports no visible tearing on the seat.
+
+**But the present path regressed back to debug-build territory.** Standard pass (binary
+`v26.04-792-g657f5c57-modified` = §23's plus two doc commits and the Q7 bluetooth QS work —
+nothing on the frame path; async scanout on, scale 1.5, 8-kitty populate, VT active, mixed x5
+20:37:52-20:49:24 + heavy x2 20:49:27-20:54:27; an earlier contaminated pass 20:32-20:38 was
+discarded — a stuck host-side Shift was eating the driver's Super presses):
+
+| slice | §23 clean deploy | this deploy |
+|---|---|---|
+| mixed, all | 0.15% | **3.91%** (1127/28858) |
+| mixed, draws 0-40 | 0.05% | **2.72%** |
+| heavy, all | 0.04% | **14.45%** (1597/11051) |
+| heavy, draws 200+ | 0.07% | **28.90%** |
+| heavy, gpu p50 12ms+ | — | **81.61%** (3 windows) |
+
+Same shape as the §21 debug build: every single miss (1144 mixed + 2109 heavy) was queued
+EARLY, median 15.5 / 13.4 ms — the CPU handed KMS the flip with most of the refresh interval to
+spare and the render fence still signaled past the deadline. The guest side is not the
+variable: same scale, same env, and the only guest code delta since §23 is a QS tile that never
+renders on this VM. Non-monotonic bands (heavy 6-12 ms gpu at 3.8% vs 4-6 ms at 24.8%) say the
+misses cluster in time rather than tracking frame cost — the episode signature again.
+
+**Ask for the VMM side:** it looks like the bridge fix shipped with (or on top of) something
+that re-slowed fence delivery — plausibly the same class of debug/WIP payload as §21/§23.
+Worth checking what else this deploy carries relative to the §23 one. Guest is happy to re-run
+the pass on the next build; it takes ~17 minutes end to end.
+
+*— the gnome-shell-rs guest session.*
