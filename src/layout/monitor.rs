@@ -77,6 +77,10 @@ const REFERENCE_PREVIEW_H: f64 = 520.;
 /// …and never below this, so a corner stays a corner (the interactive-floor rule).
 const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 
+/// The thumbnail height the strip's shadow constants were chosen at: the app-grid row's
+/// workspace on the 1920×1080 reference canvas with a 35px panel.
+const REFERENCE_THUMB_H: f64 = 157.;
+
 /// How far past its band a thumbnail's shadow is allowed to reach, so the active
 /// workspace's accent glow is not cut flat at the thumbnail's top and bottom edges.
 /// Comfortably more than the glow's own extent (softness + spread).
@@ -134,6 +138,9 @@ pub struct Monitor<W: LayoutElement> {
     /// The drop shadow under a thumbnail on the overview strip — the app-grid row's
     /// workspace shadow, at the thumbnail's size.
     thumb_shadow: Shadow,
+    /// The system accent color, kept so the strip's shadows can be rebuilt whenever the
+    /// thumbnail size changes (their geometry is derived from it).
+    accent_color: [u8; 3],
     /// The **active** thumbnail's shadow: the same shadow in the system accent color and
     /// turned up, which is what marks the active workspace on the strip.
     ///
@@ -479,10 +486,12 @@ impl<W: LayoutElement> Monitor<W> {
             previous_workspace_id: None,
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
-            thumb_shadow: Shadow::new(thumbnail_shadow_config(None)),
-            thumb_active_shadow: Shadow::new(thumbnail_shadow_config(Some(
-                crate::gnome::ACCENT_BLUE,
-            ))),
+            accent_color: crate::gnome::ACCENT_BLUE,
+            thumb_shadow: Shadow::new(thumbnail_shadow_config(None, REFERENCE_THUMB_H)),
+            thumb_active_shadow: Shadow::new(thumbnail_shadow_config(
+                Some(crate::gnome::ACCENT_BLUE),
+                REFERENCE_THUMB_H,
+            )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
             insert_hint_render_loc: None,
@@ -1297,14 +1306,23 @@ impl<W: LayoutElement> Monitor<W> {
             let scale = self.scale.fractional_scale();
             let radius = CornerRadius::from(self.thumbnail_corner_radius() as f32);
 
-            // Two shadows cover the strip: one under an inactive thumbnail and the accent
-            // one under the active thumbnail, which is drawn unshrunk. Only the two
-            // workspaces involved in a switch are ever at an in-between size, and a soft
-            // blur a couple of pixels wider than its caster is not a visible difference.
+            // Both shadows are baked at the *slot* size, once. `render_thumbnails` then puts
+            // each one through the very transform that draws the miniature it sits under, so
+            // it tracks that thumbnail's drawn size exactly instead of approximating it.
+            // Baking a second, pre-shrunk copy meant the shadow was a fixed 6% off its caster
+            // for the whole of a workspace switch and the whole of the overview's opening
+            // ramp, which is visible — worst right after a scale change, where the stale bake
+            // was a different size entirely and the glow visibly closed in on the thumbnail.
+            // Rebuilt from the current thumbnail height every frame: the shadow's geometry
+            // is derived from it (rule 2), so a scale change has to reach the config as well
+            // as the bake, and the accent color can change under us at any time.
             let full = strip.thumbs[0].size;
-            let shrunk = full.downscale(1. / WORKSPACE_INACTIVE_SCALE);
             self.thumb_shadow
-                .update_render_elements(shrunk, true, radius, scale, 1.);
+                .update_config(thumbnail_shadow_config(None, full.h));
+            self.thumb_active_shadow
+                .update_config(thumbnail_shadow_config(Some(self.accent_color), full.h));
+            self.thumb_shadow
+                .update_render_elements(full, true, radius, scale, 1.);
             self.thumb_active_shadow
                 .update_render_elements(full, true, radius, scale, 1.);
 
@@ -2291,8 +2309,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// Recolors the accent-colored overview chrome (`org.gnome.desktop.interface
     /// accent-color`).
     pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
-        self.thumb_active_shadow
-            .update_config(thumbnail_shadow_config(Some(accent)));
+        self.accent_color = accent;
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -2737,11 +2754,10 @@ impl<W: LayoutElement> Monitor<W> {
         // band's height plus their own reach. It slides with the band, so the strip's
         // entrance still clips correctly.
         let glow_margin = SHADOW_GLOW_MARGIN * overview_layout::chrome_ramp(self.view_size);
-        let glow_bounds = Rectangle::new(
+        let glow_bounds_logical = Rectangle::new(
             band.loc - Point::from((0., glow_margin)),
             band.size + Size::from((0., glow_margin * 2.)),
-        )
-        .to_physical_precise_round(scale);
+        );
         // Each ring is in view coordinates already, so it clips against the band directly.
         let mut push_ring = |elem| {
             if let Some(elem) = CropRenderElement::from_element(elem, scale, band_physical) {
@@ -2877,14 +2893,27 @@ impl<W: LayoutElement> Monitor<W> {
             } else {
                 &self.thumb_shadow
             };
-            shadow.render(thumb.loc, &mut |elem| {
+            // Drawn through the miniature's own transform — baked at the slot size, scaled
+            // by this thumbnail's shrink and relocated onto it — so the shadow cannot drift
+            // from its caster mid-animation. The crop therefore has to be expressed in the
+            // same pre-transform space, like the contents' one above.
+            let glow_crop = Rectangle::new(
+                Point::from((
+                    (glow_bounds_logical.loc.x - thumb.loc.x) / shrink,
+                    (glow_bounds_logical.loc.y - thumb.loc.y) / shrink,
+                )),
+                glow_bounds_logical.size.downscale(shrink),
+            )
+            .to_physical_precise_round(scale);
+            shadow.render(Point::default(), &mut |elem| {
                 let elem = elem.with_alpha(progress.clamp(0., 1.) as f32);
-                if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_bounds) {
+                if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_crop) {
                     let elem = MonitorInnerRenderElement::CroppedShadow(elem);
-                    let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                    let elem =
+                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), shrink);
                     let elem = RelocateRenderElement::from_element(
                         elem,
-                        Point::default(),
+                        thumb_loc_physical,
                         Relocate::Relative,
                     );
                     push(elem);
@@ -3608,7 +3637,13 @@ fn thumbnail_placeholder_config() -> niri_config::FocusRing {
 /// a 157px miniature would be a smudge. The active one is the same geometry spread wider
 /// and at full alpha in the accent color, so the cue is a glow around the workspace rather
 /// than gnome-shell's border ring.
-fn thumbnail_shadow_config(accent: Option<[u8; 3]>) -> niri_config::Shadow {
+fn thumbnail_shadow_config(accent: Option<[u8; 3]>, thumb_h: f64) -> niri_config::Shadow {
+    // **Adaptive chrome, rule 2 — derived from the widget's own box.** The workspace shadow
+    // normalizes to the view height for the same reason (`compute_workspace_shadow_config`).
+    // Left as a fixed logical constant it was a 14px blur under a 157px thumbnail at scale 1
+    // and the same 14px under a 95px one at scale 2 — a halo half again as deep for its
+    // caster, which is most of why the glow read as sitting too far out on a scaled canvas.
+    let norm = thumb_h / REFERENCE_THUMB_H;
     // Identical geometry and alpha either way: the accent one is the *same* shadow, only
     // colored. Turning it up as well read as too much.
     let color = match accent {
@@ -3619,10 +3654,10 @@ fn thumbnail_shadow_config(accent: Option<[u8; 3]>) -> niri_config::Shadow {
         on: true,
         offset: niri_config::ShadowOffset {
             x: niri_config::FloatOrInt(0.),
-            y: niri_config::FloatOrInt(3.),
+            y: niri_config::FloatOrInt(3. * norm),
         },
-        softness: 14.,
-        spread: 3.,
+        softness: 14. * norm,
+        spread: 3. * norm,
         draw_behind_window: false,
         color,
         inactive_color: None,

@@ -1437,6 +1437,33 @@ slide about on every switch. **The tradeoff to keep in mind:** at the first or l
 roughly half the band is empty. That is what "nothing further this way" looks like, and it is
 the price of never ending on a whole thumbnail.
 
+**The shadow goes through the miniature's own transform** (fixed 2026-07-29, reported live: "the
+drop shadow seems to animate slightly out of step with the workspace … can clearly see the accent
+glow starting far out and then animating to be hugging the thumb"). Two defects, both from
+treating the shadow as a thing sized *near* its caster rather than *by* it:
+
+- It was baked at two sizes, full and pre-shrunk by `WORKSPACE_INACTIVE_SCALE`, and each
+  thumbnail picked one. But the shrink is *ramped in with the overview progress* and is
+  fractional for both workspaces in a switch, so the shadow was a fixed few percent off its
+  caster for the whole of every animation — and after a scale change the stale bake was a
+  different size entirely, which is the glow visibly closing in. Now one bake at the slot size,
+  put through the same rescale+relocate that draws the miniature, so it cannot drift by
+  construction. (Its crop moves into the same pre-transform space as the contents' crop.)
+- Its geometry was a fixed logical constant: a 14px blur under a 157px thumbnail at scale 1 and
+  the same 14px under a 95px one at scale 2 — half again as deep for its caster. Now derived
+  from the thumbnail's own height (**adaptive chrome, rule 2**), rebuilt each frame so a scale
+  change reaches the config and not just the bake, which is also what lets the accent color
+  change under us.
+
+**Not a bug: a row that fits does not follow the selection.** Reported alongside as "the
+centering does not happen" after a scale change. Measured on the live compositor at 1024×665: the
+band is 302+420 and the active thumbnail 439..585, centered on 512 — the centering is exact. What
+changes with scale is *when it engages*: a smaller canvas gives a smaller band but proportionally
+smaller thumbnails, and with few workspaces the row fits, so it is centered as a whole and stays
+put (§12.4). Two workspaces at 1024×665 need 308 of a 420 band. That is deliberate — a
+two-workspace strip sliding on every switch would be worse — but it is the thing to re-check
+before believing a centering report.
+
 **Trap worth keeping.** The band clip from §12.2 is a *horizontal* concern — it exists to keep the
 row out of the floating entry's column. Clipping the shadow to the band as well cut the glow flat
 along the thumbnail's top and bottom edges, so the active workspace read as two accent side
