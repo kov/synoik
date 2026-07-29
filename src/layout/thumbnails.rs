@@ -35,6 +35,14 @@ pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 /// `.placeholder`).
 pub const PLACEHOLDER_WIDTH: f64 = 18.;
 
+/// How far inside its band the row is allowed to come to rest.
+///
+/// The scroll clamps the row against this inset rather than against the band itself, so the
+/// first and last workspaces keep room for their shadow — the active one's accent glow was
+/// cut off flat where the row sat flush against the band edge. Comfortably more than the
+/// glow's own reach. **Adaptive chrome, rule 1 — ramped.**
+pub const EDGE_INSET: f64 = 32.;
+
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {
@@ -115,8 +123,11 @@ pub fn strip_geometry(
     let t = idx.fract();
     let focus_x = thumbs[lo].loc.x + (thumbs[hi].loc.x - thumbs[lo].loc.x) * t;
 
+    let inset = (EDGE_INSET * crate::ui::overview_layout::chrome_ramp(view_size)).round();
+    let span = (band.size.w - inset * 2.).max(1.);
     let x0 = (band.loc.x
-        + super::monitor::scroll_to_follow(band.size.w, total_w, focus_x + thumb_w / 2.))
+        + inset
+        + super::monitor::scroll_to_follow(span, total_w, focus_x + thumb_w / 2.))
     .round();
     for rect in &mut thumbs {
         rect.loc.x += x0;
@@ -288,11 +299,13 @@ mod tests {
         }
 
         // The ends stay flush against the band — the clamp, not just the centering.
+        // Flush against the row's resting inset, not the band edge: the first and last
+        // workspaces keep room for their shadow (see `EDGE_INSET`).
         let first = strip_geometry(view(), band(), THUMB_H, n, None, 0.);
-        assert_eq!(first.thumbs[0].loc.x, BAND_X);
+        assert_eq!(first.thumbs[0].loc.x, BAND_X + EDGE_INSET);
         let last = strip_geometry(view(), band(), THUMB_H, n, None, (n - 1) as f64);
         let tail = last.thumbs[n - 1];
-        assert_eq!(tail.loc.x + tail.size.w, BAND_X + AVAIL_W);
+        assert_eq!(tail.loc.x + tail.size.w, BAND_X + AVAIL_W - EDGE_INSET);
 
         // A fractional focus scrolls smoothly between the two, so the row tracks a
         // workspace switch as it animates rather than jumping at the halfway point.
@@ -332,8 +345,11 @@ mod tests {
         assert_eq!(strip.thumb_under(pos), None);
         assert_eq!(strip.drop_target(pos), None);
 
-        // …while the one at the band's edge still is, on its visible part.
-        assert_eq!(strip.thumb_under(Point::from((BAND_X + 4., y))), Some(0));
+        // …while the one at the row's resting edge still is, on its visible part.
+        assert_eq!(
+            strip.thumb_under(Point::from((BAND_X + EDGE_INSET + 4., y))),
+            Some(0)
+        );
     }
 
     /// The strip fills the band it was allocated, so the allocator is the only
@@ -355,7 +371,7 @@ mod tests {
         // first workspace active it starts flush at the band's left edge.
         let total_w = THUMB_W * 3. + SPACING * 2.;
         assert!(total_w > 800.);
-        assert_eq!(strip.thumbs[0].loc.x, 40.);
+        assert_eq!(strip.thumbs[0].loc.x, 40. + EDGE_INSET);
     }
 
     #[test]

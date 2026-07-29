@@ -2828,7 +2828,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
     f.niri().advance_animations();
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (213., 734.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (230., 717.));
 
     // Back to one populated desktop: the emptied workspace is only reaped once the
     // switch settles, and the collapse ease arms on that frame.
@@ -2906,7 +2906,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
     // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (213., 734.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (230., 717.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a

@@ -15,12 +15,10 @@
 //! each owning widget publishes its own preferred height.
 //!
 //! Divergences from gnome-shell, deliberate:
-//! - gnome-shell measures the thumbnails against the *work area* porthole
-//!   (`workspaceThumbnail.js:1204-1219,1248-1255`); our workspace miniature is the whole view (it
-//!   includes the strip under the top panel), so [`crate::layout::thumbnails`] measures against the
-//!   view. At 1920×1080 that is 54px where gnome-shell has 52. gnome-shell additionally clamps that
-//!   measurement at `height × maxThumbnailScale` (`overviewControls.js:190-192`); ours is already
-//!   the cap by construction, so there is nothing left to clamp.
+//! - gnome-shell sizes the thumbnails from a `maxThumbnailScale` of the work-area porthole
+//!   (`workspaceThumbnail.js:1204-1219,1248-1255`, clamped again at `overviewControls.js:190-192`),
+//!   shrinking them further until the row fits. Ours are [`small_workspace_height`] — the app-grid
+//!   row's workspace, whatever the count — and the row scrolls instead.
 //! - gnome-shell lays out *secondary* monitors with `SecondaryMonitorDisplay`
 //!   (`workspacesView.js:589-720`) — thumbnails and padding only, no dash or search — so their
 //!   picker box, and now their zoom, differ from the primary's. We draw the full chrome on every
@@ -45,7 +43,12 @@ const VERTICAL_SPACING_RATIO: f64 = 0.02;
 const THUMBNAILS_SPACING_ADJUSTMENT_TOP: f64 = 0.6;
 /// `THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM` (`overviewControls.js:25`): and the
 /// rest of the spacing goes below them.
-const THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM: f64 = 0.4;
+///
+/// **Divergence (approved 2026-07-29).** gnome-shell's is `0.4`, splitting one spacing
+/// 60/40 around the strip. Ours is bigger: at the app-grid row's size the strip is a row of
+/// real workspaces rather than a thin ribbon, and 40% of a spacing left it crowding the
+/// picker below it.
+const THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM: f64 = 1.2;
 /// `SMALL_WORKSPACE_RATIO` (`overviewControls.js:21`): in the app-grid state the
 /// window picker shrinks to this fraction of the work-area height, a thin strip
 /// under the search entry, and the app grid fills the space below it.
@@ -110,9 +113,7 @@ fn search_entry_zone(view_size: Size<f64, Logical>, search_entry_width: f64) -> 
 
 /// The width the thumbnails strip has to fit its row into — the view minus the floating
 /// entry's zone **at both edges**, so a row that is centered on the screen can never run
-/// under the pill. Published because [`crate::layout::thumbnails::preferred_height`] has to
-/// answer against the same width that [`layout`] will hand the band, and its answer is one
-/// of that function's inputs.
+/// under the pill.
 pub fn thumbnails_available_width(view_size: Size<f64, Logical>, search_entry_width: f64) -> f64 {
     (view_size.w - search_entry_zone(view_size, search_entry_width) * 2.).max(1.)
 }
@@ -436,8 +437,8 @@ mod tests {
         // Bottom-anchored: 35 + 1045 − 112. Unchanged from the pre-allocator
         // hardcoded anchor (1080 − 12 − 100), which is the point.
         assert_eq!(l.dash, rect(0., 968., 1920., 112.));
-        // 48 + 108 + 8, and 1045 − 112 − 21 − 13 − 108 − 8.
-        assert_eq!(l.workspaces, rect(0., 164., 1920., 783.));
+        // 48 + 108 + 25, and 1045 − 112 − 21 − 13 − 108 − 25.
+        assert_eq!(l.workspaces, rect(0., 181., 1920., 766.));
         // 35 + 58 + 21, and 1045 − 58 − 21 − 112 − 21. Spans the thumbnails
         // and the picker both — gnome-shell cross-fades, it does not carve.
         assert_eq!(l.search_results, rect(0., 114., 1920., 833.));
@@ -466,9 +467,9 @@ mod tests {
         let l = layout_1080(0.5);
 
         assert_eq!(l.thumbnails.size.h, 54.);
-        // 48 + 54 + 4
-        assert_eq!(l.workspaces.loc.y, 106.);
-        assert_eq!(l.workspaces.size.h, 841.);
+        // 48 + 54 + round(21 × 1.2) × 0.5
+        assert_eq!(l.workspaces.loc.y, 114.5);
+        assert_eq!(l.workspaces.size.h, 832.5);
 
         let (lo, hi) = (layout_1080(0.), layout_1080(1.));
         assert_eq!(
@@ -540,7 +541,7 @@ mod tests {
         assert_eq!(l.thumbnails, rect(376., 52., 2560. - 752., 144.));
         assert_eq!(l.dash, rect(0., 1440. - 112., 2560., 112.));
         // 52 + 144 + 11, and 1405 − 112 − 28 − 17 − 144 − 11.
-        assert_eq!(l.workspaces, rect(0., 207., 2560., 1093.));
+        assert_eq!(l.workspaces, rect(0., 230., 2560., 1070.));
         assert_eq!(l.search_results, rect(0., 121., 2560., 1179.));
     }
 
@@ -563,7 +564,7 @@ mod tests {
         assert_eq!(l.search_entry.loc.y, 0.);
         assert_eq!(l.dash.loc.y, 1080. - 112.);
         // spacing = round(1080 × 0.02) = 22, top 13, bottom 9.
-        assert_eq!(l.workspaces, rect(0., 130., 1920., 816.));
+        assert_eq!(l.workspaces, rect(0., 147., 1920., 799.));
     }
 
     /// In the app-grid state the picker shrinks to the small top strip
@@ -587,7 +588,7 @@ mod tests {
         // Parked at box.y2 = start_y + work-area height = 35 + 1045.
         assert_eq!(l.app_display, rect(0., 1080., 1920., 655.));
         // The picker is exactly the pre-app-grid window-picker box.
-        assert_eq!(l.workspaces, rect(0., 164., 1920., 783.));
+        assert_eq!(l.workspaces, rect(0., 181., 1920., 766.));
     }
 
     /// A fractional state interpolates both the picker and the app grid between the

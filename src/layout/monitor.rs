@@ -3584,26 +3584,20 @@ fn thumbnail_placeholder_config() -> niri_config::FocusRing {
 /// and at full alpha in the accent color, so the cue is a glow around the workspace rather
 /// than gnome-shell's border ring.
 fn thumbnail_shadow_config(accent: Option<[u8; 3]>) -> niri_config::Shadow {
-    let (color, spread, softness) = match accent {
-        Some([r, g, b]) => (
-            niri_config::Color::from_rgba8_unpremul(r, g, b, 0xff),
-            6.,
-            18.,
-        ),
-        None => (
-            niri_config::Color::from_rgba8_unpremul(0, 0, 0, 0x50),
-            3.,
-            14.,
-        ),
+    // Identical geometry and alpha either way: the accent one is the *same* shadow, only
+    // colored. Turning it up as well read as too much.
+    let color = match accent {
+        Some([r, g, b]) => niri_config::Color::from_rgba8_unpremul(r, g, b, 0x50),
+        None => niri_config::Color::from_rgba8_unpremul(0, 0, 0, 0x50),
     };
     niri_config::Shadow {
         on: true,
         offset: niri_config::ShadowOffset {
             x: niri_config::FloatOrInt(0.),
-            y: niri_config::FloatOrInt(if accent.is_some() { 0. } else { 3. }),
+            y: niri_config::FloatOrInt(3.),
         },
-        softness,
-        spread,
+        softness: 14.,
+        spread: 3.,
         draw_behind_window: false,
         color,
         inactive_color: None,
