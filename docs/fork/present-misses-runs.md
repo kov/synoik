@@ -208,3 +208,20 @@ despite the higher miss rate. Confirmed in the cadence — overview phases, 5 s 
 fps 49.1 ± 9.4 (min 14), async off = 47.3 ± 3.5 (min 41). The miss metric counts late fences,
 not perceived smoothness; see the metric caution in `present-misses.md` §21.5 and the queued
 frame-pacing design item.
+
+## Clean deploy (boot 68fa5075, 2026-07-29, 16:47-17:04)
+
+The morning's VMM was a fumbled deploy carrying host debug instrumentation (operator's
+diagnosis); this is the clean one. Guest binary `2abfa499` (= §21 binary + §22 hardening),
+async on, scale 1.5, 8-kitty populate, VT active.
+
+| when | what |
+|---|---|
+| 16:47:16-16:58:48 | `drive-workload.sh` mixed x5 |
+| 16:58:51-17:01:18 | heavy run 1 |
+| 17:01:23-17:03:50 | heavy run 2 |
+
+Result: mixed 0.15% overall / 0.05% at 0-40 draws; heavy 0.04% overall / 0.07% at 200+ (6
+misses in 16 453 flips) / warm 0.01%. Beats post-0051 by ~15x at the heavy end; episodes gone;
+remaining misses queue ~15.5 ms early (the §19 benign shape). Full reading:
+`present-misses.md` §23.
