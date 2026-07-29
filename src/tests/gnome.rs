@@ -2145,6 +2145,124 @@ fn overview_hovering_a_preview_grows_it() {
     );
 }
 
+/// **Divergence (approved 2026-07-28).** A picker slot keeps the same clearance at both edges
+/// of the workspace background it sits on. gnome-shell lays out over the raw work area while
+/// the background is the whole monitor, so the top panel's strut is clearance the top edge
+/// gets and the bottom does not — a maximized window's preview came out with 40px at the
+/// sides and 51 above but only 22 below, which reads as the window touching the bottom.
+///
+/// Symmetrizing the area costs the preview no size: the `MAXIMUM_SCALE` cap still binds, so
+/// the slot only moves. (Which is also why a padding constant would have done nothing here —
+/// it would have had to exceed the slack under the cap before it moved anything at all.)
+#[test]
+fn overview_picker_slots_clear_both_workspace_edges_evenly() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // A maximized window: the case where the slot comes closest to the edges.
+    let _w = map_window_sized(&mut f, id, (1920, 1045), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let output = f.niri_output(1);
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let bg = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspace_under(smithay::utils::Point::from((960., 500.)))
+        .expect("the active workspace is under the middle of the view")
+        .1;
+
+    let top = slot.loc.y - bg.loc.y;
+    let bottom = (bg.loc.y + bg.size.h) - (slot.loc.y + slot.size.h);
+    let left = slot.loc.x - bg.loc.x;
+    // Even to within a rounding of the zoomed row, not to the pixel.
+    assert!(
+        (top - bottom).abs() <= bg.size.h * 0.005,
+        "the preview must clear both workspace edges evenly, got top={top} bottom={bottom}"
+    );
+    // …and the clearance is real, not a hairline: comparable to what the sides get.
+    assert!(
+        bottom > left / 2.,
+        "the bottom clearance must read like a margin, got {bottom} against {left} at the side"
+    );
+
+    // The cap still decides the size, so nothing was scaled down to buy that room.
+    let want = (1045. * 0.95) / 1080.;
+    assert!(
+        (slot.size.h / bg.size.h - want).abs() < 1e-9,
+        "the preview must keep its MAXIMUM_SCALE size, got {}",
+        slot.size.h / bg.size.h
+    );
+}
+
+/// …and the symmetry is bought by insetting to the *larger* strut, never by centering on the
+/// view outright — so a bottom dock still keeps the picker out of its space.
+#[test]
+fn overview_picker_slots_stay_out_of_a_bottom_strut() {
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
+    use crate::tests::client::LayerConfigureProps;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // A 200px bottom dock, taller than the top panel's strut.
+    let layer = f.client(id).create_layer(None, Layer::Top, "");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        size: Some((0, 200)),
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Bottom),
+        exclusive_zone: Some(200),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(1920, 200);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let _w = map_window_sized(&mut f, id, (1920, 800), None);
+    let win = f.niri().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let output = f.niri_output(1);
+    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let bg = f
+        .niri()
+        .layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspace_under(smithay::utils::Point::from((960., 300.)))
+        .expect("the active workspace is under the middle of the view")
+        .1;
+
+    // The dock takes 200 of 1080, so the picker must stay at least that far off both edges
+    // (the inset is the larger strut, applied to both).
+    let strut_frac = 200. / 1080.;
+    let top = (slot.loc.y - bg.loc.y) / bg.size.h;
+    let bottom = ((bg.loc.y + bg.size.h) - (slot.loc.y + slot.size.h)) / bg.size.h;
+    assert!(
+        bottom >= strut_frac - 0.001,
+        "a preview must not reach into the bottom dock's space, got {bottom} of the workspace"
+    );
+    assert!(
+        top >= strut_frac - 0.001,
+        "…and the inset is symmetric, got {top} at the top"
+    );
+}
+
 /// The close button half-overhangs its preview (`windowPreview.js:203-218`), so reaching for
 /// that half takes the pointer *off* the picker slot. gnome-shell doesn't care — the button
 /// is a child actor, so it is inside the preview's own reactive box — but ours are separate
@@ -2304,13 +2422,14 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     let ws_w = (1920. * zoom).ceil(); // 1599
     let offset_x = ((1920. - ws_w) / 2.).round(); // 161
 
-    // Workspace-local slot (see expose::tests): 760 × 570 centered in the work
-    // area — the top panel insets it to 1920×1045, so the slot sits at
-    // (580, 35 + (1045−570)/2) = (580, 272), scaled into the picker box at y = 48.
+    // Workspace-local slot (see expose::tests): 760 × 570 centered in the picker's area,
+    // which is the work area symmetrized about the view — the 35px panel strut is applied
+    // at both edges, giving 1920×1010 at y = 35, so the slot sits at
+    // (580, 35 + (1010−570)/2) = (580, 255), scaled into the picker box at y = 48.
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 48. + 272. * zoom),
+        (offset_x + 580. * zoom, 48. + 255. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(

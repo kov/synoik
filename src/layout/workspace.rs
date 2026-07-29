@@ -1983,13 +1983,57 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         let rects: Vec<_> = tiles.iter().map(|(_, rect)| *rect).collect();
-        let area = self.floating.working_area();
+        let area = self.expose_area();
         let slots = expose::compute_slots(self.view_size.h, area, &rects);
         tiles
             .into_iter()
             .zip(slots)
             .map(|((tile, rect), slot)| (tile, rect, slot))
             .collect()
+    }
+
+    /// The area the picker lays its slots out in: the working area, **symmetrized about the
+    /// view** — each axis inset by the larger of that axis' two struts.
+    ///
+    /// **Divergence (approved 2026-07-28).** gnome-shell lays out over the raw work area
+    /// (`_getAdjustedWorkarea`, `workspace.js:573-581`, minus the container's theme-node
+    /// padding, which `.window-picker` doesn't set in 50.1). Its slots are therefore centered
+    /// on the *work area* while the workspace background they sit on is the whole monitor, so
+    /// the top panel's strut is clearance the top edge gets and the bottom edge does not: at
+    /// 1920×1080 a maximized window's preview came out with 40px at the sides and 51 above it,
+    /// but only 22 below — which reads as the window touching the bottom of the workspace.
+    ///
+    /// Insetting by the *larger* strut on each axis, rather than centering on the view
+    /// outright, is what keeps this from putting a preview underneath a bottom dock: the area
+    /// is always a subset of the working area, so every strut is still respected. Nothing is
+    /// scaled down by it — a preview at the `MAXIMUM_SCALE` cap keeps its size and only moves.
+    ///
+    /// Note a padding constant here would have been a no-op: the cap already binds, so an
+    /// inset has to exceed the slack under it (~26px at 1920×1080) before it moves anything.
+    fn expose_area(&self) -> Rectangle<f64, Logical> {
+        let work = self.floating.working_area();
+        let view = Rectangle::from_size(self.view_size);
+
+        let inset = |lo: f64, hi: f64| -> (f64, f64) {
+            let strut = f64::max(lo, hi);
+            (strut, strut * 2.)
+        };
+        let (x, dw) = inset(
+            work.loc.x - view.loc.x,
+            view.size.w - (work.loc.x + work.size.w),
+        );
+        let (y, dh) = inset(
+            work.loc.y - view.loc.y,
+            view.size.h - (work.loc.y + work.size.h),
+        );
+
+        Rectangle::new(
+            Point::from((view.loc.x + x, view.loc.y + y)),
+            Size::from((
+                f64::max(view.size.w - dw, 1.),
+                f64::max(view.size.h - dh, 1.),
+            )),
+        )
     }
 
     /// Point the picker overlay at `window` (or at nothing), easing the previous
