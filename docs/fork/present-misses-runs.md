@@ -160,3 +160,21 @@ Result (heavy): overall 4.08%, draws 200+ 6.98%, gpu 6-12 ms 4.24%; warm run *de
 presented 1-2 vblanks late. **Verdict: both effects are real — VMM ~4-6x with the binary held,
 our new overview work ~2.5x on top with the VMM held, and the warm-up anomaly is entirely
 ours.** Full decomposition in `present-misses.md` §21.6.
+
+## Scale sweep, old binary on the new VMM (boot a8a1fbce, 2026-07-29, 15:21-15:34)
+
+Operator-suggested confound close: the Jul 27 arm likely ran at scale 2 (unrecoverable from the
+journal; his recollection), the §21.6 A/B arms at 1.5. Same `b808c5bb` seat process (up since
+15:07), same 8 kitties, operator flipped the scale between sweeps via display settings
+(the `ApplyMonitorsConfig` persist lines in the journal mark the flips).
+
+| when | what |
+|---|---|
+| 15:21:49-15:26:48 | heavy x2 at scale 2 |
+| 15:29:03-15:34:02 | heavy x2 at scale 1 |
+
+Result (200+ draws / gpu 6-12 ms / overall): scale 2 → 5.77% / 5.03% / 2.82%; scale 1.5
+(§21.6) → 6.98% / 4.24% / 4.08%; scale 1 → **21.20% / 18.42% / 9.55%**. Scale does not explain
+the VMM leg (matched scale 2: 1.11% → 5.77%), and scale 1 misses 3-4x more on the *cheapest*
+frames of the sweep (gpu p50 6.05 vs 7.34/8.05 ms) — the miss driver on this VMM is not guest
+GPU cost. Analysis in `present-misses.md` §21.7.

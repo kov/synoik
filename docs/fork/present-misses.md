@@ -1313,6 +1313,40 @@ a late fence". Host-side ask (yours): the ~4-6x with the binary held — §20's 
 (`sample <worker-pid> 1 | grep vkr-journal`) would say in one command whether the two-lane
 journal build made it into this VMM at all.
 
+### 21.7 The scale sweep: scale is not the confound, and scale 1 is a new lead (same day)
+
+The operator raised the last plausible confound: the Jul 27 arm probably ran at scale 2 (his
+recollection; the journal cannot recover it — no `monitors.xml` persists before Jul 28 and the
+startup read is not logged), while the §21.6 A/B arms ran at 1.5. So the old binary was swept
+across all three scales on the new VMM — same boot, same process (up since 15:07), same 8-window
+populate, heavy x2 per scale:
+
+| scale (old binary, new VMM) | draws p50 | gpu p50 | draws 200+ | gpu 6-12 ms | overall |
+|---|---|---|---|---|---|
+| 1.5 (§21.6) | 226 | 8.05 ms | 6.98% | 4.24% | 4.08% |
+| 2 | 189 | 7.34 ms | 5.77% | 5.03% | 2.82% |
+| 1 | 143 | 6.05 ms | **21.20%** | **18.42%** | **9.55%** |
+
+Two findings:
+
+- **Scale does not rescue the VMM leg.** If Jul 27 ran at scale 2, the matched-scale comparison
+  is 1.11% → 5.77% at 200+ draws — the ~5x VMM regression stands. (The same binary's gpu p50 is
+  also 5.53 → 7.34 ms at matched scale: the GPU work itself got ~33% slower across VMMs.)
+- **Scale 1 is anomalous, and it inverts the cost story.** Scale 1 produces the *cheapest*
+  frames of the sweep (gpu p50 6.05 ms, draws p50 143) and misses 3-4x more than either scaled
+  configuration. Miss character unchanged (1580/1587 queued ~15.6 ms early, exactly 1 vblank
+  late). On this VMM, whatever drops presents is NOT paced by guest GPU cost or draw count —
+  something about the scale-1 configuration itself (identity logical→physical mapping is the
+  only guest-side difference; the compositor renders a full-physical buffer and flips it
+  identically at every scale). That is a strong, cheap discriminator for the host side: same
+  binary, same boot, only the scale knob moved, 3-4x.
+
+The §21.6 within-boot decomposition is unaffected (both of its arms ran at 1.5). The warm-run
+note from §21.6 gets one asterisk: the scale sweep's runs were not process-cold, and neither
+scale-2 nor scale-1 warm runs decayed much (2.82% → 3.52%, 9.55% → 9.20%) — the clean §21.6
+warm-decay contrast (old binary decays, new binary degrades) still holds but the decay part is
+weaker when the process is already warm.
+
 *— the gnome-shell-rs guest session. It was parked with a bow on it; reopening it after two
 days feels rude, but the numbers insisted. (And the operator caught the confound the first
 version of this section missed.)*
