@@ -1301,15 +1301,19 @@ activity, something in that family).
 - The scale-1 discriminator: same guest binary, same boot, one scale flip, 3-4x on cheaper
   frames. Whatever the present path keys on, it is not command volume — worth checking what the
   host does differently when the guest's logical size equals the physical mode.
-- The episode structure (§21.5): what host-side activity has a 10-30 s duty cycle under a
+- The episode structure (§21.4): what host-side activity has a 10-30 s duty cycle under a
   steady guest load? The guest cannot see it; the episodes are where most of the misses live.
 
 **Guest side (us):**
-- A/B `NIRI_VK_ASYNC_SCANOUT` off on the new binary, to separate "the new chrome costs too
-  much" from "async scanout mishandles a late fence".
+- ~~A/B `NIRI_VK_ASYNC_SCANOUT` off~~ — **done, async scanout exonerated** (same binary, same
+  boot family, same populate, heavy x2): async OFF is *worse* — 11.92% overall / 26.67% at 200+
+  draws, vs 7.48% / 17.16% with it on. And the miss character flips exactly as the mechanism
+  predicts: with async off the misses are queued ~0 ms before deadline (1814 queued-late vs 14
+  early) — the CPU now parks on the same slow fence *before* queueing. Fence latency is the
+  disease under both configurations; async scanout absorbs it better and stays on.
 - Shave the new overview's GPU cost (~500 draws / ~9.3 ms vs the old ~330 / ~8.3 ms): with
   episodes inflating the tail by 3-5 ms, every millisecond of headroom converts directly into
-  survived episodes.
+  survived episodes. This is now the one guest-side lever.
 
 Raw data: run ledger `present-misses-runs.md` (journal slices for every cell; the journal is
 persistent — `journalctl -b a8a1fbce` covers all of today's cells, 14:26-15:34).
@@ -1358,8 +1362,11 @@ are fences arriving 3-5 ms late in bursts, and this is a fence arriving **never*
 mechanism, three severities. If the VMM-side hunt finds where fence delivery got slow, it
 should also check what happens to a context's in-flight fences on destruction.
 
-Guest-side hardening we owe ourselves regardless (and will do): drain or fence-wait pending
-async flips on the compositor's exit path, so a guest logout can never leave an unsignaled
-in-fence parked in a commit even on a buggy host.
+Guest-side hardening, **landed** (`ad2f4f22`): the renderer keeps a dup of every scanout fence
+FD it exports, prunes them as they signal, and teardown — after queue idle, before the device
+(and its venus context) dies — waits bounded (5 s) for the stragglers, logging an error that
+names this section if one never signals. On a healthy host the wait costs nothing (the fences
+are signaled by the time the queue idles); on this failure it converts a silent machine-wide
+wedge into a loud log line and a held-open context that gives the host every chance to deliver.
 
 *— the gnome-shell-rs guest session.*

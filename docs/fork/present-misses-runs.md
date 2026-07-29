@@ -189,3 +189,16 @@ Result: no guest-side accumulation (RSS/draws/elements/bakes all flat); misses a
 10-30 s episodes (gpu p90 ~10 → 13-15 ms, rate 8-9% floor → 35-50%) with 20-40 s gaps. The
 "warm run worse" fingerprint from the morning cells was these episodes under-sampled — claim
 withdrawn in `present-misses.md` §21.2/§21.4.
+
+## Async-scanout A/B, new binary (boot 2dd2ea15, 2026-07-29, 16:22-16:28)
+
+Post-wedge reboot; seat auto-started on the same `d4c7a61d` binary (built 13:42), scale 1.5,
+`NIRI_VK_ASYNC_SCANOUT` commented out of `environment.d` → async OFF. 8-kitty populate,
+heavy x2 (16:22:58-16:25:25, 16:25:30-16:27:57).
+
+Result: async OFF is worse — overall 11.92%, draws 200+ 26.67% (vs 7.48% / 17.16% async-on,
+same binary, morning cells). Miss character inverted as the mechanism predicts: 1814 misses
+queued LATE / ~0 ms early (vs "15.5 ms early" under async-on) — the CPU parks on the slow fence
+before queueing instead of after. Async scanout exonerated and restored to on
+(`present-misses.md` §21.5). Note the frame log's gpu/draws accounting differs between the two
+modes (unwaited vs waited GPU), so only the miss rates compare, not the cost columns.
