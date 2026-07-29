@@ -372,7 +372,7 @@ impl Element for XrayElement {
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.geometry.to_physical_precise_round(scale)
+        physical_geometry(self.geometry, scale)
     }
 
     fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
@@ -380,6 +380,25 @@ impl Element for XrayElement {
         // account
         OpaqueRegions::default()
     }
+}
+
+/// The xray's physical rect, rounded **by its extremities**.
+///
+/// The translucent surface drawn over the xray computes its own far edge as
+/// `round((loc + size) * scale)` (smithay's `WaylandSurfaceRenderElement`), so the xray has to
+/// use the same formula or the two disagree by a pixel at fractional scale — and the row between
+/// them blends the window against whatever is *under* the xray instead of the blurred backdrop.
+/// `Rectangle::to_physical_precise_round` rounds the location and the size apart, which is that
+/// disagreement (the same defect our smithay fork fixed in `RescaleRenderElement::geometry`).
+fn physical_geometry(
+    geometry: Rectangle<f64, Logical>,
+    scale: Scale<f64>,
+) -> Rectangle<i32, Physical> {
+    let scaled = geometry.to_physical(scale);
+    Rectangle::from_extremities(
+        scaled.loc.to_i32_round::<i32>(),
+        (scaled.loc + scaled.size).to_i32_round::<i32>(),
+    )
 }
 
 impl RenderElement<VulkanRenderer> for XrayElement {
@@ -446,5 +465,54 @@ impl RenderElement<VulkanRenderer> for XrayElement {
         };
 
         frame.render_postprocess(&texture, src, dst, damage, push)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The xray must end exactly where the translucent surface above it ends.
+    ///
+    /// Reported 2026-07-28: returning from the overview, a kitty window's bottom edge showed
+    /// something bleeding through as the animation ended. `Rectangle::to_physical_precise_round`
+    /// rounds the location and the size apart, so the xray's far edge was
+    /// `round(loc·scale) + round(size·scale)` while the surface drawn over it uses
+    /// `round((loc + size)·scale)`. At fractional scale those disagree by a pixel for about half
+    /// of all positions, and in that row the translucent window blends against whatever is under
+    /// the xray rather than the blurred backdrop.
+    #[test]
+    fn the_xray_ends_where_the_surface_over_it_ends() {
+        let scale = Scale::from(2.25);
+        let mut disagreements = 0;
+
+        for step in 0..400 {
+            // Sub-pixel positions, as a window travelling home in an animation has.
+            let y = 137. + f64::from(step) * 0.017;
+            // A height whose physical size is fractional (401 · 2.25 = 902.25) — with an
+            // integral one the two roundings agree by luck and prove nothing.
+            let geometry = Rectangle::new(Point::from((100., y)), Size::from((640., 401.)));
+            let xray = physical_geometry(geometry, scale);
+
+            // How smithay's `WaylandSurfaceRenderElement` computes the same edge.
+            let surface_bottom = ((geometry.loc.y + geometry.size.h) * scale.y).round() as i32;
+            assert_eq!(
+                xray.loc.y + xray.size.h,
+                surface_bottom,
+                "xray bottom must meet the surface bottom at y {y}"
+            );
+
+            // …and that the old rounding really did differ, so this test is not vacuous.
+            let old: Rectangle<i32, Physical> = geometry.to_physical_precise_round(scale);
+            if old.loc.y + old.size.h != surface_bottom {
+                disagreements += 1;
+            }
+        }
+
+        assert!(
+            disagreements > 0,
+            "the sweep never hit a position where the two roundings disagree; \
+             it would pass with the defect in place"
+        );
     }
 }

@@ -256,4 +256,56 @@ mod rescale_tests {
             }
         }
     }
+
+    /// Two elements that abut must still abut after a rescale.
+    ///
+    /// This is what makes the fix matter beyond a shimmer: in the overview every element is
+    /// wrapped in its **own** `RescaleRenderElement` (`workspace.rs` `render_expose`), so a
+    /// window's bottom and the workspace edge under it are rounded independently. When their
+    /// shared extremity maps to two different pixels, a one-pixel gap opens and the overview
+    /// backdrop shows through it — Gustavo's "the background is bleeding through", at the one
+    /// place the report named: the bottom of the workspace.
+    #[test]
+    fn two_abutting_elements_stay_abutting() {
+        let scale = Scale::from(2.25);
+        // A window ending exactly where the workspace edge below it begins.
+        let seam = 537.;
+        let upper = Rectangle::new(Point::from((100., 137.)), Size::from((640., seam - 137.)));
+        let lower = Rectangle::new(Point::from((100., seam)), Size::from((640., 120.)));
+
+        for step in 0..=400 {
+            let progress = f64::from(step) / 400.;
+            let zoom = 1. - 0.45 * progress;
+            // The origin travels too, as a tile flying to its slot does. Holding it still — and
+            // worse, holding it *on* one of the element edges — makes the two roundings agree by
+            // construction and the test proves nothing.
+            let origin = Point::<i32, crate::render_helpers::Physical>::from((
+                (60. + 500. * progress).round() as i32,
+                (40. + 430. * progress).round() as i32,
+            ));
+
+            let rescaled = |geo: Rectangle<f64, Logical>| {
+                RescaleRenderElement::from_element(
+                    SolidColorRenderElement::new(
+                        Id::new(),
+                        geo,
+                        CommitCounter::default(),
+                        Color32F::from([1., 0., 0., 1.]),
+                        Kind::Unspecified,
+                    ),
+                    origin,
+                    zoom,
+                )
+                .geometry(scale)
+            };
+
+            let upper = rescaled(upper);
+            let lower = rescaled(lower);
+            assert_eq!(
+                upper.loc.y + upper.size.h,
+                lower.loc.y,
+                "zoom {zoom}: the seam split, {upper:?} then {lower:?}"
+            );
+        }
+    }
 }
