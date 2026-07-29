@@ -13,6 +13,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::FocusRing;
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
 use super::scrolling::{Column, ColumnWidth};
+use super::shadow::Shadow;
 use super::thumbnails::{self, Strip};
 use super::tile::Tile;
 use super::workspace::{
@@ -76,9 +77,12 @@ const REFERENCE_PREVIEW_H: f64 = 520.;
 /// …and never below this, so a corner stays a corner (the interactive-floor rule).
 const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 
-/// The thumbnail height GNOME's 6px thumb radius is for: 5% of a 1080px view
-/// (`MAX_THUMBNAIL_SCALE`, `layout/thumbnails.rs`).
-const REFERENCE_THUMB_H: f64 = 54.;
+/// How far past its band a thumbnail's shadow is allowed to reach, so the active
+/// workspace's accent glow is not cut flat at the thumbnail's top and bottom edges.
+/// Comfortably more than the glow's own extent (softness + spread).
+///
+/// **Adaptive chrome, rule 1 — ramped.**
+const SHADOW_GLOW_MARGIN: f64 = 48.;
 
 /// gnome-shell's `WORKSPACE_INACTIVE_SCALE` (`workspacesView.js:25`): how far a
 /// workspace shrinks once the row has scrolled off it.
@@ -127,9 +131,16 @@ pub struct Monitor<W: LayoutElement> {
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
     insert_hint_render_loc: Option<InsertHintRenderLoc>,
-    /// The active-workspace ring on the overview thumbnails strip
-    /// (gnome-shell's `.workspace-thumbnail-indicator`).
-    thumb_indicator: FocusRing,
+    /// The drop shadow under a thumbnail on the overview strip — the app-grid row's
+    /// workspace shadow, at the thumbnail's size.
+    thumb_shadow: Shadow,
+    /// The **active** thumbnail's shadow: the same shadow in the system accent color and
+    /// turned up, which is what marks the active workspace on the strip.
+    ///
+    /// **Divergence (approved 2026-07-29).** gnome-shell wraps it in a border ring
+    /// (`.workspace-thumbnail-indicator`); Gustavo asked for an accent glow instead, so the
+    /// strip reads exactly like the app-grid row it is modelled on plus one colored cue.
+    thumb_active_shadow: Shadow,
     /// The strip's new-workspace drop placeholder pill (gnome-shell's
     /// `.placeholder`).
     thumb_placeholder: FocusRing,
@@ -303,6 +314,7 @@ niri_render_elements! {
         // Insert hint between workspaces, and the thumbnail-strip indicator.
         Ring = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
+        CroppedShadow = CropRenderElement<ShadowRenderElement>,
         SolidColor = SolidColorRenderElement,
         CroppedSolidColor = CropRenderElement<SolidColorRenderElement>,
         // The wallpaper in a workspace thumbnail.
@@ -467,7 +479,10 @@ impl<W: LayoutElement> Monitor<W> {
             previous_workspace_id: None,
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
-            thumb_indicator: FocusRing::new(thumbnail_indicator_config(crate::gnome::ACCENT_BLUE)),
+            thumb_shadow: Shadow::new(thumbnail_shadow_config(None)),
+            thumb_active_shadow: Shadow::new(thumbnail_shadow_config(Some(
+                crate::gnome::ACCENT_BLUE,
+            ))),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
             insert_hint_render_loc: None,
@@ -1279,19 +1294,19 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn update_render_elements(&mut self, is_active: bool) {
         if let Some(strip) = self.thumbnail_strip() {
-            let rect = self.thumbnail_indicator_rect(&strip);
             let scale = self.scale.fractional_scale();
-            let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
-            self.thumb_indicator.update_render_elements(
-                rect.size,
-                true,
-                true,
-                false,
-                view_rect,
-                CornerRadius::from(12.),
-                scale,
-                1.,
-            );
+            let radius = CornerRadius::from(self.thumbnail_corner_radius() as f32);
+
+            // Two shadows cover the strip: one under an inactive thumbnail and the accent
+            // one under the active thumbnail, which is drawn unshrunk. Only the two
+            // workspaces involved in a switch are ever at an in-between size, and a soft
+            // blur a couple of pixels wider than its caster is not a visible difference.
+            let full = strip.thumbs[0].size;
+            let shrunk = full.downscale(1. / WORKSPACE_INACTIVE_SCALE);
+            self.thumb_shadow
+                .update_render_elements(shrunk, true, radius, scale, 1.);
+            self.thumb_active_shadow
+                .update_render_elements(full, true, radius, scale, 1.);
 
             if let Some(rect) = strip.placeholder {
                 let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
@@ -1891,7 +1906,7 @@ impl<W: LayoutElement> Monitor<W> {
                 search_entry_height: crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
                 search_entry_width: entry_w,
                 dash_preferred_height: crate::ui::dash::preferred_height(self.view_size),
-                thumbnails_preferred_height: thumbnails::preferred_height(self.view_size),
+                thumbnails_preferred_height: self.thumbnail_height(),
             },
             self.thumbnails_expand_fraction(),
             state,
@@ -2111,6 +2126,26 @@ impl<W: LayoutElement> Monitor<W> {
         self.expose_progress().is_some() && self.thumbnails_expand_fraction() > 0.
     }
 
+    /// The corner the strip's thumbnails are rounded to, in *drawn* pixels: the same curve
+    /// as the picker's workspace background, evaluated at the thumbnail's own height, so
+    /// the strip and the app-grid row round alike.
+    ///
+    /// One accessor because the wallpaper, the shadow and the clip all need it and must
+    /// agree — the same reason [`Self::workspace_background_radius`] is one.
+    fn thumbnail_corner_radius(&self) -> f64 {
+        (WORKSPACE_BACKGROUND_CORNER_RADIUS * self.thumbnail_height() / REFERENCE_PREVIEW_H).clamp(
+            MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS,
+            WORKSPACE_BACKGROUND_CORNER_RADIUS,
+        )
+    }
+
+    /// How tall one thumbnail is: the app-grid row's workspace height, so the strip is
+    /// that row's twin rather than a scale of its own (divergence, approved 2026-07-29 —
+    /// see [`overview_layout::small_workspace_height`]).
+    fn thumbnail_height(&self) -> f64 {
+        overview_layout::small_workspace_height(self.view_size, self.working_area.loc.y)
+    }
+
     /// The thumbnails strip, laid out in the band [`Self::controls_layout`]
     /// allocates it. While a drag hovers one of its gaps, the strip makes room
     /// for the new-workspace drop placeholder there; while a *thumbnail* is
@@ -2139,6 +2174,7 @@ impl<W: LayoutElement> Monitor<W> {
         Some(thumbnails::strip_geometry(
             self.view_size,
             self.controls_layout().thumbnails,
+            self.thumbnail_height(),
             self.workspaces.len(),
             placeholder,
             self.workspace_render_idx(),
@@ -2242,25 +2278,6 @@ impl<W: LayoutElement> Monitor<W> {
         -extent * (1. - progress)
     }
 
-    /// The thumbnail rect the active-workspace indicator wraps,
-    /// interpolated between the two nearest thumbnails while the view moves
-    /// (gnome-shell tracks the scroll adjustment).
-    fn thumbnail_indicator_rect(&self, strip: &Strip) -> Rectangle<f64, Logical> {
-        let last = (strip.thumbs.len() - 1) as f64;
-        let idx = self.workspace_render_idx().clamp(0., last);
-        let (lo, hi) = (idx.floor() as usize, idx.ceil() as usize);
-        let t = idx.fract();
-        let a = strip.thumbs[lo];
-        let b = strip.thumbs[hi];
-        Rectangle::new(
-            Point::from((
-                a.loc.x + (b.loc.x - a.loc.x) * t,
-                a.loc.y + (b.loc.y - a.loc.y) * t,
-            )),
-            a.size,
-        )
-    }
-
     /// The workspace whose strip thumbnail is under the position.
     pub fn thumbnail_workspace_under(
         &self,
@@ -2274,8 +2291,8 @@ impl<W: LayoutElement> Monitor<W> {
     /// Recolors the accent-colored overview chrome (`org.gnome.desktop.interface
     /// accent-color`).
     pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
-        self.thumb_indicator
-            .update_config(thumbnail_indicator_config(accent));
+        self.thumb_active_shadow
+            .update_config(thumbnail_shadow_config(Some(accent)));
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -2713,6 +2730,18 @@ impl<W: LayoutElement> Monitor<W> {
         // strip on the way in.
         let band = Rectangle::new(strip.band.loc + slide, strip.band.size);
         let band_physical = band.to_physical_precise_round(scale);
+        // The clip is a *horizontal* concern: it exists to keep the row out of the
+        // floating entry's column. A shadow clipped to the band as well is cut flat along
+        // the thumbnail's top and bottom edges, which turns the active workspace's accent
+        // glow into two side stripes — so shadows keep the band's x range and get the
+        // band's height plus their own reach. It slides with the band, so the strip's
+        // entrance still clips correctly.
+        let glow_margin = SHADOW_GLOW_MARGIN * overview_layout::chrome_ramp(self.view_size);
+        let glow_bounds = Rectangle::new(
+            band.loc - Point::from((0., glow_margin)),
+            band.size + Size::from((0., glow_margin * 2.)),
+        )
+        .to_physical_precise_round(scale);
         // Each ring is in view coordinates already, so it clips against the band directly.
         let mut push_ring = |elem| {
             if let Some(elem) = CropRenderElement::from_element(elem, scale, band_physical) {
@@ -2724,27 +2753,35 @@ impl<W: LayoutElement> Monitor<W> {
             }
         };
 
-        // First pushed = topmost: the indicator ring sits above the
-        // thumbnails (gnome-shell keeps it as the top sibling).
-        let indicator_loc = self.thumbnail_indicator_rect(&strip).loc + slide;
-        self.thumb_indicator.render(indicator_loc, &mut push_ring);
-
-        // The new-workspace drop placeholder, while a drag hovers a gap.
+        // The new-workspace drop placeholder, while a drag hovers a gap. First pushed =
+        // topmost, and it belongs over the row it is parting.
         if let Some(rect) = strip.placeholder {
             self.thumb_placeholder
                 .render(rect.loc + slide, &mut push_ring);
         }
 
-        for (ws, thumb) in zip(&self.workspaces, &strip.thumbs) {
-            let thumb = Rectangle::new(thumb.loc + slide, thumb.size);
+        for (idx, (ws, slot)) in zip(&self.workspaces, &strip.thumbs).enumerate() {
+            // Inactive workspaces shrink about their slot's center, exactly as they do in
+            // the row this strip is modelled on (`_updateWorkspacesState`,
+            // `workspacesView.js:243-266`) — the strip's own "which one am I on" cue,
+            // under the accent glow.
+            let shrink = self.workspace_render_scale(idx);
+            let size = slot.size.downscale(1. / shrink);
+            let thumb = Rectangle::new(
+                slot.loc
+                    + slide
+                    + Point::from(((slot.size.w - size.w) / 2., (slot.size.h - size.h) / 2.)),
+                size,
+            );
+            let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
-            let xray_pos = XrayPos::new(thumb.loc, strip.scale);
+            let xray_pos = XrayPos::new(thumb.loc, thumb_scale);
 
             // Clip each miniature to its workspace, and to the part of it the band
             // leaves visible. Both live in *workspace* coordinates, because the crop
             // is applied before the thumbnail's rescale and relocate.
-            let x0 = ((band.loc.x - thumb.loc.x) / strip.scale).max(0.);
-            let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / strip.scale).min(self.view_size.w);
+            let x0 = ((band.loc.x - thumb.loc.x) / thumb_scale).max(0.);
+            let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / thumb_scale).min(self.view_size.w);
             if x1 <= x0 {
                 // Scrolled entirely out of the band.
                 continue;
@@ -2765,7 +2802,7 @@ impl<W: LayoutElement> Monitor<W> {
                             let elem = RescaleRenderElement::from_element(
                                 elem,
                                 Point::from((0, 0)),
-                                strip.scale,
+                                thumb_scale,
                             );
                             let elem = RelocateRenderElement::from_element(
                                 elem,
@@ -2787,29 +2824,24 @@ impl<W: LayoutElement> Monitor<W> {
                 ws.render_scrolling(ctx.r(), xray_pos, false, push_thumb!());
             }
 
-            // The wallpaper behind, rounded like the thumbnail (half the
-            // indicator's radius, per the shell theme); the solid color
-            // backs workspaces without one.
+            // The wallpaper behind, rounded exactly as the shadow under it is — the
+            // drawn radius expressed in workspace coordinates, since this is applied
+            // before the rescale. The solid color backs workspaces without one.
             let mut wallpapered = false;
             if let Some(wallpaper) = wallpaper {
-                // Rule 1 again: the thumb is 5% of the screen by construction, so its
-                // corner is a fraction of its own height and its *shape* is the same on
-                // every canvas (`6.` is GNOME's `$base_border_radius * 0.5` at 1080).
-                let radius = (6. * ws.view_size().h * strip.scale / REFERENCE_THUMB_H)
-                    .clamp(2., 6.)
-                    / strip.scale;
+                let radius = self.thumbnail_corner_radius() / thumb_scale;
                 if let Some(elem) = wallpaper.render(
                     ctx.renderer,
                     ws.view_size(),
                     radius,
-                    Scale::from(scale * strip.scale),
+                    Scale::from(scale * thumb_scale),
                 ) {
                     if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_bounds) {
                         let elem = MonitorInnerRenderElement::CroppedRoundedTexture(elem);
                         let elem = RescaleRenderElement::from_element(
                             elem,
                             Point::from((0, 0)),
-                            strip.scale,
+                            thumb_scale,
                         );
                         let elem = RelocateRenderElement::from_element(
                             elem,
@@ -2827,7 +2859,7 @@ impl<W: LayoutElement> Monitor<W> {
                 {
                     let elem = MonitorInnerRenderElement::CroppedSolidColor(elem);
                     let elem =
-                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), strip.scale);
+                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), thumb_scale);
                     let elem = RelocateRenderElement::from_element(
                         elem,
                         thumb_loc_physical,
@@ -2836,6 +2868,28 @@ impl<W: LayoutElement> Monitor<W> {
                     push(elem);
                 }
             }
+
+            // Last pushed = bottommost: the shadow under everything the thumbnail draws.
+            // The active workspace gets the accent one — the strip's replacement for
+            // gnome-shell's indicator ring.
+            let shadow = if idx == self.active_workspace_idx {
+                &self.thumb_active_shadow
+            } else {
+                &self.thumb_shadow
+            };
+            shadow.render(thumb.loc, &mut |elem| {
+                let elem = elem.with_alpha(progress.clamp(0., 1.) as f32);
+                if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_bounds) {
+                    let elem = MonitorInnerRenderElement::CroppedShadow(elem);
+                    let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        Point::default(),
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                }
+            });
         }
     }
 
@@ -3521,19 +3575,38 @@ fn thumbnail_placeholder_config() -> niri_config::FocusRing {
     }
 }
 
-/// The thumbnails-strip active-workspace ring: a 3px border in the system
-/// accent color (the shell theme's `-st-accent-color`).
-fn thumbnail_indicator_config(accent: [u8; 3]) -> niri_config::FocusRing {
-    let color = niri_config::Color::from_rgba8_unpremul(accent[0], accent[1], accent[2], 0xff);
-    niri_config::FocusRing {
-        off: false,
-        width: thumbnails::INDICATOR_WIDTH,
-        active_color: color,
-        inactive_color: color,
-        urgent_color: color,
-        active_gradient: None,
-        inactive_gradient: None,
-        urgent_gradient: None,
+/// The drop shadow under a thumbnail on the strip, and — given the system accent color —
+/// the stronger colored one that marks the **active** workspace.
+///
+/// The plain one is the app-grid row's workspace shadow (`_window-picker.scss:56-60`)
+/// scaled down to a thumbnail: same shape, proportionally smaller, since a 40px blur under
+/// a 157px miniature would be a smudge. The active one is the same geometry spread wider
+/// and at full alpha in the accent color, so the cue is a glow around the workspace rather
+/// than gnome-shell's border ring.
+fn thumbnail_shadow_config(accent: Option<[u8; 3]>) -> niri_config::Shadow {
+    let (color, spread, softness) = match accent {
+        Some([r, g, b]) => (
+            niri_config::Color::from_rgba8_unpremul(r, g, b, 0xff),
+            6.,
+            18.,
+        ),
+        None => (
+            niri_config::Color::from_rgba8_unpremul(0, 0, 0, 0x50),
+            3.,
+            14.,
+        ),
+    };
+    niri_config::Shadow {
+        on: true,
+        offset: niri_config::ShadowOffset {
+            x: niri_config::FloatOrInt(0.),
+            y: niri_config::FloatOrInt(if accent.is_some() { 0. } else { 3. }),
+        },
+        softness,
+        spread,
+        draw_behind_window: false,
+        color,
+        inactive_color: None,
     }
 }
 

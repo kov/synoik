@@ -3951,7 +3951,15 @@ fn dropping_on_the_strip_thumbnail_of_a_culled_workspace() {
     // an `Existing` hint always named a visible workspace. `update_render_elements` still assumed
     // that when it looked the hint's geometry up, and unwrapped a `None` — a live crash when
     // dragging a window onto the strip.
-    let mut ops = vec![Op::AddOutput(1)];
+    // A roomy logical canvas on purpose: the strip is clipped to its band, so a workspace
+    // can only be dropped on where it is actually drawn. At 1280×720 the band happens to
+    // show exactly the three workspaces the picker renders, and the case below cannot be
+    // built at all.
+    let mut ops = vec![Op::AddScaledOutput {
+        id: 1,
+        scale: 0.5,
+        layout_config: None,
+    }];
     for ws_name in 1..=8 {
         ops.push(Op::AddNamedWorkspace {
             ws_name,
@@ -3981,13 +3989,21 @@ fn dropping_on_the_strip_thumbnail_of_a_culled_workspace() {
         .workspaces_with_render_geo()
         .map(|(ws, _)| ws.id())
         .collect();
+    // Culled from the *picker*, but still drawn in the strip — the strip scrolls and is
+    // clipped to its band, so a thumbnail outside the band is not a drop target at all.
+    let in_band = |idx: usize| {
+        let thumb = strip.thumbs[idx];
+        strip
+            .band
+            .contains(thumb.loc + Point::from((thumb.size.w / 2., thumb.size.h / 2.)))
+    };
     let (idx, _) = mon
         .workspaces
         .iter()
         .enumerate()
-        .find(|(_, ws)| !visible.contains(&ws.id()))
+        .find(|(idx, ws)| !visible.contains(&ws.id()) && in_band(*idx))
         // Without one, this test would pass for the wrong reason.
-        .expect("some workspace must be culled for this to test anything");
+        .expect("some workspace must be culled but still on the strip for this to test anything");
     let thumb = strip.thumbs[idx];
     let target = thumb.loc + Point::from((thumb.size.w / 2., thumb.size.h / 2.));
 

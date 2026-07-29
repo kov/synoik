@@ -1354,6 +1354,42 @@ Live-validated on the headless seat at 13 workspaces: the strip scrolls with a p
 peeking at each band edge, the pill is untouched, and the app grid's row keeps the active
 workspace on screen.
 
+### 12.4 The thumbnail strip is the app-grid row's twin ✅
+
+Gustavo, having seen the two rows side by side: *"would it be possible to replace the thumb strip
+with the same widget used for the workspaces while in app grid mode? I like how they behave a lot
+and their spacing and size … I do like the idea of the cursor you added to the thumb strip, but I
+am thinking perhaps we could make it be the drop shadow being stronger and accent-colored?"*
+
+**Not the same widget instance — that one is impossible.** In the window-picker state the
+workspace row *is* the big picker; the strip is a second, simultaneous drawing of the same
+workspaces at a different size. Two live views of one row, on screen at once, cannot be one
+actor. What is shareable is everything that made the app-grid row look right, and that is what
+landed:
+
+- **Size.** A thumbnail is `overview_layout::small_workspace_height` — one expression, used by the
+  app-grid picker box *and* the strip, so the two can't drift. 157px at the 1920×1080/35 reference,
+  against the 108 of yesterday's doubled cap. Pinned by asserting the strip's thumbnail against the
+  *rendered* app-grid workspace, so a change on either side has to move both.
+- **Spacing.** `WORKSPACE_MIN_SPACING` (24), ramped, instead of the theme's `$base_padding` (8).
+- **Corner + shadow.** `Monitor::thumbnail_corner_radius` is the picker's own background curve
+  evaluated at the thumbnail's height, and the wallpaper, the shadow and the clip all read it from
+  that one accessor — the same reason `workspace_background_radius` is one accessor.
+- **The inactive shrink.** `WORKSPACE_INACTIVE_SCALE` about the slot's center, exactly as
+  `_updateWorkspacesState` does it for the row (`workspacesView.js:243-266`).
+
+**The indicator ring is gone**, replaced by the accent glow: `thumb_active_shadow`, the same
+shadow geometry spread wider, at full alpha, in the system accent color, which
+`set_gnome_accent_color` now recolors instead of the ring. gnome-shell's
+`.workspace-thumbnail-indicator` border is dropped.
+
+**Trap worth keeping.** The band clip from §12.2 is a *horizontal* concern — it exists to keep the
+row out of the floating entry's column. Clipping the shadow to the band as well cut the glow flat
+along the thumbnail's top and bottom edges, so the active workspace read as two accent side
+stripes. Shadows keep the band's x range and get the band's height plus `SHADOW_GLOW_MARGIN`,
+still sliding with the band so the entrance clips correctly. It looked *fine* in the geometry
+tests and wrong on the first screenshot.
+
 ### 12.3 Panel / quick-settings buttons that launch apps must leave the overview ✅
 
 Gustavo, from live use: a button on the panel or in quick settings that starts an application

@@ -51,6 +51,16 @@ const THUMBNAILS_SPACING_ADJUSTMENT_BOTTOM: f64 = 0.4;
 /// under the search entry, and the app grid fills the space below it.
 const SMALL_WORKSPACE_RATIO: f64 = 0.15;
 
+/// How tall one workspace is in the app-grid row: [`SMALL_WORKSPACE_RATIO`] of the work
+/// area.
+///
+/// Published because the **thumbnail strip is deliberately the same size** (divergence,
+/// approved 2026-07-29 — Gustavo liked the app-grid row's size and spacing enough to want
+/// the strip to match it). One expression, so the two rows cannot drift apart.
+pub fn small_workspace_height(view_size: Size<f64, Logical>, start_y: f64) -> f64 {
+    ((view_size.h - start_y) * SMALL_WORKSPACE_RATIO).round()
+}
+
 /// **Divergence (approved 2026-07-28).** How far the floating search entry is inset from the
 /// right edge of the work area — `.search-entry`'s own `margin-top` (`$base_padding*2`),
 /// reused as the edge gap so the pill sits the same distance from both edges it touches.
@@ -236,7 +246,7 @@ pub fn layout(
                 0.,
                 start_y + search_h + spacing,
                 width,
-                (height * SMALL_WORKSPACE_RATIO).round(),
+                small_workspace_height(view_size, start_y),
             )
         } else if s == state::WINDOW_PICKER {
             // No `search_h` term: the entry floats, so the picker starts at the top of the

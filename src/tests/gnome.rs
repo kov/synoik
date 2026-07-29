@@ -2589,13 +2589,14 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
     assert_eq!(row_y(&mut f), 0.);
 }
 
-/// **Divergence (approved 2026-07-28).** The search entry floats at the top right instead
-/// of taking a full-width row, and the thumbnails strip is at twice gnome-shell's band
-/// height. Judged on both the reference canvas and the 1024×665 one the adaptive chrome
-/// ramp was written for (`docs/fork/adaptive-overview-chrome.md`), because that is the
-/// canvas the sizes actually have to work on.
+/// **Divergence (approved 2026-07-28/29).** The search entry floats at the top right
+/// instead of taking a full-width row, and a thumbnail is the app-grid row's workspace
+/// rather than gnome-shell's 5% speck. Judged on both the reference canvas and the
+/// 1024×665 one the adaptive chrome ramp was written for
+/// (`docs/fork/adaptive-overview-chrome.md`), because that is the canvas the sizes
+/// actually have to work on.
 #[test]
-fn overview_entry_floats_right_of_a_doubled_thumbnail_strip() {
+fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
     for size in [(1920u16, 1080u16), (1024, 665)] {
         let mut f = Fixture::new();
         f.add_output(1, size);
@@ -2633,18 +2634,67 @@ fn overview_entry_floats_right_of_a_doubled_thumbnail_strip() {
         // The strip is at the doubled cap: a thumbnail is a tenth of the view tall.
         assert_eq!(
             strip.thumbs[0].size.h,
-            (f64::from(size.1) * crate::layout::thumbnails::MAX_THUMBNAIL_SCALE).round(),
-            "{size:?}: the strip must sit at the doubled cap"
+            crate::ui::overview_layout::small_workspace_height(
+                smithay::utils::Size::from((f64::from(size.0), f64::from(size.1))),
+                crate::ui::panel::PANEL_HEIGHT,
+            ),
+            "{size:?}: a thumbnail must be the app-grid row's workspace height"
         );
 
-        // And the two never collide: the row is clear of the pill's column.
-        let strip_right = strip.bounds().loc.x + strip.bounds().size.w;
+        // And the two never collide. The *band* is what has to clear the pill's column,
+        // not the row: at the app-grid size the row overflows and scrolls, and what runs
+        // past the band is clipped away rather than drawn under the entry.
+        let band_right = band.loc.x + band.size.w;
         assert!(
-            strip_right <= pill.loc.x,
-            "{size:?}: the strip runs under the floating entry ({strip_right} vs {})",
+            band_right <= pill.loc.x,
+            "{size:?}: the strip's band runs under the floating entry ({band_right} vs {})",
             pill.loc.x
         );
+        assert!(
+            strip.thumbs[0].loc.x >= band.loc.x,
+            "{size:?}: the row must start inside its band"
+        );
     }
+}
+
+/// **Divergence (approved 2026-07-29).** The strip is the app-grid row's twin: a
+/// thumbnail is exactly the workspace that row draws, at the same size, so the two rows
+/// cannot drift apart. gnome-shell has no such relationship — its thumbnails are
+/// `MAX_THUMBNAIL_SCALE` (5%) and its app-grid workspaces `SMALL_WORKSPACE_RATIO` (15%).
+///
+/// Asserted against the *rendered* app-grid row rather than the constant, so a change to
+/// either side has to move both.
+#[test]
+fn overview_thumbnail_is_the_app_grid_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let thumb = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .thumbnail_strip()
+            .expect("three workspaces must show the strip")
+            .thumbs[0]
+            .size
+    };
+
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let ws = mon
+        .expect("workspaces must be on a monitor")
+        .workspaces_render_geo()
+        .next()
+        .expect("the app grid lays the workspaces out too");
+
+    assert!(
+        (thumb.h - ws.size.h).abs() <= 1. && (thumb.w - ws.size.w).abs() <= 1.,
+        "a thumbnail must be the app-grid row's workspace: {thumb:?} vs {:?}",
+        ws.size
+    );
 }
 
 /// Past the point where the row fills its band, the strip scrolls to follow the
@@ -2688,8 +2738,11 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
     // …and the thumbnails are still the full doubled cap, not shrunk to fit.
     assert_eq!(
         strip.thumbs[0].size.h,
-        (1080. * crate::layout::thumbnails::MAX_THUMBNAIL_SCALE).round(),
-        "the cap must not give way to the workspace count"
+        crate::ui::overview_layout::small_workspace_height(
+            smithay::utils::Size::from((1920., 1080.)),
+            crate::ui::panel::PANEL_HEIGHT,
+        ),
+        "the size must not give way to the workspace count"
     );
 
     // Walk down the strip: the active workspace's thumbnail is inside the band
@@ -2735,9 +2788,9 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     f.settle_animations();
 
     let band = overview_controls(&mut f).thumbnails;
-    // 35 + round(21 × 0.6) = 48 (the entry floats and takes no row), and
-    // 1080 × MAX_THUMBNAIL_SCALE = 108 (our doubled cap).
-    assert_eq!((band.loc.y, band.size.h), (48., 108.));
+    // 35 + round(21 × 0.6) = 48 (the entry floats and takes no row), and the app-grid
+    // row's workspace height, round((1080 - 35) × SMALL_WORKSPACE_RATIO) = 157.
+    assert_eq!((band.loc.y, band.size.h), (48., 157.));
 
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     let strip = mon
@@ -2775,7 +2828,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
     f.niri().advance_animations();
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (164., 783.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (213., 734.));
 
     // Back to one populated desktop: the emptied workspace is only reaped once the
     // switch settles, and the collapse ease arms on that frame.
@@ -2853,7 +2906,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
     // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (164., 783.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (213., 734.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a
