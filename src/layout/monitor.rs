@@ -1844,6 +1844,7 @@ impl<W: LayoutElement> Monitor<W> {
             ws_w_all,
             self.workspace_gap(zoom_all, FitMode::All),
             self.workspaces.len() as f64,
+            render_idx,
         );
 
         let lerp = |a: f64, b: f64| a + (b - a) * fit;
@@ -3444,26 +3445,41 @@ fn fit_single_row(view_w: f64, ws_w: f64, gap: f64, render_idx: f64) -> (f64, f6
     ((view_w - ws_w) / 2. - render_idx * extent, extent)
 }
 
+/// Where a row of `run` length sits inside a `span`-wide viewport so that the item at
+/// `focus` (a distance from the row's start) stays visible: a row that fits is centered,
+/// and one that does not scrolls to center the focused item, clamped so the row never
+/// leaves a gap at either end.
+///
+/// This is the one rule both overview rows follow when they overflow — the workspace row
+/// ([`fit_all_row`]) and the thumbnail strip
+/// ([`crate::layout::thumbnails::strip_geometry`]).
+pub(super) fn scroll_to_follow(span: f64, run: f64, focus: f64) -> f64 {
+    if run <= span {
+        return (span - run) / 2.;
+    }
+    (span / 2. - focus).clamp(span - run, 0.)
+}
+
 /// The fit-all row: every workspace laid out inside the allocation with the run
 /// centered (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`). The gap
 /// is also the space before the first and after the last workspace, so the row
 /// never touches the edges (`:135-137`).
 ///
-/// **Divergence.** When the row is wide enough that the *width* binds rather than
-/// the height (roughly seven or more workspaces at 16:9), gnome-shell narrows each
-/// box to `availableWidth / n`, squashing the workspaces out of aspect. We keep one
-/// zoom per monitor, so ours stay aspect-locked and the packed row simply overflows
-/// the edges as it does in fit-single. Everything up to that count matches.
-fn fit_all_row(view_w: f64, ws_w: f64, gap: f64, n: f64) -> (f64, f64) {
-    let available = view_w - gap * (n + 1.);
-    let x1 = if available / n >= ws_w {
-        // The height binds, so the boxes keep their aspect-locked width and the
-        // leftover space centers the run.
-        gap + f64::max((available - ws_w * n) / 2., 0.)
-    } else {
-        gap
-    };
-    (x1, ws_w + gap)
+/// **Divergence (approved 2026-07-29).** When the row is wide enough that the *width*
+/// binds rather than the height (roughly seven or more workspaces at 16:9), gnome-shell
+/// narrows every box to `availableWidth / n` so the whole row always fits. We keep one
+/// zoom per monitor, so ours stay aspect-locked and the run overflows instead — and it
+/// then **scrolls to follow the active workspace**, which is what makes a workspace past
+/// the edge reachable at all. Pinning the overflowing run at the left gap (what this did
+/// before) left the tail permanently off-screen.
+///
+/// Up to that count nothing moves: [`scroll_to_follow`] centers a run that fits, which is
+/// gnome-shell's `Math.max((availableWidth - workspaceWidth * n) / 2, 0)` exactly.
+fn fit_all_row(view_w: f64, ws_w: f64, gap: f64, n: f64, render_idx: f64) -> (f64, f64) {
+    let span = view_w - gap * 2.;
+    let run = ws_w * n + gap * (n - 1.);
+    let focus = render_idx * (ws_w + gap) + ws_w / 2.;
+    (gap + scroll_to_follow(span, run, focus), ws_w + gap)
 }
 
 /// The strip's drop placeholder: a translucent pill marking where the new
@@ -3517,7 +3533,11 @@ mod row_tests {
     }
 
     fn all_positions(ws_w: f64, gap: f64, n: usize) -> Vec<f64> {
-        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64);
+        all_positions_at(ws_w, gap, n, 0.)
+    }
+
+    fn all_positions_at(ws_w: f64, gap: f64, n: usize, render_idx: f64) -> Vec<f64> {
+        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64, render_idx);
         (0..n).map(|i| x1 + i as f64 * pitch).collect()
     }
 
@@ -3600,15 +3620,51 @@ mod row_tests {
     }
 
     /// When the width binds instead of the height (many workspaces), we keep the
-    /// aspect-locked width and let the row overflow rather than squashing the
-    /// boxes — the recorded divergence. It still starts at the left gap.
+    /// aspect-locked width and let the row overflow rather than squashing the boxes
+    /// — the recorded divergence. The overflowing row then scrolls to follow the
+    /// active workspace, or the tail would be unreachable.
     #[test]
-    fn fit_all_overflows_rather_than_squashing() {
+    fn fit_all_scrolls_an_overflowing_run_to_the_active_workspace() {
         let (ws_w, gap, n) = (1400., 32., 8usize);
-        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64);
-        assert!((x1 - gap).abs() < 1e-9);
-        assert!((pitch - (ws_w + gap)).abs() < 1e-9);
-        assert!(x1 + (n - 1) as f64 * pitch + ws_w > VIEW);
+        let run = ws_w * n as f64 + gap * (n - 1) as f64;
+        assert!(run > VIEW, "this case must actually overflow");
+
+        // Every workspace, selected in turn, is fully on screen.
+        for active in 0..n {
+            let xs = all_positions_at(ws_w, gap, n, active as f64);
+            assert!(
+                xs[active] >= -1e-9 && xs[active] + ws_w <= VIEW + 1e-9,
+                "workspace {active} is off screen at x={}",
+                xs[active]
+            );
+        }
+
+        // The ends stay flush: at the extremes the row has scrolled as far as it
+        // can and no further, so no gap opens past the first or last workspace.
+        let first = all_positions_at(ws_w, gap, n, 0.);
+        assert!((first[0] - gap).abs() < 1e-9);
+        let last = all_positions_at(ws_w, gap, n, (n - 1) as f64);
+        assert!((last[n - 1] + ws_w - (VIEW - gap)).abs() < 1e-9);
+
+        // And the row stays rigid — scrolling moves the whole run, never the pitch.
+        for active in 0..n {
+            let xs = all_positions_at(ws_w, gap, n, active as f64);
+            for w in xs.windows(2) {
+                assert!((w[1] - w[0] - (ws_w + gap)).abs() < 1e-9);
+            }
+        }
+    }
+
+    /// A run that *fits* ignores which workspace is active, exactly as gnome-shell's
+    /// centering does — the scroll only engages on overflow.
+    #[test]
+    fn fit_all_ignores_the_selection_while_the_run_fits() {
+        let (gap, n) = (32., 5usize);
+        let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64 * 0.8;
+        let base = all_positions_at(ws_w, gap, n, 0.);
+        for active in 1..n {
+            assert_eq!(base, all_positions_at(ws_w, gap, n, active as f64));
+        }
     }
 
     /// Both rows advance by width + gap, so a lerp between them is a lerp of two
@@ -3619,7 +3675,7 @@ mod row_tests {
         let (ws_w, gap) = (1400., 32.);
         for (x1, pitch) in [
             fit_single_row(VIEW, ws_w, gap, 2.),
-            fit_all_row(VIEW, ws_w, gap, 4.),
+            fit_all_row(VIEW, ws_w, gap, 4., 1.),
         ] {
             let xs: Vec<f64> = (0..4).map(|i| x1 + f64::from(i) * pitch).collect();
             for w in xs.windows(2) {

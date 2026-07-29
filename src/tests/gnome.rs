@@ -3077,6 +3077,117 @@ fn app_grid_fits_the_whole_workspace_row() {
     );
 }
 
+/// Populates `n` workspaces, one window each, leaving the trailing empty one that
+/// dynamic workspaces always keep. A window maps onto the focused workspace, so
+/// stepping down after each map lands the next one on a fresh desktop.
+fn setup_n_desktops(f: &mut Fixture, id: ClientId, n: usize) {
+    for _ in 0..n {
+        let _ = map_window_sized(f, id, (800, 600), None);
+        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    }
+    f.niri_complete_animations();
+}
+
+/// With enough workspaces the app grid's fitted row no longer fits, and every
+/// workspace past the edge used to be unreachable: gnome-shell keeps them on screen
+/// by narrowing each box to `availableWidth / n`
+/// (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`), which we can't do
+/// with one aspect-locked zoom per monitor. The overflowing row scrolls to follow
+/// the active workspace instead (**divergence**, approved 2026-07-29).
+#[test]
+fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
+    use smithay::utils::{Logical, Rectangle};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // Eight populated workspaces at the app grid's zoom overflow 1920 (~279px wide,
+    // packed at the 24px minimum spacing) with room to spare.
+    setup_n_desktops(&mut f, id, 8);
+
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+
+    let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .workspaces_render_geo()
+            .collect()
+    };
+    let n = row(&mut f).len();
+    assert!(
+        n >= 8,
+        "expected the populated workspaces plus a spare, got {n}"
+    );
+    let run = {
+        let r = row(&mut f);
+        r[n - 1].loc.x + r[n - 1].size.w - r[0].loc.x
+    };
+    assert!(
+        run > 1920.,
+        "this test is vacuous unless the row actually overflows, got {run}"
+    );
+
+    // Walk the whole row from the top. Whichever workspace is active is fully on
+    // screen — that is the property the report was about.
+    while f
+        .niri()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .active_workspace_idx()
+        != 0
+    {
+        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+    }
+    f.settle_animations();
+
+    let mut visited = 0;
+    loop {
+        let active = f
+            .niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx();
+        visited += 1;
+        let geo = row(&mut f);
+        assert!(
+            geo[active].loc.x >= -1. && geo[active].loc.x + geo[active].size.w <= 1921.,
+            "workspace {active} is off screen at {:?}",
+            geo[active]
+        );
+        // Rigid: scrolling moves the run, it never re-spaces it. Read off the slot
+        // *centers*, which the active workspace's unshrunk rect leaves untouched.
+        let center = |r: &Rectangle<f64, Logical>| r.loc.x + r.size.w / 2.;
+        let pitch = center(&geo[1]) - center(&geo[0]);
+        for w in geo.windows(2) {
+            assert!(
+                (center(&w[1]) - center(&w[0]) - pitch).abs() <= 2.,
+                "the row must stay uniform at active={active}, got {geo:?}"
+            );
+        }
+        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+        f.settle_animations();
+        let moved = f
+            .niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx();
+        if moved == active {
+            break;
+        }
+    }
+    assert!(
+        visited >= 8,
+        "the walk must reach every populated workspace, only saw {visited}"
+    );
+}
+
 /// The workspace the row sits on draws at full size while every other one is
 /// shrunk to `WORKSPACE_INACTIVE_SCALE` about its own center
 /// (`WorkspacesView._updateWorkspacesState`, `workspacesView.js:243-266`, with
