@@ -8159,7 +8159,9 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     f.niri()
         .app_system
         .set_windows(vec![crate::app_system::RunningWindow {
+            id: crate::window::mapped::MappedId::next(),
             app_id: Some("run".to_owned()),
+            title: None,
             last_focus: None,
         }]);
     f.niri().sync_dash_favorites();

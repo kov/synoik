@@ -866,6 +866,7 @@ impl XdgActivationHandler for State {
                 }
             } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(&surface) {
                 unmapped.activation_token_data = Some(token_data);
+                unmapped.activation_token = Some(token.to_string());
             }
         }
 

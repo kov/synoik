@@ -852,13 +852,12 @@ impl State {
                                         this.niri.sync_overview_search();
                                     }
                                     SearchOutcome::Activate(id) => {
-                                        if let Err(err) = this
-                                            .niri
-                                            .app_system
-                                            .launch(&id, crate::app_system::LaunchMode::Activate)
-                                        {
-                                            tracing::warn!("search launch of {id} failed: {err:?}");
-                                        }
+                                        this.launch_app(
+                                            &id,
+                                            crate::app_system::LaunchMode::Activate,
+                                            None,
+                                            "search",
+                                        );
                                         this.niri.overview_search.clear();
                                         this.niri.layout.close_overview();
                                     }
@@ -1369,10 +1368,41 @@ impl State {
 
     /// Launch `id` from a context-menu row and leave the overview.
     fn launch_from_app_menu(&mut self, id: &str, mode: LaunchMode) {
-        if let Err(err) = self.niri.app_system.launch(id, mode) {
-            tracing::warn!("app-menu launch of {id} failed: {err:?}");
-        }
+        self.launch_app(id, mode, None, "app-menu");
         self.niri.layout.close_overview();
+    }
+
+    /// The one place an app is launched — our `shell_app_launch`
+    /// (`shell-app.c:1354`) plus the launch context it needs.
+    ///
+    /// Every launch mints an xdg-activation token, exactly as mutter's launch
+    /// context does on Wayland (`meta-launch-context.c:158-184`): it is the child's
+    /// permission to raise its own first window, and it is the id of the startup
+    /// sequence that puts the app in `AppState::Starting` until that window shows
+    /// up. `workspace` is the sequence's target workspace, if the launch asked for
+    /// one (an icon dropped on a workspace thumbnail).
+    ///
+    /// `origin` only labels the warning on failure.
+    fn launch_app(
+        &mut self,
+        id: &str,
+        mode: LaunchMode,
+        workspace: Option<crate::layout::workspace::WorkspaceId>,
+        origin: &str,
+    ) -> bool {
+        let (token, _) = self.niri.activation_state.create_external_token(None);
+        let ctx = crate::app_system::LaunchContext {
+            token: Some(token.as_str().to_owned()),
+            workspace,
+            now: get_monotonic_time(),
+        };
+        match self.niri.app_system.launch(id, mode, &ctx) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!("{origin} launch of {id} failed: {err:?}");
+                false
+            }
+        }
     }
 
     /// Start recording the active output, or stop if one is already running (the
@@ -4767,10 +4797,7 @@ impl State {
             if let Some(workspace) = target {
                 // `open_new_window`, not `activate`: a drop always asks for a window
                 // *here*, even for an app that is already running elsewhere.
-                match self.niri.app_system.launch(&drag.id, LaunchMode::NewWindow) {
-                    Ok(()) => self.niri.expect_launch_on_workspace(drag.id, workspace),
-                    Err(err) => tracing::warn!("drag launch of {} failed: {err:?}", drag.id),
-                }
+                self.launch_app(&drag.id, LaunchMode::NewWindow, Some(workspace), "drag");
                 true
             } else {
                 // The app display accepts any app icon dropped anywhere inside it
@@ -5284,9 +5311,7 @@ impl State {
             // only for a *running* app (`appDisplay.js:3060`).
             OverviewHit::Dash(DashHit::App(i)) if launches => {
                 if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
-                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
-                        tracing::warn!("dash launch of {id} failed: {err:?}");
-                    }
+                    self.launch_app(&id, LaunchMode::Activate, None, "dash");
                     self.niri.layout.close_overview();
                 }
             }
@@ -5297,9 +5322,7 @@ impl State {
             }
             OverviewHit::Search(SearchHit::Result(i)) if launches => {
                 if let Some(id) = self.niri.overview_search.result_id(i).map(str::to_owned) {
-                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
-                        tracing::warn!("search launch of {id} failed: {err:?}");
-                    }
+                    self.launch_app(&id, LaunchMode::Activate, None, "search");
                     self.niri.overview_search.clear();
                     self.niri.layout.close_overview();
                 }
@@ -5312,9 +5335,7 @@ impl State {
             // the dialog goes down with the overview.
             OverviewHit::Folder(DialogHit::App(i)) if launches => {
                 if let Some(id) = self.niri.folder_dialog.entry_id(i).map(str::to_owned) {
-                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
-                        tracing::warn!("folder launch of {id} failed: {err:?}");
-                    }
+                    self.launch_app(&id, LaunchMode::Activate, None, "folder");
                     // The overview is going with it, which is GNOME's source-unmapped
                     // path — no shrink to watch.
                     self.niri.folder_dialog.hide();
@@ -5363,9 +5384,7 @@ impl State {
             }
             OverviewHit::GridApp(i) if launches => {
                 if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {
-                    if let Err(err) = self.niri.app_system.launch(&id, LaunchMode::Activate) {
-                        tracing::warn!("app grid launch of {id} failed: {err:?}");
-                    }
+                    self.launch_app(&id, LaunchMode::Activate, None, "app grid");
                     self.niri.layout.close_overview();
                 }
             }

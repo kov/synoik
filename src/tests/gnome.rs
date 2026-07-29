@@ -26,6 +26,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::ClientId;
 use super::*;
 use crate::gnome::{Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction};
+use crate::utils::get_monotonic_time;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_ESC: u32 = 1;
@@ -6478,7 +6479,11 @@ fn app_system_is_disconnected_and_injectable_headless() {
 
     f.niri()
         .app_system
-        .launch("org.example.App.desktop", LaunchMode::Activate)
+        .launch(
+            "org.example.App.desktop",
+            LaunchMode::Activate,
+            &crate::app_system::LaunchContext::bare(get_monotonic_time()),
+        )
         .expect("launch reaches the recorder");
 
     let calls = recorder.calls.borrow();
@@ -7187,9 +7192,12 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
     );
     drop(calls);
 
-    // And the app's first window opens on the workspace it was dropped on.
+    // And the app's first window opens on the workspace it was dropped on: the
+    // drop opened a startup sequence carrying that workspace.
     assert_eq!(
-        f.niri().claim_pending_launch(Some("a")),
+        f.niri()
+            .app_system
+            .complete_startup(Some("a"), None, Duration::ZERO),
         Some(ws),
         "the launch must claim the workspace it was dropped on"
     );
@@ -7198,7 +7206,7 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
 /// The other half of the drop: the app's first window really does open on the
 /// workspace it was dropped on. gnome-shell hands the workspace index to
 /// `open_new_window`, which carries it through the startup-notification launch
-/// context; we park the intent and the mapping window claims it.
+/// context; ours opens a startup sequence and the mapping window completes it.
 #[test]
 fn overview_launch_on_workspace_places_the_first_window() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
@@ -7226,7 +7234,8 @@ fn overview_launch_on_workspace_places_the_first_window() {
     );
 
     f.niri()
-        .expect_launch_on_workspace("a.desktop".to_owned(), target);
+        .app_system
+        .begin_startup("a.desktop", None, Some(target), get_monotonic_time());
 
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
@@ -7259,9 +7268,14 @@ fn overview_launch_on_workspace_places_the_first_window() {
         "the launched window must open on the workspace it was dropped on"
     );
 
-    // The intent is one-shot: a second window of the same app opens wherever it
+    // The sequence is one-shot: a second window of the same app opens wherever it
     // would have anyway.
-    assert_eq!(f.niri().claim_pending_launch(Some("a")), None);
+    assert_eq!(
+        f.niri()
+            .app_system
+            .complete_startup(Some("a"), None, get_monotonic_time()),
+        None
+    );
 }
 
 /// A drag that ends over the overview's own chrome drops nothing: gnome-shell's
@@ -9783,6 +9797,136 @@ fn overview_search_resets_on_reopen() {
     );
 }
 
+/// **Lifecycle.** A launch puts the app in `STARTING` and its first window moves
+/// it to `RUNNING` — `shell_app_activate_full`'s stopped branch opening a startup
+/// sequence (`shell-app.c:508-521` via `meta-launch-context.c:158-184`), then
+/// `_shell_app_handle_startup_sequence`'s completed branch (`shell-app.c:1190-1195`).
+///
+/// The intermediate state is the point: between the spawn and the map, GNOME shows
+/// a running dot but offers neither Quit nor a new window.
+#[test]
+fn launching_an_app_marks_it_starting_until_its_window_maps() {
+    use crate::app_system::{
+        AppEntry, AppState, AppSystem, FakeCatalog, LaunchMode, RecordingLauncher,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let recorder = RecordingLauncher::default();
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "a.desktop",
+            "A",
+            "a",
+        )])),
+        Box::new(recorder.clone()),
+    );
+    assert_eq!(
+        f.niri().app_system.app_state("a.desktop"),
+        AppState::Stopped
+    );
+    assert!(f.niri().app_system.can_open_new_window("a.desktop"));
+
+    f.niri()
+        .app_system
+        .launch(
+            "a.desktop",
+            LaunchMode::Activate,
+            &crate::app_system::LaunchContext {
+                token: Some("tok-1".to_owned()),
+                workspace: None,
+                now: get_monotonic_time(),
+            },
+        )
+        .expect("launch");
+
+    assert_eq!(
+        f.niri().app_system.app_state("a.desktop"),
+        AppState::Starting,
+        "a launch opens a startup sequence"
+    );
+    assert!(
+        f.niri().app_system.shows_running_dot("a.desktop"),
+        "a starting app already shows the running dot (`appDisplay.js:3007`)"
+    );
+    assert!(
+        !f.niri().app_system.can_open_new_window("a.desktop"),
+        "a starting app cannot be asked for another window (`shell-app.c:606-611`)"
+    );
+    assert_eq!(
+        recorder.calls.borrow()[0].2.as_deref(),
+        Some("tok-1"),
+        "the activation token reaches the launcher, which exports it to the child"
+    );
+
+    // Its first window completes the sequence.
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("a");
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.niri().app_system.app_state("a.desktop"),
+        AppState::Running,
+        "the mapping window completes the sequence"
+    );
+    assert_eq!(
+        f.niri().app_system.starting_apps().count(),
+        0,
+        "the sequence is consumed, not left open"
+    );
+}
+
+/// A launch that never produces a window stops being `STARTING` after mutter's
+/// `STARTUP_TIMEOUT_MS` (`startup-notification.c:38,483-512`) — otherwise a failed
+/// spawn would leave a permanent running dot.
+#[test]
+fn a_startup_sequence_that_never_maps_expires() {
+    use crate::app_system::{
+        AppEntry, AppState, AppSystem, FakeCatalog, RecordingLauncher, STARTUP_TIMEOUT,
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let now = get_monotonic_time();
+    f.niri()
+        .app_system
+        .begin_startup("a.desktop", None, None, now);
+    assert_eq!(
+        f.niri().app_system.app_state("a.desktop"),
+        AppState::Starting
+    );
+
+    assert!(
+        !f.niri()
+            .app_system
+            .expire_startups(now + STARTUP_TIMEOUT - Duration::from_millis(1)),
+        "the sequence outlives everything up to the timeout"
+    );
+    assert!(f
+        .niri()
+        .app_system
+        .expire_startups(now + STARTUP_TIMEOUT + Duration::from_millis(1)));
+    assert_eq!(
+        f.niri().app_system.app_state("a.desktop"),
+        AppState::Stopped,
+        "an expired sequence leaves the app stopped, not starting forever"
+    );
+}
+
 /// **S6 — running apps.** A mapped window makes its app *running*, through the
 /// compositor's own bookkeeping: the real xdg-shell `app_id` crosses the
 /// `sync_running_apps` seam in `State::refresh`, runs the `StartupWMClass` ladder
@@ -9839,7 +9983,7 @@ fn overview_mapped_window_marks_its_app_running() {
         ["org.example.Editor.desktop"],
         "the mapped window's app_id resolved through StartupWMClass"
     );
-    assert_eq!(f.niri().app_system.running()[0].n_windows, 1);
+    assert_eq!(f.niri().app_system.running()[0].n_windows(), 1);
     assert!(f.niri().app_system.is_running("org.example.Editor.desktop"));
 
     // Unmap: the app stops running.
@@ -9932,7 +10076,7 @@ fn overview_dash_shows_running_apps_after_a_separator() {
             .calls
             .borrow()
             .iter()
-            .map(|(e, _)| e.id.clone())
+            .map(|(e, _, _)| e.id.clone())
             .collect::<Vec<_>>(),
         ["runner.desktop"],
         "the running tile is a live launch target"

@@ -12,6 +12,10 @@ pub struct Unmapped {
     pub state: InitialConfigureState,
     /// Activation token, if one was used on this unmapped window.
     pub activation_token_data: Option<XdgActivationTokenData>,
+    /// The token *string*, kept alongside the data so a mapping window can be
+    /// matched against an open startup sequence by id — mutter's
+    /// `xdg_activation_token_lookup` path (`meta-wayland-activation.c:339-347`).
+    pub activation_token: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -87,6 +91,7 @@ impl Unmapped {
                 wants_maximized: false,
             },
             activation_token_data: None,
+            activation_token: None,
         }
     }
 

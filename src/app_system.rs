@@ -29,10 +29,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gio::glib;
 use gio_unix::prelude::*;
 use gio_unix::DesktopAppInfo;
+
+use crate::layout::workspace::WorkspaceId;
+use crate::window::mapped::MappedId;
 
 /// A plain-data snapshot of an app's icon (`g_app_info_get_icon()`), resolved to
 /// pixels by [`crate::render_helpers::icon::AppIconCache`]. Mirrors the `GIcon`
@@ -140,14 +144,20 @@ pub enum LaunchError {
 /// [`AppSystem::app_for_window`] for what the single `app_id` costs us.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningWindow {
+    /// The compositor's handle for the window — what a per-window menu verb
+    /// ("Open Windows", Quit) acts on. GNOME passes the `MetaWindow` itself.
+    pub id: MappedId,
     /// The xdg-shell `app_id` — our only `WM_CLASS` analogue.
     pub app_id: Option<String>,
+    /// The toplevel title — an "Open Windows" row's label, falling back to the app
+    /// name when empty (`_updateWindowsSection`, `appMenu.js:283`).
+    pub title: Option<String>,
     /// `Mapped::get_focus_timestamp()`, standing in for
     /// `shell_app_get_last_user_time()` in [`shell_app_compare`]'s last clause.
     /// `None` (never focused) sorts last, as GNOME's `0` does.
     ///
     /// [`shell_app_compare`]: AppSystem::running
-    pub last_focus: Option<std::time::Duration>,
+    pub last_focus: Option<Duration>,
 }
 
 /// An application with at least one open window — an entry of
@@ -156,11 +166,60 @@ pub struct RunningWindow {
 pub struct RunningApp {
     /// The resolved desktop id.
     pub id: String,
-    /// How many windows resolved to this app.
-    pub n_windows: usize,
+    /// Its windows, most recently used first — `shell_app_get_windows()`
+    /// (`shell-app.c:733`), whose order is `shell_app_compare_windows` (`:692`)
+    /// reduced the same way [`AppSystem::running`] reduces `shell_app_compare`.
+    pub windows: Vec<RunningWindow>,
     /// The most recent `last_focus` among them — the app's user time.
-    pub last_focus: Option<std::time::Duration>,
+    pub last_focus: Option<Duration>,
 }
+
+impl RunningApp {
+    /// How many windows resolved to this app — `shell_app_get_n_windows()`.
+    pub fn n_windows(&self) -> usize {
+        self.windows.len()
+    }
+}
+
+/// An app's lifecycle state — `ShellAppState` (`shell-app.h`).
+///
+/// **Derived, not stored.** GNOME keeps this on the app object and transitions it
+/// imperatively (`shell_app_state_transition`, `shell-app.c:911`); we recompute it
+/// from the two inputs that drive those transitions — an open startup sequence and
+/// the window snapshot — so there is no edge to miss. See
+/// [`AppSystem::app_state`] and `docs/fork/app-lifecycle-port.md` §3.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppState {
+    Stopped,
+    Starting,
+    Running,
+}
+
+/// An in-flight launch — mutter's `MetaStartupSequence` (`startup-notification.c`).
+///
+/// On Wayland mutter mints the id itself rather than waiting for the client:
+/// `meta_launch_context_get_startup_notify_id` (`meta-launch-context.c:158-184`)
+/// generates a UUID, registers the sequence and exports the id to the child. We do
+/// the same with an xdg-activation token, so the sequence exists from the moment we
+/// spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupSequence {
+    /// The xdg-activation token handed to the child — the sequence's id. `None`
+    /// when the launcher could not mint one (headless tests, GIO failures); the
+    /// sequence then completes by app-id match only, which is mutter's
+    /// `find_startup_sequence_by_wmclass` fallback (`display.c:2679`).
+    pub token: Option<String>,
+    /// Where the app's first window should open, if the launch asked for one —
+    /// `meta_startup_sequence_get_workspace` (`startup-notification.c:364`),
+    /// applied in `meta_display_apply_startup_properties` (`display.c:2720`).
+    pub workspace: Option<WorkspaceId>,
+    /// When the sequence times out — `STARTUP_TIMEOUT_MS`
+    /// (`startup-notification.c:38`).
+    pub expires: Duration,
+}
+
+/// mutter's `STARTUP_TIMEOUT_MS` (`startup-notification.c:38`).
+pub const STARTUP_TIMEOUT: Duration = Duration::from_millis(15000);
 
 /// The enumerate/lookup/search seam — GIO in production, a fake in tests.
 pub trait AppCatalog {
@@ -176,7 +235,14 @@ pub trait AppCatalog {
 /// The launch seam — real GIO spawn in production, a recorder in tests so the
 /// corpus never spawns a process.
 pub trait AppLauncher {
-    fn launch(&self, entry: &AppEntry, verb: &ResolvedLaunch) -> Result<(), String>;
+    /// `token` is the xdg-activation token to export to the child, if one was
+    /// minted (see [`LaunchContext`]).
+    fn launch(
+        &self,
+        entry: &AppEntry,
+        verb: &ResolvedLaunch,
+        token: Option<&str>,
+    ) -> Result<(), String>;
 }
 
 /// The compositor-owned application model. Owned on `Niri`; fed from the
@@ -201,6 +267,10 @@ pub struct AppSystem {
     windows: Vec<RunningWindow>,
     /// `windows` resolved, grouped and ordered — `get_running()`'s answer.
     running: Vec<RunningApp>,
+    /// Open startup sequences by desktop id — the `STARTING` half of
+    /// [`app_state`](Self::app_state). Keyed by id rather than by token because
+    /// that is the lookup every consumer does; the token is matched inside.
+    starting: HashMap<String, StartupSequence>,
 }
 
 /// Desktop-id prefixes tried when a bare `WM_CLASS`-derived basename misses
@@ -220,6 +290,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
+            starting: HashMap::new(),
         }
     }
 
@@ -239,6 +310,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
+            starting: HashMap::new(),
         };
         system.refresh();
 
@@ -292,6 +364,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
+            starting: HashMap::new(),
         };
         system.refresh();
         system
@@ -453,18 +526,27 @@ impl AppSystem {
             };
             match apps.iter_mut().find(|a| a.id == entry.id) {
                 Some(app) => {
-                    app.n_windows += 1;
+                    app.windows.push(window.clone());
                     app.last_focus = app.last_focus.max(window.last_focus);
                 }
                 None => apps.push(RunningApp {
                     id: entry.id,
-                    n_windows: 1,
+                    windows: vec![window.clone()],
                     last_focus: window.last_focus,
                 }),
             }
         }
 
         // Most recent first; never-focused (`None`) last, as GNOME's `0` sorts.
+        // Windows within an app take the same order — `shell_app_get_windows()`
+        // hands them out sorted by `shell_app_compare_windows`.
+        for app in &mut apps {
+            app.windows.sort_by(|a, b| {
+                b.last_focus
+                    .cmp(&a.last_focus)
+                    .then_with(|| a.id.get().cmp(&b.id.get()))
+            });
+        }
         apps.sort_by(|a, b| {
             b.last_focus
                 .cmp(&a.last_focus)
@@ -480,10 +562,122 @@ impl AppSystem {
         &self.running
     }
 
-    /// Whether `id` has at least one open window — what the running dot reads
-    /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007`).
+    /// Whether `id` has at least one open window.
     pub fn is_running(&self, id: &str) -> bool {
         self.running.iter().any(|a| a.id == id)
+    }
+
+    /// The running entry for `id`, if it has windows.
+    pub fn running_app(&self, id: &str) -> Option<&RunningApp> {
+        self.running.iter().find(|a| a.id == id)
+    }
+
+    /// `id`'s lifecycle state — `shell_app_get_state()`.
+    ///
+    /// The sequence is checked *first*, which is `shell_app_sync_running_state`'s
+    /// "while STARTING, do nothing" (`shell-app.c:948`): a launching app does not
+    /// read STOPPED merely because no window has arrived yet.
+    pub fn app_state(&self, id: &str) -> AppState {
+        if self.starting.contains_key(id) {
+            AppState::Starting
+        } else if self.is_running(id) {
+            AppState::Running
+        } else {
+            AppState::Stopped
+        }
+    }
+
+    /// Whether the running dot shows — every state but STOPPED
+    /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007-3012`).
+    pub fn shows_running_dot(&self, id: &str) -> bool {
+        self.app_state(id) != AppState::Stopped
+    }
+
+    /// Whether `id` can be asked for a new window — `shell_app_can_open_new_window`
+    /// (`shell-app.c:598-670`) reduced to what we can observe.
+    ///
+    /// GNOME's ladder consults the app's exported action group and the
+    /// `SingleMainWindow` / `X-GNOME-SingleWindow` desktop keys. We have no action
+    /// muxer (`docs/fork/app-lifecycle-port.md` §5); the desktop keys are not in
+    /// [`AppEntry`] yet, so a running app falls through to GNOME's own
+    /// err-on-the-side-of-yes default, and the leading clause — "stopped apps can
+    /// always, starting apps never" (`:606-611`) — is exact.
+    pub fn can_open_new_window(&self, id: &str) -> bool {
+        match self.app_state(id) {
+            AppState::Stopped => true,
+            AppState::Starting => false,
+            AppState::Running => true,
+        }
+    }
+
+    /// Open a startup sequence for `id` — mutter registering one from its launch
+    /// context (`meta-launch-context.c:158-184`). A second launch of the same app
+    /// replaces the first, as re-keying the id does in mutter's table.
+    pub fn begin_startup(
+        &mut self,
+        id: &str,
+        token: Option<String>,
+        workspace: Option<WorkspaceId>,
+        now: Duration,
+    ) {
+        self.starting.insert(
+            id.to_owned(),
+            StartupSequence {
+                token,
+                workspace,
+                expires: now + STARTUP_TIMEOUT,
+            },
+        );
+    }
+
+    /// Complete the sequence a mapping window belongs to, returning the workspace
+    /// that sequence asked for — `meta_display_apply_startup_properties`
+    /// (`display.c:2661-2731`). The window's own activation token is matched first;
+    /// failing that we match the resolved app id, which is mutter's
+    /// `find_startup_sequence_by_wmclass` fallback.
+    pub fn complete_startup(
+        &mut self,
+        app_id: Option<&str>,
+        token: Option<&str>,
+        now: Duration,
+    ) -> Option<WorkspaceId> {
+        self.expire_startups(now);
+
+        let by_token = token.and_then(|token| {
+            self.starting
+                .iter()
+                .find(|(_, seq)| seq.token.as_deref() == Some(token))
+                .map(|(id, _)| id.clone())
+        });
+        let key = by_token.or_else(|| {
+            let app_id = app_id?;
+            // Unresolvable ids still key the table (that is what `launch` inserts
+            // when the catalog is a fake), so fall back to the raw string.
+            let desktop_id = self
+                .app_for_window(app_id)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| app_id.to_owned());
+            self.starting
+                .contains_key(&desktop_id)
+                .then_some(desktop_id)
+        })?;
+
+        self.starting.remove(&key).and_then(|seq| seq.workspace)
+    }
+
+    /// Drop sequences past `STARTUP_TIMEOUT` — `startup_sequence_timeout`
+    /// (`startup-notification.c:483-512`). Returns whether any went away, since
+    /// that is an app-state change the dash and menus want to see.
+    pub fn expire_startups(&mut self, now: Duration) -> bool {
+        let before = self.starting.len();
+        self.starting.retain(|_, seq| seq.expires > now);
+        self.starting.len() != before
+    }
+
+    /// The apps with an open startup sequence — for the corpus, and for whoever
+    /// schedules the expiry sweep.
+    pub fn starting_apps(&self) -> impl Iterator<Item = &str> {
+        self.starting.keys().map(|s| s.as_str())
     }
 
     /// The installed apps that should be shown (`g_app_info_should_show`) — the
@@ -641,13 +835,49 @@ impl AppSystem {
 
     /// Launch an app by id with the given mode. Resolves the intent to a
     /// [`ResolvedLaunch`] above the launcher seam so the policy is testable
-    /// without spawning.
-    pub fn launch(&mut self, id: &str, mode: LaunchMode) -> Result<(), LaunchError> {
+    /// without spawning, and — on success — opens the startup sequence that puts
+    /// the app in [`AppState::Starting`], which is what mutter's launch context
+    /// does as a side effect of handing out a startup id.
+    pub fn launch(
+        &mut self,
+        id: &str,
+        mode: LaunchMode,
+        ctx: &LaunchContext,
+    ) -> Result<(), LaunchError> {
         let entry = self.lookup(id).ok_or(LaunchError::UnknownApp)?;
         let verb = resolve_launch(mode, &entry);
         self.launcher
-            .launch(&entry, &verb)
-            .map_err(LaunchError::Failed)
+            .launch(&entry, &verb, ctx.token.as_deref())
+            .map_err(LaunchError::Failed)?;
+        self.begin_startup(&entry.id, ctx.token.clone(), ctx.workspace, ctx.now);
+        Ok(())
+    }
+}
+
+/// The launch context — mutter's `MetaLaunchContext` reduced to what crosses our
+/// seam (`meta-launch-context.c`). Built by the caller, which is the only place
+/// with an activation state to mint a token from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchContext {
+    /// The xdg-activation token exported to the child as `XDG_ACTIVATION_TOKEN` /
+    /// `DESKTOP_STARTUP_ID`, and the startup sequence's id.
+    pub token: Option<String>,
+    /// The workspace the app's first window should open on, if this launch asked
+    /// for one (`meta_launch_context_set_workspace`).
+    pub workspace: Option<WorkspaceId>,
+    /// Now, for the sequence's expiry.
+    pub now: Duration,
+}
+
+impl LaunchContext {
+    /// A context with no token and no workspace — what a test, or a launch that
+    /// could not mint a token, uses.
+    pub fn bare(now: Duration) -> Self {
+        Self {
+            token: None,
+            workspace: None,
+            now,
+        }
     }
 }
 
@@ -768,15 +998,19 @@ impl AppCatalog for GioCatalog {
 
 /// The production launcher. Re-resolves the desktop entry (thread-safe,
 /// cache-backed) and launches through [`scoped_launch_context`], so the app lands
-/// in its own systemd scope. Startup-notify/timestamp wrapping is still a deferred
-/// refinement (`overview-port.md` §4).
+/// in its own systemd scope, carrying the startup-notification token.
 struct GioLauncher;
 
 impl AppLauncher for GioLauncher {
-    fn launch(&self, entry: &AppEntry, verb: &ResolvedLaunch) -> Result<(), String> {
+    fn launch(
+        &self,
+        entry: &AppEntry,
+        verb: &ResolvedLaunch,
+        token: Option<&str>,
+    ) -> Result<(), String> {
         let desktop = DesktopAppInfo::new(&entry.id)
             .ok_or_else(|| format!("no desktop entry: {}", entry.id))?;
-        let context = scoped_launch_context();
+        let context = scoped_launch_context(token);
         match verb {
             ResolvedLaunch::Default => desktop
                 .launch(&[], Some(&context))
@@ -793,10 +1027,21 @@ impl AppLauncher for GioLauncher {
 ///
 /// GNOME builds the same thing in `shell-global.c:1221` (`create_app_launch_context`) and hooks
 /// `launched` at line 1206; see [`crate::utils::spawning::start_app_scope`] for why the scope
-/// matters. Ours carries only the scope hookup — GNOME's context also plumbs the startup
-/// notification and target workspace, which we do not have yet.
-fn scoped_launch_context() -> gio::AppLaunchContext {
+/// matters.
+///
+/// The startup notification rides along as `token`. mutter gets it for free by
+/// overriding `get_startup_notify_id` on its own `GAppLaunchContext` subclass
+/// (`meta-launch-context.c:129`), which GIO then exports to the child; a plain
+/// `GAppLaunchContext` has no such id, so we set the two environment variables GIO
+/// would have set. `DESKTOP_STARTUP_ID` goes along with it because
+/// `g_desktop_app_info` sets both, and XWayland clients (through
+/// xwayland-satellite) only understand the latter.
+fn scoped_launch_context(token: Option<&str>) -> gio::AppLaunchContext {
     let context = gio::AppLaunchContext::new();
+    if let Some(token) = token {
+        context.setenv("XDG_ACTIVATION_TOKEN", token);
+        context.setenv("DESKTOP_STARTUP_ID", token);
+    }
     context.connect_launched(|_context, info, platform_data| {
         let Some(pid) = launched_pid(platform_data) else {
             return;
@@ -843,7 +1088,12 @@ impl AppCatalog for EmptyCatalog {
 struct NullLauncher;
 
 impl AppLauncher for NullLauncher {
-    fn launch(&self, entry: &AppEntry, _verb: &ResolvedLaunch) -> Result<(), String> {
+    fn launch(
+        &self,
+        entry: &AppEntry,
+        _verb: &ResolvedLaunch,
+        _token: Option<&str>,
+    ) -> Result<(), String> {
         tracing::warn!(
             "ignoring launch of {} on a disconnected AppSystem",
             entry.id
@@ -887,17 +1137,29 @@ impl AppCatalog for FakeCatalog {
     }
 }
 
-/// A launcher that records `(entry, verb)` instead of spawning.
+/// One recorded launch: the resolved entry, the verb, and the activation token
+/// that would have been exported to the child.
+#[cfg(test)]
+pub type RecordedLaunch = (AppEntry, ResolvedLaunch, Option<String>);
+
+/// A launcher that records [`RecordedLaunch`]es instead of spawning.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub struct RecordingLauncher {
-    pub calls: std::rc::Rc<std::cell::RefCell<Vec<(AppEntry, ResolvedLaunch)>>>,
+    pub calls: std::rc::Rc<std::cell::RefCell<Vec<RecordedLaunch>>>,
 }
 
 #[cfg(test)]
 impl AppLauncher for RecordingLauncher {
-    fn launch(&self, entry: &AppEntry, verb: &ResolvedLaunch) -> Result<(), String> {
-        self.calls.borrow_mut().push((entry.clone(), verb.clone()));
+    fn launch(
+        &self,
+        entry: &AppEntry,
+        verb: &ResolvedLaunch,
+        token: Option<&str>,
+    ) -> Result<(), String> {
+        self.calls
+            .borrow_mut()
+            .push((entry.clone(), verb.clone(), token.map(|t| t.to_owned())));
         Ok(())
     }
 }
@@ -1095,7 +1357,11 @@ mod tests {
         let mut system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
 
         system
-            .launch("org.example.App.desktop", LaunchMode::Activate)
+            .launch(
+                "org.example.App.desktop",
+                LaunchMode::Activate,
+                &LaunchContext::bare(Duration::ZERO),
+            )
             .expect("launch");
         {
             let calls = recorder.calls.borrow();
@@ -1106,7 +1372,11 @@ mod tests {
         }
 
         assert_eq!(
-            system.launch("nope.desktop", LaunchMode::Activate),
+            system.launch(
+                "nope.desktop",
+                LaunchMode::Activate,
+                &LaunchContext::bare(Duration::ZERO)
+            ),
             Err(LaunchError::UnknownApp)
         );
         assert_eq!(
@@ -1166,8 +1436,13 @@ mod tests {
             Box::new(recorder.clone()),
         );
 
-        system.launch("w.desktop", LaunchMode::NewWindow).unwrap();
-        system.launch("p.desktop", LaunchMode::NewWindow).unwrap();
+        let ctx = LaunchContext::bare(Duration::ZERO);
+        system
+            .launch("w.desktop", LaunchMode::NewWindow, &ctx)
+            .unwrap();
+        system
+            .launch("p.desktop", LaunchMode::NewWindow, &ctx)
+            .unwrap();
 
         let calls = recorder.calls.borrow();
         assert_eq!(calls[0].1, ResolvedLaunch::Action("new-window".to_string()));
@@ -1387,8 +1662,10 @@ mod tests {
 
     fn win(app_id: &str, secs: Option<u64>) -> RunningWindow {
         RunningWindow {
+            id: MappedId::next(),
             app_id: Some(app_id.to_owned()),
-            last_focus: secs.map(std::time::Duration::from_secs),
+            title: None,
+            last_focus: secs.map(Duration::from_secs),
         }
     }
 
@@ -1513,7 +1790,7 @@ mod tests {
         let running = system.running();
         assert_eq!(running.len(), 2);
         let a = running.iter().find(|r| r.id == "a.desktop").unwrap();
-        assert_eq!(a.n_windows, 2);
+        assert_eq!(a.n_windows(), 2);
         assert_eq!(a.last_focus, Some(std::time::Duration::from_secs(9)));
         assert!(system.is_running("a.desktop"));
         assert!(!system.is_running("c.desktop"));
@@ -1542,8 +1819,10 @@ mod tests {
             win("a", Some(1)),
             win("nonesuch", Some(2)),
             RunningWindow {
+                id: MappedId::next(),
                 app_id: None,
-                last_focus: Some(std::time::Duration::from_secs(3)),
+                title: None,
+                last_focus: Some(Duration::from_secs(3)),
             },
         ]);
         let ids: Vec<&str> = system.running().iter().map(|r| r.id.as_str()).collect();
@@ -1555,13 +1834,18 @@ mod tests {
     #[test]
     fn set_windows_reports_resolved_changes_only() {
         let mut system = system_with(vec![AppEntry::fake("a.desktop", "A")]);
-        assert!(system.set_windows(vec![win("a", Some(1))]));
+        let a = win("a", Some(1));
+        assert!(system.set_windows(vec![a.clone()]));
         assert!(
-            !system.set_windows(vec![win("a", Some(1)), win("nonesuch", Some(2))]),
+            !system.set_windows(vec![a.clone(), win("nonesuch", Some(2))]),
             "an unresolvable window must not trigger a redisplay"
         );
+        let refocused = RunningWindow {
+            last_focus: Some(Duration::from_secs(4)),
+            ..a
+        };
         assert!(
-            system.set_windows(vec![win("a", Some(4))]),
+            system.set_windows(vec![refocused]),
             "a focus-order change must trigger one"
         );
     }

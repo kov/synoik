@@ -87,6 +87,7 @@ impl CompositorHandler for State {
                         window,
                         state,
                         activation_token_data,
+                        activation_token,
                     } = entry.remove();
 
                     window.on_commit();
@@ -280,13 +281,26 @@ impl CompositorHandler for State {
                     };
                     let window = mapped.window.clone();
 
-                    // A window launched onto a workspace (an app icon dropped on
-                    // it in the overview) opens there, unless a window rule already
-                    // pinned one. gnome-shell's `open_new_window(workspaceIndex)`
-                    // routes through the startup-notification launch context;
-                    // `claim_pending_launch` is our stand-in.
-                    let workspace_id =
-                        workspace_id.or_else(|| self.niri.claim_pending_launch(app_id.as_deref()));
+                    // A window launched onto a workspace (an app icon dropped on it
+                    // in the overview) opens there, unless a window rule already
+                    // pinned one. This is `meta_display_apply_startup_properties`
+                    // (`mutter/src/core/display.c:2661-2731`): the window completes
+                    // the startup sequence it belongs to — matched by its activation
+                    // token, else by app id — and inherits that sequence's workspace.
+                    let workspace_id = workspace_id.or_else(|| {
+                        let target = self.niri.app_system.complete_startup(
+                            app_id.as_deref(),
+                            activation_token.as_deref(),
+                            get_monotonic_time(),
+                        )?;
+                        // The workspace may be gone by the time the app got around
+                        // to mapping.
+                        self.niri
+                            .layout
+                            .workspaces()
+                            .any(|(_, _, ws)| ws.id() == target)
+                            .then_some(target)
+                    });
 
                     let target = if let Some(p) = &parent {
                         // Open dialogs next to their parent window.

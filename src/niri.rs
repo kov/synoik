@@ -221,11 +221,6 @@ const ALL_RENDER_TARGETS: [RenderTarget; RenderTarget::COUNT] = [
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
 
-/// How long an [app-launch workspace intent](Niri::expect_launch_on_workspace)
-/// stays claimable — mutter's `STARTUP_TIMEOUT_MS`
-/// (`src/core/startup-notification.c:38`), the same 15s a startup sequence lives.
-const PENDING_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// How long the app catalog waits for `installed-changed` pings to stop before
 /// reloading — gnome-shell's `DEFAULT_TIMEOUT_SECONDS` (`src/shell-app-cache.c:28`),
 /// which it uses both as the coalescing timeout and as its directory monitors'
@@ -296,18 +291,6 @@ pub struct AppGridPan {
     pub origin: Point<f64, Logical>,
     pub last: Point<f64, Logical>,
     pub dragging: bool,
-}
-
-/// An app launched onto a particular workspace, waiting for its window. See
-/// [`Niri::expect_launch_on_workspace`].
-#[derive(Debug)]
-pub struct PendingLaunch {
-    /// The desktop id that was launched.
-    pub app_id: String,
-    /// Where its first window should open.
-    pub workspace: WorkspaceId,
-    /// When this intent stops being claimable.
-    pub expires: Duration,
 }
 
 pub struct Niri {
@@ -656,8 +639,6 @@ pub struct Niri {
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
     pub preview_close_hovered: Option<Window>,
-    /// Workspaces claimed by apps launched onto them — see [`PendingLaunch`].
-    pub pending_launches: Vec<PendingLaunch>,
     /// An app icon being dragged onto a workspace — see [`AppDrag`].
     pub app_drag: Option<AppDrag>,
     /// The icon whose context menu is open, so it can keep its highlight for as long as
@@ -3932,7 +3913,6 @@ impl Niri {
             folder_dialog: crate::ui::folder_dialog::FolderDialog::new(animation_clock.clone()),
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
-            pending_launches: Vec::new(),
             app_drag: None,
             app_menu_source: None,
             app_icon_uploads: crate::ui::widget::SharedAppIconUploads::default(),
@@ -9085,53 +9065,6 @@ impl Niri {
         }
     }
 
-    /// Remember that the next window of `app_id` (a desktop id) should open on
-    /// `workspace` — what gnome-shell expresses as `app.open_new_window(index)`
-    /// when an app icon is dropped on a workspace (`workspace.js:1429-1434`).
-    ///
-    /// mutter carries that through a startup-notification sequence bound to the
-    /// launch context; we have no launch context, so the intent is parked here and
-    /// claimed by the first window that resolves to the app. It expires on the same
-    /// clock a startup sequence does (`STARTUP_TIMEOUT_MS`,
-    /// `mutter/src/core/startup-notification.c:38`), so a launch that never
-    /// produces a window can't misplace an unrelated one later.
-    pub fn expect_launch_on_workspace(&mut self, app_id: String, workspace: WorkspaceId) {
-        let expires = get_monotonic_time() + PENDING_LAUNCH_TIMEOUT;
-        self.pending_launches.retain(|p| p.app_id != app_id);
-        self.pending_launches.push(PendingLaunch {
-            app_id,
-            workspace,
-            expires,
-        });
-    }
-
-    /// Claim the workspace a mapping window was launched onto, if any: the
-    /// window's `app_id` is resolved to a desktop id the same way the running-app
-    /// tracker resolves it, and a matching (unexpired) intent is consumed.
-    pub fn claim_pending_launch(&mut self, app_id: Option<&str>) -> Option<WorkspaceId> {
-        let now = get_monotonic_time();
-        self.pending_launches.retain(|p| p.expires > now);
-
-        let app_id = app_id?;
-        let desktop_id = self
-            .app_system
-            .app_for_window(app_id)
-            .map(|entry| entry.id)
-            .unwrap_or_else(|| app_id.to_owned());
-
-        let idx = self
-            .pending_launches
-            .iter()
-            .position(|p| p.app_id == desktop_id)?;
-        let pending = self.pending_launches.remove(idx);
-
-        // The workspace may be gone by the time the app got around to mapping.
-        self.layout
-            .workspaces()
-            .any(|(_, _, ws)| ws.id() == pending.workspace)
-            .then_some(pending.workspace)
-    }
-
     /// Snapshot every mapped window into the app model's running-app tracker —
     /// our `ShellWindowTracker` bookkeeping (`shell-window-tracker.c`), which
     /// GNOME drives from `window-created`/`unmanaged`/`notify::wm-class` and the
@@ -9144,15 +9077,25 @@ impl Niri {
         use crate::app_system::RunningWindow;
         use crate::utils::with_toplevel_role;
 
+        // Sweep timed-out startup sequences here too — mutter runs a timeout source
+        // for the same purpose (`startup_sequence_timeout`,
+        // `startup-notification.c:483`). A launch that never produced a window would
+        // otherwise keep its running dot forever.
+        let expired = self.app_system.expire_startups(get_monotonic_time());
+
         let mut windows = Vec::new();
         self.layout.with_windows(|mapped, _, _, _| {
-            let app_id = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+            let (app_id, title) = with_toplevel_role(mapped.toplevel(), |role| {
+                (role.app_id.clone(), role.title.clone())
+            });
             windows.push(RunningWindow {
+                id: mapped.id(),
                 app_id,
+                title,
                 last_focus: mapped.get_focus_timestamp(),
             });
         });
-        self.app_system.set_windows(windows)
+        self.app_system.set_windows(windows) || expired
     }
 
     /// Whether the overview chrome (dash, search) is actually on screen: the GNOME
