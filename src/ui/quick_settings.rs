@@ -22,10 +22,10 @@
 //! row and the tile grid when a sink is present: a mute icon-button plus a draggable
 //! track bound to the default sink's volume.
 //!
-//! Deferred vs gnome-shell: the brightness slider, the bluetooth toggle, the
-//! per-toggle detail sub-menus (the Network tile opens settings instead of an
-//! in-menu enable/disable + connection list), and SSID/connection-name labels. The
-//! self-contained tiles, the Network status tile, the system row, the battery
+//! Deferred vs gnome-shell: the brightness slider, the Network tile's in-menu
+//! enable/disable + connection list (its detail card is just a settings entry point),
+//! and SSID/connection-name labels. The self-contained tiles, the Network status
+//! tile, the Bluetooth tile (device list included), the system row, the battery
 //! pill, and the volume slider are here.
 
 use std::cell::RefCell;
@@ -42,7 +42,8 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::system_status::{
-    self, AirplaneStatus, BatteryStatus, NetworkStatus, PowerProfileStatus,
+    self, AirplaneStatus, BatteryStatus, BluetoothRfkill, BluetoothStatus, BtAdapterState,
+    NetworkStatus, PowerProfileStatus,
 };
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{self, style, Align, Painter, ShapedText, TextShaper, TextStyle};
@@ -184,6 +185,22 @@ const CARD_BG: [f32; 4] = widget::style::CARD_BG;
 /// `%title_3` (15pt/700); rows are regular-weight `.popup-menu-item` at `DETAIL_ROW_PT`.
 const DETAIL_TITLE_PT: f64 = 15.;
 const DETAIL_ROW_PT: f64 = 11.;
+/// The bluetooth placeholder line: `.bt-menu-placeholder` extends `%title_4` = 13pt/700
+/// (`_quick-settings.scss:227-232`, `_common.scss` heading scale).
+const DETAIL_PLACEHOLDER_PT: f64 = 13.;
+/// A row's trailing sublabel color: `.device-subtitle` = `transparentize($fg_color, 0.5)`
+/// (`_quick-settings.scss:234`).
+const DETAIL_SUBTITLE_FG: [f32; 4] = [1., 1., 1., 0.5];
+
+/// A detail row's shaped text + the per-row flags the draw loop needs (so it never re-derives
+/// rows mid-bake).
+struct DetailRowRun {
+    label: ShapedText,
+    /// The trailing right-aligned sublabel run (Connect/Disconnect/busy), if any.
+    trailing: Option<ShapedText>,
+    placeholder: bool,
+    has_icon: bool,
+}
 
 /// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
 /// opens a visual group break above the row (the shutdown menu's power/session split).
@@ -196,6 +213,12 @@ struct DetailRow {
     /// Whether this row is the current selection (a trailing check, gnome-shell's
     /// `Ornament.CHECK`).
     selected: bool,
+    /// A trailing right-aligned sublabel (the bluetooth row's Connect/Disconnect,
+    /// `.device-subtitle` = fg@50%, `bluetooth.js:242-246`). Mutually exclusive with `selected`.
+    trailing: Option<String>,
+    /// A non-reactive placeholder line (the bluetooth menu's `.bt-menu-placeholder`,
+    /// `bluetooth.js:286-295`): drawn centered/bold, no hover, click consumed.
+    placeholder: bool,
 }
 
 /// Who owns the currently-open detail view. Keyed by **identity**, not a grid index, so it also
@@ -210,6 +233,8 @@ enum DetailOwner {
     Power,
     /// The Power Mode grid tile's profile picker (gnome-shell's `PowerProfilesToggle` menu).
     PowerProfile,
+    /// The Bluetooth grid tile's device list (gnome-shell's `BluetoothToggle` menu).
+    Bluetooth,
     /// The volume slider's output-device picker (gnome-shell's `OutputStreamSlider` device menu).
     Output,
     /// The mic slider's input-device picker (gnome-shell's `InputStreamSlider` device menu).
@@ -281,7 +306,18 @@ fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
         action: PopoverAction::Spawn(cmd.iter().map(|s| s.to_string()).collect()),
         separator_before,
         selected: false,
+        trailing: None,
+        placeholder: false,
     }
+}
+
+/// The live Bluetooth state a detail card renders from: the snapshot, the row order frozen when
+/// the card opened (gnome-shell reorders only at menu open, `bluetooth.js:326-331,384-393`), and
+/// the device path with a connect/disconnect in flight (its busy mark).
+struct BtDetail<'a> {
+    status: &'a BluetoothStatus,
+    order: &'a [String],
+    busy: Option<&'a str>,
 }
 
 impl DetailOwner {
@@ -289,6 +325,12 @@ impl DetailOwner {
     /// the live state the owner reflects.
     fn header(self, network: NetworkStatus) -> (Vec<String>, String) {
         match self {
+            // gnome-shell's `menu.setHeader('bluetooth-active-symbolic', _('Bluetooth'))`
+            // (`bluetooth.js:280`).
+            DetailOwner::Bluetooth => (
+                vec!["bluetooth-active-symbolic".to_string()],
+                "Bluetooth".to_string(),
+            ),
             DetailOwner::Network => (network_icons(network), network_label(network).to_string()),
             // gnome-shell's `ShutdownItem` menu header (`status/system.js`).
             DetailOwner::Power => (
@@ -320,24 +362,82 @@ impl DetailOwner {
         sink_list: &SinkList,
         source_list: &SourceList,
         power: &PowerProfileStatus,
+        bt: BtDetail<'_>,
     ) -> Vec<DetailRow> {
         match self {
+            // gnome-shell's device list (`bluetooth.js:283-304,395-408`): one row per visible
+            // (connectable, paired‖trusted, adapter on) device — icon + alias + a trailing
+            // Connect/Disconnect sublabel — in the order frozen at open with newcomers appended;
+            // a placeholder when there are none; then a separator + "Bluetooth Settings".
+            DetailOwner::Bluetooth => {
+                let visible = bt.status.visible_devices();
+                let mut ordered: Vec<&crate::system_status::BluetoothDevice> = bt
+                    .order
+                    .iter()
+                    .filter_map(|p| visible.iter().find(|d| &d.path == p).copied())
+                    .collect();
+                for d in &visible {
+                    if !bt.order.contains(&d.path) {
+                        ordered.push(d);
+                    }
+                }
+                let mut rows: Vec<DetailRow> = ordered
+                    .into_iter()
+                    .take(MAX_DEVICE_ROWS)
+                    .map(|d| DetailRow {
+                        label: d.alias.clone(),
+                        icons: d.icon_candidates(),
+                        action: PopoverAction::ConnectBluetoothDevice {
+                            path: d.path.clone(),
+                            connect: !d.connected,
+                        },
+                        separator_before: false,
+                        selected: false,
+                        // The busy mark stands in for gnome-shell's spinner (which hides the
+                        // subtitle while a connect is in flight, `bluetooth.js:225-231`).
+                        trailing: Some(if bt.busy == Some(d.path.as_str()) {
+                            "…".to_string()
+                        } else if d.connected {
+                            "Disconnect".to_string()
+                        } else {
+                            "Connect".to_string()
+                        }),
+                        placeholder: false,
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    // `.bt-menu-placeholder`, text by adapter state (`bluetooth.js:348-352`).
+                    rows.push(DetailRow {
+                        label: if bt.status.powered {
+                            "No available or connected devices"
+                        } else {
+                            "Turn on Bluetooth to connect to devices"
+                        }
+                        .to_string(),
+                        icons: Vec::new(),
+                        action: PopoverAction::Consumed,
+                        separator_before: false,
+                        selected: false,
+                        trailing: None,
+                        placeholder: true,
+                    });
+                }
+                rows.push(spawn_row(
+                    "Bluetooth Settings",
+                    &["gnome-control-center", "bluetooth"],
+                    true,
+                ));
+                rows
+            }
             // v1 Network detail: a single entry point to the full settings (the in-menu
             // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
             DetailOwner::Network => {
                 let _ = network;
-                vec![DetailRow {
-                    label: "Network Settings".to_string(),
-                    icons: Vec::new(),
-                    action: PopoverAction::Spawn(
-                        ["gnome-control-center", "network"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                    separator_before: false,
-                    selected: false,
-                }]
+                vec![spawn_row(
+                    "Network Settings",
+                    &["gnome-control-center", "network"],
+                    false,
+                )]
             }
             // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
             // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
@@ -365,6 +465,8 @@ impl DetailOwner {
                         action: PopoverAction::SetPowerProfile(profile.id().to_string()),
                         separator_before: false,
                         selected: power.active == profile.id(),
+                        trailing: None,
+                        placeholder: false,
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -388,6 +490,8 @@ impl DetailOwner {
                         action: PopoverAction::SetDefaultSink(sink.name.clone()),
                         separator_before: false,
                         selected: sink_list.default_name.as_deref() == Some(sink.name.as_str()),
+                        trailing: None,
+                        placeholder: false,
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -409,6 +513,8 @@ impl DetailOwner {
                         action: PopoverAction::SetDefaultSource(source.name.clone()),
                         separator_before: false,
                         selected: source_list.default_name.as_deref() == Some(source.name.as_str()),
+                        trailing: None,
+                        placeholder: false,
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -436,6 +542,13 @@ impl DetailOwner {
                 shape.push(true);
                 shape
             }
+            // N visible-device rows — or ONE placeholder row when there are none — then the
+            // settings row past a separator.
+            DetailOwner::Bluetooth => {
+                let mut shape = vec![false; device_count.clamp(1, MAX_DEVICE_ROWS)];
+                shape.push(true);
+                shape
+            }
         }
     }
 
@@ -455,17 +568,20 @@ impl DetailOwner {
 
     /// The natural (pre-shift) y of the bottom edge of the owner's row — where the detail card is
     /// pinned directly below (gnome-shell binds the menu container's Y to the source actor).
-    fn anchor_row_bottom(self, sliders: Sliders) -> f64 {
+    fn anchor_row_bottom(self, layout: Layout) -> f64 {
+        let sliders = layout.sliders;
+        let grid_row_bottom = |index: usize| {
+            let row = (index / COLS) as f64;
+            grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
+        };
         match self {
-            DetailOwner::Network => {
-                let row = (network_index() / COLS) as f64;
-                grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
-            }
-            // The Power Mode tile is the first appended conditional at the constant
-            // `power_profile_index()`, so its card pins below that row (same formula as Network).
+            DetailOwner::Network => grid_row_bottom(network_index()),
+            // The Bluetooth tile is inserted right after Network (index 1) — same first row.
+            DetailOwner::Bluetooth => grid_row_bottom(bluetooth_index()),
+            // The Power Mode tile is the first appended conditional; its index shifts by one when
+            // the Bluetooth tile is inserted ahead of it.
             DetailOwner::PowerProfile => {
-                let row = (power_profile_index() / COLS) as f64;
-                grid_top(sliders) + (row + 1.) * TILE_H + row * TILE_GAP
+                grid_row_bottom(power_profile_index(layout.show_bluetooth))
             }
             // The power button lives in the top system row, so its detail pins right below it —
             // above the sliders and the whole grid, which shift down.
@@ -489,12 +605,20 @@ fn network_index() -> usize {
         .unwrap_or(0)
 }
 
+/// The grid slot the Bluetooth tile occupies when shown: **inserted at 1**, right after Network —
+/// GNOME's QS tile order is network, bluetooth, powerProfiles (`panel.js:380-383`), and of the
+/// tiles we carry, Bluetooth is the only one that goes *between* existing tiles rather than
+/// appending. Pinned by a debug_assert at the hit site.
+fn bluetooth_index() -> usize {
+    1
+}
+
 /// The grid slot the Power Mode tile occupies when shown. It's the **first** conditional tile
-/// appended after [`BASE_GRID`] (before Airplane — see [`grid`]), so its index is the constant
-/// `BASE_GRID.len()` whenever present; its detail view anchors below this row. The append order is
+/// appended after [`BASE_GRID`] (before Airplane — see [`grid`]), shifted one right when the
+/// Bluetooth tile is inserted ahead of it; its detail view anchors below this row. The order is
 /// load-bearing here and pinned by a debug_assert at the hit/render sites.
-fn power_profile_index() -> usize {
-    BASE_GRID.len()
+fn power_profile_index(show_bluetooth: bool) -> usize {
+    BASE_GRID.len() + show_bluetooth as usize
 }
 
 /// The menu-local layout context: everything the pure geometry functions need to place elements,
@@ -512,6 +636,12 @@ struct Layout {
     sink_count: usize,
     source_count: usize,
     profile_count: usize,
+    /// Visible bluetooth-device count — the Bluetooth detail card's row count (min 1: the
+    /// placeholder takes a row when there are none).
+    bt_device_count: usize,
+    /// Whether the Bluetooth tile is in the grid (rfkill `available`) — it's *inserted* at index
+    /// 1, so every later tile's index shifts by it.
+    show_bluetooth: bool,
     /// The slider being dragged and the device count frozen at drag start, so a device hot-plug
     /// mid-drag can't add/remove that slider's picker arrow (which would resize the track and
     /// remap `volume_from_x`, snapping the level). Scoped to the arrow/track only — the detail
@@ -542,6 +672,7 @@ impl Layout {
             DetailOwner::Output => self.sink_count,
             DetailOwner::Input => self.source_count,
             DetailOwner::PowerProfile => self.profile_count,
+            DetailOwner::Bluetooth => self.bt_device_count,
             _ => 0,
         }
     }
@@ -552,7 +683,7 @@ impl Layout {
     fn detail_block(self) -> Option<(f64, f64)> {
         let owner = self.expanded?;
         Some((
-            owner.anchor_row_bottom(self.sliders),
+            owner.anchor_row_bottom(self),
             DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner)),
         ))
     }
@@ -629,6 +760,11 @@ enum GridTile {
     /// hardware has rfkill switches (`ShouldShowAirplaneMode`). Unlike [`Toggle`](Self::Toggle)
     /// its state isn't gsettings; unlike [`Network`](Self::Network) its click flips a value.
     Airplane,
+    /// Bluetooth (BlueZ + gsd-rfkill) — a live D-Bus-backed `QuickMenuToggle`, shown only when a
+    /// soft Bluetooth kill switch exists (gnome-shell's `available`, `bluetooth.js:103-108`).
+    /// Its body toggles the adapter (an rfkill + `Powered` write pair); its arrow opens the
+    /// device list.
+    Bluetooth,
 }
 
 /// The always-present grid tiles, row-major over two columns: Network leads in the prominent
@@ -643,14 +779,17 @@ const BASE_GRID: [GridTile; 4] = [
     GridTile::Toggle(Tile::NightLight),
 ];
 
-/// The live grid: [`BASE_GRID`] plus the two conditional tiles. **They are always appended in this
-/// exact order — PowerProfile then Airplane — never inserted.** `network_index` and
-/// `power_profile_index`/`anchor_row_bottom` resolve tile identity by a *constant* index over
-/// `BASE_GRID` (Network at its `BASE_GRID` slot; PowerProfile, the first conditional, always at
-/// `BASE_GRID.len()`), which holds only while PowerProfile precedes Airplane. Two debug_asserts at
-/// the hit site (`pointer_click`) pin both the prefix and the append order.
-fn grid(show_power_profile: bool, show_airplane: bool) -> Vec<GridTile> {
+/// The live grid: [`BASE_GRID`] with the Bluetooth tile **inserted at index 1** when shown
+/// (GNOME puts bluetooth right after network, `panel.js:380-383`) plus the two appended
+/// conditionals, **always in this exact order — PowerProfile then Airplane**. `network_index`
+/// (0, unaffected by the insertion), `bluetooth_index` (1), and
+/// `power_profile_index`/`anchor_row_bottom` (shifted by `show_bluetooth`) resolve tile identity
+/// positionally; debug_asserts at the hit site (`pointer_click`) pin the order.
+fn grid(show_bluetooth: bool, show_power_profile: bool, show_airplane: bool) -> Vec<GridTile> {
     let mut tiles = BASE_GRID.to_vec();
+    if show_bluetooth {
+        tiles.insert(bluetooth_index(), GridTile::Bluetooth);
+    }
     if show_power_profile {
         tiles.push(GridTile::PowerProfile);
     }
@@ -669,36 +808,49 @@ impl GridTile {
             GridTile::Network => network_label(network).to_string(),
             GridTile::PowerProfile => "Power Mode".to_string(),
             GridTile::Airplane => "Airplane Mode".to_string(),
+            GridTile::Bluetooth => "Bluetooth".to_string(),
         }
     }
 
-    /// The tile's second (subtitle) line, or `None` for a single-line tile. Only Power Mode has one
-    /// (the active profile name), mirroring gnome-shell's `QuickMenuToggle` subtitle.
-    fn subtitle(self, power: &PowerProfileStatus) -> Option<String> {
+    /// The tile's second (subtitle) line, or `None` for a single-line tile: Power Mode's active
+    /// profile, and Bluetooth's connected-device summary (`bluetooth.js:410-419`), mirroring
+    /// gnome-shell's `QuickMenuToggle` subtitle.
+    fn subtitle(self, power: &PowerProfileStatus, bluetooth: &BluetoothStatus) -> Option<String> {
         match self {
             GridTile::PowerProfile => Some(power.name().to_string()),
+            GridTile::Bluetooth => bluetooth.subtitle(),
             _ => None,
         }
     }
 
-    /// Candidate symbolic icon names, first that resolves wins.
-    fn icons(self, network: NetworkStatus, power: &PowerProfileStatus) -> Vec<String> {
+    /// Candidate symbolic icon names, first that resolves wins. `bt_state` is the Bluetooth
+    /// adapter state *as displayed* — the predicted override during a toggle, else the snapshot
+    /// (`bluetooth.js:114-118`).
+    fn icons(
+        self,
+        network: NetworkStatus,
+        power: &PowerProfileStatus,
+        bt_state: BtAdapterState,
+    ) -> Vec<String> {
         match self {
             GridTile::Toggle(t) => t.icons().iter().map(|s| s.to_string()).collect(),
             GridTile::Network => network_icons(network),
             GridTile::PowerProfile => vec![power.icon().to_string()],
             GridTile::Airplane => vec!["airplane-mode-symbolic".to_string()],
+            GridTile::Bluetooth => vec![BluetoothStatus::icon_for(bt_state).to_string()],
         }
     }
 
     /// Whether the tile reads as "on" (accent background): a toggle's gsettings state, Network's
-    /// connected state, Power Mode's non-Balanced state, or Airplane's active state.
+    /// connected state, Power Mode's non-Balanced state, Airplane's active state, or Bluetooth's
+    /// powered adapter (`checked = active`, `bluetooth.js:311-313`).
     fn is_on(
         self,
         toggles: QuickToggles,
         network: NetworkStatus,
         airplane: AirplaneStatus,
         power: &PowerProfileStatus,
+        bt_powered: bool,
     ) -> bool {
         match self {
             GridTile::Toggle(t) => t.is_on(toggles),
@@ -707,17 +859,20 @@ impl GridTile {
             }
             GridTile::PowerProfile => power.is_active(),
             GridTile::Airplane => airplane.active,
+            GridTile::Bluetooth => bt_powered,
         }
     }
 
     /// Whether this tile carries an expand-arrow that opens a detail view (gnome-shell's
-    /// `QuickMenuToggle`): Network and Power Mode. The toggles/Airplane are plain [`QuickToggle`]s.
-    /// (Power Mode's arrow is additionally gated on >2 profiles in [`tile_arrow_rect`],
-    /// gnome-shell's `menuEnabled`.)
+    /// `QuickMenuToggle`): Network, Power Mode, and Bluetooth. The toggles/Airplane are plain
+    /// [`QuickToggle`]s. (Power Mode's arrow is additionally gated on >2 profiles in
+    /// [`tile_arrow_rect`], gnome-shell's `menuEnabled`; Bluetooth's menu is unconditional like
+    /// gnome-shell's.)
     fn detail_owner(self) -> Option<DetailOwner> {
         match self {
             GridTile::Network => Some(DetailOwner::Network),
             GridTile::PowerProfile => Some(DetailOwner::PowerProfile),
+            GridTile::Bluetooth => Some(DetailOwner::Bluetooth),
             GridTile::Toggle(_) | GridTile::Airplane => None,
         }
     }
@@ -820,6 +975,24 @@ pub struct QuickSettings {
     /// grid; `active`/profiles drive its subtitle, icon, on-state, and (next slice) its
     /// picker.
     power: PowerProfileStatus,
+    /// Bluetooth adapter + devices (from the BlueZ watcher), for the conditionally-shown
+    /// Bluetooth tile and its device-list detail view.
+    bluetooth: BluetoothStatus,
+    /// The Bluetooth kill-switch state from gsd-rfkill: `available()` gates the tile
+    /// (`bluetooth.js:103-108,308-310`).
+    bluetooth_rfkill: BluetoothRfkill,
+    /// The adapter state shown while a body-click's rfkill/Powered writes round-trip — the
+    /// "acquiring" icon is the only feedback the click landed (gnome-shell's `_predictedState`,
+    /// `bluetooth.js:120-136`). Cleared when a snapshot's real adapter state *changes*, or by the
+    /// caller's 30 s failsafe.
+    bt_predicted: Option<BtAdapterState>,
+    /// The device path with a `Connect`/`Disconnect` in flight — its row swaps the trailing
+    /// label for a busy mark (gnome-shell's row spinner). Cleared on
+    /// [`bluetooth_connect_done`](Self::bluetooth_connect_done) or the device vanishing.
+    bt_busy: Option<String>,
+    /// The device-row order frozen when the Bluetooth detail opened ("we don't reorder the list
+    /// while the menu is open", `bluetooth.js:326-331`); newcomers append.
+    bt_row_order: Vec<String>,
     /// The battery, for the far-left power pill; `None` hides it (desktop / VM
     /// without a battery), like gnome-shell's `PowerToggle.visible = IsPresent`.
     battery: Option<BatteryStatus>,
@@ -877,6 +1050,8 @@ impl QuickSettings {
         network: NetworkStatus,
         airplane: AirplaneStatus,
         power: PowerProfileStatus,
+        bluetooth: BluetoothStatus,
+        bluetooth_rfkill: BluetoothRfkill,
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
@@ -889,6 +1064,11 @@ impl QuickSettings {
             network,
             airplane,
             power,
+            bluetooth,
+            bluetooth_rfkill,
+            bt_predicted: None,
+            bt_busy: None,
+            bt_row_order: Vec::new(),
             battery,
             audio,
             sink_list,
@@ -929,7 +1109,32 @@ impl QuickSettings {
     /// The live grid tiles (Network + toggles, plus Power Mode / Airplane when their daemons are
     /// present).
     fn grid(&self) -> Vec<GridTile> {
-        grid(self.power.show, self.airplane.show)
+        grid(
+            self.bluetooth_rfkill.available(),
+            self.power.show,
+            self.airplane.show,
+        )
+    }
+
+    /// The Bluetooth adapter state as displayed: the predicted override during a toggle, else the
+    /// live snapshot (`bluetooth.js:114-118`).
+    fn bt_effective_state(&self) -> BtAdapterState {
+        self.bt_predicted.unwrap_or(self.bluetooth.state)
+    }
+
+    /// The open detail view's rows for `owner`, with every live source threaded in.
+    fn detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
+        owner.rows(
+            self.network,
+            &self.sink_list,
+            &self.source_list,
+            &self.power,
+            BtDetail {
+                status: &self.bluetooth,
+                order: &self.bt_row_order,
+                busy: self.bt_busy.as_deref(),
+            },
+        )
     }
 
     /// The current layout context (slider presence + which detail view is open + device counts +
@@ -941,6 +1146,8 @@ impl QuickSettings {
             sink_count: self.sink_list.sinks.len(),
             source_count: self.source_list.sources.len(),
             profile_count: self.power.available.len(),
+            bt_device_count: self.bluetooth.visible_devices().len(),
+            show_bluetooth: self.bluetooth_rfkill.available(),
             drag: self.sliding,
             grid_len: self.grid().len(),
         }
@@ -982,6 +1189,78 @@ impl QuickSettings {
         true
     }
 
+    /// Adopt a fresh Bluetooth adapter/device snapshot (from the BlueZ watcher). Returns whether
+    /// it changed. Clears the predicted state when the *real* adapter state changes (gnome-shell's
+    /// `notify::default-adapter-state` → `delete this._predictedState`, `bluetooth.js:53-56`) and
+    /// the busy mark if its device vanished.
+    pub fn set_bluetooth(&mut self, bluetooth: BluetoothStatus) -> bool {
+        if self.bluetooth == bluetooth {
+            return false;
+        }
+        if bluetooth.state != self.bluetooth.state {
+            self.bt_predicted = None;
+        }
+        // An active (powered) flip rebuilds GNOME's whole device list (`notify::active` destroys
+        // every item and re-syncs, `bluetooth.js:339-346`), so the frozen order resets to the
+        // fresh sort rather than resurrecting the pre-flip order.
+        if bluetooth.powered != self.bluetooth.powered
+            && self.expanded == Some(DetailOwner::Bluetooth)
+        {
+            self.bt_row_order = bluetooth
+                .visible_devices()
+                .iter()
+                .map(|d| d.path.clone())
+                .collect();
+        }
+        if let Some(busy) = &self.bt_busy {
+            if !bluetooth.devices.iter().any(|d| &d.path == busy) {
+                self.bt_busy = None;
+            }
+        }
+        self.bluetooth = bluetooth;
+        self.content_bumped();
+        self.normalize_expanded();
+        true
+    }
+
+    /// Adopt a fresh Bluetooth rfkill snapshot (from the gsd-rfkill watcher). `available()`
+    /// grows/shrinks the grid by the Bluetooth tile (inserted at slot 1). Returns whether it
+    /// changed. Calls `normalize_expanded`: an open device list must collapse if the tile
+    /// vanishes.
+    pub fn set_bluetooth_rfkill(&mut self, rfkill: BluetoothRfkill) -> bool {
+        if self.bluetooth_rfkill == rfkill {
+            return false;
+        }
+        self.bluetooth_rfkill = rfkill;
+        self.content_bumped();
+        self.normalize_expanded();
+        true
+    }
+
+    /// A `Device1.Connect`/`Disconnect` we issued finished (either way): clear the row's busy
+    /// mark (gnome-shell's `spinner.stop()` after the await, `bluetooth.js:257-261`). Returns
+    /// whether anything changed (→ redraw).
+    pub fn bluetooth_connect_done(&mut self, path: &str) -> bool {
+        if self.bt_busy.as_deref() != Some(path) {
+            return false;
+        }
+        self.bt_busy = None;
+        self.revision += 1;
+        true
+    }
+
+    /// The 30 s failsafe on the predicted adapter state (`bluetooth.js:27,131-136`): if no real
+    /// state change ever echoes back (the write failed silently), stop showing "acquiring".
+    /// Returns whether anything changed (→ redraw).
+    pub fn clear_bluetooth_prediction(&mut self) -> bool {
+        if self.bt_predicted.is_none() {
+            return false;
+        }
+        self.bt_predicted = None;
+        self.revision += 1;
+        true
+    }
+
     /// Enforce the invariant that an open detail view's owner still exists: the Output picker is
     /// valid only while there's a slider (a bound sink) AND more than one sink to choose between —
     /// the same `>1` gate that shows its arrow. If a sink is removed (down to one) or the default
@@ -997,6 +1276,8 @@ impl QuickSettings {
             Some(DetailOwner::Input) => !sliders.mic || self.source_list.sources.len() <= 1,
             // Power picker valid only while the daemon is present AND >2 profiles (its arrow gate).
             Some(DetailOwner::PowerProfile) => !self.power.show || self.power.available.len() <= 2,
+            // The device list is valid only while its tile exists (rfkill `available`).
+            Some(DetailOwner::Bluetooth) => !self.bluetooth_rfkill.available(),
             _ => false,
         };
         if invalid {
@@ -1037,17 +1318,15 @@ impl QuickSettings {
         // An open detail view is topmost: a row runs its action (a `Spawn`, which closes the
         // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
         if let Some(owner) = self.expanded {
-            for (k, row) in owner
-                .rows(
-                    self.network,
-                    &self.sink_list,
-                    &self.source_list,
-                    &self.power,
-                )
-                .into_iter()
-                .enumerate()
-            {
+            for (k, row) in self.detail_rows(owner).into_iter().enumerate() {
                 if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+                    // A device-row click marks that row busy until the Connect/Disconnect
+                    // finishes (gnome-shell plays the spinner around the await,
+                    // `bluetooth.js:257-261`).
+                    if let PopoverAction::ConnectBluetoothDevice { path, .. } = &row.action {
+                        self.bt_busy = Some(path.clone());
+                        self.revision += 1;
+                    }
                     return row.action;
                 }
             }
@@ -1056,18 +1335,24 @@ impl QuickSettings {
             }
         }
         let tiles = self.grid();
-        debug_assert_eq!(
-            &tiles[..BASE_GRID.len()],
-            &BASE_GRID,
-            "grid() must APPEND the conditional tiles, never insert (network_index depends on it)"
+        debug_assert!(
+            matches!(tiles[0], GridTile::Network),
+            "Network leads the grid (network_index depends on it)"
+        );
+        debug_assert!(
+            tiles
+                .iter()
+                .position(|t| matches!(t, GridTile::Bluetooth))
+                .is_none_or(|i| i == bluetooth_index()),
+            "Bluetooth is the only INSERTED tile, always at slot 1 (right after Network)"
         );
         debug_assert!(
             tiles
                 .iter()
                 .position(|t| matches!(t, GridTile::PowerProfile))
-                .is_none_or(|i| i == power_profile_index()),
+                .is_none_or(|i| i == power_profile_index(layout.show_bluetooth)),
             "PowerProfile must be the FIRST appended tile (before Airplane) — \
-             power_profile_index()/anchor_row_bottom assume its constant index"
+             power_profile_index(false)/anchor_row_bottom assume its position"
         );
         for (i, &item) in tiles.iter().enumerate() {
             // A menu tile's arrow-half toggles its detail view (open, or close if already open —
@@ -1076,6 +1361,16 @@ impl QuickSettings {
             if tile_arrow_rect(i, item, layout).is_some_and(|r| r.contains(pos)) {
                 let owner = item.detail_owner();
                 self.expanded = if self.expanded == owner { None } else { owner };
+                // Freeze the device-row order at open ("we don't reorder the list while the menu
+                // is open, so do it now", `bluetooth.js:326-331`).
+                if self.expanded == Some(DetailOwner::Bluetooth) {
+                    self.bt_row_order = self
+                        .bluetooth
+                        .visible_devices()
+                        .iter()
+                        .map(|d| d.path.clone())
+                        .collect();
+                }
                 self.revision += 1;
                 return PopoverAction::Consumed;
             }
@@ -1108,6 +1403,20 @@ impl QuickSettings {
                     // gsettings/memory), so we defer the choice to `apply_popover_action`. Also
                     // echo-driven (no local flip).
                     GridTile::PowerProfile => PopoverAction::TogglePowerProfile,
+                    // Bluetooth body: gnome-shell's `toggleActive` (`bluetooth.js:120-141`) — an
+                    // rfkill write plus (when off) powering the adapter, resolved in
+                    // `apply_popover_action`. Echo-driven for the real state, but the *icon*
+                    // optimistically shows the acquiring transition (the rfkill→adapter delay is
+                    // user-visible; `_predictedState`, `bluetooth.js:126-129`).
+                    GridTile::Bluetooth => {
+                        self.bt_predicted = Some(if self.bluetooth.powered {
+                            BtAdapterState::TurningOff
+                        } else {
+                            BtAdapterState::TurningOn
+                        });
+                        self.revision += 1;
+                        PopoverAction::ToggleBluetooth
+                    }
                 };
             }
         }
@@ -1209,14 +1518,10 @@ impl QuickSettings {
         // An open detail view is topmost: a row highlights; the rest of the card
         // swallows the hover (no tile leaks through).
         if let Some(owner) = self.expanded {
-            let rows = owner.rows(
-                self.network,
-                &self.sink_list,
-                &self.source_list,
-                &self.power,
-            );
-            for k in 0..rows.len() {
-                if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+            let rows = self.detail_rows(owner);
+            for (k, row) in rows.iter().enumerate() {
+                // A placeholder line is non-reactive (`bluetooth.js:286-290`): no highlight.
+                if !row.placeholder && detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
                     return Some(QsHover::DetailRow(k));
                 }
             }
@@ -1357,14 +1662,20 @@ impl QuickSettings {
 
         // Tile icons (drawn above the chrome, so pushed before it).
         for (i, item) in self.grid().into_iter().enumerate() {
-            let on = item.is_on(self.toggles, self.network, self.airplane, &self.power);
+            let on = item.is_on(
+                self.toggles,
+                self.network,
+                self.airplane,
+                &self.power,
+                self.bluetooth.powered,
+            );
             let color = if on { FG_ON } else { FG_OFF };
             let rect = tile_rect(i, layout);
             let center = Point::from((
                 rect.loc.x + TILE_ICON_INSET + TILE_ICON / 2.,
                 rect.loc.y + rect.size.h / 2.,
             ));
-            let candidates = item.icons(self.network, &self.power);
+            let candidates = item.icons(self.network, &self.power, self.bt_effective_state());
             if let Some(el) = widget::icon_element(
                 renderer,
                 icons,
@@ -1422,16 +1733,7 @@ impl QuickSettings {
                 ) {
                     elements.push(el);
                 }
-                for (k, row) in owner
-                    .rows(
-                        self.network,
-                        &self.sink_list,
-                        &self.source_list,
-                        &self.power,
-                    )
-                    .into_iter()
-                    .enumerate()
-                {
+                for (k, row) in self.detail_rows(owner).into_iter().enumerate() {
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
@@ -1636,7 +1938,7 @@ impl QuickSettings {
                 .grid()
                 .iter()
                 .map(|item| {
-                    item.subtitle(&self.power)
+                    item.subtitle(&self.power, &self.bluetooth)
                         .map(|s| shaper.shape(&s, subtitle_style))
                         .transpose()
                 })
@@ -1652,12 +1954,7 @@ impl QuickSettings {
                 .map(|owner| -> anyhow::Result<_> {
                     let (_, title) = owner.header(self.network);
                     let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
-                    let rows = owner.rows(
-                        self.network,
-                        &self.sink_list,
-                        &self.source_list,
-                        &self.power,
-                    );
+                    let rows = self.detail_rows(owner);
                     // The card is sized from the pure `row_shape`; assert the live rows match it
                     // (count + separator positions) so the geometry can't drift from what's drawn.
                     debug_assert_eq!(
@@ -1667,7 +1964,25 @@ impl QuickSettings {
                     );
                     let row_runs = rows
                         .into_iter()
-                        .map(|r| shaper.shape(&r.label, TextStyle::new(DETAIL_ROW_PT)))
+                        .map(|r| -> anyhow::Result<DetailRowRun> {
+                            // The placeholder is `.bt-menu-placeholder` = `%title_4` (13pt/700,
+                            // centered, `_quick-settings.scss:227-232`); ordinary rows are
+                            // regular-weight menu items.
+                            let style = if r.placeholder {
+                                TextStyle::new(DETAIL_PLACEHOLDER_PT).bold()
+                            } else {
+                                TextStyle::new(DETAIL_ROW_PT)
+                            };
+                            Ok(DetailRowRun {
+                                label: shaper.shape(&r.label, style)?,
+                                trailing: r
+                                    .trailing
+                                    .map(|t| shaper.shape(&t, TextStyle::new(DETAIL_ROW_PT)))
+                                    .transpose()?,
+                                placeholder: r.placeholder,
+                                has_icon: !r.icons.is_empty(),
+                            })
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok((title_run, row_runs))
                 })
@@ -1685,7 +2000,13 @@ impl QuickSettings {
 
             for (i, item) in self.grid().into_iter().enumerate() {
                 let rect = tile_rect(i, layout);
-                let on = item.is_on(self.toggles, self.network, self.airplane, &self.power);
+                let on = item.is_on(
+                    self.toggles,
+                    self.network,
+                    self.airplane,
+                    &self.power,
+                    self.bluetooth.powered,
+                );
                 let bg = if on { self.accent } else { TILE_OFF };
                 // gnome-shell quick toggles use `$forced_circular_radius` → pill-shaped; a
                 // half-height radius clamps to the pill in `sdf_rect.frag`. The cut corners fall
@@ -1858,7 +2179,8 @@ impl QuickSettings {
                     .expanded
                     .map(|o| o.row_shape(layout.owner_device_count(o)))
                     .unwrap_or_default();
-                for (k, run) in row_runs.iter().enumerate() {
+                for (k, row_run) in row_runs.iter().enumerate() {
+                    let run = &row_run.label;
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
@@ -1887,30 +2209,42 @@ impl QuickSettings {
                     if self.hovered == Some(QsHover::DetailRow(k)) {
                         p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
                     }
-                    let has_icon = self
-                        .expanded
-                        .map(|o| {
-                            o.rows(
-                                self.network,
-                                &self.sink_list,
-                                &self.source_list,
-                                &self.power,
-                            )
-                        })
-                        .and_then(|rows| rows.into_iter().nth(k).map(|r| !r.icons.is_empty()))
-                        .unwrap_or(false);
-                    let label_x = if has_icon {
+                    let label_cy = rrect.loc.y + rrect.size.h / 2.;
+                    // The bluetooth placeholder line: centered bold text, nothing else in the row
+                    // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`).
+                    if row_run.placeholder {
+                        p.text_clipped(
+                            run,
+                            Point::from((rrect.loc.x + rrect.size.w / 2., label_cy)),
+                            Align::CENTER,
+                            FG_OFF,
+                            rrect,
+                        )?;
+                        continue;
+                    }
+                    let label_x = if row_run.has_icon {
                         rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
                     } else {
                         rrect.loc.x + DETAIL_ROW_INSET
                     };
-                    let label_cy = rrect.loc.y + rrect.size.h / 2.;
-                    // Reserve the trailing check zone (a check icon + its inset) on every row so a
-                    // long label (e.g. a verbose HDMI sink description) is clipped before it, not
-                    // drawn under the selected row's `object-select-symbolic`.
+                    // The trailing sublabel (Connect/Disconnect, `.device-subtitle` = fg@50%,
+                    // `_quick-settings.scss:234`), right-aligned where the check zone sits.
+                    let mut trailing_w = TILE_ICON;
+                    if let Some(trailing) = &row_run.trailing {
+                        trailing_w = f64::from(trailing.ink_bounds().2) / scale;
+                        p.text(
+                            trailing,
+                            Point::from((rrect.loc.x + rrect.size.w - DETAIL_ROW_INSET, label_cy)),
+                            Align::RIGHT_MIDDLE,
+                            DETAIL_SUBTITLE_FG,
+                        )?;
+                    }
+                    // Reserve the trailing zone (the check icon, or the sublabel's width) on every
+                    // row so a long label (e.g. a verbose HDMI sink description or device alias)
+                    // is clipped before it, not drawn under it.
                     let mut label_clip = rrect;
                     label_clip.size.w =
-                        (label_clip.size.w - (DETAIL_ROW_INSET + TILE_ICON)).max(0.);
+                        (label_clip.size.w - (DETAIL_ROW_INSET + trailing_w + 8.)).max(0.);
                     p.text_clipped(
                         run,
                         Point::from((label_x, label_cy)),
@@ -2070,7 +2404,7 @@ fn tile_body_rect(i: usize, tile: GridTile, layout: Layout) -> Rectangle<f64, Lo
 /// when collapsed.
 fn detail_rect(layout: Layout) -> Option<Rectangle<f64, Logical>> {
     let owner = layout.expanded?;
-    let insert_y = owner.anchor_row_bottom(layout.sliders);
+    let insert_y = owner.anchor_row_bottom(layout);
     Some(Rectangle::new(
         Point::from((PAD, insert_y + DETAIL_MARGIN)),
         Size::from((
@@ -2179,6 +2513,8 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
+            bt_device_count: 0,
+            show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
         }
@@ -2196,6 +2532,8 @@ mod tests {
                 NetworkStatus::Wired,
                 AirplaneStatus::default(),
                 PowerProfileStatus::default(),
+                BluetoothStatus::default(),
+                BluetoothRfkill::default(),
                 None,
                 audio,
                 SinkList::default(),
@@ -2247,6 +2585,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2272,6 +2612,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2314,18 +2656,26 @@ mod tests {
     fn network_tile_reflects_state_and_opens_settings() {
         let off = AirplaneStatus::default();
         let np = PowerProfileStatus::default();
-        assert!(GridTile::Network.is_on(QuickToggles::default(), NetworkStatus::Wired, off, &np));
+        assert!(GridTile::Network.is_on(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            off,
+            &np,
+            false
+        ));
         assert!(GridTile::Network.is_on(
             QuickToggles::default(),
             NetworkStatus::Wireless(60),
             off,
-            &np
+            &np,
+            false
         ));
         assert!(!GridTile::Network.is_on(
             QuickToggles::default(),
             NetworkStatus::Offline,
             off,
-            &np
+            &np,
+            false
         ));
 
         let mut qs = QuickSettings::new(
@@ -2333,6 +2683,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2359,6 +2711,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2388,6 +2742,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2415,6 +2771,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2452,6 +2810,8 @@ mod tests {
             NetworkStatus::Unknown,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             Some(battery(79.)),
             None,
             SinkList::default(),
@@ -2517,6 +2877,8 @@ mod tests {
             network,
             AirplaneStatus::default(),
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             audio,
             SinkList::default(),
@@ -2647,7 +3009,7 @@ mod tests {
         ));
         assert_eq!(q.expanded, Some(DetailOwner::Input));
 
-        let rows = DetailOwner::Input.rows(q.network, &q.sink_list, &q.source_list, &q.power);
+        let rows = q.detail_rows(DetailOwner::Input);
         assert_eq!(rows.len(), 4, "3 sources + Sound Settings");
         assert!(rows[0].selected && !rows[1].selected);
         assert_eq!(rows[3].label, "Sound Settings");
@@ -2811,6 +3173,8 @@ mod tests {
             NetworkStatus::Wired,
             airplane,
             PowerProfileStatus::default(),
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2878,6 +3242,8 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             power,
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2889,8 +3255,8 @@ mod tests {
         // Appended as the 5th tile at the constant power_profile_index (4).
         let tiles = qs.grid();
         assert_eq!(tiles.len(), 5);
-        assert_eq!(power_profile_index(), 4);
-        assert_eq!(tiles[power_profile_index()], GridTile::PowerProfile);
+        assert_eq!(power_profile_index(false), 4);
+        assert_eq!(tiles[power_profile_index(false)], GridTile::PowerProfile);
 
         // Two-line tile: static "Power Mode" title, active profile as the subtitle.
         assert_eq!(
@@ -2898,7 +3264,9 @@ mod tests {
             "Power Mode"
         );
         assert_eq!(
-            GridTile::PowerProfile.subtitle(&qs.power).as_deref(),
+            GridTile::PowerProfile
+                .subtitle(&qs.power, &qs.bluetooth)
+                .as_deref(),
             Some("Performance")
         );
         // On because the active profile isn't Balanced.
@@ -2907,10 +3275,11 @@ mod tests {
             NetworkStatus::Wired,
             AirplaneStatus::default(),
             &qs.power,
+            false,
         ));
 
         // Body click returns the toggle action; no arrow yet, so the whole tile is body.
-        let action = qs.pointer_click(center(tile_rect(power_profile_index(), qs.layout())));
+        let action = qs.pointer_click(center(tile_rect(power_profile_index(false), qs.layout())));
         assert!(matches!(action, PopoverAction::TogglePowerProfile));
 
         // Both conditionals shown: PowerProfile (4) stays ahead of Airplane (5).
@@ -2935,6 +3304,8 @@ mod tests {
                 available: profiles.to_vec(),
                 show: true,
             },
+            BluetoothStatus::default(),
+            BluetoothRfkill::default(),
             None,
             None,
             SinkList::default(),
@@ -2954,7 +3325,7 @@ mod tests {
             KnownProfile::Balanced,
             KnownProfile::PowerSaver,
         ];
-        let ppi = power_profile_index();
+        let ppi = power_profile_index(false);
 
         // >2 profiles → an arrow that opens the picker.
         let mut qs = qs_profiles("performance", &all);
@@ -2967,8 +3338,7 @@ mod tests {
         assert_eq!(qs.expanded, Some(DetailOwner::PowerProfile));
 
         // Rows: 3 profiles (reversed: performance→power-saver) + Power Settings; active checked.
-        let rows =
-            DetailOwner::PowerProfile.rows(qs.network, &qs.sink_list, &qs.source_list, &qs.power);
+        let rows = qs.detail_rows(DetailOwner::PowerProfile);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].label, "Performance");
         assert_eq!(rows[2].label, "Power Saver");
@@ -3025,7 +3395,7 @@ mod tests {
             active: false,
             show: true,
         });
-        let ppi = power_profile_index();
+        let ppi = power_profile_index(false);
         assert_eq!(qs.grid().len(), 6, "power + airplane both shown");
 
         qs.pointer_click(center(
@@ -3077,6 +3447,8 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
+            bt_device_count: 0,
+            show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -3089,6 +3461,8 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
+            bt_device_count: 0,
+            show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -3183,6 +3557,8 @@ mod tests {
                     sink_count: 0,
                     source_count: 0,
                     profile_count: 0,
+                    bt_device_count: 0,
+                    show_bluetooth: false,
                     drag: None,
                     grid_len: BASE_GRID.len(),
                 };
@@ -3211,12 +3587,7 @@ mod tests {
 
         let (_, title) = DetailOwner::Power.header(NetworkStatus::Unknown);
         assert_eq!(title, "Power Off");
-        let rows = DetailOwner::Power.rows(
-            NetworkStatus::Unknown,
-            &SinkList::default(),
-            &SourceList::default(),
-            &PowerProfileStatus::default(),
-        );
+        let rows = qs.detail_rows(DetailOwner::Power);
         assert_eq!(rows.len(), 4);
         assert!(rows[3].separator_before, "Log Out starts the session group");
 
@@ -3279,6 +3650,8 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
+            bt_device_count: 0,
+            show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -3291,6 +3664,8 @@ mod tests {
             sink_count: 0,
             source_count: 0,
             profile_count: 0,
+            bt_device_count: 0,
+            show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
         };
@@ -3417,7 +3792,7 @@ mod tests {
         q.pointer_click(center(
             slider_arrow_rect(Slider::Output, q.layout()).unwrap(),
         ));
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list, &q.power);
+        let rows = q.detail_rows(DetailOwner::Output);
         assert_eq!(rows.len(), 4, "3 sinks + Sound Settings");
         assert!(rows[0].selected && !rows[1].selected && !rows[2].selected);
         assert!(rows[3].separator_before && !rows[3].selected);
@@ -3443,7 +3818,7 @@ mod tests {
     #[test]
     fn output_picker_caps_the_sink_rows() {
         let q = qs_with_sinks(MAX_DEVICE_ROWS + 3);
-        let rows = DetailOwner::Output.rows(q.network, &q.sink_list, &q.source_list, &q.power);
+        let rows = q.detail_rows(DetailOwner::Output);
         assert_eq!(
             rows.len(),
             MAX_DEVICE_ROWS + 1,
@@ -3501,5 +3876,483 @@ mod tests {
         assert_eq!(q.expanded, Some(DetailOwner::Output));
         assert!(q.set_audio(None));
         assert!(q.expanded.is_none(), "slider vanished → no picker");
+    }
+
+    /// A rfkill snapshot with a usable soft Bluetooth switch (the tile's `available` gate).
+    fn bt_rfkill_available() -> BluetoothRfkill {
+        BluetoothRfkill {
+            airplane: false,
+            has_airplane: true,
+            hardware_airplane: false,
+        }
+    }
+
+    fn bt_device(alias: &str, connected: bool) -> crate::system_status::BluetoothDevice {
+        crate::system_status::BluetoothDevice {
+            path: format!("/org/bluez/hci0/dev_{alias}"),
+            alias: alias.to_string(),
+            icon: None,
+            connectable: true,
+            paired: true,
+            trusted: false,
+            connected,
+        }
+    }
+
+    fn bt_status(
+        powered: bool,
+        devices: Vec<crate::system_status::BluetoothDevice>,
+    ) -> BluetoothStatus {
+        BluetoothStatus {
+            adapter: Some("/org/bluez/hci0".to_string()),
+            adapter_present: true,
+            powered,
+            state: if powered {
+                BtAdapterState::On
+            } else {
+                BtAdapterState::Off
+            },
+            devices,
+        }
+    }
+
+    /// A QS with the Bluetooth tile shown (rfkill available), a powered adapter, and `devices`.
+    fn qs_bluetooth(
+        powered: bool,
+        devices: Vec<crate::system_status::BluetoothDevice>,
+    ) -> QuickSettings {
+        QuickSettings::new(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            PowerProfileStatus::default(),
+            bt_status(powered, devices),
+            bt_rfkill_available(),
+            None,
+            None,
+            SinkList::default(),
+            MicStatus::default(),
+            SourceList::default(),
+            [0, 0, 0],
+        )
+    }
+
+    /// The Bluetooth tile is INSERTED at slot 1 (right after Network, GNOME's tile order,
+    /// `panel.js:380-383`), gated on the rfkill `available`; with the appended conditionals also
+    /// shown, PowerProfile shifts one right but still precedes Airplane.
+    #[test]
+    fn bluetooth_tile_inserts_at_slot_1_when_available() {
+        // No soft switch → no tile (gnome-shell's `available`, bluetooth.js:103-108).
+        let hidden = qs(NetworkStatus::Wired, None);
+        assert!(!hidden.grid().contains(&GridTile::Bluetooth));
+
+        let mut qs = qs_bluetooth(true, Vec::new());
+        let tiles = qs.grid();
+        assert_eq!(tiles.len(), 5);
+        assert_eq!(tiles[0], GridTile::Network);
+        assert_eq!(tiles[bluetooth_index()], GridTile::Bluetooth);
+        assert_eq!(tiles[2], GridTile::Toggle(Tile::DarkStyle));
+
+        // With power + airplane too: PowerProfile lands at the shifted index, Airplane last.
+        qs.set_power_profile(PowerProfileStatus {
+            active: "balanced".to_string(),
+            available: vec![KnownProfile::Performance, KnownProfile::Balanced],
+            show: true,
+        });
+        qs.set_airplane(AirplaneStatus {
+            active: false,
+            show: true,
+        });
+        let tiles = qs.grid();
+        assert_eq!(tiles.len(), 7);
+        assert_eq!(tiles[power_profile_index(true)], GridTile::PowerProfile);
+        assert_eq!(tiles[6], GridTile::Airplane);
+
+        // A hardware kill switch takes the tile away and collapses an open device list.
+        qs.pointer_click(center(
+            tile_arrow_rect(bluetooth_index(), GridTile::Bluetooth, qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::Bluetooth));
+        assert!(qs.set_bluetooth_rfkill(BluetoothRfkill {
+            airplane: false,
+            has_airplane: true,
+            hardware_airplane: true,
+        }));
+        assert!(!qs.grid().contains(&GridTile::Bluetooth));
+        assert!(
+            qs.expanded.is_none(),
+            "an open device list must collapse when the tile vanishes"
+        );
+    }
+
+    /// The tile body click: checked = powered (`bluetooth.js:311-313`), the click returns the
+    /// deferred toggle and optimistically shows the acquiring icon (`_predictedState`,
+    /// `bluetooth.js:126-129`), which clears when a real adapter-state change echoes back
+    /// (`bluetooth.js:53-56`) — or via the 30 s failsafe.
+    #[test]
+    fn bluetooth_body_toggles_with_a_predicted_acquiring_icon() {
+        let mut qs = qs_bluetooth(true, Vec::new());
+        let i = bluetooth_index();
+        assert!(GridTile::Bluetooth.is_on(
+            QuickToggles::default(),
+            NetworkStatus::Wired,
+            AirplaneStatus::default(),
+            &PowerProfileStatus::default(),
+            true,
+        ));
+
+        let action = qs.pointer_click(center(tile_body_rect(i, GridTile::Bluetooth, qs.layout())));
+        assert!(matches!(action, PopoverAction::ToggleBluetooth));
+        assert!(qs.bluetooth.powered, "echo-driven: no local flip");
+        assert_eq!(qs.bt_effective_state(), BtAdapterState::TurningOff);
+        assert_eq!(
+            GridTile::Bluetooth.icons(
+                NetworkStatus::Wired,
+                &PowerProfileStatus::default(),
+                qs.bt_effective_state()
+            )[0],
+            "bluetooth-acquiring-symbolic"
+        );
+
+        // A snapshot with an unchanged state does NOT clear the prediction…
+        assert!(qs.set_bluetooth(bt_status(true, vec![bt_device("Buds", false)])));
+        assert_eq!(qs.bt_effective_state(), BtAdapterState::TurningOff);
+        // …but a real state change does.
+        assert!(qs.set_bluetooth(bt_status(false, Vec::new())));
+        assert_eq!(qs.bt_effective_state(), BtAdapterState::Off);
+
+        // The failsafe path (nothing ever echoed).
+        let mut qs2 = qs_bluetooth(false, Vec::new());
+        qs2.pointer_click(center(tile_body_rect(i, GridTile::Bluetooth, qs2.layout())));
+        assert_eq!(qs2.bt_effective_state(), BtAdapterState::TurningOn);
+        assert!(qs2.clear_bluetooth_prediction());
+        assert_eq!(qs2.bt_effective_state(), BtAdapterState::Off);
+        assert!(!qs2.clear_bluetooth_prediction(), "idempotent");
+    }
+
+    /// The device list: the arrow opens `DetailOwner::Bluetooth` with rows sorted connected-first
+    /// then alias, each with icon + alias + a Connect/Disconnect trailing label, then a separator
+    /// and Bluetooth Settings; a row click returns the connect action and marks the row busy
+    /// until `bluetooth_connect_done`.
+    #[test]
+    fn bluetooth_device_list_rows_and_connect_flow() {
+        let mut qs = qs_bluetooth(
+            true,
+            vec![
+                bt_device("Zeta", false),
+                bt_device("Buds", true),
+                bt_device("Alpha", false),
+            ],
+        );
+        let i = bluetooth_index();
+        let arrow = tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).expect("an arrow");
+        assert!(matches!(
+            qs.pointer_click(center(arrow)),
+            PopoverAction::Consumed
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::Bluetooth));
+
+        let rows = qs.detail_rows(DetailOwner::Bluetooth);
+        assert_eq!(rows.len(), 4, "3 devices + Bluetooth Settings");
+        assert_eq!(rows[0].label, "Buds");
+        assert_eq!(rows[0].trailing.as_deref(), Some("Disconnect"));
+        assert_eq!(rows[1].label, "Alpha");
+        assert_eq!(rows[1].trailing.as_deref(), Some("Connect"));
+        assert_eq!(rows[2].label, "Zeta");
+        assert!(rows[3].separator_before);
+        assert_eq!(rows[3].label, "Bluetooth Settings");
+
+        // Clicking Alpha's row asks to connect and marks it busy…
+        let alpha_path = "/org/bluez/hci0/dev_Alpha".to_string();
+        match qs.pointer_click(center(detail_row_rect(1, qs.layout()).unwrap())) {
+            PopoverAction::ConnectBluetoothDevice { path, connect } => {
+                assert_eq!(path, alpha_path);
+                assert!(connect);
+            }
+            other => panic!("expected ConnectBluetoothDevice, got {other:?}"),
+        }
+        let rows = qs.detail_rows(DetailOwner::Bluetooth);
+        assert_eq!(rows[1].trailing.as_deref(), Some("…"), "busy mark");
+        // …until the call reports done.
+        assert!(qs.bluetooth_connect_done(&alpha_path));
+        let rows = qs.detail_rows(DetailOwner::Bluetooth);
+        assert_eq!(rows[1].trailing.as_deref(), Some("Connect"));
+
+        // The settings row spawns control-center.
+        match qs.pointer_click(center(detail_row_rect(3, qs.layout()).unwrap())) {
+            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "bluetooth"]),
+            other => panic!("expected a spawn, got {other:?}"),
+        }
+    }
+
+    /// The order is frozen at open ("we don't reorder the list while the menu is open",
+    /// `bluetooth.js:326-331,384-408`): a connection change mid-open must not re-sort; a new
+    /// device appends; a removed device drops its row; reopening re-sorts.
+    #[test]
+    fn bluetooth_device_order_freezes_while_open() {
+        let mut qs = qs_bluetooth(
+            true,
+            vec![bt_device("Buds", true), bt_device("Mouse", false)],
+        );
+        let i = bluetooth_index();
+        let arrow = tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap();
+        qs.pointer_click(center(arrow));
+
+        // Mouse connects and Buds disconnects mid-open: sorted order would now lead with Mouse,
+        // but the frozen order keeps Buds first.
+        assert!(qs.set_bluetooth(bt_status(
+            true,
+            vec![bt_device("Buds", false), bt_device("Mouse", true)],
+        )));
+        let labels: Vec<_> = qs
+            .detail_rows(DetailOwner::Bluetooth)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(labels, ["Buds", "Mouse", "Bluetooth Settings"]);
+
+        // A newcomer appends after the frozen rows (`addMenuItem`, bluetooth.js:398-408).
+        assert!(qs.set_bluetooth(bt_status(
+            true,
+            vec![
+                bt_device("Buds", false),
+                bt_device("Mouse", true),
+                bt_device("AAA", true),
+            ],
+        )));
+        let labels: Vec<_> = qs
+            .detail_rows(DetailOwner::Bluetooth)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(labels, ["Buds", "Mouse", "AAA", "Bluetooth Settings"]);
+
+        // Reopening re-sorts: connected first (AAA, Mouse), then alias (Buds).
+        qs.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
+        )); // close
+        qs.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
+        )); // reopen
+        let labels: Vec<_> = qs
+            .detail_rows(DetailOwner::Bluetooth)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(labels, ["AAA", "Mouse", "Buds", "Bluetooth Settings"]);
+
+        // Review F2: a powered flip while open rebuilds GNOME's list (`bluetooth.js:339-346`), so
+        // the frozen order resets — power off (placeholder), power back on with a changed
+        // connection mix → the rows come back freshly sorted, not in the pre-flip order.
+        assert!(qs.set_bluetooth(bt_status(false, Vec::new())));
+        assert!(qs.detail_rows(DetailOwner::Bluetooth)[0].placeholder);
+        assert!(qs.set_bluetooth(bt_status(
+            true,
+            vec![
+                bt_device("Buds", true),
+                bt_device("Mouse", false),
+                bt_device("AAA", false),
+            ],
+        )));
+        let labels: Vec<_> = qs
+            .detail_rows(DetailOwner::Bluetooth)
+            .into_iter()
+            .map(|r| r.label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["Buds", "AAA", "Mouse", "Bluetooth Settings"],
+            "a powered flip re-freezes to the fresh sort"
+        );
+    }
+
+    /// The placeholder (`bluetooth.js:286-300,348-352`): no visible devices → one non-reactive
+    /// centered line whose text depends on the adapter state, still followed by the settings row;
+    /// it takes no hover and its click is consumed.
+    #[test]
+    fn bluetooth_placeholder_shows_without_devices() {
+        // Powered, no devices.
+        let mut qs = qs_bluetooth(true, Vec::new());
+        let i = bluetooth_index();
+        qs.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
+        ));
+        let rows = qs.detail_rows(DetailOwner::Bluetooth);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].placeholder);
+        assert_eq!(rows[0].label, "No available or connected devices");
+        assert_eq!(rows[1].label, "Bluetooth Settings");
+        assert!(matches!(
+            qs.pointer_click(center(detail_row_rect(0, qs.layout()).unwrap())),
+            PopoverAction::Consumed
+        ));
+        assert!(
+            !qs.pointer_hover(Some(center(detail_row_rect(0, qs.layout()).unwrap()))),
+            "a placeholder row takes no hover highlight"
+        );
+
+        // Adapter off (devices are ignored while off, bluetooth.js:161-164).
+        let mut qs = qs_bluetooth(false, vec![bt_device("Buds", true)]);
+        qs.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
+        ));
+        let rows = qs.detail_rows(DetailOwner::Bluetooth);
+        assert!(rows[0].placeholder);
+        assert_eq!(rows[0].label, "Turn on Bluetooth to connect to devices");
+    }
+
+    /// The tile subtitle mirrors gnome-shell's `_sync` (`bluetooth.js:410-419`), and the detail
+    /// card anchors below the Bluetooth tile's row (row 0, shared with Network).
+    #[test]
+    fn bluetooth_subtitle_and_anchor() {
+        let mut qs = qs_bluetooth(true, vec![bt_device("Buds", true)]);
+        assert_eq!(
+            GridTile::Bluetooth
+                .subtitle(&PowerProfileStatus::default(), &qs.bluetooth)
+                .as_deref(),
+            Some("Buds")
+        );
+
+        let i = bluetooth_index();
+        qs.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
+        ));
+        let card = detail_rect(qs.layout()).expect("a card when expanded");
+        let tile = tile_rect(i, qs.layout());
+        assert!(
+            (card.loc.y - (tile.loc.y + TILE_H + DETAIL_MARGIN)).abs() < 0.01,
+            "card pins directly below the Bluetooth tile's row"
+        );
+    }
+
+    /// Render differential for the new detail-card drawing: the open Bluetooth card bakes an
+    /// opaque `%card` surface, and a device row (alias + trailing Connect/Disconnect sublabel)
+    /// paints different ink than the centered placeholder. Self-skips without a Vulkan device.
+    #[test]
+    fn draws_the_bluetooth_detail_card() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{Bind, ExportMem, Texture as _};
+        use smithay::utils::Buffer as BufferCoord;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping draws_the_bluetooth_detail_card: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        let mut read_pixels = |qs: &QuickSettings| {
+            let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
+            let size = tex.size();
+            let fb = vk.bind(&mut tex).expect("bind for readback");
+            let region = Rectangle::<i32, BufferCoord>::from_size(size);
+            let mapping = vk
+                .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+                .expect("copy_framebuffer");
+            (
+                vk.map_texture(&mapping).expect("map_texture").to_vec(),
+                size,
+            )
+        };
+
+        // One connected device, detail open.
+        let mut with_device = qs_bluetooth(true, vec![bt_device("Buds", true)]);
+        let i = bluetooth_index();
+        with_device.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, with_device.layout()).unwrap(),
+        ));
+        let card = detail_rect(with_device.layout()).expect("card");
+        let (pixels, size) = read_pixels(&with_device);
+
+        // The card surface is opaque (the `%card` bg) just inside its top-left arc.
+        let cx = (card.loc.x + DETAIL_RADIUS) as i32;
+        let cy = (card.loc.y + DETAIL_RADIUS) as i32;
+        let k = ((cy * size.w + cx) * 4) as usize;
+        assert!(
+            pixels[k + 3] > 200,
+            "the detail card must bake an opaque surface, got alpha {}",
+            pixels[k + 3]
+        );
+
+        // No devices → the placeholder variant; same geometry (one row), different row ink.
+        let mut placeholder = qs_bluetooth(true, Vec::new());
+        placeholder.pointer_click(center(
+            tile_arrow_rect(i, GridTile::Bluetooth, placeholder.layout()).unwrap(),
+        ));
+        let (pixels2, size2) = read_pixels(&placeholder);
+        assert_eq!(size, size2, "both cards have one row: same menu size");
+
+        let row = detail_row_rect(0, with_device.layout()).expect("row 0");
+        let mut differs = false;
+        for y in (row.loc.y as i32)..((row.loc.y + row.size.h) as i32) {
+            for x in (row.loc.x as i32)..((row.loc.x + row.size.w) as i32) {
+                let k = ((y * size.w + x) * 4) as usize;
+                if pixels[k..k + 4] != pixels2[k..k + 4] {
+                    differs = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "a device row (alias + trailing sublabel) must paint different ink than the placeholder"
+        );
+
+        // Review F1: GNOME wraps the placeholder inside `2em 4em` padding
+        // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`; `ellipsize: NONE` +
+        // `line_wrap`, `bluetooth.js:291-294`); we draw ONE centered clipped line instead, which
+        // is only an acceptable divergence while both strings actually FIT the row unclipped —
+        // pin that, since `text_clipped` would truncate silently.
+        {
+            let row = detail_row_rect(0, placeholder.layout()).expect("placeholder row");
+            let mut shaper = TextShaper::new(&mut vk, 1.);
+            for text in [
+                "Turn on Bluetooth to connect to devices",
+                "No available or connected devices",
+            ] {
+                let run = shaper
+                    .shape(text, TextStyle::new(DETAIL_PLACEHOLDER_PT).bold())
+                    .expect("shape the placeholder");
+                let ink_w = f64::from(run.ink_bounds().2);
+                assert!(
+                    ink_w < row.size.w,
+                    "the placeholder must fit its row unclipped: {text:?} ink {ink_w} vs row {}",
+                    row.size.w
+                );
+            }
+        }
+    }
+
+    /// Review F5: with the Bluetooth tile inserted at slot 1, the Power Mode tile's index shifts
+    /// — its picker card must still pin below the Power Mode tile's own (shifted) row, not the
+    /// row the un-shifted index would name.
+    #[test]
+    fn power_picker_anchor_shifts_below_the_bluetooth_row() {
+        let mut qs = qs_bluetooth(true, Vec::new());
+        qs.set_power_profile(PowerProfileStatus {
+            active: "performance".to_string(),
+            available: vec![
+                KnownProfile::Performance,
+                KnownProfile::Balanced,
+                KnownProfile::PowerSaver,
+            ],
+            show: true,
+        });
+        let ppi = power_profile_index(true);
+        assert_eq!(qs.grid()[ppi], GridTile::PowerProfile);
+
+        qs.pointer_click(center(
+            tile_arrow_rect(ppi, GridTile::PowerProfile, qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, Some(DetailOwner::PowerProfile));
+        let card = detail_rect(qs.layout()).expect("a card when expanded");
+        let tile = tile_rect(ppi, qs.layout());
+        assert!(
+            (card.loc.y - (tile.loc.y + TILE_H + DETAIL_MARGIN)).abs() < 0.01,
+            "card must pin below the SHIFTED Power Mode row (index {ppi}), got card y {} vs tile bottom {}",
+            card.loc.y,
+            tile.loc.y + TILE_H
+        );
     }
 }

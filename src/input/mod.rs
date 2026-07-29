@@ -1248,8 +1248,59 @@ impl State {
                     crate::dbus::system_status::set_active_profile(conn, profile);
                 }
             }
+            // Bluetooth body toggle: gnome-shell's `toggleActive` (`bluetooth.js:120-141`) —
+            // write the rfkill soft switch (blocking when turning off, unblocking when turning
+            // on), and if the adapter isn't powered, also power it. Both fire-and-forget,
+            // echo-driven; the tile's predicted icon is the only optimistic part, so arm its 30 s
+            // failsafe (`bluetooth.js:27,131-136`) in case no state change ever echoes back.
+            #[cfg(feature = "dbus")]
+            PopoverAction::ToggleBluetooth => {
+                let was_active = self.niri.system_status.bluetooth.powered;
+                if let Some(conn) = self.niri.dbus.as_ref().and_then(|d| d.conn_rfkill.as_ref()) {
+                    crate::dbus::rfkill::set_bluetooth_airplane_mode(conn, was_active);
+                }
+                if !was_active {
+                    if let (Some(path), Some(conn)) = (
+                        self.niri.system_status.bluetooth.adapter.clone(),
+                        self.niri
+                            .dbus
+                            .as_ref()
+                            .and_then(|d| d.conn_system_status.as_ref()),
+                    ) {
+                        crate::dbus::bluez::set_adapter_powered(conn, path, true);
+                    }
+                }
+                let timer =
+                    calloop::timer::Timer::from_duration(std::time::Duration::from_secs(30));
+                self.niri
+                    .event_loop
+                    .insert_source(timer, |_, _, state| {
+                        if state.niri.panel_popover.clear_bluetooth_prediction() {
+                            state.niri.queue_redraw_all();
+                        }
+                        calloop::timer::TimeoutAction::Drop
+                    })
+                    .unwrap();
+            }
+            // A Bluetooth device row: `Device1.Connect`/`Disconnect` on the system connection,
+            // reporting completion back through the system-status channel to clear the busy mark.
+            #[cfg(feature = "dbus")]
+            PopoverAction::ConnectBluetoothDevice { path, connect } => {
+                if let (Some(conn), Some(done)) = (
+                    self.niri
+                        .dbus
+                        .as_ref()
+                        .and_then(|d| d.conn_system_status.as_ref()),
+                    self.niri.system_status_tx.clone(),
+                ) {
+                    crate::dbus::bluez::connect_device(conn, path, connect, done);
+                }
+            }
             #[cfg(not(feature = "dbus"))]
-            PopoverAction::TogglePowerProfile | PopoverAction::SetPowerProfile(_) => {}
+            PopoverAction::TogglePowerProfile
+            | PopoverAction::SetPowerProfile(_)
+            | PopoverAction::ToggleBluetooth
+            | PopoverAction::ConnectBluetoothDevice { .. } => {}
             // Message-list card interactions: the same store paths as the
             // banner's clicks (`on_banner_hit`); `apply_notification_effects`
             // pushes the shrunk snapshot back into the open popover.
@@ -5800,6 +5851,8 @@ impl State {
                                 let network = self.niri.system_status.network;
                                 let airplane = self.niri.system_status.airplane;
                                 let power = self.niri.system_status.power.clone();
+                                let bluetooth = self.niri.system_status.bluetooth.clone();
+                                let bluetooth_rfkill = self.niri.system_status.bluetooth_rfkill;
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
@@ -5813,6 +5866,8 @@ impl State {
                                     network,
                                     airplane,
                                     power,
+                                    bluetooth,
+                                    bluetooth_rfkill,
                                     battery,
                                     audio,
                                     sink_list,

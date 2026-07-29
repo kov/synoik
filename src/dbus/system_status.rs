@@ -1,5 +1,6 @@
 //! System-bus watcher for the panel status area: network (NetworkManager),
-//! battery (UPower), and power profile (power-profiles-daemon).
+//! battery (UPower), power profile (power-profiles-daemon), and bluetooth
+//! (BlueZ, in [`super::bluez`]).
 //!
 //! Mirrors [`crate::dbus::freedesktop_locale1`]: one `Connection::system()` with
 //! a task per source on its executor, each subscribing to a `PropertiesChanged` stream and
@@ -15,7 +16,9 @@ use futures_util::StreamExt;
 use zbus::names::InterfaceName;
 use zbus::{fdo, zvariant};
 
-use crate::system_status::{BatteryStatus, KnownProfile, NetworkStatus, PowerProfileStatus};
+use crate::system_status::{
+    BatteryStatus, BluetoothStatus, KnownProfile, NetworkStatus, PowerProfileStatus,
+};
 
 const POWER_PROFILES_BUS: &str = "org.freedesktop.UPower.PowerProfiles";
 const POWER_PROFILES_PATH: &str = "/org/freedesktop/UPower/PowerProfiles";
@@ -28,6 +31,11 @@ pub enum SystemStatusToNiri {
     Network(NetworkStatus),
     /// power-profiles-daemon's profile state (hidden when the daemon is absent).
     PowerProfiles(PowerProfileStatus),
+    /// BlueZ's adapter + device snapshot (absent default when bluetoothd is gone).
+    Bluetooth(BluetoothStatus),
+    /// A `Device1.Connect`/`Disconnect` we issued finished (either way) — clears the row's
+    /// busy mark ([`super::bluez::connect_device`]).
+    BluetoothConnectDone(String),
 }
 
 type Props = HashMap<String, zvariant::OwnedValue>;
@@ -218,6 +226,9 @@ pub fn start(
             .spawn(future, "monitor power-profiles-daemon")
             .detach();
     }
+
+    // --- BlueZ (bluetooth adapter + devices) ---
+    super::bluez::spawn(&conn, to_niri);
 
     Ok(conn)
 }

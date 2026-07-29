@@ -108,6 +108,14 @@ pub enum PopoverAction {
     /// The menu stays open; the check moves when the write echoes back (like
     /// [`SetDefaultSink`]).
     SetPowerProfile(String),
+    /// Toggle Bluetooth (the Bluetooth tile body): gnome-shell's `toggleActive`
+    /// (`bluetooth.js:120-141`) — write gsd-rfkill's `BluetoothAirplaneMode` and, when turning
+    /// on, also power the adapter. Resolved in `apply_popover_action` (the writes need live
+    /// compositor state); menu stays open; echo-driven apart from the predicted tile icon.
+    ToggleBluetooth,
+    /// Connect or disconnect a Bluetooth device (`Device1.Connect`/`Disconnect`, a device-list
+    /// row). The menu stays open; the row shows a busy mark until the call finishes.
+    ConnectBluetoothDevice { path: String, connect: bool },
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -510,6 +518,8 @@ impl PanelPopover {
         network: crate::system_status::NetworkStatus,
         airplane: crate::system_status::AirplaneStatus,
         power: crate::system_status::PowerProfileStatus,
+        bluetooth: crate::system_status::BluetoothStatus,
+        bluetooth_rfkill: crate::system_status::BluetoothRfkill,
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
@@ -531,6 +541,8 @@ impl PanelPopover {
             network,
             airplane,
             power,
+            bluetooth,
+            bluetooth_rfkill,
             battery,
             audio,
             sink_list,
@@ -605,6 +617,50 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_power_profile(power)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh Bluetooth adapter/device snapshot to an open quick-settings popover, so the
+    /// tile and an open device list track live changes. Returns whether it changed.
+    pub fn set_bluetooth(&mut self, bluetooth: crate::system_status::BluetoothStatus) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_bluetooth(bluetooth)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh Bluetooth rfkill snapshot to an open quick-settings popover, so the Bluetooth
+    /// tile appears/vanishes with its kill switch. Returns whether it changed.
+    pub fn set_bluetooth_rfkill(&mut self, rfkill: crate::system_status::BluetoothRfkill) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_bluetooth_rfkill(rfkill)
+            }
+            _ => false,
+        }
+    }
+
+    /// A Bluetooth `Connect`/`Disconnect` we issued finished: clear that row's busy mark in an
+    /// open quick-settings popover. Returns whether anything changed (→ redraw).
+    pub fn bluetooth_connect_done(&mut self, path: &str) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.bluetooth_connect_done(path)
+            }
+            _ => false,
+        }
+    }
+
+    /// The 30 s failsafe on the Bluetooth tile's predicted state (see
+    /// [`QuickSettings::clear_bluetooth_prediction`]). Returns whether anything changed.
+    pub fn clear_bluetooth_prediction(&mut self) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.clear_bluetooth_prediction()
             }
             _ => false,
         }

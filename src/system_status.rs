@@ -20,6 +20,149 @@ pub struct SystemStatus {
     pub airplane: AirplaneStatus,
     /// Power profile, from power-profiles-daemon (`org.freedesktop.UPower.PowerProfiles`).
     pub power: PowerProfileStatus,
+    /// Bluetooth adapter + devices, from the BlueZ system-bus watcher.
+    pub bluetooth: BluetoothStatus,
+    /// The Bluetooth rfkill switch state, from gsd-rfkill (gates the QS tile's visibility and
+    /// backs its toggle, `js/ui/status/bluetooth.js`).
+    pub bluetooth_rfkill: BluetoothRfkill,
+}
+
+/// GnomeBluetooth's `AdapterState`, derived from BlueZ `Adapter1.PowerState`
+/// (`bluetooth-client.c` `adapter_get_state`: `on`→On, `off`/`off-blocked`→Off,
+/// `off-enabling`→TurningOn, `on-disabling`→TurningOff; `Powered` fallback when the property is
+/// absent — older/non-experimental BlueZ doesn't expose it, so the Turning states may only ever
+/// come from the predicted-state override on toggle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BtAdapterState {
+    #[default]
+    Absent,
+    On,
+    TurningOn,
+    Off,
+    TurningOff,
+}
+
+/// One BlueZ device as the QS Bluetooth menu needs it (`org.bluez.Device1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BluetoothDevice {
+    /// The D-Bus object path — the stable identity rows/actions key on.
+    pub path: String,
+    /// `Alias` (falls back to `Name`/`Address` inside BlueZ itself).
+    pub alias: String,
+    /// `Icon`, when BlueZ derived one from the device class.
+    pub icon: Option<String>,
+    /// gnome-bluetooth's derived `connectable`: the device advertises a service gnome-shell can
+    /// ask BlueZ to connect (audio/HID/MIDI UUIDs, `bluetooth-device.c` `update_connectable`).
+    /// Gates row visibility (`bluetooth.js:233-235`).
+    pub connectable: bool,
+    pub paired: bool,
+    pub trusted: bool,
+    pub connected: bool,
+}
+
+impl BluetoothDevice {
+    /// Icon candidates for the device row: BlueZ's class-derived `Icon` first, then the generic
+    /// fallbacks (gnome-bluetooth's default is the plain `bluetooth` icon, not the active one).
+    pub fn icon_candidates(&self) -> Vec<String> {
+        let mut icons = Vec::new();
+        if let Some(icon) = &self.icon {
+            icons.push(format!("{icon}-symbolic"));
+            icons.push(icon.clone());
+        }
+        icons.push("bluetooth-symbolic".to_string());
+        icons.push("bluetooth-active-symbolic".to_string());
+        icons
+    }
+}
+
+/// Bluetooth adapter + device snapshot from the BlueZ watcher, mirroring what gnome-shell's
+/// `BtClient` (`js/ui/status/bluetooth.js`) reduces GnomeBluetooth to. [`Default`] (adapter
+/// absent, no devices) where the `dbus` feature / bluetoothd is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BluetoothStatus {
+    /// The default adapter's object path (the lexicographically largest `Adapter1`,
+    /// gnome-bluetooth's `should_be_default_adapter`) — the target of the `Powered` write; `None`
+    /// when BlueZ is absent or has no adapter.
+    pub adapter: Option<String>,
+    /// A default adapter exists (BlueZ present and exposes an `Adapter1`).
+    pub adapter_present: bool,
+    /// The default adapter's `Powered` — gnome-shell's `active` (`bluetooth.js:110-112`),
+    /// the tile's `checked`.
+    pub powered: bool,
+    /// The default adapter's power state, for the tile icon (`bluetooth.js:424-439`).
+    pub state: BtAdapterState,
+    /// Every `Device1` on the default adapter (unfiltered; see [`Self::menu_devices`]).
+    pub devices: Vec<BluetoothDevice>,
+}
+
+impl BluetoothStatus {
+    /// The devices the menu iterates: none while the adapter is off ("ignore any lingering device
+    /// references when turned off"), else paired-or-trusted (`bluetooth.js:161-174`).
+    pub fn menu_devices(&self) -> impl Iterator<Item = &BluetoothDevice> {
+        self.devices
+            .iter()
+            .filter(move |d| self.powered && (d.paired || d.trusted))
+    }
+
+    /// [`Self::menu_devices`] that actually get a visible row (`connectable`,
+    /// `bluetooth.js:233-235`), sorted connected-first then by alias
+    /// (`bluetooth.js:369-375`; plain Unicode order stands in for `localeCompare`).
+    pub fn visible_devices(&self) -> Vec<&BluetoothDevice> {
+        let mut devices: Vec<_> = self.menu_devices().filter(|d| d.connectable).collect();
+        devices.sort_by(|a, b| {
+            b.connected
+                .cmp(&a.connected)
+                .then_with(|| a.alias.cmp(&b.alias))
+        });
+        devices
+    }
+
+    /// Connected devices among the menu set — drives the panel icon (visible iff > 0,
+    /// `bluetooth.js:458-464`) and the subtitle.
+    pub fn connected_count(&self) -> usize {
+        self.menu_devices().filter(|d| d.connected).count()
+    }
+
+    /// The tile subtitle: >1 → "N Connected", ==1 → that device's alias, 0 → none
+    /// (`bluetooth.js:410-419`).
+    pub fn subtitle(&self) -> Option<String> {
+        let connected: Vec<_> = self.menu_devices().filter(|d| d.connected).collect();
+        match connected.len() {
+            0 => None,
+            1 => Some(connected[0].alias.clone()),
+            n => Some(format!("{n} Connected")),
+        }
+    }
+
+    /// The tile icon for an adapter state (`bluetooth.js:424-439`).
+    pub fn icon_for(state: BtAdapterState) -> &'static str {
+        match state {
+            BtAdapterState::On => "bluetooth-active-symbolic",
+            BtAdapterState::Off | BtAdapterState::Absent => "bluetooth-disabled-symbolic",
+            BtAdapterState::TurningOn | BtAdapterState::TurningOff => {
+                "bluetooth-acquiring-symbolic"
+            }
+        }
+    }
+}
+
+/// The Bluetooth-specific gsd-rfkill properties gnome-shell's `BtClient` reads
+/// (`bluetooth.js:74-80,103-108`). [`Default`] (absent → tile hidden) without the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluetoothRfkill {
+    /// `BluetoothAirplaneMode` — the soft kill switch the QS toggle writes.
+    pub airplane: bool,
+    /// `BluetoothHasAirplaneMode` — a Bluetooth rfkill switch exists at all.
+    pub has_airplane: bool,
+    /// `BluetoothHardwareAirplaneMode` — a hardware switch we can't leave in software.
+    pub hardware_airplane: bool,
+}
+
+impl BluetoothRfkill {
+    /// gnome-shell's `available` — gates the QS tile's visibility (`bluetooth.js:103-108`).
+    pub fn available(&self) -> bool {
+        self.has_airplane && !self.hardware_airplane
+    }
 }
 
 /// A power profile gnome-shell knows how to render, mirroring `PROFILE_PARAMS`
@@ -275,6 +418,140 @@ mod tests {
         assert!(custom.is_active());
         assert_eq!(custom.icon(), "gnome-power-manager-symbolic");
         assert_eq!(custom.name(), "Custom");
+    }
+
+    fn bt_device(alias: &str, connected: bool) -> BluetoothDevice {
+        BluetoothDevice {
+            path: format!("/org/bluez/hci0/dev_{alias}"),
+            alias: alias.to_string(),
+            icon: None,
+            connectable: true,
+            paired: true,
+            trusted: false,
+            connected,
+        }
+    }
+
+    #[test]
+    fn bluetooth_menu_devices_gate_on_power_and_pairing() {
+        let mut status = BluetoothStatus {
+            adapter: Some("/org/bluez/hci0".to_string()),
+            adapter_present: true,
+            powered: true,
+            state: BtAdapterState::On,
+            devices: vec![
+                bt_device("Keyboard", true),
+                BluetoothDevice {
+                    paired: false,
+                    trusted: false,
+                    ..bt_device("Stranger", false)
+                },
+                BluetoothDevice {
+                    paired: false,
+                    trusted: true,
+                    ..bt_device("Trusted", false)
+                },
+            ],
+        };
+        // Paired or trusted only (bluetooth.js:171).
+        let aliases: Vec<_> = status.menu_devices().map(|d| d.alias.as_str()).collect();
+        assert_eq!(aliases, ["Keyboard", "Trusted"]);
+
+        // Nothing while the adapter is off (bluetooth.js:161-164).
+        status.powered = false;
+        assert_eq!(status.menu_devices().count(), 0);
+        assert_eq!(status.connected_count(), 0);
+        assert_eq!(status.subtitle(), None);
+    }
+
+    #[test]
+    fn bluetooth_visible_devices_sort_connected_first_then_alias() {
+        let status = BluetoothStatus {
+            adapter: Some("/org/bluez/hci0".to_string()),
+            adapter_present: true,
+            powered: true,
+            state: BtAdapterState::On,
+            devices: vec![
+                bt_device("Zeta", false),
+                bt_device("Mouse", true),
+                BluetoothDevice {
+                    connectable: false,
+                    ..bt_device("Camera", false)
+                },
+                bt_device("Alpha", false),
+                bt_device("Buds", true),
+            ],
+        };
+        let aliases: Vec<_> = status
+            .visible_devices()
+            .iter()
+            .map(|d| d.alias.as_str())
+            .collect();
+        // Connected first, then alias; the non-connectable Camera has no row.
+        assert_eq!(aliases, ["Buds", "Mouse", "Alpha", "Zeta"]);
+    }
+
+    #[test]
+    fn bluetooth_subtitle_counts_connected() {
+        let mut status = BluetoothStatus {
+            adapter: Some("/org/bluez/hci0".to_string()),
+            adapter_present: true,
+            powered: true,
+            state: BtAdapterState::On,
+            devices: vec![bt_device("Buds", true)],
+        };
+        assert_eq!(status.subtitle().as_deref(), Some("Buds"));
+
+        status.devices.push(bt_device("Mouse", true));
+        assert_eq!(status.subtitle().as_deref(), Some("2 Connected"));
+        assert_eq!(status.connected_count(), 2);
+
+        status.devices.clear();
+        assert_eq!(status.subtitle(), None);
+    }
+
+    #[test]
+    fn bluetooth_icon_covers_every_adapter_state() {
+        use BtAdapterState::*;
+        assert_eq!(BluetoothStatus::icon_for(On), "bluetooth-active-symbolic");
+        for s in [Off, Absent] {
+            assert_eq!(BluetoothStatus::icon_for(s), "bluetooth-disabled-symbolic");
+        }
+        for s in [TurningOn, TurningOff] {
+            assert_eq!(BluetoothStatus::icon_for(s), "bluetooth-acquiring-symbolic");
+        }
+    }
+
+    #[test]
+    fn bluetooth_rfkill_available_requires_soft_switch() {
+        let mut rfkill = BluetoothRfkill::default();
+        assert!(!rfkill.available(), "no switch at all → hidden");
+        rfkill.has_airplane = true;
+        assert!(rfkill.available());
+        rfkill.hardware_airplane = true;
+        assert!(
+            !rfkill.available(),
+            "a hardware switch can't be left in software (bluetooth.js:104-107)"
+        );
+    }
+
+    #[test]
+    fn bluetooth_device_icons_fall_back_to_generic() {
+        let mut dev = bt_device("Buds", true);
+        assert_eq!(
+            dev.icon_candidates(),
+            ["bluetooth-symbolic", "bluetooth-active-symbolic"]
+        );
+        dev.icon = Some("audio-headset".to_string());
+        assert_eq!(
+            dev.icon_candidates(),
+            [
+                "audio-headset-symbolic",
+                "audio-headset",
+                "bluetooth-symbolic",
+                "bluetooth-active-symbolic"
+            ]
+        );
     }
 
     #[test]

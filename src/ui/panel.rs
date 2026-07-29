@@ -324,6 +324,11 @@ fn qs_indicator_icons(
             v.push((owned(candidates), TEXT));
         }
     }
+    // Bluetooth: visible iff any connected device (`bluetooth.js:458-464`). GNOME's indicator
+    // order puts bluetooth between network and rfkill (`panel.js:351-357`), so it slots here.
+    if status.bluetooth.connected_count() > 0 {
+        v.push((owned(&["bluetooth-active-symbolic"]), TEXT));
+    }
     if airplane_on {
         v.push((owned(system_status::airplane_icon()), TEXT));
     }
@@ -1837,6 +1842,66 @@ mod tests {
         let icons = qs_indicator_icons(toggles, &off, None, no_mic);
         assert_eq!(icons.len(), 1);
         assert_eq!(icons[0].0[0], "network-wired-symbolic");
+    }
+
+    /// The bluetooth indicator is visible iff any device is connected (`bluetooth.js:458-464`)
+    /// and sits between the network slot and the airplane icon (GNOME's `_indicators` order:
+    /// network … bluetooth, rfkill — `panel.js:351-357`).
+    #[test]
+    fn bluetooth_indicator_shows_only_with_a_connected_device() {
+        use crate::system_status::{
+            AirplaneStatus, BluetoothDevice, BluetoothStatus, BtAdapterState, NetworkStatus,
+            SystemStatus,
+        };
+
+        let toggles = QuickToggles::default();
+        let no_mic = MicStatus::default();
+        let device = |connected| BluetoothDevice {
+            path: "/org/bluez/hci0/dev_AA".to_string(),
+            alias: "Buds".to_string(),
+            icon: None,
+            connectable: true,
+            paired: true,
+            trusted: false,
+            connected,
+        };
+        let bt = |connected| BluetoothStatus {
+            adapter: Some("/org/bluez/hci0".to_string()),
+            adapter_present: true,
+            powered: true,
+            state: BtAdapterState::On,
+            devices: vec![device(connected)],
+        };
+
+        // Powered adapter, nothing connected → no icon.
+        let idle = SystemStatus {
+            network: NetworkStatus::Wired,
+            bluetooth: bt(false),
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &idle, None, no_mic);
+        assert!(!icons.iter().any(|c| c.0[0].starts_with("bluetooth")));
+
+        // A connected device → the icon, after network, before airplane.
+        let connected = SystemStatus {
+            network: NetworkStatus::Wired,
+            bluetooth: bt(true),
+            airplane: AirplaneStatus {
+                active: true,
+                show: true,
+            },
+            ..Default::default()
+        };
+        let icons = qs_indicator_icons(toggles, &connected, None, no_mic);
+        let names: Vec<_> = icons.iter().map(|c| c.0[0].as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "network-wired-symbolic",
+                "bluetooth-active-symbolic",
+                "airplane-mode-symbolic"
+            ]
+        );
     }
 
     /// The power-profile indicator appears (with the active profile's icon, before the battery)

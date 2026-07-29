@@ -3081,6 +3081,8 @@ fn vulkan_renders_the_quick_settings_popover() {
         let network = f.niri().system_status.network;
         let airplane = f.niri().system_status.airplane;
         let power = f.niri().system_status.power.clone();
+        let bluetooth = f.niri().system_status.bluetooth.clone();
+        let bluetooth_rfkill = f.niri().system_status.bluetooth_rfkill;
         let battery = f.niri().system_status.battery.clone();
         let audio = f.niri().audio;
         let sink_list = f.niri().sink_list.clone();
@@ -3094,6 +3096,8 @@ fn vulkan_renders_the_quick_settings_popover() {
             network,
             airplane,
             power,
+            bluetooth,
+            bluetooth_rfkill,
             battery,
             audio,
             sink_list,
@@ -8662,6 +8666,8 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let network = f.niri().system_status.network;
     let airplane = f.niri().system_status.airplane;
     let power = f.niri().system_status.power.clone();
+    let bluetooth = f.niri().system_status.bluetooth.clone();
+    let bluetooth_rfkill = f.niri().system_status.bluetooth_rfkill;
     let battery = f.niri().system_status.battery.clone();
     let audio = f.niri().audio;
     let sink_list = f.niri().sink_list.clone();
@@ -8675,6 +8681,8 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
         network,
         airplane,
         power,
+        bluetooth,
+        bluetooth_rfkill,
         battery,
         audio,
         sink_list,

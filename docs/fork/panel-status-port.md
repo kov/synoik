@@ -145,7 +145,7 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
 | Q4 | **brightness** | none | `BrightnessItem` slider; multi-monitor submenu | `js/ui/status/brightness.js:94`; slider `:38,99`; submenu `:12` | `[dbus:gsd/logind]` backlight | ⬜ |
 | Q5 | **keyboard backlight** | none | `KeyboardBrightnessToggle` (slider or discrete steps) | `js/ui/status/backlight.js:236`; toggle `:159,241`; slider `:21`; steps `:79` | `[dbus:UPower/logind]` | ⬜ |
 | Q6 | **network** | status icon(s) | per-device `QuickMenuToggle`s: wired, Wi-Fi (list), modem, BT-tether, VPN — each w/ submenu | `js/ui/status/network.js`; built `panel.js:303-310`; NMToggle `:1381`; Wi-Fi `:1076`; VPN `:1541` | `[nm]` | 🟡 panel icon ✅; tile is now a QuickMenuToggle — arrow opens an in-menu detail card (header + **Network Settings** row); body opens settings. **In-menu enable/disable, Wi-Fi list, VPN ⬜** (need NM writes); no SSID label |
-| Q7 | **bluetooth** | bluetooth icon | `BluetoothToggle` + device-list submenu | `js/ui/status/bluetooth.js:442`; built `panel.js:312-319`; icon `:450`; toggle `:273,453`; device item `:201` | `[dbus:bluez]` | ⬜ |
+| Q7 | **bluetooth** | bluetooth icon | `BluetoothToggle` + device-list submenu | `js/ui/status/bluetooth.js:442`; built `panel.js:312-319`; icon `:450`; toggle `:273,453`; device item `:201` | `[dbus:bluez]` | ✅ BlueZ ObjectManager watcher (`src/dbus/bluez.rs`, 4th task on the shared system connection; one PropertiesChanged match rule for all of `/org/bluez`) + the gsd-rfkill Bluetooth trio (tile `available` gate + `BluetoothAirplaneMode` write, `rfkill.rs`). Tile INSERTED at grid slot 1 (after Network, `panel.js:380-383`), subtitle = connected summary, icon from `PowerState` incl. the ported predicted-state override (30 s failsafe); arrow → `DetailOwner::Bluetooth` device list (order frozen at open, newcomers append; trailing Connect/Disconnect; placeholder; settings row); `connectable` = gnome-bluetooth's UUID list; connect = `Device1.Connect/Disconnect` with a busy mark until done. Panel icon between network and rfkill iff any connected device. Headless/unit + render-differential verified; **live-only: everything** (this VM has no BT adapter — needs real hw). Divergences in the module docs: no spinner ("…" busy mark), placeholder as one 36px centered row, no idle-coalescing, plain-Unicode sort, echoed-state toggle target |
 | Q8 | **power profiles** | profile icon (when not Balanced) | `PowerProfilesToggle` + profile submenu | `js/ui/status/powerProfiles.js:134`; icon `:139`; toggle `:42,150`; section `:75` | `[dbus:power-profiles-daemon]` | ✅ two-line QS tile ("Power Mode" + active-profile subtitle) with body-toggle (Balanced ↔ last-selected via `org.gnome.shell last-selected-power-profile`, vendor profiles included) + a >2-gated profile picker + panel icon; `UPower.PowerProfiles` system-bus watcher (3rd task, echo-driven write). Headless/unit-verified; not live (this VM has no ppd) |
 | Q9 | **night light** | `night-light-symbolic` | `NightLightToggle` (plain) | `js/ui/status/nightLight.js:38`; icon `:43`; toggle `:16-21,46` | `[self]` gsettings | ✅ |
 | Q10 | **dark mode** | none | `DarkModeToggle` "Dark Style" (plain) | `js/ui/status/darkMode.js:43`; toggle `:9-13,48` | `[self]` gsettings | ✅ |
@@ -241,7 +241,10 @@ carved these out as separate work — none block R1 for daily use:
    menu-button.
 
 **Tier 3 — new system-bus watchers (same pattern as `src/dbus/system_status.rs`):**
-8. Q7 bluetooth (bluez).
+8. ✅ Q7 bluetooth (bluez) — done (see the Q7 row above). Semantics grounded in gnome-bluetooth
+   master (`lib/bluetooth-client.c`/`bluetooth-device.c`, read from GitLab): largest-path default
+   adapter, `PowerState` mapping, the connectable-UUID list, plain `Device1.Connect/Disconnect`.
+   Needs real hardware for any live validation.
 9. ✅ Q8 power profiles — done (`70b9ba96` model+watcher+panel icon, `a47fb1de` two-line tile+body
    toggle, `8e0bad97` picker, `69f6a2b0` review): `UPower.PowerProfiles` watcher as a 3rd task on
    the shared system-bus connection (name-owner wake, hidden-on-daemon-death); a two-line Power Mode

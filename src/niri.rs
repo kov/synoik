@@ -468,6 +468,12 @@ pub struct Niri {
     /// (not re-read from the gsettings model, which the watcher rebuilds from defaults on
     /// every unrelated change).
     pub last_power_profile: String,
+    /// A clone of the system-status watcher's inbound channel, for
+    /// [`crate::dbus::bluez::connect_device`] to report `BluetoothConnectDone` back through the
+    /// same path the snapshots take. `None` without the `dbus` feature / before D-Bus starts.
+    #[cfg(feature = "dbus")]
+    pub system_status_tx:
+        Option<calloop::channel::Sender<crate::dbus::system_status::SystemStatusToNiri>>,
     /// The notifications model behind the banner/list/indicator surfaces and the
     /// `org.freedesktop.Notifications` server (empty when the server isn't running,
     /// e.g. headless or without the `dbus` feature).
@@ -3139,6 +3145,16 @@ impl State {
                 }
                 self.niri.system_status.power = power;
             }
+            SystemStatusToNiri::Bluetooth(bluetooth) => {
+                self.niri.system_status.bluetooth = bluetooth;
+            }
+            SystemStatusToNiri::BluetoothConnectDone(path) => {
+                // Only clears an open menu's busy mark; no model change.
+                if self.niri.panel_popover.bluetooth_connect_done(&path) {
+                    self.niri.queue_redraw_all();
+                }
+                return;
+            }
         }
         trace!("system status changed: {:?}", self.niri.system_status);
         let mut redraw = self
@@ -3150,21 +3166,31 @@ impl State {
             .niri
             .panel_popover
             .set_power_profile(self.niri.system_status.power.clone());
+        redraw |= self
+            .niri
+            .panel_popover
+            .set_bluetooth(self.niri.system_status.bluetooth.clone());
         if redraw {
             self.niri.queue_redraw_all();
         }
     }
 
-    /// Adopt a fresh airplane-mode snapshot from the gsd-rfkill watcher. Updates the panel airplane
-    /// icon and an open QS "Airplane Mode" toggle tile (which appears/vanishes with `show`).
+    /// Adopt a fresh rfkill snapshot from the gsd-rfkill watcher: the panel airplane icon, an open
+    /// QS "Airplane Mode" toggle tile (which appears/vanishes with `show`), and the Bluetooth
+    /// tile's availability gate + kill-switch state.
     #[cfg(feature = "dbus")]
-    pub fn on_airplane_status(&mut self, status: crate::system_status::AirplaneStatus) {
-        self.niri.system_status.airplane = status;
+    pub fn on_rfkill_status(&mut self, status: crate::dbus::rfkill::RfkillStatus) {
+        self.niri.system_status.airplane = status.airplane;
+        self.niri.system_status.bluetooth_rfkill = status.bluetooth;
         let mut redraw = self
             .niri
             .panel
             .set_system_status(self.niri.system_status.clone());
-        redraw |= self.niri.panel_popover.set_airplane(status);
+        redraw |= self.niri.panel_popover.set_airplane(status.airplane);
+        redraw |= self
+            .niri
+            .panel_popover
+            .set_bluetooth_rfkill(status.bluetooth);
         if redraw {
             self.niri.queue_redraw_all();
         }
@@ -3842,6 +3868,8 @@ impl Niri {
             notification_banner,
             notification_banner_timer: None,
             last_power_profile: "power-saver".to_string(),
+            #[cfg(feature = "dbus")]
+            system_status_tx: None,
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),

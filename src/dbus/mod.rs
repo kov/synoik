@@ -3,6 +3,7 @@ use zbus::object_server::Interface;
 
 use crate::niri::State;
 
+pub mod bluez;
 pub mod calendar_server;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
@@ -278,6 +279,8 @@ impl DBusServers {
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
+        // The bluez connect/disconnect writer reports completion back through this same channel.
+        niri.system_status_tx = Some(to_niri.clone());
         match system_status::start(to_niri) {
             Ok(conn) => {
                 dbus.conn_system_status = Some(conn);
@@ -290,7 +293,7 @@ impl DBusServers {
         let (to_niri, from_rfkill) = calloop::channel::channel();
         niri.event_loop
             .insert_source(from_rfkill, move |event, _, state| match event {
-                calloop::channel::Event::Msg(msg) => state.on_airplane_status(msg),
+                calloop::channel::Event::Msg(msg) => state.on_rfkill_status(msg),
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
