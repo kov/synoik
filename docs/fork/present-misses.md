@@ -1501,3 +1501,49 @@ Worth checking what else this deploy carries relative to the §23 one. Guest is 
 the pass on the next build; it takes ~17 minutes end to end.
 
 *— the gnome-shell-rs guest session.*
+
+## §25 — Client A/B: the miss regression is client-independent; the "kitty sluggishness" is a second, separate symptom (2026-07-29)
+
+Context: the VMM side could not reproduce the §24 regression, and Gustavo observed live that
+workspace switching feels *hella fast* with gnome-terminal windows and *sooo sluggish* with
+kitty windows — hypothesis: kitty (a GPU/dmabuf client) is the variable.
+
+A/B on the same boot (`3cac48f9`) and session as §24, same rig: close all windows → populate
+8 of one client → heavy ×2, then the same for the other. kitty arm 23:34:07-23:39:04,
+gnome-terminal arm 23:39:29-23:44:26, scored with `correlate-frame-log.py` (28 qualifying
+windows each, coverage bands overlap).
+
+| slice | 8× kitty | 8× gnome-terminal | §23 clean deploy (8× kitty) |
+|---|---|---|---|
+| overall | 12.59% (1858/14757) | **16.28%** (2327/14294) | 0.04% |
+| draws 90-130 | 0.07% | 0.02% | — |
+| draws 200+ | 28.31% | **38.98%** | 0.07% |
+| miss character | 1880 early (median 15.5 ms), 0 late | 2394 early (median 15.2 ms), 0 late | — |
+
+**Verdict: the present-path miss regression does NOT come from kitty.** The shm-only
+gnome-terminal arm misses at least as much (slightly more), with the identical all-queued-early
+/ late-fence signature. §24's conclusion stands: this deploy delays *the compositor's own*
+render-fence delivery, no client GPU work required. That also explains why the VMM side's own
+workloads may not show it — it needs a guest venus context under sustained load with a
+frame deadline, not any particular client.
+
+**But the perceived difference is real and is a second symptom.** Two observations line up:
+
+1. Only the kitty arm reaches the pathological gpu-p50 12 ms+ band (5 windows at 67.45% miss;
+   gnome-terminal arm max p50 = 11.47 ms, zero windows in the band). Compositing dmabuf client
+   content costs more GPU time on this deploy than compositing shm content, enough to push
+   whole windows over the edge.
+2. The perceived kitty sluggishness is most plausibly *client content latency*, which the miss
+   rate never measures (miss ≠ smoothness, §23): every kitty commit is gated by the implicit-
+   sync pre-commit blocker (`poll(2)` on the dmabuf fence), so if this deploy delays fence
+   signaling by ~a frame, every kitty content update lands a frame or more late and the window
+   contents visibly drag behind the animation. gnome-terminal (shm, no fences) skips that path
+   entirely, so it *feels* fast even while the compositor misses 16% of its own flips.
+
+Both symptoms point at the same root: **fence signal delivery from the host is slow on this
+deploy** — it taxes the compositor's flips (client-independent) and the dmabuf clients' commits
+(kitty-visible). Repro recipe for the VMM side: any venus workload that queues GPU work and
+needs the fence *observed promptly* (compositor flip deadline, or an exported/polled dmabuf
+fence); throughput-style benchmarks that only measure total duration would not notice.
+
+*— the gnome-shell-rs guest session.*

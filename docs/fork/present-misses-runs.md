@@ -242,3 +242,5 @@ Recover with `journalctl -b --since 20:37:52 --until 20:54:27 -o short-iso _UID=
 `3cac48f9`; score with correlate-frame-log.py. Result: mixed 3.91% (0-40 draws 2.72%), heavy
 14.45% (200+ draws 28.90%, 12ms+ gpu band 81.61%) — ~26-200x worse than §23; all misses queued
 early (median 15.5/13.4 ms), the late-fence shape. Written up as `present-misses.md` §24.
+
+| 23:33-23:44 | client A/B (§25): same boot `3cac48f9`, close-all → 8× kitty heavy ×2 (23:34:07-23:39:04) → close-all → 8× gnome-terminal heavy ×2 (23:39:29-23:44:26). kitty 12.59% / 200+ 28.31%; gnome-terminal 16.28% / 200+ 38.98%; both all-queued-early (median ~15 ms). Regression is client-independent; kitty adds a second symptom (12 ms+ gpu band + fence-gated commits). |
