@@ -349,6 +349,10 @@ Displays panel — XML-derived conformance tests from day one.
 
 ### 3.9 Accessibility
 
+> **Milestone doc: `docs/fork/a11y-port.md`.** A11y is sequenced as its own milestone, not as
+> part of the panel/chrome build-up: the `ATIndicator` menu (shipped) is the *control panel*
+> for ten subsystems, none of which exist yet. Slices, citations and order live there.
+
 - **Keyboard:** cosmic-comp already serves `org.freedesktop.a11y.KeyboardMonitor` **and**
   `org.gnome.Orca.KeyboardMonitor` — Orca's keyboard path works out of the box; extend it
   (add the `PointerLocator` half).
@@ -524,8 +528,13 @@ In-compositor overview (live thumbnails, workspace strip, dash, app-grid view, s
 
 ### Phase 3: Platform completeness
 ScreenCast (PipeWire producer) → RemoteDesktop/InputCapture → Screenshot/portal backend →
-notifications/calendar clients → OSK → IBus candidate UI → AccessKit a11y → magnifier
-parity.
+notifications/calendar clients → OSK → IBus candidate UI.
+
+**Accessibility is its own milestone here, tracked in `docs/fork/a11y-port.md`** — chrome
+scale ends at the toggle menu (done); behind it sit high-contrast/text-scaling in our own
+chrome, the magnifier, the keyboard filters, the visual bell, the a11y D-Bus surface, and
+**AccessKit/AT-SPI for our own UI tree**, which is what actually decides whether a screen
+reader can drive this shell. Do not fold these into panel work.
 
 ### Phase 4+: The endgame (optional, last)
 Shed GObject/Cogl/Clutter where it still lingers; **HDR/color-management** on the owned Vulkan
