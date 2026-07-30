@@ -513,6 +513,11 @@ pub struct Niri {
     pub calendar_range_emit: Option<async_channel::Sender<crate::calendar_events::NiriToCalendar>>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
+    /// The on-screen display (volume/brightness/…), one window per output.
+    pub osd: crate::ui::osd::OsdManager,
+    /// Wake-up for the OSD's 1500 ms hide timeout: an OSD over a static desktop
+    /// produces no frames of its own to expire on.
+    pub osd_timer: Option<RegistrationToken>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -3958,6 +3963,7 @@ impl Niri {
             animation_clock.clone(),
             config.clone(),
         );
+        let osd = crate::ui::osd::OsdManager::new(animation_clock.clone(), config.clone());
 
         // No "Important Hotkeys" card on login: GNOME shows nothing over a fresh
         // session, and a modal cheat-sheet in front of the desktop is niri's
@@ -4147,6 +4153,8 @@ impl Niri {
             calendar_range_emit: None,
             notification_banner,
             notification_banner_timer: None,
+            osd,
+            osd_timer: None,
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
@@ -4549,6 +4557,8 @@ impl Niri {
         // A banner orphaned when its output (and every fallback) disappeared
         // adopts the first output that returns.
         self.notification_banner.adopt_output(&output);
+        // `_monitorsChanged` (`js/ui/osdWindow.js:151-163`): one OSD per monitor.
+        self.osd.add_output(&output);
 
         let lock_render_state = if self.is_locked() {
             // We haven't rendered anything yet so it's as good as locked.
@@ -4632,6 +4642,9 @@ impl Niri {
         // would otherwise be unclickable and jam the queue forever.
         let fallback = self.layout.active_output().cloned();
         self.notification_banner.retarget_output(output, fallback);
+        // An OSD does not migrate — GNOME destroys the departing monitor's window
+        // (`js/ui/osdWindow.js:157-160`).
+        self.osd.remove_output(output);
 
         // Disable the output global and remove some time later to give the clients some time to
         // process it.
@@ -5968,6 +5981,15 @@ impl Niri {
             self.reschedule_notification_banner_timer();
         }
 
+        // Same shape as the banner above: the hide deadline is armed inside
+        // `advance_animations` (at the Showing→Shown transition), so this
+        // comparison is the only place that can arm the wake-up for it.
+        let osd_wakeup = self.osd.next_wakeup();
+        self.osd.advance_animations();
+        if self.osd.next_wakeup() != osd_wakeup {
+            self.reschedule_osd_timer();
+        }
+
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
@@ -6337,6 +6359,11 @@ impl Niri {
                 push(element.into());
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
+            // The OSD raises itself above everything on show (`js/ui/osdWindow.js:98`
+            // lifts it to the top of `uiGroup`), so it is pushed FIRST = topmost.
+            for element in self.osd.render(ctx.renderer, &self.icon_cache, output) {
+                push(element.into());
+            }
             // bar; the quick-settings menu composites several elements (chrome + icons).
             for element in self
                 .panel_popover
@@ -6912,6 +6939,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.osd.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
             // The dash's drop gap eases shut after a drop, with no pointer motion left
             // to generate the frames it needs.
@@ -9923,6 +9951,30 @@ impl Niri {
             })
             .unwrap();
         self.notification_banner_timer = Some(token);
+    }
+
+    /// The OSD's equivalent of
+    /// [`reschedule_notification_banner_timer`](Self::reschedule_notification_banner_timer):
+    /// wake the loop at the earliest armed 1500 ms hide deadline.
+    pub fn reschedule_osd_timer(&mut self) {
+        if let Some(token) = self.osd_timer.take() {
+            self.event_loop.remove(token);
+        }
+        let Some(deadline) = self.osd.next_wakeup() else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let timer = Timer::from_duration(deadline.saturating_sub(now));
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.osd_timer = None;
+                // The frame's advance_animations re-checks the deadline.
+                state.niri.queue_redraw_all();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.osd_timer = Some(token);
     }
 
     /// Re-arm the single idle-watch timer to the earliest pending deadline (or cancel it if none).

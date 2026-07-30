@@ -174,6 +174,26 @@ pub fn icon_element<S: AsRef<str>>(
     origin: Point<f64, Logical>,
     center: Point<f64, Logical>,
 ) -> Option<TextureRenderElement<VkTexture>> {
+    icon_element_alpha(
+        renderer, icons, candidates, logical_px, scale, color, origin, center, 1.,
+    )
+}
+
+/// [`icon_element`] with an explicit element `alpha` — for a surface that fades as a
+/// whole (the OSD), where the icon rides on top of the fading bake rather than
+/// inside it and so must fade with it.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_element_alpha<S: AsRef<str>>(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    candidates: &[S],
+    logical_px: f64,
+    scale: f64,
+    color: Rgba,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+) -> Option<TextureRenderElement<VkTexture>> {
     let tb = candidates
         .iter()
         .find_map(|name| icons.texture(renderer, name.as_ref(), logical_px, scale, color))?;
@@ -182,7 +202,7 @@ pub fn icon_element<S: AsRef<str>>(
     Some(TextureRenderElement::from_texture_buffer(
         tb,
         loc,
-        1.,
+        alpha,
         None,
         None,
         Kind::Unspecified,
@@ -1428,6 +1448,38 @@ const SWITCH_HANDLE_ON: Rgba = [1., 1., 1., 1.];
 /// (`_switches.scss:36`), approximated as a single offset dark disc behind it.
 const SWITCH_HANDLE_SHADOW: Rgba = [0., 0., 0., 0.2];
 
+/// GNOME's shared `BarLevel` (`js/ui/barLevel.js`) — the rounded progress bar the
+/// OSD shows under its icon, and the same drawing the quick-settings sliders use.
+///
+/// A geometry-and-paint primitive like [`Switch`]: the owner holds the value and the
+/// rect and calls [`Painter::bar_level`]. The metrics below are the `.level` node
+/// inside `.osd-window` (`_osd.scss:22-34`); the colors are per-call
+/// ([`BarLevelStyle`]) because each host node re-declares them.
+pub struct BarLevel;
+
+impl BarLevel {
+    /// `-barlevel-height: $osd_levelbar_height` (`_osd.scss:3,26`).
+    pub const HEIGHT: f64 = 6.;
+    /// `min-width: 160px` (`_osd.scss:25`).
+    pub const MIN_WIDTH: f64 = 160.;
+    /// `-barlevel-overdrive-separator-width: $base_padding * 0.5` (`_osd.scss:31`).
+    pub const OVERDRIVE_SEPARATOR: f64 = 3.;
+}
+
+/// The four theme colors a [`BarLevel`] draws with (`barLevel.js:110-113,155`).
+#[derive(Debug, Clone, Copy)]
+pub struct BarLevelStyle {
+    /// `-barlevel-background-color` — the unfilled track.
+    pub track: Rgba,
+    /// `-barlevel-active-background-color` — the filled part below `overdrive_start`.
+    pub fill: Rgba,
+    /// `-barlevel-overdrive-color` — the filled part above it.
+    pub overdrive: Rgba,
+    /// The node's foreground color, which is what the separator is drawn in while
+    /// the value has not reached overdrive (`barLevel.js:215-218`).
+    pub separator: Rgba,
+}
+
 /// A `%card`-styled `St.Button` — the dateMenu's launcher cards
 /// (`.events-button` / `.world-clocks-button` / `.weather-button`, all
 /// `@extend %card`, `_calendar.scss:153-157`): a rounded [`style::CARD_BG`] card
@@ -1956,6 +2008,76 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             SWITCH_HANDLE_OFF
         };
         self.fill_rounded(handle, size / 2., fill)?;
+        Ok(())
+    }
+
+    /// Draw a [`BarLevel`] filling `rect`: the track, the fill up to `value`, and —
+    /// when `overdrive_start < max` — the overdrive segment past it, separated by a
+    /// [`BarLevel::OVERDRIVE_SEPARATOR`]-wide gap (`barLevel.js:117-220`).
+    ///
+    /// `value` is clamped to `0..=max` and `max` to at least 1, exactly like the
+    /// property setters (`barLevel.js:57-80`). The cap radius is
+    /// `min(width, height) / 2` (`:122`), and — this is the part that is easy to get
+    /// wrong — the fill's end cap is a **full circle centered on** the progress
+    /// position (`:194-210`), so the fill actually reaches `end_x + radius`, which is
+    /// what makes a full bar reach the right edge.
+    ///
+    /// We differ from the cairo original in one harmless way: GNOME paints the track
+    /// only over the *unfilled* remainder, we paint the whole pill and cover it. That
+    /// is identical for opaque fills (every current caller) and it is also what makes
+    /// the overdrive gap correct for free — the gap shows the track through, which is
+    /// precisely the color GNOME paints the separator with once the value is in
+    /// overdrive (`:215-218`), so that branch draws nothing.
+    pub fn bar_level(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        value: f64,
+        max: f64,
+        overdrive_start: f64,
+        style: BarLevelStyle,
+    ) -> anyhow::Result<()> {
+        let max = max.max(1.);
+        let value = value.clamp(0., max);
+        let overdrive_start = overdrive_start.clamp(1., max);
+        let radius = rect.size.w.min(rect.size.h) / 2.;
+        // The span the progress position travels across, inset by a cap at each end.
+        let travel = (rect.size.w - 2. * radius).max(0.);
+
+        self.fill_rounded(rect, radius, style.track)?;
+
+        let seg = |from: f64, to: f64| {
+            Rectangle::new(
+                Point::from((rect.loc.x + from, rect.loc.y)),
+                Size::from((to - from, rect.size.h)),
+            )
+        };
+        let end_x = radius + travel * (value / max);
+        let sep_x = radius + travel * (overdrive_start / max);
+        let overdrive_active = overdrive_start < max;
+        let half_sep = if overdrive_active {
+            BarLevel::OVERDRIVE_SEPARATOR / 2.
+        } else {
+            0.
+        };
+
+        if value > 0. {
+            if !overdrive_active || value <= overdrive_start {
+                self.fill_rounded(seg(0., end_x + radius), radius, style.fill)?;
+            } else {
+                self.fill_rounded(seg(0., sep_x - half_sep), radius, style.fill)?;
+                self.fill_rounded(
+                    seg(sep_x + half_sep, end_x + radius),
+                    radius,
+                    style.overdrive,
+                )?;
+            }
+        }
+
+        // Below overdrive the separator is a solid foreground tick; above it, the gap
+        // left between the two fills already shows the track (see the doc comment).
+        if overdrive_active && value <= overdrive_start {
+            self.fill_rounded(seg(sep_x - half_sep, sep_x + half_sep), 0., style.separator)?;
+        }
         Ok(())
     }
 }

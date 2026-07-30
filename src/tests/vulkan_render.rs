@@ -10679,3 +10679,98 @@ fn vulkan_app_grid_dots_follow_the_page() {
          cached bake, not the layout: {on_second:?}"
     );
 }
+
+/// The OSD actually paints: an opaque `$osd_bg_color` pill at the bottom of the
+/// output, a level bar whose white fill grows with the value, and — only once
+/// `max_level > 1` — a `$destructive_color` overdrive segment past 100%
+/// (`_osd.scss:5-34`, `js/ui/barLevel.js:180-220`).
+#[test]
+fn vulkan_renders_the_osd() {
+    use crate::ui::osd::OsdLevel;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let out_size = output_size(&output);
+
+    // (white bar pixels, red overdrive pixels) inside the level bar's own band.
+    let sample = |f: &mut Fixture, level: f64, max: f64| {
+        let out = output.clone();
+        f.niri().osd.show_one(
+            &out,
+            &["audio-volume-high-symbolic"],
+            None,
+            OsdLevel::new(level, max),
+        );
+        f.settle_animations();
+
+        let bar = f
+            .niri()
+            .osd
+            .level_rect(&out)
+            .expect("an OSD with a level has a bar");
+        let pill = f.niri().osd.rect(&out).expect("the OSD is visible");
+        assert!(
+            pill.loc.y + pill.size.h < out_size.h,
+            "the pill sits above the bottom edge (margin-bottom: 4em)"
+        );
+
+        let w = to_physical_precise_round::<i32>(scale.x, out_size.w);
+        let h = to_physical_precise_round::<i32>(scale.x, out_size.h);
+        let band_top = to_physical_precise_round::<i32>(scale.x, bar.loc.y);
+        let band_bot = to_physical_precise_round::<i32>(scale.x, bar.loc.y + bar.size.h);
+
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let elems = state.niri.osd.render(vk, &state.niri.icon_cache, &out);
+                assert!(!elems.is_empty(), "a visible OSD must render");
+                let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
+                let mut white = 0usize;
+                let mut red = 0usize;
+                let mut pill_bg = 0usize;
+                for (i, p) in pixels.chunks_exact(4).enumerate() {
+                    let y = i as i32 / w;
+                    // Abgr8888 is byte-order R,G,B,A here.
+                    if p[3] == 255 && p[0] > 40 && p[0] < 60 && p[2] > 44 && p[2] < 64 {
+                        pill_bg += 1;
+                    }
+                    if y < band_top || y >= band_bot {
+                        continue;
+                    }
+                    if p[3] == 255 && p[0] > 240 && p[1] > 240 && p[2] > 240 {
+                        white += 1;
+                    }
+                    if p[3] == 255 && p[0] > 150 && p[1] < 80 && p[2] < 90 {
+                        red += 1;
+                    }
+                }
+                assert!(pill_bg > 1000, "the $osd_bg_color pill must be drawn");
+                (white, red)
+            })
+            .expect("vulkan renderer")
+    };
+
+    let (low, low_red) = sample(&mut f, 0.25, 1.);
+    let (high, high_red) = sample(&mut f, 0.75, 1.);
+    assert!(
+        high > low * 2,
+        "a fuller bar means more white: 0.25 -> {low}px, 0.75 -> {high}px"
+    );
+    assert_eq!(
+        (low_red, high_red),
+        (0, 0),
+        "no overdrive segment while max_level is 1"
+    );
+
+    // Amplified volume: max 1.5, value 1.4 -> a red segment past the separator.
+    let (_, over_red) = sample(&mut f, 1.4, 1.5);
+    assert!(
+        over_red > 20,
+        "value past overdrive_start must paint $destructive_color, got {over_red}px"
+    );
+}

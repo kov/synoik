@@ -337,6 +337,13 @@ impl Fixture {
         state.backend.headless().add_output(niri, n, size);
     }
 
+    /// Unplug a headless output added by [`add_output`](Self::add_output), so a test
+    /// can exercise the per-output teardown paths (OSD windows, banner retargeting).
+    pub fn remove_output(&mut self, n: u8) {
+        let output = self.niri_output(n);
+        self.niri().remove_output(&output);
+    }
+
     pub fn add_client(&mut self) -> ClientId {
         let (sock1, sock2) = UnixStream::pair().unwrap();
         self.niri().insert_client(NewClient {

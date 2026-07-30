@@ -12,6 +12,7 @@ pub mod input_source_menu;
 pub mod mru;
 pub mod notification_banner;
 pub mod notification_card;
+pub mod osd;
 pub mod overview_layout;
 pub mod overview_search;
 pub mod panel;

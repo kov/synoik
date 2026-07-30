@@ -26,6 +26,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use super::client::ClientId;
 use super::*;
 use crate::gnome::{Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction};
+use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
@@ -11678,4 +11679,171 @@ fn a11y_menu_row_toggles_the_setting_and_closes() {
         f.niri().panel.a11y_rect(ow).is_some(),
         "High Contrast alone keeps the indicator up"
     );
+}
+
+// ---------------------------------------------------------------------------
+// OSD (`js/ui/osdWindow.js`)
+// ---------------------------------------------------------------------------
+
+const VOL_ICON: &[&str] = &["audio-volume-high-symbolic"];
+
+/// `show()` refuses without an icon (`js/ui/osdWindow.js:90-92`), and the 1500 ms
+/// `HIDE_TIMEOUT` (`:10,104-107`) takes it away again — armed as a real wake-up,
+/// since an OSD over a damage-free desktop generates no frames to expire on.
+#[test]
+fn osd_shows_and_expires() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    // No icon -> nothing at all.
+    f.niri()
+        .osd
+        .show_one(&out, &[], Some("Volume"), OsdLevel::new(0.5, 1.));
+    assert!(f.niri().osd.content(&out).is_none());
+
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
+    assert!(f.niri().osd.content(&out).is_some());
+    // The 100 ms fade is running, so it is not yet opaque.
+    assert!(f.niri().osd.alpha(&out) < 1.);
+    assert!(f.niri().osd.are_animations_ongoing());
+
+    tick(&mut f, 120);
+    assert_eq!(f.niri().osd.alpha(&out), 1.);
+    // The deadline is armed at the Showing->Shown transition inside
+    // advance_animations; the wake-up must be armed from the same place.
+    assert!(f.niri().osd_timer.is_some());
+
+    // Still up just before the timeout, gone after it (plus the fade out).
+    tick(&mut f, 1400);
+    assert!(f.niri().osd.content(&out).is_some());
+    tick(&mut f, 200);
+    tick(&mut f, 200);
+    assert!(f.niri().osd.content(&out).is_none());
+}
+
+/// A second OSD while one is up replaces its content in place and re-arms the
+/// timeout, with **no re-fade** — the fade only runs on the hidden->visible edge
+/// (`js/ui/osdWindow.js:94-111`).
+#[test]
+fn osd_replace_in_place_never_refades() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.3, 1.));
+    tick(&mut f, 120);
+    assert_eq!(f.niri().osd.alpha(&out), 1.);
+
+    // 1.4 s in — one step short of expiry — a new level arrives.
+    tick(&mut f, 1400);
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.6, 1.));
+    assert_eq!(
+        f.niri().osd.alpha(&out),
+        1.,
+        "replacing content must not restart the fade"
+    );
+
+    // The re-arm bought another full 1500 ms from *now*.
+    tick(&mut f, 1400);
+    assert!(f.niri().osd.content(&out).is_some());
+    tick(&mut f, 200);
+    tick(&mut f, 200);
+    assert!(f.niri().osd.content(&out).is_none());
+}
+
+/// The level *eases* when the OSD is already visible and *snaps* when it is not
+/// (`js/ui/osdWindow.js:71-84`) — which is what makes a held volume key look like a
+/// bar sliding rather than teleporting.
+#[test]
+fn osd_level_eases_only_when_already_visible() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    // First show: no ease, the bar is already at its value.
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.2, 1.));
+    assert_eq!(f.niri().osd.displayed_level(&out), Some(0.2));
+    tick(&mut f, 120);
+
+    // A step up while visible eases across 100 ms.
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.8, 1.));
+    let mid = f.niri().osd.displayed_level(&out).unwrap();
+    assert!(
+        (0.2..0.8).contains(&mid),
+        "the bar should still be travelling, was at {mid}"
+    );
+    tick(&mut f, 120);
+    assert_eq!(f.niri().osd.displayed_level(&out), Some(0.8));
+    assert!(!f.niri().osd.are_animations_ongoing());
+}
+
+/// `show(icon, label, levels)` cancels every output **absent** from the level map
+/// (`js/ui/osdWindow.js:172-182`) — the behavior the brightness manager relies on to
+/// flash only the monitors that actually changed.
+#[test]
+fn osd_show_cancels_outputs_absent_from_the_level_map() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let a = f.niri_output(1);
+    let b = f.niri_output(2);
+
+    f.niri()
+        .osd
+        .show_all(VOL_ICON, None, OsdLevel::new(0.5, 1.));
+    tick(&mut f, 120);
+    assert!(f.niri().osd.content(&a).is_some());
+    assert!(f.niri().osd.content(&b).is_some());
+
+    // Now show on `a` alone: `b` is cancelled, not left behind.
+    f.niri()
+        .osd
+        .show_one(&a, VOL_ICON, None, OsdLevel::new(0.9, 1.));
+    tick(&mut f, 200);
+    assert!(f.niri().osd.content(&a).is_some());
+    assert!(
+        f.niri().osd.content(&b).is_none(),
+        "an output missing from the level map must be cancelled"
+    );
+
+    // hideAll takes the rest (`switcherPopup.js:178`).
+    f.niri().osd.hide_all();
+    tick(&mut f, 200);
+    assert!(!f.niri().osd.is_visible());
+}
+
+/// An output that goes away takes its OSD with it (`js/ui/osdWindow.js:157-160`);
+/// one that appears gets its own. Nothing migrates.
+#[test]
+fn osd_follows_outputs() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let a = f.niri_output(1);
+    f.niri()
+        .osd
+        .show_all(VOL_ICON, None, OsdLevel::new(0.5, 1.));
+    tick(&mut f, 120);
+    assert!(f.niri().osd.is_visible());
+
+    f.add_output(2, (1280, 720));
+    let b = f.niri_output(2);
+    assert!(
+        f.niri().osd.content(&b).is_none(),
+        "a new output starts with a hidden OSD, it does not inherit one"
+    );
+
+    f.remove_output(1);
+    assert!(f.niri().osd.content(&a).is_none());
+    assert!(!f.niri().osd.is_visible());
 }
