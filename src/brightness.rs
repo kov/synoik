@@ -44,6 +44,27 @@ pub struct BacklightWrite {
     pub brightness: i32,
 }
 
+/// What the quick-settings surfaces need from the manager, as a plain snapshot they can hold.
+///
+/// Mirrors what `BrightnessItem._sync` reads (`brightness.js:57-74`): the global scale decides
+/// whether the slider exists at all, and the per-monitor scales fill the detail card and gate its
+/// arrow (`menuEnabled = scales.length > 1`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BrightnessView {
+    /// The global scale's value, or `None` when nothing is backlit — which hides the slider.
+    pub global: Option<f64>,
+    /// One entry per backlit output, in output order.
+    pub monitors: Vec<MonitorView>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitorView {
+    pub connector: String,
+    /// The monitor's display name, the label above its row in the card.
+    pub name: String,
+    pub value: f64,
+}
+
 /// `BrightnessScale` (`:279-330`): a 0..1 value with a step count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrightnessScale {
@@ -230,6 +251,22 @@ impl BrightnessManager {
     /// The per-monitor scales, in output order — the detail card's rows.
     pub fn scales(&self) -> &[MonitorScale] {
         &self.monitors
+    }
+
+    /// The snapshot the UI renders from.
+    pub fn view(&self) -> BrightnessView {
+        BrightnessView {
+            global: self.global.as_ref().map(BrightnessScale::value),
+            monitors: self
+                .monitors
+                .iter()
+                .map(|scale| MonitorView {
+                    connector: scale.connector.clone(),
+                    name: scale.name().to_owned(),
+                    value: scale.value(),
+                })
+                .collect(),
+        }
     }
 
     pub fn dimming(&self) -> bool {

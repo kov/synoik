@@ -3103,6 +3103,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             sink_list,
             mic,
             source_list,
+            crate::brightness::BrightnessView::default(),
             accent,
         );
     }
@@ -3141,6 +3142,67 @@ fn vulkan_renders_the_quick_settings_popover() {
     assert!(
         opaque > 0,
         "the quick-settings popover did not composite any opaque pixels on Vulkan"
+    );
+}
+
+/// The quick-settings popover with a live brightness slider renders on Vulkan: the extra slider
+/// row grows the menu and adds a `display-brightness-symbolic` icon element. Its real value is the
+/// validation-layer run (`NIRI_VK_VALIDATION=1`), which this test's draw path feeds.
+#[test]
+fn vulkan_renders_the_brightness_slider() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    // Seed a backlit panel, exactly as the udev match would.
+    let snapshot = crate::backlight::BacklightSnapshot {
+        outputs: vec![crate::backlight::OutputBacklight {
+            connector: "eDP-1".to_owned(),
+            display_name: "Built-in display".to_owned(),
+            range: crate::backlight::BacklightRange { min: 1, max: 100 },
+            brightness: 60,
+        }],
+    };
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri().backlight = snapshot;
+
+    open_quick_settings(&mut f, &output);
+    assert!(f.niri().panel_popover.is_open());
+    f.settle_animations();
+
+    let state = f.niri_state();
+    let opaque = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            assert!(
+                !elems.is_empty(),
+                "the popover must produce render elements"
+            );
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 300.);
+            let pixels = render_to_vec(
+                vk,
+                Size::<i32, Physical>::from((w, h)),
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elems.into_iter(),
+            )
+            .expect("render the brightness slider");
+            pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        opaque > 0,
+        "the quick-settings popover with a brightness slider composited no opaque pixels"
     );
 }
 
@@ -8673,6 +8735,7 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let sink_list = f.niri().sink_list.clone();
     let mic = f.niri().mic;
     let source_list = f.niri().source_list.clone();
+    let brightness = f.niri().brightness.view();
     let accent = f.niri().gnome_settings.accent_color;
     f.niri().panel_popover.toggle_quick_settings(
         output.clone(),
@@ -8688,6 +8751,7 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
         sink_list,
         mic,
         source_list,
+        brightness,
         accent,
     );
 }

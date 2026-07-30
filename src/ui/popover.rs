@@ -92,6 +92,10 @@ pub enum PopoverAction {
     SetDefaultSink(String),
     /// Set the default source's perceptual volume `0..=1` (the QS mic slider).
     SetInputVolume(f64),
+    /// Set the global brightness scale `0..=1` (the QS brightness slider). Resolved in
+    /// `apply_popover_action`, since the scale algebra and the hardware both live on the
+    /// compositor; the menu stays open.
+    SetBrightness(f64),
     /// Toggle the default source's mute (clicking the mic slider's icon).
     ToggleInputMute,
     /// Set the system default input source to this `node.name` (an input-device-picker row). The
@@ -525,6 +529,7 @@ impl PanelPopover {
         sink_list: crate::audio::SinkList,
         mic: crate::audio::MicStatus,
         source_list: crate::audio::SourceList,
+        brightness: crate::brightness::BrightnessView,
         accent: [u8; 3],
     ) {
         if self.is_showing::<QuickSettingsTag>() {
@@ -548,6 +553,7 @@ impl PanelPopover {
             sink_list,
             mic,
             source_list,
+            brightness,
             accent,
         ))));
         self.anim = Some(self.make_anim(0., 1.));
@@ -582,6 +588,18 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_mic(mic)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh brightness snapshot to an open quick-settings popover, so the brightness
+    /// slider tracks the hardware and appears/disappears with the backlight. Returns whether it
+    /// changed.
+    pub fn set_brightness(&mut self, brightness: crate::brightness::BrightnessView) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_brightness(brightness)
             }
             _ => false,
         }

@@ -3152,6 +3152,12 @@ impl State {
         for write in writes {
             self.set_backlight_brightness(&write.connector, write.brightness);
         }
+
+        // gnome-shell's `BrightnessItem._sync` off the manager's `changed`/`notify::value`.
+        let view = self.niri.brightness.view();
+        if self.niri.panel_popover.set_brightness(view) {
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// The quick-settings brightness slider: the global scale, which fans out to every monitor

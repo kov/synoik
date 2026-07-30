@@ -22,11 +22,11 @@
 //! row and the tile grid when a sink is present: a mute icon-button plus a draggable
 //! track bound to the default sink's volume.
 //!
-//! Deferred vs gnome-shell: the brightness slider, the Network tile's in-menu
-//! enable/disable + connection list (its detail card is just a settings entry point),
-//! and SSID/connection-name labels. The self-contained tiles, the Network status
-//! tile, the Bluetooth tile (device list included), the system row, the battery
-//! pill, and the volume slider are here.
+//! Deferred vs gnome-shell: the brightness slider's per-monitor detail card, the
+//! Network tile's in-menu enable/disable + connection list (its detail card is just
+//! a settings entry point), and SSID/connection-name labels. The self-contained
+//! tiles, the Network status tile, the Bluetooth tile (device list included), the
+//! system row, the battery pill, and the volume, mic and brightness sliders are here.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -254,14 +254,33 @@ const MAX_DEVICE_ROWS: usize = 6;
 enum Slider {
     Output,
     Mic,
+    /// The display-brightness slider, stacked below the mic slider — gnome-shell adds the
+    /// brightness item right after the two volume items (`panel.js:366-373`).
+    Brightness,
 }
 
+/// The slider rows, top to bottom. Kept as an array so every draw/hit loop covers all of them.
+const SLIDERS: [Slider; 3] = [Slider::Output, Slider::Mic, Slider::Brightness];
+
 impl Slider {
-    /// The detail picker this slider's arrow opens.
-    fn owner(self) -> DetailOwner {
+    /// The detail picker this slider's arrow opens, if it has one.
+    fn owner(self) -> Option<DetailOwner> {
         match self {
-            Slider::Output => DetailOwner::Output,
-            Slider::Mic => DetailOwner::Input,
+            Slider::Output => Some(DetailOwner::Output),
+            Slider::Mic => Some(DetailOwner::Input),
+            // The per-monitor brightness card is Q4c-2; until then the arrow never appears
+            // (`arrow_count` reports one scale), so this is unreachable rather than a silent drop.
+            Slider::Brightness => None,
+        }
+    }
+
+    /// Whether the slider's leading icon is a button. gnome-shell's `QuickSlider` icon is
+    /// **opt-in** reactive (`quickSettings.js:290-311`): the volume sliders opt in, to toggle
+    /// mute; brightness does not, so its icon is decoration.
+    fn icon_is_button(self) -> bool {
+        match self {
+            Slider::Output | Slider::Mic => true,
+            Slider::Brightness => false,
         }
     }
 }
@@ -273,27 +292,33 @@ impl Slider {
 struct Sliders {
     output: bool,
     mic: bool,
+    /// The brightness slider, shown iff the manager has a global scale — i.e. iff some monitor
+    /// has a usable backlight (`brightness.js:59-60`).
+    brightness: bool,
 }
 
 impl Sliders {
-    /// Count of present slider rows (0, 1, or 2).
+    /// Count of present slider rows (0..=3).
     fn count(self) -> usize {
-        self.output as usize + self.mic as usize
+        self.output as usize + self.mic as usize + self.brightness as usize
     }
 
     fn present(self, sl: Slider) -> bool {
         match sl {
             Slider::Output => self.output,
             Slider::Mic => self.mic,
+            Slider::Brightness => self.brightness,
         }
     }
 
-    /// This slider's vertical slot among the present sliders, top-down: Output is always slot 0;
-    /// Mic follows the output slider (slot 1) when present, else takes slot 0.
+    /// This slider's vertical slot among the *present* sliders, top-down, in the order
+    /// gnome-shell adds them: output, mic, brightness. Each one takes the next free slot, so a
+    /// hidden slider above simply closes the gap.
     fn slot(self, sl: Slider) -> usize {
         match sl {
             Slider::Output => 0,
             Slider::Mic => self.output as usize,
+            Slider::Brightness => self.output as usize + self.mic as usize,
         }
     }
 }
@@ -661,6 +686,9 @@ impl Layout {
             _ => match sl {
                 Slider::Output => self.sink_count,
                 Slider::Mic => self.source_count,
+                // The per-monitor card is Q4c-2; reporting a single scale keeps the arrow away
+                // until it exists.
+                Slider::Brightness => 1,
             },
         }
     }
@@ -1007,6 +1035,9 @@ pub struct QuickSettings {
     mic: MicStatus,
     /// The input sources + current default, for the mic slider's device picker.
     source_list: SourceList,
+    /// The brightness scales (from the compositor-owned `BrightnessManager`): the global scale
+    /// backs the slider and its presence decides whether the slider exists at all.
+    brightness: crate::brightness::BrightnessView,
     /// The slider currently being dragged (a button held on its track) and the device count frozen
     /// at drag start — so a device hot-plug mid-drag can't add/remove that slider's picker arrow,
     /// resize the track, and remap `volume_from_x` (snapping the level under a stationary
@@ -1057,6 +1088,7 @@ impl QuickSettings {
         sink_list: SinkList,
         mic: MicStatus,
         source_list: SourceList,
+        brightness: crate::brightness::BrightnessView,
         accent: [u8; 3],
     ) -> Self {
         Self {
@@ -1083,6 +1115,7 @@ impl QuickSettings {
                 f32::from(accent[2]) / 255.,
                 1.,
             ],
+            brightness,
             revision: 0,
             cache: RefCell::new(TextureCache {
                 context: None,
@@ -1103,6 +1136,7 @@ impl QuickSettings {
         Sliders {
             output: self.audio.is_some(),
             mic: self.mic.recording && self.mic.source_present,
+            brightness: self.brightness.global.is_some(),
         }
     }
 
@@ -1451,7 +1485,7 @@ impl QuickSettings {
         // toggles the device picker; the track jumps to (and begins dragging toward) the clicked
         // position. The arrow is tested BEFORE the track so an arrow click never starts a drag (the
         // track is genuinely shortened to make room, so `volume_from_x` stays in range).
-        for slider in [Slider::Output, Slider::Mic] {
+        for slider in SLIDERS {
             if !layout.sliders.present(slider) {
                 continue;
             }
@@ -1459,16 +1493,19 @@ impl QuickSettings {
                 return match slider {
                     Slider::Output => PopoverAction::ToggleMute,
                     Slider::Mic => PopoverAction::ToggleInputMute,
+                    // Non-reactive icon: the click lands on the row, and stops there.
+                    Slider::Brightness => PopoverAction::Consumed,
                 };
             }
             if slider_arrow_rect(slider, layout).is_some_and(|r| r.contains(pos)) {
-                let owner = slider.owner();
-                self.expanded = if self.expanded == Some(owner) {
-                    None
-                } else {
-                    Some(owner)
-                };
-                self.revision += 1;
+                if let Some(owner) = slider.owner() {
+                    self.expanded = if self.expanded == Some(owner) {
+                        None
+                    } else {
+                        Some(owner)
+                    };
+                    self.revision += 1;
+                }
                 return PopoverAction::Consumed;
             }
             if slider_track_rect(slider, layout).contains(pos) {
@@ -1485,6 +1522,7 @@ impl QuickSettings {
         match slider {
             Slider::Output => self.sink_list.sinks.len(),
             Slider::Mic => self.source_list.sources.len(),
+            Slider::Brightness => self.brightness.monitors.len(),
         }
     }
 
@@ -1542,8 +1580,11 @@ impl QuickSettings {
                 return Some(QsHover::Sys(button));
             }
         }
-        for slider in [Slider::Output, Slider::Mic] {
-            if layout.sliders.present(slider) && slider_icon_rect(slider, layout).contains(pos) {
+        for slider in SLIDERS {
+            if slider.icon_is_button()
+                && layout.sliders.present(slider)
+                && slider_icon_rect(slider, layout).contains(pos)
+            {
                 return Some(QsHover::SliderIcon(slider));
             }
         }
@@ -1574,6 +1615,14 @@ impl QuickSettings {
             Slider::Mic => {
                 self.mic.volume = volume;
                 PopoverAction::SetInputVolume(volume)
+            }
+            Slider::Brightness => {
+                // Optimistic like the volume sliders: the handle follows the pointer, and the
+                // hardware echo (a udev change) confirms it a moment later.
+                if let Some(global) = self.brightness.global.as_mut() {
+                    *global = volume;
+                }
+                PopoverAction::SetBrightness(volume)
             }
         }
     }
@@ -1625,6 +1674,28 @@ impl QuickSettings {
         self.content_bumped();
         // The mic slider vanishing must also close an open input picker.
         self.normalize_expanded();
+        true
+    }
+
+    /// Adopt a fresh brightness snapshot (from the compositor's `BrightnessManager`). Returns
+    /// whether it changed.
+    ///
+    /// Same drag guard as [`set_mic`](Self::set_mic): while the brightness slider is being
+    /// dragged, the hardware echo lags the pointer, so the optimistic value wins — unless the
+    /// backlight is *going away* (the panel was unplugged), which cancels the drag before the
+    /// slider hides.
+    pub fn set_brightness(&mut self, brightness: crate::brightness::BrightnessView) -> bool {
+        if brightness == self.brightness {
+            return false;
+        }
+        if matches!(self.sliding, Some((Slider::Brightness, _))) {
+            if brightness.global.is_some() {
+                return false;
+            }
+            self.sliding = None;
+        }
+        self.brightness = brightness;
+        self.content_bumped();
         true
     }
 
@@ -1814,7 +1885,7 @@ impl QuickSettings {
 
         // Each present slider's mute/level icon (speaker for output, mic for input) in its disc,
         // plus its device-picker arrow at the right (when >1 device).
-        for slider in [Slider::Output, Slider::Mic] {
+        for slider in SLIDERS {
             if !layout.sliders.present(slider) {
                 continue;
             }
@@ -1824,6 +1895,8 @@ impl QuickSettings {
             let name = match slider {
                 Slider::Output => crate::audio::volume_icon(&self.audio.unwrap_or_default()),
                 Slider::Mic => crate::audio::mic_volume_icon(&self.mic),
+                // A single icon, not sensitivity-graded like the volume ones (`brightness.js:41`).
+                Slider::Brightness => "display-brightness-symbolic",
             }
             .to_string();
             if let Some(el) = widget::icon_element(
@@ -2103,7 +2176,7 @@ impl QuickSettings {
             // Each present slider: mute-button disc, the trough, its accent-filled portion, and the
             // round handle (`.quick-slider` + `_slider.scss`). The level icon composites on top
             // afterwards. Output and mic share the geometry; only the level/mute source differs.
-            for slider in [Slider::Output, Slider::Mic] {
+            for slider in SLIDERS {
                 if !layout.sliders.present(slider) {
                     continue;
                 }
@@ -2113,6 +2186,8 @@ impl QuickSettings {
                         (a.volume, a.muted)
                     }
                     Slider::Mic => (self.mic.volume, self.mic.muted),
+                    // Brightness has no mute, so the fill is always the accent colour.
+                    Slider::Brightness => (self.brightness.global.unwrap_or_default(), false),
                 };
                 let disc = slider_icon_rect(slider, layout);
                 p.fill_rounded(disc, SLIDER_H / 2., TILE_OFF)?;
@@ -2508,6 +2583,7 @@ mod tests {
             sliders: Sliders {
                 output: has_slider,
                 mic: false,
+                brightness: false,
             },
             expanded: None,
             sink_count: 0,
@@ -2539,6 +2615,7 @@ mod tests {
                 SinkList::default(),
                 MicStatus::default(),
                 SourceList::default(),
+                crate::brightness::BrightnessView::default(),
                 [0, 0, 0],
             )
             .logical_size();
@@ -2592,6 +2669,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
         let dnd = tile_rect(2, lay(false)); // grid: [Network, Dark Style, Do Not Disturb, Night Light]
@@ -2619,6 +2697,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
         let rev0 = qs.revision;
@@ -2690,6 +2769,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
         let before = qs.revision;
@@ -2718,6 +2798,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
 
@@ -2749,6 +2830,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
         let pill = pill_rect(true).expect("a battery must show the pill");
@@ -2778,6 +2860,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
         // Below the top system row, between the two tile columns.
@@ -2817,6 +2900,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0xff, 0x00, 0x00],
         );
         let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
@@ -2884,6 +2968,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         )
     }
@@ -2938,6 +3023,118 @@ mod tests {
         q.mic = recording_mic();
         q.source_list = make_sources(n);
         q
+    }
+
+    /// A brightness view with `n` backlit monitors, the global scale at `value`.
+    fn brightness_view(n: usize, value: f64) -> crate::brightness::BrightnessView {
+        crate::brightness::BrightnessView {
+            global: (n > 0).then_some(value),
+            monitors: (0..n)
+                .map(|i| crate::brightness::MonitorView {
+                    connector: format!("eDP-{i}"),
+                    name: format!("Display {i}"),
+                    value,
+                })
+                .collect(),
+        }
+    }
+
+    /// A menu with a live brightness slider (one backlit panel) and no audio.
+    fn qs_with_brightness(value: f64) -> QuickSettings {
+        let mut q = qs(NetworkStatus::Wired, None);
+        q.brightness = brightness_view(1, value);
+        q
+    }
+
+    /// The brightness slider exists only when some monitor has a backlight
+    /// (`brightness.js:59-60` gates on the global scale), and stacks BELOW both volume sliders --
+    /// gnome-shell adds the items in the order output, input, brightness (`panel.js:366-373`).
+    #[test]
+    fn brightness_slider_shows_with_a_backlight_and_stacks_last() {
+        let none = qs(NetworkStatus::Wired, None);
+        assert!(!none.layout().sliders.brightness);
+
+        // Alone, it takes the top slot (a desktop with no bound sink and no mic).
+        let only = qs_with_brightness(0.5);
+        assert!(only.layout().sliders.brightness);
+        assert_eq!(
+            slider_row_rect(Slider::Brightness, only.layout()).loc.y,
+            slider_row_rect(
+                Slider::Output,
+                qs(NetworkStatus::Wired, Some(AudioStatus::default())).layout(),
+            )
+            .loc
+            .y,
+        );
+
+        // With both volume sliders up it is the third row, below the mic.
+        let mut all = qs_with_sources(1);
+        all.brightness = brightness_view(1, 0.5);
+        let layout = all.layout();
+        let out = slider_row_rect(Slider::Output, layout).loc.y;
+        let mic = slider_row_rect(Slider::Mic, layout).loc.y;
+        let bright = slider_row_rect(Slider::Brightness, layout).loc.y;
+        assert!(out < mic && mic < bright);
+        assert_eq!(layout.sliders.count(), 3);
+
+        // Hiding the mic closes the gap rather than leaving a hole.
+        all.mic = MicStatus::default();
+        let layout = all.layout();
+        assert_eq!(
+            slider_row_rect(Slider::Brightness, layout).loc.y,
+            slider_row_rect(Slider::Mic, layout).loc.y,
+        );
+    }
+
+    /// The brightness icon is decoration, not a button: `QuickSlider`'s icon reactivity is opt-in
+    /// (`quickSettings.js:290-311`) and brightness does not opt in, unlike the two mute buttons.
+    #[test]
+    fn the_brightness_icon_is_not_a_button() {
+        let mut q = qs_with_brightness(0.5);
+        let layout = q.layout();
+        let icon = center(slider_icon_rect(Slider::Brightness, layout));
+
+        // No hover highlight...
+        q.pointer_hover(Some(icon));
+        assert_eq!(q.hovered, None);
+        // ... and a click on it does nothing but land.
+        assert_eq!(q.pointer_click(icon), PopoverAction::Consumed);
+        assert!(q.sliding.is_none());
+    }
+
+    /// Dragging the track reports the new global value and moves the handle optimistically, so it
+    /// tracks the pointer instead of waiting for the udev echo.
+    #[test]
+    fn dragging_brightness_sets_the_global_scale() {
+        let mut q = qs_with_brightness(0.);
+        let layout = q.layout();
+        let track = slider_track_rect(Slider::Brightness, layout);
+
+        let action = q.pointer_click(center(track));
+        let PopoverAction::SetBrightness(value) = action else {
+            panic!("expected SetBrightness, got {action:?}");
+        };
+        assert!((value - 0.5).abs() < 0.01);
+        assert!(matches!(q.sliding, Some((Slider::Brightness, _))));
+        assert!((q.brightness.global.unwrap() - value).abs() < 1e-9);
+
+        // The lagging echo is ignored mid-drag, so the handle does not snap back.
+        assert!(!q.set_brightness(brightness_view(1, 0.)));
+        assert!((q.brightness.global.unwrap() - value).abs() < 1e-9);
+
+        // But the backlight going away cancels the drag before the slider hides.
+        assert!(q.set_brightness(crate::brightness::BrightnessView::default()));
+        assert!(q.sliding.is_none());
+        assert!(!q.layout().sliders.brightness);
+    }
+
+    /// The per-monitor card is Q4c-2: until it exists the arrow must stay away, even with several
+    /// backlit monitors, or it would open nothing.
+    #[test]
+    fn brightness_has_no_picker_arrow_yet() {
+        let mut q = qs_with_brightness(0.5);
+        q.brightness = brightness_view(2, 0.5);
+        assert!(slider_arrow_rect(Slider::Brightness, q.layout()).is_none());
     }
 
     /// The mic slider shows only while recording with a bound source (gnome-shell's
@@ -3180,6 +3377,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
 
@@ -3249,6 +3447,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         );
 
@@ -3311,6 +3510,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         )
     }
@@ -3442,6 +3642,7 @@ mod tests {
             sliders: Sliders {
                 output: false,
                 mic: false,
+                brightness: false,
             },
             expanded: None,
             sink_count: 0,
@@ -3456,6 +3657,7 @@ mod tests {
             sliders: Sliders {
                 output: false,
                 mic: false,
+                brightness: false,
             },
             expanded: Some(DetailOwner::Network),
             sink_count: 0,
@@ -3552,6 +3754,7 @@ mod tests {
                     sliders: Sliders {
                         output: has_slider,
                         mic: false,
+                        brightness: false,
                     },
                     expanded: Some(owner),
                     sink_count: 0,
@@ -3645,6 +3848,7 @@ mod tests {
             sliders: Sliders {
                 output: true,
                 mic: false,
+                brightness: false,
             },
             expanded: None,
             sink_count: 0,
@@ -3659,6 +3863,7 @@ mod tests {
             sliders: Sliders {
                 output: true,
                 mic: false,
+                brightness: false,
             },
             expanded: Some(DetailOwner::Power),
             sink_count: 0,
@@ -3933,6 +4138,7 @@ mod tests {
             SinkList::default(),
             MicStatus::default(),
             SourceList::default(),
+            crate::brightness::BrightnessView::default(),
             [0, 0, 0],
         )
     }

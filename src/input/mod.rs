@@ -1193,6 +1193,11 @@ impl State {
                     self.on_mic_status(status);
                 }
             }
+            // The scale algebra and the backlight both live on the compositor, so the slider only
+            // reports where it was dragged; the manager decides what each monitor gets written.
+            PopoverAction::SetBrightness(value) => {
+                self.set_global_brightness(value);
+            }
             // Fire-and-forget, like SetDefaultSink.
             #[cfg(feature = "pipewire")]
             PopoverAction::SetDefaultSource(name) => {
@@ -5858,6 +5863,7 @@ impl State {
                                 let sink_list = self.niri.sink_list.clone();
                                 let mic = self.niri.mic;
                                 let source_list = self.niri.source_list.clone();
+                                let brightness = self.niri.brightness.view();
                                 let accent = self.niri.gnome_settings.accent_color;
                                 self.niri.panel_popover.toggle_quick_settings(
                                     output,
@@ -5873,6 +5879,7 @@ impl State {
                                     sink_list,
                                     mic,
                                     source_list,
+                                    brightness,
                                     accent,
                                 );
                                 self.niri.suppressed_buttons.insert(button_code);
