@@ -53,6 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         REMOVE_ENV_RUST_LIB_BACKTRACE.store(true, Ordering::Relaxed);
     }
 
+    // Before ANY thread is spawned, so every one of them inherits the mask — a
+    // thread that does not block these takes the signal instead of the signalfd,
+    // and the default action for all of them is to kill the process. That is not
+    // hypothetical: the `log-writer` thread below used to be created first, and it
+    // swallowed SIGUSR1 (the frame-log dump) straight into a silent exit. The same
+    // race applied to SIGINT/SIGTERM, where it would have skipped the clean
+    // shutdown path.
+    niri::utils::signals::block_early().unwrap();
+
     // Log through a writer thread, so emitting a line is a channel send instead of a `write(2)`.
     //
     // Under systemd our stderr is a journald socket, and writing to it blocks whenever journald
@@ -176,9 +185,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
-    // Needs to be done before starting Tracy, so that it applies to Tracy's threads.
-    niri::utils::signals::block_early().unwrap();
 
     // Avoid starting Tracy for the `niri msg` code path since starting/stopping Tracy is a bit
     // slow.

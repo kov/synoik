@@ -54,6 +54,21 @@ mod platform {
                 },
             )
             .unwrap();
+
+        // Its own source, because this one must not terminate the session:
+        // SIGUSR1 dumps the frame log's in-memory ring (`NIRI_FRAME_LOG=ring`).
+        handle
+            .insert_source(
+                Signals::new(&[Signal::SIGUSR1]).unwrap(),
+                |_event, _, state| match state.niri.frame_log.dump() {
+                    Ok((path, 0)) => {
+                        info!("frame-log ring is empty (is NIRI_FRAME_LOG=ring set?); {path:?}")
+                    }
+                    Ok((path, n)) => info!("dumped {n} frame-log entries to {}", path.display()),
+                    Err(err) => warn!("error dumping the frame log: {err}"),
+                },
+            )
+            .unwrap();
     }
 
     // We block the signals early, so that they apply to all threads.
@@ -81,6 +96,10 @@ mod platform {
             add_signal(&mut set, libc::SIGINT)?;
             add_signal(&mut set, libc::SIGTERM)?;
             add_signal(&mut set, libc::SIGHUP)?;
+            // Blocked from the start too: until the `Signals` source below is
+            // installed, the default action for SIGUSR1 is to kill the process —
+            // so an early dump request would take the session down.
+            add_signal(&mut set, libc::SIGUSR1)?;
         }
         Ok(set)
     }

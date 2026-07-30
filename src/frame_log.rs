@@ -530,6 +530,16 @@ struct Settings {
     log_all: bool,
     /// How often to emit the rolling summary. `None` disables it.
     summary_every: Option<Duration>,
+    /// Bank every frame in a bounded in-memory ring instead of writing it out as
+    /// it happens, and dump the ring to a file on `SIGUSR1`. `None` = off.
+    ///
+    /// This exists because `all` is an observer effect that hides from its own
+    /// instrument: formatting a ~600-char line and handing it to journald costs
+    /// the compositor thread real time *per frame*, but it happens after `total`
+    /// is measured, so it inflates the miss rate while leaving the reported frame
+    /// cost untouched. Banking the raw record is a move of data the frame already
+    /// built — no formatting, no allocation beyond the ring, no I/O.
+    ring: Option<usize>,
 }
 
 impl Default for Settings {
@@ -538,6 +548,7 @@ impl Default for Settings {
             threshold: None,
             log_all: false,
             summary_every: Some(Duration::from_secs(10)),
+            ring: None,
         }
     }
 }
@@ -622,7 +633,7 @@ struct Span {
 }
 
 /// The frame being timed right now.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InFlight {
     output: String,
     /// This frame's number, so a GPU sample read back after the frame has ended
@@ -647,7 +658,7 @@ struct InFlight {
 /// What a finished frame cost, beyond its per-phase wall clock: the counters and
 /// timers that live in process-wide statics because the code that feeds them sits
 /// too deep to carry a log handle.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Totals {
     gpu: Duration,
     /// `gpu`, split by the submit it was spent in. Indexed by `SubmitSite::index`.
@@ -704,6 +715,31 @@ struct Totals {
     shaded: u64,
 }
 
+/// How many entries the ring holds by default: ~6 minutes at 46 fps, which covers
+/// a `drive-workload.sh heavy` pair with room to spare. Each entry is the record
+/// the frame already built, so the cost is memory, not frame time.
+const DEFAULT_RING: usize = 16384;
+
+/// One banked entry, in the order it happened. Frames are kept *unformatted* —
+/// formatting is the cost this whole mechanism exists to move off the frame path —
+/// while summaries, which are one line per 10 s, are formatted as they happen so
+/// the dump needs no aggregation state to reconstruct them.
+#[derive(Debug)]
+// Boxing the big variant is the usual fix and is wrong here: `Frame` is what the
+// ring is almost entirely made of, so a box would add exactly the per-frame
+// allocation this mechanism exists to avoid. `Line` is one entry per summary
+// period, so the wasted padding on those is a few hundred bytes per 10 seconds.
+#[allow(clippy::large_enum_variant)]
+enum Entry {
+    Frame {
+        frame: InFlight,
+        total: Duration,
+        totals: Totals,
+        budget: Option<Duration>,
+    },
+    Line(String),
+}
+
 /// A finished frame waiting for the GPU samples it was promised. See
 /// [`FrameLog::parked`].
 #[derive(Debug)]
@@ -757,6 +793,8 @@ pub struct FrameLog {
     /// Bounded by [`MAX_PARKED_FRAMES`]; empty whenever GPU timing is off, since
     /// nothing promises a sample then.
     parked: VecDeque<Parked>,
+    /// Banked entries awaiting a `SIGUSR1` dump. Empty unless `ring` is set.
+    ring: VecDeque<Entry>,
     stats: HashMap<String, Stats>,
     /// Per output, the last frame handed to KMS: what it aimed at and when we let
     /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
@@ -804,6 +842,7 @@ impl FrameLog {
             settings,
             in_flight: None,
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             stats: HashMap::new(),
             queued: HashMap::new(),
             last_presented: HashMap::new(),
@@ -832,6 +871,18 @@ impl FrameLog {
                 // now the renderer has almost certainly already read it. All this
                 // arm does is keep `gpu` alone a valid way to turn logging on.
                 ("gpu", None) => enabled = true,
+                ("ring", None) => {
+                    enabled = true;
+                    settings.ring = Some(DEFAULT_RING);
+                }
+                ("ring", Some(v)) => match v.parse::<usize>() {
+                    Ok(0) => settings.ring = None,
+                    Ok(n) => {
+                        enabled = true;
+                        settings.ring = Some(n);
+                    }
+                    Err(_) => tracing::warn!("NIRI_FRAME_LOG: bad ring size {v:?}, ignoring"),
+                },
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
                     Ok(secs) => settings.summary_every = Some(Duration::from_secs(secs)),
@@ -1026,7 +1077,23 @@ impl FrameLog {
         let cost = frame_cost(total, &totals);
         let over = budget.is_some_and(|budget| cost > budget);
 
-        if over || settings.log_all {
+        if let Some(cap) = settings.ring {
+            // Bank the record unformatted. Over-budget frames still go to the
+            // journal as they happen: they are rare, and a live `warn!` is what
+            // tells you something is wrong without waiting for a dump.
+            if over {
+                tracing::warn!("{}", Self::format_frame(&frame, total, &totals, budget));
+            }
+            while self.ring.len() >= cap {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(Entry::Frame {
+                frame: frame.clone(),
+                total,
+                totals: totals.clone(),
+                budget,
+            });
+        } else if over || settings.log_all {
             let line = Self::format_frame(&frame, total, &totals, budget);
             if over {
                 tracing::warn!("{line}");
@@ -1383,6 +1450,8 @@ impl FrameLog {
             );
         }
 
+        let ring_cap = self.settings.and_then(|s| s.ring);
+        let mut banked: Vec<String> = Vec::new();
         for (output, stats) in &mut self.stats {
             if stats.frames == 0 {
                 // Still report drops on an output that rendered nothing: that is
@@ -1441,7 +1510,7 @@ impl FrameLog {
             // many frames aimed into quiet and missed, but not how many aimed into quiet at all.
             let aim = histogram_clause("aim", &stats.aim);
 
-            tracing::info!(
+            let line = format!(
                 "{output}: {:.1} fps over {}, p50 {}, p95 {}, worst {}, {} over budget, \
                  {} dropped{gpu}{headroom}{cadence}{aim}",
                 fps,
@@ -1452,10 +1521,74 @@ impl FrameLog {
                 stats.over_budget,
                 stats.dropped,
             );
+            // One line per summary period, so formatting it eagerly costs nothing
+            // even in ring mode — and banking it keeps the dump self-sufficient:
+            // `correlate-frame-log.py` needs the summaries to close its windows,
+            // and they cannot be reconstructed from the frame records alone.
+            if ring_cap.is_some() {
+                banked.push(line.clone());
+            }
+            tracing::info!("{line}");
 
             *stats = Stats::default();
         }
+
+        if let Some(cap) = ring_cap {
+            for line in banked {
+                while self.ring.len() >= cap {
+                    self.ring.pop_front();
+                }
+                self.ring.push_back(Entry::Line(line));
+            }
+        }
     }
+
+    /// Format and write every banked entry, oldest first, then clear the ring — so
+    /// successive dumps give successive windows rather than re-reporting the same
+    /// frames.
+    ///
+    /// A file rather than the journal on purpose: a dump is tens of thousands of
+    /// lines at once, and journald's rate limiter would *drop* some of them, which
+    /// is the one failure this whole mechanism cannot tolerate — a log with
+    /// invisible holes reads exactly like a log of a session that rendered fewer
+    /// frames. The text is byte-identical to the journal's, so
+    /// `scripts/correlate-frame-log.py` reads a dump directly.
+    pub fn dump(&mut self) -> std::io::Result<(std::path::PathBuf, usize)> {
+        use std::io::Write as _;
+
+        let path = dump_path();
+        let entries = self.ring.len();
+        let file = std::fs::File::create(&path)?;
+        let mut out = std::io::BufWriter::new(file);
+        for entry in self.ring.drain(..) {
+            match entry {
+                Entry::Frame {
+                    frame,
+                    total,
+                    totals,
+                    budget,
+                } => writeln!(
+                    out,
+                    "{}",
+                    Self::format_frame(&frame, total, &totals, budget)
+                )?,
+                Entry::Line(line) => writeln!(out, "{line}")?,
+            }
+        }
+        out.flush()?;
+        Ok((path, entries))
+    }
+}
+
+/// Where [`FrameLog::dump`] writes. `NIRI_FRAME_LOG_DUMP` overrides it; otherwise
+/// the session's runtime dir, which is where the rest of our per-session files live
+/// and is writable without any assumption about the cwd.
+fn dump_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("NIRI_FRAME_LOG_DUMP") {
+        return std::path::PathBuf::from(path);
+    }
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
+    std::path::PathBuf::from(dir).join(format!("niri-frame-log.{}.txt", std::process::id()))
 }
 
 /// How many bake sites a frame line names before it starts counting the rest.
@@ -1868,6 +2001,7 @@ mod tests {
     fn test_log() -> FrameLog {
         FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -1964,6 +2098,84 @@ mod tests {
         );
         // The split must sum to the total, or the line would attribute time twice.
         assert_eq!(s.by_site.iter().sum::<Duration>(), s.time);
+    }
+
+    /// Ring mode banks every frame with no formatting and no I/O, and the dump
+    /// writes them out in order and empties the ring.
+    ///
+    /// The property under test is the one that makes ring mode worth having: with
+    /// `all`, the compositor thread formats a ~600-char line and hands it to
+    /// journald *per frame*, and because that happens after the frame's total is
+    /// measured it inflates the miss rate while leaving the reported cost
+    /// untouched — an observer effect invisible to its own instrument. So the
+    /// assertions are "nothing was written while frames ran" and "everything is
+    /// there afterwards".
+    #[test]
+    fn ring_mode_banks_frames_and_dumps_them() {
+        let dir = std::env::temp_dir().join(format!("niri-ring-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.txt");
+        std::env::set_var("NIRI_FRAME_LOG_DUMP", &path);
+
+        let mut log = test_log();
+        log.settings = Some(Settings {
+            ring: Some(4),
+            ..Settings::default()
+        });
+
+        for _ in 0..3 {
+            log.begin("out");
+            log.end(Some(Duration::from_millis(16)));
+        }
+        assert_eq!(log.ring.len(), 3, "frames must be banked, not dropped");
+
+        // The ring is bounded: the oldest entries fall off rather than growing
+        // without limit in a session left running for hours.
+        for _ in 0..3 {
+            log.begin("out");
+            log.end(Some(Duration::from_millis(16)));
+        }
+        assert_eq!(log.ring.len(), 4, "the ring must stay at its cap");
+
+        let (dumped, n) = log.dump().expect("dump");
+        assert_eq!(dumped, path);
+        assert_eq!(n, 4);
+        assert!(log.ring.is_empty(), "a dump must empty the ring");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            4,
+            "every banked entry must reach the file"
+        );
+        assert!(
+            text.lines().all(|l| l.contains("frame on out took")),
+            "dumped lines must be byte-identical to the journal's, so \
+             correlate-frame-log.py reads a dump directly: {text}"
+        );
+
+        // A second dump reports the window since the first, not the same frames again.
+        log.begin("out");
+        log.end(Some(Duration::from_millis(16)));
+        let (_, n) = log.dump().expect("dump");
+        assert_eq!(n, 1, "successive dumps must give successive windows");
+
+        std::env::remove_var("NIRI_FRAME_LOG_DUMP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ring` is off unless asked for, and `ring=0` turns it back off.
+    #[test]
+    fn ring_is_parsed_from_the_environment() {
+        assert_eq!(FrameLog::parse("1").unwrap().ring, None);
+        assert_eq!(FrameLog::parse("ring").unwrap().ring, Some(DEFAULT_RING));
+        assert_eq!(FrameLog::parse("ring=200").unwrap().ring, Some(200));
+        // `ring=0` disables the ring without enabling logging on its own, so it
+        // needs a companion to be a valid setting at all.
+        assert!(FrameLog::parse("ring=0").is_none());
+        assert_eq!(FrameLog::parse("1,ring=0").unwrap().ring, None);
+        // And `ring` turns logging on by itself, like `all` and `gpu`.
+        assert!(FrameLog::parse("ring").is_some());
     }
 
     /// A frame whose submit was deferred holds its line until the measurement
@@ -2179,6 +2391,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2221,6 +2434,7 @@ mod tests {
         // second; it is a compositor with nothing to draw.
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2250,6 +2464,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2289,6 +2504,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2335,6 +2551,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            ring: VecDeque::new(),
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
