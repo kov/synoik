@@ -96,6 +96,10 @@ pub enum PopoverAction {
     /// `apply_popover_action`, since the scale algebra and the hardware both live on the
     /// compositor; the menu stays open.
     SetBrightness(f64),
+    /// Set ONE output's brightness scale `0..=1` (a row of the per-monitor brightness card).
+    /// Resolved in `apply_popover_action` like [`SetBrightness`](Self::SetBrightness); the menu
+    /// stays open.
+    SetMonitorBrightness(String, f64),
     /// Toggle the default source's mute (clicking the mic slider's icon).
     ToggleInputMute,
     /// Set the system default input source to this `node.name` (an input-device-picker row). The
@@ -590,6 +594,16 @@ impl PanelPopover {
                 qs.set_mic(mic)
             }
             _ => false,
+        }
+    }
+
+    /// Open the brightness card on an open quick-settings popover. Test-only: the real path is a
+    /// click on the slider's picker arrow, whose position the render tests would have to
+    /// re-derive.
+    #[cfg(test)]
+    pub fn open_brightness_card_for_test(&mut self) {
+        if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
+            qs.open_brightness_card_for_test();
         }
     }
 

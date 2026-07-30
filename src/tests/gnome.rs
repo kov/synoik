@@ -4494,6 +4494,59 @@ fn messages_indicator_toggles_with_dnd_tile() {
     );
 }
 
+/// The brightness card's rows drive the shell's scale algebra, not the hardware directly: moving
+/// ONE monitor re-derives every scale factor from the new maximum and pulls the global scale (the
+/// quick-settings slider) to it, while moving the GLOBAL scale fans back out through those factors
+/// (`js/misc/brightnessManager.js:203-240`).
+#[test]
+fn brightness_card_rows_drive_the_scale_algebra() {
+    use crate::backlight::{BacklightRange, BacklightSnapshot, OutputBacklight};
+    use crate::ui::popover::PopoverAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Two backlit monitors, the external one at half the panel's brightness. A 0..100 range makes
+    // a raw value read as a percentage of the usable span.
+    let backlight = |connector: &str, name: &str, brightness| OutputBacklight {
+        connector: connector.to_owned(),
+        display_name: name.to_owned(),
+        range: BacklightRange { min: 0, max: 100 },
+        brightness,
+    };
+    let snapshot = BacklightSnapshot {
+        outputs: vec![
+            backlight("eDP-1", "Built-in display", 100),
+            backlight("DP-2", "Dell 24\u{2033}", 50),
+        ],
+    };
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri().backlight = snapshot;
+
+    // The first sync adopts the hardware, so the global slider sits at the maximum.
+    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
+    assert_eq!(f.niri().brightness.scales()[1].value(), 0.5);
+
+    // A card row: pushing the external monitor to full makes IT the maximum, so the global scale
+    // follows it and the two are now in step.
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetMonitorBrightness("DP-2".into(), 1.0));
+    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
+    assert_eq!(f.niri().brightness.scales()[0].value(), 1.0);
+    assert_eq!(f.niri().brightness.scales()[1].value(), 1.0);
+
+    // The top-level slider now moves both together, through the re-derived factors.
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetBrightness(0.4));
+    assert_eq!(f.niri().brightness.scales()[0].value(), 0.4);
+    assert_eq!(f.niri().brightness.scales()[1].value(), 0.4);
+
+    // An unknown connector is a no-op, not a panic.
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetMonitorBrightness("HDMI-A-1".into(), 0.9));
+    assert_eq!(f.niri().brightness.scales()[0].value(), 0.4);
+}
+
 /// The popover opens and closes with an animation (gnome-shell's `BoxPointer` fade):
 /// opening starts a running animation; dismissing does NOT drop the popover instantly
 /// but keeps it visible (fading) with an ongoing animation until it settles.

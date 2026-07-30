@@ -3145,9 +3145,10 @@ fn vulkan_renders_the_quick_settings_popover() {
     );
 }
 
-/// The quick-settings popover with a live brightness slider renders on Vulkan: the extra slider
-/// row grows the menu and adds a `display-brightness-symbolic` icon element. Its real value is the
-/// validation-layer run (`NIRI_VK_VALIDATION=1`), which this test's draw path feeds.
+/// The quick-settings popover with a live brightness slider and its per-monitor card open renders
+/// on Vulkan: the extra slider row grows the menu, and the card adds label rows plus the shared
+/// slider body. Its real value is the validation-layer run (`NIRI_VK_VALIDATION=1`), which this
+/// test's draw path feeds.
 #[test]
 fn vulkan_renders_the_brightness_slider() {
     let Some(mut f) = window_fixture(GREEN) else {
@@ -3156,14 +3157,19 @@ fn vulkan_renders_the_brightness_slider() {
     let output = f.niri_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
-    // Seed a backlit panel, exactly as the udev match would.
+    // Seed two backlit monitors, exactly as the udev match would: two scales means the slider
+    // gets its picker arrow, and the per-monitor card behind it has rows to draw.
+    let backlight = |connector: &str, name: &str, brightness| crate::backlight::OutputBacklight {
+        connector: connector.to_owned(),
+        display_name: name.to_owned(),
+        range: crate::backlight::BacklightRange { min: 1, max: 100 },
+        brightness,
+    };
     let snapshot = crate::backlight::BacklightSnapshot {
-        outputs: vec![crate::backlight::OutputBacklight {
-            connector: "eDP-1".to_owned(),
-            display_name: "Built-in display".to_owned(),
-            range: crate::backlight::BacklightRange { min: 1, max: 100 },
-            brightness: 60,
-        }],
+        outputs: vec![
+            backlight("eDP-1", "Built-in display", 60),
+            backlight("DP-2", "Dell 24\u{2033}", 30),
+        ],
     };
     let _ = f.niri().brightness.monitors_changed(&snapshot);
     f.niri().backlight = snapshot;

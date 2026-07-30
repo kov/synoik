@@ -1198,6 +1198,9 @@ impl State {
             PopoverAction::SetBrightness(value) => {
                 self.set_global_brightness(value);
             }
+            PopoverAction::SetMonitorBrightness(connector, value) => {
+                self.set_monitor_brightness(&connector, value);
+            }
             // Fire-and-forget, like SetDefaultSink.
             #[cfg(feature = "pipewire")]
             PopoverAction::SetDefaultSource(name) => {

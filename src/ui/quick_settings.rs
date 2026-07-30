@@ -194,7 +194,13 @@ const DETAIL_SUBTITLE_FG: [f32; 4] = [1., 1., 1., 0.5];
 
 /// A detail row's shaped text + the per-row flags the draw loop needs (so it never re-derives
 /// rows mid-bake).
-struct DetailRowRun {
+/// A baked card row: shaped text for the ordinary and label rows, a bare value for a slider one.
+enum DetailRowRun {
+    Text(TextRun),
+    Slider { value: f64 },
+}
+
+struct TextRun {
     label: ShapedText,
     /// The trailing right-aligned sublabel run (Connect/Disconnect/busy), if any.
     trailing: Option<ShapedText>,
@@ -204,7 +210,7 @@ struct DetailRowRun {
 
 /// One actionable row in a detail view (gnome-shell's `addAction` items). `separator_before`
 /// opens a visual group break above the row (the shutdown menu's power/session split).
-struct DetailRow {
+struct ItemRow {
     label: String,
     /// Optional leading symbolic-icon candidates (empty = label-only, like the shutdown rows).
     icons: Vec<String>,
@@ -219,6 +225,96 @@ struct DetailRow {
     /// A non-reactive placeholder line (the bluetooth menu's `.bt-menu-placeholder`,
     /// `bluetooth.js:286-295`): drawn centered/bold, no hover, click consumed.
     placeholder: bool,
+}
+
+impl From<ItemRow> for DetailRow {
+    fn from(row: ItemRow) -> Self {
+        DetailRow::Item(row)
+    }
+}
+
+/// One row of an open detail card.
+///
+/// Most cards are lists of actionable items, but the brightness card is a stack of
+/// (name label, slider) pairs (`brightness.js:13-34`), so a row is not always a clickable label.
+/// The variants are what the consumers genuinely branch on: only `Item` rows have an action, an
+/// icon or a check; only `Slider` rows drag; and `Label`/`Slider` are both `reactive: false` in
+/// gnome-shell (`brightness.js:14,29`), so neither ever highlights on hover.
+enum DetailRow {
+    Item(ItemRow),
+    /// A non-reactive name label above a monitor's slider (`brightness.js:14-15`).
+    Label(String),
+    /// A bare slider bound to one output's scale (`brightness.js:17-31`) — no icon, unlike the
+    /// top-level `QuickSlider` rows.
+    Slider {
+        connector: String,
+        value: f64,
+    },
+}
+
+/// What kind of row occupies a slot, and thus how tall it is. Part of the *pure* card shape, so
+/// the geometry can size a card without building its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// An ordinary actionable list row.
+    Item,
+    /// A non-reactive text label.
+    Label,
+    /// A slider.
+    Slider,
+}
+
+impl RowKind {
+    /// All three are ordinary `%menuitem`s in gnome-shell (`brightness.js:14,29` builds the label
+    /// and the slider bin as plain menu items), so they share a height today. The per-kind hook
+    /// exists so a kind can diverge without another geometry refactor.
+    fn height(self) -> f64 {
+        DETAIL_ROW_H
+    }
+}
+
+/// One slot of a card's pure shape: its kind, and whether a group separator opens above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowSpec {
+    kind: RowKind,
+    separator_before: bool,
+}
+
+impl RowSpec {
+    /// The ordinary actionable row every card but brightness is made of.
+    fn item(separator_before: bool) -> Self {
+        Self {
+            kind: RowKind::Item,
+            separator_before,
+        }
+    }
+}
+
+impl DetailRow {
+    /// The shape slot this row must occupy — what ties the live rows to the pure `row_shape` the
+    /// geometry sized the card from.
+    fn spec(&self) -> RowSpec {
+        match self {
+            DetailRow::Item(row) => RowSpec::item(row.separator_before),
+            DetailRow::Label(_) => RowSpec {
+                kind: RowKind::Label,
+                separator_before: false,
+            },
+            DetailRow::Slider { .. } => RowSpec {
+                kind: RowKind::Slider,
+                separator_before: false,
+            },
+        }
+    }
+
+    /// The item behind an ordinary row; `None` for the label/slider rows, which have no action,
+    /// icon or check.
+    fn item(&self) -> Option<&ItemRow> {
+        match self {
+            DetailRow::Item(row) => Some(row),
+            _ => None,
+        }
+    }
 }
 
 /// Who owns the currently-open detail view. Keyed by **identity**, not a grid index, so it also
@@ -239,6 +335,8 @@ enum DetailOwner {
     Output,
     /// The mic slider's input-device picker (gnome-shell's `InputStreamSlider` device menu).
     Input,
+    /// The brightness slider's per-monitor card (gnome-shell's `BrightnessSliderMenu`).
+    Brightness,
 }
 
 /// The most device rows a picker renders (Fable): the card grows with the device count and the
@@ -262,15 +360,23 @@ enum Slider {
 /// The slider rows, top to bottom. Kept as an array so every draw/hit loop covers all of them.
 const SLIDERS: [Slider; 3] = [Slider::Output, Slider::Mic, Slider::Brightness];
 
+/// Which slider a drag is on. A card slider is per-connector, so it can't be named by the
+/// top-level [`Slider`] enum — but [`Layout`] stays `Copy` by only ever carrying the top-level
+/// half (a card slider has no arrow, so there is nothing for the drag freeze to pin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SliderId {
+    Top(Slider),
+    /// A per-monitor slider row inside the brightness card, by connector.
+    Monitor(String),
+}
+
 impl Slider {
     /// The detail picker this slider's arrow opens, if it has one.
     fn owner(self) -> Option<DetailOwner> {
         match self {
             Slider::Output => Some(DetailOwner::Output),
             Slider::Mic => Some(DetailOwner::Input),
-            // The per-monitor brightness card is Q4c-2; until then the arrow never appears
-            // (`arrow_count` reports one scale), so this is unreachable rather than a silent drop.
-            Slider::Brightness => None,
+            Slider::Brightness => Some(DetailOwner::Brightness),
         }
     }
 
@@ -325,7 +431,7 @@ impl Sliders {
 
 /// A spawn `DetailRow` from a command's words.
 fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
-    DetailRow {
+    ItemRow {
         label: label.to_string(),
         icons: Vec::new(),
         action: PopoverAction::Spawn(cmd.iter().map(|s| s.to_string()).collect()),
@@ -334,6 +440,7 @@ fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
         trailing: None,
         placeholder: false,
     }
+    .into()
 }
 
 /// The live Bluetooth state a detail card renders from: the snapshot, the row order frozen when
@@ -357,6 +464,12 @@ impl DetailOwner {
                 "Bluetooth".to_string(),
             ),
             DetailOwner::Network => (network_icons(network), network_label(network).to_string()),
+            // `menu.setHeader('display-brightness-symbolic', _('Brightness'))`
+            // (`brightness.js:47`).
+            DetailOwner::Brightness => (
+                vec!["display-brightness-symbolic".to_string()],
+                "Brightness".to_string(),
+            ),
             // gnome-shell's `ShutdownItem` menu header (`status/system.js`).
             DetailOwner::Power => (
                 vec!["system-shutdown-symbolic".to_string()],
@@ -388,6 +501,7 @@ impl DetailOwner {
         source_list: &SourceList,
         power: &PowerProfileStatus,
         bt: BtDetail<'_>,
+        monitors: &[crate::brightness::MonitorView],
     ) -> Vec<DetailRow> {
         match self {
             // gnome-shell's device list (`bluetooth.js:283-304,395-408`): one row per visible
@@ -409,43 +523,49 @@ impl DetailOwner {
                 let mut rows: Vec<DetailRow> = ordered
                     .into_iter()
                     .take(MAX_DEVICE_ROWS)
-                    .map(|d| DetailRow {
-                        label: d.alias.clone(),
-                        icons: d.icon_candidates(),
-                        action: PopoverAction::ConnectBluetoothDevice {
-                            path: d.path.clone(),
-                            connect: !d.connected,
-                        },
-                        separator_before: false,
-                        selected: false,
-                        // The busy mark stands in for gnome-shell's spinner (which hides the
-                        // subtitle while a connect is in flight, `bluetooth.js:225-231`).
-                        trailing: Some(if bt.busy == Some(d.path.as_str()) {
-                            "…".to_string()
-                        } else if d.connected {
-                            "Disconnect".to_string()
-                        } else {
-                            "Connect".to_string()
-                        }),
-                        placeholder: false,
+                    .map(|d| {
+                        ItemRow {
+                            label: d.alias.clone(),
+                            icons: d.icon_candidates(),
+                            action: PopoverAction::ConnectBluetoothDevice {
+                                path: d.path.clone(),
+                                connect: !d.connected,
+                            },
+                            separator_before: false,
+                            selected: false,
+                            // The busy mark stands in for gnome-shell's spinner (which hides the
+                            // subtitle while a connect is in flight, `bluetooth.js:225-231`).
+                            trailing: Some(if bt.busy == Some(d.path.as_str()) {
+                                "…".to_string()
+                            } else if d.connected {
+                                "Disconnect".to_string()
+                            } else {
+                                "Connect".to_string()
+                            }),
+                            placeholder: false,
+                        }
+                        .into()
                     })
                     .collect();
                 if rows.is_empty() {
                     // `.bt-menu-placeholder`, text by adapter state (`bluetooth.js:348-352`).
-                    rows.push(DetailRow {
-                        label: if bt.status.powered {
-                            "No available or connected devices"
-                        } else {
-                            "Turn on Bluetooth to connect to devices"
+                    rows.push(
+                        ItemRow {
+                            label: if bt.status.powered {
+                                "No available or connected devices"
+                            } else {
+                                "Turn on Bluetooth to connect to devices"
+                            }
+                            .to_string(),
+                            icons: Vec::new(),
+                            action: PopoverAction::Consumed,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: true,
                         }
-                        .to_string(),
-                        icons: Vec::new(),
-                        action: PopoverAction::Consumed,
-                        separator_before: false,
-                        selected: false,
-                        trailing: None,
-                        placeholder: true,
-                    });
+                        .into(),
+                    );
                 }
                 rows.push(spawn_row(
                     "Bluetooth Settings",
@@ -484,14 +604,17 @@ impl DetailOwner {
                 let mut rows: Vec<DetailRow> = power
                     .available
                     .iter()
-                    .map(|profile| DetailRow {
-                        label: profile.name().to_string(),
-                        icons: Vec::new(),
-                        action: PopoverAction::SetPowerProfile(profile.id().to_string()),
-                        separator_before: false,
-                        selected: power.active == profile.id(),
-                        trailing: None,
-                        placeholder: false,
+                    .map(|profile| {
+                        ItemRow {
+                            label: profile.name().to_string(),
+                            icons: Vec::new(),
+                            action: PopoverAction::SetPowerProfile(profile.id().to_string()),
+                            separator_before: false,
+                            selected: power.active == profile.id(),
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -509,14 +632,17 @@ impl DetailOwner {
                     .sinks
                     .iter()
                     .take(MAX_DEVICE_ROWS)
-                    .map(|sink| DetailRow {
-                        label: sink.description.clone(),
-                        icons: Vec::new(),
-                        action: PopoverAction::SetDefaultSink(sink.name.clone()),
-                        separator_before: false,
-                        selected: sink_list.default_name.as_deref() == Some(sink.name.as_str()),
-                        trailing: None,
-                        placeholder: false,
+                    .map(|sink| {
+                        ItemRow {
+                            label: sink.description.clone(),
+                            icons: Vec::new(),
+                            action: PopoverAction::SetDefaultSink(sink.name.clone()),
+                            separator_before: false,
+                            selected: sink_list.default_name.as_deref() == Some(sink.name.as_str()),
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -526,20 +652,39 @@ impl DetailOwner {
                 ));
                 rows
             }
+            // A (name label, slider) pair per monitor, and nothing else — gnome-shell's
+            // `BrightnessSliderMenu.addSlider` adds a non-reactive `PopupMenuItem(scale.name)`
+            // then a `PopupBaseMenuItem` holding the bare slider (`brightness.js:13-34`).
+            DetailOwner::Brightness => monitors
+                .iter()
+                .flat_map(|m| {
+                    [
+                        DetailRow::Label(m.name.clone()),
+                        DetailRow::Slider {
+                            connector: m.connector.clone(),
+                            value: m.value,
+                        },
+                    ]
+                })
+                .collect(),
             // The input mirror of Output: one row per source, then "Sound Settings".
             DetailOwner::Input => {
                 let mut rows: Vec<DetailRow> = source_list
                     .sources
                     .iter()
                     .take(MAX_DEVICE_ROWS)
-                    .map(|source| DetailRow {
-                        label: source.description.clone(),
-                        icons: Vec::new(),
-                        action: PopoverAction::SetDefaultSource(source.name.clone()),
-                        separator_before: false,
-                        selected: source_list.default_name.as_deref() == Some(source.name.as_str()),
-                        trailing: None,
-                        placeholder: false,
+                    .map(|source| {
+                        ItemRow {
+                            label: source.description.clone(),
+                            icons: Vec::new(),
+                            action: PopoverAction::SetDefaultSource(source.name.clone()),
+                            separator_before: false,
+                            selected: source_list.default_name.as_deref()
+                                == Some(source.name.as_str()),
+                            trailing: None,
+                            placeholder: false,
+                        }
+                        .into()
                     })
                     .collect();
                 rows.push(spawn_row(
@@ -557,23 +702,45 @@ impl DetailOwner {
     /// rows. MUST match `rows()`'s length + separators (a debug_assert checks it at the draw/hit
     /// sites). `device_count` is ignored by the fixed owners; it's the sink count for Output, the
     /// source count for Input, and the profile count for PowerProfile.
-    fn row_shape(self, device_count: usize) -> Vec<bool> {
+    fn row_shape(self, device_count: usize) -> Vec<RowSpec> {
         match self {
-            DetailOwner::Network => vec![false],
-            DetailOwner::Power => vec![false, false, false, true],
+            DetailOwner::Network => vec![RowSpec::item(false)],
+            DetailOwner::Power => vec![
+                RowSpec::item(false),
+                RowSpec::item(false),
+                RowSpec::item(false),
+                RowSpec::item(true),
+            ],
             // N device/profile rows, then a trailing settings row past a separator.
             DetailOwner::Output | DetailOwner::Input | DetailOwner::PowerProfile => {
-                let mut shape = vec![false; device_count.min(MAX_DEVICE_ROWS)];
-                shape.push(true);
+                let mut shape = vec![RowSpec::item(false); device_count.min(MAX_DEVICE_ROWS)];
+                shape.push(RowSpec::item(true));
                 shape
             }
             // N visible-device rows — or ONE placeholder row when there are none — then the
             // settings row past a separator.
             DetailOwner::Bluetooth => {
-                let mut shape = vec![false; device_count.clamp(1, MAX_DEVICE_ROWS)];
-                shape.push(true);
+                let mut shape = vec![RowSpec::item(false); device_count.clamp(1, MAX_DEVICE_ROWS)];
+                shape.push(RowSpec::item(true));
                 shape
             }
+            // A (name label, slider) pair per monitor and nothing else: gnome-shell adds only the
+            // header and the slider section, with no separator and no settings row
+            // (`brightness.js:47-49`, `BrightnessSliderMenu.addSlider` `:13-34`).
+            DetailOwner::Brightness => (0..device_count)
+                .flat_map(|_| {
+                    [
+                        RowSpec {
+                            kind: RowKind::Label,
+                            separator_before: false,
+                        },
+                        RowSpec {
+                            kind: RowKind::Slider,
+                            separator_before: false,
+                        },
+                    ]
+                })
+                .collect(),
         }
     }
 
@@ -581,11 +748,12 @@ impl DetailOwner {
     fn detail_height(self, device_count: usize) -> f64 {
         let shape = self.row_shape(device_count);
         let rows = shape.len() as f64;
-        let seps = shape.iter().filter(|&&s| s).count() as f64;
+        let seps = shape.iter().filter(|s| s.separator_before).count() as f64;
+        let row_h: f64 = shape.iter().map(|s| s.kind.height()).sum();
         DETAIL_PAD
             + DETAIL_HEADER_H
             + DETAIL_HEADER_GAP
-            + rows * DETAIL_ROW_H
+            + row_h
             + (rows - 1.).max(0.) * DETAIL_ROW_GAP
             + seps * DETAIL_SEP_EXTRA
             + DETAIL_PAD
@@ -616,6 +784,7 @@ impl DetailOwner {
             // Input anchor is right whether or not the output slider is present.
             DetailOwner::Output => slider_row_y(Slider::Output, sliders) + SLIDER_H,
             DetailOwner::Input => slider_row_y(Slider::Mic, sliders) + SLIDER_H,
+            DetailOwner::Brightness => slider_row_y(Slider::Brightness, sliders) + SLIDER_H,
         }
     }
 }
@@ -664,6 +833,9 @@ struct Layout {
     /// Visible bluetooth-device count — the Bluetooth detail card's row count (min 1: the
     /// placeholder takes a row when there are none).
     bt_device_count: usize,
+    /// The number of backlit monitors — the brightness card's row-pair count and the gate on its
+    /// arrow.
+    monitor_count: usize,
     /// Whether the Bluetooth tile is in the grid (rfkill `available`) — it's *inserted* at index
     /// 1, so every later tile's index shifts by it.
     show_bluetooth: bool,
@@ -686,9 +858,7 @@ impl Layout {
             _ => match sl {
                 Slider::Output => self.sink_count,
                 Slider::Mic => self.source_count,
-                // The per-monitor card is Q4c-2; reporting a single scale keeps the arrow away
-                // until it exists.
-                Slider::Brightness => 1,
+                Slider::Brightness => self.monitor_count,
             },
         }
     }
@@ -701,6 +871,7 @@ impl Layout {
             DetailOwner::Input => self.source_count,
             DetailOwner::PowerProfile => self.profile_count,
             DetailOwner::Bluetooth => self.bt_device_count,
+            DetailOwner::Brightness => self.monitor_count,
             _ => 0,
         }
     }
@@ -1043,7 +1214,7 @@ pub struct QuickSettings {
     /// resize the track, and remap `volume_from_x` (snapping the level under a stationary
     /// pointer). `None` when not dragging; [`layout`](Self::layout) threads it into
     /// `Layout::drag`.
-    sliding: Option<(Slider, usize)>,
+    sliding: Option<(SliderId, usize)>,
     /// Which tile's detail view is open (gnome-shell's single open `QuickToggleMenu`), or `None`
     /// when collapsed. At most one at a time.
     expanded: Option<DetailOwner>,
@@ -1168,6 +1339,7 @@ impl QuickSettings {
                 order: &self.bt_row_order,
                 busy: self.bt_busy.as_deref(),
             },
+            &self.brightness.monitors,
         )
     }
 
@@ -1181,8 +1353,14 @@ impl QuickSettings {
             source_count: self.source_list.sources.len(),
             profile_count: self.power.available.len(),
             bt_device_count: self.bluetooth.visible_devices().len(),
+            monitor_count: self.monitor_count(),
             show_bluetooth: self.bluetooth_rfkill.available(),
-            drag: self.sliding,
+            // Only a top-level drag can affect the geometry (it's the arrow it pins); a card
+            // slider's row is placed by the card, which sizes from the live counts anyway.
+            drag: match &self.sliding {
+                Some((SliderId::Top(sl), frozen)) => Some((*sl, *frozen)),
+                _ => None,
+            },
             grid_len: self.grid().len(),
         }
     }
@@ -1312,6 +1490,9 @@ impl QuickSettings {
             Some(DetailOwner::PowerProfile) => !self.power.show || self.power.available.len() <= 2,
             // The device list is valid only while its tile exists (rfkill `available`).
             Some(DetailOwner::Bluetooth) => !self.bluetooth_rfkill.available(),
+            // The brightness card the same, off its slider + the >1-scale arrow gate
+            // (`brightness.js:61`).
+            Some(DetailOwner::Brightness) => !sliders.brightness || self.monitor_count() <= 1,
             _ => false,
         };
         if invalid {
@@ -1353,15 +1534,41 @@ impl QuickSettings {
         // menu — so no need to collapse first); a click elsewhere in the card is swallowed.
         if let Some(owner) = self.expanded {
             for (k, row) in self.detail_rows(owner).into_iter().enumerate() {
-                if detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
-                    // A device-row click marks that row busy until the Connect/Disconnect
-                    // finishes (gnome-shell plays the spinner around the await,
-                    // `bluetooth.js:257-261`).
-                    if let PopoverAction::ConnectBluetoothDevice { path, .. } = &row.action {
-                        self.bt_busy = Some(path.clone());
-                        self.revision += 1;
+                let Some(rrect) = detail_row_rect(k, layout) else {
+                    continue;
+                };
+                if !rrect.contains(pos) {
+                    continue;
+                }
+                match row {
+                    DetailRow::Item(row) => {
+                        // A device-row click marks that row busy until the Connect/Disconnect
+                        // finishes (gnome-shell plays the spinner around the await,
+                        // `bluetooth.js:257-261`).
+                        if let PopoverAction::ConnectBluetoothDevice { path, .. } = &row.action {
+                            self.bt_busy = Some(path.clone());
+                            self.revision += 1;
+                        }
+                        return row.action;
                     }
-                    return row.action;
+                    // A card slider: jump to (and begin dragging toward) the clicked position,
+                    // like the top-level tracks. Only the track band is reactive — in gnome-shell
+                    // the menu item is `reactive: false` and only the `slider-bin` inside it takes
+                    // the click (`brightness.js:23,29`), so a click on the item's padding must do
+                    // nothing. Without this the clamp in `volume_from_track_x` would turn a
+                    // near-miss into a slam to minimum (i.e. a dark panel).
+                    DetailRow::Slider { connector, .. } => {
+                        let track = detail_slider_track_rect(rrect);
+                        if !track.contains(pos) {
+                            return PopoverAction::Consumed;
+                        }
+                        self.sliding =
+                            Some((SliderId::Monitor(connector.clone()), self.monitor_count()));
+                        let value = volume_from_track_x(track, pos.x);
+                        return self.set_local_monitor(&connector, value);
+                    }
+                    // A non-reactive name label swallows its click.
+                    DetailRow::Label(_) => return PopoverAction::Consumed,
                 }
             }
             if detail_rect(layout).is_some_and(|r| r.contains(pos)) {
@@ -1509,11 +1716,33 @@ impl QuickSettings {
                 return PopoverAction::Consumed;
             }
             if slider_track_rect(slider, layout).contains(pos) {
-                self.sliding = Some((slider, self.device_count(slider)));
+                self.sliding = Some((SliderId::Top(slider), self.device_count(slider)));
                 return self.set_local_volume(slider, volume_from_x(slider, pos.x, layout));
             }
         }
         PopoverAction::Consumed
+    }
+
+    /// The number of backlit monitors — the brightness card's row-pair count and its arrow gate
+    /// (`menuEnabled = this._manager.scales.length > 1`, `brightness.js:61`; `scales` is the
+    /// per-monitor scales, the global one excluded, `brightnessManager.js:104-106`).
+    fn monitor_count(&self) -> usize {
+        self.brightness.monitors.len()
+    }
+
+    /// Optimistically move one monitor's scale (so its handle tracks the pointer ahead of the
+    /// hardware echo) and emit the matching action.
+    fn set_local_monitor(&mut self, connector: &str, value: f64) -> PopoverAction {
+        self.revision += 1;
+        if let Some(m) = self
+            .brightness
+            .monitors
+            .iter_mut()
+            .find(|m| m.connector == connector)
+        {
+            m.value = value;
+        }
+        PopoverAction::SetMonitorBrightness(connector.to_owned(), value)
     }
 
     /// The live device count backing a slider's picker (sinks for Output, sources for Mic) — the
@@ -1530,8 +1759,22 @@ impl QuickSettings {
     /// the volume. Returns the action to apply, or `None` when not dragging.
     pub fn pointer_drag(&mut self, pos: Point<f64, Logical>) -> Option<PopoverAction> {
         let layout = self.layout();
-        let (slider, _) = self.sliding?;
-        Some(self.set_local_volume(slider, volume_from_x(slider, pos.x, layout)))
+        match self.sliding.clone()?.0 {
+            SliderId::Top(slider) => {
+                Some(self.set_local_volume(slider, volume_from_x(slider, pos.x, layout)))
+            }
+            // A card row's index is looked up live, never frozen: a monitor coming or going
+            // reorders the rows under the pointer, and the drag must follow its own connector.
+            SliderId::Monitor(connector) => {
+                let owner = layout.expanded?;
+                let k = self.detail_rows(owner).iter().position(
+                    |row| matches!(row, DetailRow::Slider { connector: c, .. } if *c == connector),
+                )?;
+                let track = detail_slider_track_rect(detail_row_rect(k, layout)?);
+                let value = volume_from_track_x(track, pos.x);
+                Some(self.set_local_monitor(&connector, value))
+            }
+        }
     }
 
     /// Update the hovered control from a menu-local position (`None` clears the
@@ -1558,8 +1801,11 @@ impl QuickSettings {
         if let Some(owner) = self.expanded {
             let rows = self.detail_rows(owner);
             for (k, row) in rows.iter().enumerate() {
-                // A placeholder line is non-reactive (`bluetooth.js:286-290`): no highlight.
-                if !row.placeholder && detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
+                // Only ordinary rows highlight: a placeholder line is non-reactive
+                // (`bluetooth.js:286-290`), and so are the brightness card's label and slider
+                // rows (`brightness.js:14,29` build both with `reactive: false`).
+                let reactive = row.item().is_some_and(|r| !r.placeholder);
+                if reactive && detail_row_rect(k, layout).is_some_and(|r| r.contains(pos)) {
                     return Some(QsHover::DetailRow(k));
                 }
             }
@@ -1598,7 +1844,11 @@ impl QuickSettings {
         let Some((slider, frozen)) = self.sliding.take() else {
             return false;
         };
-        frozen != self.device_count(slider)
+        match slider {
+            SliderId::Top(slider) => frozen != self.device_count(slider),
+            // A card slider has no arrow, so nothing about it can have been suppressed.
+            SliderId::Monitor(_) => false,
+        }
     }
 
     /// Optimistically move a slider locally (so the handle tracks the pointer before the PipeWire
@@ -1636,7 +1886,7 @@ impl QuickSettings {
         if audio == self.audio {
             return false;
         }
-        if matches!(self.sliding, Some((Slider::Output, _))) {
+        if matches!(self.sliding, Some((SliderId::Top(Slider::Output), _))) {
             if audio.is_some() {
                 // Still present: keep the optimistic drag value, don't yank.
                 return false;
@@ -1662,7 +1912,7 @@ impl QuickSettings {
         if mic == self.mic {
             return false;
         }
-        if matches!(self.sliding, Some((Slider::Mic, _))) {
+        if matches!(self.sliding, Some((SliderId::Top(Slider::Mic), _))) {
             if mic.recording && mic.source_present {
                 // Still visible: keep the optimistic level/mute, don't move the slider mid-drag.
                 return false;
@@ -1677,6 +1927,13 @@ impl QuickSettings {
         true
     }
 
+    /// See [`crate::ui::popover::PanelPopover::open_brightness_card_for_test`].
+    #[cfg(test)]
+    pub fn open_brightness_card_for_test(&mut self) {
+        self.expanded = Some(DetailOwner::Brightness);
+        self.revision += 1;
+    }
+
     /// Adopt a fresh brightness snapshot (from the compositor's `BrightnessManager`). Returns
     /// whether it changed.
     ///
@@ -1684,18 +1941,65 @@ impl QuickSettings {
     /// dragged, the hardware echo lags the pointer, so the optimistic value wins — unless the
     /// backlight is *going away* (the panel was unplugged), which cancels the drag before the
     /// slider hides.
-    pub fn set_brightness(&mut self, brightness: crate::brightness::BrightnessView) -> bool {
+    pub fn set_brightness(&mut self, mut brightness: crate::brightness::BrightnessView) -> bool {
         if brightness == self.brightness {
             return false;
         }
-        if matches!(self.sliding, Some((Slider::Brightness, _))) {
-            if brightness.global.is_some() {
-                return false;
+        match &self.sliding {
+            // Hold ONLY the dragged value at the pointer; everything else in the snapshot is
+            // adopted. Rejecting the whole snapshot (the way the mic slider does) would drop
+            // structural changes for good — `set_brightness` is only called on brightness events,
+            // so a monitor that unplugged mid-drag would leave a phantom row and a live arrow
+            // behind until some unrelated event happened to re-push.
+            Some((SliderId::Top(Slider::Brightness), _)) => match brightness.global.as_mut() {
+                Some(global) => {
+                    if let Some(value) = self.brightness.global {
+                        *global = value;
+                    }
+                }
+                // The backlight vanished under the drag: cancel it before the slider hides.
+                None => self.sliding = None,
+            },
+            // A card slider is dragged *per monitor*, and moving one monitor moves the global
+            // scale with it (`brightnessManager.js:203-228` normalizes the global to the max), so
+            // the snapshot IS adopted mid-drag — with the dragged row's own value held at the
+            // pointer. Suppressing the whole snapshot the way the mic slider does would freeze the
+            // top-level slider while a card row is dragged.
+            Some((SliderId::Monitor(connector), _)) => {
+                let dragged = self
+                    .brightness
+                    .monitors
+                    .iter()
+                    .find(|m| m.connector == *connector)
+                    .map(|m| m.value);
+                match brightness
+                    .monitors
+                    .iter_mut()
+                    .find(|m| m.connector == *connector)
+                {
+                    Some(m) => {
+                        if let Some(value) = dragged {
+                            m.value = value;
+                        }
+                    }
+                    // The dragged monitor is gone: cancel the drag before its row disappears.
+                    None => self.sliding = None,
+                }
             }
-            self.sliding = None;
+            _ => (),
         }
         self.brightness = brightness;
         self.content_bumped();
+        // Losing the slider, or dropping to a single scale, must close the card — it would
+        // otherwise pin below a row that is no longer there.
+        self.normalize_expanded();
+        // A card drag cannot outlive its card: the row it tracks is gone, so further motion would
+        // keep pinning a stale value over incoming snapshots with nothing on screen to explain it.
+        if matches!(self.sliding, Some((SliderId::Monitor(_), _)))
+            && self.expanded != Some(DetailOwner::Brightness)
+        {
+            self.sliding = None;
+        }
         true
     }
 
@@ -1806,6 +2110,10 @@ impl QuickSettings {
                 }
                 for (k, row) in self.detail_rows(owner).into_iter().enumerate() {
                     let Some(rrect) = detail_row_rect(k, layout) else {
+                        continue;
+                    };
+                    // Only ordinary rows carry an icon or a check.
+                    let DetailRow::Item(row) = row else {
                         continue;
                     };
                     // A leading row icon (none for the current consumers), if any.
@@ -2031,13 +2339,31 @@ impl QuickSettings {
                     // The card is sized from the pure `row_shape`; assert the live rows match it
                     // (count + separator positions) so the geometry can't drift from what's drawn.
                     debug_assert_eq!(
-                        rows.iter().map(|r| r.separator_before).collect::<Vec<_>>(),
+                        rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
                         owner.row_shape(self.layout().owner_device_count(owner)),
                         "rows() must match row_shape() for correct card sizing"
                     );
                     let row_runs = rows
                         .into_iter()
                         .map(|r| -> anyhow::Result<DetailRowRun> {
+                            let r = match r {
+                                DetailRow::Item(row) => row,
+                                // A name label is an ordinary regular-weight menu item with
+                                // nothing else in it (`brightness.js:14-15`).
+                                DetailRow::Label(label) => ItemRow {
+                                    label,
+                                    icons: Vec::new(),
+                                    action: PopoverAction::Consumed,
+                                    separator_before: false,
+                                    selected: false,
+                                    trailing: None,
+                                    placeholder: false,
+                                },
+                                // A slider row has no text at all; only its value is baked.
+                                DetailRow::Slider { value, .. } => {
+                                    return Ok(DetailRowRun::Slider { value })
+                                }
+                            };
                             // The placeholder is `.bt-menu-placeholder` = `%title_4` (13pt/700,
                             // centered, `_quick-settings.scss:227-232`); ordinary rows are
                             // regular-weight menu items.
@@ -2046,7 +2372,7 @@ impl QuickSettings {
                             } else {
                                 TextStyle::new(DETAIL_ROW_PT)
                             };
-                            Ok(DetailRowRun {
+                            Ok(DetailRowRun::Text(TextRun {
                                 label: shaper.shape(&r.label, style)?,
                                 trailing: r
                                     .trailing
@@ -2054,7 +2380,7 @@ impl QuickSettings {
                                     .transpose()?,
                                 placeholder: r.placeholder,
                                 has_icon: !r.icons.is_empty(),
-                            })
+                            }))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok((title_run, row_runs))
@@ -2195,27 +2521,13 @@ impl QuickSettings {
                     p.fill_rounded(disc, SLIDER_H / 2., style::HOVER_WASH)?;
                 }
 
-                let track = slider_track_rect(slider, layout);
-                let cy = track.loc.y + track.size.h / 2.;
-                let trough = Rectangle::new(
-                    Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
-                    Size::from((track.size.w, SLIDER_TROUGH)),
-                );
-                p.fill_rounded(trough, SLIDER_TROUGH / 2., SLIDER_TROUGH_BG)?;
-
-                let handle_cx = slider_handle_x(slider, volume, layout);
                 let fill_color = if muted { SLIDER_TROUGH_BG } else { self.accent };
-                let fill = Rectangle::new(
-                    trough.loc,
-                    Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
-                );
-                p.fill_rounded(fill, SLIDER_TROUGH / 2., fill_color)?;
-
-                let handle = Rectangle::new(
-                    Point::from((handle_cx - SLIDER_HANDLE / 2., cy - SLIDER_HANDLE / 2.)),
-                    Size::from((SLIDER_HANDLE, SLIDER_HANDLE)),
-                );
-                p.fill_rounded(handle, SLIDER_HANDLE / 2., FG_OFF)?;
+                paint_slider(
+                    &mut p,
+                    slider_track_rect(slider, layout),
+                    volume,
+                    fill_color,
+                )?;
             }
 
             // The open detail view: the `%card` background, its header title (the header icon
@@ -2255,16 +2567,30 @@ impl QuickSettings {
                     .map(|o| o.row_shape(layout.owner_device_count(o)))
                     .unwrap_or_default();
                 for (k, row_run) in row_runs.iter().enumerate() {
-                    let run = &row_run.label;
                     let Some(rrect) = detail_row_rect(k, layout) else {
                         continue;
                     };
+                    // A card slider row: the shared slider body, inset like a `%menuitem`. No
+                    // separator, no hover (`brightness.js:29` is a non-reactive item), no text.
+                    let row_run = match row_run {
+                        DetailRowRun::Text(run) => run,
+                        DetailRowRun::Slider { value } => {
+                            paint_slider(
+                                &mut p,
+                                detail_slider_track_rect(rrect),
+                                *value,
+                                self.accent,
+                            )?;
+                            continue;
+                        }
+                    };
+                    let run = &row_run.label;
                     // The group-separator rule, centered in the extra gap above a group-opening
                     // row. The same `$borders_color` + crisp `Painter::hairline` as the calendar
                     // column separator — but this bakes onto the *opaque* card, where the clear
                     // would punch a translucent hole, so pre-blend the border over the card
                     // (`style::over`) to lay the identical line as an opaque color.
-                    if k > 0 && sep_shape.get(k).copied().unwrap_or(false) {
+                    if k > 0 && sep_shape.get(k).is_some_and(|s| s.separator_before) {
                         let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
                         // The separator is itself a `.popup-separator-menu-item`, so its rule is
                         // inset by the `%menuitem` horizontal padding (`$base_padding*2`, our
@@ -2415,20 +2741,66 @@ fn slider_track_rect(sl: Slider, layout: Layout) -> Rectangle<f64, Logical> {
     )
 }
 
-/// Perceptual volume `0..=1` for a pointer x on a slider's track.
-fn volume_from_x(sl: Slider, x: f64, layout: Layout) -> f64 {
-    let track = slider_track_rect(sl, layout);
+/// A slider's drawn body inside `track`: the trough, its value fill and the round handle
+/// (`.quick-slider` + `_slider.scss`). Shared by the top-level slider rows and the brightness
+/// card's per-monitor rows, so the two can't drift.
+fn paint_slider(
+    p: &mut Painter,
+    track: Rectangle<f64, Logical>,
+    value: f64,
+    fill_color: [f32; 4],
+) -> anyhow::Result<()> {
+    let cy = track.loc.y + track.size.h / 2.;
+    let trough = Rectangle::new(
+        Point::from((track.loc.x, cy - SLIDER_TROUGH / 2.)),
+        Size::from((track.size.w, SLIDER_TROUGH)),
+    );
+    p.fill_rounded(trough, SLIDER_TROUGH / 2., SLIDER_TROUGH_BG)?;
+
+    // The fill's width comes from the two extremities, never from a rounded size (rounding loc
+    // and size apart doubles the error on the far edge).
+    let handle_cx = handle_x_on_track(track, value);
+    let fill = Rectangle::new(
+        trough.loc,
+        Size::from(((handle_cx - track.loc.x).max(0.), SLIDER_TROUGH)),
+    );
+    p.fill_rounded(fill, SLIDER_TROUGH / 2., fill_color)?;
+
+    let handle = Rectangle::new(
+        Point::from((handle_cx - SLIDER_HANDLE / 2., cy - SLIDER_HANDLE / 2.)),
+        Size::from((SLIDER_HANDLE, SLIDER_HANDLE)),
+    );
+    p.fill_rounded(handle, SLIDER_HANDLE / 2., FG_OFF)
+}
+
+/// The track band of a slider row inside a detail card: the row minus the `%menuitem` inset.
+/// There is no icon disc and no arrow to make room for — gnome-shell's card slider is a bare
+/// `Slider` in a `slider-bin` filling the item (`brightness.js:17-31`).
+fn detail_slider_track_rect(row: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((row.loc.x + DETAIL_ROW_INSET, row.loc.y)),
+        Size::from(((row.size.w - 2. * DETAIL_ROW_INSET).max(0.), row.size.h)),
+    )
+}
+
+/// Perceptual value `0..=1` for a pointer x on any track band. The usable span is inset by half a
+/// handle at each end, so the handle center never leaves the band.
+fn volume_from_track_x(track: Rectangle<f64, Logical>, x: f64) -> f64 {
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     ((x - left) / (right - left)).clamp(0.0, 1.0)
 }
 
-/// The x of the handle center for a given perceptual volume on a slider's track.
-fn slider_handle_x(sl: Slider, volume: f64, layout: Layout) -> f64 {
-    let track = slider_track_rect(sl, layout);
+/// The handle-center x for a value on any track band — the inverse of [`volume_from_track_x`].
+fn handle_x_on_track(track: Rectangle<f64, Logical>, volume: f64) -> f64 {
     let left = track.loc.x + SLIDER_HANDLE / 2.;
     let right = track.loc.x + track.size.w - SLIDER_HANDLE / 2.;
     left + volume.clamp(0.0, 1.0) * (right - left)
+}
+
+/// Perceptual volume `0..=1` for a pointer x on a top-level slider's track.
+fn volume_from_x(sl: Slider, x: f64, layout: Layout) -> f64 {
+    volume_from_track_x(slider_track_rect(sl, layout), x)
 }
 
 /// The rectangle of tile `i` (row-major), menu-local logical. The grid sits below the top system
@@ -2504,20 +2876,20 @@ fn detail_row_rect(k: usize, layout: Layout) -> Option<Rectangle<f64, Logical>> 
     // Walk from the first row's top, adding each earlier row's height + gap, plus a separator's
     // extra space wherever one opens a group.
     let mut y = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H + DETAIL_HEADER_GAP;
-    for (j, &separator_before) in shape.iter().enumerate() {
+    for (j, spec) in shape.iter().enumerate() {
         if j > 0 {
             y += DETAIL_ROW_GAP;
         }
-        if separator_before {
+        if spec.separator_before {
             y += DETAIL_SEP_EXTRA;
         }
         if j == k {
             return Some(Rectangle::new(
                 Point::from((card.loc.x + DETAIL_PAD, y)),
-                Size::from((card.size.w - 2. * DETAIL_PAD, DETAIL_ROW_H)),
+                Size::from((card.size.w - 2. * DETAIL_PAD, spec.kind.height())),
             ));
         }
-        y += DETAIL_ROW_H;
+        y += spec.kind.height();
     }
     None
 }
@@ -2590,6 +2962,7 @@ mod tests {
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
+            monitor_count: 0,
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
@@ -2955,6 +3328,13 @@ mod tests {
         );
     }
 
+    /// The `ItemRow` behind an ordinary card row (the picker/settings rows every pre-brightness
+    /// card is made of); panics on a label/slider row, which is what a test asserting an action
+    /// or a label wants.
+    fn item(row: &DetailRow) -> &ItemRow {
+        row.item().expect("an ordinary item row")
+    }
+
     fn qs(network: NetworkStatus, audio: Option<AudioStatus>) -> QuickSettings {
         QuickSettings::new(
             QuickToggles::default(),
@@ -3115,12 +3495,25 @@ mod tests {
             panic!("expected SetBrightness, got {action:?}");
         };
         assert!((value - 0.5).abs() < 0.01);
-        assert!(matches!(q.sliding, Some((Slider::Brightness, _))));
+        assert!(matches!(
+            q.sliding,
+            Some((SliderId::Top(Slider::Brightness), _))
+        ));
         assert!((q.brightness.global.unwrap() - value).abs() < 1e-9);
 
-        // The lagging echo is ignored mid-drag, so the handle does not snap back.
-        assert!(!q.set_brightness(brightness_view(1, 0.)));
+        // The lagging echo is adopted, but the dragged global value is held at the pointer, so
+        // the handle does not snap back. (Adopting the rest matters: a snapshot dropped mid-drag
+        // is never re-pushed, so a monitor that vanished would leave a phantom row behind.)
+        let mut echo = brightness_view(2, 0.);
+        echo.global = Some(0.);
+        assert!(q.set_brightness(echo));
         assert!((q.brightness.global.unwrap() - value).abs() < 1e-9);
+        assert_eq!(
+            q.brightness.monitors.len(),
+            2,
+            "the structural change lands"
+        );
+        assert_eq!(q.brightness.monitors[0].value, 0.);
 
         // But the backlight going away cancels the drag before the slider hides.
         assert!(q.set_brightness(crate::brightness::BrightnessView::default()));
@@ -3128,13 +3521,216 @@ mod tests {
         assert!(!q.layout().sliders.brightness);
     }
 
-    /// The per-monitor card is Q4c-2: until it exists the arrow must stay away, even with several
-    /// backlit monitors, or it would open nothing.
+    /// A menu whose brightness card is open over `n` monitors.
+    fn qs_with_card(n: usize) -> QuickSettings {
+        let mut q = qs(NetworkStatus::Wired, None);
+        q.brightness = brightness_view(n, 0.5);
+        q.expanded = Some(DetailOwner::Brightness);
+        q
+    }
+
+    /// The picker arrow appears only with more than one scale (`menuEnabled =
+    /// this._manager.scales.length > 1`, `brightness.js:61`) -- and `scales` is the per-monitor
+    /// scales, the global one excluded (`brightnessManager.js:104-106`).
     #[test]
-    fn brightness_has_no_picker_arrow_yet() {
-        let mut q = qs_with_brightness(0.5);
+    fn the_brightness_arrow_needs_more_than_one_monitor() {
+        let one = qs_with_brightness(0.5);
+        assert!(slider_arrow_rect(Slider::Brightness, one.layout()).is_none());
+
+        let mut two = qs_with_brightness(0.5);
+        two.brightness = brightness_view(2, 0.5);
+        let arrow = slider_arrow_rect(Slider::Brightness, two.layout())
+            .expect("an arrow with two backlit monitors");
+
+        // Clicking it opens (and re-clicking closes) the card, like every other picker.
+        assert_eq!(two.pointer_click(center(arrow)), PopoverAction::Consumed);
+        assert_eq!(two.expanded, Some(DetailOwner::Brightness));
+        let arrow = slider_arrow_rect(Slider::Brightness, two.layout()).unwrap();
+        assert_eq!(two.pointer_click(center(arrow)), PopoverAction::Consumed);
+        assert_eq!(two.expanded, None);
+    }
+
+    /// The card is a (name label, slider) pair per monitor and nothing else: no separator, no
+    /// settings row (`brightness.js:47-49` adds only the header and the slider section, and
+    /// `addSlider` `:13-34` adds exactly those two items).
+    #[test]
+    fn the_brightness_card_is_label_slider_pairs() {
+        let q = qs_with_card(2);
+        let rows = q.detail_rows(DetailOwner::Brightness);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(&rows[0], DetailRow::Label(n) if n == "Display 0"));
+        assert!(matches!(&rows[1], DetailRow::Slider { connector, .. } if connector == "eDP-0"));
+        assert!(matches!(&rows[2], DetailRow::Label(n) if n == "Display 1"));
+        assert!(matches!(&rows[3], DetailRow::Slider { connector, .. } if connector == "eDP-1"));
+
+        // The live rows must match the pure shape the card was sized from.
+        assert_eq!(
+            rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
+            DetailOwner::Brightness.row_shape(2),
+        );
+        // No separators anywhere -- unlike every other card, which ends in one.
+        assert!(DetailOwner::Brightness
+            .row_shape(2)
+            .iter()
+            .all(|s| !s.separator_before));
+
+        // Rows stack top-down without overlapping, and the card contains them all.
+        let layout = q.layout();
+        let card = detail_rect(layout).expect("an open card");
+        let rects: Vec<_> = (0..rows.len())
+            .map(|k| detail_row_rect(k, layout).expect("a row rect"))
+            .collect();
+        for pair in rects.windows(2) {
+            assert!(pair[0].loc.y + pair[0].size.h <= pair[1].loc.y);
+        }
+        let last = rects.last().unwrap();
+        assert!(last.loc.y + last.size.h <= card.loc.y + card.size.h);
+    }
+
+    /// Both card rows are `reactive: false` in gnome-shell (`brightness.js:14,29`), so neither
+    /// ever takes the menu-item hover highlight -- only the slider inside is interactive.
+    #[test]
+    fn brightness_card_rows_never_highlight() {
+        let mut q = qs_with_card(2);
+        let layout = q.layout();
+        for k in 0..4 {
+            let rect = detail_row_rect(k, layout).unwrap();
+            q.pointer_hover(Some(center(rect)));
+            assert_eq!(q.hovered, None, "row {k} must not highlight");
+        }
+    }
+
+    /// Dragging a card row's track reports that monitor's connector, and the track spans the row
+    /// minus the menu-item inset (no icon disc, no arrow -- the card slider is a bare slider bin).
+    #[test]
+    fn dragging_a_card_row_sets_that_monitor() {
+        let mut q = qs_with_card(2);
+        let layout = q.layout();
+        // Row 3 is the second monitor's slider.
+        let row = detail_row_rect(3, layout).unwrap();
+        let track = detail_slider_track_rect(row);
+        assert!(track.loc.x > row.loc.x && track.size.w < row.size.w);
+
+        let action = q.pointer_click(center(track));
+        let PopoverAction::SetMonitorBrightness(connector, value) = action else {
+            panic!("expected SetMonitorBrightness, got {action:?}");
+        };
+        assert_eq!(connector, "eDP-1");
+        assert!((value - 0.5).abs() < 0.01);
+        assert_eq!(q.sliding, Some((SliderId::Monitor("eDP-1".into()), 2)));
+        // Optimistic: only that monitor moved.
+        assert!((q.brightness.monitors[1].value - value).abs() < 1e-9);
+        assert_eq!(q.brightness.monitors[0].value, 0.5);
+
+        // The track's ends map to the full range.
+        assert_eq!(volume_from_track_x(track, track.loc.x), 0.);
+        assert_eq!(volume_from_track_x(track, track.loc.x + track.size.w), 1.);
+
+        // Dragging continues to the same monitor, and releasing clears the drag.
+        let left = Point::from((track.loc.x, center(track).y));
+        assert_eq!(
+            q.pointer_drag(left),
+            Some(PopoverAction::SetMonitorBrightness("eDP-1".into(), 0.)),
+        );
+        assert!(!q.end_drag());
+        assert!(q.sliding.is_none());
+    }
+
+    /// A card drag adopts fresh snapshots (gnome-shell pulls the GLOBAL scale to the max while a
+    /// monitor scale is dragged, `brightnessManager.js:203-228`) while holding the dragged row at
+    /// the pointer -- and the monitor going away cancels the drag.
+    #[test]
+    fn a_card_drag_holds_only_its_own_row() {
+        let mut q = qs_with_card(2);
+        let layout = q.layout();
+        let track = detail_slider_track_rect(detail_row_rect(1, layout).unwrap());
+        q.pointer_click(center(track));
+        let dragged = q.brightness.monitors[0].value;
+
+        // A snapshot arrives with everything moved: the other monitor and the global scale follow
+        // it, the dragged row does not.
+        let mut view = brightness_view(2, 0.2);
+        view.global = Some(0.9);
+        assert!(q.set_brightness(view));
+        assert_eq!(q.brightness.global, Some(0.9));
+        assert_eq!(q.brightness.monitors[1].value, 0.2);
+        assert!((q.brightness.monitors[0].value - dragged).abs() < 1e-9);
+
+        // The dragged monitor unplugs: the drag is cancelled, and dropping to one scale closes
+        // the card (its arrow gate is gone).
+        let mut view = brightness_view(2, 0.5);
+        view.monitors.remove(0);
+        assert!(q.set_brightness(view));
+        assert!(q.sliding.is_none());
+        assert_eq!(q.expanded, None);
+    }
+
+    /// Only the track band of a card row is reactive: in gnome-shell the slider's menu item is
+    /// `reactive: false` and just holds the `slider-bin` (`brightness.js:23,29`). Without this a
+    /// click a few px left of the track would clamp to 0 -- i.e. slam that monitor dark.
+    #[test]
+    fn a_near_miss_on_a_card_slider_does_nothing() {
+        let mut q = qs_with_card(2);
+        let layout = q.layout();
+        let row = detail_row_rect(1, layout).unwrap();
+        let track = detail_slider_track_rect(row);
+
+        // In the inset strip left of the track, still inside the row.
+        let miss = Point::from((row.loc.x + 1., row.loc.y + row.size.h / 2.));
+        assert!(row.contains(miss) && !track.contains(miss));
+        assert_eq!(q.pointer_click(miss), PopoverAction::Consumed);
+        assert!(q.sliding.is_none());
+        assert_eq!(
+            q.brightness.monitors[0].value, 0.5,
+            "unchanged by a near miss"
+        );
+    }
+
+    /// A drag holds only the dragged VALUE; structural changes in a snapshot are always adopted.
+    /// `set_brightness` is only called on brightness events, so a rejected snapshot is never
+    /// re-pushed -- a monitor that unplugged mid-drag would leave a phantom row and a live picker
+    /// arrow behind indefinitely.
+    #[test]
+    fn a_top_slider_drag_still_adopts_structural_changes() {
+        let mut q = qs_with_brightness(0.);
         q.brightness = brightness_view(2, 0.5);
+        let layout = q.layout();
+        q.pointer_click(center(slider_track_rect(Slider::Brightness, layout)));
+        let dragged = q.brightness.global.unwrap();
+        assert!(slider_arrow_rect(Slider::Brightness, q.layout()).is_some());
+
+        // The dock unplugs mid-drag.
+        let mut view = brightness_view(1, 0.5);
+        view.global = Some(0.1);
+        assert!(q.set_brightness(view));
+        assert_eq!(q.brightness.monitors.len(), 1);
+        assert!((q.brightness.global.unwrap() - dragged).abs() < 1e-9);
+
+        // The arrow is still drawn from the count frozen at drag start -- that freeze is what
+        // stops the track resizing under a stationary pointer. Releasing unfreezes it, and the
+        // arrow goes with the monitor rather than opening a card of phantom rows.
+        assert!(slider_arrow_rect(Slider::Brightness, q.layout()).is_some());
+        assert!(q.end_drag(), "the frozen count no longer matches");
         assert!(slider_arrow_rect(Slider::Brightness, q.layout()).is_none());
+    }
+
+    /// A card drag cannot outlive its card: with the card closed there is nothing on screen to
+    /// explain why incoming snapshots keep getting overridden.
+    #[test]
+    fn closing_the_card_cancels_a_card_drag() {
+        let mut q = qs_with_card(2);
+        let layout = q.layout();
+        let track = detail_slider_track_rect(detail_row_rect(1, layout).unwrap());
+        q.pointer_click(center(track));
+        assert!(matches!(q.sliding, Some((SliderId::Monitor(_), _))));
+
+        // The OTHER monitor unplugs: the dragged one is still there, but one scale means no
+        // arrow, so the card closes -- and the drag goes with it.
+        let mut view = brightness_view(2, 0.5);
+        view.monitors.pop();
+        assert!(q.set_brightness(view));
+        assert_eq!(q.expanded, None);
+        assert!(q.sliding.is_none());
     }
 
     /// The mic slider shows only while recording with a bound source (gnome-shell's
@@ -3208,8 +3804,8 @@ mod tests {
 
         let rows = q.detail_rows(DetailOwner::Input);
         assert_eq!(rows.len(), 4, "3 sources + Sound Settings");
-        assert!(rows[0].selected && !rows[1].selected);
-        assert_eq!(rows[3].label, "Sound Settings");
+        assert!(item(&rows[0]).selected && !item(&rows[1]).selected);
+        assert_eq!(item(&rows[3]).label, "Sound Settings");
         match q.pointer_click(center(detail_row_rect(1, q.layout()).unwrap())) {
             PopoverAction::SetDefaultSource(name) => assert_eq!(name, "source1"),
             other => panic!("expected SetDefaultSource, got {other:?}"),
@@ -3265,7 +3861,7 @@ mod tests {
             track.loc.y + track.size.h / 2.,
         ));
         q.pointer_click(press);
-        assert!(matches!(q.sliding, Some((Slider::Mic, _))));
+        assert!(matches!(q.sliding, Some((SliderId::Top(Slider::Mic), _))));
         let held = q.mic.volume;
 
         // A second source appears mid-drag: the arrow stays suppressed, the level doesn't snap.
@@ -3303,7 +3899,10 @@ mod tests {
         let mut q = qs_with_sinks(1);
         let track = slider_track_rect(Slider::Output, q.layout());
         q.pointer_click(center(track));
-        assert!(matches!(q.sliding, Some((Slider::Output, _))));
+        assert!(matches!(
+            q.sliding,
+            Some((SliderId::Top(Slider::Output), _))
+        ));
         assert!(
             q.set_audio(None),
             "the sink unplugging must be adopted mid-drag"
@@ -3540,10 +4139,13 @@ mod tests {
         // Rows: 3 profiles (reversed: performance→power-saver) + Power Settings; active checked.
         let rows = qs.detail_rows(DetailOwner::PowerProfile);
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].label, "Performance");
-        assert_eq!(rows[2].label, "Power Saver");
-        assert!(rows[0].selected && !rows[1].selected);
-        assert!(rows[3].separator_before, "Power Settings past a separator");
+        assert_eq!(item(&rows[0]).label, "Performance");
+        assert_eq!(item(&rows[2]).label, "Power Saver");
+        assert!(item(&rows[0]).selected && !item(&rows[1]).selected);
+        assert!(
+            item(&rows[3]).separator_before,
+            "Power Settings past a separator"
+        );
 
         // Clicking the Power Saver row sets that profile (echo-driven, menu stays open).
         let row = detail_row_rect(2, qs.layout()).expect("the power-saver row");
@@ -3649,6 +4251,7 @@ mod tests {
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
+            monitor_count: 0,
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
@@ -3664,6 +4267,7 @@ mod tests {
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
+            monitor_count: 0,
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
@@ -3761,6 +4365,7 @@ mod tests {
                     source_count: 0,
                     profile_count: 0,
                     bt_device_count: 0,
+                    monitor_count: 0,
                     show_bluetooth: false,
                     drag: None,
                     grid_len: BASE_GRID.len(),
@@ -3792,7 +4397,10 @@ mod tests {
         assert_eq!(title, "Power Off");
         let rows = qs.detail_rows(DetailOwner::Power);
         assert_eq!(rows.len(), 4);
-        assert!(rows[3].separator_before, "Log Out starts the session group");
+        assert!(
+            item(&rows[3]).separator_before,
+            "Log Out starts the session group"
+        );
 
         // The "Power Off…" row (index 2) spawns the shutdown command.
         let row = detail_row_rect(2, qs.layout()).expect("the power-off row");
@@ -3855,6 +4463,7 @@ mod tests {
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
+            monitor_count: 0,
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
@@ -3870,6 +4479,7 @@ mod tests {
             source_count: 0,
             profile_count: 0,
             bt_device_count: 0,
+            monitor_count: 0,
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
@@ -3999,9 +4609,9 @@ mod tests {
         ));
         let rows = q.detail_rows(DetailOwner::Output);
         assert_eq!(rows.len(), 4, "3 sinks + Sound Settings");
-        assert!(rows[0].selected && !rows[1].selected && !rows[2].selected);
-        assert!(rows[3].separator_before && !rows[3].selected);
-        assert_eq!(rows[3].label, "Sound Settings");
+        assert!(item(&rows[0]).selected && !item(&rows[1]).selected && !item(&rows[2]).selected);
+        assert!(item(&rows[3]).separator_before && !item(&rows[3]).selected);
+        assert_eq!(item(&rows[3]).label, "Sound Settings");
         // Row geometry agrees with the shape.
         assert_eq!(
             DetailOwner::Output.row_shape(q.sink_list.sinks.len()).len(),
@@ -4260,13 +4870,13 @@ mod tests {
 
         let rows = qs.detail_rows(DetailOwner::Bluetooth);
         assert_eq!(rows.len(), 4, "3 devices + Bluetooth Settings");
-        assert_eq!(rows[0].label, "Buds");
-        assert_eq!(rows[0].trailing.as_deref(), Some("Disconnect"));
-        assert_eq!(rows[1].label, "Alpha");
-        assert_eq!(rows[1].trailing.as_deref(), Some("Connect"));
-        assert_eq!(rows[2].label, "Zeta");
-        assert!(rows[3].separator_before);
-        assert_eq!(rows[3].label, "Bluetooth Settings");
+        assert_eq!(item(&rows[0]).label, "Buds");
+        assert_eq!(item(&rows[0]).trailing.as_deref(), Some("Disconnect"));
+        assert_eq!(item(&rows[1]).label, "Alpha");
+        assert_eq!(item(&rows[1]).trailing.as_deref(), Some("Connect"));
+        assert_eq!(item(&rows[2]).label, "Zeta");
+        assert!(item(&rows[3]).separator_before);
+        assert_eq!(item(&rows[3]).label, "Bluetooth Settings");
 
         // Clicking Alpha's row asks to connect and marks it busy…
         let alpha_path = "/org/bluez/hci0/dev_Alpha".to_string();
@@ -4278,11 +4888,11 @@ mod tests {
             other => panic!("expected ConnectBluetoothDevice, got {other:?}"),
         }
         let rows = qs.detail_rows(DetailOwner::Bluetooth);
-        assert_eq!(rows[1].trailing.as_deref(), Some("…"), "busy mark");
+        assert_eq!(item(&rows[1]).trailing.as_deref(), Some("…"), "busy mark");
         // …until the call reports done.
         assert!(qs.bluetooth_connect_done(&alpha_path));
         let rows = qs.detail_rows(DetailOwner::Bluetooth);
-        assert_eq!(rows[1].trailing.as_deref(), Some("Connect"));
+        assert_eq!(item(&rows[1]).trailing.as_deref(), Some("Connect"));
 
         // The settings row spawns control-center.
         match qs.pointer_click(center(detail_row_rect(3, qs.layout()).unwrap())) {
@@ -4313,7 +4923,7 @@ mod tests {
         let labels: Vec<_> = qs
             .detail_rows(DetailOwner::Bluetooth)
             .into_iter()
-            .map(|r| r.label)
+            .map(|r| item(&r).label.clone())
             .collect();
         assert_eq!(labels, ["Buds", "Mouse", "Bluetooth Settings"]);
 
@@ -4329,7 +4939,7 @@ mod tests {
         let labels: Vec<_> = qs
             .detail_rows(DetailOwner::Bluetooth)
             .into_iter()
-            .map(|r| r.label)
+            .map(|r| item(&r).label.clone())
             .collect();
         assert_eq!(labels, ["Buds", "Mouse", "AAA", "Bluetooth Settings"]);
 
@@ -4343,7 +4953,7 @@ mod tests {
         let labels: Vec<_> = qs
             .detail_rows(DetailOwner::Bluetooth)
             .into_iter()
-            .map(|r| r.label)
+            .map(|r| item(&r).label.clone())
             .collect();
         assert_eq!(labels, ["AAA", "Mouse", "Buds", "Bluetooth Settings"]);
 
@@ -4351,7 +4961,7 @@ mod tests {
         // the frozen order resets — power off (placeholder), power back on with a changed
         // connection mix → the rows come back freshly sorted, not in the pre-flip order.
         assert!(qs.set_bluetooth(bt_status(false, Vec::new())));
-        assert!(qs.detail_rows(DetailOwner::Bluetooth)[0].placeholder);
+        assert!(item(&qs.detail_rows(DetailOwner::Bluetooth)[0]).placeholder);
         assert!(qs.set_bluetooth(bt_status(
             true,
             vec![
@@ -4363,7 +4973,7 @@ mod tests {
         let labels: Vec<_> = qs
             .detail_rows(DetailOwner::Bluetooth)
             .into_iter()
-            .map(|r| r.label)
+            .map(|r| item(&r).label.clone())
             .collect();
         assert_eq!(
             labels,
@@ -4385,9 +4995,9 @@ mod tests {
         ));
         let rows = qs.detail_rows(DetailOwner::Bluetooth);
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].placeholder);
-        assert_eq!(rows[0].label, "No available or connected devices");
-        assert_eq!(rows[1].label, "Bluetooth Settings");
+        assert!(item(&rows[0]).placeholder);
+        assert_eq!(item(&rows[0]).label, "No available or connected devices");
+        assert_eq!(item(&rows[1]).label, "Bluetooth Settings");
         assert!(matches!(
             qs.pointer_click(center(detail_row_rect(0, qs.layout()).unwrap())),
             PopoverAction::Consumed
@@ -4403,8 +5013,11 @@ mod tests {
             tile_arrow_rect(i, GridTile::Bluetooth, qs.layout()).unwrap(),
         ));
         let rows = qs.detail_rows(DetailOwner::Bluetooth);
-        assert!(rows[0].placeholder);
-        assert_eq!(rows[0].label, "Turn on Bluetooth to connect to devices");
+        assert!(item(&rows[0]).placeholder);
+        assert_eq!(
+            item(&rows[0]).label,
+            "Turn on Bluetooth to connect to devices"
+        );
     }
 
     /// The tile subtitle mirrors gnome-shell's `_sync` (`bluetooth.js:410-419`), and the detail
