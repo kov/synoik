@@ -518,6 +518,12 @@ pub struct Niri {
     /// Wake-up for the OSD's 1500 ms hide timeout: an OSD over a static desktop
     /// produces no frames of its own to expire on.
     pub osd_timer: Option<RegistrationToken>,
+    /// The deadline `osd_timer` is actually armed for. The OSD arms its deadline in
+    /// `show()`, which can happen from anywhere between frames (a D-Bus call, a
+    /// brightness key), so a before/after-`advance_animations` comparison cannot see
+    /// it — a replaced OSD would keep the *old* timer and, once that fired,
+    /// re-arm nothing and hang on screen until unrelated damage.
+    pub osd_timer_at: Option<Duration>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -4155,6 +4161,7 @@ impl Niri {
             notification_banner_timer: None,
             osd,
             osd_timer: None,
+            osd_timer_at: None,
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
@@ -5981,12 +5988,12 @@ impl Niri {
             self.reschedule_notification_banner_timer();
         }
 
-        // Same shape as the banner above: the hide deadline is armed inside
-        // `advance_animations` (at the Showing→Shown transition), so this
-        // comparison is the only place that can arm the wake-up for it.
-        let osd_wakeup = self.osd.next_wakeup();
         self.osd.advance_animations();
-        if self.osd.next_wakeup() != osd_wakeup {
+        // Unlike the banner above, this compares against what the timer is armed for
+        // rather than against the pre-advance deadline: the OSD's deadline is set in
+        // `show()`, which runs between frames, so a before/after diff is always equal
+        // and would never re-arm. See `osd_timer_at`.
+        if self.osd.next_wakeup() != self.osd_timer_at {
             self.reschedule_osd_timer();
         }
 
@@ -6348,6 +6355,12 @@ impl Niri {
                 .monitor_for_output(output)
                 .and_then(|mon| mon.expose_progress())
                 .unwrap_or(0.);
+            // The OSD raises itself above everything else on show
+            // (`js/ui/osdWindow.js:98` lifts it to the top of `uiGroup`), so it is
+            // pushed before the panel and its popovers — earlier push = higher z.
+            for element in self.osd.render(ctx.renderer, &self.icon_cache, output) {
+                push(element.into());
+            }
             for element in self.panel.render(
                 ctx.renderer,
                 output,
@@ -6359,11 +6372,6 @@ impl Niri {
                 push(element.into());
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
-            // The OSD raises itself above everything on show (`js/ui/osdWindow.js:98`
-            // lifts it to the top of `uiGroup`), so it is pushed FIRST = topmost.
-            for element in self.osd.render(ctx.renderer, &self.icon_cache, output) {
-                push(element.into());
-            }
             // bar; the quick-settings menu composites several elements (chrome + icons).
             for element in self
                 .panel_popover
@@ -9960,7 +9968,8 @@ impl Niri {
         if let Some(token) = self.osd_timer.take() {
             self.event_loop.remove(token);
         }
-        let Some(deadline) = self.osd.next_wakeup() else {
+        self.osd_timer_at = self.osd.next_wakeup();
+        let Some(deadline) = self.osd_timer_at else {
             return;
         };
         let now = self.clock.now_unadjusted();
@@ -9969,6 +9978,7 @@ impl Niri {
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 state.niri.osd_timer = None;
+                state.niri.osd_timer_at = None;
                 // The frame's advance_animations re-checks the deadline.
                 state.niri.queue_redraw_all();
                 TimeoutAction::Drop

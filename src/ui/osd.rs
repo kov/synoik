@@ -212,7 +212,7 @@ fn layout(content: &OsdContent) -> OsdLayout {
 enum State {
     Hidden,
     Showing(Animation),
-    Shown { deadline: Duration },
+    Shown,
     Hiding(Animation),
 }
 
@@ -223,7 +223,13 @@ struct OsdWindow {
     /// The level actually drawn: it eases toward `content.level` while the window is
     /// already visible, and snaps when it is not (`osdWindow.js:71-84`).
     level_anim: Option<Animation>,
-    level_from: f64,
+    /// When the OSD takes itself away. Armed by `show()` — **not** by the
+    /// Showing→Shown transition: GNOME starts the 1500 ms timeout at `show()` time,
+    /// concurrently with the fade-in (`osdWindow.js:107-110`), so a `show()` that
+    /// lands mid-fade re-arms it just the same. Keeping it out of the state enum is
+    /// what makes that expressible, and it is the only place a deadline is ever set,
+    /// which is what `Niri::reschedule_osd_timer` needs in order to stay in step.
+    deadline: Option<Duration>,
     /// Bumped when the *baked chrome* changes (label text, geometry) — deliberately
     /// NOT by the level, whose animated value would otherwise re-bake the whole pill
     /// every frame. The level bar is its own small bake, keyed on the physical pixel
@@ -241,7 +247,7 @@ impl OsdWindow {
             state: State::Hidden,
             content: OsdContent::default(),
             level_anim: None,
-            level_from: 0.,
+            deadline: None,
             revision: 0,
             chrome_cache: RefCell::new(widget::BakeCache::new()),
             level_cache: RefCell::new(widget::BakeCache::new()),
@@ -279,15 +285,17 @@ impl OsdWindow {
         let visible = self.is_visible();
 
         // The level eases only when the window is already up; otherwise it snaps.
-        match (visible, content.level) {
-            (true, Some(level)) => {
-                let from = self.displayed_level();
-                if from != level {
-                    self.level_from = from;
-                    self.level_anim = Some(self.ease(from, level, LEVEL_TIME_MS));
-                }
+        // Either way any running ease is replaced — `ease_property` does
+        // (`osdWindow.js:75-78`), and leaving a stale one would keep animating toward
+        // the *previous* target and then jump back (volume up then down in one frame).
+        // Read where the bar *is* before dropping the running ease — clearing first
+        // would fall back to the previous target instead of the current position.
+        let from = self.displayed_level();
+        self.level_anim = None;
+        if let (true, Some(level)) = (visible, content.level) {
+            if from != level {
+                self.level_anim = Some(self.ease(from, level, LEVEL_TIME_MS));
             }
-            _ => self.level_anim = None,
         }
 
         // Only the chrome's own inputs bump the revision — see `revision`.
@@ -299,20 +307,18 @@ impl OsdWindow {
         }
         self.content = content;
 
+        // The fade runs ONLY on the hidden→visible edge (`osdWindow.js:94-105` guards
+        // it with `if (!this.visible)`); every other state keeps whatever opacity
+        // transition it already has. In particular a second show during the 100 ms
+        // fade-in must let that fade finish rather than snapping to opaque, and one
+        // during the fade-*out* does not resurrect the OSD: GNOME's actor is still
+        // `visible` until `_reset()` (`:136`), so the ease-to-0 completes and the OSD
+        // it was asked to show is genuinely lost. A 100 ms window, but faithful.
         if !visible {
             self.state = State::Showing(self.ease(0., 1., FADE_TIME_MS));
-        } else if let State::Hiding(anim) = &self.state {
-            // Content replaced mid-fade-out: resume from wherever it got to rather
-            // than snapping to opaque.
-            let from = anim.value();
-            self.state = State::Showing(self.ease(from, 1., FADE_TIME_MS));
-        } else {
-            // Already fully shown: replace in place, no re-fade (`:94-111`), and
-            // re-arm the timeout.
-            self.state = State::Shown {
-                deadline: self.clock.now_unadjusted() + HIDE_TIMEOUT,
-            };
         }
+        // Re-armed on every show, whatever the state (`osdWindow.js:107-110`).
+        self.deadline = Some(self.clock.now_unadjusted() + HIDE_TIMEOUT);
     }
 
     /// Kill the timer and start hiding now (`osdWindow.js:114-120`).
@@ -320,16 +326,14 @@ impl OsdWindow {
         let from = match &self.state {
             State::Hidden | State::Hiding(_) => return,
             State::Showing(anim) => anim.value(),
-            State::Shown { .. } => 1.,
+            State::Shown => 1.,
         };
+        self.deadline = None;
         self.state = State::Hiding(self.ease(from, 0., FADE_TIME_MS));
     }
 
     fn next_wakeup(&self) -> Option<Duration> {
-        match &self.state {
-            State::Shown { deadline } => Some(*deadline),
-            _ => None,
-        }
+        self.deadline
     }
 
     fn advance_animations(&mut self) {
@@ -339,17 +343,10 @@ impl OsdWindow {
             }
         }
         match &mut self.state {
-            State::Hidden => (),
+            State::Hidden | State::Shown => (),
             State::Showing(anim) => {
                 if anim.is_done() {
-                    self.state = State::Shown {
-                        deadline: self.clock.now_unadjusted() + HIDE_TIMEOUT,
-                    };
-                }
-            }
-            State::Shown { deadline } => {
-                if self.clock.now_unadjusted() >= *deadline {
-                    self.cancel();
+                    self.state = State::Shown;
                 }
             }
             State::Hiding(anim) => {
@@ -358,8 +355,16 @@ impl OsdWindow {
                     // `_reset()` (`osdWindow.js:135-140`) clears the content.
                     self.content = OsdContent::default();
                     self.level_anim = None;
+                    self.deadline = None;
                     self.revision += 1;
                 }
+            }
+        }
+        // GNOME's timeout is a plain GLib source: it fires on its own schedule, not
+        // only once the fade-in has landed, so a still-Showing OSD expires too.
+        if let Some(deadline) = self.deadline {
+            if self.clock.now_unadjusted() >= deadline {
+                self.cancel();
             }
         }
     }
@@ -372,7 +377,7 @@ impl OsdWindow {
         match &self.state {
             State::Hidden => 0.,
             State::Showing(anim) | State::Hiding(anim) => anim.value().clamp(0., 1.) as f32,
-            State::Shown { .. } => 1.,
+            State::Shown => 1.,
         }
     }
 
@@ -483,6 +488,11 @@ impl OsdWindow {
                 .of((rect.size.w * value / max * scale).round() as i64)
                 .px(rect.size.w)
                 .px(max)
+                // The separator flips from a solid white tick to a gap showing the
+                // track as the value crosses `overdrive_start` — a branch the rounded
+                // end-cap pixel above cannot see, so two values that straddle it and
+                // land on the same pixel would serve each other's texture.
+                .of(value > 1.)
                 .done();
             let baked = widget::bake(
                 renderer,

@@ -82,6 +82,18 @@ Spec, cited:
 **Toolkit-first:** the level bar is GNOME's shared `BarLevel`, so it becomes `widget::BarLevel`,
 not a one-off in the OSD. The quick-settings sliders should eventually share it.
 
+**Landed `5bb8c180`** (`src/ui/osd.rs`, `widget::BarLevel` + `Painter::bar_level`). Two things
+adversarial review changed, both worth remembering: the hide deadline is armed in `show()`, not at
+the fade's end — GNOME's timeout runs concurrently with the fade-in (`osdWindow.js:107-110`), so a
+still-fading OSD can expire and a `show()` mid-fade must not restart the fade; and because `show()`
+can set that deadline *between* frames, `Niri` re-arms the calloop wake-up against **what the timer
+is armed for** (`osd_timer_at`), not against a before/after-`advance_animations` diff, which is
+always equal and would let a replaced OSD hang on a damage-free desktop.
+
+Known gap, systemic rather than this slice's: **RTL is unimplemented**. `barLevel.js:121,131-148`
+mirrors the whole bar for RTL locales; nothing in `src/ui/` does RTL layout anywhere, so the bar
+fills left-to-right regardless. Fixing it belongs to a toolkit-wide RTL pass, not here.
+
 ### B — `ShowOSD` on `org.gnome.Shell`
 Add the method to the existing interface in `src/dbus/gnome_shell.rs`, forwarding a
 `ShowOsd { connector, label, level, max_level, icon }` message over the existing channel.

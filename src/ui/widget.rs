@@ -2064,10 +2064,22 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             if !overdrive_active || value <= overdrive_start {
                 self.fill_rounded(seg(0., end_x + radius), radius, style.fill)?;
             } else {
-                self.fill_rounded(seg(0., sep_x - half_sep), radius, style.fill)?;
+                // Only the *outer* ends of these two segments are round: the edges
+                // facing the separator are straight `lineTo`s in cairo
+                // (`barLevel.js:163-172,177-190`). Ours come from `fill_rounded`,
+                // which rounds all four corners, so each inner edge is squared off
+                // again by a plain rect over its corner band — at 6px tall the
+                // corners are full semicircles, and leaving them would make the 3px
+                // separator read as a wide notch exactly when overdrive is showing.
+                let fill_end = sep_x - half_sep;
+                let over_start = sep_x + half_sep;
+                let over_end = end_x + radius;
+                self.fill_rounded(seg(0., fill_end), radius, style.fill)?;
+                self.fill_rounded(seg((fill_end - radius).max(0.), fill_end), 0., style.fill)?;
+                self.fill_rounded(seg(over_start, over_end), radius, style.overdrive)?;
                 self.fill_rounded(
-                    seg(sep_x + half_sep, end_x + radius),
-                    radius,
+                    seg(over_start, (over_start + radius).min(over_end)),
+                    0.,
                     style.overdrive,
                 )?;
             }

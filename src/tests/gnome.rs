@@ -11716,8 +11716,9 @@ fn osd_shows_and_expires() {
     // advance_animations; the wake-up must be armed from the same place.
     assert!(f.niri().osd_timer.is_some());
 
-    // Still up just before the timeout, gone after it (plus the fade out).
-    tick(&mut f, 1400);
+    // Still up just before the timeout — which started at `show()`, concurrently
+    // with the fade (`osdWindow.js:107-110`) — and gone after it plus the fade out.
+    tick(&mut f, 1300);
     assert!(f.niri().osd.content(&out).is_some());
     tick(&mut f, 200);
     tick(&mut f, 200);
@@ -11739,8 +11740,8 @@ fn osd_replace_in_place_never_refades() {
     tick(&mut f, 120);
     assert_eq!(f.niri().osd.alpha(&out), 1.);
 
-    // 1.4 s in — one step short of expiry — a new level arrives.
-    tick(&mut f, 1400);
+    // Just short of expiry, a new level arrives.
+    tick(&mut f, 1300);
     f.niri()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.6, 1.));
@@ -11750,8 +11751,24 @@ fn osd_replace_in_place_never_refades() {
         "replacing content must not restart the fade"
     );
 
+    // The re-arm happens inside `show()`, between frames. Nothing else can notice
+    // it, so the wake-up has to be re-armed against what the timer is actually set
+    // to — otherwise the old timer fires early, drops itself, and the OSD hangs on a
+    // damage-free desktop until unrelated damage happens by.
+    let armed = f.niri().osd_timer_at;
+    tick(&mut f, 0);
+    let (now_armed, deadline) = {
+        let niri = f.niri();
+        (niri.osd_timer_at, niri.osd.next_wakeup())
+    };
+    assert_eq!(
+        now_armed, deadline,
+        "the wake-up must follow a deadline re-armed by show()"
+    );
+    assert_ne!(armed, now_armed, "and it moved");
+
     // The re-arm bought another full 1500 ms from *now*.
-    tick(&mut f, 1400);
+    tick(&mut f, 1300);
     assert!(f.niri().osd.content(&out).is_some());
     tick(&mut f, 200);
     tick(&mut f, 200);
@@ -11774,18 +11791,95 @@ fn osd_level_eases_only_when_already_visible() {
     assert_eq!(f.niri().osd.displayed_level(&out), Some(0.2));
     tick(&mut f, 120);
 
-    // A step up while visible eases across 100 ms.
+    // A step up while visible eases across 100 ms. Sampled *mid-flight*: read at zero
+    // elapsed time it would still be exactly 0.2, which an implementation that just
+    // applies the new value one frame later would also pass.
     f.niri()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.8, 1.));
+    tick(&mut f, 50);
     let mid = f.niri().osd.displayed_level(&out).unwrap();
     assert!(
-        (0.2..0.8).contains(&mid),
-        "the bar should still be travelling, was at {mid}"
+        mid > 0.2 && mid < 0.8,
+        "the bar should be strictly in flight at 50 ms, was at {mid}"
     );
     tick(&mut f, 120);
     assert_eq!(f.niri().osd.displayed_level(&out), Some(0.8));
     assert!(!f.niri().osd.are_animations_ongoing());
+
+    // Up then straight back down inside one frame: the new target equals the value
+    // the (stale) ease started from, so nothing new is armed — and if the old ease is
+    // left running the bar climbs to 0.8 and then snaps back to 0.2.
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.3, 1.));
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.8, 1.));
+    tick(&mut f, 50);
+    assert_eq!(
+        f.niri().osd.displayed_level(&out),
+        Some(0.8),
+        "a superseded level ease must not keep running"
+    );
+}
+
+/// The fade runs ONLY on the hidden->visible edge (`js/ui/osdWindow.js:94-105` guards
+/// it with `if (!this.visible)`): a show landing mid-fade-in lets that fade finish
+/// instead of snapping to opaque, and the 1500 ms timeout starts at `show()` time,
+/// concurrently with the fade (`:107-110`) — so a still-fading OSD can expire.
+#[test]
+fn osd_show_during_the_fade_neither_snaps_nor_refades() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.4, 1.));
+    tick(&mut f, 40);
+    let mid = f.niri().osd.alpha(&out);
+    assert!(mid > 0. && mid < 1., "still fading in, alpha was {mid}");
+
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
+    let after = f.niri().osd.alpha(&out);
+    assert_eq!(after, mid, "a show mid-fade must not snap the pill opaque");
+    // ...and the fade still lands.
+    tick(&mut f, 80);
+    assert_eq!(f.niri().osd.alpha(&out), 1.);
+}
+
+/// The alt-tab switcher becoming visible hides every OSD
+/// (`js/ui/switcherPopup.js:170-178`) — driven through the real keybind, not by
+/// calling `hide_all` by hand.
+#[test]
+fn osd_hidden_by_the_window_switcher() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+    let id = f.add_client();
+    let _first = map_focused_window(&mut f, id);
+    let _second = map_focused_window(&mut f, id);
+
+    f.niri()
+        .osd
+        .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
+    tick(&mut f, 120);
+    assert!(f.niri().osd.is_visible());
+
+    // The real keybind, not a hand-call to `hide_all` — the wiring is the thing
+    // under test.
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    assert!(f.niri().window_mru_ui.is_open(), "Alt+Tab opened it");
+    tick(&mut f, 200);
+    assert!(
+        !f.niri().osd.is_visible(),
+        "opening the window switcher hides the OSD"
+    );
+    f.key_release(KEY_LEFTALT);
 }
 
 /// `show(icon, label, levels)` cancels every output **absent** from the level map

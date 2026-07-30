@@ -3356,6 +3356,10 @@ impl State {
                                 wmru,
                                 output.clone(),
                             );
+                            // The switcher becoming visible takes every OSD with it
+                            // (`js/ui/switcherPopup.js:170-178`) — otherwise a volume
+                            // pill sits under the alt-tab list for its full 1500 ms.
+                            self.niri.osd.hide_all();
 
                             // Only select the *next* window if some window (which should be the
                             // first one) is already focused. If nothing is focused, keep the first
