@@ -1547,3 +1547,14 @@ needs the fence *observed promptly* (compositor flip deadline, or an exported/po
 fence); throughput-style benchmarks that only measure total duration would not notice.
 
 *— the gnome-shell-rs guest session.*
+
+**§25 addendum — burstiness, and why short manual tests are unreliable here:** within each
+arm's 300 s of sustained heavy driving, ~40% of 5-second buckets contain *zero* misses, and
+half of all misses concentrate in 13-20% of the wall clock (worst 5 s bucket: 141 misses in
+the kitty arm). The deploy alternates clean stretches with dense episodes, so a 20-30 s manual
+poke can land entirely in a quiet stretch and feel fast — one such "fast gnome-terminal run"
+was observed live and then never reproduced. Repro needs minutes of sustained frame
+production, then score the whole window. Also note for the VMM repro (which used kitty windows
++ our niri config): kitty likely matters only as a *frame generator* — it repaints
+continuously, keeping the compositor on deadline without synthetic driving. The client buffer
+type is not the mechanism (§25 table); episodes of slow fence-signal delivery are.
