@@ -12,6 +12,7 @@ pub mod freedesktop_notifications;
 pub mod freedesktop_screensaver;
 pub mod gnome_session;
 pub mod gnome_shell;
+pub mod gnome_shell_brightness;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
 pub mod gtk_notifications;
@@ -33,6 +34,7 @@ use self::freedesktop_notifications::Notifications;
 use self::freedesktop_screensaver::ScreenSaver;
 use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
+use self::gnome_shell_brightness::Brightness;
 use self::gnome_shell_introspect::Introspect;
 use self::gtk_notifications::GtkNotifications;
 use self::mutter_display_config::DisplayConfig;
@@ -69,6 +71,9 @@ pub struct DBusServers {
     pub conn_rfkill: Option<Connection>,
     /// org.gnome.Shell.CalendarServer (session bus) — the dateMenu Events source.
     pub conn_calendar_server: Option<Connection>,
+    /// org.gnome.Shell.Brightness (session bus) — gsd-power's way in to idle dimming and the
+    /// auto-brightness target. Its own well-known name, hence its own connection.
+    pub conn_brightness: Option<Connection>,
 }
 
 impl DBusServers {
@@ -110,6 +115,21 @@ impl DBusServers {
 
             let screen_saver = ScreenSaver::new(niri.is_fdo_idle_inhibited.clone());
             dbus.conn_screen_saver = try_start(screen_saver);
+
+            // gsd-power's way in to brightness: idle dimming and the auto-brightness target.
+            let (to_niri, from_brightness) = calloop::channel::channel();
+            let (to_brightness, from_niri) = async_channel::unbounded();
+            niri.event_loop
+                .insert_source(from_brightness, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_brightness_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let brightness = Brightness::new(to_niri, from_niri);
+            if let Some(conn) = try_start(brightness) {
+                dbus.conn_brightness = Some(conn);
+                niri.brightness_emit = Some(to_brightness);
+            }
 
             let (to_niri, from_screenshot) = calloop::channel::channel();
             let (to_screenshot, from_niri) = async_channel::unbounded();

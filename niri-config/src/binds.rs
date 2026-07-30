@@ -374,6 +374,11 @@ pub enum Action {
     Unmaximize,
     ToggleTiledLeft,
     ToggleTiledRight,
+    /// Step the brightness scales up / down / cyclically. The bool is GNOME's `-monitor`
+    /// variant: act on the monitor under the pointer instead of the global scale.
+    ScreenBrightnessUp(#[knuffel(property(name = "current-monitor"), default)] bool),
+    ScreenBrightnessDown(#[knuffel(property(name = "current-monitor"), default)] bool),
+    ScreenBrightnessCycle(#[knuffel(property(name = "current-monitor"), default)] bool),
     /// Notify a grabbed accelerator (org.gnome.Shell GrabAccelerator); the
     /// argument is the grab's action id. Internal, not bindable from config.
     #[knuffel(skip)]
@@ -722,6 +727,15 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::Unmaximize {} => Self::Unmaximize,
             niri_ipc::Action::ToggleTiledLeft {} => Self::ToggleTiledLeft,
             niri_ipc::Action::ToggleTiledRight {} => Self::ToggleTiledRight,
+            niri_ipc::Action::ScreenBrightnessUp { current_monitor } => {
+                Self::ScreenBrightnessUp(current_monitor)
+            }
+            niri_ipc::Action::ScreenBrightnessDown { current_monitor } => {
+                Self::ScreenBrightnessDown(current_monitor)
+            }
+            niri_ipc::Action::ScreenBrightnessCycle { current_monitor } => {
+                Self::ScreenBrightnessCycle(current_monitor)
+            }
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

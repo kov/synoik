@@ -4547,6 +4547,226 @@ fn brightness_card_rows_drive_the_scale_algebra() {
     assert_eq!(f.niri().brightness.scales()[0].value(), 0.4);
 }
 
+/// The brightness keys (`org.gnome.shell.keybindings screen-brightness-*`) step the shell's
+/// scales: the plain ones move the global scale (and so every monitor, through its factor), the
+/// `-monitor` ones only the monitor under the pointer -- gnome-shell's
+/// `get_current_logical_monitor()` (`js/misc/brightnessManager.js:107-132`).
+#[test]
+fn brightness_keys_step_the_scales() {
+    use crate::brightness::Step;
+
+    // The scale arithmetic is in twentieths, so compare with a tolerance rather than exactly.
+    fn close(value: f64, expected: f64) -> bool {
+        (value - expected).abs() < 1e-9
+    }
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    let backlight = |connector: &str, name: &str, brightness| crate::backlight::OutputBacklight {
+        connector: connector.to_owned(),
+        display_name: name.to_owned(),
+        range: crate::backlight::BacklightRange { min: 0, max: 100 },
+        brightness,
+    };
+    // Both outputs backlit and equally bright, so the factors are 1:1 and a global step moves
+    // both by the same amount.
+    let snapshot = crate::backlight::BacklightSnapshot {
+        outputs: vec![
+            backlight("headless-1", "Built-in display", 100),
+            backlight("headless-2", "Dell 24\u{2033}", 100),
+        ],
+    };
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri().backlight = snapshot;
+
+    // A plain brightness-down key: one step of 1/20 off the global scale, fanned out to both.
+    f.niri_state().step_brightness(Step::Down, false);
+    assert!(close(
+        f.niri().brightness.global_scale().unwrap().value(),
+        0.95
+    ));
+    assert!(close(f.niri().brightness.scales()[0].value(), 0.95));
+    assert!(close(f.niri().brightness.scales()[1].value(), 0.95));
+
+    // The `-monitor` variant follows the pointer. Park it on the second output.
+    pointer_motion_to(&mut f, 1920. + 100., 100.);
+    f.niri_state().step_brightness(Step::Down, true);
+    assert!(
+        close(f.niri().brightness.scales()[0].value(), 0.95),
+        "the other monitor must not move"
+    );
+    assert!(close(f.niri().brightness.scales()[1].value(), 0.9));
+
+    // Cycle wraps at the top rather than stopping there -- the single-key control.
+    f.niri_state().step_brightness(Step::Up, false);
+    assert!(close(
+        f.niri().brightness.global_scale().unwrap().value(),
+        1.0
+    ));
+    f.niri_state().step_brightness(Step::Cycle, false);
+    assert!(close(
+        f.niri().brightness.global_scale().unwrap().value(),
+        0.0
+    ));
+}
+
+/// `org.gnome.Shell.Brightness` is gsd-power's way in (`js/ui/shellDBus.js:595-637`): idle dimming
+/// clamps the backlight without moving the scales, and the auto-brightness target biases them.
+/// `BrightnessChanged` marks changes *the user* made, so the ambient-light loop can tell its own
+/// adjustments apart from ours (`brightnessManager.js:151-158,172-179` emit `user-update` only
+/// from the slider handlers).
+#[cfg(feature = "dbus")]
+#[test]
+fn brightness_dbus_dims_without_moving_the_scales() {
+    use crate::dbus::gnome_shell_brightness::{BrightnessToNiri, NiriToBrightness};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let snapshot = crate::backlight::BacklightSnapshot {
+        outputs: vec![crate::backlight::OutputBacklight {
+            connector: "headless-1".to_owned(),
+            display_name: "Built-in display".to_owned(),
+            range: crate::backlight::BacklightRange { min: 0, max: 100 },
+            brightness: 100,
+        }],
+    };
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri().backlight = snapshot;
+
+    // Stand in for the D-Bus service's outbound half so the emissions are observable.
+    let (tx, rx) = async_channel::unbounded();
+    f.niri().brightness_emit = Some(tx);
+
+    // gsd-power dims: the scale stays where the user put it; only the written brightness drops.
+    f.niri_state()
+        .on_brightness_msg(BrightnessToNiri::SetDimming(true));
+    assert!(f.niri().brightness.dimming());
+    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
+
+    // ... and none of that is a user change.
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !emitted
+            .iter()
+            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+        "gsd-power's own request must not come back as BrightnessChanged"
+    );
+    // The property is pushed (the service dedups it), and it is true: we have a backlight.
+    assert!(emitted
+        .iter()
+        .any(|m| matches!(m, NiriToBrightness::HasControl(true))));
+
+    // An auto-brightness target biases around the scale's midpoint, still not a user change.
+    f.niri_state()
+        .on_brightness_msg(BrightnessToNiri::SetAutoBrightnessTarget(0.6));
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(!emitted
+        .iter()
+        .any(|m| matches!(m, NiriToBrightness::UserChanged)));
+
+    // A brightness KEY is a user change, so it does emit.
+    f.niri_state()
+        .step_brightness(crate::brightness::Step::Down, false);
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        emitted
+            .iter()
+            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+        "a brightness key is a user change"
+    );
+
+    // Losing the backlight clears HasBrightnessControl.
+    f.niri().backlight = crate::backlight::BacklightSnapshot::default();
+    let snapshot = f.niri().backlight.clone();
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri_state()
+        .on_brightness_msg(BrightnessToNiri::SetDimming(false));
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(emitted
+        .iter()
+        .any(|m| matches!(m, NiriToBrightness::HasControl(false))));
+}
+
+/// gnome-shell registers the brightness keys with `Shell.ActionMode.ALL`
+/// (`js/misc/brightnessManager.js:35-76`), so they keep working on the lock screen -- which is
+/// when you need them most, gsd-power having dimmed the panel -- and while the screenshot UI is up.
+#[test]
+fn brightness_keys_work_when_locked() {
+    use niri_config::Action;
+
+    for action in [
+        Action::ScreenBrightnessUp(false),
+        Action::ScreenBrightnessDown(false),
+        Action::ScreenBrightnessCycle(false),
+        Action::ScreenBrightnessUp(true),
+    ] {
+        assert!(
+            crate::input::allowed_when_locked(&action),
+            "{action:?} must survive the lock gate"
+        );
+        assert!(
+            crate::input::allowed_during_screenshot(&action),
+            "{action:?} must survive the screenshot gate"
+        );
+    }
+}
+
+/// `BrightnessChanged` marks a change the user made to a scale that exists. gnome-shell's key
+/// handlers are `this._globalScale?.stepUp()` (`brightnessManager.js:107-132`): with no scale
+/// there is no `notify::value` and so no `user-update`. Emitting anyway would tell gsd-power's
+/// ambient-light loop to back off over a key press that did nothing.
+#[cfg(feature = "dbus")]
+#[test]
+fn a_brightness_key_with_no_backlight_is_silent() {
+    use crate::dbus::gnome_shell_brightness::NiriToBrightness;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.niri().brightness_emit = Some(tx);
+    assert!(f.niri().brightness.global_scale().is_none(), "no backlight");
+
+    f.niri_state()
+        .step_brightness(crate::brightness::Step::Up, false);
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !emitted
+            .iter()
+            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+        "a key press with nothing to move must not emit BrightnessChanged"
+    );
+
+    // The `-monitor` variant with the pointer on a monitor that has no backlight is the same
+    // case: gnome-shell's lookup simply misses.
+    let snapshot = crate::backlight::BacklightSnapshot {
+        outputs: vec![crate::backlight::OutputBacklight {
+            connector: "headless-1".to_owned(),
+            display_name: "Built-in display".to_owned(),
+            range: crate::backlight::BacklightRange { min: 0, max: 100 },
+            brightness: 100,
+        }],
+    };
+    let _ = f.niri().brightness.monitors_changed(&snapshot);
+    f.niri().backlight = snapshot;
+    f.add_output(2, (1920, 1080));
+    pointer_motion_to(&mut f, 1920. + 100., 100.);
+    let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+    f.niri_state()
+        .step_brightness(crate::brightness::Step::Up, true);
+    let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        !emitted
+            .iter()
+            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+        "the -monitor key on a monitor without a backlight must not emit"
+    );
+}
+
 /// The popover opens and closes with an animation (gnome-shell's `BoxPointer` fade):
 /// opening starts a running animation; dismissing does NOT drop the popover instantly
 /// but keeps it visible (fading) with an ongoing animation until it settles.

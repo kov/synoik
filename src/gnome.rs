@@ -534,11 +534,16 @@ impl GnomeSettings {
         &mut self,
         wm: Option<&gio::Settings>,
         mutter_keybindings: Option<&gio::Settings>,
+        shell_keybindings: Option<&gio::Settings>,
     ) {
         let mut keybindings = read_keybinding_table(wm, adopted_wm_keybindings());
         keybindings.extend(read_keybinding_table(
             mutter_keybindings,
             adopted_mutter_keybindings(),
+        ));
+        keybindings.extend(read_keybinding_table(
+            shell_keybindings,
+            adopted_shell_keybindings(),
         ));
         self.keybindings = keybindings;
     }
@@ -636,6 +641,13 @@ pub enum GnomeKeyAction {
     /// the focused window to the given half of the work area, or untile it if
     /// already tiled there.
     ToggleTiled(TileSide),
+    /// `screen-brightness-{up,down,cycle}[-monitor]` (`org.gnome.shell.keybindings`): step the
+    /// brightness scales. The `-monitor` variants act on the monitor under the pointer, which is
+    /// gnome-shell's `get_current_logical_monitor()` (`brightnessManager.js:107-132`).
+    ScreenBrightness {
+        step: crate::brightness::Step,
+        current_monitor: bool,
+    },
 }
 
 /// Which half of the work area a window is tiled to.
@@ -798,6 +810,7 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
 fn default_keybindings() -> Vec<GnomeKeybinding> {
     let mut keybindings = read_keybinding_table(None, adopted_wm_keybindings());
     keybindings.extend(read_keybinding_table(None, adopted_mutter_keybindings()));
+    keybindings.extend(read_keybinding_table(None, adopted_shell_keybindings()));
     keybindings
 }
 
@@ -1221,6 +1234,68 @@ impl GnomeSettingsWriter {
 /// The `org.gnome.mutter.keybindings` keys we honor, with their schema
 /// defaults (this schema ships with mutter, so the defaults are authoritative
 /// in the reference checkout).
+/// The `org.gnome.shell.keybindings` keys we honor. Unlike the wm/mutter tables these are the
+/// *shell's* own bindings; brightness is the only group we implement so far
+/// (`data/org.gnome.shell.gschema.xml.in:281-304`).
+fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
+    use crate::brightness::Step;
+
+    fn entry(
+        key: &str,
+        step: Step,
+        current_monitor: bool,
+        accel: &str,
+    ) -> (String, GnomeKeyAction, Vec<String>) {
+        (
+            key.to_owned(),
+            GnomeKeyAction::ScreenBrightness {
+                step,
+                current_monitor,
+            },
+            vec![accel.to_owned()],
+        )
+    }
+
+    vec![
+        entry(
+            "screen-brightness-up",
+            Step::Up,
+            false,
+            "XF86MonBrightnessUp",
+        ),
+        entry(
+            "screen-brightness-up-monitor",
+            Step::Up,
+            true,
+            "<Shift>XF86MonBrightnessUp",
+        ),
+        entry(
+            "screen-brightness-down",
+            Step::Down,
+            false,
+            "XF86MonBrightnessDown",
+        ),
+        entry(
+            "screen-brightness-down-monitor",
+            Step::Down,
+            true,
+            "<Shift>XF86MonBrightnessDown",
+        ),
+        entry(
+            "screen-brightness-cycle",
+            Step::Cycle,
+            false,
+            "XF86MonBrightnessCycle",
+        ),
+        entry(
+            "screen-brightness-cycle-monitor",
+            Step::Cycle,
+            true,
+            "<Shift>XF86MonBrightnessCycle",
+        ),
+    ]
+}
+
 fn adopted_mutter_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     vec![
         (
@@ -1257,6 +1332,7 @@ fn is_new_model(seen: &RefCell<Option<GnomeSettings>>, settings: &GnomeSettings)
 struct Stores {
     mutter: Option<gio::Settings>,
     mutter_keybindings: Option<gio::Settings>,
+    shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
     shell: Option<gio::Settings>,
@@ -1297,6 +1373,7 @@ impl Stores {
         Self {
             mutter: gsettings("org.gnome.mutter"),
             mutter_keybindings: gsettings("org.gnome.mutter.keybindings"),
+            shell_keybindings: gsettings("org.gnome.shell.keybindings"),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings"),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences"),
             shell: gsettings("org.gnome.shell"),
@@ -1337,6 +1414,7 @@ impl Stores {
         [
             &self.mutter,
             &self.mutter_keybindings,
+            &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
             &self.shell,
@@ -1363,6 +1441,7 @@ impl Stores {
         settings.load_keybindings(
             self.wm_keybindings.as_ref(),
             self.mutter_keybindings.as_ref(),
+            self.shell_keybindings.as_ref(),
         );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);
@@ -2230,6 +2309,51 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    /// The brightness keys come from `org.gnome.shell.keybindings`, which we had never read
+    /// before: they are the shell's own bindings, not the wm's. Their defaults are the bare
+    /// `XF86MonBrightness*` keysyms, with the `-monitor` variants on Shift
+    /// (`data/org.gnome.shell.gschema.xml.in:281-304`).
+    #[test]
+    fn brightness_keys_are_in_the_default_keybindings() {
+        use crate::brightness::Step;
+
+        let bindings = default_keybindings();
+        let find = |step, current_monitor| {
+            bindings
+                .iter()
+                .find(|kb| {
+                    kb.action
+                        == GnomeKeyAction::ScreenBrightness {
+                            step,
+                            current_monitor,
+                        }
+                })
+                .unwrap_or_else(|| panic!("no binding for {step:?} monitor={current_monitor}"))
+        };
+
+        // One accel each, and the plain/`-monitor` pair differs only by Shift.
+        for step in [Step::Up, Step::Down, Step::Cycle] {
+            let plain = find(step, false);
+            let monitor = find(step, true);
+            assert_eq!(plain.accels.len(), 1);
+            assert_eq!(monitor.accels.len(), 1);
+            assert_ne!(
+                plain.accels[0], monitor.accels[0],
+                "the -monitor variant must not shadow the plain one"
+            );
+        }
+
+        // The three steps are distinct bindings, not one key reused.
+        assert_ne!(
+            find(Step::Up, false).accels[0],
+            find(Step::Down, false).accels[0]
+        );
+        assert_ne!(
+            find(Step::Up, false).accels[0],
+            find(Step::Cycle, false).accels[0]
+        );
+    }
+
     /// A folder that asks to be translated names a `.directory` file, not a string:
     /// the display name is that file's `[Desktop Entry] Name`, looked up under
     /// `desktop-directories/` with the **user** data dir first and the first file
@@ -2738,6 +2862,7 @@ mod tests {
                     None,
                 )),
                 mutter_keybindings: None,
+                shell_keybindings: None,
                 wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
                 wm_preferences: None,
                 shell: None,
@@ -2844,6 +2969,7 @@ mod tests {
                     STORES.set(Some(Rc::new(Stores {
                         mutter: None,
                         mutter_keybindings: None,
+                        shell_keybindings: None,
                         wm_keybindings: None,
                         wm_preferences: None,
                         shell: Some(shell),
@@ -2933,6 +3059,7 @@ mod tests {
                     STORES.set(Some(Rc::new(Stores {
                         mutter: None,
                         mutter_keybindings: None,
+                        shell_keybindings: None,
                         wm_keybindings: None,
                         wm_preferences: None,
                         shell: Some(shell),

@@ -2605,6 +2605,15 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::ScreenBrightnessUp(current_monitor) => {
+                self.step_brightness(crate::brightness::Step::Up, current_monitor);
+            }
+            Action::ScreenBrightnessDown(current_monitor) => {
+                self.step_brightness(crate::brightness::Step::Down, current_monitor);
+            }
+            Action::ScreenBrightnessCycle(current_monitor) => {
+                self.step_brightness(crate::brightness::Step::Cycle, current_monitor);
+            }
             Action::ToggleTiledLeft => {
                 let focus = self.niri.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
@@ -8079,6 +8088,14 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::Unmaximize => Action::Unmaximize,
         GnomeKeyAction::ToggleTiled(TileSide::Left) => Action::ToggleTiledLeft,
         GnomeKeyAction::ToggleTiled(TileSide::Right) => Action::ToggleTiledRight,
+        GnomeKeyAction::ScreenBrightness {
+            step,
+            current_monitor,
+        } => match step {
+            crate::brightness::Step::Up => Action::ScreenBrightnessUp(current_monitor),
+            crate::brightness::Step::Down => Action::ScreenBrightnessDown(current_monitor),
+            crate::brightness::Step::Cycle => Action::ScreenBrightnessCycle(current_monitor),
+        },
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
@@ -8271,7 +8288,7 @@ fn should_reset_pointer_inactivity_timer<I: InputBackend>(event: &InputEvent<I>)
     )
 }
 
-fn allowed_when_locked(action: &Action) -> bool {
+pub(crate) fn allowed_when_locked(action: &Action) -> bool {
     matches!(
         action,
         Action::Quit(_)
@@ -8284,10 +8301,16 @@ fn allowed_when_locked(action: &Action) -> bool {
             | Action::Reboot
             | Action::SwitchLayout(_)
             | Action::ToggleKeyboardShortcutsInhibit
+            // gnome-shell registers the brightness keys with `Shell.ActionMode.ALL`
+            // (`brightnessManager.js:35-76`), so they work on the lock screen — which is exactly
+            // when you need them, since gsd-power has usually dimmed the panel by then.
+            | Action::ScreenBrightnessUp(_)
+            | Action::ScreenBrightnessDown(_)
+            | Action::ScreenBrightnessCycle(_)
     )
 }
 
-fn allowed_during_screenshot(action: &Action) -> bool {
+pub(crate) fn allowed_during_screenshot(action: &Action) -> bool {
     matches!(
         action,
         Action::Quit(_)
@@ -8298,6 +8321,10 @@ fn allowed_during_screenshot(action: &Action) -> bool {
             // Intended for binds such as volume up/down, lock the screen, etc.
             | Action::Spawn(_)
             | Action::SpawnSh(_)
+            // `ActionMode.ALL` covers the screenshot UI too.
+            | Action::ScreenBrightnessUp(_)
+            | Action::ScreenBrightnessDown(_)
+            | Action::ScreenBrightnessCycle(_)
             // The screenshot UI can handle these.
             | Action::MoveColumnLeft
             | Action::MoveColumnLeftOrToMonitorLeft

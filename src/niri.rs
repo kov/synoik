@@ -482,6 +482,11 @@ pub struct Niri {
     /// slider drives, plus one scale per backlit output. Dormant (no global scale) when nothing is
     /// backlit.
     pub brightness: crate::brightness::BrightnessManager,
+    /// The outbound half of `org.gnome.Shell.Brightness`: `HasBrightnessControl` changes and the
+    /// `BrightnessChanged` signal. `None` without the `dbus` feature / before D-Bus starts.
+    #[cfg(feature = "dbus")]
+    pub brightness_emit:
+        Option<async_channel::Sender<crate::dbus::gnome_shell_brightness::NiriToBrightness>>,
     /// A clone of the login1 watcher's inbound channel, so a brightness write can report its
     /// completion back to the write serializer through the same path.
     #[cfg(feature = "dbus")]
@@ -3145,9 +3150,42 @@ impl State {
             &crate::backlight::BacklightSnapshot,
         ) -> Vec<crate::brightness::BacklightWrite>,
     ) {
+        self.sync_brightness_inner(false, f);
+    }
+
+    /// [`sync_brightness`](Self::sync_brightness) for a change the **user** made — a slider drag
+    /// or a brightness key. gnome-shell's manager emits `user-update` for exactly those
+    /// (`brightnessManager.js:151-158,172-179`) and `org.gnome.Shell.Brightness` turns it into
+    /// `BrightnessChanged`, which is how the ambient-light loop learns to back off. Changes that
+    /// came *from* gsd-power, from the hardware, or from a monitor hotplug must not emit it, or
+    /// the two would chase each other.
+    fn sync_brightness_user(
+        &mut self,
+        f: impl FnOnce(
+            &mut crate::brightness::BrightnessManager,
+            &crate::backlight::BacklightSnapshot,
+        ) -> Vec<crate::brightness::BacklightWrite>,
+    ) {
+        self.sync_brightness_inner(true, f);
+    }
+
+    fn sync_brightness_inner(
+        &mut self,
+        user: bool,
+        f: impl FnOnce(
+            &mut crate::brightness::BrightnessManager,
+            &crate::backlight::BacklightSnapshot,
+        ) -> Vec<crate::brightness::BacklightWrite>,
+    ) {
         let mut manager = std::mem::take(&mut self.niri.brightness);
         let writes = f(&mut manager, &self.niri.backlight);
         self.niri.brightness = manager;
+
+        // gnome-shell's key handlers are `this._globalScale?.stepUp()` and
+        // `this._monitorScales.get(monitor)?.stepUp()` (`brightnessManager.js:107-132`): with no
+        // scale to move there is no `notify::value`, so no `user-update` either. An empty write
+        // list is exactly that case — every entry point returns early when its scale is missing.
+        let moved = !writes.is_empty();
 
         for write in writes {
             self.set_backlight_brightness(&write.connector, write.brightness);
@@ -3155,20 +3193,78 @@ impl State {
 
         // gnome-shell's `BrightnessItem._sync` off the manager's `changed`/`notify::value`.
         let view = self.niri.brightness.view();
+        let has_control = view.global.is_some();
         if self.niri.panel_popover.set_brightness(view) {
             self.niri.queue_redraw_all();
+        }
+
+        #[cfg(feature = "dbus")]
+        if let Some(tx) = self.niri.brightness_emit.as_ref() {
+            use crate::dbus::gnome_shell_brightness::NiriToBrightness;
+
+            // The service dedups `HasControl`, so this can fire on every sync.
+            let _ = tx.send_blocking(NiriToBrightness::HasControl(has_control));
+            if user && moved {
+                let _ = tx.send_blocking(NiriToBrightness::UserChanged);
+            }
+        }
+        #[cfg(not(feature = "dbus"))]
+        let _ = (user, moved, has_control);
+    }
+
+    /// A call on `org.gnome.Shell.Brightness` — gsd-power asking for idle dimming or feeding an
+    /// auto-brightness target. Never `user`: these are not the user touching a slider.
+    #[cfg(feature = "dbus")]
+    pub fn on_brightness_msg(
+        &mut self,
+        msg: crate::dbus::gnome_shell_brightness::BrightnessToNiri,
+    ) {
+        use crate::dbus::gnome_shell_brightness::BrightnessToNiri;
+
+        match msg {
+            BrightnessToNiri::SetDimming(enable) => {
+                trace!("brightness: dimming {enable}");
+                self.sync_brightness(|manager, snapshot| manager.set_dimming(enable, snapshot));
+            }
+            BrightnessToNiri::SetAutoBrightnessTarget(target) => {
+                trace!("brightness: auto-brightness target {target}");
+                self.sync_brightness(|manager, snapshot| {
+                    manager.set_auto_brightness_target(target, snapshot)
+                });
+            }
         }
     }
 
     /// The quick-settings brightness slider: the global scale, which fans out to every monitor
     /// through its factor (`brightnessManager.js:229-240`).
     pub fn set_global_brightness(&mut self, value: f64) {
-        self.sync_brightness(|manager, snapshot| manager.set_global_value(value, snapshot));
+        self.sync_brightness_user(|manager, snapshot| manager.set_global_value(value, snapshot));
+    }
+
+    /// A brightness keybinding (`org.gnome.shell.keybindings screen-brightness-*`).
+    ///
+    /// `current_monitor` is GNOME's `-monitor` variant, which steps only
+    /// `get_current_logical_monitor()` — the monitor under the pointer
+    /// (`brightnessManager.js:107-132`). With no backlight on that monitor it is a no-op, as in
+    /// gnome-shell, where the lookup simply misses (`this._monitorScales.get(monitor)?.stepUp()`).
+    pub fn step_brightness(&mut self, step: crate::brightness::Step, current_monitor: bool) {
+        if !current_monitor {
+            self.sync_brightness_user(|manager, snapshot| manager.step_global(step, snapshot));
+            return;
+        }
+
+        let Some(output) = self.niri.output_under_cursor() else {
+            return;
+        };
+        let connector = output.name();
+        self.sync_brightness_user(|manager, snapshot| {
+            manager.step_monitor(&connector, step, snapshot)
+        });
     }
 
     /// One row of the per-monitor brightness card (`brightness.js:12-35`).
     pub fn set_monitor_brightness(&mut self, connector: &str, value: f64) {
-        self.sync_brightness(|manager, snapshot| {
+        self.sync_brightness_user(|manager, snapshot| {
             manager.set_monitor_value(connector, value, snapshot)
         });
     }
@@ -3209,14 +3305,36 @@ impl State {
     /// a slider drag stays at one in-flight logind call.
     pub fn set_backlight_brightness(&mut self, connector: &str, brightness: i32) {
         let Some(tty) = self.backend.tty_checked() else {
+            // No backend owns any backlight, so the snapshot is the only "hardware" there is.
+            // Keeping it in step matters because the snapshot is what the next `_sync` reads back:
+            // leaving it stale would make the manager mistake our own write for someone else
+            // moving the panel and re-adopt the old value. On the TTY path below the same
+            // invariant holds -- `snapshot()` reports the writer's *target*, not a fresh sysfs
+            // read -- so this is the same rule, not a stand-in for hardware we don't have.
+            if let Some(output) = self
+                .niri
+                .backlight
+                .outputs
+                .iter_mut()
+                .find(|o| o.connector == connector)
+            {
+                output.brightness = output.range.clamp(brightness);
+            }
             return;
         };
-        let Some(write) = tty.backlights.request(connector, brightness) else {
-            return;
-        };
+        // The snapshot is refreshed whether or not a write goes out. `request` returns `None`
+        // when the serializer holds the write back behind one already in flight — but the
+        // writer's *target* has still moved, and the snapshot reports targets. Refreshing only on
+        // `Some` left it stale for the rest of a key repeat or drag, and the next `_sync` would
+        // then read its own old write back as an external change: the scale would snap up and
+        // idle dimming would be cancelled. Mutter has no such window — it notifies
+        // `brightness-target` immediately even while pending (`meta-backlight.c:159-196`).
+        let write = tty.backlights.request(connector, brightness);
         let snapshot = tty.backlights.snapshot();
         self.niri.backlight = snapshot;
-        self.send_backlight_write(write);
+        if let Some(write) = write {
+            self.send_backlight_write(write);
+        }
     }
 
     #[cfg(feature = "dbus")]
@@ -4027,6 +4145,8 @@ impl Niri {
             system_status_tx: None,
             backlight: crate::backlight::BacklightSnapshot::default(),
             brightness: crate::brightness::BrightnessManager::default(),
+            #[cfg(feature = "dbus")]
+            brightness_emit: None,
             #[cfg(feature = "dbus")]
             login1_tx: None,
             wallpaper: Wallpaper::default(),

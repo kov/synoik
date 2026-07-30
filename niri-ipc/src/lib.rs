@@ -1003,6 +1003,30 @@ pub enum Action {
     /// Tile the focused window to the right half of the work area, or untile
     /// it if already tiled right (GNOME Super+Right).
     ToggleTiledRight {},
+    /// Step the screen brightness up one step (GNOME's `screen-brightness-up`).
+    ///
+    /// Drives the shell's brightness scales, so it moves every backlit monitor through its
+    /// factor; with `current-monitor` it steps only the monitor under the pointer, like GNOME's
+    /// `screen-brightness-up-monitor`.
+    ScreenBrightnessUp {
+        /// Step only the monitor under the pointer instead of the global scale.
+        #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, default_value_t = false))]
+        current_monitor: bool,
+    },
+    /// Step the screen brightness down one step (GNOME's `screen-brightness-down`).
+    ScreenBrightnessDown {
+        /// Step only the monitor under the pointer instead of the global scale.
+        #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, default_value_t = false))]
+        current_monitor: bool,
+    },
+    /// Step the screen brightness up, wrapping to the minimum at the top (GNOME's
+    /// `screen-brightness-cycle`) — the single-key brightness control on keyboards with one
+    /// brightness key.
+    ScreenBrightnessCycle {
+        /// Cycle only the monitor under the pointer instead of the global scale.
+        #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, default_value_t = false))]
+        current_monitor: bool,
+    },
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.
