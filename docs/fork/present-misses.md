@@ -1558,3 +1558,32 @@ production, then score the whole window. Also note for the VMM repro (which used
 + our niri config): kitty likely matters only as a *frame generator* — it repaints
 continuously, keeping the compositor on deadline without synthetic driving. The client buffer
 type is not the mechanism (§25 table); episodes of slow fence-signal delivery are.
+
+## §26 — Fresh-boot control run + the mouse-motion masking clue (2026-07-30)
+
+Two more discriminators, both pointing at the same host-side feedback latency:
+
+**Fresh-boot, shm-only control.** Rebooted onto boot `6eae47e5`, populated 8 gnome-terminals
+as the very first workload — no kitty (no GPU client at all) ever spawned this boot. Heavy ×2,
+00:03:28-00:08:25, 28 qualifying windows, same env (async on, scale 1.5, VT active): **7.17%
+overall, 15.42% at draws 200+**, every one of the 1175 misses queued early (median 15.3 ms),
+zero late; same burstiness (23/60 five-second buckets fully quiet, busiest bucket 114 misses).
+Compare §23 clean deploy: 0.04% / 0.07%. So: not boot state, not accumulated GPU-client state,
+not client buffer type. Run-to-run magnitude varies ~2× (16.28% on the previous boot's
+gnome-terminal arm) — consistent with bursty episodes, not with any guest-visible variable
+we've been able to move.
+
+**Mouse motion masks it (live observation, Gustavo).** With the cursor idle, client content
+updates visibly drag; keep the pointer moving (or parked where hit-tests keep changing the
+cursor) and updates speed right up. Mechanism: the cursor is composited on this seat (software
+cursor), so pointer motion is a steady stream of damage that schedules compositor redraws
+*independently* of present feedback. Client updates are throttled on `wl_surface.frame`
+callbacks, which ride present completion — when the host delivers completion/vblank feedback
+late (the episode signature), the whole callback loop stretches and content lags; extra
+input-driven redraws outrun the stalled loop and hide it. i.e. mouse motion doesn't fix
+anything, it *masks* delayed present feedback by forcing more frames. This narrows the suspect
+from "fence signaling" to **completion feedback delivery in general** (dma-fence signal and/or
+pageflip/vblank event), and is a very cheap live discriminator for candidate fixes: park the
+mouse, watch a scrolling terminal.
+
+*— the gnome-shell-rs guest session.*

@@ -244,3 +244,5 @@ Recover with `journalctl -b --since 20:37:52 --until 20:54:27 -o short-iso _UID=
 early (median 15.5/13.4 ms), the late-fence shape. Written up as `present-misses.md` §24.
 
 | 23:33-23:44 | client A/B (§25): same boot `3cac48f9`, close-all → 8× kitty heavy ×2 (23:34:07-23:39:04) → close-all → 8× gnome-terminal heavy ×2 (23:39:29-23:44:26). kitty 12.59% / 200+ 28.31%; gnome-terminal 16.28% / 200+ 38.98%; both all-queued-early (median ~15 ms). Regression is client-independent; kitty adds a second symptom (12 ms+ gpu band + fence-gated commits). |
+
+| 00:03-00:08 (2026-07-30) | fresh-boot control (§26): boot `6eae47e5`, 8× gnome-terminal as first-ever workload (no GPU client this boot), heavy ×2 00:03:28-00:08:25. 7.17% overall / 200+ 15.42%; 1175 misses all queued early (median 15.3 ms). A first attempt 23:58-00:04 was DISCARDED (mouse experimentation on the seat mid-pass). |
