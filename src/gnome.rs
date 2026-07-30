@@ -101,6 +101,157 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.app-folders`: the user's app-grid folders, in
     /// `folder-children` order. See [`AppFolder`].
     pub app_folders: Vec<AppFolder>,
+    /// The accessibility state behind the `a11y` panel indicator and its menu.
+    pub a11y: A11ySettings,
+}
+
+/// One row of the accessibility menu (`js/ui/status/accessibility.js:45-81`), in
+/// gnome-shell's construction order — which is the order the menu shows them in.
+///
+/// Every row is a `PopupSwitchMenuItem`; nine are a plain boolean key, and
+/// [`A11yToggle::LargeText`] is the odd one out (see [`A11ySettings::large_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum A11yToggle {
+    HighContrast,
+    Zoom,
+    LargeText,
+    ScreenReader,
+    ScreenKeyboard,
+    VisualAlerts,
+    StickyKeys,
+    SlowKeys,
+    BounceKeys,
+    MouseKeys,
+}
+
+impl A11yToggle {
+    /// Every row, in gnome-shell's menu order (`accessibility.js:45-81`).
+    pub const ALL: [A11yToggle; 10] = [
+        A11yToggle::HighContrast,
+        A11yToggle::Zoom,
+        A11yToggle::LargeText,
+        A11yToggle::ScreenReader,
+        A11yToggle::ScreenKeyboard,
+        A11yToggle::VisualAlerts,
+        A11yToggle::StickyKeys,
+        A11yToggle::SlowKeys,
+        A11yToggle::BounceKeys,
+        A11yToggle::MouseKeys,
+    ];
+
+    /// The row label (`accessibility.js:45-81`).
+    pub fn label(self) -> &'static str {
+        match self {
+            A11yToggle::HighContrast => "High Contrast",
+            A11yToggle::Zoom => "Zoom",
+            A11yToggle::LargeText => "Large Text",
+            A11yToggle::ScreenReader => "Screen Reader",
+            A11yToggle::ScreenKeyboard => "Screen Keyboard",
+            A11yToggle::VisualAlerts => "Visual Alerts",
+            A11yToggle::StickyKeys => "Sticky Keys",
+            A11yToggle::SlowKeys => "Slow Keys",
+            A11yToggle::BounceKeys => "Bounce Keys",
+            A11yToggle::MouseKeys => "Mouse Keys",
+        }
+    }
+
+    /// The `(store, key)` this row is a plain boolean mirror of, or `None` for
+    /// [`A11yToggle::LargeText`], whose key is a scaling *factor*.
+    fn bool_key(self) -> Option<(&'static str, &'static str)> {
+        Some(match self {
+            A11yToggle::HighContrast => ("a11y-interface", "high-contrast"),
+            A11yToggle::Zoom => ("a11y-applications", "screen-magnifier-enabled"),
+            A11yToggle::LargeText => return None,
+            A11yToggle::ScreenReader => ("a11y-applications", "screen-reader-enabled"),
+            A11yToggle::ScreenKeyboard => ("a11y-applications", "screen-keyboard-enabled"),
+            A11yToggle::VisualAlerts => ("wm-preferences", "visual-bell"),
+            A11yToggle::StickyKeys => ("a11y-keyboard", "stickykeys-enable"),
+            A11yToggle::SlowKeys => ("a11y-keyboard", "slowkeys-enable"),
+            A11yToggle::BounceKeys => ("a11y-keyboard", "bouncekeys-enable"),
+            A11yToggle::MouseKeys => ("a11y-keyboard", "mousekeys-enable"),
+        })
+    }
+}
+
+/// The accessibility keys gnome-shell's `ATIndicator` reads and writes
+/// (`js/ui/status/accessibility.js`).
+///
+/// We mirror the keys faithfully, but almost none of them have a consumer in this
+/// stack yet: the magnifier, the on-screen keyboard, the keyboard filters, the visual
+/// bell and the screen reader are separate subsystems, and our own chrome does not
+/// follow `high-contrast`/`text-scaling-factor` the way St does. Writing the canonical
+/// key is still the right port — GTK apps read `high-contrast` and
+/// `text-scaling-factor` directly, and each consumer is its own later slice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct A11ySettings {
+    /// `org.gnome.desktop.a11y always-show-universal-access-status`: pin the panel
+    /// indicator on even with everything off (`accessibility.js:93-96`).
+    pub always_show: bool,
+    /// The nine plain-boolean rows, indexed by [`A11yToggle::ALL`] position (the
+    /// `LargeText` slot is unused — its state lives in `text_scaling_factor`).
+    bools: [bool; 10],
+    /// `org.gnome.desktop.interface text-scaling-factor` (`d`). The Large Text row is
+    /// on iff this is `> 1.0` (`accessibility.js:120-122`); turning it on writes
+    /// `DPI_FACTOR_LARGE` = 1.25 and turning it off **resets** the key rather than
+    /// writing 1.0 (`accessibility.js:124-129`).
+    pub text_scaling_factor: f64,
+}
+
+/// `DPI_FACTOR_LARGE` (`accessibility.js:21`) — what the Large Text row writes.
+pub const DPI_FACTOR_LARGE: f64 = 1.25;
+
+impl Default for A11ySettings {
+    fn default() -> Self {
+        Self {
+            always_show: false,
+            bools: [false; 10],
+            // The schema default; anything at or below 1.0 reads as Large Text off.
+            text_scaling_factor: 1.0,
+        }
+    }
+}
+
+impl A11ySettings {
+    /// Whether the Large Text row reads as on (`accessibility.js:122`).
+    pub fn large_text(&self) -> bool {
+        self.text_scaling_factor > 1.0
+    }
+
+    /// Whether `toggle` is on.
+    pub fn get(&self, toggle: A11yToggle) -> bool {
+        match toggle {
+            A11yToggle::LargeText => self.large_text(),
+            other => self.bools[Self::index(other)],
+        }
+    }
+
+    /// Set `toggle` in the model. For [`A11yToggle::LargeText`] this moves the
+    /// factor the same way a write would, so the optimistic update and the value
+    /// that comes back from the store agree.
+    pub fn set(&mut self, toggle: A11yToggle, on: bool) {
+        match toggle {
+            A11yToggle::LargeText => {
+                self.text_scaling_factor = if on { DPI_FACTOR_LARGE } else { 1.0 };
+            }
+            other => self.bools[Self::index(other)] = on,
+        }
+    }
+
+    /// Whether any row is on — half of the indicator's visibility predicate
+    /// (`_syncMenuVisibility`, `accessibility.js:96`).
+    pub fn any_active(&self) -> bool {
+        A11yToggle::ALL.iter().any(|&t| self.get(t))
+    }
+
+    /// Whether the panel indicator is shown: `alwaysShow || items.some(f => !!f.state)`
+    /// (`accessibility.js:96`).
+    pub fn indicator_visible(&self) -> bool {
+        self.always_show || self.any_active()
+    }
+
+    fn index(toggle: A11yToggle) -> usize {
+        A11yToggle::ALL.iter().position(|&t| t == toggle).unwrap()
+    }
 }
 
 /// One app-grid folder, as `FolderIcon`/`FolderView` read it
@@ -201,6 +352,7 @@ impl Default for GnomeSettings {
             input_sources: InputSources::default(),
             world_clocks: WorldClocks::default(),
             app_folders: Vec::new(),
+            a11y: A11ySettings::default(),
         }
     }
 }
@@ -514,6 +666,33 @@ impl GnomeSettings {
                     locale_week_start()
                 }
             };
+        }
+    }
+
+    /// Read the accessibility state (`ATIndicator`, `js/ui/status/accessibility.js`).
+    /// The rows live across five schemas, so this takes the whole [`Stores`] rather
+    /// than one store; each is skipped where the schema (or the key) is absent.
+    fn load_a11y(&mut self, stores: &Stores) {
+        if let Some(a11y) = &stores.a11y {
+            if settings_has_key(a11y, "always-show-universal-access-status") {
+                self.a11y.always_show = a11y.boolean("always-show-universal-access-status");
+            }
+        }
+        for toggle in A11yToggle::ALL {
+            let Some((store, key)) = toggle.bool_key() else {
+                continue;
+            };
+            if let Some(settings) = stores.get(store) {
+                if settings_has_key(settings, key) {
+                    self.a11y.set(toggle, settings.boolean(key));
+                }
+            }
+        }
+        // Large Text is a factor, not a flag (`accessibility.js:118-129`).
+        if let Some(interface) = &stores.interface {
+            if settings_has_key(interface, "text-scaling-factor") {
+                self.a11y.text_scaling_factor = interface.double("text-scaling-factor");
+            }
         }
     }
 
@@ -1195,6 +1374,22 @@ impl GnomeSettingsWriter {
         self.set_bool("color", "night-light-enabled", on);
     }
 
+    /// Flip one accessibility menu row (`ATIndicator._buildItem` /
+    /// `_buildFontItem`, `js/ui/status/accessibility.js:107-146`).
+    ///
+    /// Nine rows are a plain boolean key. Large Text is not: it writes
+    /// [`DPI_FACTOR_LARGE`] on, and **resets** `text-scaling-factor` off rather than
+    /// writing 1.0 (`accessibility.js:126-128`) — the difference is visible to anyone
+    /// reading the key's user value, and resetting is what lets a system default
+    /// other than 1.0 come back.
+    pub fn set_a11y_toggle(&self, toggle: A11yToggle, on: bool) {
+        match toggle.bool_key() {
+            Some((store, key)) => self.set_bool(store, key, on),
+            None if on => self.set_double("interface", "text-scaling-factor", DPI_FACTOR_LARGE),
+            None => self.reset_key("interface", "text-scaling-factor"),
+        }
+    }
+
     /// Write a string key on one of the stores (named by [`Stores::get`]),
     /// hopping onto the watcher thread first. Missing store/key is a no-op.
     fn set_string(&self, store: &'static str, key: &'static str, value: &'static str) {
@@ -1223,6 +1418,39 @@ impl GnomeSettingsWriter {
                         if let Err(err) = settings.set_boolean(key, value) {
                             warn!("error writing {store} {key}: {err}");
                         }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Write a double key on one of the stores. Missing store/key is a no-op.
+    fn set_double(&self, store: &'static str, key: &'static str, value: f64) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(settings) = s.get(store) {
+                    if settings_has_key(settings, key) {
+                        if let Err(err) = settings.set_double(key, value) {
+                            warn!("error writing {store} {key}: {err}");
+                        }
+                    }
+                }
+                stores.set(Some(s));
+            });
+        });
+    }
+
+    /// Drop the user value of a key, letting the system default show through —
+    /// `Gio.Settings.reset`. Missing store/key is a no-op.
+    fn reset_key(&self, store: &'static str, key: &'static str) {
+        self.ctx.invoke(move || {
+            STORES.with(|stores| {
+                let Some(s) = stores.take() else { return };
+                if let Some(settings) = s.get(store) {
+                    if settings_has_key(settings, key) {
+                        settings.reset(key);
                     }
                 }
                 stores.set(Some(s));
@@ -1345,6 +1573,12 @@ struct Stores {
     input_sources: Option<gio::Settings>,
     world_clocks: Option<gio::Settings>,
     app_folders: Option<gio::Settings>,
+    /// `org.gnome.desktop.a11y` — only `always-show-universal-access-status`, the
+    /// indicator's pin (`accessibility.js:10-11`).
+    a11y: Option<gio::Settings>,
+    a11y_interface: Option<gio::Settings>,
+    a11y_applications: Option<gio::Settings>,
+    a11y_keyboard: Option<gio::Settings>,
     /// The relocatable `org.gnome.desktop.app-folders.folder` instances, one per
     /// `folder-children` id, opened lazily and then kept alive so the `changed`
     /// subscription installed on first sight stays live (a folder's *contents* live
@@ -1386,9 +1620,46 @@ impl Stores {
             input_sources: gsettings("org.gnome.desktop.input-sources"),
             world_clocks: gsettings("org.gnome.shell.world-clocks"),
             app_folders: gsettings("org.gnome.desktop.app-folders"),
+            a11y: gsettings("org.gnome.desktop.a11y"),
+            a11y_interface: gsettings("org.gnome.desktop.a11y.interface"),
+            a11y_applications: gsettings("org.gnome.desktop.a11y.applications"),
+            a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard"),
             folder_stores: RefCell::new(HashMap::new()),
             folder_on_change: RefCell::new(None),
             clocks_installed: desktop_app_installed("org.gnome.clocks.desktop"),
+            world_clocks_cache: RefCell::new(None),
+            clocks_proxy: RefCell::new(None),
+        }
+    }
+
+    /// Every store closed, for tests that open only the one or two schemas they
+    /// exercise (`Stores { interface: .., ..Stores::none() }`) — so adding a store
+    /// here doesn't churn every test.
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            mutter: None,
+            mutter_keybindings: None,
+            shell_keybindings: None,
+            wm_keybindings: None,
+            wm_preferences: None,
+            shell: None,
+            lockdown: None,
+            background: None,
+            interface: None,
+            calendar: None,
+            notifications: None,
+            color: None,
+            input_sources: None,
+            world_clocks: None,
+            app_folders: None,
+            a11y: None,
+            a11y_interface: None,
+            a11y_applications: None,
+            a11y_keyboard: None,
+            folder_stores: RefCell::new(HashMap::new()),
+            folder_on_change: RefCell::new(None),
+            clocks_installed: false,
             world_clocks_cache: RefCell::new(None),
             clocks_proxy: RefCell::new(None),
         }
@@ -1406,6 +1677,10 @@ impl Stores {
             "color" => self.color.as_ref(),
             "shell" => self.shell.as_ref(),
             "input-sources" => self.input_sources.as_ref(),
+            "wm-preferences" => self.wm_preferences.as_ref(),
+            "a11y-interface" => self.a11y_interface.as_ref(),
+            "a11y-applications" => self.a11y_applications.as_ref(),
+            "a11y-keyboard" => self.a11y_keyboard.as_ref(),
             _ => None,
         }
     }
@@ -1427,6 +1702,10 @@ impl Stores {
             &self.input_sources,
             &self.world_clocks,
             &self.app_folders,
+            &self.a11y,
+            &self.a11y_interface,
+            &self.a11y_applications,
+            &self.a11y_keyboard,
         ]
         .into_iter()
         .flatten()
@@ -1474,6 +1753,7 @@ impl Stores {
         if let Some(world_clocks) = &self.world_clocks {
             settings.load_world_clocks(world_clocks, &self.world_clocks_cache);
         }
+        settings.load_a11y(self);
         settings.app_folders = self.read_app_folders();
         settings
     }
@@ -2861,25 +3141,8 @@ mod tests {
                     Some(&backend),
                     None,
                 )),
-                mutter_keybindings: None,
-                shell_keybindings: None,
                 wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
-                wm_preferences: None,
-                shell: None,
-                lockdown: None,
-                background: None,
-                interface: None,
-                calendar: None,
-                notifications: None,
-                color: None,
-                input_sources: None,
-                world_clocks: None,
-                app_folders: None,
-                folder_stores: RefCell::new(HashMap::new()),
-                folder_on_change: RefCell::new(None),
-                clocks_installed: false,
-                world_clocks_cache: RefCell::new(None),
-                clocks_proxy: RefCell::new(None),
+                ..Stores::none()
             });
 
             let received = Rc::new(RefCell::new(Vec::new()));
@@ -2934,6 +3197,163 @@ mod tests {
         .unwrap();
     }
 
+    /// The a11y model reads every row from its own schema, and the Large Text row is a
+    /// *factor*, not a flag (`ATIndicator._buildFontItem`,
+    /// `js/ui/status/accessibility.js:118-129`). Memory backend throughout, so the
+    /// user's real dconf is never touched.
+    #[test]
+    fn a11y_settings_read_every_row() {
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let (Some(kbd_schema), Some(iface_schema)) = (
+            source.lookup("org.gnome.desktop.a11y.keyboard", true),
+            source.lookup("org.gnome.desktop.interface", true),
+        ) else {
+            return; // schemas not installed
+        };
+
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let backend = gio::memory_settings_backend_new();
+            let keyboard = gio::Settings::new_full(&kbd_schema, Some(&backend), None);
+            let interface = gio::Settings::new_full(&iface_schema, Some(&backend), None);
+            keyboard.set_boolean("slowkeys-enable", true).unwrap();
+            interface.set_double("text-scaling-factor", 1.25).unwrap();
+
+            let stores = Rc::new(Stores {
+                a11y_keyboard: Some(keyboard),
+                interface: Some(interface),
+                ..Stores::none()
+            });
+            let mut settings = GnomeSettings::default();
+            settings.load_a11y(&stores);
+
+            assert!(settings.a11y.get(A11yToggle::SlowKeys));
+            assert!(!settings.a11y.get(A11yToggle::StickyKeys));
+            assert!(
+                settings.a11y.large_text(),
+                "text-scaling-factor 1.25 reads as Large Text on"
+            );
+            assert!(settings.a11y.indicator_visible());
+
+            // Exactly 1.0 is off — the reference tests `factor > 1.0`
+            // (`accessibility.js:122`), not `!= 1.0`.
+            stores
+                .interface
+                .as_ref()
+                .unwrap()
+                .set_double("text-scaling-factor", 1.0)
+                .unwrap();
+            let mut settings = GnomeSettings::default();
+            settings.load_a11y(&stores);
+            assert!(!settings.a11y.large_text());
+        })
+        .unwrap();
+    }
+
+    /// Writing an a11y row: nine rows are a plain boolean set, but turning Large Text
+    /// **off resets** `text-scaling-factor` rather than writing 1.0
+    /// (`accessibility.js:126-128`) — so a non-1.0 system default comes back instead of
+    /// being pinned to 1.0 by us.
+    #[test]
+    fn writer_resets_text_scaling_when_large_text_goes_off() {
+        let Some(source) = gio::SettingsSchemaSource::default() else {
+            return;
+        };
+        let (Some(kbd_schema), Some(iface_schema)) = (
+            source.lookup("org.gnome.desktop.a11y.keyboard", true),
+            source.lookup("org.gnome.desktop.interface", true),
+        ) else {
+            return;
+        };
+        if !kbd_schema.has_key("stickykeys-enable") || !iface_schema.has_key("text-scaling-factor")
+        {
+            return;
+        }
+
+        let ctx = glib::MainContext::new();
+        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
+
+        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn({
+            let ctx = ctx.clone();
+            move || {
+                ctx.with_thread_default(|| {
+                    // SettingsSchema is not Send; look them up again here.
+                    let source = gio::SettingsSchemaSource::default().unwrap();
+                    let backend = gio::memory_settings_backend_new();
+                    let keyboard = gio::Settings::new_full(
+                        &source
+                            .lookup("org.gnome.desktop.a11y.keyboard", true)
+                            .unwrap(),
+                        Some(&backend),
+                        None,
+                    );
+                    let interface = gio::Settings::new_full(
+                        &source.lookup("org.gnome.desktop.interface", true).unwrap(),
+                        Some(&backend),
+                        None,
+                    );
+                    STORES.set(Some(Rc::new(Stores {
+                        a11y_keyboard: Some(keyboard),
+                        interface: Some(interface),
+                        ..Stores::none()
+                    })));
+
+                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
+                    loop_tx.send(main_loop.clone()).unwrap();
+                    main_loop.run();
+                })
+                .unwrap();
+            }
+        });
+        let main_loop = loop_rx.recv().unwrap();
+
+        // A plain boolean row.
+        writer.set_a11y_toggle(A11yToggle::StickyKeys, true);
+        // Large Text on, then off again.
+        writer.set_a11y_toggle(A11yToggle::LargeText, true);
+
+        let read = |writer_ctx: &glib::MainContext| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            writer_ctx.invoke(move || {
+                STORES.with(|stores| {
+                    let s = stores.take().unwrap();
+                    let interface = s.interface.as_ref().unwrap();
+                    let out = (
+                        s.a11y_keyboard
+                            .as_ref()
+                            .unwrap()
+                            .boolean("stickykeys-enable"),
+                        interface.double("text-scaling-factor"),
+                        // `user_value` is `None` once the key is reset.
+                        interface.user_value("text-scaling-factor").is_some(),
+                    );
+                    tx.send(out).unwrap();
+                    stores.set(Some(s));
+                });
+            });
+            rx.recv().unwrap()
+        };
+
+        let (sticky, factor, has_user_value) = read(&ctx);
+        assert!(sticky, "a boolean row writes its key");
+        assert_eq!(factor, DPI_FACTOR_LARGE, "Large Text on writes 1.25");
+        assert!(has_user_value);
+
+        writer.set_a11y_toggle(A11yToggle::LargeText, false);
+        let (_, factor, has_user_value) = read(&ctx);
+        assert!(
+            !has_user_value,
+            "Large Text off must RESET text-scaling-factor, not write 1.0"
+        );
+        assert_eq!(factor, 1.0, "and the schema default shows through");
+
+        main_loop.quit();
+        watcher.join().unwrap();
+    }
+
     /// [`GnomeSettingsWriter`] hops onto the watcher thread and lands the
     /// write in the store. This drives the real writer against a dedicated
     /// thread running a glib loop, with a memory backend standing in for
@@ -2967,26 +3387,8 @@ mod tests {
                     let backend = gio::memory_settings_backend_new();
                     let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
                     STORES.set(Some(Rc::new(Stores {
-                        mutter: None,
-                        mutter_keybindings: None,
-                        shell_keybindings: None,
-                        wm_keybindings: None,
-                        wm_preferences: None,
                         shell: Some(shell),
-                        lockdown: None,
-                        background: None,
-                        interface: None,
-                        calendar: None,
-                        notifications: None,
-                        color: None,
-                        input_sources: None,
-                        world_clocks: None,
-                        app_folders: None,
-                        folder_stores: RefCell::new(HashMap::new()),
-                        folder_on_change: RefCell::new(None),
-                        clocks_installed: false,
-                        world_clocks_cache: RefCell::new(None),
-                        clocks_proxy: RefCell::new(None),
+                        ..Stores::none()
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);
@@ -3057,26 +3459,8 @@ mod tests {
                     let backend = gio::memory_settings_backend_new();
                     let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
                     STORES.set(Some(Rc::new(Stores {
-                        mutter: None,
-                        mutter_keybindings: None,
-                        shell_keybindings: None,
-                        wm_keybindings: None,
-                        wm_preferences: None,
                         shell: Some(shell),
-                        lockdown: None,
-                        background: None,
-                        interface: None,
-                        calendar: None,
-                        notifications: None,
-                        color: None,
-                        input_sources: None,
-                        world_clocks: None,
-                        app_folders: None,
-                        folder_stores: RefCell::new(HashMap::new()),
-                        folder_on_change: RefCell::new(None),
-                        clocks_installed: false,
-                        world_clocks_cache: RefCell::new(None),
-                        clocks_proxy: RefCell::new(None),
+                        ..Stores::none()
                     })));
 
                     let main_loop = glib::MainLoop::new(Some(&ctx), false);

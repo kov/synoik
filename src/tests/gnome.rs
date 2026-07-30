@@ -11603,3 +11603,79 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
         "closing the app grid makes the picker live again"
     );
 }
+
+/// Clicking the accessibility indicator opens its menu, and clicking a switch row flips
+/// the backing state **and closes the menu** — `PopupSwitchMenuItem.activate` toggles
+/// and then falls through to `super.activate` for a pointer event
+/// (`js/ui/popupMenu.js:539-550`).
+#[test]
+fn a11y_menu_row_toggles_the_setting_and_closes() {
+    use crate::gnome::A11yToggle;
+    use crate::ui::panel::ROLE_A11Y;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    // Pin the indicator on so it's clickable with nothing enabled.
+    let mut a11y = f.niri().gnome_settings.a11y;
+    a11y.always_show = true;
+    f.niri().gnome_settings.a11y = a11y;
+    f.niri().panel.set_a11y(a11y);
+
+    let anchor = f.niri().panel.a11y_rect(ow).expect("indicator present");
+    let click = |f: &mut Fixture, x: f64, y: f64| {
+        pointer_motion_to(f, x, y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    click(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.loc.y + anchor.size.h / 2.,
+    );
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "clicking the a11y indicator opens its menu"
+    );
+    assert_eq!(f.niri().panel_popover.open_role(), Some(ROLE_A11Y));
+
+    // The first row is High Contrast (`accessibility.js:45-46`). Its center comes from the
+    // menu itself rather than a copy of its metrics, so changing the padding can't
+    // silently retarget this click at a different row.
+    let out = f.niri().global_space.outputs().next().unwrap().clone();
+    let origin = f.niri().panel_popover.content_location(&out);
+    let row0 = f.niri().panel_popover.a11y_row_center(0).unwrap();
+    click(&mut f, origin.x + row0.x, origin.y + row0.y);
+
+    assert!(
+        f.niri().gnome_settings.a11y.get(A11yToggle::HighContrast),
+        "the row must flip the backing a11y state"
+    );
+    // Before the fade finishes, the clicked switch must already show its NEW state:
+    // GNOME's rows are `settings.bind`-ed, so the switch travels as the menu closes
+    // rather than fading out still showing the old position. The gsettings echo cannot
+    // do this — it arrives after the close has begun.
+    assert_eq!(
+        f.niri().panel_popover.a11y_row_state(0),
+        Some(true),
+        "the clicked switch must flip before the menu finishes closing"
+    );
+
+    f.settle_animations();
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "a switch row closes the menu (popupMenu.js:539-550)"
+    );
+
+    // And the indicator's own predicate now holds without the pin.
+    let mut a11y = f.niri().gnome_settings.a11y;
+    a11y.always_show = false;
+    f.niri().gnome_settings.a11y = a11y;
+    f.niri().panel.set_a11y(a11y);
+    assert!(
+        f.niri().panel.a11y_rect(ow).is_some(),
+        "High Contrast alone keeps the indicator up"
+    );
+}

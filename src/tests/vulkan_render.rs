@@ -3212,6 +3212,93 @@ fn vulkan_renders_the_brightness_slider() {
     );
 }
 
+/// The accessibility menu composites: a switch row must produce both the label glyphs and
+/// the switch itself. Pinned by comparing an all-off menu against one with every row on —
+/// the accent-filled tracks are a large, saturated, *countable* difference that a missing
+/// [`crate::ui::widget::Switch`] paint (or an off/on state that never reaches the bake)
+/// would erase. Skips with no Vulkan device.
+#[test]
+fn vulkan_renders_the_a11y_switches() {
+    use crate::gnome::{A11ySettings, A11yToggle};
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    // Count accent-blue-ish pixels (the on-state switch track, `_switches.scss:41`).
+    let count_accent = |f: &mut Fixture, a11y: A11ySettings| {
+        f.niri().gnome_settings.a11y = a11y;
+        f.niri().panel.set_a11y(a11y);
+        let anchor = f
+            .niri()
+            .panel
+            .a11y_rect(output_size(&output).w)
+            .expect("the indicator is pinned on");
+        let accent = f.niri().gnome_settings.accent_color;
+        let out = output.clone();
+        f.niri()
+            .panel_popover
+            .toggle_a11y(out.clone(), anchor, a11y, accent);
+        f.settle_animations();
+
+        let state = f.niri_state();
+        let n = state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let elems = state
+                    .niri
+                    .panel_popover
+                    .render(vk, &state.niri.icon_cache, &out);
+                assert!(!elems.is_empty(), "the a11y menu must render");
+                // `render_elements` draws in ITERATION order, so this helper wants
+                // back-to-front; `PanelPopover::render` returns front-to-back (first =
+                // topmost), which is what the real path in `niri.rs` pushes. Without the
+                // reverse the opaque `.popup-menu-content` fill lands on top and the
+                // whole menu reads as a flat box.
+                let elems: Vec<_> = elems.into_iter().rev().collect();
+                let w = to_physical_precise_round(scale.x, output_size(&out).w);
+                let h = to_physical_precise_round(scale.x, 600.);
+                let pixels = render_to_vec(
+                    vk,
+                    Size::<i32, Physical>::from((w, h)),
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elems.into_iter(),
+                )
+                .expect("render the a11y menu");
+                // Abgr8888 is byte-order R,G,B,A here: accent #3584e4 is blue-dominant.
+                pixels
+                    .chunks_exact(4)
+                    .filter(|p| p[3] == 255 && p[2] > 180 && u16::from(p[2]) > u16::from(p[0]) + 60)
+                    .count()
+            })
+            .expect("vulkan renderer");
+        f.niri().panel_popover.close();
+        f.settle_animations();
+        n
+    };
+
+    let mut off = A11ySettings::default();
+    off.always_show = true;
+    let off_px = count_accent(&mut f, off);
+
+    let mut on = off;
+    for toggle in A11yToggle::ALL {
+        on.set(toggle, true);
+    }
+    let on_px = count_accent(&mut f, on);
+
+    assert!(
+        on_px > off_px + 1000,
+        "ten on-state switch tracks must add a large block of accent pixels \
+         (off={off_px}, on={on_px})"
+    );
+}
+
 /// A translucent `TextureRenderElement` (alpha < 1, e.g. a fading popover) must NOT report
 /// any opaque regions. If it does, the damage tracker skips clearing and repainting beneath
 /// it, so the fade blends over stale framebuffer content instead of the scene behind — the

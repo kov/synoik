@@ -59,6 +59,7 @@ const POPOVER_BORDER: widget::Rgba = [0.260, 0.260, 0.279, 1.];
 
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::a11y_menu::A11yMenu;
 use crate::ui::app_menu::AppMenu;
 use crate::ui::calendar::DateMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
@@ -169,12 +170,18 @@ pub enum PopoverAction {
     /// "Quit" (`appMenu.js:99-100`) — `shell_app_request_quit`. Unlike the launch
     /// rows this does *not* leave the overview: gnome-shell's handler is bare.
     AppQuit(String),
+    /// Flip one accessibility menu row: write the backing gsettings key and close the
+    /// menu (`PopupSwitchMenuItem.activate`, `js/ui/popupMenu.js:539-550`).
+    SetA11yToggle {
+        toggle: crate::gnome::A11yToggle,
+        on: bool,
+    },
 }
 
 impl PopoverAction {
     /// Whether applying this action dismisses the menu (GNOME closes quick
     /// settings when a system button is used, but keeps it open for a toggle).
-    fn closes_menu(&self) -> bool {
+    pub(crate) fn closes_menu(&self) -> bool {
         // Activating a notification also closes the calendar: gnome-shell's
         // no-default-action path runs `source.open()` → `Main.panel
         // .closeCalendar()` (`js/ui/notificationDaemon.js:370-382`), and with
@@ -200,6 +207,9 @@ impl PopoverAction {
                 | PopoverAction::AppActivateWindow(_)
                 | PopoverAction::AppDetails(_)
                 | PopoverAction::AppQuit(_)
+                // A switch row toggles and then falls through to `super.activate`,
+                // which closes the menu — only Space keeps it open.
+                | PopoverAction::SetA11yToggle { .. }
         )
     }
 }
@@ -211,6 +221,7 @@ pub enum PopoverContent {
     Calendar(Box<DateMenu>),
     QuickSettings(Box<QuickSettings>),
     InputSources(InputSourceMenu),
+    A11y(Box<A11yMenu>),
     App(Box<AppMenu>),
 }
 
@@ -220,6 +231,7 @@ impl PopoverContent {
             PopoverContent::Calendar(dm) => dm.logical_size(),
             PopoverContent::QuickSettings(qs) => qs.logical_size(),
             PopoverContent::InputSources(m) => m.logical_size(),
+            PopoverContent::A11y(m) => m.logical_size(),
             PopoverContent::App(m) => m.logical_size(),
         }
     }
@@ -230,6 +242,7 @@ impl PopoverContent {
             PopoverContent::Calendar(dm) => dm.corner_radius(),
             PopoverContent::QuickSettings(qs) => qs.corner_radius(),
             PopoverContent::InputSources(m) => m.corner_radius(),
+            PopoverContent::A11y(m) => m.corner_radius(),
             PopoverContent::App(m) => m.corner_radius(),
         }
     }
@@ -321,6 +334,7 @@ impl PanelPopover {
             PopoverContent::Calendar(_) => Some(crate::ui::panel::ROLE_DATE_MENU),
             PopoverContent::QuickSettings(_) => Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
             PopoverContent::InputSources(_) => Some(crate::ui::panel::ROLE_KEYBOARD),
+            PopoverContent::A11y(_) => Some(crate::ui::panel::ROLE_A11Y),
             // Not a panel menu: nothing in the panel should light up for it.
             PopoverContent::App(_) => None,
         }
@@ -472,6 +486,31 @@ impl PanelPopover {
         self.anim = Some(self.make_anim(0., 1.));
     }
 
+    /// Toggle the accessibility menu, anchored at `anchor` on `output`
+    /// (gnome-shell's `ATIndicator` menu). `settings` is the snapshot the rows show;
+    /// `accent` is straight RGB, the switch's on-state fill.
+    pub fn toggle_a11y(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        settings: crate::gnome::A11ySettings,
+        accent: [u8; 3],
+    ) {
+        if self.is_showing::<A11yTag>() {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Top;
+        self.content = Some(PopoverContent::A11y(Box::new(A11yMenu::new(
+            settings, accent,
+        ))));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
     /// The popover's content origin on `output` (its resting top-left),
     /// output-local logical — for tests that click inside the content.
     pub fn content_location(&self, output: &Output) -> Point<f64, Logical> {
@@ -594,6 +633,42 @@ impl PanelPopover {
                 qs.set_mic(mic)
             }
             _ => false,
+        }
+    }
+
+    /// Push fresh accessibility state to an open a11y menu. GNOME's rows are
+    /// `settings.bind`-ed (`accessibility.js:110`), so a key written by anyone else — a
+    /// Settings window, another shell, `gsettings set` — moves the switch under the open
+    /// menu. Returns whether it changed.
+    ///
+    /// Deliberately NOT gated on `!self.closing`: the row the user just clicked flips its
+    /// own key *and* starts the close fade, and GNOME's `settings.bind` moves that switch
+    /// synchronously — so the user watches it travel as the menu fades. A closing menu is
+    /// still rendered, and [`A11yMenu::set_settings`] bumps the revision, so the bake
+    /// follows.
+    pub fn set_a11y(&mut self, a11y: crate::gnome::A11ySettings) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::A11y(m)) if self.open => m.set_settings(a11y),
+            _ => false,
+        }
+    }
+
+    /// The menu-local center of a11y menu row `k`, so a conformance test can click a row
+    /// without duplicating the menu's padding and row height. Test-only.
+    #[cfg(test)]
+    pub fn a11y_row_center(&self, k: usize) -> Option<Point<f64, Logical>> {
+        match self.content.as_ref()? {
+            PopoverContent::A11y(m) => Some(m.row_center(k)),
+            _ => None,
+        }
+    }
+
+    /// Whether a11y menu row `k`'s switch currently reads as on. Test-only.
+    #[cfg(test)]
+    pub fn a11y_row_state(&self, k: usize) -> Option<bool> {
+        match self.content.as_ref()? {
+            PopoverContent::A11y(m) => m.row_state(k),
+            _ => None,
         }
     }
 
@@ -737,6 +812,7 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) => dm.pointer_hover(local),
             Some(PopoverContent::QuickSettings(qs)) => qs.pointer_hover(local),
             Some(PopoverContent::InputSources(m)) => m.pointer_hover(local),
+            Some(PopoverContent::A11y(m)) => m.pointer_hover(local),
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
             None => false,
         }
@@ -817,6 +893,7 @@ impl PanelPopover {
                 Some(PopoverContent::Calendar(dm)) => dm.pointer_click(local),
                 Some(PopoverContent::QuickSettings(qs)) => qs.pointer_click(local),
                 Some(PopoverContent::InputSources(m)) => m.pointer_click(local),
+                Some(PopoverContent::A11y(m)) => m.pointer_click(local),
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
@@ -936,6 +1013,7 @@ impl PanelPopover {
             Some(PopoverContent::Calendar(dm)) => dm.render(renderer, icons, scale, origin),
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
+            Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
@@ -1112,5 +1190,11 @@ struct InputSourcesTag;
 impl ContentTag for InputSourcesTag {
     fn matches(content: &PopoverContent) -> bool {
         matches!(content, PopoverContent::InputSources(_))
+    }
+}
+struct A11yTag;
+impl ContentTag for A11yTag {
+    fn matches(content: &PopoverContent) -> bool {
+        matches!(content, PopoverContent::A11y(_))
     }
 }

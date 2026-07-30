@@ -1271,6 +1271,7 @@ impl State {
                 .niri
                 .panel
                 .set_quick_toggles(state.niri.gnome_settings.quick_toggles);
+            state.niri.panel.set_a11y(state.niri.gnome_settings.a11y);
             state
                 .niri
                 .event_loop
@@ -1292,6 +1293,12 @@ impl State {
                             .update(&settings.background, gpu.as_ref());
                         state.niri.panel.set_clock_format(settings.clock);
                         state.niri.panel.set_quick_toggles(settings.quick_toggles);
+                        state.niri.panel.set_a11y(settings.a11y);
+                        // An a11y key written by anyone else moves the switch under an
+                        // open menu (GNOME's rows are `settings.bind`-ed).
+                        if state.niri.panel_popover.set_a11y(settings.a11y) {
+                            state.niri.queue_redraw_all();
+                        }
                         // A `favorite-apps` change re-seeds the dash favorites and
                         // the grid (an app moves between the two).
                         state

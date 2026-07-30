@@ -41,7 +41,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
-use crate::gnome::{ClockFormat, QuickToggles};
+use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
 use crate::niri_render_elements;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
@@ -146,11 +146,12 @@ const BTN_ACTIVE_HOVER_A: f32 = 0.32;
 /// menu — `js/ui/status/keyboard.js:875`). The one place a role opts into the pill:
 /// add it here and give [`Panel::pill_rect`] its geometry. `screenRecording` is
 /// excluded — it carries its own always-on red fill rather than the state layer.
-const PILL_ROLES: [&str; 4] = [
+const PILL_ROLES: [&str; 5] = [
     ROLE_ACTIVITIES,
     ROLE_DATE_MENU,
     ROLE_QUICK_SETTINGS,
     ROLE_KEYBOARD,
+    ROLE_A11Y,
 ];
 
 /// A button container's fill-alpha fade (gnome-shell `panel_button`'s 150ms
@@ -204,6 +205,10 @@ pub const ROLE_SCREEN_RECORDING: &str = "screenRecording";
 /// `InputSourceIndicator` `js/ui/status/keyboard.js:874`) — a short xkb-layout label shown
 /// only when more than one layout is configured.
 pub const ROLE_KEYBOARD: &str = "keyboard";
+/// Role of the accessibility indicator (GNOME's `a11y`, `sessionMode.js:99`; `ATIndicator`
+/// `js/ui/status/accessibility.js:32`) — an `accessibility-menu-symbolic` button shown only
+/// when a11y is pinned on or some a11y feature is enabled (`accessibility.js:90-97`).
+pub const ROLE_A11Y: &str = "a11y";
 
 /// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The remaining unbuilt
 /// standalone indicators are commented out; adding one is a new entry here plus a
@@ -211,7 +216,8 @@ pub const ROLE_KEYBOARD: &str = "keyboard";
 /// right edge; earlier roles stack to its left in this order.
 const RIGHT_BOX_ORDER: &[&str] = &[
     ROLE_SCREEN_RECORDING,
-    // screenSharing, dwellClick, a11y,
+    // screenSharing, dwellClick,
+    ROLE_A11Y,
     ROLE_KEYBOARD,
     ROLE_QUICK_SETTINGS,
 ];
@@ -248,6 +254,16 @@ const R1_BG: [f32; 4] = [
     0x1c as f32 / 255.,
     0x28 as f32 / 255.,
     1.,
+];
+
+/// The accessibility indicator's icon (`accessibility.js:39`). Like the screencast
+/// stop glyph, `accessibility-menu-symbolic` ships inside gnome-shell's own gresource
+/// (`data/icons/scalable/actions/`), not Adwaita, so our IconCache may not resolve it;
+/// fall back to Adwaita's `preferences-desktop-accessibility-symbolic` so the button is
+/// never iconless. First name that resolves wins.
+const A11Y_ICONS: &[&str] = &[
+    "accessibility-menu-symbolic",
+    "preferences-desktop-accessibility-symbolic",
 ];
 
 /// Fallback anchor icon shown only when the status cluster would otherwise be
@@ -555,6 +571,9 @@ pub struct Panel {
     /// compositor recomputes it from the notification store; a size-matched pad
     /// keeps the clock centered whether it's shown or not.
     messages_indicator: bool,
+    /// The accessibility state driving the `a11y` right-box indicator's presence
+    /// (`ATIndicator._syncMenuVisibility`, `js/ui/status/accessibility.js:90-97`).
+    a11y: A11ySettings,
 
     /// Animation clock + config, for the button-container fill fades.
     clock: Clock,
@@ -595,11 +614,29 @@ impl Panel {
             recording: None,
             keyboard_layout: None,
             messages_indicator: false,
+            a11y: A11ySettings::default(),
             clock,
             config,
             fills,
             cache: RefCell::new(BarCache::new()),
         }
+    }
+
+    /// Adopt the accessibility state (from a gsettings change or a menu row click).
+    /// Returns whether it changed, so the caller can queue a redraw; the indicator's
+    /// presence and the right box's layout both depend on it.
+    pub fn set_a11y(&mut self, a11y: A11ySettings) -> bool {
+        if a11y == self.a11y {
+            return false;
+        }
+        self.a11y = a11y;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
+    /// The accessibility state the indicator is drawn from.
+    pub fn a11y(&self) -> A11ySettings {
+        self.a11y
     }
 
     /// Adopt the quick-settings toggle states (from a gsettings change or a tile
@@ -1010,6 +1047,21 @@ impl Panel {
         2. * INDICATOR_H_PADDING + label_w
     }
 
+    /// The accessibility indicator's rect, or `None` when it's hidden (nothing enabled
+    /// and not pinned on — `accessibility.js:90-97`).
+    pub fn a11y_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        self.right_box_rect(ROLE_A11Y, output_width)
+    }
+
+    /// Logical width of the accessibility indicator: padding + one `.system-status-icon`
+    /// + padding. Zero when hidden.
+    fn a11y_width(&self) -> f64 {
+        if !self.a11y.indicator_visible() {
+            return 0.;
+        }
+        2. * INDICATOR_H_PADDING + QS_ICON
+    }
+
     /// The logical width a right-box role currently occupies, `0` when the role is absent
     /// (quickSettings is always present, the others come and go). The single source of
     /// truth for right-box presence, folded by [`Self::right_box_rect`] into placement.
@@ -1020,6 +1072,7 @@ impl Panel {
             }
             ROLE_SCREEN_RECORDING => self.recording_width(),
             ROLE_KEYBOARD => self.keyboard_width(),
+            ROLE_A11Y => self.a11y_width(),
             _ => 0.,
         }
     }
@@ -1169,6 +1222,31 @@ impl Panel {
             {
                 let logical = tb.logical_size();
                 let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
+                elements.push(PanelElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb,
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
+                ));
+            }
+        }
+
+        // The accessibility indicator's icon, centered in its button
+        // (`accessibility.js:37-40`), on top of the shared `PILL_ROLES` container.
+        if let Some(rect) = self.a11y_rect(width) {
+            if let Some(tb) = A11Y_ICONS
+                .iter()
+                .find_map(|n| icons.texture(renderer, n, QS_ICON, scale, TEXT))
+            {
+                let logical = tb.logical_size();
+                let location = Point::from((
+                    rect.loc.x + (rect.size.w - logical.w) / 2.,
+                    (PANEL_HEIGHT - logical.h) / 2.,
+                ));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
                         tb,
@@ -2657,6 +2735,94 @@ mod tests {
         // Clearing the label hides it again.
         assert!(panel.set_keyboard_layout(None));
         assert!(panel.items(ow, ws).iter().all(|i| i.role != ROLE_KEYBOARD));
+    }
+
+    /// The accessibility indicator's presence is a *predicate*, not a setting: gnome-shell
+    /// shows it when `always-show-universal-access-status` is on **or** any a11y feature
+    /// is enabled (`ATIndicator._syncMenuVisibility`, `js/ui/status/accessibility.js:90-97`).
+    /// Its right-box slot is between `screenRecording` and `keyboard`
+    /// (`js/ui/sessionMode.js:99`). Structural, no GPU.
+    #[test]
+    fn a11y_indicator_visibility_and_order() {
+        use crate::gnome::A11yToggle;
+
+        let clock = Clock::default();
+        let mut panel = Panel::new(clock.clone(), Rc::new(RefCell::new(Config::default())));
+        let ws = WorkspaceState {
+            count: 1,
+            active: 0,
+        };
+        let ow = 1920.;
+
+        // A default profile has nothing enabled and no pin: no indicator, no re-set churn.
+        assert!(!panel.set_a11y(A11ySettings::default()));
+        assert!(panel.a11y_rect(ow).is_none());
+        assert!(panel.items(ow, ws).iter().all(|i| i.role != ROLE_A11Y));
+
+        // Any one enabled feature brings it out.
+        let mut a11y = A11ySettings::default();
+        a11y.set(A11yToggle::StickyKeys, true);
+        assert!(panel.set_a11y(a11y));
+        let items = panel.items(ow, ws);
+        let at = items
+            .iter()
+            .find(|i| i.role == ROLE_A11Y)
+            .expect("an enabled a11y feature shows the indicator");
+        assert_eq!(at.r#box, PanelBox::Right);
+        let center = Point::from((at.rect.loc.x + at.rect.size.w / 2., 16.));
+        assert_eq!(panel.hit_test(center, ow, ws), Some(ROLE_A11Y));
+
+        // Order: screenRecording | a11y | keyboard | quickSettings, each abutting the next.
+        panel.set_keyboard_layout(Some("us".into()));
+        panel.set_recording(Some(clock.now_unadjusted()));
+        let items = panel.items(ow, ws);
+        let rect_of = |role: &str| {
+            items
+                .iter()
+                .find(|i| i.role == role)
+                .unwrap_or_else(|| panic!("{role} missing"))
+                .rect
+        };
+        let (rx, ax, kx, qx) = (
+            rect_of(ROLE_SCREEN_RECORDING),
+            rect_of(ROLE_A11Y),
+            rect_of(ROLE_KEYBOARD),
+            rect_of(ROLE_QUICK_SETTINGS),
+        );
+        assert!(
+            (rx.loc.x + rx.size.w - ax.loc.x).abs() < 1e-6,
+            "recording abuts a11y"
+        );
+        assert!(
+            (ax.loc.x + ax.size.w - kx.loc.x).abs() < 1e-6,
+            "a11y abuts keyboard"
+        );
+        assert!(
+            (kx.loc.x + kx.size.w - qx.loc.x).abs() < 1e-6,
+            "keyboard abuts QS"
+        );
+
+        // Large Text counts through its factor, not a flag (`accessibility.js:120-122`).
+        let mut a11y = A11ySettings::default();
+        a11y.set(A11yToggle::LargeText, true);
+        assert!(panel.set_a11y(a11y));
+        assert!(
+            panel.a11y_rect(ow).is_some(),
+            "Large Text shows the indicator"
+        );
+
+        // Turning everything off hides it again — the predicate is live.
+        assert!(panel.set_a11y(A11ySettings::default()));
+        assert!(panel.a11y_rect(ow).is_none());
+
+        // The pin alone is enough, with nothing enabled.
+        let mut a11y = A11ySettings::default();
+        a11y.always_show = true;
+        assert!(panel.set_a11y(a11y));
+        assert!(
+            panel.a11y_rect(ow).is_some(),
+            "always-show-universal-access-status pins the indicator on"
+        );
     }
 
     /// The keyboard input-source indicator shares the panel-button pill: it lights on

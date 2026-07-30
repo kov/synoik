@@ -1133,6 +1133,24 @@ impl State {
                 }
                 set_toggle(self, |t, v| t.night_light = v, v);
             }
+            PopoverAction::SetA11yToggle { toggle, on } => {
+                if let Some(w) = &self.niri.gnome_settings_writer {
+                    w.set_a11y_toggle(toggle, on);
+                }
+                // Update the model optimistically like the quick-settings tiles do: the
+                // gsettings round-trip is the only other path and it's absent headless,
+                // and the indicator's *presence* hangs off this state.
+                self.niri.gnome_settings.a11y.set(toggle, on);
+                self.niri.panel.set_a11y(self.niri.gnome_settings.a11y);
+                // The clicked row also closes the menu, but GNOME's `settings.bind` moves
+                // the switch synchronously — so it flips while the menu fades out rather
+                // than fading away still showing the old state. The gsettings echo can't
+                // do this for us: it arrives after the close has begun.
+                self.niri
+                    .panel_popover
+                    .set_a11y(self.niri.gnome_settings.a11y);
+                self.niri.queue_redraw_all();
+            }
             // The screenshot UI deliberately does NOT leave the overview: gnome-shell's
             // screenshot button only closes the quick-settings menu and calls
             // `Main.screenshotUI.open()` (`js/ui/status/system.js:120-127`), which has no
@@ -5914,6 +5932,20 @@ impl State {
                                     self.niri
                                         .panel_popover
                                         .toggle_input_sources(output, anchor, items, active);
+                                }
+                                self.niri.suppressed_buttons.insert(button_code);
+                                self.niri.queue_redraw_all();
+                                return;
+                            }
+                            Some(crate::ui::panel::ROLE_A11Y) => {
+                                // Open the accessibility menu, anchored on the indicator
+                                // (gnome-shell's `ATIndicator`).
+                                if let Some(anchor) = self.niri.panel.a11y_rect(output_w) {
+                                    let a11y = self.niri.gnome_settings.a11y;
+                                    let accent = self.niri.gnome_settings.accent_color;
+                                    self.niri
+                                        .panel_popover
+                                        .toggle_a11y(output, anchor, a11y, accent);
                                 }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();

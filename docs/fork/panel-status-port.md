@@ -116,7 +116,7 @@ All five are unbuilt in the fork. Order per `sessionMode.js:96-100`.
 | R1 | **screenRecording** | red ticking `M:SS` timer + `screencast-stop-symbolic`, only while a screencast is live; click stops it | none | `ScreenRecordingIndicator` `js/ui/status/remoteAccess.js:65`; label/icon `:78-88`; visibility+stop `:90-99` | `[self]` (compositor knows) | ✅ (`914accbb`; `is-recording` ledger → panel pill; triggered by `RecordArea` `a4b8c72c`. See slice-1 follow-ups) |
 | R2 | **screenSharing** | `screen-shared-symbolic` + stop icon during remote sharing; click stops | none | `ScreenSharingIndicator` `remoteAccess.js:133`; icons `:146-153` | `[self]`/portal state | ⬜ |
 | R3 | **dwellClick** | dwell-click mode icon, only when the a11y feature is on | mode choices | `DwellClickIndicator` `js/ui/status/dwellClick.js:35`; icon `:42`; per-mode `:76-82` | `[self]` a11y gsettings | ⬜ |
-| R4 | **a11y** (`ATIndicator`) | `accessibility-menu-symbolic` | toggles: High Contrast, Zoom, Large Text, Screen Reader, Screen Keyboard, Visual Alerts, Sticky/Slow/Bounce Keys | `js/ui/status/accessibility.js:32`; icon `:39`; items `:45-75+` | `[self]` a11y gsettings | ⬜ |
+| R4 | **a11y** (`ATIndicator`) | `accessibility-menu-symbolic` | toggles: High Contrast, Zoom, Large Text, Screen Reader, Screen Keyboard, Visual Alerts, Sticky/Slow/Bounce/Mouse Keys | `js/ui/status/accessibility.js:32`; icon `:39`; items `:45-85`; visibility `:90-97` | `[self]` a11y gsettings | ✅ (indicator + full menu; `src/ui/a11y_menu.rs`, model in `src/gnome.rs`). Presence is a live predicate (`always-show-universal-access-status` OR any row on). Ten `PopupSwitchMenuItem` rows in JS construction order on a new `widget::Switch` primitive; a row click flips the key and **closes** the menu (`popupMenu.js:539-550`); an external write moves the switch under an open menu (`settings.bind`). Large Text is a *factor*, not a flag: on writes `DPI_FACTOR_LARGE` 1.25, off **resets** `text-scaling-factor` (`:126-128`). Divergences: no switch slide animation (never visible — the click closes the menu); no lockdown-driven insensitive Large Text row (`:141-143`); the eight `QuickToggle` classes at `:149-327` are GDM-only (`gdm/loginDialog.js:429-438`) and out of scope. **We write the keys but consume almost none of them** — magnifier, OSK, keyboard filters, visual bell and screen reader are each their own subsystem, and our chrome does not follow `high-contrast`/`text-scaling-factor`; GTK apps do read the latter two directly |
 | R5 | **keyboard** (`InputSourceIndicator`) | current input-source short-name/flag label, only when >1 source | source list to switch; modifier-key popup (`InputSourcePopup` `keyboard.js:78`) | `js/ui/status/keyboard.js:874`; container `:834,884-885`; label `:986` | `[self]` xkb + input-source gsettings | ✅ label (`33c25f94`) + **keymap driven by GNOME's `org.gnome.desktop.input-sources`** (`b396e063`; GNOME wins when the schema is present, niri xkb + systemd-localed fallback-only) + **layout popover** (`7c4f1e88`: row/layout w/ active checked + short label, separator, "Show Keyboard Layout"→Tecla, "Keyboard Settings"→control-center; picking switches the xkb group + writes `mru-sources`) + HiDPI glyph fix (`3c7473be`) + startup-seed panic fix (`79e14af5`) + **shares the panel-button hover/checked pill** (`48418eaf`). Live-validated 2026-07-23. Divergences: active row uses a check not a radio dot; IBus unsupported; per-window layout not honored (global); modifier-key `InputSourcePopup` not built. **Cleanup TODO:** the now fallback-only niri `input.keyboard.xkb` knob could be dropped ([[gnome-way-replaces-niri]]) |
 
 ---
@@ -258,7 +258,17 @@ carved these out as separate work — none block R1 for daily use:
     is left**, deferred by request: we have no OSD subsystem at all, so it is its own slice (and
     would also serve volume, which currently has none either). Nothing about Q4 is live-validated
     — this VM has no backlight device. Plan file: `~/.claude/plans/q4-brightness-plan.md`.
-12. R4 a11y menu (gsettings).
+12. ✅ **R4 a11y menu** — the `ATIndicator` indicator + its ten-switch menu, all gsettings-backed.
+    Added the toolkit's first switch (`widget::Switch` + `Painter::toggle_switch`) and a `reset`
+    verb on `GnomeSettingsWriter` (Large Text turns off by *resetting* `text-scaling-factor`, not
+    by writing 1.0). See the R4 row for divergences and for what the keys still have no consumer
+    for. **Test-harness finding (not fixed here):** `render_to_vec`/`render_elements`
+    (`src/render_helpers/mod.rs:340`) draws in ITERATION order — first element = bottom — while
+    `PanelPopover::render` returns front-to-back like the real path in `src/niri.rs:6335` wants.
+    The eight existing popover Vulkan tests hand it the list unreversed, so they composite upside
+    down and only pass because they assert `opaque > 0`, which the opaque `.popup-menu-content`
+    fill satisfies alone. `vulkan_renders_the_a11y_switches` reverses; the others are worth
+    revisiting.
 
 **Tier 4 — larger subsystems:**
 13. Notification server (`org.freedesktop.Notifications`) → C2 dot + C3 message list.

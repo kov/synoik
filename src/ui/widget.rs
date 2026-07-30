@@ -1386,6 +1386,48 @@ impl Button {
     }
 }
 
+/// GNOME's `.toggle-switch` (`_switches.scss:6-52`) — the pill-and-handle control a
+/// `PopupSwitchMenuItem` puts at the right end of a menu row (`popupMenu.js:501-524`).
+///
+/// A geometry-and-paint primitive, not a stateful widget: the owner holds the on/off
+/// state (it lives in a settings model) and the rect (it comes from the owner's row
+/// layout), and calls [`Painter::toggle_switch`] so every switch looks the same
+/// wherever one appears.
+///
+/// No slide animation yet: the only switch so far lives in the accessibility menu,
+/// which closes on click (`popupMenu.js:539-550`), so the travel is never seen.
+pub struct Switch;
+
+impl Switch {
+    /// `$switch_width` (`_switches.scss:3`).
+    pub const WIDTH: f64 = 46.;
+    /// `$switch_handle_size` (`_switches.scss:4`).
+    pub const HANDLE: f64 = 20.;
+    /// `.handle { margin: 3px }` (`_switches.scss:31`) — so the track is
+    /// `HANDLE + 2 * MARGIN` = 26px tall.
+    pub const MARGIN: f64 = 3.;
+    /// Track height: the handle plus its margin on both sides.
+    pub const HEIGHT: f64 = Self::HANDLE + 2. * Self::MARGIN;
+
+    /// The control's logical size.
+    pub fn size() -> Size<f64, Logical> {
+        Size::from((Self::WIDTH, Self::HEIGHT))
+    }
+}
+
+/// Off-state track fill: `transparentize(white, .85)` (`_switches.scss:19`).
+const SWITCH_OFF_BG: Rgba = [1., 1., 1., 0.15];
+/// Off-state track fill while hovered: `transparentize(white, .8)` (`_switches.scss:22`).
+const SWITCH_OFF_BG_HOVER: Rgba = [1., 1., 1., 0.2];
+/// Handle fill when off: `mix(white, $bg_color, 80%)` over `$bg_color` #36363a
+/// (`_switches.scss:35`).
+const SWITCH_HANDLE_OFF: Rgba = [0.96, 0.96, 0.96, 1.];
+/// Handle fill when on: plain white (`_switches.scss:50`).
+const SWITCH_HANDLE_ON: Rgba = [1., 1., 1., 1.];
+/// `box-shadow: 0 2px 4px transparentize(black, .8)` under the handle
+/// (`_switches.scss:36`), approximated as a single offset dark disc behind it.
+const SWITCH_HANDLE_SHADOW: Rgba = [0., 0., 0., 0.2];
+
 /// A `%card`-styled `St.Button` — the dateMenu's launcher cards
 /// (`.events-button` / `.world-clocks-button` / `.weather-button`, all
 /// `@extend %card`, `_calendar.scss:153-157`): a rounded [`style::CARD_BG`] card
@@ -1865,6 +1907,55 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             b.rect.loc.y + b.rect.size.h / 2.,
         ));
         self.text_clipped(label, center, Align::CENTER, style::TEXT, b.rect)?;
+        Ok(())
+    }
+
+    /// Draw a [`Switch`] filling `rect` (use [`Switch::size`] for it): the fully-rounded
+    /// track, then the handle at whichever end `on` selects (`_switches.scss:6-52`).
+    ///
+    /// `accent` is the system accent — the on-state track fill (`background:
+    /// -st-accent-color`, `_switches.scss:41`). `hovered` only lightens the *off* track,
+    /// which is the direction the SCSS gives it (`:15-23`); the on state's hover is a
+    /// 5% accent lighten we skip, since our switch has no hover state of its own yet
+    /// (the whole row is the hover target).
+    pub fn toggle_switch(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        on: bool,
+        hovered: bool,
+        accent: Rgba,
+    ) -> anyhow::Result<()> {
+        // `border-radius: $forced_circular_radius` — a pill, so half the height.
+        let track_radius = rect.size.h / 2.;
+        let track = if on {
+            accent
+        } else if hovered {
+            SWITCH_OFF_BG_HOVER
+        } else {
+            SWITCH_OFF_BG
+        };
+        self.fill_rounded(rect, track_radius, track)?;
+
+        // The handle sits `MARGIN` from the track's near end, sized square.
+        let size = rect.size.h - 2. * Switch::MARGIN;
+        let x = if on {
+            rect.loc.x + rect.size.w - Switch::MARGIN - size
+        } else {
+            rect.loc.x + Switch::MARGIN
+        };
+        let handle = Rectangle::new(
+            Point::from((x, rect.loc.y + Switch::MARGIN)),
+            Size::from((size, size)),
+        );
+        // `box-shadow: 0 2px 4px …` — the same disc, nudged down, behind the handle.
+        let shadow = Rectangle::new(handle.loc + Point::from((0., 2.)), handle.size);
+        self.fill_rounded(shadow, size / 2., SWITCH_HANDLE_SHADOW)?;
+        let fill = if on {
+            SWITCH_HANDLE_ON
+        } else {
+            SWITCH_HANDLE_OFF
+        };
+        self.fill_rounded(handle, size / 2., fill)?;
         Ok(())
     }
 }

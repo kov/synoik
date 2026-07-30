@@ -1,3 +1,4 @@
+pub mod a11y_menu;
 pub mod app_grid;
 pub mod app_menu;
 pub mod calendar;
