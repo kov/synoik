@@ -715,10 +715,15 @@ struct Totals {
     shaded: u64,
 }
 
-/// How many entries the ring holds by default: ~6 minutes at 46 fps, which covers
-/// a `drive-workload.sh heavy` pair with room to spare. Each entry is the record
-/// the frame already built, so the cost is memory, not frame time.
-const DEFAULT_RING: usize = 16384;
+/// How many entries the ring holds by default: ~22 minutes at 50 fps. Sized off the
+/// fact that the ring fills from *compositor start*, not run start — a measured
+/// `drive-workload.sh heavy` pair is ~14.8k entries on its own, so anything close to
+/// that evicts the head of the run behind whatever idle frames preceded it. Dumping
+/// drains the ring, so the exact way to scope a run is still to dump right before it;
+/// this size is what makes forgetting to survivable. Each entry is the record the
+/// frame already built, so the cost is memory (~600 B/entry, ~39 MB here), not frame
+/// time — and only for sessions that asked for `ring`.
+const DEFAULT_RING: usize = 65536;
 
 /// One banked entry, in the order it happened. Frames are kept *unformatted* —
 /// formatting is the cost this whole mechanism exists to move off the frame path —
