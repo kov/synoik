@@ -255,9 +255,11 @@ carved these out as separate work — none block R1 for daily use:
     profiles — each adds a `DetailOwner` arm + its backend.
 11. ✅ Q4 brightness — Q4a backlight subsystem, Q4b manager algebra, Q4c the QS slider + the
     per-monitor card, Q4d keybindings + the `org.gnome.Shell.Brightness` object. **Only the OSD
-    is left**, deferred by request: we have no OSD subsystem at all, so it is its own slice (and
-    would also serve volume, which currently has none either). Nothing about Q4 is live-validated
-    — this VM has no backlight device. Plan file: `~/.claude/plans/q4-brightness-plan.md`.
+    is left**, deferred by request: we have no OSD subsystem at all, so it is now slice C of the
+    **OSD + media milestone**, `docs/fork/osd-media-port.md` — which also covers the volume OSD
+    (delivered by implementing the inbound `ShowOSD`, since gsd-media-keys owns the volume keys)
+    and MPRIS. Nothing about Q4 is live-validated — this VM has no backlight device. Plan file:
+    `~/.claude/plans/q4-brightness-plan.md`.
 12. ✅ **R4 a11y menu** — the `ATIndicator` indicator + its ten-switch menu, all gsettings-backed.
     Added the toolkit's first switch (`widget::Switch` + `Painter::toggle_switch`) and a `reset`
     verb on `GnomeSettingsWriter` (Large Text turns off by *resetting* `text-scaling-factor`, not

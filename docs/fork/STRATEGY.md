@@ -526,6 +526,12 @@ In-compositor overview (live thumbnails, workspace strip, dash, app-grid view, s
 **Switch User** (and gates sessionMode `isLocked`); requirements investigated in
 `docs/fork/panel-status-port.md` backlog item 16.
 
+**OSDs and media controls are their own milestone, tracked in `docs/fork/osd-media-port.md`** —
+we have no OSD subsystem at all today, so volume, brightness, mute and kbd-backlight feedback are
+all missing at once. Note the shape: `ShowOSD` is an **inbound** `org.gnome.Shell` method that
+gsd-media-keys calls, so volume feedback is a D-Bus contract we implement, not a key we handle.
+The milestone also covers the MPRIS model and the media card in the message list.
+
 ### Phase 3: Platform completeness
 ScreenCast (PipeWire producer) → RemoteDesktop/InputCapture → Screenshot/portal backend →
 notifications/calendar clients → OSK → IBus candidate UI.
