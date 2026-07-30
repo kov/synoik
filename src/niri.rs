@@ -478,6 +478,10 @@ pub struct Niri {
     /// without the TTY backend or without backlight hardware — which is also how the brightness
     /// slider stays absent, as in GNOME (`brightness.js:59-60`).
     pub backlight: crate::backlight::BacklightSnapshot,
+    /// The shell-side brightness algebra over that snapshot: the global scale the quick-settings
+    /// slider drives, plus one scale per backlit output. Dormant (no global scale) when nothing is
+    /// backlit.
+    pub brightness: crate::brightness::BrightnessManager,
     /// A clone of the login1 watcher's inbound channel, so a brightness write can report its
     /// completion back to the write serializer through the same path.
     #[cfg(feature = "dbus")]
@@ -3118,11 +3122,49 @@ impl State {
         let Some(tty) = self.backend.tty_checked() else {
             return;
         };
-        if tty.backlights.handle_uevent(event) {
-            let snapshot = tty.backlights.snapshot();
-            self.niri.backlight = snapshot;
-            trace!("backlight changed: {:?}", self.niri.backlight);
+        if !tty.backlights.handle_uevent(event) {
+            return;
         }
+
+        let snapshot = tty.backlights.snapshot();
+        self.niri.backlight = snapshot;
+        trace!("backlight changed: {:?}", self.niri.backlight);
+
+        // GNOME's `backlights-changed` — the scales adopt a change made behind our back, and one
+        // that was not ours cancels idle dimming (`brightnessManager.js:194-200`).
+        self.sync_brightness(|manager, snapshot| manager.backlights_changed(snapshot));
+    }
+
+    /// Run one pass of the brightness algebra and push whatever it wants written to the hardware.
+    ///
+    /// The manager is moved out for the pass because it reads the snapshot that lives beside it.
+    fn sync_brightness(
+        &mut self,
+        f: impl FnOnce(
+            &mut crate::brightness::BrightnessManager,
+            &crate::backlight::BacklightSnapshot,
+        ) -> Vec<crate::brightness::BacklightWrite>,
+    ) {
+        let mut manager = std::mem::take(&mut self.niri.brightness);
+        let writes = f(&mut manager, &self.niri.backlight);
+        self.niri.brightness = manager;
+
+        for write in writes {
+            self.set_backlight_brightness(&write.connector, write.brightness);
+        }
+    }
+
+    /// The quick-settings brightness slider: the global scale, which fans out to every monitor
+    /// through its factor (`brightnessManager.js:229-240`).
+    pub fn set_global_brightness(&mut self, value: f64) {
+        self.sync_brightness(|manager, snapshot| manager.set_global_value(value, snapshot));
+    }
+
+    /// One row of the per-monitor brightness card (`brightness.js:12-35`).
+    pub fn set_monitor_brightness(&mut self, connector: &str, value: f64) {
+        self.sync_brightness(|manager, snapshot| {
+            manager.set_monitor_value(connector, value, snapshot)
+        });
     }
 
     /// Re-match backlight devices against the connected outputs. Runs off the same funnel as the
@@ -3144,11 +3186,17 @@ impl State {
         let Some(tty) = self.backend.tty_checked() else {
             return;
         };
-        if tty.backlights.set_outputs(outputs) {
-            let snapshot = tty.backlights.snapshot();
-            self.niri.backlight = snapshot;
-            debug!("backlights: {:?}", self.niri.backlight);
+        if !tty.backlights.set_outputs(outputs) {
+            return;
         }
+
+        let snapshot = tty.backlights.snapshot();
+        self.niri.backlight = snapshot;
+        debug!("backlights: {:?}", self.niri.backlight);
+
+        // GNOME's `_monitorsChanged`: the per-monitor scales are rebuilt, the global scale is
+        // created once and keeps its value (`brightnessManager.js:134-181`).
+        self.sync_brightness(|manager, snapshot| manager.monitors_changed(snapshot));
     }
 
     /// Ask the hardware for a new brightness on one output. Goes through the write serializer, so
@@ -3972,6 +4020,7 @@ impl Niri {
             #[cfg(feature = "dbus")]
             system_status_tx: None,
             backlight: crate::backlight::BacklightSnapshot::default(),
+            brightness: crate::brightness::BrightnessManager::default(),
             #[cfg(feature = "dbus")]
             login1_tx: None,
             wallpaper: Wallpaper::default(),
