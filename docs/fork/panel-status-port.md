@@ -253,10 +253,11 @@ carved these out as separate work — none block R1 for daily use:
 10. ✅ **QuickMenuToggle detail-view framework** — done (`2f7d2b0a`/`16d81fc9`); consumers so far
     Network tile + Q1 power submenu. Unlocks Q6 Wi-Fi list, Q7 device list, Q2 device picker, Q8
     profiles — each adds a `DetailOwner` arm + its backend.
-11. 🟡 Q4 brightness — Q4a backlight subsystem, Q4b manager algebra, Q4c-1 the QS slider and
-    Q4c-2 the per-monitor card are all done; **only Q4d** (keybindings / OSD /
-    `org.gnome.Shell.Brightness`) remains, and the OSD is a subsystem we don't have at all.
-    Plan file: `~/.claude/plans/q4-brightness-plan.md`.
+11. ✅ Q4 brightness — Q4a backlight subsystem, Q4b manager algebra, Q4c the QS slider + the
+    per-monitor card, Q4d keybindings + the `org.gnome.Shell.Brightness` object. **Only the OSD
+    is left**, deferred by request: we have no OSD subsystem at all, so it is its own slice (and
+    would also serve volume, which currently has none either). Nothing about Q4 is live-validated
+    — this VM has no backlight device. Plan file: `~/.claude/plans/q4-brightness-plan.md`.
 12. R4 a11y menu (gsettings).
 
 **Tier 4 — larger subsystems:**
