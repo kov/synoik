@@ -132,6 +132,33 @@ impl OsdContent {
     }
 }
 
+/// Icon-name candidates from a **serialized `GIcon`** — what `ShowOSD` carries
+/// (`js/ui/shellDBus.js:140-142` runs it through `Gio.Icon.new_for_string`).
+///
+/// Two forms reach us in practice: a bare theme name (`g_icon_to_string` of a
+/// single-name `GThemedIcon` is just the name), and the serialized list
+/// `". GThemedIcon name1 name2 …"` that `g_themed_icon_new_with_default_fallbacks`
+/// produces — which maps exactly onto our first-that-resolves candidate list.
+///
+/// **Divergence:** the other `GIcon` kinds — `GFileIcon` (a path or `file://` URI)
+/// and `GBytesIcon` — yield no candidates, so the OSD is refused rather than
+/// showing a loaded image. Our icon cache resolves theme names only; nothing on
+/// this desktop sends anything else to `ShowOSD`.
+pub fn icon_candidates(serialized: &str) -> Vec<String> {
+    let s = serialized.trim();
+    if let Some(rest) = s.strip_prefix(". GThemedIcon ") {
+        return rest.split_whitespace().map(str::to_owned).collect();
+    }
+    // A serialized non-themed icon, a path, or a URI. A theme name never contains
+    // a slash, a colon or a space, so those characters are what rules it out —
+    // testing only the leading character would let `file:///x.png` through as a
+    // name.
+    if s.is_empty() || s.starts_with('.') || s.contains(['/', ':', ' ']) {
+        return Vec::new();
+    }
+    vec![s.to_owned()]
+}
+
 /// Where each piece of an OSD sits inside its own bake buffer.
 #[derive(Debug, Clone, Copy)]
 struct OsdLayout {

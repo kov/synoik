@@ -3553,7 +3553,54 @@ impl State {
             GnomeShellToNiri::SenderVanished(name) => {
                 self.niri.accel_grabs.retain(|g| g.owner != name);
             }
+            GnomeShellToNiri::ShowOsd {
+                connector,
+                label,
+                level,
+                max_level,
+                icon,
+            } => {
+                self.show_osd(connector, label, level, max_level, icon);
+            }
         }
+    }
+
+    /// `ShowOSD` (`js/ui/shellDBus.js:143-152`): route to one connector's monitor,
+    /// or to all of them when none is given. This is how volume, mute, mic-mute,
+    /// keyboard-backlight and rotation-lock OSDs arrive — gsd-media-keys handles
+    /// those keys and supplies the icon, level and stepping.
+    #[cfg(feature = "dbus")]
+    pub fn show_osd(
+        &mut self,
+        connector: Option<String>,
+        label: Option<String>,
+        level: Option<f64>,
+        max_level: Option<f64>,
+        icon: Option<String>,
+    ) {
+        let owned = icon.as_deref().map(crate::ui::osd::icon_candidates);
+        let candidates: Vec<&str> = owned.iter().flatten().map(String::as_str).collect();
+        // An absent `level` means "no bar", not "a bar at zero": `setLevel(undefined)`
+        // hides it (`js/ui/osdWindow.js:71-72`). An absent `max_level` is 1 (`:86-88`).
+        let lv = match level {
+            Some(level) => crate::ui::osd::OsdLevel::new(level, max_level.unwrap_or(1.)),
+            None => crate::ui::osd::OsdLevel::none(),
+        };
+
+        match connector {
+            Some(connector) => {
+                let Some(output) = self.niri.output_by_name_match(&connector).cloned() else {
+                    // GNOME would index its array with -1 and throw; we just skip.
+                    warn!("ShowOSD for unknown connector {connector:?}");
+                    return;
+                };
+                self.niri
+                    .osd
+                    .show_one(&output, &candidates, label.as_deref(), lv);
+            }
+            None => self.niri.osd.show_all(&candidates, label.as_deref(), lv),
+        }
+        self.niri.queue_redraw_all();
     }
 
     #[cfg(feature = "dbus")]

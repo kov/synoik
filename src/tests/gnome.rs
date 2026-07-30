@@ -11941,3 +11941,130 @@ fn osd_follows_outputs() {
     assert!(f.niri().osd.content(&a).is_none());
     assert!(!f.niri().osd.is_visible());
 }
+
+/// A serialized `GIcon` is not a bare icon name (`js/ui/shellDBus.js:140-142` runs
+/// it through `Gio.Icon.new_for_string`): the multi-name themed form is what
+/// `g_themed_icon_new_with_default_fallbacks` produces, and it maps straight onto
+/// our first-that-resolves candidate list.
+#[test]
+fn osd_icon_candidates_parse_serialized_gicons() {
+    use crate::ui::osd::icon_candidates;
+
+    assert_eq!(
+        icon_candidates("audio-volume-high-symbolic"),
+        vec!["audio-volume-high-symbolic"]
+    );
+    assert_eq!(
+        icon_candidates(". GThemedIcon audio-volume-high-symbolic audio-volume-high"),
+        vec!["audio-volume-high-symbolic", "audio-volume-high"]
+    );
+    // GFileIcon / GBytesIcon / empty: no theme name to resolve, so no OSD.
+    assert!(icon_candidates("/usr/share/pixmaps/x.png").is_empty());
+    assert!(icon_candidates("file:///tmp/x.png").is_empty());
+    assert!(icon_candidates(". GBytesIcon AAAA").is_empty());
+    assert!(icon_candidates("").is_empty());
+}
+
+/// `ShowOSD` end to end from the D-Bus message: `connector` routes to one output
+/// (and cancels the rest), an absent one goes to all, an absent `level` means no
+/// bar rather than a bar at zero, and an absent `max_level` is 1
+/// (`js/ui/shellDBus.js:143-152`, `js/ui/osdWindow.js:71-72,86-88`).
+#[cfg(feature = "dbus")]
+#[test]
+fn osd_show_osd_routes_by_connector() {
+    use crate::dbus::gnome_shell::GnomeShellToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1280, 720));
+    let a = f.niri_output(1);
+    let b = f.niri_output(2);
+    let a_name = a.name();
+
+    let show = |f: &mut Fixture, connector: Option<&str>, level: Option<f64>, max: Option<f64>| {
+        f.niri_state()
+            .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+                connector: connector.map(str::to_owned),
+                label: None,
+                level,
+                max_level: max,
+                icon: Some(". GThemedIcon audio-volume-high-symbolic audio-volume-high".to_owned()),
+            });
+        tick(f, 120);
+    };
+
+    // No connector -> every monitor.
+    show(&mut f, None, Some(0.5), None);
+    assert!(f.niri().osd.content(&a).is_some());
+    assert!(f.niri().osd.content(&b).is_some());
+    let content = f.niri().osd.content(&a).unwrap();
+    assert_eq!(
+        content.icon,
+        vec!["audio-volume-high-symbolic", "audio-volume-high"],
+        "the serialized GIcon becomes the candidate list"
+    );
+    assert_eq!(content.max_level, 1., "an absent max_level is 1");
+
+    // A connector routes to that output alone, and cancels the other.
+    show(&mut f, Some(&a_name), Some(0.5), None);
+    tick(&mut f, 200);
+    assert!(f.niri().osd.content(&a).is_some());
+    assert!(
+        f.niri().osd.content(&b).is_none(),
+        "showOne cancels the monitors it did not name"
+    );
+
+    // An unknown connector is skipped, not applied to everything.
+    f.niri().osd.hide_all();
+    tick(&mut f, 200);
+    show(&mut f, Some("does-not-exist"), Some(0.5), None);
+    assert!(!f.niri().osd.is_visible());
+
+    // Amplified volume: max_level > 1 is carried through.
+    show(&mut f, None, Some(1.4), Some(1.5));
+    assert_eq!(f.niri().osd.content(&a).unwrap().max_level, 1.5);
+
+    // No level at all -> the OSD shows, but with no bar.
+    f.niri().osd.hide_all();
+    tick(&mut f, 200);
+    show(&mut f, None, None, None);
+    let content = f.niri().osd.content(&a).unwrap();
+    assert!(content.level.is_none(), "an absent level means no bar");
+    assert!(f.niri().osd.level_rect(&a).is_none());
+}
+
+/// An icon that is not a theme name leaves no candidates, and `show()` refuses
+/// without an icon (`js/ui/osdWindow.js:90-92`) — so a ShowOSD carrying only a
+/// file icon draws nothing rather than an empty pill.
+#[cfg(feature = "dbus")]
+#[test]
+fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
+    use crate::dbus::gnome_shell::GnomeShellToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let out = f.niri_output(1);
+
+    f.niri_state()
+        .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+            connector: None,
+            label: Some("Volume".to_owned()),
+            level: Some(0.5),
+            max_level: None,
+            icon: Some("/usr/share/pixmaps/whatever.png".to_owned()),
+        });
+    tick(&mut f, 120);
+    assert!(f.niri().osd.content(&out).is_none());
+
+    // ...and with no icon key at all.
+    f.niri_state()
+        .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+            connector: None,
+            label: Some("Volume".to_owned()),
+            level: Some(0.5),
+            max_level: None,
+            icon: None,
+        });
+    tick(&mut f, 120);
+    assert!(f.niri().osd.content(&out).is_none());
+}
