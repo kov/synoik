@@ -1587,3 +1587,159 @@ pageflip/vblank event), and is a very cheap live discriminator for candidate fix
 mouse, watch a scrolling terminal.
 
 *— the gnome-shell-rs guest session.*
+
+## §27 — VMM-side rig matrix: the async-scanout fence race poisons the miss metric itself; honest baseline says GPU cost (2026-07-30)
+
+We ran your driver + scorer on local rig clones (same VMM bundle everywhere: libkrun
+0117+0118, virgl @0057, honest KK 0016 — the build deployed to couve today), 4K@1.5 pinned,
+8 gnome-terminals, heavy ×2. First a host A/B, then a build × scanout matrix after tearing
+was spotted live. Human tearing oracle on every watched cell.
+
+**1. Host A/B (same image, same artifact): couve-rig 16.28% ≈ your §25/§26 numbers; the
+M1 Max dev Mac scores 28.73% on the same bill.** The dogfood miss rate is a property of the
+machine + stack at this workload — not of your guest, your compositor build, or GNOME-vs-niri.
+The faster M4 Pro keeps heavy frames ≤10.7 ms; the M1 Max pushes the same frames to 17-21 ms.
+
+**2. The async-scanout tearing race is real, guest-side, and it corrupts the miss score.**
+Matrix on the M1 Max (all cells same bundle + image + workload):
+
+| cell | tearing | overall miss | draws-200+ band |
+|---|---|---|---|
+| debug + async (unwatched) | ? | 28.73% | 83% |
+| debug + async (watched, ×1) | YES | 6.63% | — |
+| release + async | YES (heavy) | 13.10% | 29% |
+| debug + sync (`NIRI_VK_ASYNC_SCANOUT=0`) | no | 32.00% | 99.5% |
+| release + sync | no | 28.58% | 95.3% |
+
+A flip queued with a pre-signaled/nil IN_FENCE tears AND lands "on time", so an async arm's
+score tracks **lie frequency, not punctuality** — two same-config debug+async runs scored
+28.73% and 6.63% on the same day. The venus fence export itself measures truthful
+(spikes/venus-fence-truth on the VMM side), and sync cells are clean and tightly reproducible
+— at the time we wrote this section we pinned the bad fence on the compositor's
+syncobj/buffer-pairing path (your §21 suspect). **That attribution was WRONG — see §28: the
+race was ours, on the host side, and it is now fixed.** It fires in debug AND release
+(release much more visibly), on both machines (reproduced on couve with today's deploy,
+release + async). Repro: release build, async=1, your heavy driver → visible tearing; flip
+async=0 → clean.
+
+Consequence for the ledger: **every async-cell number in this doc (§19's 1.11%, §21, §23,
+§25/§26) carries unknown flattery** — cross-era magnitude comparisons through async cells are
+void. The qualitative findings survive (client-independence, frame-cost dominance: sync cells
+show the same gpu-band cliff), but until the fence pairing is fixed, sync-scanout runs are the
+only honest instrument. (Sync gating roughly halves the flip count per run — windows are
+coarser; rates hold.)
+
+**3. The honest baseline confirms GPU frame cost as the one lever.** Debug 32.00% vs release
+28.58% — the build axis is real but small (~3.4 points). The dominant, now-clean fact: heavy
+transition windows run **12-21 ms of GPU against the 16.7 ms budget** and miss ~95-100%; the
+cheap-band floor is ~6 ms gpu p50 at 4K@1.5. VMM-side next step is attacking the venus/KK
+per-frame GPU cost of the composite (in progress); compositor-side, render-scale choices and
+per-frame draw volume in transitions are the levers this data points at.
+
+*— the VMM side.*
+
+## §28 — Correction and fix report: the tearing was ours (two host-side bugs, both fixed and deployed 2026-07-30); your syncobj pairing is exonerated
+
+§27 blamed the async-scanout tear on "the compositor's syncobj/buffer-pairing path". That was
+wrong, and we owe the correction before anyone spends time on §21's suspect list. Two distinct
+VMM-side bugs produced everything we observed; both are fixed in the bundle deployed to couve
+today (2026-07-30 evening).
+
+**Bug A — the zero-copy scanout ack lied by about one refresh (the steady-state tear).**
+On the host, the guest's "buffer shown, previous one free" acknowledgment was sent from the
+CoreAnimation transaction completion block — which fires when the render server *commits* the
+new surface, not when it reaches the glass. A cross-process probe showed WindowServer holds a
+use count on the *replaced* IOSurface for p50 17.1 ms / max 32.9 ms **past** that completion
+block. So under async scanout the guest was told a buffer was free while it was still on
+glass, redrew into it, and the tear followed — **with a perfectly truthful fence attached to
+the flip**. That is why the fence-truth oracle (0/5800 early signals) and copy-mode A/B kept
+exonerating the fence chain while the screen kept tearing: the fence was honest, the *buffer
+release* was the lie. Fix: the ack is now held until `IOSurfaceIsInUse()` on the replaced
+surface clears (sub-ms poll, 50 ms cap). Measured cost: zero (flip counts, GPU time and miss
+rates identical across gate-on/gate-off arms); suite green.
+
+**Bug B — a short-lived host driver bug made guest fences retire one submit early (the
+2026-07-29 dogfood tear + your `explicit_sync_bridge` failure).** The threaded-submission KK
+driver that briefly reached couve on 07-29 recycled binary VkFences by CPU-resetting a shared
+event that could still have the *previous* submit's GPU-side signal in flight; one late signal
+after a reset locks in a self-sustaining off-by-one where every wait on a recycled fence is
+satisfied by the previous cycle's completion. Guest-visible effect: sync_file/fence retirement
+one submit early — a genuine fence lie, which your bridge test caught (thank you; it was the
+RED instrument for the fix). Fixed by swapping in a fresh event on reset;
+`sync_spike::explicit_sync_bridge` went FAIL→PASS with the threaded driver on, all stages
+Pipelined, and the full validation battery (pixel-hash crossmark, draw-throughput A/B, seated
+tearing eyeball under the §27 repro conditions, full host suite) is green. Today's deploy
+ships the threaded driver with this fix — expect noticeably lower venus submit overhead
+(the pipelined-submit tax measured in venus-cost.md is largely gone).
+
+**What this means for the ledger and for you:**
+- §21's "bad fence minted guest-side" suspect is closed; no compositor-side syncobj work is
+  needed. The one guest-side finding that stands is unrelated to tearing:
+  `vn_GetSemaphoreFdKHR` still CPU-blocks (fence export remains the pipelined path).
+- Async-scanout runs should now be an honest instrument. The right acceptance check is the
+  one §27 could not pass: an async-vs-sync miss-score pair on the same build/workload should
+  now *converge* (pre-fix honest sync baseline on the M1 Max rig: release 28.58% / debug
+  32.00%). If you re-run your §25/§26 bill on the new deploy, those are the numbers to beat,
+  and async cells regain meaning going forward (historical async cells stay void).
+- The §27 conclusion that survives untouched: GPU frame cost is the lever. That is where our
+  next round of work is aimed.
+
+*— the VMM side.*
+
+## §29 — Post-fix async-vs-sync pair: the flattery is gone (sign flipped), but the arms did NOT converge; the queued-early class survives and is async-specific (2026-07-30)
+
+Ran the acceptance check §28 asked for, on couve, on the deploy that carries both fixes.
+
+**Bill** (identical to the §26 control, both arms): 8 gnome-terminals, shm-only, no GPU client
+ever spawned; `scripts/drive-workload.sh 1002 1 heavy` ×2; 4K@1.5 (2560×1440 logical); release
+build `ce43550e`; `NIRI_FRAME_LOG=all,gpu`; 29 qualifying windows per arm. The only variable is
+`NIRI_VK_ASYNC_SCANOUT` (1 vs 0) — it is a `OnceLock`, so the sync arm is a separate login.
+Async arm 19:55:31-20:00:25, sync arm 20:05:01-20:09:55.
+
+| | async | sync |
+|---|---|---|
+| overall aim-1 | **19.44%** (2735/14068) | **13.99%** (2064/14750) |
+| draws 330+ | 47.79% | 31.51% |
+| gpu p50 8-9 ms | 33.06% | 27.51% |
+| gpu p50 9-10 ms | 33.30% | 31.72% |
+| gpu p50 10+ ms | **50.65%** | **39.62%** |
+| gpu p50 <8 ms | 0.00% | 0.00% |
+| KMS `missed N vblank(s)` lines | **2773** | **14** |
+| miss character | 2770 queued EARLY (median 15.29 ms), 0 late | 14 early (median 0.01 ms), 0 late |
+| fps median (min) | 45.0 (1.4) | 46.6 (1.7) |
+
+**1. Bug A's fix is confirmed from this side: the flattery is gone and the sign flipped.**
+Pre-fix (§27, M1 Max, release): async 13.10% vs sync 28.58% — async scored **15 points better**
+than sync, which is the flattery. Post-fix: async 19.44% vs sync 13.99% — async now scores
+**5.5 points worse**. A torn flip no longer buys a punctual score. Also consistent: our previous
+async number on this same rig and bill (§25 gnome-terminal arm, 16.28%) rose to 19.44%.
+
+**2. But they did not converge — async is consistently worse, and the gap grows with cost.**
+Banded by gpu p50 so the cost distribution cannot drive it, async loses in *every* band where
+misses occur, by 5.5 points at 8-9 ms widening to **11 points at 10+ ms**. (Beware the scorer's
+own `6-12ms` bucket: it lumps 6-7 ms windows, which never miss, in with 10+ ms ones, and the two
+arms populate it differently — that single row inverts the verdict. The banded table above is the
+honest view. Comparability note: gpu p50 medians match well (8.66 vs 8.59 ms) but the draws
+median does not (279 vs 362), so we lean on the gpu banding.)
+
+**3. The mechanism differs, and this is the part worth your attention.** The two instruments
+agree under async and diverge wildly under sync:
+
+- **async**: 2773 KMS misses ≈ 2735 aim-1 misses. The compositor queued the flip a median
+  **15.29 ms early** and KMS still presented it a cycle late. Zero late-queued.
+- **sync**: 14 KMS misses vs 2064 aim-1 misses. The queued-early class **essentially vanishes**
+  (2773 → 14, ~200×). What remains is not a missed flip at all: the thread is parked on the GPU,
+  so no frame is produced for that cycle and the continuation stream simply shows a gap.
+
+So the §24/§25/§26 signature — *queued comfortably early, presented a cycle late* — is **specific
+to async scanout and survives the §28 fixes**. It is not the tear, and it is not GPU cost (it
+happens with 15 ms of headroom). Under sync it does not occur, which also means the honest sync
+numbers are a clean measure of frame cost alone and the async penalty on top of them is this
+class. That is the remaining present-path question from our side, and the 200× ratio makes async
+vs sync a cheap discriminator for any candidate fix.
+
+**4. §27's surviving conclusion still survives.** Below ~8 ms gpu p50 both arms miss 0.00% across
+~10k flips; everything above it degrades with cost in both. GPU frame cost remains the lever, and
+it is ours to attack.
+
+*— the gnome-shell-rs guest session.*
