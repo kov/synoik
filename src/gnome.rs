@@ -1028,6 +1028,19 @@ pub fn load_and_watch_gsettings() -> (
     calloop::channel::Channel<GnomeSettings>,
     GnomeSettingsWriter,
 ) {
+    load_and_watch_gsettings_with(SettingsStore::System)
+}
+
+/// [`load_and_watch_gsettings`] against a chosen [`SettingsStore`], so a test can run this
+/// exact watcher — real thread, real subscription, real dedup, real writer — on a private
+/// in-memory store.
+pub fn load_and_watch_gsettings_with(
+    store: SettingsStore,
+) -> (
+    GnomeSettings,
+    calloop::channel::Channel<GnomeSettings>,
+    GnomeSettingsWriter,
+) {
     let (tx, rx) = calloop::channel::channel();
     let (init_tx, init_rx) = std::sync::mpsc::channel();
     let ctx = glib::MainContext::new();
@@ -1037,7 +1050,7 @@ pub fn load_and_watch_gsettings() -> (
         .name("gsettings-watch".to_owned())
         .spawn(move || {
             ctx.with_thread_default(|| {
-                let stores = Rc::new(Stores::open());
+                let stores = Rc::new(Stores::open(store));
                 STORES.set(Some(stores.clone()));
 
                 // Subscribe before the initial read so no change can fall
@@ -1251,7 +1264,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if let Some(app_folders) = &s.app_folders {
-                    create_app_folder(app_folders, &folder_id, &name, &apps, None);
+                    create_app_folder(app_folders, &folder_id, &name, &apps, s.backend.as_ref());
                 }
                 stores.set(Some(s));
             });
@@ -1268,7 +1281,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if s.app_folders.is_some() {
-                    add_to_app_folder(&folder_id, &app, None);
+                    add_to_app_folder(&folder_id, &app, s.backend.as_ref());
                 }
                 stores.set(Some(s));
             });
@@ -1285,7 +1298,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if s.app_folders.is_some() {
-                    remove_from_app_folder(&folder_id, &app, None);
+                    remove_from_app_folder(&folder_id, &app, s.backend.as_ref());
                 }
                 stores.set(Some(s));
             });
@@ -1306,7 +1319,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if s.app_folders.is_some() {
-                    if let Some(store) = folder_settings(&folder_id, None) {
+                    if let Some(store) = folder_settings(&folder_id, s.backend.as_ref()) {
                         let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
                         if let Err(err) = store.set_strv("apps", refs) {
                             warn!("error reordering the app folder {folder_id}: {err}");
@@ -1327,7 +1340,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if s.app_folders.is_some() {
-                    if let Some(store) = folder_settings(&folder_id, None) {
+                    if let Some(store) = folder_settings(&folder_id, s.backend.as_ref()) {
                         if let Err(err) = store.set_string("name", &name) {
                             warn!("error renaming the app folder {folder_id}: {err}");
                         } else {
@@ -1348,7 +1361,7 @@ impl GnomeSettingsWriter {
             STORES.with(|stores| {
                 let Some(s) = stores.take() else { return };
                 if let Some(app_folders) = &s.app_folders {
-                    delete_app_folder(app_folders, &folder_id, None);
+                    delete_app_folder(app_folders, &folder_id, s.backend.as_ref());
                 }
                 stores.set(Some(s));
             });
@@ -1557,7 +1570,37 @@ fn is_new_model(seen: &RefCell<Option<GnomeSettings>>, settings: &GnomeSettings)
     true
 }
 
+/// Which GSettings store [`Stores::open`] opens on.
+///
+/// The only reason this exists is so a test can drive the **real**
+/// [`load_and_watch_gsettings_with`] / [`Stores::read`] / [`GnomeSettingsWriter`] instead
+/// of a hand-assembled stand-in: a test that builds its own `Stores` literal is testing a
+/// reimplementation of the wiring, not the wiring. The backend is created on the watcher
+/// thread (glib objects are not `Send`), so this is a *kind*, not a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsStore {
+    /// The process default — dconf, i.e. the user's real settings.
+    System,
+    /// A private in-memory store, discarded with the process. Tests only: it makes the
+    /// real code path safe to run without touching the user's dconf.
+    Memory,
+}
+
+impl SettingsStore {
+    /// The backend to open every store on, or `None` for the process default.
+    fn backend(self) -> Option<gio::SettingsBackend> {
+        match self {
+            SettingsStore::System => None,
+            SettingsStore::Memory => Some(gio::memory_settings_backend_new()),
+        }
+    }
+}
+
 struct Stores {
+    /// The backend every store here was opened on — `None` for the process default.
+    /// Held so the *relocatable* per-folder stores, which are opened on demand rather
+    /// than in [`Stores::open`], land on the same store as everything else.
+    backend: Option<gio::SettingsBackend>,
     mutter: Option<gio::Settings>,
     mutter_keybindings: Option<gio::Settings>,
     shell_keybindings: Option<gio::Settings>,
@@ -1601,65 +1644,36 @@ struct Stores {
 }
 
 impl Stores {
-    /// Open every schema we honor; each is `None` where not installed (e.g.
+    /// Open every schema we honor on `store`; each is `None` where not installed (e.g.
     /// running outside a GNOME environment).
-    fn open() -> Self {
+    fn open(store: SettingsStore) -> Self {
+        let backend = store.backend();
+        let b = backend.as_ref();
         Self {
-            mutter: gsettings("org.gnome.mutter"),
-            mutter_keybindings: gsettings("org.gnome.mutter.keybindings"),
-            shell_keybindings: gsettings("org.gnome.shell.keybindings"),
-            wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings"),
-            wm_preferences: gsettings("org.gnome.desktop.wm.preferences"),
-            shell: gsettings("org.gnome.shell"),
-            lockdown: gsettings("org.gnome.desktop.lockdown"),
-            background: gsettings("org.gnome.desktop.background"),
-            interface: gsettings("org.gnome.desktop.interface"),
-            calendar: gsettings("org.gnome.desktop.calendar"),
-            notifications: gsettings("org.gnome.desktop.notifications"),
-            color: gsettings("org.gnome.settings-daemon.plugins.color"),
-            input_sources: gsettings("org.gnome.desktop.input-sources"),
-            world_clocks: gsettings("org.gnome.shell.world-clocks"),
-            app_folders: gsettings("org.gnome.desktop.app-folders"),
-            a11y: gsettings("org.gnome.desktop.a11y"),
-            a11y_interface: gsettings("org.gnome.desktop.a11y.interface"),
-            a11y_applications: gsettings("org.gnome.desktop.a11y.applications"),
-            a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard"),
+            // A refcount bump; `b` keeps borrowing it through the rest of the literal.
+            backend: backend.clone(),
+            mutter: gsettings("org.gnome.mutter", b),
+            mutter_keybindings: gsettings("org.gnome.mutter.keybindings", b),
+            shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
+            wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
+            wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
+            shell: gsettings("org.gnome.shell", b),
+            lockdown: gsettings("org.gnome.desktop.lockdown", b),
+            background: gsettings("org.gnome.desktop.background", b),
+            interface: gsettings("org.gnome.desktop.interface", b),
+            calendar: gsettings("org.gnome.desktop.calendar", b),
+            notifications: gsettings("org.gnome.desktop.notifications", b),
+            color: gsettings("org.gnome.settings-daemon.plugins.color", b),
+            input_sources: gsettings("org.gnome.desktop.input-sources", b),
+            world_clocks: gsettings("org.gnome.shell.world-clocks", b),
+            app_folders: gsettings("org.gnome.desktop.app-folders", b),
+            a11y: gsettings("org.gnome.desktop.a11y", b),
+            a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
+            a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
+            a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard", b),
             folder_stores: RefCell::new(HashMap::new()),
             folder_on_change: RefCell::new(None),
             clocks_installed: desktop_app_installed("org.gnome.clocks.desktop"),
-            world_clocks_cache: RefCell::new(None),
-            clocks_proxy: RefCell::new(None),
-        }
-    }
-
-    /// Every store closed, for tests that open only the one or two schemas they
-    /// exercise (`Stores { interface: .., ..Stores::none() }`) — so adding a store
-    /// here doesn't churn every test.
-    #[cfg(test)]
-    fn none() -> Self {
-        Self {
-            mutter: None,
-            mutter_keybindings: None,
-            shell_keybindings: None,
-            wm_keybindings: None,
-            wm_preferences: None,
-            shell: None,
-            lockdown: None,
-            background: None,
-            interface: None,
-            calendar: None,
-            notifications: None,
-            color: None,
-            input_sources: None,
-            world_clocks: None,
-            app_folders: None,
-            a11y: None,
-            a11y_interface: None,
-            a11y_applications: None,
-            a11y_keyboard: None,
-            folder_stores: RefCell::new(HashMap::new()),
-            folder_on_change: RefCell::new(None),
-            clocks_installed: false,
             world_clocks_cache: RefCell::new(None),
             clocks_proxy: RefCell::new(None),
         }
@@ -1798,12 +1812,10 @@ impl Stores {
         if let Some(store) = self.folder_stores.borrow().get(id) {
             return Some(store.clone());
         }
-        let source = gio::SettingsSchemaSource::default()?;
-        source.lookup(APP_FOLDER_SCHEMA, true)?;
-        let store = gio::Settings::with_path(
-            APP_FOLDER_SCHEMA,
-            &format!("/org/gnome/desktop/app-folders/folders/{id}/"),
-        );
+        // On the backend the rest of the stores were opened on — a relocatable store
+        // opened on the *default* backend would read (and a write would clobber) the
+        // user's real dconf even when everything else is on a private store.
+        let store = folder_settings(id, self.backend.as_ref())?;
         if let Some(on_change) = self.folder_on_change.borrow().clone() {
             let stores = self.clone();
             store.connect_changed(None, move |_, _key| {
@@ -2214,13 +2226,17 @@ fn strv(settings: &gio::Settings, key: &str) -> Vec<String> {
     settings.strv(key).iter().map(|s| s.to_string()).collect()
 }
 
-/// Open a [`gio::Settings`] for `schema_id`, or `None` if the schema isn't
+/// Open a [`gio::Settings`] for `schema_id` on `backend`, or `None` if the schema isn't
 /// installed (e.g. running outside a GNOME environment). Guarding with the schema
 /// source avoids `gio::Settings::new`'s abort-on-missing-schema behavior.
-fn gsettings(schema_id: &str) -> Option<gio::Settings> {
+///
+/// `backend` is `None` for the process default (dconf — the user's real store); tests
+/// pass a memory backend so they exercise this same code against a private store. See
+/// [`SettingsStore`].
+fn gsettings(schema_id: &str, backend: Option<&gio::SettingsBackend>) -> Option<gio::Settings> {
     let source = gio::SettingsSchemaSource::default()?;
-    source.lookup(schema_id, true)?;
-    Some(gio::Settings::new(schema_id))
+    let schema = source.lookup(schema_id, true)?;
+    Some(gio::Settings::new_full(&schema, backend, None))
 }
 
 /// Whether an application `${id}.desktop` is installed, gnome-shell's
@@ -3125,25 +3141,20 @@ mod tests {
         let Some(source) = gio::SettingsSchemaSource::default() else {
             return;
         };
-        let Some(mutter_schema) = source.lookup("org.gnome.mutter", true) else {
+        if source.lookup("org.gnome.mutter", true).is_none()
+            || source
+                .lookup("org.gnome.desktop.wm.keybindings", true)
+                .is_none()
+        {
             return;
-        };
-        let Some(wm_schema) = source.lookup("org.gnome.desktop.wm.keybindings", true) else {
-            return;
-        };
+        }
 
         let ctx = glib::MainContext::new();
         ctx.with_thread_default(|| {
-            let backend = gio::memory_settings_backend_new();
-            let stores = Rc::new(Stores {
-                mutter: Some(gio::Settings::new_full(
-                    &mutter_schema,
-                    Some(&backend),
-                    None,
-                )),
-                wm_keybindings: Some(gio::Settings::new_full(&wm_schema, Some(&backend), None)),
-                ..Stores::none()
-            });
+            // The REAL store set, on a private in-memory backend — so this exercises
+            // `Stores::open` + `subscribe` + `read` as the compositor runs them, not a
+            // two-store stand-in that can't notice a store we forgot to watch.
+            let stores = Rc::new(Stores::open(SettingsStore::Memory));
 
             let received = Rc::new(RefCell::new(Vec::new()));
             stores.subscribe({
@@ -3203,32 +3214,29 @@ mod tests {
     /// user's real dconf is never touched.
     #[test]
     fn a11y_settings_read_every_row() {
-        let Some(source) = gio::SettingsSchemaSource::default() else {
+        // The schemas come from the host system; skip where not installed.
+        if !schema_available("org.gnome.desktop.a11y.keyboard", None)
+            || !schema_available("org.gnome.desktop.interface", None)
+        {
             return;
-        };
-        let (Some(kbd_schema), Some(iface_schema)) = (
-            source.lookup("org.gnome.desktop.a11y.keyboard", true),
-            source.lookup("org.gnome.desktop.interface", true),
-        ) else {
-            return; // schemas not installed
-        };
+        }
 
         let ctx = glib::MainContext::new();
         ctx.with_thread_default(|| {
-            let backend = gio::memory_settings_backend_new();
-            let keyboard = gio::Settings::new_full(&kbd_schema, Some(&backend), None);
-            let interface = gio::Settings::new_full(&iface_schema, Some(&backend), None);
-            keyboard.set_boolean("slowkeys-enable", true).unwrap();
-            interface.set_double("text-scaling-factor", 1.25).unwrap();
+            // The REAL store set + the REAL `read()` composition, on a private backend.
+            let stores = Rc::new(Stores::open(SettingsStore::Memory));
+            let write = |store: &str, f: &dyn Fn(&gio::Settings)| {
+                f(stores.get(store).expect("store open on the memory backend"));
+            };
 
-            let stores = Rc::new(Stores {
-                a11y_keyboard: Some(keyboard),
-                interface: Some(interface),
-                ..Stores::none()
+            write("a11y-keyboard", &|s| {
+                s.set_boolean("slowkeys-enable", true).unwrap()
             });
-            let mut settings = GnomeSettings::default();
-            settings.load_a11y(&stores);
+            write("interface", &|s| {
+                s.set_double("text-scaling-factor", 1.25).unwrap()
+            });
 
+            let settings = stores.read();
             assert!(settings.a11y.get(A11yToggle::SlowKeys));
             assert!(!settings.a11y.get(A11yToggle::StickyKeys));
             assert!(
@@ -3239,266 +3247,155 @@ mod tests {
 
             // Exactly 1.0 is off — the reference tests `factor > 1.0`
             // (`accessibility.js:122`), not `!= 1.0`.
-            stores
-                .interface
-                .as_ref()
-                .unwrap()
-                .set_double("text-scaling-factor", 1.0)
-                .unwrap();
-            let mut settings = GnomeSettings::default();
-            settings.load_a11y(&stores);
+            write("interface", &|s| {
+                s.set_double("text-scaling-factor", 1.0).unwrap()
+            });
+            let settings = stores.read();
             assert!(!settings.a11y.large_text());
+            assert!(
+                settings.a11y.indicator_visible(),
+                "Slow Keys is still on, so the indicator stays up"
+            );
+
+            // With that last row off too, and no pin, it goes away.
+            write("a11y-keyboard", &|s| {
+                s.set_boolean("slowkeys-enable", false).unwrap()
+            });
+            assert!(!stores.read().a11y.indicator_visible());
         })
         .unwrap();
     }
 
-    /// Writing an a11y row: nine rows are a plain boolean set, but turning Large Text
-    /// **off resets** `text-scaling-factor` rather than writing 1.0
-    /// (`accessibility.js:126-128`) — so a non-1.0 system default comes back instead of
-    /// being pinned to 1.0 by us.
-    #[test]
-    fn writer_resets_text_scaling_when_large_text_goes_off() {
+    /// Drives the **real** settings stack on a private in-memory store:
+    /// [`load_and_watch_gsettings_with`] spawns the production watcher thread,
+    /// [`GnomeSettingsWriter`] performs the production write, and the re-read model arrives
+    /// over the production calloop channel.
+    ///
+    /// This exists so the writer tests stop standing in for the wiring. A test that builds
+    /// its own `Stores` and its own glib loop passes even when a store is missing from
+    /// `Stores::all()` (→ no subscription → no delivery) or when the writer routes a key to
+    /// a store `Stores::open` never opened — the two mistakes most likely to be made when
+    /// adding a setting.
+    struct RealWatcher {
+        event_loop: calloop::EventLoop<'static, Option<GnomeSettings>>,
+        latest: Option<GnomeSettings>,
+        writer: GnomeSettingsWriter,
+        initial: GnomeSettings,
+    }
+
+    impl RealWatcher {
+        fn start() -> Self {
+            let (initial, channel, writer) = load_and_watch_gsettings_with(SettingsStore::Memory);
+            let event_loop = calloop::EventLoop::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(channel, |event, _, latest: &mut Option<GnomeSettings>| {
+                    if let calloop::channel::Event::Msg(settings) = event {
+                        *latest = Some(settings);
+                    }
+                })
+                .unwrap();
+            Self {
+                event_loop,
+                latest: None,
+                writer,
+                initial,
+            }
+        }
+
+        /// Pump the loop until `want` holds on a delivered model, then return it. The
+        /// watcher is a real thread, so delivery is asynchronous.
+        fn settle(&mut self, want: impl Fn(&GnomeSettings) -> bool, what: &str) -> &GnomeSettings {
+            for _ in 0..100 {
+                self.event_loop
+                    .dispatch(Some(std::time::Duration::from_millis(50)), &mut self.latest)
+                    .unwrap();
+                if self.latest.as_ref().is_some_and(&want) {
+                    return self.latest.as_ref().unwrap();
+                }
+            }
+            panic!("the real watcher never delivered {what}: {:?}", self.latest);
+        }
+    }
+
+    /// Whether a schema (and optionally a key) is installed on this host; these tests skip
+    /// where GNOME's schemas aren't.
+    fn schema_available(id: &str, key: Option<&str>) -> bool {
         let Some(source) = gio::SettingsSchemaSource::default() else {
-            return;
+            return false;
         };
-        let (Some(kbd_schema), Some(iface_schema)) = (
-            source.lookup("org.gnome.desktop.a11y.keyboard", true),
-            source.lookup("org.gnome.desktop.interface", true),
-        ) else {
-            return;
+        let Some(schema) = source.lookup(id, true) else {
+            return false;
         };
-        if !kbd_schema.has_key("stickykeys-enable") || !iface_schema.has_key("text-scaling-factor")
+        key.is_none_or(|k| schema.has_key(k))
+    }
+
+    /// The a11y rows travel the real stack, and the one write that is not a boolean set is
+    /// pinned: turning Large Text off **resets** `text-scaling-factor` rather than writing
+    /// 1.0 (`accessibility.js:126-128`), so a system default other than 1.0 comes back
+    /// instead of being pinned by us.
+    #[test]
+    fn the_real_watcher_delivers_a11y_writes() {
+        if !schema_available("org.gnome.desktop.a11y.keyboard", Some("stickykeys-enable"))
+            || !schema_available("org.gnome.desktop.interface", Some("text-scaling-factor"))
         {
             return;
         }
 
-        let ctx = glib::MainContext::new();
-        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
-
-        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
-        let watcher = std::thread::spawn({
-            let ctx = ctx.clone();
-            move || {
-                ctx.with_thread_default(|| {
-                    // SettingsSchema is not Send; look them up again here.
-                    let source = gio::SettingsSchemaSource::default().unwrap();
-                    let backend = gio::memory_settings_backend_new();
-                    let keyboard = gio::Settings::new_full(
-                        &source
-                            .lookup("org.gnome.desktop.a11y.keyboard", true)
-                            .unwrap(),
-                        Some(&backend),
-                        None,
-                    );
-                    let interface = gio::Settings::new_full(
-                        &source.lookup("org.gnome.desktop.interface", true).unwrap(),
-                        Some(&backend),
-                        None,
-                    );
-                    STORES.set(Some(Rc::new(Stores {
-                        a11y_keyboard: Some(keyboard),
-                        interface: Some(interface),
-                        ..Stores::none()
-                    })));
-
-                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
-                    loop_tx.send(main_loop.clone()).unwrap();
-                    main_loop.run();
-                })
-                .unwrap();
-            }
-        });
-        let main_loop = loop_rx.recv().unwrap();
+        let mut w = RealWatcher::start();
+        assert!(
+            !w.initial.a11y.indicator_visible(),
+            "a pristine memory store has no a11y feature on"
+        );
 
         // A plain boolean row.
-        writer.set_a11y_toggle(A11yToggle::StickyKeys, true);
-        // Large Text on, then off again.
-        writer.set_a11y_toggle(A11yToggle::LargeText, true);
-
-        let read = |writer_ctx: &glib::MainContext| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            writer_ctx.invoke(move || {
-                STORES.with(|stores| {
-                    let s = stores.take().unwrap();
-                    let interface = s.interface.as_ref().unwrap();
-                    let out = (
-                        s.a11y_keyboard
-                            .as_ref()
-                            .unwrap()
-                            .boolean("stickykeys-enable"),
-                        interface.double("text-scaling-factor"),
-                        // `user_value` is `None` once the key is reset.
-                        interface.user_value("text-scaling-factor").is_some(),
-                    );
-                    tx.send(out).unwrap();
-                    stores.set(Some(s));
-                });
-            });
-            rx.recv().unwrap()
-        };
-
-        let (sticky, factor, has_user_value) = read(&ctx);
-        assert!(sticky, "a boolean row writes its key");
-        assert_eq!(factor, DPI_FACTOR_LARGE, "Large Text on writes 1.25");
-        assert!(has_user_value);
-
-        writer.set_a11y_toggle(A11yToggle::LargeText, false);
-        let (_, factor, has_user_value) = read(&ctx);
+        w.writer.set_a11y_toggle(A11yToggle::StickyKeys, true);
+        let settings = w.settle(|s| s.a11y.get(A11yToggle::StickyKeys), "Sticky Keys on");
         assert!(
-            !has_user_value,
-            "Large Text off must RESET text-scaling-factor, not write 1.0"
+            settings.a11y.indicator_visible(),
+            "one row on is enough to show the indicator (accessibility.js:96)"
         );
-        assert_eq!(factor, 1.0, "and the schema default shows through");
 
-        main_loop.quit();
-        watcher.join().unwrap();
+        // Large Text on writes the factor...
+        w.writer.set_a11y_toggle(A11yToggle::LargeText, true);
+        let settings = w.settle(|s| s.a11y.large_text(), "Large Text on");
+        assert_eq!(settings.a11y.text_scaling_factor, DPI_FACTOR_LARGE);
+
+        // ...and off RESETS it, so the schema default shows through.
+        w.writer.set_a11y_toggle(A11yToggle::LargeText, false);
+        let settings = w.settle(|s| !s.a11y.large_text(), "Large Text off");
+        assert_eq!(
+            settings.a11y.text_scaling_factor, 1.0,
+            "Large Text off must reset the key, leaving the schema default"
+        );
     }
 
-    /// [`GnomeSettingsWriter`] hops onto the watcher thread and lands the
-    /// write in the store. This drives the real writer against a dedicated
-    /// thread running a glib loop, with a memory backend standing in for
-    /// dconf, and reads the value back from that same thread.
+    /// The run dialog's history round-trips the real stack.
     #[test]
     fn writer_persists_command_history() {
-        // The schema comes from the host system; skip where not installed.
-        let Some(source) = gio::SettingsSchemaSource::default() else {
-            return;
-        };
-        let Some(shell_schema) = source.lookup("org.gnome.shell", true) else {
-            return;
-        };
-        if !shell_schema.has_key("command-history") {
+        if !schema_available("org.gnome.shell", Some("command-history")) {
             return;
         }
-
-        let ctx = glib::MainContext::new();
-        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
-
-        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
-        let watcher = std::thread::spawn({
-            let ctx = ctx.clone();
-            move || {
-                ctx.with_thread_default(|| {
-                    // SettingsSchema is not Send; look it up again here.
-                    let shell_schema = gio::SettingsSchemaSource::default()
-                        .unwrap()
-                        .lookup("org.gnome.shell", true)
-                        .unwrap();
-                    let backend = gio::memory_settings_backend_new();
-                    let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
-                    STORES.set(Some(Rc::new(Stores {
-                        shell: Some(shell),
-                        ..Stores::none()
-                    })));
-
-                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
-                    loop_tx.send(main_loop.clone()).unwrap();
-                    main_loop.run();
-                })
-                .unwrap();
-            }
-        });
-        let main_loop = loop_rx.recv().unwrap();
-
-        writer.set_command_history(vec!["echo hi".to_owned()]);
-
-        // Invokes run in order, so this reads back after the write landed.
-        let (read_tx, read_rx) = std::sync::mpsc::channel();
-        ctx.invoke(move || {
-            STORES.with(|stores| {
-                let s = stores.take().unwrap();
-                let history: Vec<String> = s
-                    .shell
-                    .as_ref()
-                    .unwrap()
-                    .strv("command-history")
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                read_tx.send(history).unwrap();
-                stores.set(Some(s));
-            });
-        });
-
-        assert_eq!(
-            read_rx.recv().unwrap(),
-            vec!["echo hi".to_owned()],
-            "the write must land in the store via the watcher thread"
+        let mut w = RealWatcher::start();
+        w.writer.set_command_history(vec!["echo hi".to_owned()]);
+        w.settle(
+            |s| s.command_history == ["echo hi".to_owned()],
+            "command-history",
         );
-
-        main_loop.quit();
-        watcher.join().unwrap();
     }
 
+    /// The dash's pinned apps round-trip the real stack.
     #[test]
     fn writer_persists_favorite_apps() {
-        // The schema comes from the host system; skip where not installed.
-        let Some(source) = gio::SettingsSchemaSource::default() else {
-            return;
-        };
-        let Some(shell_schema) = source.lookup("org.gnome.shell", true) else {
-            return;
-        };
-        if !shell_schema.has_key("favorite-apps") {
+        if !schema_available("org.gnome.shell", Some("favorite-apps")) {
             return;
         }
-
-        let ctx = glib::MainContext::new();
-        let writer = GnomeSettingsWriter { ctx: ctx.clone() };
-
-        let (loop_tx, loop_rx) = std::sync::mpsc::channel();
-        let watcher = std::thread::spawn({
-            let ctx = ctx.clone();
-            move || {
-                ctx.with_thread_default(|| {
-                    // SettingsSchema is not Send; look it up again here.
-                    let shell_schema = gio::SettingsSchemaSource::default()
-                        .unwrap()
-                        .lookup("org.gnome.shell", true)
-                        .unwrap();
-                    let backend = gio::memory_settings_backend_new();
-                    let shell = gio::Settings::new_full(&shell_schema, Some(&backend), None);
-                    STORES.set(Some(Rc::new(Stores {
-                        shell: Some(shell),
-                        ..Stores::none()
-                    })));
-
-                    let main_loop = glib::MainLoop::new(Some(&ctx), false);
-                    loop_tx.send(main_loop.clone()).unwrap();
-                    main_loop.run();
-                })
-                .unwrap();
-            }
-        });
-        let main_loop = loop_rx.recv().unwrap();
-
-        writer.set_favorite_apps(vec!["org.gnome.Nautilus.desktop".to_owned()]);
-
-        // Invokes run in order, so this reads back after the write landed.
-        let (read_tx, read_rx) = std::sync::mpsc::channel();
-        ctx.invoke(move || {
-            STORES.with(|stores| {
-                let s = stores.take().unwrap();
-                let favorites: Vec<String> = s
-                    .shell
-                    .as_ref()
-                    .unwrap()
-                    .strv("favorite-apps")
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                read_tx.send(favorites).unwrap();
-                stores.set(Some(s));
-            });
-        });
-
-        assert_eq!(
-            read_rx.recv().unwrap(),
-            vec!["org.gnome.Nautilus.desktop".to_owned()],
-            "the write must land in the store via the watcher thread"
+        let mut w = RealWatcher::start();
+        w.writer
+            .set_favorite_apps(vec!["org.gnome.Nautilus.desktop".to_owned()]);
+        w.settle(
+            |s| s.favorite_apps == ["org.gnome.Nautilus.desktop".to_owned()],
+            "favorite-apps",
         );
-
-        main_loop.quit();
-        watcher.join().unwrap();
     }
 }

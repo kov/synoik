@@ -39,6 +39,36 @@ const GREEN: [u32; 4] = [0, u32::MAX, 0, u32::MAX];
 const RED: [u32; 4] = [u32::MAX, 0, 0, u32::MAX];
 
 /// The tight `Abgr8888` pixel at (x, y) in a `w`-wide readback buffer.
+/// Composite UI elements the way the compositor does, and read the frame back.
+///
+/// The z convention is the trap this exists for. Every UI `render()` in the fork returns
+/// its elements **front-to-back** (first = topmost) — that is what `Niri::render` pushes
+/// and what the real paths hand around. But `render_helpers::render_elements` draws in
+/// **iteration order**, so later elements land on top: it wants back-to-front, which is
+/// why every production caller reverses (`Niri::screenshot`, `snapshot.rs`, …).
+///
+/// A test that passes the list straight to `render_to_vec` therefore composites it upside
+/// down. That is not loud: the bottom-most element is usually the opaque background box
+/// (a popover's `.popup-menu-content` fill, the panel's bar), so it ends up covering the
+/// content and an `opaque > 0` assertion still passes while measuring a flat rectangle.
+/// Route every UI composite through here so the reverse cannot be forgotten.
+fn composite_ui<E: RenderElement<VulkanRenderer>>(
+    vk: &mut VulkanRenderer,
+    elems: Vec<E>,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+) -> Vec<u8> {
+    render_to_vec(
+        vk,
+        size,
+        scale,
+        Transform::Normal,
+        Fourcc::Abgr8888,
+        elems.into_iter().rev(),
+    )
+    .expect("composite UI elements")
+}
+
 fn px(pixels: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
     let i = ((y * w + x) * 4) as usize;
     [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
@@ -2104,15 +2134,12 @@ fn vulkan_renders_the_top_panel() {
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"
             );
-            let pixels = render_to_vec(
+            let pixels = composite_ui(
                 vk,
+                elems,
                 Size::<i32, Physical>::from((width, bar_h)),
                 scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter(),
-            )
-            .expect("render panel");
+            );
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
         })
         .expect("vulkan renderer");
@@ -2175,18 +2202,12 @@ fn vulkan_renders_the_messages_indicator_dot() {
                 let elems = niri
                     .panel
                     .render(vk, &output, ws, position, 0., &niri.icon_cache);
-                render_to_vec(
+                composite_ui(
                     vk,
+                    elems,
                     Size::<i32, Physical>::from((width, bar_h)),
                     scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    // Panel elements are first=topmost; render_to_vec paints in
-                    // iteration order, so reverse to composite bottom-up (else
-                    // the bar paints over the dot).
-                    elems.into_iter().rev(),
                 )
-                .expect("render panel")
             };
             // Hidden: nothing bright where the dot would sit.
             let off = bright_at_dot(&render_panel(vk, &state.niri));
@@ -2263,16 +2284,12 @@ fn vulkan_composites_the_workspace_dots() {
                         .niri
                         .panel
                         .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
-                render_to_vec(
+                composite_ui(
                     vk,
+                    elems,
                     Size::<i32, Physical>::from((width, bar_h)),
                     scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    // First=topmost, so reverse to composite bottom-up.
-                    elems.into_iter().rev(),
                 )
-                .expect("render panel")
             };
             let at_rest = render_at(vk, 1.);
             let mid_switch = render_at(vk, 1.5);
@@ -2398,15 +2415,7 @@ fn vulkan_renders_the_calendar_popover() {
             // output width and enough height to include the calendar box.
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 400.);
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter(),
-            )
-            .expect("render popover");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
         })
         .expect("vulkan renderer");
@@ -2483,15 +2492,7 @@ fn vulkan_renders_the_message_list_card() {
             // The element list is top-to-bottom; `render_to_vec` paints in
             // iteration order (bottom first), so reverse — like every capture
             // path does.
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter().rev(),
-            )
-            .expect("render popover");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             let sample = |x: f64, y: f64| {
                 let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
                 let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
@@ -2610,15 +2611,7 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
                     .niri
                     .panel_popover
                     .render(vk, &state.niri.icon_cache, &output);
-                let pixels = render_to_vec(
-                    vk,
-                    Size::<i32, Physical>::from((w, h)),
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elems.into_iter().rev(),
-                )
-                .expect("render popover");
+                let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 let at = |x: i32, y: i32| {
                     let i = ((y * w + x) * 4) as usize;
                     [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
@@ -2732,15 +2725,7 @@ fn vulkan_renders_the_expanded_card_body() {
                 .render(vk, &state.niri.icon_cache, &output);
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 500.);
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter().rev(),
-            )
-            .expect("render popover");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             let sample = |x: f64, y: f64| {
                 let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
                 let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
@@ -2842,15 +2827,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
                     .niri
                     .panel_popover
                     .render(vk, &state.niri.icon_cache, &output);
-                let pixels = render_to_vec(
-                    vk,
-                    Size::<i32, Physical>::from((w, h)),
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elems.into_iter().rev(),
-                )
-                .expect("render popover");
+                let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 pts.into_iter()
                     .map(|(x, y)| {
                         let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
@@ -2997,15 +2974,7 @@ fn vulkan_renders_the_scrolled_message_list() {
                 .niri
                 .panel_popover
                 .render(vk, &state.niri.icon_cache, &output);
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter().rev(),
-            )
-            .expect("render popover");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             let at = |x: f64, y: f64| {
                 let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
                 let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
@@ -3126,15 +3095,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 300.);
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter(),
-            )
-            .expect("render quick-settings popover");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
         })
         .expect("vulkan renderer");
@@ -3193,15 +3154,7 @@ fn vulkan_renders_the_brightness_slider() {
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 300.);
-            let pixels = render_to_vec(
-                vk,
-                Size::<i32, Physical>::from((w, h)),
-                scale,
-                Transform::Normal,
-                Fourcc::Abgr8888,
-                elems.into_iter(),
-            )
-            .expect("render the brightness slider");
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
         })
         .expect("vulkan renderer");
@@ -3253,23 +3206,9 @@ fn vulkan_renders_the_a11y_switches() {
                     .panel_popover
                     .render(vk, &state.niri.icon_cache, &out);
                 assert!(!elems.is_empty(), "the a11y menu must render");
-                // `render_elements` draws in ITERATION order, so this helper wants
-                // back-to-front; `PanelPopover::render` returns front-to-back (first =
-                // topmost), which is what the real path in `niri.rs` pushes. Without the
-                // reverse the opaque `.popup-menu-content` fill lands on top and the
-                // whole menu reads as a flat box.
-                let elems: Vec<_> = elems.into_iter().rev().collect();
                 let w = to_physical_precise_round(scale.x, output_size(&out).w);
                 let h = to_physical_precise_round(scale.x, 600.);
-                let pixels = render_to_vec(
-                    vk,
-                    Size::<i32, Physical>::from((w, h)),
-                    scale,
-                    Transform::Normal,
-                    Fourcc::Abgr8888,
-                    elems.into_iter(),
-                )
-                .expect("render the a11y menu");
+                let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 // Abgr8888 is byte-order R,G,B,A here: accent #3584e4 is blue-dominant.
                 pixels
                     .chunks_exact(4)
@@ -3296,6 +3235,81 @@ fn vulkan_renders_the_a11y_switches() {
         on_px > off_px + 1000,
         "ten on-state switch tracks must add a large block of accent pixels \
          (off={off_px}, on={on_px})"
+    );
+}
+
+/// The a11y indicator actually composites a glyph. The indicator is icon-only, so a name
+/// the theme cannot resolve leaves a correctly-sized but **invisible** button — the panel
+/// geometry tests all still pass, and only a pixel test can tell. `accessibility-menu-symbolic`
+/// ships in gnome-shell's own gresource rather than Adwaita, which is exactly the situation
+/// the fallback list exists for. Skips with no Vulkan device.
+#[test]
+fn vulkan_renders_the_a11y_indicator_icon() {
+    use crate::gnome::A11ySettings;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let width = to_physical_precise_round(scale.x, output_size(&output).w);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+
+    let render_panel = |f: &mut Fixture| {
+        let ws = f.niri().workspace_state_for(&output);
+        let position = f.niri().workspace_position_for(&output);
+        let state = f.niri_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let elems =
+                    state
+                        .niri
+                        .panel
+                        .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
+                composite_ui(
+                    vk,
+                    elems,
+                    Size::<i32, Physical>::from((width, bar_h)),
+                    scale,
+                )
+            })
+            .expect("vulkan renderer")
+    };
+
+    // Bright pixels inside the indicator's own rect — the glyph, if one resolved.
+    let glyph_px = |f: &mut Fixture, pixels: &[u8]| {
+        let rect = f.niri().panel.a11y_rect(output_size(&output).w)?;
+        let x0 = to_physical_precise_round(scale.x, rect.loc.x);
+        let x1 = to_physical_precise_round(scale.x, rect.loc.x + rect.size.w);
+        let mut n = 0;
+        for y in 0..bar_h {
+            for x in x0..x1 {
+                let p = px(pixels, width, x, y);
+                if u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2]) > 300 {
+                    n += 1;
+                }
+            }
+        }
+        Some(n)
+    };
+
+    // Hidden: no rect at all.
+    let pixels = render_panel(&mut f);
+    assert!(glyph_px(&mut f, &pixels).is_none(), "hidden by default");
+
+    // Pinned on: the button exists AND draws a glyph.
+    let mut a11y = A11ySettings::default();
+    a11y.always_show = true;
+    f.niri().gnome_settings.a11y = a11y;
+    f.niri().panel.set_a11y(a11y);
+    let pixels = render_panel(&mut f);
+    let n = glyph_px(&mut f, &pixels).expect("the indicator is pinned on");
+    assert!(
+        n > 20,
+        "the a11y indicator composited no glyph ({n} bright px) — its icon name did not \
+         resolve in the theme, so the button is invisible"
     );
 }
 

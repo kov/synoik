@@ -262,13 +262,13 @@ carved these out as separate work — none block R1 for daily use:
     Added the toolkit's first switch (`widget::Switch` + `Painter::toggle_switch`) and a `reset`
     verb on `GnomeSettingsWriter` (Large Text turns off by *resetting* `text-scaling-factor`, not
     by writing 1.0). See the R4 row for divergences and for what the keys still have no consumer
-    for. **Test-harness finding (not fixed here):** `render_to_vec`/`render_elements`
+    for. **Test-harness fix that came with it:** `render_elements`
     (`src/render_helpers/mod.rs:340`) draws in ITERATION order — first element = bottom — while
-    `PanelPopover::render` returns front-to-back like the real path in `src/niri.rs:6335` wants.
-    The eight existing popover Vulkan tests hand it the list unreversed, so they composite upside
-    down and only pass because they assert `opaque > 0`, which the opaque `.popup-menu-content`
-    fill satisfies alone. `vulkan_renders_the_a11y_switches` reverses; the others are worth
-    revisiting.
+    every UI `render()` returns front-to-back, which is why each production caller reverses
+    (`Niri::screenshot`, `snapshot.rs`). Four Vulkan tests passed the list through unreversed and
+    so composited upside down, passing only because the opaque background box satisfies their
+    `opaque > 0` assertion on its own. All UI composites now go through one `composite_ui` helper
+    that owns the reverse.
 
 **Tier 4 — larger subsystems:**
 13. Notification server (`org.freedesktop.Notifications`) → C2 dot + C3 message list.
