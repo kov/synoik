@@ -129,7 +129,8 @@ thread_local! {
     /// flake: samples were a process-wide counter that the timing test drained
     /// first to compensate, which only works while no other test renders at the
     /// same moment.
-    static GPU_SAMPLES: RefCell<Vec<(u64, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
+    static GPU_SAMPLES: RefCell<Vec<(u64, niri_vk::stats::SubmitSite, Option<Duration>)>> =
+        const { RefCell::new(Vec::new()) };
 
     /// How many samples the renderer has promised for the frame being built —
     /// one per submit it stamped. [`FrameLog::end`] waits for exactly this many
@@ -376,9 +377,10 @@ pub fn expect_gpu_sample() {
     GPU_EXPECTED.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-/// Report a submit's measured GPU duration against the frame that issued it.
-pub fn add_gpu_time(seq: u64, duration: Duration) {
-    push_gpu_sample(seq, Some(duration));
+/// Report a submit's measured GPU duration against the frame that issued it,
+/// tagged with the site the submit came from.
+pub fn add_gpu_time(seq: u64, site: niri_vk::stats::SubmitSite, duration: Duration) {
+    push_gpu_sample(seq, site, Some(duration));
 }
 
 /// Report a timestamp pair that came back unusable. Counted, not silently
@@ -386,17 +388,17 @@ pub fn add_gpu_time(seq: u64, duration: Duration) {
 /// the reported total a sum over an unknown subset of the frame's passes, i.e. a
 /// number that reads like a total and is a floor. With the loss count beside it
 /// the reader can tell the two apart.
-pub fn add_gpu_lost(seq: u64) {
-    push_gpu_sample(seq, None);
+pub fn add_gpu_lost(seq: u64, site: niri_vk::stats::SubmitSite) {
+    push_gpu_sample(seq, site, None);
 }
 
-fn push_gpu_sample(seq: u64, sample: Option<Duration>) {
+fn push_gpu_sample(seq: u64, site: niri_vk::stats::SubmitSite, sample: Option<Duration>) {
     GPU_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
         if s.len() >= MAX_PENDING_SAMPLES {
             s.remove(0);
         }
-        s.push((seq, sample));
+        s.push((seq, site, sample));
     });
 }
 
@@ -405,6 +407,12 @@ fn push_gpu_sample(seq: u64, sample: Option<Duration>) {
 pub struct GpuSamples {
     /// Summed duration of the pairs that came back usable.
     pub time: Duration,
+    /// The same time, split by the submit each pair belongs to. A frame's `gpu`
+    /// figure is a sum over its submits, and "23ms of GPU" says nothing about
+    /// whether the effects offscreen or the scanout pass is what to attack —
+    /// which is the whole question when a frame is over budget. Indexed by
+    /// `SubmitSite::index`.
+    pub by_site: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
     /// Pairs that came back unusable.
     pub lost: u64,
     /// Pairs of either kind, i.e. how many of the promised samples have landed.
@@ -412,10 +420,13 @@ pub struct GpuSamples {
 }
 
 impl GpuSamples {
-    fn add(&mut self, sample: Option<Duration>) {
+    fn add(&mut self, site: niri_vk::stats::SubmitSite, sample: Option<Duration>) {
         self.count += 1;
         match sample {
-            Some(time) => self.time += time,
+            Some(time) => {
+                self.time += time;
+                self.by_site[site.index()] += time;
+            }
             None => self.lost += 1,
         }
     }
@@ -426,9 +437,9 @@ fn take_gpu_samples_for(seq: u64) -> GpuSamples {
     GPU_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
         let mut out = GpuSamples::default();
-        s.retain(|&(at, sample)| {
+        s.retain(|&(at, site, sample)| {
             if at == seq {
-                out.add(sample);
+                out.add(site, sample);
                 false
             } else {
                 true
@@ -443,8 +454,8 @@ fn take_gpu_samples_for(seq: u64) -> GpuSamples {
 pub fn take_gpu_samples() -> GpuSamples {
     GPU_SAMPLES.with(|s| {
         let mut out = GpuSamples::default();
-        for (_, sample) in s.borrow_mut().drain(..) {
-            out.add(sample);
+        for (_, site, sample) in s.borrow_mut().drain(..) {
+            out.add(site, sample);
         }
         out
     })
@@ -639,6 +650,8 @@ struct InFlight {
 #[derive(Debug, Default)]
 struct Totals {
     gpu: Duration,
+    /// `gpu`, split by the submit it was spent in. Indexed by `SubmitSite::index`.
+    gpu_sites: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
     /// Timestamp pairs the renderer could not use. Nonzero means `gpu` is a
     /// floor, not a total. See [`GPU_LOST`].
     gpu_lost: u64,
@@ -933,6 +946,7 @@ impl FrameLog {
         let samples = take_gpu_samples_for(frame.seq);
         let totals = Totals {
             gpu: samples.time,
+            gpu_sites: samples.by_site,
             gpu_lost: samples.lost,
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
@@ -984,6 +998,9 @@ impl FrameLog {
             if parked.arrived < parked.expected {
                 let late = take_gpu_samples_for(parked.frame.seq);
                 parked.totals.gpu += late.time;
+                for (dst, add) in parked.totals.gpu_sites.iter_mut().zip(late.by_site.iter()) {
+                    *dst += *add;
+                }
                 parked.totals.gpu_lost += late.lost;
                 parked.arrived += late.count;
             }
@@ -1068,6 +1085,24 @@ impl FrameLog {
             let _ = write!(line, " (gpu {}", ms(totals.gpu));
             if totals.gpu_lost > 0 {
                 let _ = write!(line, ", {} lost", totals.gpu_lost);
+            }
+            // The split, biggest first, and only when more than one site
+            // contributed — on a frame with a single submit it would just restate
+            // the total.
+            let mut by_site: Vec<_> = niri_vk::stats::SubmitSite::ALL
+                .iter()
+                .map(|site| (*site, totals.gpu_sites[site.index()]))
+                .filter(|(_, d)| !d.is_zero())
+                .collect();
+            if by_site.len() > 1 {
+                by_site.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+                line.push_str(": ");
+                for (i, (site, d)) in by_site.iter().enumerate() {
+                    if i > 0 {
+                        line.push_str(", ");
+                    }
+                    let _ = write!(line, "{} {}", site.label(), ms(*d));
+                }
             }
             line.push(')');
         } else if totals.gpu_lost > 0 {
@@ -1867,9 +1902,17 @@ mod tests {
     fn a_sample_belongs_to_the_frame_that_issued_it() {
         let _ = take_gpu_samples();
 
-        add_gpu_time(7, Duration::from_millis(5));
-        add_gpu_time(9, Duration::from_millis(2));
-        add_gpu_lost(7);
+        add_gpu_time(
+            7,
+            niri_vk::stats::SubmitSite::KmsFrame,
+            Duration::from_millis(5),
+        );
+        add_gpu_time(
+            9,
+            niri_vk::stats::SubmitSite::KmsFrame,
+            Duration::from_millis(2),
+        );
+        add_gpu_lost(7, niri_vk::stats::SubmitSite::KmsFrame);
 
         let seven = take_gpu_samples_for(7);
         assert_eq!(seven.time, Duration::from_millis(5), "wrong frame's time");
@@ -1881,6 +1924,46 @@ mod tests {
         assert_eq!(nine.count, 1, "frame 9 took a sample that was not its own");
 
         assert_eq!(take_gpu_samples().count, 0, "samples outlived their frame");
+    }
+
+    /// A frame's GPU time splits by the submit that spent it, and the split
+    /// survives the parked-frame top-up.
+    ///
+    /// This is the whole point of the per-site tag: a heavy transition frame is
+    /// two submits — the effects offscreen and the scanout pass — and "gpu 23ms"
+    /// cannot tell you which to attack. The failure mode it guards is silent,
+    /// because summing is exactly what the total already does: the line keeps
+    /// printing a correct total while the breakdown quietly lands on one site.
+    #[test]
+    fn gpu_time_splits_by_submit_site() {
+        use niri_vk::stats::SubmitSite;
+        let _ = take_gpu_samples();
+
+        add_gpu_time(11, SubmitSite::OffscreenFrame, Duration::from_millis(5));
+        add_gpu_time(11, SubmitSite::KmsFrame, Duration::from_millis(18));
+        add_gpu_time(11, SubmitSite::OffscreenFrame, Duration::from_millis(2));
+
+        let s = take_gpu_samples_for(11);
+        assert_eq!(
+            s.time,
+            Duration::from_millis(25),
+            "the total must still hold"
+        );
+        assert_eq!(
+            s.by_site[SubmitSite::KmsFrame.index()],
+            Duration::from_millis(18)
+        );
+        assert_eq!(
+            s.by_site[SubmitSite::OffscreenFrame.index()],
+            Duration::from_millis(7),
+            "two offscreen submits must accumulate into one site"
+        );
+        assert!(
+            s.by_site[SubmitSite::Blur.index()].is_zero(),
+            "a site that never ran must stay zero"
+        );
+        // The split must sum to the total, or the line would attribute time twice.
+        assert_eq!(s.by_site.iter().sum::<Duration>(), s.time);
     }
 
     /// A frame whose submit was deferred holds its line until the measurement
@@ -1909,7 +1992,11 @@ mod tests {
             "a complete frame overtook a parked one"
         );
 
-        add_gpu_time(deferred, Duration::from_millis(9));
+        add_gpu_time(
+            deferred,
+            niri_vk::stats::SubmitSite::KmsFrame,
+            Duration::from_millis(9),
+        );
         log.flush_parked(log.settings.unwrap());
 
         assert!(log.parked.is_empty(), "the sample landed and nothing moved");
@@ -2343,7 +2430,11 @@ mod tests {
         let seq = log.in_flight.as_ref().unwrap().seq;
         log.end(Some(budget));
         // A frame whose CPU time is trivial but whose GPU work blows the budget on its own.
-        add_gpu_time(seq, Duration::from_millis(20));
+        add_gpu_time(
+            seq,
+            niri_vk::stats::SubmitSite::KmsFrame,
+            Duration::from_millis(20),
+        );
         log.flush_parked(log.settings.unwrap());
 
         let stats = &log.stats["out"];

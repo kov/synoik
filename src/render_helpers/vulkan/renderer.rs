@@ -1741,6 +1741,9 @@ struct GpuTimer {
 pub(super) struct GpuTimerSlot {
     index: u64,
     seq: u64,
+    /// Which submit this pair times, so the frame log can split a frame's GPU
+    /// total the same way it already splits the CPU's wait on it.
+    site: niri_vk::stats::SubmitSite,
 }
 
 impl GpuTimer {
@@ -2153,7 +2156,11 @@ impl VulkanRenderer {
     /// `None` when timing is off, the device turned out not to write timestamps,
     /// or every slot is still outstanding — an untimed submit, which costs the
     /// frame log one line's `gpu` figure and costs the frame path nothing.
-    pub(super) fn gpu_timer_begin(&self, cbuf: vk::CommandBuffer) -> Option<GpuTimerSlot> {
+    pub(super) fn gpu_timer_begin(
+        &self,
+        cbuf: vk::CommandBuffer,
+        site: niri_vk::stats::SubmitSite,
+    ) -> Option<GpuTimerSlot> {
         let timer = self.gpu_timer.as_ref().filter(|t| !t.unusable.get())?;
         if timer.pending.borrow().len() as u64 >= GpuTimer::SLOTS {
             return None;
@@ -2164,6 +2171,7 @@ impl VulkanRenderer {
         let slot = GpuTimerSlot {
             index,
             seq: crate::frame_log::current_frame_seq(),
+            site,
         };
         timer.pending.borrow_mut().push_back(slot);
         crate::frame_log::expect_gpu_sample();
@@ -2232,7 +2240,7 @@ impl VulkanRenderer {
         };
         if let Err(err) = res {
             warn!("error reading GPU timestamps: {err}");
-            crate::frame_log::add_gpu_lost(slot.seq);
+            crate::frame_log::add_gpu_lost(slot.seq, slot.site);
             return;
         }
 
@@ -2244,9 +2252,9 @@ impl VulkanRenderer {
                 // Above the sane limit the pair is from some other clock domain,
                 // so it is a lost sample too, not a very slow pass.
                 if duration <= GpuTimer::SANE_LIMIT {
-                    crate::frame_log::add_gpu_time(slot.seq, duration);
+                    crate::frame_log::add_gpu_time(slot.seq, slot.site, duration);
                 } else {
-                    crate::frame_log::add_gpu_lost(slot.seq);
+                    crate::frame_log::add_gpu_lost(slot.seq, slot.site);
                 }
             }
             TimestampSample::Lost => {
@@ -2254,10 +2262,10 @@ impl VulkanRenderer {
                 // this particular pair just isn't a pass we can report.
                 timer.unwritten_run.set(0);
                 timer.ever_written.set(true);
-                crate::frame_log::add_gpu_lost(slot.seq);
+                crate::frame_log::add_gpu_lost(slot.seq, slot.site);
             }
             TimestampSample::NotWritten => {
-                crate::frame_log::add_gpu_lost(slot.seq);
+                crate::frame_log::add_gpu_lost(slot.seq, slot.site);
                 let run = timer.unwritten_run.get() + 1;
                 timer.unwritten_run.set(run);
                 // A device that has written before is not broken, however long

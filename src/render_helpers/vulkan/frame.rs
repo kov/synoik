@@ -183,7 +183,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // `VulkanRenderer::pending_dmabuf_acquires`.
         // Outside the render pass, before any work: `vkCmdResetQueryPool` is not
         // allowed inside one, and this must precede the acquires so they count.
-        let gpu_slot = renderer.gpu_timer_begin(cbuf);
+        // The GPU pair is tagged with the same site the submit will report, so the
+        // frame log's `gpu` split and its wait breakdown speak one vocabulary. Both
+        // inputs are fixed for the frame's lifetime, so deciding here and at submit
+        // time cannot disagree — `submit_site_of` is the single classifier.
+        let gpu_slot = renderer.gpu_timer_begin(
+            cbuf,
+            submit_site_of(fb.offscreen, renderer.finish_is_for_kms()),
+        );
 
         // Kept alive by the frame (`held`) until its submit retires: the barriers above are
         // recorded against these images, and destroying one mid-recording invalidates this whole
@@ -1539,13 +1546,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// of the one submit that costs a refresh interval. What separates them is whether the tty
     /// backend is asking for this frame — the same permission the deferred finish rides on.
     fn submit_site(&self) -> niri_vk::stats::SubmitSite {
-        if self.fb.offscreen {
-            niri_vk::stats::SubmitSite::OffscreenFrame
-        } else if self.renderer.finish_is_for_kms() {
-            niri_vk::stats::SubmitSite::KmsFrame
-        } else {
-            niri_vk::stats::SubmitSite::DmabufFrame
-        }
+        submit_site_of(self.fb.offscreen, self.renderer.finish_is_for_kms())
     }
 
     /// The command buffer carrying our recorded glyph copies is never going to be submitted, so
@@ -2009,4 +2010,18 @@ fn normalized_src(src: Rectangle<f64, BufferCoord>, texture: &VkTexture) -> [f32
         src.size.w as f32 / tw,
         src.size.h as f32 / th,
     ]
+}
+
+/// Where a frame's submit came from, from the two facts that decide it. A free
+/// function because it is needed once before the [`VulkanFrame`] exists (tagging
+/// the GPU timestamp pair at `begin`) and again from the frame itself at submit
+/// and retire — three call sites that must never disagree about what a frame is.
+fn submit_site_of(offscreen: bool, for_kms: bool) -> niri_vk::stats::SubmitSite {
+    if offscreen {
+        niri_vk::stats::SubmitSite::OffscreenFrame
+    } else if for_kms {
+        niri_vk::stats::SubmitSite::KmsFrame
+    } else {
+        niri_vk::stats::SubmitSite::DmabufFrame
+    }
 }

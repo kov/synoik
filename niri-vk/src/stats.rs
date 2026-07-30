@@ -140,7 +140,11 @@ impl SubmitSite {
         }
     }
 
-    const fn index(self) -> usize {
+    /// Position in [`ALL`](Self::ALL), for the per-site arrays. `pub` because the
+    /// frame log indexes its own GPU-time array with the same taxonomy — one
+    /// vocabulary for where a submit came from, whether we are reporting the CPU's
+    /// wait on it or the GPU time it actually cost.
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
