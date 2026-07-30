@@ -94,7 +94,7 @@ Known gap, systemic rather than this slice's: **RTL is unimplemented**. `barLeve
 mirrors the whole bar for RTL locales; nothing in `src/ui/` does RTL layout anywhere, so the bar
 fills left-to-right regardless. Fixing it belongs to a toolkit-wide RTL pass, not here.
 
-### B — `ShowOSD` on `org.gnome.Shell`
+### B — `ShowOSD` on `org.gnome.Shell` ✅ `dd52b347`
 Add the method to the existing interface in `src/dbus/gnome_shell.rs`, forwarding a
 `ShowOsd { connector, label, level, max_level, icon }` message over the existing channel.
 **This single commit lands volume, mute, mic-mute, kbd-backlight and rotation-lock OSDs**, because
@@ -104,6 +104,12 @@ Details: all params optional; `icon` is a **serialized `GIcon`** (`shellDBus.js:
 both a bare themed name and the `". GThemedIcon name1 name2 …"` form, resolving through
 `IconCache`'s existing candidate-list fallback. `max_level` defaults to 1.0 (`osdWindow.js:86-88`)
 and may exceed it. `connector` routes to one output, absent = all.
+
+**Live-validated** 2026-07-30 on an owned headless harness with a real allowlisted caller (a
+python process owning `org.gnome.SettingsDaemon.MediaKeys`): the pill, icon, bar, label and the red
+overdrive segment past 100% all render; `busctl` (a unique name only) is refused with Access denied.
+The cold-icon trap bit again — a *newly requested* icon name misses the first frame after its first
+request, so always take a second shot.
 
 **Decision — implement the sender allowlist here.** `src/dbus/gnome_shell.rs:10-14` records "no
 sender allowlist" as an existing divergence for the accelerator API; `ShowOSD` is the first method
