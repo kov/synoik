@@ -2,8 +2,21 @@ use futures_util::StreamExt;
 use zbus::fdo;
 use zbus::names::InterfaceName;
 
+use crate::backlight::WriteOutcome;
+
+/// logind resolves this path to the caller's own session, so we never have to look one up.
+const SESSION_PATH: &str = "/org/freedesktop/login1/session/auto";
+const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
+
 pub enum Login1ToNiri {
     LidClosedChanged(bool),
+    /// A [`set_brightness`] call finished, carrying the connector it was for. Drives the
+    /// per-device write serializer ([`crate::backlight::BacklightWriter::write_finished`]), which
+    /// is what keeps a slider drag down to one in-flight D-Bus call.
+    BrightnessWriteDone {
+        connector: String,
+        outcome: WriteOutcome,
+    },
 }
 
 pub fn start(
@@ -102,4 +115,52 @@ pub fn start(
     task.detach();
 
     Ok(conn)
+}
+
+/// Write a backlight brightness through logind: `Session.SetBrightness("backlight", <device>, v)`,
+/// which is how mutter drives the panel without being root (`meta-backlight-sysfs.c:167-173`).
+///
+/// Spawned on the connection's executor rather than called synchronously — a slider drag would
+/// otherwise stall the compositor thread for the D-Bus timeout whenever logind is slow. The
+/// completion comes back as [`Login1ToNiri::BrightnessWriteDone`] because the write serializer
+/// needs it: it is what releases the next write of a drag.
+///
+/// **Divergence (D1):** mutter falls back to a `pkexec mutter-backlight-helper` subprocess when
+/// logind has no `SetBrightness` (old logind, or seatd instead of logind). We ship no such helper,
+/// so a failing write is warned about and dropped.
+pub fn set_brightness(
+    conn: &zbus::blocking::Connection,
+    done: calloop::channel::Sender<Login1ToNiri>,
+    connector: String,
+    device_name: String,
+    brightness: i32,
+) {
+    let async_conn = conn.inner().clone();
+    let future = async move {
+        let value = u32::try_from(brightness).unwrap_or(0);
+        let result = async_conn
+            .call_method(
+                Some("org.freedesktop.login1"),
+                SESSION_PATH,
+                Some(SESSION_IFACE),
+                "SetBrightness",
+                &("backlight", device_name.as_str(), value),
+            )
+            .await;
+
+        let outcome = match result {
+            Ok(_) => WriteOutcome::Done(brightness),
+            Err(err) => {
+                warn!("error setting backlight brightness on {device_name}: {err:?}");
+                WriteOutcome::Failed
+            }
+        };
+
+        let _ = done.send(Login1ToNiri::BrightnessWriteDone { connector, outcome });
+    };
+
+    conn.inner()
+        .executor()
+        .spawn(future, "set login1 backlight brightness")
+        .detach();
 }

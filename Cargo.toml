@@ -107,6 +107,9 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 tracy-client.workspace = true
+# Direct libudev access for the `backlight` subsystem: smithay's UdevBackend is DRM-only, and
+# mutter watches {drm, backlight} (`meta-udev.c:357-367`). Already in the tree via smithay.
+udev = "0.9.3"
 wayland-backend = "0.3.15"
 wayland-scanner = "0.31.10"
 wayland-server = "0.31.13"

@@ -247,9 +247,11 @@ impl DBusServers {
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
-        match freedesktop_login1::start(to_niri) {
+        match freedesktop_login1::start(to_niri.clone()) {
             Ok(conn) => {
                 dbus.conn_login1 = Some(conn);
+                // Kept for the backlight write path, which needs to report completions back.
+                niri.login1_tx = Some(to_niri);
             }
             Err(err) => {
                 warn!("error starting login1 watcher: {err:?}");

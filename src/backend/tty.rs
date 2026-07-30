@@ -33,8 +33,11 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, OutputModeSource, PhysicalProperties, Scale};
+use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{Dispatcher, LoopHandle, RegistrationToken};
+use smithay::reexports::calloop::{
+    Dispatcher, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
+};
 use smithay::reexports::drm::control::atomic::AtomicModeReq;
 use smithay::reexports::drm::control::dumbbuffer::DumbBuffer;
 use smithay::reexports::drm::control::{
@@ -57,6 +60,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::{IpcOutputMap, RenderResult};
+use crate::backend::backlight::{BacklightMonitor, Backlights};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
@@ -104,6 +108,9 @@ pub struct Tty {
     // it, feeding `DrmCompositor`. Built in `Tty::new`, so this is always `Some` -- it stays an
     // Option only because the field is moved through by `with_vulkan_renderer`.
     vulkan_renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
+    // Per-output display backlights, matched from the udev `backlight` subsystem. Only the TTY
+    // backend has any (mutter's MetaBacklight is native-backend-only too).
+    pub backlights: Backlights,
 }
 
 type GbmDrmCompositor = DrmCompositor<
@@ -494,6 +501,26 @@ impl Tty {
         info!("using the owned Vulkan renderer for the TTY backend");
         let vulkan_renderer = Some(vulkan_renderer);
 
+        // Display backlights sit on their own udev subsystem, which the DRM-only UdevBackend above
+        // does not watch; mutter watches `{drm, backlight}` (`meta-udev.c:357-367`). External
+        // changes (a firmware hotkey, another tool, or the echo of our own write) arrive here.
+        let backlights = Backlights::new();
+        match BacklightMonitor::new() {
+            Ok(monitor) => {
+                let source = Generic::new(monitor, Interest::READ, CalloopMode::Level);
+                let res = event_loop.insert_source(source, |_, monitor, state: &mut State| {
+                    for event in monitor.drain() {
+                        state.on_backlight_uevent(&event);
+                    }
+                    Ok(PostAction::Continue)
+                });
+                if let Err(err) = res {
+                    warn!("error inserting the backlight udev source: {err:?}");
+                }
+            }
+            Err(err) => warn!("error watching the backlight udev subsystem: {err:?}"),
+        }
+
         Ok(Self {
             config,
             session,
@@ -508,6 +535,7 @@ impl Tty {
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
             vulkan_renderer,
+            backlights,
         })
     }
 

@@ -2428,6 +2428,7 @@ dependencies = [
  "tracing-subscriber",
  "tracy-client",
  "tzf-rs",
+ "udev",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",

@@ -7,6 +7,7 @@ pub mod animation;
 pub mod app_system;
 pub mod audio;
 pub mod backend;
+pub mod backlight;
 pub mod calendar_events;
 pub mod cli;
 pub mod cursor;

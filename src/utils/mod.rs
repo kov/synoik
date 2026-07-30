@@ -324,8 +324,49 @@ pub fn output_matches_name(output: &Output, target: &str) -> bool {
     name.matches(target)
 }
 
+/// Whether a connector drives a built-in panel: mutter's `meta_output_info_is_builtin`
+/// (`meta-output.c:520-533`), the one predicate behind both the "Built-in display" name and the
+/// backlight device preference ([`crate::backlight::find_backlight`]).
+///
+/// The prefixes are the drm crate's `Interface::as_str` spellings, which are the kernel's.
 pub fn is_laptop_panel(connector: &str) -> bool {
-    matches!(connector.get(..4), Some("eDP-" | "LVDS" | "DSI-"))
+    ["eDP-", "LVDS-", "DSI-", "DPI-"]
+        .iter()
+        .any(|prefix| connector.starts_with(prefix))
+}
+
+/// The monitor's user-visible name — mutter's `meta_monitor_get_display_name`.
+///
+/// Shared by the `DisplayConfig` service and the per-monitor brightness rows
+/// ([`crate::backlight::OutputBacklight::display_name`]); gnome-shell names a brightness scale
+/// after its first monitor's display name (`brightnessManager.js:338`).
+// Adapted from Mutter.
+pub fn make_display_name(output: &niri_ipc::Output, is_laptop_panel: bool) -> String {
+    if is_laptop_panel {
+        return String::from("Built-in display");
+    }
+
+    let make = &output.make;
+    let model = &output.model;
+    if let Some(diagonal) = output.physical_size.map(|(width_mm, height_mm)| {
+        let diagonal = f64::hypot(f64::from(width_mm), f64::from(height_mm)) / 25.4;
+        format_diagonal(diagonal)
+    }) {
+        format!("{make} {diagonal}")
+    } else if model != "Unknown" {
+        format!("{make} {model}")
+    } else {
+        make.clone()
+    }
+}
+
+pub fn format_diagonal(diagonal_inches: f64) -> String {
+    let known = [12.1, 13.3, 15.6];
+    if let Some(d) = known.iter().find(|d| (*d - diagonal_inches).abs() < 0.1) {
+        format!("{d:.1}″")
+    } else {
+        format!("{}″", diagonal_inches.round() as u32)
+    }
 }
 
 /// Returns the geometry of the surface.
@@ -601,7 +642,18 @@ pub fn cause_panic() {
 
 #[cfg(test)]
 mod tests {
+    use insta::assert_snapshot;
+
     use super::*;
+
+    #[test]
+    fn test_format_diagonal() {
+        assert_snapshot!(format_diagonal(12.11), @"12.1″");
+        assert_snapshot!(format_diagonal(13.28), @"13.3″");
+        assert_snapshot!(format_diagonal(15.6), @"15.6″");
+        assert_snapshot!(format_diagonal(23.2), @"23″");
+        assert_snapshot!(format_diagonal(24.8), @"25″");
+    }
 
     #[test]
     fn test_clamp_preferring_top_left() {

@@ -197,9 +197,9 @@ use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
-    logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_laptop_panel,
+    is_mapped, logical_output, make_display_name, make_screenshot_path, output_matches_name,
+    output_size, panel_orientation, send_scale_transform, write_png_rgba8, xwayland,
 };
 use crate::wallpaper::Wallpaper;
 use crate::window::mapped::MappedId;
@@ -474,6 +474,14 @@ pub struct Niri {
     #[cfg(feature = "dbus")]
     pub system_status_tx:
         Option<calloop::channel::Sender<crate::dbus::system_status::SystemStatusToNiri>>,
+    /// Every output that has a usable display backlight, with its current brightness. Empty
+    /// without the TTY backend or without backlight hardware — which is also how the brightness
+    /// slider stays absent, as in GNOME (`brightness.js:59-60`).
+    pub backlight: crate::backlight::BacklightSnapshot,
+    /// A clone of the login1 watcher's inbound channel, so a brightness write can report its
+    /// completion back to the write serializer through the same path.
+    #[cfg(feature = "dbus")]
+    pub login1_tx: Option<calloop::channel::Sender<crate::dbus::freedesktop_login1::Login1ToNiri>>,
     /// The notifications model behind the banner/list/indicator surfaces and the
     /// `org.freedesktop.Notifications` server (empty when the server isn't running,
     /// e.g. headless or without the `dbus` feature).
@@ -2827,6 +2835,10 @@ impl State {
         #[cfg(feature = "dbus")]
         self.niri.on_ipc_outputs_changed();
 
+        // The backlight device match depends on the connector set and on each connector's
+        // `enabled` attribute, which flips on mode-set — so it rides the same funnel.
+        self.refresh_backlights();
+
         let new_config = self.backend.ipc_outputs().lock().unwrap().clone();
         self.niri.output_management_state.notify_changes(new_config);
     }
@@ -3083,11 +3095,100 @@ impl State {
 
     #[cfg(feature = "dbus")]
     pub fn on_login1_msg(&mut self, msg: Login1ToNiri) {
-        let Login1ToNiri::LidClosedChanged(is_closed) = msg;
-
-        trace!("login1 lid {}", if is_closed { "closed" } else { "opened" });
-        self.set_lid_closed(is_closed);
+        match msg {
+            Login1ToNiri::LidClosedChanged(is_closed) => {
+                trace!("login1 lid {}", if is_closed { "closed" } else { "opened" });
+                self.set_lid_closed(is_closed);
+            }
+            Login1ToNiri::BrightnessWriteDone { connector, outcome } => {
+                let Some(tty) = self.backend.tty_checked() else {
+                    return;
+                };
+                // The serializer hands back the one write a drag queued up while this one was in
+                // flight (`meta-backlight.c:139-148`).
+                if let Some(write) = tty.backlights.write_finished(&connector, outcome) {
+                    self.send_backlight_write(write);
+                }
+            }
+        }
     }
+
+    /// A `backlight`-subsystem uevent: an external brightness change, or a device coming or going.
+    pub fn on_backlight_uevent(&mut self, event: &crate::backend::backlight::BacklightUevent) {
+        let Some(tty) = self.backend.tty_checked() else {
+            return;
+        };
+        if tty.backlights.handle_uevent(event) {
+            let snapshot = tty.backlights.snapshot();
+            self.niri.backlight = snapshot;
+            trace!("backlight changed: {:?}", self.niri.backlight);
+        }
+    }
+
+    /// Re-match backlight devices against the connected outputs. Runs off the same funnel as the
+    /// IPC output refresh, so it catches hotplug, mode-set (a connector's `enabled` attribute is
+    /// part of the device match) and output-config changes alike.
+    pub fn refresh_backlights(&mut self) {
+        let outputs: Vec<(String, String)> = self
+            .backend
+            .ipc_outputs()
+            .lock()
+            .unwrap()
+            .values()
+            .map(|output| {
+                let display_name = make_display_name(output, is_laptop_panel(&output.name));
+                (output.name.clone(), display_name)
+            })
+            .collect();
+
+        let Some(tty) = self.backend.tty_checked() else {
+            return;
+        };
+        if tty.backlights.set_outputs(outputs) {
+            let snapshot = tty.backlights.snapshot();
+            self.niri.backlight = snapshot;
+            debug!("backlights: {:?}", self.niri.backlight);
+        }
+    }
+
+    /// Ask the hardware for a new brightness on one output. Goes through the write serializer, so
+    /// a slider drag stays at one in-flight logind call.
+    pub fn set_backlight_brightness(&mut self, connector: &str, brightness: i32) {
+        let Some(tty) = self.backend.tty_checked() else {
+            return;
+        };
+        let Some(write) = tty.backlights.request(connector, brightness) else {
+            return;
+        };
+        let snapshot = tty.backlights.snapshot();
+        self.niri.backlight = snapshot;
+        self.send_backlight_write(write);
+    }
+
+    #[cfg(feature = "dbus")]
+    fn send_backlight_write(&mut self, write: crate::backend::backlight::PendingWrite) {
+        let Some(dbus) = self.niri.dbus.as_ref() else {
+            return;
+        };
+        let Some(conn) = dbus.conn_login1.as_ref() else {
+            return;
+        };
+        let Some(tx) = self.niri.login1_tx.as_ref() else {
+            return;
+        };
+        crate::dbus::freedesktop_login1::set_brightness(
+            conn,
+            tx.clone(),
+            write.connector,
+            write.device_name,
+            write.brightness,
+        );
+    }
+
+    /// Without D-Bus there is no logind to write through, and no pkexec helper fallback (D1), so
+    /// the backlight is read-only.
+    #[cfg(not(feature = "dbus"))]
+    fn send_backlight_write(&mut self, _write: crate::backend::backlight::PendingWrite) {}
 
     #[cfg(feature = "dbus")]
     pub fn on_locale1_msg(&mut self, msg: Locale1ToNiri) {
@@ -3870,6 +3971,9 @@ impl Niri {
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
+            backlight: crate::backlight::BacklightSnapshot::default(),
+            #[cfg(feature = "dbus")]
+            login1_tx: None,
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
             accel_grab_release_pending: HashMap::new(),

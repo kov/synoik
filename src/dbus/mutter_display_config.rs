@@ -11,8 +11,8 @@ use zbus::{fdo, interface};
 
 use super::Start;
 use crate::backend::IpcOutputMap;
-use crate::utils::is_laptop_panel;
 use crate::utils::scale::supported_scales;
+use crate::utils::{is_laptop_panel, make_display_name};
 
 pub struct DisplayConfig {
     to_niri: calloop::channel::Sender<HashMap<String, Option<niri_config::Output>>>,
@@ -342,26 +342,6 @@ impl Start for DisplayConfig {
     }
 }
 
-// Adapted from Mutter.
-fn make_display_name(output: &niri_ipc::Output, is_laptop_panel: bool) -> String {
-    if is_laptop_panel {
-        return String::from("Built-in display");
-    }
-
-    let make = &output.make;
-    let model = &output.model;
-    if let Some(diagonal) = output.physical_size.map(|(width_mm, height_mm)| {
-        let diagonal = f64::hypot(f64::from(width_mm), f64::from(height_mm)) / 25.4;
-        format_diagonal(diagonal)
-    }) {
-        format!("{make} {diagonal}")
-    } else if model != "Unknown" {
-        format!("{make} {model}")
-    } else {
-        make.clone()
-    }
-}
-
 /// Parse a mode id as minted by `get_current_state` — `"{width}x{height}@{rate:.3}"` — back into
 /// `(width, height, rate)` for persistence. Falls back to `(0, 0, 60.0)` on a malformed id (the
 /// ids we hand out always parse; the fallback just keeps a rogue client from writing garbage).
@@ -372,29 +352,4 @@ fn parse_mode_id(mode: &str) -> (i32, i32, f64) {
         Some((w.parse().ok()?, h.parse().ok()?, rate.parse().ok()?))
     })()
     .unwrap_or((0, 0, 60.0))
-}
-
-fn format_diagonal(diagonal_inches: f64) -> String {
-    let known = [12.1, 13.3, 15.6];
-    if let Some(d) = known.iter().find(|d| (*d - diagonal_inches).abs() < 0.1) {
-        format!("{d:.1}″")
-    } else {
-        format!("{}″", diagonal_inches.round() as u32)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use insta::assert_snapshot;
-
-    use super::*;
-
-    #[test]
-    fn test_format_diagonal() {
-        assert_snapshot!(format_diagonal(12.11), @"12.1″");
-        assert_snapshot!(format_diagonal(13.28), @"13.3″");
-        assert_snapshot!(format_diagonal(15.6), @"15.6″");
-        assert_snapshot!(format_diagonal(23.2), @"23″");
-        assert_snapshot!(format_diagonal(24.8), @"25″");
-    }
 }

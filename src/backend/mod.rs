@@ -9,6 +9,8 @@ use smithay::output::Output;
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
 
+pub mod backlight;
+
 pub mod tty;
 pub use tty::Tty;
 
