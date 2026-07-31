@@ -424,19 +424,28 @@ export default class UiDumpExtension extends Extension {
         return `opened ${label}; dumping when allocated (result goes to the journal)`;
     }
 
-    // Poll until every requested class has at least one mapped match with a non-zero allocation,
-    // then hand over. Polling rather than a single `later_add`: the menu's children are built
-    // lazily on open, so "one layout pass from now" is not reliably late enough.
+    // Poll until the requested classes are laid out, then hand over. Polling rather than a single
+    // `later_add`: the menu's children are built lazily on open, so "one layout pass from now" is
+    // not reliably late enough.
+    //
+    // "Ready" cannot mean *every* class has a mapped match: a class is often legitimately absent
+    // (asking for `.message` with no notifications pending), and waiting for it would burn the
+    // whole timeout and then dump the classes that WERE ready with a scary warning. So: every class
+    // that matched anything must have a mapped, allocated match, and at least one must have matched.
     _whenAllocated(styleClasses, done) {
         let tries = 0;
         const poll = () => {
             tries++;
+            let anyPresent = false;
             const ready = styleClasses.every((styleClass) => {
                 const found = findAll(
                     global.stage, (actor) => hasClass(actor, styleClass), []);
+                if (found.length === 0)
+                    return true;
+                anyPresent = true;
                 return found.some(
                     (a) => a.mapped && a.get_allocation_box().get_width() > 0);
-            });
+            }) && anyPresent;
             if (!ready && tries < MAX_ALLOCATION_POLLS)
                 return GLib.SOURCE_CONTINUE;
             this._timeout = null;
