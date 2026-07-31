@@ -6574,10 +6574,15 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         (card, expand, actions)
     };
 
-    // Collapsed: 90px card, live caret, no action row.
+    // Collapsed: a one-icon-row card, live caret, no action row. The height is the reference box
+    // model (`_message-list.scss:83,118-120,160`), not a number to re-baseline when it moves.
+    let collapsed_h = {
+        use crate::ui::notification_card::{BODY_ICON, HEADER_H, HEADER_PAD_B, PAD};
+        PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
+    };
     let ((cid, card, _), expand, actions) = dm(&mut f);
     assert_eq!(cid, id);
-    assert_eq!(card.size.h, 90.);
+    assert_eq!(card.size.h, collapsed_h);
     assert!(actions.is_empty(), "actions hidden until expanded");
     let caret = expand.expect("a long body makes the caret live");
 
@@ -6589,7 +6594,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     let ((_, card, _), expand, actions) = dm(&mut f);
     assert_eq!(
         card.size.h,
-        90. + 5. * 18. + 28. + 6.,
+        collapsed_h + 5. * 18. + 28. + 6.,
         "six body lines + the action row"
     );
     assert_eq!(actions.len(), 2);
@@ -6604,7 +6609,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     assert_eq!(aid, id);
     assert_eq!(
         a_card.size.h,
-        90. + 5. * 18. + 28. + 6.,
+        collapsed_h + 5. * 18. + 28. + 6.,
         "still fully expanded (six lines); the list scrolls, no clamp"
     );
 
@@ -6618,7 +6623,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         .unwrap();
     click(&mut f, rect_center(caret));
     let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
-    assert_eq!(rects[1].1.size.h, 90.);
+    assert_eq!(rects[1].1.size.h, collapsed_h);
     assert!(f
         .niri()
         .panel_popover

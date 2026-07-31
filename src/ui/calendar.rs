@@ -735,7 +735,18 @@ fn list_w() -> f64 {
 /// the popover box and its content. Applied on the left (before the list column),
 /// the right (after the calendar column), and the bottom (below the calendar
 /// column) in [`DateMenu::logical_size`]; the top comes from the grid's own inset.
-const LIST_PAD: f64 = 6.;
+///
+/// Two containers stack here: `.popup-menu-content` `padding: $base_padding` (6px,
+/// `_popovers.scss:28`) and `#calendarArea` `padding: $base_margin` (4px, `_calendar.scss:5`).
+/// **Measured** on a real GNOME shot (`gnomes.png`): the first card's left edge sits 10px inside
+/// the popover border, and its top 10-11px below — matching 6+4, not 6.
+const LIST_PAD: f64 = 10.;
+
+/// [`LIST_PAD`], for tests that place sample points relative to the list rather than to a literal.
+#[cfg(test)]
+pub(crate) fn list_pad() -> f64 {
+    LIST_PAD
+}
 /// `.message-list:ltr` margin-right, separating the two columns
 /// (`_message-list.scss:11`).
 const LIST_MARGIN_R: f64 = 4.;
@@ -4226,9 +4237,10 @@ mod tests {
         assert_eq!(groups.len(), 1);
         let (_, bounds, expanded) = &groups[0];
         assert!(!expanded);
-        // A lone card is 90px; the stack adds the two visible peeks' offsets
-        // (10 + 10/1.4), i.e. it is taller but not by a whole card.
-        let expected = 90. + STACK_HEIGHT_OFFSET_LOCAL;
+        // The stack adds the two visible peeks' offsets (10 + 10/1.4) to a lone card, i.e. it is
+        // taller but not by a whole card. The lone card's height comes from the box model rather
+        // than a literal, so a padding fix does not read as a stacking regression.
+        let expected = lone_card_h() + STACK_HEIGHT_OFFSET_LOCAL;
         assert!(
             (bounds.size.h - expected).abs() < 0.01,
             "stack height {} vs {expected}",
@@ -4236,8 +4248,15 @@ mod tests {
         );
     }
 
-    // The two visible peeks add 10 + 10/1.4 to the top card's 90px.
+    // The two visible peeks add 10 + 10/1.4 to the top card.
     const STACK_HEIGHT_OFFSET_LOCAL: f64 = 10. + 10. / 1.4;
+
+    /// One collapsed `.message` with a body icon: the reference box model
+    /// (`_message-list.scss:83,118-120,160`).
+    fn lone_card_h() -> f64 {
+        use notification_card::{BODY_ICON, HEADER_H, HEADER_PAD_B, PAD};
+        PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
+    }
 
     /// Clicking a collapsed stack expands it into a header + vertical list;
     /// the close button in the collapsed state closes the WHOLE group, and the

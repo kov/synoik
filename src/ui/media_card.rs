@@ -46,8 +46,8 @@ use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{
-    BODY_ICON, BTN_RADIUS, CARD_BG, CARD_HOVER_BG, CIRCLE_BG, HEADER_FG, HEADER_H, LINE_H, PAD,
-    SMALL_ICON, TEXT, TRANSPARENT,
+    BODY_ICON, BTN_RADIUS, CARD_BG, CARD_HOVER_BG, CIRCLE_BG, HEADER_FG, HEADER_H, HEADER_PAD_B,
+    ICON_MARGIN, LINE_H, PAD, SMALL_ICON, TEXT, TRANSPARENT,
 };
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
 
@@ -196,7 +196,7 @@ impl MediaLayout {
 /// action bin and its body is a single line.
 pub fn layout(width: f64) -> MediaLayout {
     let header_y = PAD;
-    let body_y = header_y + HEADER_H + PAD;
+    let body_y = header_y + HEADER_H + HEADER_PAD_B + PAD;
 
     let source_icon = Rectangle::new(
         Point::from((PAD * 2., header_y + (HEADER_H - SMALL_ICON) / 2.)),
@@ -217,14 +217,14 @@ pub fn layout(width: f64) -> MediaLayout {
         )
     });
 
-    let text_x = art.loc.x + BODY_ICON + PAD;
+    let text_x = art.loc.x + BODY_ICON + PAD + ICON_MARGIN;
     let text = Rectangle::new(
         Point::from((text_x, body_y)),
         Size::from(((controls_x - PAD - text_x).max(1.), BODY_ICON)),
     );
 
     MediaLayout {
-        size: Size::from((width, body_y + BODY_ICON + PAD)),
+        size: Size::from((width, body_y + BODY_ICON + PAD * 2.)),
         source_icon,
         art,
         controls,
@@ -514,8 +514,17 @@ mod tests {
         assert!(l.text.loc.x >= l.art.loc.x + l.art.size.w);
         assert!(l.text.loc.x + l.text.size.w <= l.controls[0].loc.x);
 
-        // A media card is the height of a single-line notification card: header + icon row.
-        assert_eq!(l.size.h, PAD + HEADER_H + PAD + BODY_ICON + PAD);
+        // A media card is the height of a single-line notification card, and that height is the
+        // reference's box model stacked up: `.message` padding, the header content row and its
+        // own padding-bottom, `.message-box` padding, the 48px icon, then `.message-box` and
+        // `.message` padding again (`_message-list.scss:83,118-120,160`).
+        assert_eq!(
+            l.size.h,
+            PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
+        );
+        // The gap between the art and the text is `.message-box` spacing *plus* the icon's own
+        // margin — two separate 6px, not one (`_message-list.scss:163,168-170`).
+        assert_eq!(l.text.loc.x, l.art.loc.x + BODY_ICON + PAD + ICON_MARGIN);
     }
 
     /// Hit-testing resolves a point to the control under it, and to nothing off the row.

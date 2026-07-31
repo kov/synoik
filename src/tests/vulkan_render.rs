@@ -2867,8 +2867,9 @@ fn vulkan_renders_a_grouped_stack_and_header() {
     let samples = render_sample(
         &mut f,
         vec![
-            (bounds.size.w / 2., bounds.loc.y + 95.), // second-in-stack
-            (bounds.size.w / 2., bounds.loc.y + 103.5), // lower-in-stack
+            // The peeks start just below the top card, so both offsets follow its height.
+            (bounds.size.w / 2., bounds.loc.y + collapsed_card_h() + 5.), // second-in-stack
+            (bounds.size.w / 2., bounds.loc.y + collapsed_card_h() + 13.5), // lower-in-stack
         ],
     );
     let (second, lower) = (samples[0], samples[1]);
@@ -2979,6 +2980,7 @@ fn vulkan_renders_the_scrolled_message_list() {
     let w = to_physical_precise_round(scale.x, output_size(&output).w);
     let h = to_physical_precise_round(scale.x, 500.);
     let list_w = 29. * crate::ui::pt_to_px(11.);
+    let list_pad = crate::ui::calendar::list_pad();
 
     let state = f.niri_state();
     let samples = state
@@ -2998,18 +3000,18 @@ fn vulkan_renders_the_scrolled_message_list() {
                 let i = ((py * w + px) * 4) as usize;
                 [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
             };
-            let cx = 6. + (list_w - 18.) / 2.;
-            // The top card's bg (clipped content in the viewport).
-            let card = at(cx, 6. + 40.);
+            let cx = list_pad + (list_w - 18.) / 2.;
+            // The top card's bg (clipped content in the viewport), inside its header row.
+            let card = at(cx, list_pad + 40.);
             // The collapsed stack's two peek bands, baked through the scroll
             // path: second-in-stack [90,100] must render OVER (lighter than)
             // the deeper lower-in-stack [100,107]. If the bake's z-order is
             // wrong (missing the `.rev()`), the card bg paints over the peeks
             // and the icons, and this ordering flips.
-            let second = at(cx, 6. + 95.);
-            let lower = at(cx, 6. + 103.5);
+            let second = at(cx, list_pad + collapsed_card_h() + 5.);
+            let lower = at(cx, list_pad + collapsed_card_h() + 13.5);
             // The scrollbar thumb strip, near the viewport top (scroll at 0).
-            let thumb = at(list_w - 7., 6. + 12.);
+            let thumb = at(list_w - 7., list_pad + 12.);
             (card, second, lower, thumb)
         })
         .expect("vulkan renderer");
@@ -10885,8 +10887,12 @@ fn vulkan_renders_the_media_card() {
                 card_rect.loc.y + card_rect.size.h - 4.,
             );
             // The art slot's top-left corner area, inside its rounded backdrop but clear of the
-            // 32px fallback glyph.
-            let art_px = sample(card_rect.loc.x + 16., card_rect.loc.y + 40.);
+            // centred 32px fallback glyph. Taken from the layout, not a literal.
+            let slot = crate::ui::media_card::layout(card_rect.size.w).art;
+            let art_px = sample(
+                card_rect.loc.x + slot.loc.x + 4.,
+                card_rect.loc.y + slot.loc.y + 4.,
+            );
             // The play/pause glyph. Its dead centre is the GAP between the pause bars, so scan
             // the row across the icon and keep the brightest pixel.
             let cy = controls[1].loc.y + controls[1].size.h / 2.;
@@ -10914,6 +10920,15 @@ fn vulkan_renders_the_media_card() {
             "the play-pause glyph must composite above the card, got {ctrl_px:?}"
         );
     }
+}
+
+/// One collapsed `.message` with a body icon, from the reference box model
+/// (`_message-list.scss:83,118-120,160`). Sample points below are expressed relative to this
+/// rather than as literals, so a padding correction does not read as a stacking or z-order
+/// regression in three unrelated tests.
+fn collapsed_card_h() -> f64 {
+    use crate::ui::notification_card::{BODY_ICON, HEADER_H, HEADER_PAD_B, PAD};
+    PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
 }
 
 /// A player publishing `mpris:artUrl` draws the cover in the icon slot, and drawing it takes the

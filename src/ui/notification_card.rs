@@ -32,6 +32,13 @@ use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle}
 pub const PAD: f64 = 6.;
 /// `.message-header-content` min-height (`_message-list.scss:118`).
 pub const HEADER_H: f64 = 24.;
+/// `.message-header-content` padding-bottom (`_message-list.scss:120`). Separate from [`PAD`]
+/// because it stacks *with* `.message-box`'s own top padding: the body row starts
+/// `PAD + HEADER_H + HEADER_PAD_B + PAD` down, not `PAD + HEADER_H + PAD`.
+pub const HEADER_PAD_B: f64 = 6.;
+/// `.message-icon` margin (`_message-list.scss:168-170`), which stacks with `.message-box`'s
+/// `spacing` — so the gap between the 48px icon and the text column is two of these, not one.
+pub const ICON_MARGIN: f64 = 6.;
 /// `.message-icon` icon-size = 48px (`_message-list.scss:168`).
 pub const BODY_ICON: f64 = 48.;
 /// Header/source/close icons (`$scalable_icon_size`).
@@ -302,7 +309,7 @@ pub fn layout_clamped(
     max_lines: usize,
 ) -> CardLayout {
     let header_y = PAD;
-    let body_y = header_y + HEADER_H + PAD;
+    let body_y = header_y + HEADER_H + HEADER_PAD_B + PAD;
     let show_actions = expanded && !content.actions.is_empty();
     let actions_h = if show_actions { BTN_H + PAD } else { 0. };
 
@@ -335,7 +342,7 @@ pub fn layout_clamped(
 
     // The body column: wrapped to the space right of the icon, minus the
     // card's edge padding.
-    let text_x = PAD * 2. + body_icon.map_or(0., |_| BODY_ICON + PAD);
+    let text_x = PAD * 2. + body_icon.map_or(0., |_| BODY_ICON + PAD + ICON_MARGIN);
     let text_w = (width - text_x - PAD).max(1.);
     let body_lines = if content.body.is_empty() {
         Vec::new()
@@ -370,7 +377,7 @@ pub fn layout_clamped(
     // first grows it (one line expanded == collapsed, so toggling a short
     // body only reveals the action row).
     let body_h = BODY_ICON + (body_lines.len().saturating_sub(1)) as f64 * LINE_H;
-    let h = body_y + body_h + PAD + actions_h;
+    let h = body_y + body_h + PAD * 2. + actions_h;
 
     let mut actions = Vec::new();
     if show_actions {
