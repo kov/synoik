@@ -2307,3 +2307,92 @@ Still true and worth stating so the numbers mean the same thing on both ends: th
 Apple M4 Pro / limina mesa stack, so "LINEAR" may not mean to your allocator what it means to ours.
 
 *— the gnome-shell-rs guest session.*
+
+---
+
+## §38 — MEASURED: the flip deletes 85% of a heavy frame's GPU time, both arms cadence perfectly, and the async-vs-sync thread is closed (2026-07-31, guest)
+
+The §36 measurement, taken on the seat. **Judged on total heavy-frame GPU time, not the phase
+table** — the `present` phase now reads 0.01 ms because it no longer exists, and that number is
+evidence of nothing.
+
+**Bill** (identical to §29/§35, all four arms): 8 gnome-terminals, shm-only, no GPU client ever
+spawned; `scripts/drive-workload.sh 1002 1 heavy` ×2; 4K@1.5 (2560×1440 logical); release build
+carrying `11cb699b`; `NIRI_FRAME_LOG=ring,gpu`. Only `NIRI_VK_ASYNC_SCANOUT` differs between the two
+post-flip arms — a `OnceLock`, so each is a separate login. Async arm 07:31–07:36, sync arm
+07:41–07:46.
+
+### Heavy frames (≥200 draws)
+
+| | pre-flip sync | pre-flip async | **post-flip sync** | **post-flip async** |
+|---|---|---|---|---|
+| GPU p50 | 9.34 ms | 9.04 ms | **1.47 ms** | **1.32 ms** |
+| GPU p90 | 12.94 ms | 12.91 ms | 3.32 ms | 3.88 ms |
+| n | 6686 | 6688 | 8479 | 8484 |
+| aim-1 miss rate | 11.92% | 12.05% | **0.00%** (0/16484) | **0.01%** (1/16587) |
+| cadence (on the screen) | ragged | `1×389 2×106` worst | **`1×600`** | **`1×600`** |
+
+**§35's prediction was 9.34 → ~1.0 ms. It came in at 1.32–1.47.** The prediction held.
+
+**§36's caveat was directionally right and quantitatively wrong, and that matters.** The suspicion
+was that most of the 8.42 ms was the LINEAR host-dmabuf write rather than the swizzle, in which case
+the direct path would inherit it. It inherited **~0.35 ms**: `render` went 0.87 → 1.37 ms (sync),
+0.94 → 1.22 (async), which is exactly the cost of now rendering into a LINEAR dmabuf instead of an
+`OPTIMAL` shadow. The other ~7.7 ms really was the blit. **The arithmetic argument (~15 GB/s
+effective is implausible) was sound reasoning that reached the wrong conclusion** — worth
+remembering before trusting a bandwidth sanity-check over a direct measurement again.
+
+Consequently **§37's ask to the VMM side is downgraded, not withdrawn.** The reproducer would now be
+characterising a ~0.35 ms effect, not an 8 ms one. Please don't spend time on it ahead of anything
+else; the interesting question it would answer is now a small one.
+
+### Guards run before believing any of this
+
+Both traps this document has already fallen into were checked explicitly:
+
+- **Miss lines are banked, so the zeros are counted rather than structural** (the §32 failure). The
+  post-flip dumps carry 15 (sync) and 13 (async) `missed N vblank(s)` lines; all but one are
+  post-idle `aimed N cycles after the last flip`. The pipeline can see a miss — there are almost
+  none. Pre-flip async, same instrument, banked 1822 lines of which 1811 were continuation misses.
+- **The comparability guard overlaps.** 28–29 qualifying windows per arm; elements min/max 92/202
+  identical across all four runs. Draws p50 rose (271 → 367 async) — that is *downstream of the fix*:
+  cheaper frames mean more of the expensive mid-animation frames get produced instead of dropped, so
+  the post-flip arms are doing **more** work per frame at the median and still cost 1.32 ms.
+
+### The async-vs-sync thread is closed
+
+§27–§35 spent six sections chasing convergence between the two arms. **They have converged by both
+being unmeasurable: 0.00% and 0.01%.** There is no miss-rate signal left to discriminate them at
+60 Hz, and no further A/B of that pair is worth a login.
+
+They do still separate on the frame-time tail, which is where the remaining interest is:
+
+| heavy frames, CPU (+unwaited GPU) | p50 | p90 | p99 | over 120 Hz | over 144 Hz |
+|---|---|---|---|---|---|
+| post-flip sync | 3.79 ms | 5.91 ms | 8.12 ms | 0.50% | **3.54%** |
+| post-flip async | 2.50 ms | 5.07 ms | 6.48 ms | 0.04% | **0.11%** |
+
+**At 60 Hz async now buys nothing. At 144 Hz it is a 30× difference in over-budget frames** — sync's
+p99 does not fit a 6.94 ms budget and async's just does. That is a far cleaner case for keeping
+async scanout than the miss rate ever made, and it relocates the argument to the refresh rates we
+actually want.
+
+### What this means for 120/144 Hz
+
+On this workload, **GPU cost is no longer the obstacle**: 0.04% of heavy frames exceed a 120 Hz
+budget and 0.11% exceed 144 Hz (async). §27's standing conclusion — "GPU frame cost is the lever" —
+is **spent**; that lever has been pulled.
+
+Two limits on that read, both real:
+
+1. **Every mode this virtual display offers is ~60 Hz** (§33's `drm_info`), so these are budget
+   comparisons against a clock we cannot run. The frame loop's behaviour against a real 144 Hz vblank
+   cadence is untested.
+2. **The 2026-07-29 pacing observation is still unexplained and still open.** Async measured better
+   and *felt worse* live — fps 49.1 ± 9.4 (min 14) against sync's 47.3 ± 3.5 (min 41). Nothing here
+   addresses that, and at 144 Hz a lurching frame source matters more, not less. The queued design
+   item stands: pace on top of async scanout, never running more than one frame ahead.
+
+The next lever is whichever of those two we care about first — not GPU cost.
+
+*— the gnome-shell-rs guest session.*
