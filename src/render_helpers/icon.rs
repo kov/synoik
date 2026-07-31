@@ -11,9 +11,11 @@
 //!   `g_app_info_get_icon()`): resolved through the `freedesktop-icons` crate (real theme
 //!   inheritance + size directories) and decoded **keeping their own colors** — raster (PNG/…) via
 //!   the `image` crate, SVG via `resvg`. Falls back to `application-x-executable` (GNOME's
-//!   `St.Icon` fallback). Its [`image`](AppIconCache::image) door decodes a plain **local image
-//!   file** through the same machinery with that fallback off — album art, where an executable
-//!   glyph would silently displace the caller's own themed fallback.
+//!   `St.Icon` fallback).
+//! - [`ImageCache`] draws images an *app* pointed us at ([`ImageSource`]): album art, local or
+//!   fetched. Same decode core, but a separate cache because almost everything around it differs —
+//!   no themed fallback, its own worker so a slow fetch cannot stall icon decodes, and an
+//!   open-ended key space that has to be evicted.
 //!
 //! Both return a premultiplied `Abgr8888` [`MemoryBuffer`] tagged at the output
 //! scale (never `1.` — the buffer-scale-tag trap) that the caller composites like
@@ -37,6 +39,7 @@ use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Scale, Size, Transform};
 
 use crate::app_system::AppIconRef;
+use crate::image_source::{remote_is_permitted, ImageSource, FETCH_TIMEOUT, MAX_FETCH_BYTES};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -585,14 +588,8 @@ fn render_svg_pixmap(
     Ok(pixmap)
 }
 
-/// The cache key for a decoded app icon: descriptor + logical + physical size + whether a
-/// resolve/decode failure may fall back to `application-x-executable`.
-///
-/// The fallback flag is part of the *key*, not just the request: the same file decoded for an app
-/// tile (where a failure becomes the executable glyph) and for [`AppIconCache::image`] (where a
-/// failure must stay `None`, so the caller can draw its own themed fallback) are different results,
-/// and one must never be served in place of the other.
-type IconKey = (AppIconRef, u16, u32, bool);
+/// The cache key for a decoded app icon: descriptor + logical + physical size.
+type IconKey = (AppIconRef, u16, u32);
 
 /// A decode request handed to the worker thread — all fields are `Send`.
 pub struct IconRequest {
@@ -679,14 +676,7 @@ impl AppIconCache {
                     // panics the rasterizer must not take down the worker (it becomes
                     // a negative result instead).
                     let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        render_icon(
-                            &req.theme,
-                            &req.icon,
-                            req.logical_px,
-                            req.scale,
-                            req.key.2,
-                            req.key.3,
-                        )
+                        render_icon(&req.theme, &req.icon, req.logical_px, req.scale, req.key.2)
                     }))
                     .unwrap_or(None);
                     let decoded = IconDecoded {
@@ -769,56 +759,17 @@ impl AppIconCache {
     /// Interior-mutable like [`IconCache::buffer`] so the render path and UI can
     /// rasterize from a shared `&`.
     pub fn buffer(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
-        self.decode(icon, logical_px, scale, true)
+        self.decode(icon, logical_px, scale)
     }
 
-    /// A decoded **local image file** at `logical_px` on its longest side, aspect-preserved and
-    /// centered on a transparent square (what [`decode_icon`] produces for every source), tagged at
-    /// the output `scale`. Async, cached and negative-cached exactly like [`buffer`](Self::buffer).
-    ///
-    /// The one difference is the failure mode, and it is why this is a separate entry point rather
-    /// than a `File` descriptor through `buffer`: a file that will not resolve or decode returns
-    /// `None` instead of `application-x-executable`. Album art is the first caller, and an
-    /// executable glyph stretched across an album-art slot is worse than the themed fallback it
-    /// displaced — the caller draws that itself. The file is *app-chosen content*, so the decode
-    /// runs on the worker behind the same `catch_unwind` as an app icon.
-    ///
-    /// Callers whose set of images is open-ended (one cover per track played) must bound it with
-    /// [`retain_images`](Self::retain_images) — nothing else evicts these.
-    pub fn image(&self, path: &Path, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
-        self.decode(&AppIconRef::File(path.to_owned()), logical_px, scale, false)
-    }
-
-    /// Drop the decodes of every image whose path `keep` rejects — the eviction hook for
-    /// [`image`](Self::image), whose key space grows with the content it is shown (album art is one
-    /// entry per cover seen). App-icon entries are never touched: their key space is the installed
-    /// app set, which is bounded.
-    pub fn retain_images(&mut self, keep: impl Fn(&Path) -> bool) {
-        let live = |(icon, _, _, fallback): &IconKey| match (fallback, icon) {
-            (false, AppIconRef::File(path)) => keep(path),
-            _ => true,
-        };
-        self.buffers.get_mut().retain(|key, _| live(key));
-        self.stale.get_mut().retain(|key, _| live(key));
-        // An in-flight decode is deliberately left alone: dropping its slot here would let the
-        // next miss queue the same decode again while the first is still on the worker. It lands,
-        // is inserted, and the next `retain_images` evicts it.
-    }
-
-    fn decode(
-        &self,
-        icon: &AppIconRef,
-        logical_px: f64,
-        scale: f64,
-        fallback: bool,
-    ) -> Option<MemoryBuffer> {
+    fn decode(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
         // Keying on both logical and physical size avoids two different logical
         // sizes at different scales colliding on the same physical px and picking
         // a wrong-resolution theme source. Like the symbolic cache, two very close
         // fractional scales can still alias to one entry (<1px logical drift).
         let logical = (logical_px.round() as u16).max(1);
         let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
-        let key = (icon.clone(), logical, px, fallback);
+        let key = (icon.clone(), logical, px);
         if let Some(cached) = self.buffers.borrow().get(&key) {
             return cached.clone();
         }
@@ -838,8 +789,7 @@ impl AppIconCache {
                     if tx.send(req).is_err() {
                         // Worker gone: decode this one synchronously and cache it.
                         self.in_flight.borrow_mut().remove(&key);
-                        let result =
-                            render_icon(&self.theme, icon, logical_px, scale, px, fallback);
+                        let result = render_icon(&self.theme, icon, logical_px, scale, px);
                         self.stale.borrow_mut().remove(&key);
                         self.buffers.borrow_mut().insert(key, result.clone());
                         return result;
@@ -851,7 +801,7 @@ impl AppIconCache {
             }
             // No worker (tests): decode inline, caching the result (incl. negatives).
             None => {
-                let result = render_icon(&self.theme, icon, logical_px, scale, px, fallback);
+                let result = render_icon(&self.theme, icon, logical_px, scale, px);
                 self.buffers.borrow_mut().insert(key, result.clone());
                 result
             }
@@ -892,25 +842,18 @@ impl IconRequest {
 /// worker as well as inline): try the icon's own file first, and only on a
 /// resolve/decode failure fall back to `application-x-executable` (so a resolvable
 /// icon never pays for the fallback's multi-theme sweep).
-///
-/// `fallback` is what [`AppIconCache::image`] turns off: a plain image file that will not decode
-/// has no business becoming an executable glyph.
 fn render_icon(
     theme: &str,
     icon: &AppIconRef,
     logical_px: f64,
     scale: f64,
     px: u32,
-    fallback: bool,
 ) -> Option<MemoryBuffer> {
     if let Some(path) = resolve_icon(theme, icon, logical_px, scale) {
         match decode_icon(&path, px, scale) {
             Ok(buf) => return Some(buf),
             Err(err) => tracing::warn!("failed to decode app icon {}: {err:#}", path.display()),
         }
-    }
-    if !fallback {
-        return None;
     }
     let fallback = resolve_named_in_theme(theme, "application-x-executable", logical_px, scale)?;
     match decode_icon(&fallback, px, scale) {
@@ -953,6 +896,256 @@ fn resolve_named_in_theme(theme: &str, name: &str, logical_px: f64, scale: f64) 
         .find()
 }
 
+// --- images an app pointed us at -----------------------------------------------------------
+
+/// The cache key for a loaded image: source + logical + physical size.
+type ImageKey = (ImageSource, u16, u32);
+
+/// A load request handed to the image worker — all fields are `Send`.
+pub struct ImageRequest {
+    key: ImageKey,
+    source: ImageSource,
+    scale: f64,
+}
+
+/// A finished load delivered back to the main loop, routed to [`ImageCache::apply_loaded`].
+/// `None` is a fetch/decode failure, cached as a negative so a broken cover isn't re-fetched
+/// every frame — which for a remote source would mean re-hitting the network.
+pub struct ImageLoaded {
+    key: ImageKey,
+    buffer: Option<MemoryBuffer>,
+}
+
+/// Loads images an *app* chose ([`ImageSource`]): album art today, local or remote.
+///
+/// Shares the decode core with [`AppIconCache`] and almost nothing else, which is why it is its
+/// own type:
+///
+/// - **No themed fallback.** A source that will not load stays `None`, so the caller draws its own
+///   (the media card's `audio-x-generic-symbolic`). An `application-x-executable` in an album-art
+///   slot would silently displace it.
+/// - **Its own worker.** A remote fetch can block for the full [`FETCH_TIMEOUT`], and the app-icon
+///   worker must never queue behind it — a hung cover server would otherwise hold up the dash and
+///   app grid, looking for all the world like a renderer stall.
+/// - **An open-ended key space.** One entry per cover *played*, versus the bounded installed-app
+///   set, so it must be evicted ([`retain`](Self::retain)).
+/// - **No theme generation.** An icon-theme change does not change a cover.
+///
+/// Without a worker (headless tests) loading is synchronous, exactly like [`AppIconCache`] — note
+/// that this means tests never exercise the not-yet-loaded frame.
+#[derive(Default)]
+pub struct ImageCache {
+    buffers: RefCell<HashMap<ImageKey, Option<MemoryBuffer>>>,
+    in_flight: RefCell<HashSet<ImageKey>>,
+    load_tx: Option<mpsc::Sender<ImageRequest>>,
+}
+
+impl ImageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start the load worker; `result_tx`'s receiver belongs on the main loop calling
+    /// [`apply_loaded`](Self::apply_loaded).
+    pub fn spawn_worker(&mut self, result_tx: CalloopSender<ImageLoaded>) {
+        let (req_tx, req_rx) = mpsc::channel::<ImageRequest>();
+        self.load_tx = Some(req_tx);
+        if let Err(err) = std::thread::Builder::new()
+            .name("image-load".to_owned())
+            .spawn(move || {
+                for req in req_rx {
+                    // App-chosen bytes from an app-chosen server: a malformed image that panics
+                    // the decoder must become a negative result, not a dead worker.
+                    let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        load_image(&req.source, req.key.2, req.scale)
+                    }))
+                    .unwrap_or(None);
+                    if result_tx
+                        .send(ImageLoaded {
+                            key: req.key,
+                            buffer,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        {
+            tracing::warn!("could not spawn the image-load thread: {err}; loading synchronously");
+            self.load_tx = None;
+        }
+    }
+
+    /// Insert a finished load. Returns the source it was for, so the caller can invalidate
+    /// whatever drew a fallback while it was in flight.
+    pub fn apply_loaded(&mut self, loaded: ImageLoaded) -> Option<ImageSource> {
+        self.in_flight.get_mut().remove(&loaded.key);
+        let source = loaded.key.0.clone();
+        self.buffers.get_mut().insert(loaded.key, loaded.buffer);
+        Some(source)
+    }
+
+    /// The pixels for `source` at `logical_px` on its longest side, aspect-fit and centred on a
+    /// transparent square, tagged at the output `scale`. `None` while a load is in flight, or if it
+    /// failed.
+    pub fn buffer(
+        &self,
+        source: &ImageSource,
+        logical_px: f64,
+        scale: f64,
+    ) -> Option<MemoryBuffer> {
+        let logical = (logical_px.round() as u16).max(1);
+        let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
+        let key = (source.clone(), logical, px);
+        if let Some(cached) = self.buffers.borrow().get(&key) {
+            return cached.clone();
+        }
+        match &self.load_tx {
+            Some(tx) => {
+                if self.in_flight.borrow_mut().insert(key.clone()) {
+                    let req = ImageRequest {
+                        key: key.clone(),
+                        source: source.clone(),
+                        scale,
+                    };
+                    if tx.send(req).is_err() {
+                        self.in_flight.borrow_mut().remove(&key);
+                        let result = load_image(source, px, scale);
+                        self.buffers.borrow_mut().insert(key, result.clone());
+                        return result;
+                    }
+                }
+                None
+            }
+            // No worker (tests): load inline, caching the result (incl. negatives).
+            None => {
+                let result = load_image(source, px, scale);
+                self.buffers.borrow_mut().insert(key, result.clone());
+                result
+            }
+        }
+    }
+
+    /// Start loading `source` without wanting the pixels yet — GNOME builds the `MediaMessage` (and
+    /// so resolves its icon) when the *player* appears, not when the message list is opened
+    /// (`js/ui/messageList.js:1780-1784`), and on a slow link a fetch that only starts when the
+    /// popover opens shows the fallback for as long as the round trip takes.
+    pub fn warm(&self, source: &ImageSource, logical_px: f64, scale: f64) {
+        let _ = self.buffer(source, logical_px, scale);
+    }
+
+    /// Drop every entry whose source `keep` rejects. Nothing else evicts these.
+    ///
+    /// In-flight loads are deliberately left alone: dropping the slot would let the next miss queue
+    /// the same load — and, for a remote source, the same network request — while the first is
+    /// still running. It lands, is inserted, and the next call evicts it.
+    pub fn retain(&mut self, keep: impl Fn(&ImageSource) -> bool) {
+        self.buffers
+            .get_mut()
+            .retain(|(source, _, _), _| keep(source));
+    }
+
+    /// Whether `source` is already loaded at this size — a read-only probe, so a test can tell a
+    /// warm that *ran* from one it would trigger itself just by asking (without a worker,
+    /// [`buffer`](Self::buffer) loads inline, which makes any check through it vacuous).
+    pub fn is_loaded(&self, source: &ImageSource, logical_px: f64, scale: f64) -> bool {
+        let logical = (logical_px.round() as u16).max(1);
+        let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
+        matches!(
+            self.buffers.borrow().get(&(source.clone(), logical, px)),
+            Some(Some(_))
+        )
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buffers.borrow().len()
+    }
+}
+
+/// Load one image: read or fetch the bytes, then decode them at `px`.
+fn load_image(source: &ImageSource, px: u32, scale: f64) -> Option<MemoryBuffer> {
+    let (data, is_svg) = match source {
+        ImageSource::File(path) => {
+            let data = match std::fs::read(path) {
+                Ok(data) => data,
+                Err(err) => {
+                    tracing::warn!("could not read image {}: {err}", path.display());
+                    return None;
+                }
+            };
+            let is_svg = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+            (data, is_svg)
+        }
+        ImageSource::Remote(url) => match fetch_remote(source, url) {
+            Ok(data) => (data, false),
+            Err(err) => {
+                tracing::warn!("could not fetch image {url}: {err:#}");
+                return None;
+            }
+        },
+    };
+    match decode_image_bytes(&data, px, scale, is_svg) {
+        Ok(buffer) => Some(buffer),
+        Err(err) => {
+            tracing::warn!("could not decode image: {err:#}");
+            None
+        }
+    }
+}
+
+/// Fetch a remote image. **The one place the transport lives** — swapping gvfs for an owned
+/// implementation is this function and nothing else.
+///
+/// gvfs is what GNOME itself uses (`Gio.File.new_for_uri`), so this inherits its proxy and
+/// authentication integration. What it does not give us is control over redirects: see
+/// [`remote_is_permitted`] for the gap that leaves. Runs on the image worker, so blocking is fine.
+fn fetch_remote(source: &ImageSource, url: &str) -> anyhow::Result<Vec<u8>> {
+    use gio::prelude::*;
+
+    if !remote_is_permitted(source) {
+        anyhow::bail!("refusing to fetch {url}: it does not resolve to a public address");
+    }
+
+    let cancellable = gio::Cancellable::new();
+    // gvfs has no timeout of its own, and a server that accepts and then stalls would otherwise
+    // hold this worker forever. The watchdog outlives a fast fetch by design — cancelling an
+    // already-finished operation is a no-op — and one sleeping thread per cover is cheap next to
+    // the request itself.
+    let watchdog = cancellable.clone();
+    std::thread::Builder::new()
+        .name("image-fetch-timeout".to_owned())
+        .spawn(move || {
+            std::thread::sleep(FETCH_TIMEOUT);
+            watchdog.cancel();
+        })
+        .context("spawning the fetch watchdog")?;
+
+    let file = gio::File::for_uri(url);
+    let stream = file.read(Some(&cancellable)).context("opening")?;
+    let mut out = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = stream
+            .read(&mut chunk[..], Some(&cancellable))
+            .context("reading")?;
+        if read == 0 {
+            break;
+        }
+        // Cap the response, not just the buffer: `load_contents` would let a hostile server decide
+        // how much memory the shell buys.
+        if out.len() + read > MAX_FETCH_BYTES {
+            anyhow::bail!("larger than the {MAX_FETCH_BYTES} byte cap");
+        }
+        out.extend_from_slice(&chunk[..read]);
+    }
+    let _ = stream.close(Some(&cancellable));
+    Ok(out)
+}
+
 /// Decode an icon file to a premultiplied `Abgr8888` [`MemoryBuffer`] of `px`×`px`
 /// physical pixels, tagged at `scale` (the buffer-scale-tag trap). SVG via
 /// `resvg`, everything else via the `image` crate; the icon keeps its own colors.
@@ -961,14 +1154,28 @@ fn decode_icon(path: &Path, px: u32, scale: f64) -> anyhow::Result<MemoryBuffer>
     let is_svg = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    decode_image_bytes(&data, px, scale, is_svg)
+}
+
+/// The decode core, shared by [`decode_icon`] and [`ImageCache`]: bytes in, a premultiplied
+/// `Abgr8888` [`MemoryBuffer`] of `px`×`px` out, aspect-fit and centred on transparency.
+///
+/// `is_svg` is only a *hint* (a filename extension, which fetched bytes do not have); the sniff
+/// below is what actually decides when it is wrong.
+fn decode_image_bytes(
+    data: &[u8],
+    px: u32,
+    scale: f64,
+    is_svg: bool,
+) -> anyhow::Result<MemoryBuffer> {
     let rgba = if is_svg {
-        render_app_svg(&data, px)?
+        render_app_svg(data, px)?
     } else {
-        match decode_raster(&data, px) {
+        match decode_raster(data, px) {
             Ok(rgba) => rgba,
             // Some icon files are misnamed; if the bytes sniff as SVG, try that.
             Err(err) if data.starts_with(b"<?xml") || data.starts_with(b"<svg") => {
-                render_app_svg(&data, px).map_err(|_| err)?
+                render_app_svg(data, px).map_err(|_| err)?
             }
             Err(err) => return Err(err),
         }
@@ -1182,74 +1389,97 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `image` is the app-content entry point, and it differs from `buffer` in exactly one way
-    /// that matters: a file that will not decode stays `None` instead of becoming GNOME's
-    /// `application-x-executable`. A media card draws its own `audio-x-generic-symbolic` fallback,
-    /// and an executable glyph in an album-art slot would silently displace it.
-    ///
-    /// The fallback flag is therefore part of the cache key, not just the request — the assertion
-    /// below is what stops the two entry points from serving each other's result for one path.
+    /// The image cache has no themed fallback, and that is the whole reason it is separate: a
+    /// source that will not load stays `None` so the caller can draw its own
+    /// (`audio-x-generic-symbolic` for a media card). An `application-x-executable` stretched
+    /// across an album-art slot would silently displace it.
     #[test]
-    fn an_undecodable_image_stays_none_and_does_not_share_the_icon_entry() {
+    fn an_unloadable_image_stays_none_rather_than_becoming_an_icon() {
         let dir = std::env::temp_dir().join(format!("gsrs-image-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let junk = dir.join("not-an-image.png");
         std::fs::write(&junk, b"certainly not a PNG").expect("write junk");
 
-        let cache = AppIconCache::new("Adwaita");
+        let cache = ImageCache::new();
         assert!(
-            cache.image(&junk, 48., 1.0).is_none(),
-            "a file that will not decode must not fall back to the executable icon"
+            cache
+                .buffer(&ImageSource::File(junk.clone()), 48., 1.0)
+                .is_none(),
+            "a file that will not decode must not fall back to any icon"
         );
-        // The same path through the app-icon door is allowed to fall back, so it is a *different*
-        // cached result. Whether the fallback itself resolves depends on the host's icon theme;
-        // what must hold either way is that the two do not share one entry.
-        let _ = cache.buffer(&AppIconRef::File(junk.clone()), 48., 1.0);
-        assert_eq!(
-            cache.len(),
-            2,
-            "image() and buffer() must not collide on one key for the same file"
-        );
+        // Cached as a negative, so a broken cover is not re-read (or, remote, re-fetched) forever.
+        assert_eq!(cache.len(), 1);
+
+        let missing = dir.join("gone.png");
+        assert!(cache
+            .buffer(&ImageSource::File(missing), 48., 1.0)
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `retain_images` is the bound on the one open-ended key space either cache has: one entry per
-    /// album cover *played*, versus the installed app set. It must evict only images — app icons
-    /// are bounded already, and dropping them would re-decode the whole grid.
+    /// The address guard runs *before* the transport, so a refused URL costs no connection at all.
+    /// Deterministic and network-free: a loopback address is refused by the rule, not by failing to
+    /// connect (port 1 would also fail, which is exactly the confound this avoids — the assertion
+    /// below would pass either way, so the guard is pinned by its own unit tests in
+    /// `image_source`, and what this pins is that `ImageCache` actually routes through it).
     #[test]
-    fn retain_images_evicts_covers_and_leaves_app_icons_alone() {
+    fn a_refused_remote_source_is_cached_as_a_negative() {
+        let cache = ImageCache::new();
+        let blocked = ImageSource::Remote("http://127.0.0.1:1/probe".to_owned());
+        assert!(cache.buffer(&blocked, 48., 1.0).is_none());
+        // Negative-cached, so a hostile or broken cover cannot make the shell retry every frame —
+        // for a remote source that would be a request per frame.
+        assert_eq!(cache.len(), 1);
+        assert!(cache.buffer(&blocked, 48., 1.0).is_none());
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// The real remote path: fetch over gvfs, decode, and come out as a buffer at the asked-for
+    /// size. `#[ignore]` because it needs the network — run it by hand after touching
+    /// [`fetch_remote`]:
+    ///
+    /// ```text
+    /// cargo test --workspace remote_image -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the network"]
+    fn remote_image_fetches_and_decodes() {
+        let cache = ImageCache::new();
+        let source = ImageSource::Remote("https://picsum.photos/200.jpg".to_owned());
+        let buffer = cache
+            .buffer(&source, 48., 2.0)
+            .expect("fetch + decode a remote cover");
+        assert_eq!(
+            buffer.size().w,
+            96,
+            "decoded at the requested physical size"
+        );
+        assert!((buffer.logical_size().w - 48.).abs() < 1.0);
+    }
+
+    /// `retain` is the image cache's only bound: its key space is one entry per cover *played*,
+    /// unlike the app-icon cache's bounded installed-app set.
+    #[test]
+    fn retain_evicts_the_covers_that_left_the_screen() {
         let dir = std::env::temp_dir().join(format!("gsrs-image-retain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let keep = dir.join("now-playing.svg");
         let drop = dir.join("previous-track.svg");
         std::fs::write(&keep, RED_BLUE_SVG).expect("write svg");
         std::fs::write(&drop, RED_BLUE_SVG).expect("write svg");
+        let keep_src = ImageSource::File(keep.clone());
+        let drop_src = ImageSource::File(drop.clone());
 
-        let mut cache = AppIconCache::new("Adwaita");
-        assert!(cache.image(&keep, 48., 1.0).is_some());
-        assert!(cache.image(&drop, 48., 1.0).is_some());
-        assert!(cache
-            .buffer(&AppIconRef::File(keep.clone()), 48., 1.0)
-            .is_some());
-        assert_eq!(cache.len(), 3);
+        let mut cache = ImageCache::new();
+        assert!(cache.buffer(&keep_src, 48., 1.0).is_some());
+        assert!(cache.buffer(&drop_src, 48., 1.0).is_some());
+        assert_eq!(cache.len(), 2);
 
-        cache.retain_images(|path| path == keep);
-        assert_eq!(
-            cache.len(),
-            2,
-            "only the cover that left the screen may be evicted"
-        );
-        // Proven by what still answers without a re-decode: both survivors are still cached.
-        assert!(cache.image(&keep, 48., 1.0).is_some());
-        assert!(cache
-            .buffer(&AppIconRef::File(keep.clone()), 48., 1.0)
-            .is_some());
-        assert_eq!(
-            cache.len(),
-            2,
-            "the survivors must not have been re-decoded"
-        );
+        cache.retain(|source| source == &keep_src);
+        assert_eq!(cache.len(), 1, "only the cover that left may be evicted");
+        assert!(cache.buffer(&keep_src, 48., 1.0).is_some());
+        assert_eq!(cache.len(), 1, "the survivor must not have been re-loaded");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

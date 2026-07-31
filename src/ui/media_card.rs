@@ -39,10 +39,9 @@
 //!   `decode_icon` produces exactly that square, so the art element is placed centred like any
 //!   other icon.
 
-use std::path::PathBuf;
-
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+use crate::image_source::ImageSource;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -125,11 +124,11 @@ pub struct MediaCardContent {
     pub playing: bool,
     pub can_go_next: bool,
     pub can_go_previous: bool,
-    /// `mpris:artUrl` resolved to a local file ([`crate::mpris::art_path`]: `file://` only), or
+    /// `mpris:artUrl` validated into a loadable source ([`crate::image_source::ImageSource`]), or
     /// `None` for a player that published none — which is what puts the themed fallback up.
-    /// Whether the file *decodes* is answered at render time, so this being `Some` is not yet a
-    /// promise that art will be drawn.
-    pub art: Option<PathBuf>,
+    /// Whether it *loads* is answered later (a remote fetch, then a decode), so this being `Some`
+    /// is not yet a promise that art will be drawn.
+    pub art: Option<ImageSource>,
 }
 
 impl MediaCardContent {
@@ -340,7 +339,7 @@ pub fn draw_media_card(
 pub fn media_card_elements(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
-    images: &crate::render_helpers::icon::AppIconCache,
+    images: &crate::render_helpers::icon::ImageCache,
     cache: &mut crate::ui::notification_card::CardCache,
     key: u64,
     content: &MediaCardContent,
@@ -391,12 +390,12 @@ pub fn media_card_elements(
     // The art decode is async, so `art_showing` is false on the frames before it lands and the
     // fallback holds the slot; the decode arriving bumps the list revision (`note_art_decoded`),
     // which is what re-bakes this card without its backdrop.
-    let art = content.art.as_deref().and_then(|path| {
+    let art = content.art.as_ref().and_then(|source| {
         widget::image_element(
             renderer,
             cache.images(),
             images,
-            path,
+            source,
             key,
             BODY_ICON,
             scale,

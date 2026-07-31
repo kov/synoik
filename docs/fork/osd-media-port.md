@@ -239,9 +239,40 @@ the content. So a decode landing has to bump the list revision (`note_art_decode
 `IconDecoded` handler); without it the first frame's fallback stays baked in until something
 unrelated moves the revision.
 
-**Not yet live-validated**: the async path specifically. Under test there is no decode worker, so
-`image()` answers inline and the fallback frame never happens — the revision bump is covered by a
-unit test, not by pixels.
+**Remote art: LANDED 2026-07-31.** `mpris:artUrl` is no longer `file://`-only — `http(s)` covers
+are fetched, as GNOME does by handing the URI to gvfs. Notes worth keeping:
+
+- **Zero new dependencies.** We already depend on `gio`, so the transport is `gio::File::for_uri`,
+  the same call GNOME makes — which also inherits its proxy and authentication integration. The
+  whole transport is one function (`fetch_remote`) so the intended own-Rust replacement is a
+  single-site swap.
+- **Fetching is eager, when the *player* appears** (`refresh_media_art`, off `on_mpris_msg`), not
+  when the popover opens. That is what gnome-shell does — it constructs the `MediaMessage` and
+  resolves its icon on player add (`js/ui/messageList.js:1780-1784`) — and lazy loading would show
+  the themed fallback for a whole round trip on a slow link. Pinned by
+  `album_art_is_loaded_when_the_player_appears`, which never opens the popover.
+- **Its own worker.** A remote fetch can block for the full timeout, and the app-icon worker must
+  never queue behind it: a hung cover server would otherwise stall the dash and app grid, looking
+  exactly like a renderer problem. This is why `ImageCache` is a separate type from `AppIconCache`
+  rather than another door into it.
+- **Guards** (`src/image_source.rs`): a scheme whitelist (`file`/`http`/`https` — gvfs would also
+  mount `admin://`, `sftp://`, `dav://`, some carrying the user's stored credentials), a URI length
+  cap, no credentials in the authority, an 8 MB streamed response cap, a 15 s watchdog, and a
+  refusal to fetch anything resolving to a loopback/private/link-local address.
+
+**Known gaps, both arguing for the own-transport work rather than against this one:**
+
+- **Redirects are gvfs's, so the address guard is best-effort.** A public URL that redirects to a
+  private address is not caught — gvfs follows redirects internally with no hook to inspect them.
+  Closing it needs a transport whose redirect handling we own.
+- **Some CDNs reject gvfs's HTTP client.** Measured on this box: `gio cat` succeeds against
+  gnome.org, raw.githubusercontent.com and picsum.photos, and gets `400 Bad Request` from
+  upload.wikimedia.org. A player whose art lives behind such a host silently shows the fallback.
+
+**Not yet live-validated**: the async path specifically. Under test there is no worker, so the load
+answers inline and the fallback frame never happens — the revision bump is covered by a unit test,
+not by pixels. The real remote fetch *is* covered, by an `#[ignore]`d test run by hand
+(`cargo test --workspace remote_image -- --ignored`), which passed against a live HTTPS host.
 
 ### F — Panel volume scroll + headphone plug (optional polish)
 Scroll on the panel volume indicator steps volume and shows the OSD (`volume.js:442-464`: skip

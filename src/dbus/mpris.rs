@@ -416,7 +416,12 @@ mod tests {
         assert_eq!(state.status, PlaybackStatus::Playing);
         assert_eq!(state.title, "So What");
         assert_eq!(state.artists, ["Miles Davis"]);
-        assert_eq!(state.art, Some(std::path::PathBuf::from("/tmp/a.png")));
+        assert_eq!(
+            state.art,
+            Some(crate::image_source::ImageSource::File(
+                std::path::PathBuf::from("/tmp/a.png")
+            ))
+        );
 
         // A player that answers with nothing at all is still readable -- every property is
         // optional on the wire, and `CanPlay` defaulting to false is what keeps it off screen.

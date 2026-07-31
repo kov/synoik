@@ -58,8 +58,9 @@ use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::calendar_events::CalendarEventStore;
+use crate::image_source::ImageSource;
 use crate::notifications::SourceKey;
-use crate::render_helpers::icon::{AppIconCache, IconCache};
+use crate::render_helpers::icon::{IconCache, ImageCache};
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1041,25 +1042,24 @@ impl CalendarMessageList {
         true
     }
 
-    /// An album-art decode landed: bump the revision if a card is showing that file, so the list
+    /// An album-art load landed: bump the revision if a card is showing that source, so the list
     /// re-bakes with the art in place of the themed fallback. Returns whether anything changed.
     ///
     /// The cards' cache keys are *positional* and revision-scoped — nothing in them hashes the
-    /// content — so an async decode arriving is invisible to the cache unless it says so here.
+    /// content — so an async load arriving is invisible to the cache unless it says so here.
     /// Without this the first frame's fallback (and the backdrop baked behind it) would stay up
     /// until some unrelated change bumped the revision.
-    pub fn note_art_decoded(&mut self, path: &std::path::Path) -> bool {
-        if !self.players.iter().any(|p| p.art.as_deref() == Some(path)) {
+    pub fn note_art_decoded(&mut self, source: &ImageSource) -> bool {
+        if !self.players.iter().any(|p| p.art.as_ref() == Some(source)) {
             return false;
         }
         self.revision += 1;
         true
     }
 
-    /// The art paths the list is currently showing — what bounds the image-decode cache, whose
-    /// key space would otherwise grow by one cover per track played.
-    pub fn art_paths(&self) -> impl Iterator<Item = &std::path::Path> {
-        self.players.iter().filter_map(|p| p.art.as_deref())
+    /// The art sources the list is currently showing.
+    pub fn art_sources(&self) -> impl Iterator<Item = &ImageSource> {
+        self.players.iter().filter_map(|p| p.art.as_ref())
     }
 
     /// Total notification count across every group.
@@ -1610,7 +1610,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
-        images: &AppIconCache,
+        images: &ImageCache,
         scale: f64,
         origin: Point<f64, Logical>,
         height: f64,
@@ -1663,7 +1663,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
-        images: &AppIconCache,
+        images: &ImageCache,
         scale: f64,
         base: Point<f64, Logical>,
         media: &[MediaPlaced],
@@ -1809,7 +1809,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
-        images: &AppIconCache,
+        images: &ImageCache,
         scale: f64,
         p: &Placed,
     ) -> anyhow::Result<VkTexture> {
@@ -2657,8 +2657,8 @@ impl DateMenu {
     }
 
     /// An album-art decode landed — see [`CalendarMessageList::note_art_decoded`].
-    pub fn note_art_decoded(&mut self, path: &std::path::Path) -> bool {
-        self.list.note_art_decoded(path)
+    pub fn note_art_decoded(&mut self, source: &ImageSource) -> bool {
+        self.list.note_art_decoded(source)
     }
 
     /// Route a click at content-local `pos`: list hits map to notification
@@ -3216,7 +3216,7 @@ impl DateMenu {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
-        images: &AppIconCache,
+        images: &ImageCache,
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
@@ -3506,6 +3506,10 @@ mod tests {
 
     use super::*;
 
+    fn file_source(path: &str) -> ImageSource {
+        ImageSource::File(std::path::PathBuf::from(path))
+    }
+
     fn player_with_art(bus: &str, art: Option<&str>) -> media_card::MediaCardContent {
         media_card::MediaCardContent {
             bus_name: bus.to_owned(),
@@ -3516,7 +3520,7 @@ mod tests {
             playing: true,
             can_go_next: false,
             can_go_previous: false,
-            art: art.map(std::path::PathBuf::from),
+            art: art.map(|a| ImageSource::File(std::path::PathBuf::from(a))),
         }
     }
 
@@ -3537,12 +3541,12 @@ mod tests {
         let before = list.revision;
 
         assert!(
-            !list.note_art_decoded(std::path::Path::new("/tmp/some-app-icon.png")),
+            !list.note_art_decoded(&file_source("/tmp/some-other-cover.png")),
             "an unrelated decode must not re-bake the list"
         );
         assert_eq!(list.revision, before);
 
-        assert!(list.note_art_decoded(std::path::Path::new("/tmp/cover-a.png")));
+        assert!(list.note_art_decoded(&file_source("/tmp/cover-a.png")));
         assert!(
             list.revision > before,
             "the shown cover's decode must invalidate the cards"
@@ -3550,8 +3554,8 @@ mod tests {
 
         // And the eviction hook sees exactly the covers on screen — the player without art
         // contributes nothing to keep alive.
-        let live: Vec<_> = list.art_paths().collect();
-        assert_eq!(live, [std::path::Path::new("/tmp/cover-a.png")]);
+        let live: Vec<_> = list.art_sources().cloned().collect();
+        assert_eq!(live, [file_source("/tmp/cover-a.png")]);
     }
 
     #[test]

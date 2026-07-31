@@ -25,7 +25,8 @@ use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscree
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::render_helpers::icon::{AppIconCache, IconCache};
+use crate::image_source::ImageSource;
+use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
     premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer, NATIVE_FOURCC,
@@ -255,32 +256,31 @@ pub fn app_icon_element(
     ))
 }
 
-/// Uploaded textures for images loaded from a **file**, keyed by an owner-chosen slot id and the
-/// source path. See [`image_element`]; owners prune on the slot id.
-pub type ImageUploads = HashMap<(u64, std::path::PathBuf), TextureBuffer<VkTexture>>;
+/// Uploaded textures for images an app pointed us at, keyed by an owner-chosen slot id and the
+/// source. See [`image_element`]; owners prune on the slot id.
+pub type ImageUploads = HashMap<(u64, ImageSource), TextureBuffer<VkTexture>>;
 
-/// Composite an image **file** (album art today) decoded by the [`AppIconCache`], centered at
-/// `center` (relative to the element `origin`), fitted into a `logical_px` square.
+/// Composite an image an app pointed us at (album art today), loaded by the [`ImageCache`],
+/// centered at `center` (relative to the element `origin`), fitted into a `logical_px` square.
 ///
-/// The full-color, path-addressed sibling of [`app_icon_element`]. Two differences, both because
-/// the file is content some *app* pointed us at rather than an installed asset:
+/// The full-color, app-content sibling of [`app_icon_element`]. Two differences, both because the
+/// source is content some *app* chose rather than an installed asset:
 ///
-/// - it goes through [`AppIconCache::image`], so a file that will not decode yields `None` instead
-///   of GNOME's executable glyph — the caller draws its own fallback (a media card's
-///   `audio-x-generic-symbolic`);
-/// - the upload slot is keyed by path as well as id, so an owner that reuses slots cannot serve the
-///   previous image for a new one.
+/// - a source that will not load yields `None` rather than GNOME's executable glyph — the caller
+///   draws its own fallback (a media card's `audio-x-generic-symbolic`);
+/// - the upload slot is keyed by source as well as id, so an owner that reuses slots cannot serve
+///   the previous image for a new one.
 ///
-/// The decode itself is aspect-fit and centered on a transparent square (`decode_icon`), which is
-/// what makes placing it like any other centered icon reproduce St's `RESIZE_ASPECT` gravity.
-/// `None` while an async decode is still in flight — the caller draws its fallback until it lands,
-/// so the arrival has to invalidate whatever cached it (see `media_card`).
+/// The load itself is aspect-fit and centered on a transparent square (`decode_image_bytes`), which
+/// is what makes placing it like any other centered icon reproduce St's `RESIZE_ASPECT` gravity.
+/// `None` while an async load is still in flight — the caller draws its fallback until it lands, so
+/// the arrival has to invalidate whatever cached it (see `media_card`).
 #[allow(clippy::too_many_arguments)]
 pub fn image_element(
     renderer: &mut VulkanRenderer,
     uploads: &mut ImageUploads,
-    images: &AppIconCache,
-    path: &std::path::Path,
+    images: &ImageCache,
+    source: &ImageSource,
     slot: u64,
     logical_px: f64,
     scale: f64,
@@ -288,16 +288,16 @@ pub fn image_element(
     center: Point<f64, Logical>,
     alpha: f32,
 ) -> Option<TextureRenderElement<VkTexture>> {
-    let key = (slot, path.to_owned());
+    let key = (slot, source.clone());
     #[allow(clippy::map_entry)]
     if !uploads.contains_key(&key) {
-        let buffer = images.image(path, logical_px, scale)?;
+        let buffer = images.buffer(source, logical_px, scale)?;
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
                 uploads.insert(key.clone(), tb);
             }
             Err(err) => {
-                tracing::error!("error uploading image {}: {err:#}", path.display());
+                tracing::error!("error uploading image {source:?}: {err:#}");
                 return None;
             }
         }

@@ -12167,6 +12167,78 @@ fn mpris_update(bus_name: &str, state: crate::mpris::PlayerState) -> crate::mpri
     }
 }
 
+/// Cover art is resolved when the **player** appears, not when the message list is opened.
+/// gnome-shell constructs the `MediaMessage` — and with it the `Gio.FileIcon` its `Message.icon`
+/// resolves — as the player is added to the view (`js/ui/messageList.js:1780-1784`), so the art is
+/// already there the first time the popover is drawn. Loading lazily at render would instead show
+/// the themed fallback for as long as the load takes, which on a remote cover is a network round
+/// trip.
+///
+/// The popover is never opened in this test: that is the point.
+#[test]
+fn album_art_is_loaded_when_the_player_appears() {
+    use crate::image_source::ImageSource;
+    use crate::ui::notification_card::BODY_ICON;
+
+    let dir = std::env::temp_dir().join(format!("gsrs-art-warm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let first = dir.join("first.png");
+    let second = dir.join("second.png");
+    for path in [&first, &second] {
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 40, 40, 255]))
+            .save(path)
+            .unwrap();
+    }
+    let first_src = ImageSource::File(first.clone());
+    let second_src = ImageSource::File(second.clone());
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let mut state = mpris_state("Rhythmbox", None);
+    state.art = Some(first_src.clone());
+    f.niri_state()
+        .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", state));
+
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "the point of this test is that nothing has been opened"
+    );
+    assert!(
+        f.niri().image_cache.is_loaded(&first_src, BODY_ICON, 1.0),
+        "the cover must load as the player appears, not when the card is first drawn"
+    );
+
+    // The track changes: the new cover loads, and the old one stops being paid for. That eviction
+    // is the cache's only bound — its key space is one entry per cover *played*.
+    let mut next = mpris_state("Rhythmbox", None);
+    next.title = "Blue in Green".into();
+    next.art = Some(second_src.clone());
+    f.niri_state()
+        .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", next));
+
+    assert!(
+        f.niri().image_cache.is_loaded(&second_src, BODY_ICON, 1.0),
+        "the new cover must load"
+    );
+    assert!(
+        !f.niri().image_cache.is_loaded(&first_src, BODY_ICON, 1.0),
+        "the previous cover must be evicted once no player claims it"
+    );
+
+    // And a player going away takes its cover with it.
+    f.niri_state()
+        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerRemoved {
+            bus_name: "org.mpris.MediaPlayer2.rb".to_owned(),
+        });
+    assert!(
+        !f.niri().image_cache.is_loaded(&second_src, BODY_ICON, 1.0),
+        "a departed player's cover must be evicted"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The compositor's half of `_updateState` (`js/ui/mpris.js:167-177`): `DesktopEntry` resolves
 /// through the app system, and the card's source name is the app's name with `Identity` as the
 /// fallback. Everything else about a player is what the watcher validated.

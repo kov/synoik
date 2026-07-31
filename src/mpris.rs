@@ -9,19 +9,19 @@
 //! chose, and `mpris:artUrl` is a URI it chose, which gnome-shell hands straight to
 //! `Gio.File.new_for_uri` (`messageList.js:817-820`). Everything crossing into this model is
 //! therefore plain, validated, bounded data, sanitized on the watcher's side of the channel, so
-//! the watcher can be lifted into its own process later. Two divergences fall out of that:
+//! the watcher can be lifted into its own process later.
 //!
-//! - **Art is `file://` only.** A player that publishes `http(s)` cover art — Spotify does — gets
-//!   the generic icon instead. GNOME would let gvfs fetch the URL, i.e. let any app on the bus make
-//!   the shell issue a network request of its choosing.
+//! - **Art is validated, not merely accepted**: the URI goes through
+//!   [`crate::image_source::ImageSource::from_uri`], which allows `file`, `http` and `https` and
+//!   refuses the rest of what gvfs would happily mount (`admin://`, `sftp://`, `dav://`). Remote
+//!   art *is* fetched, as GNOME does — see that module for the address guard on it.
 //! - Every display string is newline-flattened and byte-capped, as notification text is.
 //!
 //! The spec-validation of `Metadata` is GNOME's own (`mpris.js:129-165`): players do send faulty
 //! metadata, so each field is type-checked with a fallback rather than trusted.
 
-use std::path::PathBuf;
-
 use crate::app_system::AppEntry;
+use crate::image_source::ImageSource;
 use crate::notifications::{clamp_text, flatten_text};
 
 /// `MPRIS_PLAYER_PREFIX` (`js/ui/mpris.js:18`).
@@ -36,9 +36,6 @@ const MAX_TEXT_BYTES: usize = 1024;
 
 /// Cap for the artist list, joined into one line by the card (`messageList.js:828`).
 const MAX_ARTISTS: usize = 16;
-
-/// Cap on the art URI we will even parse.
-const MAX_URI_BYTES: usize = 4096;
 
 /// `PlaybackStatus`. Only `Playing` is distinguished by the UI — it picks the pause icon
 /// (`messageList.js:831-835`) — but the tri-state is what the spec defines.
@@ -107,9 +104,9 @@ pub struct PlayerState {
     pub title: String,
     /// `xesam:artist`, validated. Never empty: the fallback is one "Unknown artist" entry.
     pub artists: Vec<String>,
-    /// `mpris:artUrl` resolved to a local path, or `None` for absent, malformed or non-`file://`
-    /// art. Not read here — the card loads it.
-    pub art: Option<PathBuf>,
+    /// `mpris:artUrl` validated into a source we are willing to load, or `None` for absent,
+    /// malformed or refused art. Not read here — the card loads it.
+    pub art: Option<ImageSource>,
 }
 
 impl Default for PlayerState {
@@ -143,7 +140,9 @@ fn unknown_artist() -> String {
 ///
 /// Returns the validated triple plus the mismatches worth logging, so the watcher can log them
 /// with the bus name attached, as gnome-shell does.
-pub fn validate_metadata(raw: &RawMetadata) -> (String, Vec<String>, Option<PathBuf>, Vec<String>) {
+pub fn validate_metadata(
+    raw: &RawMetadata,
+) -> (String, Vec<String>, Option<ImageSource>, Vec<String>) {
     let mut faults = Vec::new();
 
     let title = match &raw.title {
@@ -179,7 +178,7 @@ pub fn validate_metadata(raw: &RawMetadata) -> (String, Vec<String>, Option<Path
     };
 
     let art = match &raw.art_url {
-        Some(MetaField::Str(url)) => art_path(url),
+        Some(MetaField::Str(url)) => ImageSource::from_uri(url),
         Some(other) => {
             faults.push(format!(
                 "expected a string artUrl, got {}",
@@ -202,54 +201,6 @@ impl MetaField {
             Self::Malformed(signature) => signature,
         }
     }
-}
-
-/// Resolve `mpris:artUrl` to a path we are willing to read.
-///
-/// **`file://` only** (divergence, see the module docs). Also: absolute paths only, and a length
-/// cap before any parsing. Percent-escapes are decoded because that is how a URI spells a space.
-pub fn art_path(url: &str) -> Option<PathBuf> {
-    if url.len() > MAX_URI_BYTES {
-        return None;
-    }
-    // `file:///path` — the authority must be empty or `localhost`, per RFC 8089.
-    let rest = url.strip_prefix("file://")?;
-    let path = match rest.strip_prefix("localhost/") {
-        Some(path) => format!("/{path}"),
-        None if rest.starts_with('/') => rest.to_owned(),
-        None => return None,
-    };
-
-    let path = percent_decode(&path)?;
-    let path = PathBuf::from(path);
-    path.is_absolute().then_some(path)
-}
-
-/// Decode the percent-escapes in a URI path. `None` when an escape is malformed or the result is
-/// not UTF-8 — a path we cannot name is a path we will not open.
-fn percent_decode(path: &str) -> Option<String> {
-    if !path.contains('%') {
-        return Some(path.to_owned());
-    }
-
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = bytes.get(i + 1..i + 3)?;
-            let hex = std::str::from_utf8(hex).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-
-    // A NUL would truncate the path at the syscall boundary; refuse rather than open a prefix.
-    let decoded = String::from_utf8(out).ok()?;
-    (!decoded.contains('\0')).then_some(decoded)
 }
 
 /// An update pushed from the watcher to the compositor. Defined here, not in the feature-gated
@@ -393,7 +344,12 @@ mod tests {
         let (title, artists, art, faults) = validate_metadata(&good);
         assert_eq!(title, "Blue in Green");
         assert_eq!(artists, ["Miles Davis", "Bill Evans"]);
-        assert_eq!(art, Some(PathBuf::from("/tmp/cover art.png")));
+        assert_eq!(
+            art,
+            Some(ImageSource::File(std::path::PathBuf::from(
+                "/tmp/cover art.png"
+            )))
+        );
         assert!(faults.is_empty());
 
         // A player sending the artist as a bare string (a real-world bug) gets the fallback, and
@@ -440,29 +396,38 @@ mod tests {
     }
 
     /// Cover art is the one field that is a *capability*, not text: GNOME hands the URI to gvfs,
-    /// so any app on the bus could make the shell fetch a URL of its choosing. Ours opens local
-    /// files only.
+    /// so any app on the bus can make the shell open a local file or fetch a URL of its choosing.
+    /// We port that, but through a scheme whitelist — the full gvfs surface (`admin://`, `sftp://`,
+    /// `dav://`, some of it carrying the user's stored credentials) is not something a media
+    /// player's metadata should reach. The URI rules themselves live in
+    /// [`crate::image_source`]; what this pins is that `Metadata` actually routes through them.
     #[test]
-    fn only_local_cover_art_is_accepted() {
-        assert_eq!(
-            art_path("file:///home/u/cover.png"),
-            Some(PathBuf::from("/home/u/cover.png"))
-        );
-        assert_eq!(
-            art_path("file://localhost/home/u/cover.png"),
-            Some(PathBuf::from("/home/u/cover.png"))
-        );
+    fn cover_art_is_validated_through_the_image_source_whitelist() {
+        let art = |url: &str| {
+            let raw = RawMetadata {
+                art_url: Some(MetaField::Str(url.to_owned())),
+                ..RawMetadata::default()
+            };
+            validate_metadata(&raw).2
+        };
 
-        // Spotify's art is https -- the documented divergence, and the reason this is a whitelist.
-        assert_eq!(art_path("https://i.scdn.co/image/abc"), None);
-        assert_eq!(art_path("http://127.0.0.1:1/probe"), None);
-        // Neither a bare path nor a relative file URI is a URI we accept.
-        assert_eq!(art_path("/home/u/cover.png"), None);
-        assert_eq!(art_path("file://cover.png"), None);
-        // Malformed and truncating escapes.
-        assert_eq!(art_path("file:///tmp/%zz.png"), None);
-        assert_eq!(art_path("file:///tmp/a%00b.png"), None);
-        assert_eq!(art_path(&format!("file:///tmp/{}", "a".repeat(8192))), None);
+        assert_eq!(
+            art("file:///home/u/cover.png"),
+            Some(ImageSource::File(std::path::PathBuf::from(
+                "/home/u/cover.png"
+            )))
+        );
+        // Spotify's art is https, and it is now fetched rather than dropped.
+        assert_eq!(
+            art("https://i.scdn.co/image/abc"),
+            Some(ImageSource::Remote(
+                "https://i.scdn.co/image/abc".to_owned()
+            ))
+        );
+        // Everything gvfs would also mount stays out.
+        assert_eq!(art("admin:///etc/shadow"), None);
+        assert_eq!(art("sftp://host/cover.png"), None);
+        assert_eq!(art("/home/u/cover.png"), None);
     }
 
     fn state(can_play: bool, title: &str) -> PlayerState {

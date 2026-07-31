@@ -160,7 +160,7 @@ use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
-use crate::render_helpers::icon::{AppIconCache, IconCache};
+use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
@@ -753,6 +753,9 @@ pub struct Niri {
         Option<std::sync::mpsc::Sender<crate::render_helpers::icon::SymbolicRequest>>,
     /// Full-color application-icon loader for the dash / app grid / search.
     pub app_icon_cache: AppIconCache,
+    /// Images an app pointed us at (album art). Separate from `app_icon_cache`: its own worker, so
+    /// a slow cover fetch can never queue in front of the dash's icons.
+    pub image_cache: ImageCache,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -1232,17 +1235,32 @@ impl State {
                 .event_loop
                 .insert_source(icon_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(decoded) = event {
-                        if let Some((icon, logical, _, _)) =
+                        if let Some((icon, logical, _)) =
                             state.niri.app_icon_cache.apply_decoded(decoded)
                         {
                             state.niri.drop_app_icon_uploads(&icon, logical);
-                            // An image decode landing is a *content* change for the surface
-                            // showing it, not just a new texture: a media card bakes its themed
-                            // fallback into the card texture, so the list has to re-bake — and
-                            // its cache keys are revision-scoped, not content-hashed.
-                            if let crate::app_system::AppIconRef::File(path) = &icon {
-                                state.niri.panel_popover.note_art_decoded(path);
-                            }
+                            state.niri.queue_redraw_all();
+                        }
+                    }
+                })
+                .unwrap();
+
+            // Images an app pointed us at (album art) get their OWN worker, not the app-icon
+            // one: a remote cover can block for the whole fetch timeout, and the dash and app
+            // grid must never queue behind a slow or dead cover server.
+            let (img_tx, img_rx) = calloop::channel::channel();
+            state.niri.image_cache.spawn_worker(img_tx);
+            state
+                .niri
+                .event_loop
+                .insert_source(img_rx, |event, _, state| {
+                    if let calloop::channel::Event::Msg(loaded) = event {
+                        if let Some(source) = state.niri.image_cache.apply_loaded(loaded) {
+                            // A load landing is a *content* change for the surface showing it, not
+                            // just a new texture: a media card bakes its themed fallback into the
+                            // card texture, and the list's cache keys are revision-scoped rather
+                            // than content-hashed, so nothing else would invalidate it.
+                            state.niri.panel_popover.note_art_decoded(&source);
                             state.niri.queue_redraw_all();
                         }
                     }
@@ -3849,6 +3867,9 @@ impl State {
         };
 
         if changed {
+            // Art first: GNOME resolves the message's icon as the player appears, so the fetch
+            // starts now rather than when the popover is opened.
+            self.niri.refresh_media_art();
             self.niri.refresh_popover_media();
         }
     }
@@ -4449,6 +4470,7 @@ impl Niri {
             icon_cache: IconCache::new("Adwaita"),
             symbolic_icon_tx: None,
             app_icon_cache: AppIconCache::new("Adwaita"),
+            image_cache: ImageCache::new(),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -6556,12 +6578,10 @@ impl Niri {
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
             // bar; the quick-settings menu composites several elements (chrome + icons).
-            for element in self.panel_popover.render(
-                ctx.renderer,
-                &self.icon_cache,
-                &self.app_icon_cache,
-                output,
-            ) {
+            for element in
+                self.panel_popover
+                    .render(ctx.renderer, &self.icon_cache, &self.image_cache, output)
+            {
                 push(element.into());
             }
             // The notification banner slides out from under the bar (pushed after
@@ -9927,17 +9947,35 @@ impl Niri {
         }
         let players = crate::ui::media_card::media_card_contents(&self.mpris);
         if self.panel_popover.set_media_players(players) {
-            // Bound the image-decode cache to the covers still on screen. Its key space is one
-            // entry per distinct art file, which for a running player is one per *track played* —
-            // the only open-ended key space either icon cache has.
-            let live: std::collections::HashSet<std::path::PathBuf> = self
-                .panel_popover
-                .date_menu()
-                .map(|dm| dm.list().art_paths().map(|p| p.to_owned()).collect())
-                .unwrap_or_default();
-            self.app_icon_cache
-                .retain_images(|path| live.contains(path));
             self.queue_redraw_all();
+        }
+    }
+
+    /// Start loading every visible player's cover, and drop the ones no player claims any more.
+    ///
+    /// Called on any MPRIS change, **not** when the popover opens: gnome-shell builds a
+    /// `MediaMessage` — and so resolves its icon — as the player appears
+    /// (`js/ui/messageList.js:1780-1784`). Waiting until the popover opens would show the themed
+    /// fallback for a whole round trip on a slow link.
+    ///
+    /// The retain is the cache's only bound: one entry per cover *played* is the only open-ended
+    /// key space the image caches have.
+    pub fn refresh_media_art(&mut self) {
+        let live: std::collections::HashSet<crate::image_source::ImageSource> = self
+            .mpris
+            .visible()
+            .filter_map(|player| player.state.art.clone())
+            .collect();
+        self.image_cache.retain(|source| live.contains(source));
+
+        // Warm at the art slot's size for every scale a card could be drawn at, which is what the
+        // cache is keyed on — warming the wrong scale is a decode nobody reads.
+        for source in &live {
+            for output in self.global_space.outputs() {
+                let scale = output.current_scale().fractional_scale();
+                self.image_cache
+                    .warm(source, crate::ui::notification_card::BODY_ICON, scale);
+            }
         }
     }
 

@@ -20,6 +20,7 @@ pub mod frame_log;
 pub mod gnome;
 pub mod handlers;
 pub mod idle_monitor;
+pub mod image_source;
 pub mod input;
 pub mod ipc;
 pub mod keyboard_layout;

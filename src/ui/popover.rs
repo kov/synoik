@@ -24,7 +24,8 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
-use crate::render_helpers::icon::{AppIconCache, IconCache};
+use crate::image_source::ImageSource;
+use crate::render_helpers::icon::{IconCache, ImageCache};
 
 /// How far the popover slides in (logical px) as it fades open — gnome-shell's
 /// `BoxPointer` `-arrow-rise` (`$base_padding` = 6px). It emerges from `rise` above
@@ -480,10 +481,10 @@ impl PanelPopover {
     /// Introspection/test hook: the open dateMenu content.
     /// An album-art decode landed: tell the open message list, so a media card showing the themed
     /// fallback re-bakes with the art. Returns whether anything changed.
-    pub fn note_art_decoded(&mut self, path: &std::path::Path) -> bool {
+    pub fn note_art_decoded(&mut self, source: &ImageSource) -> bool {
         match &mut self.content {
             Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
-                dm.note_art_decoded(path)
+                dm.note_art_decoded(source)
             }
             _ => false,
         }
@@ -1055,7 +1056,7 @@ impl PanelPopover {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
-        images: &AppIconCache,
+        images: &ImageCache,
         output: &Output,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         if !self.open || self.output.as_ref() != Some(output) {
