@@ -14,6 +14,7 @@ import St from 'gi://St';
 
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.UiDump';
@@ -78,6 +79,18 @@ const IFACE = `
     <!-- And the app grid, which is a separate state again — the overview opens on the windows
          page, where the grid's actors exist unallocated. -->
     <method name="DumpAppGrid">
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <!-- Transient surfaces we raise ourselves, for the same reason: a hand-timed dump of
+         something that shows for three seconds is a coin flip. -->
+    <method name="DumpOsd">
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <method name="DumpBanner">
       <arg type="as" direction="in" name="styleClasses"/>
       <arg type="s" direction="in" name="path"/>
       <arg type="s" direction="out" name="result"/>
@@ -427,6 +440,39 @@ export default class UiDumpExtension extends Extension {
             Main.overview.visible && Main.overview.dash?.showAppsButton?.checked,
             () => Main.overview.showApps(),
             () => Main.overview.hide());
+    }
+
+    // An OSD, raised by us. `Main.osdWindowManager.show` wants a Gio.Icon, a label and a level;
+    // it hides itself on a timeout, so there is nothing to restore.
+    DumpOsd(styleClasses, path) {
+        Main.osdWindowManager.show(
+            Gio.ThemedIcon.new('audio-volume-high-symbolic'),
+            'UI Dump',
+            [{level: 0.5, maxLevel: 1}]);
+        this._whenAllocated(styleClasses, (ready) => {
+            const result = this.DumpClasses(styleClasses, path);
+            log(`[ui-dump] ${result}${ready ? '' : ' (WARNING: gave up waiting for allocation)'}`);
+        });
+        return 'raised an OSD; dumping when allocated (result goes to the journal)';
+    }
+
+    // A notification banner, posted through the shell's own MessageTray rather than over D-Bus, so
+    // the post and the dump are in the same process and cannot race each other.
+    DumpBanner(styleClasses, path) {
+        const source = MessageTray.getSystemSource();
+        const notification = new MessageTray.Notification({
+            source,
+            title: 'UI Dump',
+            body: 'Measuring the banner against the live shell.',
+            isTransient: true,
+        });
+        source.addNotification(notification);
+        this._whenAllocated(styleClasses, (ready) => {
+            const result = this.DumpClasses(styleClasses, path);
+            notification.destroy();
+            log(`[ui-dump] ${result}${ready ? '' : ' (WARNING: gave up waiting for allocation)'}`);
+        });
+        return 'posted a banner; dumping when allocated (result goes to the journal)';
     }
 
     // Open (if needed), wait for allocation, dump, and put the surface back the way we found it.
