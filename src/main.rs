@@ -148,6 +148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
+        // These are short-lived clients, not the compositor: they spawn no threads,
+        // install no signalfd, and have no clean-shutdown path to protect. Leaving
+        // them under the compositor's mask makes Ctrl-C do nothing at all — which
+        // matters most in exactly the case you would use it, a `niri msg` blocked
+        // on the socket of a wedged compositor.
+        niri::utils::signals::unblock_all().unwrap();
+
         match subcommand {
             Sub::Validate { config } => {
                 tracy_client::Client::start();

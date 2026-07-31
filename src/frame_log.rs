@@ -852,6 +852,9 @@ pub struct FrameLog {
     parked: VecDeque<Parked>,
     /// Banked entries awaiting a `SIGUSR1` dump. Empty unless `ring` is set.
     ring: VecDeque<Entry>,
+    /// How many dumps this process has written, so successive windows land in
+    /// successive files instead of overwriting one another.
+    dumps: u64,
     stats: HashMap<String, Stats>,
     /// Per output, the last frame handed to KMS: what it aimed at and when we let
     /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
@@ -895,11 +898,22 @@ impl FrameLog {
             );
         }
 
+        // Reserved up front: growing by doubling would memcpy the whole ring
+        // *inside* `end()`, which at these sizes is milliseconds on the frame path —
+        // a self-inflicted over-budget frame, once per threshold, landing mid-run
+        // and attributed to the workload.
+        let ring = settings
+            .as_ref()
+            .and_then(|s| s.ring)
+            .map(VecDeque::with_capacity)
+            .unwrap_or_default();
+
         Self {
             settings,
             in_flight: None,
             parked: VecDeque::new(),
-            ring: VecDeque::new(),
+            ring,
+            dumps: 0,
             stats: HashMap::new(),
             queued: HashMap::new(),
             last_presented: HashMap::new(),
@@ -1144,12 +1158,15 @@ impl FrameLog {
         let over = budget.is_some_and(|budget| cost > budget);
 
         if let Some(cap) = settings.ring {
-            // Bank the record unformatted. Over-budget frames still go to the
-            // journal as they happen: they are rare, and a live `warn!` is what
-            // tells you something is wrong without waiting for a dump.
-            if over {
-                tracing::warn!("{}", Self::format_frame(&frame, total, &totals, budget));
-            }
+            // Bank the record unformatted, and format *nothing* here — not even the
+            // over-budget frames. An earlier version kept a live `warn!` for those,
+            // on the grounds that they are rare and worth seeing without waiting for
+            // a dump. That reintroduced the exact confound this mode exists to
+            // remove, and did it selectively on the tail: the expensive frames paid
+            // a ~600-char format plus a journald write that the healthy ones did not,
+            // so the heavy band carried a self-inflicted cost while the light band
+            // did not. Biasing *against* the frames under study is still bias. The
+            // dump has every one of them; `=1` is the mode for watching live.
             while self.ring.len() >= cap {
                 self.ring.pop_front();
             }
@@ -1639,26 +1656,42 @@ impl FrameLog {
     pub fn dump(&mut self) -> std::io::Result<(std::path::PathBuf, usize)> {
         use std::io::Write as _;
 
-        let path = dump_path();
+        let path = dump_path(self.dumps);
         let entries = self.ring.len();
-        let file = std::fs::File::create(&path)?;
-        let mut out = std::io::BufWriter::new(file);
-        for entry in self.ring.drain(..) {
-            match entry {
-                Entry::Frame {
-                    frame,
-                    total,
-                    totals,
-                    budget,
-                } => writeln!(
-                    out,
-                    "{}",
-                    Self::format_frame(&frame, total, &totals, budget)
-                )?,
-                Entry::Line(line) => writeln!(out, "{line}")?,
+
+        // Write beside the target and rename into place. A dump is tens of MB onto a
+        // tmpfs, so a mid-write ENOSPC is a real outcome — and a half-written file at
+        // the expected path is indistinguishable from a complete dump of a shorter
+        // window, which is precisely the invisible-hole failure this mechanism cannot
+        // tolerate. `rename` is atomic, so the reader sees the whole file or none.
+        let tmp = path.with_extension("txt.partial");
+        {
+            let file = std::fs::File::create(&tmp)?;
+            let mut out = std::io::BufWriter::new(file);
+            // By reference, not `drain`: dropping a `Drain` discards the whole drained
+            // range, so an error partway through used to destroy the entries it had
+            // not written yet. The ring is cleared below, once the bytes are safe.
+            for entry in self.ring.iter() {
+                match entry {
+                    Entry::Frame {
+                        frame,
+                        total,
+                        totals,
+                        budget,
+                    } => writeln!(
+                        out,
+                        "{}",
+                        Self::format_frame(frame, *total, totals, *budget)
+                    )?,
+                    Entry::Line(line) => writeln!(out, "{line}")?,
+                }
             }
+            out.flush()?;
         }
-        out.flush()?;
+        std::fs::rename(&tmp, &path)?;
+
+        self.ring.clear();
+        self.dumps += 1;
         Ok((path, entries))
     }
 }
@@ -1666,12 +1699,16 @@ impl FrameLog {
 /// Where [`FrameLog::dump`] writes. `NIRI_FRAME_LOG_DUMP` overrides it; otherwise
 /// the session's runtime dir, which is where the rest of our per-session files live
 /// and is writable without any assumption about the cwd.
-fn dump_path() -> std::path::PathBuf {
+fn dump_path(nth: u64) -> std::path::PathBuf {
+    // An explicit path is taken verbatim, including on a second dump: the caller
+    // asked for that name. Everything else is numbered, because the natural way to
+    // scope a measurement is dump-to-clear, run, dump-to-collect — and with one
+    // fixed name per PID the second signal silently destroys the first window.
     if let Ok(path) = std::env::var("NIRI_FRAME_LOG_DUMP") {
         return std::path::PathBuf::from(path);
     }
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
-    std::path::PathBuf::from(dir).join(format!("niri-frame-log.{}.txt", std::process::id()))
+    std::path::PathBuf::from(dir).join(format!("niri-frame-log.{}.{nth}.txt", std::process::id()))
 }
 
 /// How many bake sites a frame line names before it starts counting the rest.
@@ -2085,6 +2122,7 @@ mod tests {
         FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2213,12 +2251,29 @@ mod tests {
         assert_eq!(log.ring.len(), 3, "frames must be banked, not dropped");
 
         // The ring is bounded: the oldest entries fall off rather than growing
-        // without limit in a session left running for hours.
-        for _ in 0..3 {
-            log.begin("out");
+        // without limit in a session left running for hours. Which four survive is
+        // the part that matters and the part a length check cannot see — an
+        // eviction that dropped the *newest* would keep the count right and hand
+        // back the beginning of the session instead of the run you just measured.
+        // The output name is per-frame here purely so the entries are telling apart.
+        for i in 3..6 {
+            log.begin(&format!("out{i}"));
             log.end(Some(Duration::from_millis(16)));
         }
         assert_eq!(log.ring.len(), 4, "the ring must stay at its cap");
+        let banked: Vec<String> = log
+            .ring
+            .iter()
+            .map(|e| match e {
+                Entry::Frame { frame, .. } => frame.output.clone(),
+                Entry::Line(l) => l.clone(),
+            })
+            .collect();
+        assert_eq!(
+            banked,
+            vec!["out", "out3", "out4", "out5"],
+            "the ring must evict the OLDEST and keep the newest, in order"
+        );
 
         let (dumped, n) = log.dump().expect("dump");
         assert_eq!(dumped, path);
@@ -2232,7 +2287,8 @@ mod tests {
             "every banked entry must reach the file"
         );
         assert!(
-            text.lines().all(|l| l.contains("frame on out took")),
+            text.lines()
+                .all(|l| l.starts_with("frame on out") && l.contains(" took ")),
             "dumped lines must be byte-identical to the journal's, so \
              correlate-frame-log.py reads a dump directly: {text}"
         );
@@ -2243,8 +2299,41 @@ mod tests {
         let (_, n) = log.dump().expect("dump");
         assert_eq!(n, 1, "successive dumps must give successive windows");
 
+        // A dump that cannot be written must leave the ring alone. It used to
+        // `drain` as it wrote, and dropping a partly-consumed `Drain` discards the
+        // whole range — so an ENOSPC partway through destroyed the frames it had not
+        // written yet, on top of leaving a truncated file that reads like a complete
+        // dump of a shorter window.
+        log.begin("out");
+        log.end(Some(Duration::from_millis(16)));
+        std::env::set_var("NIRI_FRAME_LOG_DUMP", dir.join("no/such/dir/dump.txt"));
+        assert!(
+            log.dump().is_err(),
+            "a dump into a missing directory must fail"
+        );
+        assert_eq!(
+            log.ring.len(),
+            1,
+            "a failed dump must not consume the entries it could not write"
+        );
+
         std::env::remove_var("NIRI_FRAME_LOG_DUMP");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Successive dumps must land in successive files. With one fixed name per PID
+    /// the second `SIGUSR1` silently destroyed the first window — and the natural
+    /// way to scope a measurement is exactly two dumps: one to clear, one to
+    /// collect. An explicit `NIRI_FRAME_LOG_DUMP` is still taken verbatim, because
+    /// the caller asked for that name.
+    #[test]
+    fn successive_dumps_do_not_overwrite_each_other() {
+        std::env::remove_var("NIRI_FRAME_LOG_DUMP");
+        assert_ne!(
+            dump_path(0),
+            dump_path(1),
+            "each dump needs its own file, or the second destroys the first"
+        );
     }
 
     /// `ring` is off unless asked for, and `ring=0` turns it back off.
@@ -2475,6 +2564,7 @@ mod tests {
         let mut log = FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2518,6 +2608,7 @@ mod tests {
         let mut log = FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2548,6 +2639,7 @@ mod tests {
         let mut log = FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2588,6 +2680,7 @@ mod tests {
         let mut log = FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2635,6 +2728,7 @@ mod tests {
         let mut log = FrameLog {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
+            dumps: 0,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
