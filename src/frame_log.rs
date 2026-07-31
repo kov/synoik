@@ -1522,12 +1522,32 @@ impl FrameLog {
         let cadence = cadence_clause(since_last_flip);
         let aim = aim_clause(aimed_after);
 
-        tracing::warn!(
+        let line = format!(
             "missed {missed} vblank(s) on {output}: presented {} late, \
              refresh {}{queued}{cadence}{aim}",
             ms(late),
             ms(refresh),
         );
+
+        // Bank it as well as warn it. A miss line is the ONLY record of a miss —
+        // `correlate-frame-log.py` derives the whole rate by counting these — so a
+        // dump without them is not a quieter measurement, it is a measurement that
+        // reads as a flawless session no matter what happened. That is exactly how
+        // a ring dump came to score 0.00% against the same workload's 13.99%, and
+        // the conclusion drawn from it (that the frame log was causing the misses)
+        // was wrong. Summaries are banked for the same reason; misses were missed.
+        //
+        // Formatting here is not the tail-selective cost that over-budget frames
+        // were: this fires per *miss*, which is a property of the display, not of
+        // how expensive the frame was to build.
+        if self.settings.and_then(|s| s.ring).is_some() {
+            let cap = self.settings.and_then(|s| s.ring).expect("just checked");
+            while self.ring.len() >= cap {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(Entry::Line(line.clone()));
+        }
+        tracing::warn!("{line}");
     }
 
     fn maybe_summarize(&mut self, now: Instant) {
@@ -2367,6 +2387,52 @@ mod tests {
 
         std::env::remove_var("NIRI_FRAME_LOG_DUMP");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dump must contain everything the scorer needs to compute a miss rate.
+    ///
+    /// This is the test that was missing, and its absence cost a wrong conclusion.
+    /// `correlate-frame-log.py` derives the rate purely by counting
+    /// `missed N vblank(s)` lines against the summaries' aim histogram. Ring mode
+    /// banked frames and summaries but only *warned* the miss lines, so every ring
+    /// dump scored a flawless 0.00% — and the same workload's 13.99% under `all`
+    /// got attributed to the instrument's cost rather than to the missing input.
+    #[test]
+    fn a_dump_carries_the_misses_the_scorer_counts() {
+        let mut log = test_log();
+        log.settings = Some(Settings {
+            ring: Some(64),
+            summary_every: Some(Duration::from_millis(1)),
+            ..Settings::default()
+        });
+
+        log.begin("out");
+        log.end(Some(Duration::from_millis(16)));
+
+        // A presentation a whole refresh later than it aimed for is a miss.
+        let refresh = Duration::from_micros(16667);
+        log.presented(
+            "out",
+            Duration::from_secs(10),
+            Duration::from_secs(10) + refresh,
+            Some(refresh),
+        );
+
+        let banked: Vec<String> = log
+            .ring
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Line(l) => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            banked
+                .iter()
+                .any(|l| l.contains("missed 1 vblank(s) on out")),
+            "the miss must be banked, not only warned — a dump without it scores \
+             0.00% however badly the session actually missed. Banked: {banked:?}"
+        );
     }
 
     /// The default dump location must survive a reboot.
