@@ -61,8 +61,20 @@ gdbus call --session -d org.gnome.Shell.Extensions.UiDump \
 journalctl --user -b -g "\[ui-dump\]" -n 5
 ```
 
-Also: `DumpName "calendarArea"` (for `#id` selectors) and `DumpAll` (the whole stage — large;
-prefer the targeted ones).
+For an audit, dump every widget of one surface in a single call — a menu that closes on focus loss
+will not survive a dozen round trips, and a class that matched nothing comes back as `count: 0`
+rather than vanishing, so a typo does not read as "not on screen":
+
+```sh
+gdbus call --session -d org.gnome.Shell.Extensions.UiDump \
+  -o /org/gnome/Shell/Extensions/UiDump \
+  -m org.gnome.Shell.Extensions.UiDump.DumpClassesAfter \
+  "['quick-settings','quick-toggle','quick-slider','quick-settings-system-item']" \
+  /tmp/qs.json 8
+```
+
+Also: `DumpName "calendarArea"` (for `#id` selectors), `DumpClasses` (batch, no delay) and `DumpAll`
+(the whole stage — large; prefer the targeted ones).
 
 ## Reading it
 

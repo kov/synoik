@@ -38,9 +38,23 @@ const IFACE = `
       <arg type="s" direction="in" name="path"/>
       <arg type="s" direction="out" name="result"/>
     </method>
+    <!-- Many classes into one file. An audit wants a dozen widgets from one open menu, and every
+         extra round trip is another chance for the menu to close between calls. -->
+    <method name="DumpClasses">
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
     <!-- Wait, then dump: gives you time to open a menu by hand before it runs. -->
     <method name="DumpClassAfter">
       <arg type="s" direction="in" name="styleClass"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="u" direction="in" name="delaySeconds"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <!-- The one an audit actually runs: schedule it, open the UI by hand, get every widget. -->
+    <method name="DumpClassesAfter">
+      <arg type="as" direction="in" name="styleClasses"/>
       <arg type="s" direction="in" name="path"/>
       <arg type="u" direction="in" name="delaySeconds"/>
       <arg type="s" direction="out" name="result"/>
@@ -274,17 +288,51 @@ export default class UiDumpExtension extends Extension {
             (actor) => actor.name === name, `#${name}`, path);
     }
 
-    DumpClassAfter(styleClass, path, delaySeconds) {
+    // A class that matched nothing is recorded as `count: 0` rather than dropped: in a batch, "the
+    // widget is not on screen" and "I misspelled the class" are the two likeliest outcomes, and a
+    // silently missing key looks like neither.
+    DumpClasses(styleClasses, path) {
+        const groups = styleClasses.map((styleClass) => {
+            const found = findAll(
+                global.stage, (actor) => hasClass(actor, styleClass), []);
+            return {
+                match: `.${styleClass}`,
+                count: found.length,
+                matches: found.map((actor) => ({
+                    ancestry: ancestry(actor),
+                    actor: describe(actor, 0),
+                })),
+            };
+        });
+        const missing = groups.filter((g) => g.count === 0).map((g) => g.match);
+        const written = this._write(path, {groups});
+        return missing.length
+            ? `${written}; nothing matched ${missing.join(' ')}`
+            : written;
+    }
+
+    _after(delaySeconds, label, run) {
         if (this._timeout)
             GLib.source_remove(this._timeout);
         this._timeout = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT, delaySeconds || 5, () => {
                 this._timeout = null;
-                const result = this.DumpClass(styleClass, path);
-                log(`[ui-dump] ${result}`);
+                log(`[ui-dump] ${run()}`);
                 return GLib.SOURCE_REMOVE;
             });
-        return `will dump .${styleClass} to ${path} in ${delaySeconds || 5}s ` +
+        return `will dump ${label} in ${delaySeconds || 5}s ` +
             `(open the UI now; result goes to the journal)`;
+    }
+
+    DumpClassAfter(styleClass, path, delaySeconds) {
+        return this._after(
+            delaySeconds, `.${styleClass} to ${path}`,
+            () => this.DumpClass(styleClass, path));
+    }
+
+    DumpClassesAfter(styleClasses, path, delaySeconds) {
+        return this._after(
+            delaySeconds, `${styleClasses.length} classes to ${path}`,
+            () => this.DumpClasses(styleClasses, path));
     }
 }
