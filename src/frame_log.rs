@@ -855,6 +855,17 @@ pub struct FrameLog {
     /// How many dumps this process has written, so successive windows land in
     /// successive files instead of overwriting one another.
     dumps: u64,
+    /// `NIRI_FRAME_LOG_DUMP`, captured **once at construction** rather than read on every
+    /// [`dump`](Self::dump).
+    ///
+    /// Reading it at dump time made the dump path a function of process-global state that any
+    /// other test could be mutating: two tests here set and cleared this var, and the pair raced
+    /// often enough to fail a full run roughly one time in six (more under
+    /// `NIRI_VK_VALIDATION=1`, whose slowdown widens the window). Capturing it at construction
+    /// makes each `FrameLog` carry its own answer, so a test builds one with the path it wants and
+    /// touches no environment at all. Same reasoning as [`dump_dir_from`] below, which was split
+    /// out after the same class of flake.
+    dump_override: Option<std::path::PathBuf>,
     stats: HashMap<String, Stats>,
     /// Per output, the last frame handed to KMS: what it aimed at and when we let
     /// go of it. Read back in [`FrameLog::presented`] to turn "late" into "late
@@ -914,6 +925,9 @@ impl FrameLog {
             parked: VecDeque::new(),
             ring,
             dumps: 0,
+            dump_override: std::env::var_os("NIRI_FRAME_LOG_DUMP")
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from),
             stats: HashMap::new(),
             queued: HashMap::new(),
             last_presented: HashMap::new(),
@@ -1676,7 +1690,7 @@ impl FrameLog {
     pub fn dump(&mut self) -> std::io::Result<(std::path::PathBuf, usize)> {
         use std::io::Write as _;
 
-        let path = dump_path(self.dumps);
+        let path = dump_path(self.dump_override.clone(), self.dumps);
         let entries = self.ring.len();
 
         // Write beside the target and rename into place. A dump is tens of MB onto a
@@ -1719,16 +1733,17 @@ impl FrameLog {
     }
 }
 
-/// Where [`FrameLog::dump`] writes. `NIRI_FRAME_LOG_DUMP` overrides it; otherwise
-/// the session's runtime dir, which is where the rest of our per-session files live
-/// and is writable without any assumption about the cwd.
-fn dump_path(nth: u64) -> std::path::PathBuf {
+/// Where [`FrameLog::dump`] writes, given the `NIRI_FRAME_LOG_DUMP` override the log captured at
+/// construction ([`FrameLog::dump_override`]); otherwise a numbered file under [`dump_dir`].
+///
+/// The override is a parameter rather than an env read for a reason — see that field.
+fn dump_path(over: Option<std::path::PathBuf>, nth: u64) -> std::path::PathBuf {
     // An explicit path is taken verbatim, including on a second dump: the caller
     // asked for that name. Everything else is numbered, because the natural way to
     // scope a measurement is dump-to-clear, run, dump-to-collect — and with one
     // fixed name per PID the second signal silently destroys the first window.
-    if let Ok(path) = std::env::var("NIRI_FRAME_LOG_DUMP") {
-        return std::path::PathBuf::from(path);
+    if let Some(path) = over {
+        return path;
     }
     std::path::PathBuf::from(dump_dir()).join(format!("frame-log.{}.{nth}.txt", std::process::id()))
 }
@@ -2186,6 +2201,9 @@ mod tests {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
             dumps: 0,
+            // No env read, and none of these tests may set one: `NIRI_FRAME_LOG_DUMP` is
+            // process-global, and mutating it here raced the other dump test.
+            dump_override: None,
             settings: Some(Settings::default()),
             in_flight: None,
             stats: HashMap::new(),
@@ -2299,9 +2317,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("niri-ring-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dump.txt");
-        std::env::set_var("NIRI_FRAME_LOG_DUMP", &path);
 
         let mut log = test_log();
+        // Per-log, not per-process: this is the whole point of capturing the override at
+        // construction. Setting the env var here used to race the ENOSPC test below.
+        log.dump_override = Some(path.clone());
         log.settings = Some(Settings {
             ring: Some(4),
             ..Settings::default()
@@ -2374,7 +2394,7 @@ mod tests {
         // state dir legitimately does not exist before the first dump.
         let blocker = dir.join("not-a-directory");
         std::fs::write(&blocker, b"").unwrap();
-        std::env::set_var("NIRI_FRAME_LOG_DUMP", blocker.join("dump.txt"));
+        log.dump_override = Some(blocker.join("dump.txt"));
         assert!(
             log.dump().is_err(),
             "a dump that cannot create its directory must fail"
@@ -2385,7 +2405,6 @@ mod tests {
             "a failed dump must not consume the entries it could not write"
         );
 
-        std::env::remove_var("NIRI_FRAME_LOG_DUMP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2473,16 +2492,23 @@ mod tests {
     /// Successive dumps must land in successive files. With one fixed name per PID
     /// the second `SIGUSR1` silently destroyed the first window — and the natural
     /// way to scope a measurement is exactly two dumps: one to clear, one to
-    /// collect. An explicit `NIRI_FRAME_LOG_DUMP` is still taken verbatim, because
-    /// the caller asked for that name.
+    /// collect. An explicit override is still taken verbatim, because the caller
+    /// asked for that name.
+    ///
+    /// This test used to `remove_var("NIRI_FRAME_LOG_DUMP")`, which is what broke a
+    /// *different* test mid-dump: the override is now a parameter, so nothing here
+    /// touches process-global state.
     #[test]
     fn successive_dumps_do_not_overwrite_each_other() {
-        std::env::remove_var("NIRI_FRAME_LOG_DUMP");
         assert_ne!(
-            dump_path(0),
-            dump_path(1),
+            dump_path(None, 0),
+            dump_path(None, 1),
             "each dump needs its own file, or the second destroys the first"
         );
+        // ...but an explicit path is that path, on every dump.
+        let over = std::path::PathBuf::from("/tmp/explicit.txt");
+        assert_eq!(dump_path(Some(over.clone()), 0), over);
+        assert_eq!(dump_path(Some(over.clone()), 7), over);
     }
 
     /// `ring` is off unless asked for, and `ring=0` turns it back off.
@@ -2712,6 +2738,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            dump_override: None,
             ring: VecDeque::new(),
             dumps: 0,
             settings: Some(Settings::default()),
@@ -2756,6 +2783,7 @@ mod tests {
         // second; it is a compositor with nothing to draw.
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            dump_override: None,
             ring: VecDeque::new(),
             dumps: 0,
             settings: Some(Settings::default()),
@@ -2787,6 +2815,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            dump_override: None,
             ring: VecDeque::new(),
             dumps: 0,
             settings: Some(Settings::default()),
@@ -2828,6 +2857,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            dump_override: None,
             ring: VecDeque::new(),
             dumps: 0,
             settings: Some(Settings::default()),
@@ -2876,6 +2906,7 @@ mod tests {
         let refresh = Duration::from_micros(16667);
         let mut log = FrameLog {
             parked: VecDeque::new(),
+            dump_override: None,
             ring: VecDeque::new(),
             dumps: 0,
             settings: Some(Settings::default()),
