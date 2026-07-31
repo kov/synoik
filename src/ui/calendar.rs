@@ -836,10 +836,31 @@ impl Calendar {
 fn list_em() -> f64 {
     crate::ui::pt_to_px(11.)
 }
-/// `.message-list` width (`_message-list.scss:3`).
+/// `.message-list` **content** width: `width: $_message_list_width` = 29em
+/// (`_message-list.scss:3,7`). St's `width` is a content width — `adjust_preferred_width` adds
+/// border and padding on top of it — so the box on screen is wider; see [`list_box_w`].
+/// Rounded because St allocates in whole logical px. 425 live.
 fn list_w() -> f64 {
-    29. * list_em()
+    (29. * list_em()).round()
 }
+
+/// The `.message-list` **box**: its content plus `padding-right: $base_padding` and
+/// `border-right-width: 1px` (`_message-list.scss:11`). 432 live.
+///
+/// This is also where the visible hairline between the two columns falls — the only border in
+/// the popover that is actually drawn.
+fn list_box_w() -> f64 {
+    list_w() + LIST_PAD_R + LIST_BORDER_R
+}
+const LIST_PAD_R: f64 = 6.;
+const LIST_BORDER_R: f64 = 1.;
+
+/// Between the two columns: `.message-list:ltr margin-right: $base_margin` (4) plus
+/// `.datemenu-calendar-column:ltr margin-left: $base_padding` (6, `_calendar.scss:15`). 10 live.
+fn column_gap() -> f64 {
+    LIST_MARGIN_R + COLUMN_MARGIN_L
+}
+const COLUMN_MARGIN_L: f64 = 6.;
 /// `.popup-menu-content` padding (`_popovers.scss:28`) — the uniform inset between
 /// the popover box and its content. Applied on the left (before the list column),
 /// the right (after the calendar column), and the bottom (below the calendar
@@ -859,10 +880,13 @@ pub(crate) fn list_pad() -> f64 {
 /// `.message-list:ltr` margin-right, separating the two columns
 /// (`_message-list.scss:11`).
 const LIST_MARGIN_R: f64 = 4.;
-/// Space kept free right of the cards: the list's `padding-right:
-/// $base_padding` plus `.message-view:ltr` `margin-right: $base_margin * 3`
-/// (scrollbar room, `_message-list.scss:11,31`).
-const LIST_SCROLL_R: f64 = 18.;
+/// Scrollbar room right of the cards: `.message-view:ltr { margin-right: $base_margin * 3 }`
+/// (`_message-list.scss:30-31`).
+///
+/// This used to also include the list's own `padding-right: $base_padding`, which double-charged
+/// the cards by 6 — that padding is *outside* the 29em content width (see [`list_w`]), not inside
+/// it. Cards are 413 live; we were making them 407.
+const LIST_SCROLL_R: f64 = 12.;
 /// Card width in the list column.
 fn card_w() -> f64 {
     list_w() - LIST_SCROLL_R
@@ -2563,7 +2587,7 @@ pub struct DateMenu {
 
 /// The x where the calendar column starts (also the list column's width).
 fn calendar_col_x() -> f64 {
-    LIST_PAD + list_w() + LIST_MARGIN_R
+    LIST_PAD + list_box_w() + column_gap()
 }
 
 impl DateMenu {
@@ -3048,8 +3072,10 @@ impl DateMenu {
             // `Painter::hairline` keeps it crisp (an SDF fill would AA-dim a 1px line away).
             p.hairline(
                 Rectangle::new(
-                    Point::from((LIST_PAD + list_w(), 0.)),
-                    Size::from((1., size.h)),
+                    // On the box's right EDGE — past the list's own padding-right — not at the
+                    // content edge. `list_box_w` includes the border itself, hence the -1.
+                    Point::from((LIST_PAD + list_box_w() - LIST_BORDER_R, 0.)),
+                    Size::from((LIST_BORDER_R, size.h)),
                 ),
                 widget::style::BORDERS,
             )?;
@@ -3882,6 +3908,44 @@ mod tests {
             cell.loc.y + cell.size.h / 2.,
         )));
         assert!(cal.revision > before);
+    }
+
+    /// The popover's two columns add up to what the live shell allocates across.
+    ///
+    /// GNOME's `.datemenu-popover` is 793 wide: `1 border + 6 .popup-menu-content padding + 4
+    /// #calendarArea padding` on each side, around `432 .message-list + 4 its margin-right + 6 the
+    /// column's margin-left + 329 column`. Our size is measured from inside the popover border
+    /// (the chrome adds it), so the target here is 791.
+    ///
+    /// The subtle one is `.message-list`: `width: 29em` is a **content** width, and St adds the
+    /// `padding-right: 6` and `border-right: 1` on top — so the box is 432, not 425. Reading it as
+    /// the box width made the popover 15 short *and* the cards 6 narrow, because the same 6px was
+    /// then also subtracted inside as scrollbar room.
+    #[test]
+    fn popover_columns_match_the_live_shell() {
+        assert_eq!(list_w(), 425., ".message-list content is 29em");
+        assert_eq!(
+            list_box_w(),
+            432.,
+            ".message-list box adds padding-right 6 and a 1px border"
+        );
+        assert_eq!(
+            card_w(),
+            413.,
+            ".message is 413 wide (content less .message-view's 12)"
+        );
+        assert_eq!(
+            column_gap(),
+            10.,
+            "list margin-right 4 + column margin-left 6"
+        );
+
+        let dm = DateMenu::new(0, true, [0, 0, 0], vec![]);
+        assert_eq!(
+            dm.logical_size().w,
+            791.,
+            "10 + 432 + 10 + 329 + 10, inside the popover's own border"
+        );
     }
 
     /// The calendar column matches what a live GNOME 50.3 shell allocates, box for box.
