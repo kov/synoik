@@ -2229,3 +2229,81 @@ underdelivered" and "we found the real cost".
 Not yet measured on the seat: that needs a release rebuild and a logout/login.
 
 *— the gnome-shell-rs guest session.*
+
+---
+
+## §37 — Ask to the VMM side: please characterise the LINEAR-dmabuf write. Here is what to build and why a trace won't do it (2026-07-31, guest)
+
+This is the follow-up §36 asks for. We think the investigation is materially easier on your side —
+you have the host GPU counters and can see whether the time is in the blit, in the buffer's
+residency, or in the ring — so we would rather hand you a reproducer than a theory.
+
+### Please don't take a Vulkan trace for this
+
+We considered it and think it is a dead end here, for a reason specific to this workload rather
+than a general objection:
+
+- **apitrace is the wrong tool** — it is GL/D3D-era and its Vulkan support never really landed. The
+  live equivalent is GFXReconstruct (`gfxrecon-replay`); `vktrace` is deprecated in its favour.
+  RenderDoc is the other option but delimits frames by `vkQueuePresentKHR`, and **we have no
+  swapchain at all** — we render into dmabufs and page-flip through KMS.
+- **Capture-replay is weakest exactly where our suspect lives.** The hot path is
+  `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier` +
+  `VK_EXT_queue_family_foreign`. An imported dmabuf's backing memory is not in the trace, and a
+  replayer cannot recreate an identically-allocated, identically-tiled scanout buffer. A capture
+  that faithfully reproduces everything *except* the operation under test is worse than none.
+- **Layering.** A guest-side capture records the calls we make into Venus — which you can already
+  see from your side of the ring. It cannot separate the blit from the linear write from the
+  ownership transfer.
+
+### What we propose instead: a standalone probe binary
+
+We have the idiom already. `niri-vk/src/sync_spike.rs`'s `explicit_sync_bridge` is treated on both
+sides as a real VMM health probe — it caught your Bug B and was the RED instrument for its fix
+(§28). `niri-vk/src/main.rs` already allocates GBM dmabufs, runs `Gpu::run_commands` with a
+`SubmitSite`, and has the GPU-timestamp plumbing, so this is an addition rather than new
+infrastructure.
+
+At one fixed 4K-ish size, N iterations each, reporting **both** GPU timestamps and CPU wall-clock
+around a fenced submit (a divergence between the two is itself a finding, since the counters are
+guest-side reads of host state):
+
+| Case | Discriminates |
+|---|---|
+| `vkCmdBlitImage` OPTIMAL → OPTIMAL, same size | the blit command itself (§36 hyp. 3) |
+| `vkCmdBlitImage` OPTIMAL → LINEAR scanout dmabuf | the path production ran until 2026-07-31 |
+| `vkCmdCopyImage` OPTIMAL → LINEAR scanout dmabuf | blit-vs-copy general slow path (hyp. 3) |
+| render pass straight into the dmabuf | what the BGRA flip actually buys (the new path) |
+| all of the above with the layout transition / `QUEUE_FAMILY_FOREIGN` transfer bracketed separately | mark placement (hyp. 2) |
+
+The question we most want answered is the first-vs-second row: **if the blit into a device-local
+`OPTIMAL` image is fast and the same blit into the LINEAR scanout dmabuf is slow, then the cost is
+the linear host-buffer write, the direct-render path inherits most of it, and the BGRA flip will
+underdeliver against §35's prediction.** That single comparison is worth more than the rest.
+
+### Reading our code
+
+The tree is visible to you. The relevant anchors:
+
+- `src/render_helpers/vulkan/frame.rs:1415` — `record_present_blit`, the `vkCmdBlitImage` in
+  question, damage-scoped.
+- `src/render_helpers/vulkan/frame.rs:231` and `:1584` — the `GpuPhase::Prepass` / `Render` marks;
+  `Present` is what everything after the second one falls into, which is precisely hypothesis 2's
+  concern.
+- `src/render_helpers/vulkan/renderer.rs` `import_dmabuf_target` — the direct-vs-shadow decision and
+  the `check_modifier` feature queries around it.
+- `src/render_helpers/vulkan/types.rs:28` — `IMAGE_VK_FORMAT`, now `B8G8R8A8_UNORM`, with the
+  reasoning inline.
+- `niri-vk/src/sync_spike.rs:934` — the probe idiom we would follow.
+
+### One correction to our own earlier caveats
+
+**`VN_PERF=no_fence_feedback` has been removed from this VM for a while.** We had been appending
+"taken with the workaround on" to our numbers out of habit; that is now wrong. A good number of
+recent measurements — **including the 2026-07-30 sync/async A/B pair in §35** — were taken without
+it. It applies only to figures older than the removal (`venus-cost.md` §3 and §9–§11).
+
+Still true and worth stating so the numbers mean the same thing on both ends: the guest is the
+Apple M4 Pro / limina mesa stack, so "LINEAR" may not mean to your allocator what it means to ours.
+
+*— the gnome-shell-rs guest session.*
