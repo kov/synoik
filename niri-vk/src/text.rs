@@ -385,7 +385,7 @@ fn shape_line_ranges(
         } else {
             Wrap::Word
         });
-        let mut attrs = Attrs::new().family(SANS_FAMILY);
+        let mut attrs = Attrs::new().family(sans_family());
         if bold {
             attrs = attrs.weight(Weight::BOLD);
         }
@@ -656,7 +656,7 @@ impl TextContext {
         {
             let mut b = buffer.borrow_with(&mut fonts);
             b.set_size(Some(wrap_px), None);
-            let default_attrs = Attrs::new().family(SANS_FAMILY);
+            let default_attrs = Attrs::new().family(sans_family());
             // Tag each span with its index (cosmic-text carries it to every laid-out glyph as
             // `metadata`), so `resolve` can record which span each glyph came from and a caller
             // can recover a span's ink rectangle (e.g. to paint an inline keycap background).
@@ -852,33 +852,54 @@ pub struct TextSpan<'a> {
     pub px: f32,
 }
 
-/// **This is a known, measured divergence — we render the wrong typeface.**
+/// GNOME's out-of-the-box UI font, and what [`sans_family`] falls back to.
 ///
-/// The generic `Family::SansSerif` resolves through fontconfig to whatever `sans` maps to (Noto
-/// Sans here), whose metrics differ from GNOME's, so the family has to be named. It was named
-/// Cantarell on the belief that Cantarell 11 is GNOME's default. It is not, as of 50.3: the
-/// `org.gnome.desktop.interface font-name` schema default is **`Adwaita Sans 11`** (verified with
-/// `dconf`/`gsettings` against a live 50.3 session, and Adwaita Sans is installed there).
-///
-/// Every glyph we shape is therefore the wrong face, which moves every measured text width —
-/// wrapping, ellipsis and any centring derived from an advance.
-///
-/// The fix is not to swap one hardcoded name for another: the fork's tenet is GNOME's model, and
-/// GNOME reads the family *and* size from `font-name` (we already read the size,
-/// `crate::gnome::parse_font_size_pt`). Doing it properly means this becomes a runtime value, which
-/// re-measures every text-derived layout — hence its own slice rather than a drive-by.
-pub const SANS_FAMILY: Family<'static> = Family::Name("Cantarell");
+/// The `org.gnome.desktop.interface font-name` schema default is `Adwaita Sans 11` as of 50.3 —
+/// **not** Cantarell, which it was several releases ago and which a long-lived profile still
+/// carries in dconf because an explicit value survives a default change.
+pub const DEFAULT_SANS_FAMILY: &str = "Adwaita Sans";
 
-/// Sans attrs for a single-line LABEL: Cantarell, optional bold, and **tabular figures** (`tnum`).
-/// GNOME applies `%numeric` (`tnum`) to the panel clock and calendar numbers so a digit run keeps a
-/// constant advance — Cantarell's default figures are proportional (`1` is narrower than `8`),
-/// which would jitter the advance-centered clock every second. Labels are exactly GNOME's numeric
-/// surfaces (clock, dates, counts); body paragraphs keep proportional figures (they don't set
-/// this).
+/// The realized sans family, i.e. the family half of `org.gnome.desktop.interface font-name`.
+///
+/// Named rather than `Family::SansSerif`, because the generic resolves through fontconfig to
+/// whatever `sans` maps to (Noto Sans here) — a different face with different metrics, so every
+/// measured advance, wrap point and ellipsis would land somewhere GNOME doesn't put it.
+///
+/// Runtime rather than a constant for the same reason the sizes are: GNOME reads **both** halves
+/// of `font-name` and re-derives its theme context when it changes
+/// (`st-theme-context.c:339-344`), so a hardcoded family is only ever right by luck.
+pub fn sans_family() -> Family<'static> {
+    Family::Name(*SANS_FAMILY.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Publish the realized sans family; returns whether it changed, so a caller can invalidate the
+/// text that was measured with the old one.
+///
+/// The name is leaked to reach `'static`, which `Family::Name` and thus every `Attrs` we build
+/// requires. It is one small allocation per *distinct* family picked in a session — the early
+/// return keeps a repeated settings publish (every `font-name` change re-publishes both halves)
+/// from leaking on each one.
+pub fn set_sans_family(name: &str) -> bool {
+    let mut slot = SANS_FAMILY.lock().unwrap_or_else(PoisonError::into_inner);
+    if *slot == name {
+        return false;
+    }
+    *slot = Box::leak(name.to_owned().into_boxed_str());
+    true
+}
+
+static SANS_FAMILY: Mutex<&'static str> = Mutex::new(DEFAULT_SANS_FAMILY);
+
+/// Sans attrs for a single-line LABEL: the UI sans, optional bold, and **tabular figures**
+/// (`tnum`). GNOME applies `%numeric` (`tnum`) to the panel clock and calendar numbers so a digit
+/// run keeps a constant advance — the UI sans's default figures are proportional (`1` is narrower
+/// than `8`), which would jitter the advance-centered clock every second. Labels are exactly
+/// GNOME's numeric surfaces (clock, dates, counts); body paragraphs keep proportional figures (they
+/// don't set this).
 fn sans_label_attrs(bold: bool) -> Attrs<'static> {
     let mut features = FontFeatures::new();
     features.enable(FeatureTag::new(b"tnum"));
-    let mut attrs = Attrs::new().family(SANS_FAMILY).font_features(features);
+    let mut attrs = Attrs::new().family(sans_family()).font_features(features);
     if bold {
         attrs = attrs.weight(Weight::BOLD);
     }
@@ -895,7 +916,7 @@ pub enum SpanFamily {
 impl TextSpan<'_> {
     fn attrs(&self) -> Attrs<'static> {
         let family = match self.family {
-            SpanFamily::Sans => SANS_FAMILY,
+            SpanFamily::Sans => sans_family(),
             SpanFamily::Mono => Family::Monospace,
         };
         let weight = if self.bold {

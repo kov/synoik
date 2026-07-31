@@ -77,6 +77,10 @@ pub struct GnomeSettings {
     /// every theme point size is a ratio against. See [`crate::ui::base_font_pt`] for
     /// why the theme's own `$base_font_size` is only nominal. GNOME's default is 11.
     pub base_font_pt: f64,
+
+    /// `org.gnome.desktop.interface font-name`'s family — the other half of the same key,
+    /// realized the same way. See [`niri_vk::text::sans_family`].
+    pub base_font_family: String,
     /// `org.gnome.desktop.interface icon-theme`: the icon theme both the symbolic
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
@@ -344,6 +348,7 @@ impl Default for GnomeSettings {
             accent_color: ACCENT_BLUE,
             app_picker_layout: HashMap::new(),
             base_font_pt: crate::ui::BASE_FONT_PT,
+            base_font_family: niri_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
             icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
@@ -566,6 +571,10 @@ impl GnomeSettings {
             match parse_font_size_pt(value.as_str()) {
                 Some(pt) => self.base_font_pt = pt,
                 None => warn!("ignoring font-name {value:?} with no point size"),
+            }
+            match parse_font_family(value.as_str()) {
+                Some(family) => self.base_font_family = family,
+                None => warn!("ignoring font-name {value:?} with no family"),
             }
         }
         if settings_has_key(interface, "clock-format") {
@@ -2572,6 +2581,75 @@ fn parse_font_size_pt(desc: &str) -> Option<f64> {
     (pt > 0.).then_some(pt)
 }
 
+/// The family out of a Pango font description like `"Adwaita Sans 11"` or
+/// `"Source Sans Pro Semibold 10.5"`: everything left after dropping the trailing size and any
+/// trailing style words, which is how `pango_font_description_from_string` splits it.
+///
+/// Ambiguity is Pango's, not ours: a description's style words are just trailing words off a
+/// known list, so a family whose own last word is on that list (`"Roboto Condensed"`) parses as
+/// `Roboto` + condensed. Pango resolves it the same way, so matching it is the point.
+///
+/// `None` when nothing is left (a description that is only a size, or empty), in which case the
+/// caller keeps the default rather than asking for a nameless family.
+fn parse_font_family(desc: &str) -> Option<String> {
+    // Pango matches style words case-insensitively and ignores the dashes, so `Semi-Bold`,
+    // `semibold` and `Semi Bold`'s halves all land here.
+    const STYLE_WORDS: &[&str] = &[
+        // styles and variants
+        "normal",
+        "roman",
+        "oblique",
+        "italic",
+        "smallcaps",
+        "allsmallcaps",
+        "unicase",
+        "titlecaps",
+        "petitecaps",
+        "allpetitecaps",
+        // weights
+        "thin",
+        "ultralight",
+        "extralight",
+        "light",
+        "semilight",
+        "demilight",
+        "book",
+        "regular",
+        "medium",
+        "semibold",
+        "demibold",
+        "bold",
+        "ultrabold",
+        "extrabold",
+        "heavy",
+        "black",
+        "ultraheavy",
+        "extrablack",
+        "ultrablack",
+        // stretch
+        "ultracondensed",
+        "extracondensed",
+        "condensed",
+        "semicondensed",
+        "semiexpanded",
+        "expanded",
+        "extraexpanded",
+        "ultraexpanded",
+    ];
+
+    let mut words: Vec<&str> = desc.split_whitespace().collect();
+    if words.last().is_some_and(|w| w.parse::<f64>().is_ok()) {
+        words.pop();
+    }
+    while words.last().is_some_and(|w| {
+        let normalized = w.replace('-', "").to_ascii_lowercase();
+        STYLE_WORDS.contains(&normalized.as_str())
+    }) {
+        words.pop();
+    }
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
 fn parse_accent_color(name: &str) -> Option<[u8; 3]> {
     Some(match name {
         "blue" => ACCENT_BLUE,
@@ -2905,6 +2983,40 @@ mod tests {
         assert_eq!(parse_font_size_pt("Cantarell"), None);
         assert_eq!(parse_font_size_pt(""), None);
         assert_eq!(parse_font_size_pt("Cantarell 0"), None);
+    }
+
+    #[test]
+    fn font_family_parsing() {
+        assert_eq!(
+            parse_font_family("Adwaita Sans 11").as_deref(),
+            Some("Adwaita Sans")
+        );
+        assert_eq!(
+            parse_font_family("Cantarell 12").as_deref(),
+            Some("Cantarell")
+        );
+        // Style words come off, however they are spelled, and however many there are.
+        assert_eq!(
+            parse_font_family("Source Sans Pro Semibold 10.5").as_deref(),
+            Some("Source Sans Pro")
+        );
+        assert_eq!(
+            parse_font_family("Cantarell Bold Italic 11.5").as_deref(),
+            Some("Cantarell")
+        );
+        assert_eq!(
+            parse_font_family("Inter Semi-Bold 11").as_deref(),
+            Some("Inter")
+        );
+        // A description need not carry a size — the size parser handles that half.
+        assert_eq!(
+            parse_font_family("Adwaita Sans").as_deref(),
+            Some("Adwaita Sans")
+        );
+        // Nothing left to name: keep the default rather than ask for "".
+        assert_eq!(parse_font_family(""), None);
+        assert_eq!(parse_font_family("11"), None);
+        assert_eq!(parse_font_family("Bold 11"), None);
     }
 
     #[test]

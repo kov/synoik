@@ -9451,16 +9451,23 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     // their own elements now (they cross-fade / take hover), and the first element pushed is
     // the *topmost* — so pushing them after the panel buries them, which is invisible to
     // every geometry test and is exactly what happened.
-    let label = px(
-        &pixels,
-        w,
-        (l.name_band.loc.x + l.name_band.size.w / 2.) as i32,
-        (l.name_band.loc.y + l.name_band.size.h / 2.) as i32,
-    );
+    // Scan the band's mid-line rather than probing its exact centre pixel: the name is centred, so
+    // whether the middle column lands on ink or in a letter gap is a property of the shaped font,
+    // not of the z-order this is testing. (It landed on the panel bg the moment the UI font
+    // changed — a green test that only measured which glyphs the session happened to have.)
+    let cy = (l.name_band.loc.y + l.name_band.size.h / 2.) as i32;
+    let mut label = None;
+    for x in (l.name_band.loc.x as i32)..((l.name_band.loc.x + l.name_band.size.w) as i32) {
+        let got = px(&pixels, w, x, cy);
+        if got[0] > 150 && got[1] > 150 && got[2] > 150 {
+            label = Some(got);
+            break;
+        }
+    }
     eprintln!("vulkan_folder_dialog: name={label:?}");
     assert!(
-        label[0] > 150 && label[1] > 150 && label[2] > 150,
-        "the folder name draws over the panel in $system_fg_color: {label:?}"
+        label.is_some(),
+        "the folder name draws over the panel in $system_fg_color: no light pixel across the band"
     );
 
     // The edit button's disc is `button(normal)` *over* the overlay surface — a distinctly

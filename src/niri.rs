@@ -1172,8 +1172,10 @@ impl State {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
             // Publish the realized base font before anything measures text: every point
-            // size in the UI is a ratio against it (`crate::ui::base_font_pt`).
+            // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
+            // shaped advance comes from the family.
             crate::ui::set_base_font_pt(state.niri.gnome_settings.base_font_pt);
+            niri_vk::text::set_sans_family(&state.niri.gnome_settings.base_font_family);
             state.niri.last_power_profile = state.niri.gnome_settings.last_power_profile.clone();
             state.niri.gnome_settings_writer = Some(writer);
             // Seed both icon caches from the configured icon theme (they default
@@ -1368,14 +1370,19 @@ impl State {
                             new_is.present && old_is.mru_sources != new_is.mru_sources;
                         let icon_theme_changed =
                             state.niri.gnome_settings.icon_theme != settings.icon_theme;
-                        let base_font_changed =
-                            state.niri.gnome_settings.base_font_pt != settings.base_font_pt;
+                        let base_font_changed = state.niri.gnome_settings.base_font_pt
+                            != settings.base_font_pt
+                            || state.niri.gnome_settings.base_font_family
+                                != settings.base_font_family;
                         state.niri.gnome_settings = settings;
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
                         if base_font_changed {
                             crate::ui::set_base_font_pt(state.niri.gnome_settings.base_font_pt);
+                            niri_vk::text::set_sans_family(
+                                &state.niri.gnome_settings.base_font_family,
+                            );
                         }
                         // Both surfaces are re-derived *after* the assignment: the grid's
                         // order comes out of `app_picker_layout`, so syncing it against

@@ -46,7 +46,9 @@ use crate::system_status::{
     NetworkStatus, PowerProfileStatus,
 };
 use crate::ui::popover::PopoverAction;
-use crate::ui::widget::{self, style, Align, Painter, ShapedText, TextShaper, TextStyle};
+use crate::ui::widget::{
+    self, style, Align, Painter, ParagraphSpan, ShapedParagraph, ShapedText, TextShaper, TextStyle,
+};
 use crate::utils::to_physical_precise_round;
 
 // Geometry, logical px (grounded in gnome-shell-sass quick-settings proportions).
@@ -188,6 +190,29 @@ const DETAIL_ROW_PT: f64 = 11.;
 /// The bluetooth placeholder line: `.bt-menu-placeholder` extends `%title_4` = 13pt/700
 /// (`_quick-settings.scss:227-232`, `_common.scss` heading scale).
 const DETAIL_PLACEHOLDER_PT: f64 = 13.;
+/// `.bt-menu-placeholder`'s `padding: 2em 4em` (`_quick-settings.scss:231`), in ems of its **own**
+/// `%title_4` size — St resolves an `em` against the node's realized font, not the stage's.
+const DETAIL_PLACEHOLDER_PAD_V_EM: f64 = 2.;
+const DETAIL_PLACEHOLDER_PAD_H_EM: f64 = 4.;
+/// How many wrapped lines the placeholder row is sized for.
+///
+/// GNOME does not cap it — the label is `line_wrap: true` with `ellipsize: NONE`
+/// (`bluetooth.js:291-294`), so the item grows to whatever the text needs. We need the row's
+/// height *without* measuring text, because a card's shape is pure ([`RowKind::height`]) and the
+/// geometry is derived from it, so this is the one number that has to be stated. Both strings
+/// `_updatePlaceholder` can set (`bluetooth.js:348-352`) wrap to exactly two lines at the 4em-inset
+/// width — pinned by a test, which is what turns "stated" back into "checked".
+const DETAIL_PLACEHOLDER_LINES: f64 = 2.;
+
+/// The placeholder's `em`, i.e. one `%title_4` px.
+fn placeholder_em() -> f64 {
+    crate::ui::pt_to_px(DETAIL_PLACEHOLDER_PT)
+}
+
+/// The width the placeholder wraps in, inside `.bt-menu-placeholder`'s 4em side padding.
+fn placeholder_wrap_w(row_w: f64) -> f64 {
+    (row_w - 2. * DETAIL_PLACEHOLDER_PAD_H_EM * placeholder_em()).max(1.)
+}
 /// A row's trailing sublabel color: `.device-subtitle` = `transparentize($fg_color, 0.5)`
 /// (`_quick-settings.scss:234`).
 const DETAIL_SUBTITLE_FG: [f32; 4] = [1., 1., 1., 0.5];
@@ -197,14 +222,17 @@ const DETAIL_SUBTITLE_FG: [f32; 4] = [1., 1., 1., 0.5];
 /// A baked card row: shaped text for the ordinary and label rows, a bare value for a slider one.
 enum DetailRowRun {
     Text(TextRun),
-    Slider { value: f64 },
+    Slider {
+        value: f64,
+    },
+    /// The wrapped, centered `.bt-menu-placeholder` block.
+    Placeholder(ShapedParagraph),
 }
 
 struct TextRun {
     label: ShapedText,
     /// The trailing right-aligned sublabel run (Connect/Disconnect/busy), if any.
     trailing: Option<ShapedText>,
-    placeholder: bool,
     has_icon: bool,
 }
 
@@ -262,6 +290,9 @@ enum RowKind {
     Label,
     /// A slider.
     Slider,
+    /// The bluetooth menu's wrapped, centered `.bt-menu-placeholder` — its own box, not a
+    /// `%menuitem` one (`_quick-settings.scss:227-232`).
+    Placeholder,
 }
 
 impl RowKind {
@@ -269,7 +300,16 @@ impl RowKind {
     /// and the slider bin as plain menu items), so they share a height today. The per-kind hook
     /// exists so a kind can diverge without another geometry refactor.
     fn height(self) -> f64 {
-        DETAIL_ROW_H
+        match self {
+            Self::Item | Self::Label | Self::Slider => DETAIL_ROW_H,
+            // `2em` padding top and bottom around [`DETAIL_PLACEHOLDER_LINES`] lines. The line
+            // height is cosmic-text's `px * 1.25`, the same metric the shaper lays the block out
+            // with — deriving it from anything else would drift the row off its own text.
+            Self::Placeholder => {
+                let em = placeholder_em();
+                2. * DETAIL_PLACEHOLDER_PAD_V_EM * em + DETAIL_PLACEHOLDER_LINES * em * 1.25
+            }
+        }
     }
 }
 
@@ -295,6 +335,10 @@ impl DetailRow {
     /// geometry sized the card from.
     fn spec(&self) -> RowSpec {
         match self {
+            DetailRow::Item(row) if row.placeholder => RowSpec {
+                kind: RowKind::Placeholder,
+                separator_before: row.separator_before,
+            },
             DetailRow::Item(row) => RowSpec::item(row.separator_before),
             DetailRow::Label(_) => RowSpec {
                 kind: RowKind::Label,
@@ -729,7 +773,17 @@ impl DetailOwner {
             // N visible-device rows — or ONE placeholder row when there are none — then the
             // settings row past a separator.
             DetailOwner::Bluetooth => {
-                let mut shape = vec![RowSpec::item(false); device_count.clamp(1, MAX_DEVICE_ROWS)];
+                // No devices → the one row is the wrapped `.bt-menu-placeholder`, which is a
+                // taller box than a `%menuitem` — so the *kind* has to change here, not just the
+                // text, or the card is sized for a row it doesn't draw.
+                let mut shape = if device_count == 0 {
+                    vec![RowSpec {
+                        kind: RowKind::Placeholder,
+                        separator_before: false,
+                    }]
+                } else {
+                    vec![RowSpec::item(false); device_count.min(MAX_DEVICE_ROWS)]
+                };
                 shape.push(RowSpec::item(true));
                 shape
             }
@@ -2379,6 +2433,8 @@ impl QuickSettings {
                 .map(|owner| -> anyhow::Result<_> {
                     let (_, title) = owner.header(self.network);
                     let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
+                    let row_w =
+                        detail_rect(self.layout()).map_or(0., |c| c.size.w) - 2. * DETAIL_PAD;
                     let rows = self.detail_rows(owner);
                     // The card is sized from the pure `row_shape`; assert the live rows match it
                     // (count + separator positions) so the geometry can't drift from what's drawn.
@@ -2409,20 +2465,29 @@ impl QuickSettings {
                                 }
                             };
                             // The placeholder is `.bt-menu-placeholder` = `%title_4` (13pt/700,
-                            // centered, `_quick-settings.scss:227-232`); ordinary rows are
-                            // regular-weight menu items.
-                            let style = if r.placeholder {
-                                TextStyle::new(DETAIL_PLACEHOLDER_PT).bold()
-                            } else {
-                                TextStyle::new(DETAIL_ROW_PT)
-                            };
+                            // centered, wrapped inside 4em of side padding —
+                            // `_quick-settings.scss:227-232`, `bluetooth.js:291-294`); ordinary
+                            // rows are regular-weight single-line menu items.
+                            if r.placeholder {
+                                let wrap = placeholder_wrap_w(row_w);
+                                return Ok(DetailRowRun::Placeholder(shaper.paragraph(
+                                    &[ParagraphSpan {
+                                        text: &r.label,
+                                        pt: DETAIL_PLACEHOLDER_PT,
+                                        bold: true,
+                                        mono: false,
+                                    }],
+                                    wrap,
+                                    DETAIL_PLACEHOLDER_PT,
+                                )?));
+                            }
+                            let style = TextStyle::new(DETAIL_ROW_PT);
                             Ok(DetailRowRun::Text(TextRun {
                                 label: shaper.shape(&r.label, style)?,
                                 trailing: r
                                     .trailing
                                     .map(|t| shaper.shape(&t, TextStyle::new(DETAIL_ROW_PT)))
                                     .transpose()?,
-                                placeholder: r.placeholder,
                                 has_icon: !r.icons.is_empty(),
                             }))
                         })
@@ -2618,6 +2683,17 @@ impl QuickSettings {
                     // separator, no hover (`brightness.js:29` is a non-reactive item), no text.
                     let row_run = match row_run {
                         DetailRowRun::Text(run) => run,
+                        // The bluetooth placeholder: a wrapped, centered block in its own taller
+                        // box (`.bt-menu-placeholder`), not a `%menuitem` line.
+                        DetailRowRun::Placeholder(block) => {
+                            let (_, _, bw, bh) = block.ink_bounds();
+                            let origin = Point::<f64, Physical>::from((
+                                (rrect.loc.x + rrect.size.w / 2.) * scale - f64::from(bw) / 2.,
+                                (rrect.loc.y + rrect.size.h / 2.) * scale - f64::from(bh) / 2.,
+                            ));
+                            p.paragraph(block, origin.to_i32_round(), FG_OFF)?;
+                            continue;
+                        }
                         DetailRowRun::Slider { value } => {
                             paint_slider(
                                 &mut p,
@@ -2657,16 +2733,6 @@ impl QuickSettings {
                     let label_cy = rrect.loc.y + rrect.size.h / 2.;
                     // The bluetooth placeholder line: centered bold text, nothing else in the row
                     // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`).
-                    if row_run.placeholder {
-                        p.text_clipped(
-                            run,
-                            Point::from((rrect.loc.x + rrect.size.w / 2., label_cy)),
-                            Align::CENTER,
-                            FG_OFF,
-                            rrect,
-                        )?;
-                        continue;
-                    }
                     let label_x = if row_run.has_icon {
                         rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
                     } else {
@@ -5171,13 +5237,24 @@ mod tests {
             pixels[k + 3]
         );
 
-        // No devices → the placeholder variant; same geometry (one row), different row ink.
+        // No devices → the placeholder variant. Still one row, but a *taller* one: the
+        // placeholder is `.bt-menu-placeholder`'s own `2em 4em` box, not a `%menuitem` line, so
+        // the card grows by exactly that kind's height difference and by nothing else.
         let mut placeholder = qs_bluetooth(true, Vec::new());
         placeholder.pointer_click(center(
             tile_arrow_rect(i, GridTile::Bluetooth, placeholder.layout()).unwrap(),
         ));
         let (pixels2, size2) = read_pixels(&placeholder);
-        assert_eq!(size, size2, "both cards have one row: same menu size");
+        assert_eq!(
+            size.w, size2.w,
+            "the card width does not depend on its rows"
+        );
+        let grew = f64::from(size2.h - size.h);
+        let want = RowKind::Placeholder.height() - RowKind::Item.height();
+        assert!(
+            (grew - want).abs() <= 1.,
+            "the placeholder card is taller by one row-kind difference: grew {grew}, want {want}"
+        );
 
         let row = detail_row_rect(0, with_device.layout()).expect("row 0");
         let mut differs = false;
@@ -5195,26 +5272,35 @@ mod tests {
             "a device row (alias + trailing sublabel) must paint different ink than the placeholder"
         );
 
-        // Review F1: GNOME wraps the placeholder inside `2em 4em` padding
-        // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`; `ellipsize: NONE` +
-        // `line_wrap`, `bluetooth.js:291-294`); we draw ONE centered clipped line instead, which
-        // is only an acceptable divergence while both strings actually FIT the row unclipped —
-        // pin that, since `text_clipped` would truncate silently.
+        // GNOME wraps the placeholder inside `2em 4em` padding (`.bt-menu-placeholder`,
+        // `_quick-settings.scss:227-232`; `ellipsize: NONE` + `line_wrap`,
+        // `bluetooth.js:291-294`) and lets the item grow to whatever the text needs. Our card is
+        // sized from a *pure* shape that never measures text, so the line count is stated as
+        // `DETAIL_PLACEHOLDER_LINES` — which is only honest while both strings the shell can
+        // actually set (`bluetooth.js:348-352`) really do fit it. Pin that: past it the block
+        // would overflow its row, silently, in whatever font the session is set to.
         {
             let row = detail_row_rect(0, placeholder.layout()).expect("placeholder row");
-            let mut shaper = TextShaper::new(&mut vk, 1.);
+            let wrap = placeholder_wrap_w(row.size.w);
             for text in [
                 "Turn on Bluetooth to connect to devices",
                 "No available or connected devices",
             ] {
-                let run = shaper
-                    .shape(text, TextStyle::new(DETAIL_PLACEHOLDER_PT).bold())
-                    .expect("shape the placeholder");
-                let ink_w = f64::from(run.ink_bounds().2);
+                let lines = niri_vk::text::wrap_lines_weighted(
+                    text,
+                    crate::ui::pt_to_px(DETAIL_PLACEHOLDER_PT) as f32,
+                    true,
+                    wrap,
+                    // Far above the stated count, so this measures the text rather than
+                    // re-asserting the cap.
+                    16,
+                    false,
+                );
                 assert!(
-                    ink_w < row.size.w,
-                    "the placeholder must fit its row unclipped: {text:?} ink {ink_w} vs row {}",
-                    row.size.w
+                    lines.len() as f64 <= DETAIL_PLACEHOLDER_LINES,
+                    "the placeholder must fit the row it is sized for: {text:?} takes \
+                     {} lines at {wrap}px, row is sized for {DETAIL_PLACEHOLDER_LINES}: {lines:?}",
+                    lines.len(),
                 );
             }
         }
