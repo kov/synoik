@@ -134,7 +134,7 @@ on its own deadline.
 Live validation is hardware-gated (no backlight on this VM); headless coverage is
 `brightness_changes_show_the_osd` in `src/tests/gnome.rs`.
 
-### D — MPRIS model (`src/mpris.rs`, no UI)
+### D — MPRIS model ✅ (`src/mpris.rs` + `src/dbus/mpris.rs`, no UI)
 Discovery: `ListNames` + `NameOwnerChanged`, prefix `org.mpris.MediaPlayer2.`
 (`js/ui/mpris.js:18,189-258`); proxy both `org.mpris.MediaPlayer2` and `…​.Player` at
 `/org/mpris/MediaPlayer2` (`:34-39`). A player is exposed **only while `CanPlay`**
@@ -149,6 +149,23 @@ the bidi visual-order trap from the notifications port applies. `mpris:artUrl` i
 **URI that GNOME loads directly** (`messageList.js:817-820`). Ours accepts **`file://` only**
 (divergence: players that publish `http(s)` art — Spotify — fall back to the generic icon),
 size-capped, decoded behind a plain-data `MprisSnapshot`, never panicking on a malformed image.
+
+**Landed** `b2c9db0c`: the model in `src/mpris.rs` (ungated, so its validation is testable without
+a bus) and the watcher in `src/dbus/mpris.rs`. Three shapes worth knowing before slice E builds on
+it:
+- This is our **first client that watches a set of names** (`ListNames` + a prefix-filtered
+  `NameOwnerChanged`); every other client filters on one exact name. Each player then gets its own
+  task, which is the **sole writer** for its bus name — it sends both the updates and the removal,
+  so a read racing a removal cannot resurrect a player that is gone.
+- The store tracks a player from the moment its name appears but only *shows* it while `CanPlay`,
+  which is what GNOME's `notify::can-play` → player-added/removed pair means. `MprisStore::visible`
+  is what the message list renders.
+- `raise()` resolves further than the JS does: `app.activate()` on a *running* app focuses its most
+  recently used window, so ours goes through the same window-activation path the app menu's "Open
+  Windows" row uses, and only launches when nothing is running.
+
+Art decoding is deliberately **not** here: the model carries the validated local path and slice E
+loads it, so nothing is decoded for a card that is never drawn.
 
 ### E — Media card in the message list
 Where it goes, from the construction sequence: media messages are inserted at **index 0** of the
