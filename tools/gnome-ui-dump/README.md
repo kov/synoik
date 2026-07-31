@@ -17,16 +17,25 @@ edges were wrong; only reading the cascade explained why.
 
 ## Install (reference session only)
 
+**Installing needs a shell restart, i.e. a logout on Wayland.** `ExtensionManager._loadExtensions()`
+enumerates the extension directories exactly once, guarded by `_initializationPromise`
+(`js/ui/extensionSystem.js:687,750`); the only `reloadExtension` triggers are session-mode changes
+and the extensions-website update path. There is **no filesystem monitor for newly dropped
+extensions**, so dropping a directory in and calling `gnome-extensions enable` cannot work — the
+shell has never heard of the uuid. The same applies to *editing* the code: every change needs
+another logout.
+
+Copy it in — a **real directory, not a symlink** (the scan wants a directory) — and pre-enable it,
+so it is live the moment you log back in:
+
 ```sh
-ln -s ~/Projects/gnome-shell-rs/tools/gnome-ui-dump \
+cp -r ~/Projects/gnome-shell-rs/tools/gnome-ui-dump \
       ~/.local/share/gnome-shell/extensions/ui-dump@gnome-shell-rs
-gnome-extensions enable ui-dump@gnome-shell-rs
+# `gnome-extensions enable` fails before the shell knows the uuid; write the setting directly.
+gsettings get org.gnome.shell enabled-extensions   # then append 'ui-dump@gnome-shell-rs'
 ```
 
-Enabling loads it live — no logout. (A *code change* does need the shell reloaded, which on Wayland
-means logging out and back in.)
-
-Check it is up:
+Then log out and back in. Check it is up:
 
 ```sh
 busctl --user introspect org.gnome.Shell.Extensions.UiDump /org/gnome/Shell/Extensions/UiDump
