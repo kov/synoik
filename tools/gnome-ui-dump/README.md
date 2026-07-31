@@ -43,7 +43,21 @@ busctl --user introspect org.gnome.Shell.Extensions.UiDump /org/gnome/Shell/Exte
 
 ## Use
 
-The method you usually want is `DumpClass` — it dumps every subtree whose root carries a style
+**For anything inside a menu or the overview, use `DumpMenu` / `DumpOverview`.** They open the
+surface themselves, wait until it is actually laid out, dump, and put it back. The hand-timed
+`*After` methods race whoever is opening the UI, and losing that race is silent — see the unmapped
+caveat below. Every date-menu dump taken by hand came back unmapped.
+
+```sh
+gdbus call --session -d org.gnome.Shell.Extensions.UiDump \
+  -o /org/gnome/Shell/Extensions/UiDump \
+  -m org.gnome.Shell.Extensions.UiDump.DumpMenu \
+  "dateMenu" "['datemenu-today-button','calendar','events-button','message']" /tmp/dm.json
+# the menu name is a key of Main.panel.statusArea — dateMenu, quickSettings, ...
+journalctl --user -b -g "\[ui-dump\]" -n 5
+```
+
+The method to reach for otherwise is `DumpClass` — it dumps every subtree whose root carries a style
 class, along with each match's **ancestry**, which is where a nested-padding inset actually comes
 from.
 
@@ -108,5 +122,5 @@ padding (6) + `#calendarArea` padding (4) = the 10px the first card sits in from
   complete, plausible, wrong box model. Each group carries a `mapped` count and the D-Bus reply
   warns when a group matched nothing mapped. Theme values are unaffected: `StThemeNode` resolves
   the cascade whether or not the actor was laid out, so padding/radius/`min-*` from an unmapped
-  dump are still good.
+  dump are still good. `DumpMenu`/`DumpOverview` exist to make this unreachable; prefer them.
 - Tree walks are depth-capped (40) so a stray `DumpAll` cannot stall the shell.

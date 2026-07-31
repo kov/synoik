@@ -12,6 +12,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.UiDump';
@@ -59,11 +61,28 @@ const IFACE = `
       <arg type="u" direction="in" name="delaySeconds"/>
       <arg type="s" direction="out" name="result"/>
     </method>
+    <!-- Open a panel menu ourselves, wait for it to be *allocated*, then dump. Prefer this to
+         the *After methods for anything in a menu: it cannot race the human. -->
+    <method name="DumpMenu">
+      <arg type="s" direction="in" name="menuName"/>
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <!-- Same for the overview, which is likewise only allocated once shown. -->
+    <method name="DumpOverview">
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
   </interface>
 </node>`;
 
 /** Depth limit, so a stray DumpAll cannot walk the shell into a stall. */
 const MAX_DEPTH = 40;
+
+/** ~1s of 50ms polls waiting for a just-opened menu to be laid out, then dump anyway and say so. */
+const MAX_ALLOCATION_POLLS = 20;
 
 function colorOf(color) {
     if (!color)
@@ -357,5 +376,75 @@ export default class UiDumpExtension extends Extension {
         return this._after(
             delaySeconds, `${styleClasses.length} classes to ${path}`,
             () => this.DumpClasses(styleClasses, path));
+    }
+
+    // Open the menu ourselves rather than asking a human to. Every hand-opened dump of the date
+    // menu came back `mapped: false` — a scheduled dump races the person opening the UI, and an
+    // unmapped actor answers with a *preferred* size that looks exactly like an allocation. Here
+    // the open is ours, so we can wait for the thing we actually need: a laid-out actor.
+    DumpMenu(menuName, styleClasses, path) {
+        const item = Main.panel.statusArea[menuName];
+        if (!item) {
+            const have = Object.keys(Main.panel.statusArea).join(' ');
+            return `no panel status area item named ${menuName}; have: ${have}`;
+        }
+        if (!item.menu)
+            return `${menuName} has no menu`;
+
+        const menu = item.menu;
+        // NONE, not FULL: an animated open is allocated *during* the animation, so dumping mid-way
+        // reads sizes off a frame that is still growing.
+        return this._dumpOpened(
+            menuName, styleClasses, path,
+            menu.isOpen,
+            () => menu.open(BoxPointer.PopupAnimation.NONE),
+            () => menu.close(BoxPointer.PopupAnimation.NONE));
+    }
+
+    // The overview is not a menu, but it has the same hazard: its chrome is only allocated once
+    // shown, so a dump taken with it closed measures preferred sizes.
+    DumpOverview(styleClasses, path) {
+        return this._dumpOpened(
+            'overview', styleClasses, path,
+            Main.overview.visible,
+            () => Main.overview.show(),
+            () => Main.overview.hide());
+    }
+
+    // Open (if needed), wait for allocation, dump, and put the surface back the way we found it.
+    _dumpOpened(label, styleClasses, path, wasOpen, open, close) {
+        if (!wasOpen)
+            open();
+        this._whenAllocated(styleClasses, (ready) => {
+            const result = this.DumpClasses(styleClasses, path);
+            if (!wasOpen)
+                close();
+            log(`[ui-dump] ${result}${ready ? '' : ' (WARNING: gave up waiting for allocation)'}`);
+        });
+        return `opened ${label}; dumping when allocated (result goes to the journal)`;
+    }
+
+    // Poll until every requested class has at least one mapped match with a non-zero allocation,
+    // then hand over. Polling rather than a single `later_add`: the menu's children are built
+    // lazily on open, so "one layout pass from now" is not reliably late enough.
+    _whenAllocated(styleClasses, done) {
+        let tries = 0;
+        const poll = () => {
+            tries++;
+            const ready = styleClasses.every((styleClass) => {
+                const found = findAll(
+                    global.stage, (actor) => hasClass(actor, styleClass), []);
+                return found.some(
+                    (a) => a.mapped && a.get_allocation_box().get_width() > 0);
+            });
+            if (!ready && tries < MAX_ALLOCATION_POLLS)
+                return GLib.SOURCE_CONTINUE;
+            this._timeout = null;
+            done(ready);
+            return GLib.SOURCE_REMOVE;
+        };
+        if (this._timeout)
+            GLib.source_remove(this._timeout);
+        this._timeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, poll);
     }
 }
