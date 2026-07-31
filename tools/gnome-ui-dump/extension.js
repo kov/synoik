@@ -75,6 +75,13 @@ const IFACE = `
       <arg type="s" direction="in" name="path"/>
       <arg type="s" direction="out" name="result"/>
     </method>
+    <!-- And the app grid, which is a separate state again — the overview opens on the windows
+         page, where the grid's actors exist unallocated. -->
+    <method name="DumpAppGrid">
+      <arg type="as" direction="in" name="styleClasses"/>
+      <arg type="s" direction="in" name="path"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
   </interface>
 </node>`;
 
@@ -408,6 +415,17 @@ export default class UiDumpExtension extends Extension {
             'overview', styleClasses, path,
             Main.overview.visible,
             () => Main.overview.show(),
+            () => Main.overview.hide());
+    }
+
+    // The app grid is a *third* state, not a deeper overview: `Main.overview.show()` lands on the
+    // windows page, where `.icon-grid` and `.page-indicator` exist but are never allocated. Dumping
+    // the grid from there returns preferred sizes for exactly the actors you came for.
+    DumpAppGrid(styleClasses, path) {
+        return this._dumpOpened(
+            'app grid', styleClasses, path,
+            Main.overview.visible && Main.overview.dash?.showAppsButton?.checked,
+            () => Main.overview.showApps(),
             () => Main.overview.hide());
     }
 
