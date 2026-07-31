@@ -483,7 +483,7 @@ impl NotificationBanner {
         let layout = self.layout(content);
         let ow = output_size(output).w;
         let x = ((ow - layout.size.w) / 2.).max(0.);
-        let y = crate::ui::panel::PANEL_HEIGHT + MARGIN;
+        let y = crate::ui::panel::panel_height() + MARGIN;
         Some(Rectangle::new(Point::from((x, y)), layout.size))
     }
 
@@ -555,7 +555,7 @@ impl NotificationBanner {
         let alpha = progress as f32;
 
         let x = ((ow - layout.size.w) / 2.).max(0.);
-        let y_shown = crate::ui::panel::PANEL_HEIGHT + MARGIN;
+        let y_shown = crate::ui::panel::panel_height() + MARGIN;
         // Slide down from fully off-screen above, like the tray banner.
         let y = -layout.size.h + progress * (layout.size.h + y_shown);
         let origin = Point::<f64, Logical>::from((x, y));

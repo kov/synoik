@@ -52,11 +52,21 @@ use crate::system_status::{self, SystemStatus};
 use crate::ui::widget::{self, Painter, TextShaper, TextStyle};
 use crate::utils::{output_size, to_physical_precise_round};
 
-/// Logical height of the panel. GNOME's `#panel` is `2.2em` (`_panel.scss:10,16`); measured 35px
-/// logical against a real 50.1 panel (ours was a slightly short 32). GNOME's structural height ems
-/// resolve against the mixin's 16px reference base (`2.2 × 16 = 35.2`), NOT the ~14.67 font em —
-/// hence the measured value rather than `em(2.2)`.
-pub const PANEL_HEIGHT: f64 = 35.;
+/// Logical height of the panel: GNOME's `$panel_height: 2.2em` (`_panel.scss:10,16`).
+///
+/// The `em` is the **realized** base font's em ([`crate::ui::em`]), which is why this is a
+/// function. It was a `35.` constant, measured off a real session and documented as proof that
+/// GNOME's structural ems resolve against the mixin's 16px reference base rather than the font em
+/// (`2.2 × 16 = 35.2`). That reading was an artifact: the session measured had `font-name` stuck
+/// at `Cantarell 12`, and 12pt's em *is* 16px, so the two candidate rules gave the same answer.
+/// At the default 11pt the same panel measures **32** — `2.2 × 14.667 = 32.27` — which only the
+/// font-em rule predicts. See [[ui-font-family-runtime]]; both measurements now agree.
+pub fn panel_height() -> f64 {
+    // Rounded because St allocates the panel in whole logical px: at 11pt the theme's 32.27 is a
+    // 32px panel, and every strut, work area and overview band derived from it wants that integer
+    // rather than a fraction that reappears as 29.999999999999996 three layers down.
+    crate::ui::em(2.2).round()
+}
 
 /// Panel font size. The clock draws at GNOME's `panel_button` base of 11pt
 /// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `font_px()`
@@ -961,7 +971,7 @@ impl Panel {
     pub fn activities_rect(&self, ws: WorkspaceState) -> Rectangle<f64, Logical> {
         Rectangle::new(
             Point::from((0., 0.)),
-            Size::from((indicator_logical_width(ws.count), PANEL_HEIGHT)),
+            Size::from((indicator_logical_width(ws.count), panel_height())),
         )
     }
 
@@ -973,7 +983,7 @@ impl Panel {
         let w = clock_w + H_PADDING * 2.;
         Rectangle::new(
             Point::from(((output_width - w) / 2., 0.)),
-            Size::from((w, PANEL_HEIGHT)),
+            Size::from((w, panel_height())),
         )
     }
 
@@ -992,7 +1002,7 @@ impl Panel {
         Some(Rectangle::new(
             Point::from((
                 pill_right + MESSAGES_INDICATOR_SPACING,
-                (PANEL_HEIGHT - MESSAGES_INDICATOR_ICON) / 2.,
+                (panel_height() - MESSAGES_INDICATOR_ICON) / 2.,
             )),
             Size::from((MESSAGES_INDICATOR_ICON, MESSAGES_INDICATOR_ICON)),
         ))
@@ -1098,7 +1108,7 @@ impl Panel {
                     }
                     right -= self.right_box_role_width(role);
                 }
-                Rectangle::new(Point::from((right, 0.)), Size::from((0., PANEL_HEIGHT)))
+                Rectangle::new(Point::from((right, 0.)), Size::from((0., panel_height())))
             })
     }
 
@@ -1119,7 +1129,10 @@ impl Panel {
             if w <= 0. {
                 continue; // absent
             }
-            let rect = Rectangle::new(Point::from((right - w, 0.)), Size::from((w, PANEL_HEIGHT)));
+            let rect = Rectangle::new(
+                Point::from((right - w, 0.)),
+                Size::from((w, panel_height())),
+            );
             if r == role {
                 return Some(rect);
             }
@@ -1177,7 +1190,7 @@ impl Panel {
         let x = qs_icon_x(rect.loc.x, index) - QS_ICON_MARGIN;
         Some(Rectangle::new(
             Point::from((x, 0.)),
-            Size::from((QS_ICON + 2. * QS_ICON_MARGIN, PANEL_HEIGHT)),
+            Size::from((QS_ICON + 2. * QS_ICON_MARGIN, panel_height())),
         ))
     }
 
@@ -1250,7 +1263,7 @@ impl Panel {
                 .find_map(|n| icons.texture(renderer, n, R1_ICON, scale, TEXT))
             {
                 let logical = tb.logical_size();
-                let location = Point::from((icon_x, (PANEL_HEIGHT - logical.h) / 2.));
+                let location = Point::from((icon_x, (panel_height() - logical.h) / 2.));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
                         tb,
@@ -1274,7 +1287,7 @@ impl Panel {
                 let logical = tb.logical_size();
                 let location = Point::from((
                     rect.loc.x + (rect.size.w - logical.w) / 2.,
-                    (PANEL_HEIGHT - logical.h) / 2.,
+                    (panel_height() - logical.h) / 2.,
                 ));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
@@ -1302,7 +1315,7 @@ impl Panel {
                 let logical = tb.logical_size();
                 let location = Point::from((
                     rect.loc.x + (rect.size.w - logical.w) / 2.,
-                    (PANEL_HEIGHT - logical.h) / 2.,
+                    (panel_height() - logical.h) / 2.,
                 ));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
@@ -1429,7 +1442,7 @@ impl Panel {
         let bg = bar_bg(overview_fade);
         cache
             .bg
-            .update(Size::from((width, PANEL_HEIGHT)), Color32F::from(bg));
+            .update(Size::from((width, panel_height())), Color32F::from(bg));
         if bg[3] > 0. {
             elements.push(PanelElement::Solid(SolidColorRenderElement::from_buffer(
                 &cache.bg,
@@ -1469,7 +1482,7 @@ impl Panel {
             };
             {
                 let logical = tb.logical_size();
-                let location = Point::from((x, (PANEL_HEIGHT - logical.h) / 2.));
+                let location = Point::from((x, (panel_height() - logical.h) / 2.));
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
                         tb,
@@ -1591,7 +1604,7 @@ fn workspace_dots(count: usize, position: f64) -> Vec<(Rectangle<f64, Logical>, 
     // active index — parks the wide pill on the end dot instead of expanding none of them.
     let position = position.clamp(0., count.saturating_sub(1) as f64);
     let mult = width_multiplier(count);
-    let band_cy = PANEL_HEIGHT / 2.;
+    let band_cy = panel_height() / 2.;
 
     let mut dots = Vec::with_capacity(count);
     let mut x = INDICATOR_H_PADDING; // logical left edge of the current slot
@@ -1716,7 +1729,7 @@ fn draw_bar_texture(
     let _span = tracy_client::span!("panel::draw_bar_texture");
 
     let width_px = width_px.max(1);
-    let height_px: i32 = to_physical_precise_round(scale, PANEL_HEIGHT);
+    let height_px: i32 = to_physical_precise_round(scale, panel_height());
     let height_px = height_px.max(1);
     let px = (font_px() * scale) as f32;
 
@@ -1834,7 +1847,8 @@ mod tests {
             "the volume box must be inside the cluster: {rect:?} vs {cluster:?}"
         );
         assert_eq!(
-            rect.size.h, PANEL_HEIGHT,
+            rect.size.h,
+            panel_height(),
             "an indicator is as tall as the bar"
         );
 
@@ -2309,7 +2323,7 @@ mod tests {
         for (rect, _, _) in &dots {
             let cy = rect.loc.y + rect.size.h / 2.;
             assert!(
-                (cy - PANEL_HEIGHT / 2.).abs() < 1e-9,
+                (cy - panel_height() / 2.).abs() < 1e-9,
                 "dot off the band: {cy}"
             );
         }
@@ -2519,7 +2533,7 @@ mod tests {
         };
 
         let width_px = 400;
-        let height_px = PANEL_HEIGHT as i32;
+        let height_px = panel_height() as i32;
         let ws = WorkspaceState {
             count: 3,
             active: 0,
@@ -2676,7 +2690,7 @@ mod tests {
         };
 
         let scale = 2.;
-        let height_px = to_physical_precise_round(scale, PANEL_HEIGHT);
+        let height_px = to_physical_precise_round(scale, panel_height());
         let bold = TextStyle::new(FONT_PT).bold();
 
         let (plain, descend, ink_plain, ink_descend) = {
@@ -3133,7 +3147,7 @@ mod tests {
         };
 
         let scale = 2.25;
-        let (w, h) = (600., PANEL_HEIGHT);
+        let (w, h) = (600., panel_height());
         let output = Output::new(
             "pill-test".to_owned(),
             smithay::output::PhysicalProperties {

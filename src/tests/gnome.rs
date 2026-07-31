@@ -1199,8 +1199,8 @@ fn placement_first_fit_prefers_below() {
 
     // place.c center_tile_rect_in_area: the leftover space of a hypothetical
     // grid of same-size windows, halved horizontally, third-ed vertically —
-    // within the work area, which the top panel insets to (0, 35, 1920, 1045).
-    let slot = ((1920. % 101.) / 2., 35. + (1045. % 101.) / 3.);
+    // within the work area, which the top panel insets to (0, 32, 1920, 1048).
+    let slot = ((1920. % 101.) / 2., 32. + (1048. % 101.) / 3.);
 
     let _w1 = map_window_sized(&mut f, id, (100, 100), None);
     let w1_pos = focused_window_pos(&mut f);
@@ -1257,28 +1257,28 @@ fn placement_cascades_when_nothing_fits() {
     let id = f.add_client();
 
     // 1000×600 windows: after the first takes the centered-tile slot,
-    // below/right candidates all overflow the 1920×1045 work area (the top
+    // below/right candidates all overflow the 1920×1048 work area (the top
     // panel insets it), so first-fit fails and every subsequent window cascades.
     let _w1 = map_window_sized(&mut f, id, (1000, 600), None);
 
     let _w2 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 35.),
+        (0., 32.),
         "the first cascaded window must sit at the work-area origin",
     );
 
     let _w3 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (50., 85.),
+        (50., 82.),
         "the next cascade slot is one 50px diagonal step down",
     );
 
     let _w4 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (100., 135.),
+        (100., 132.),
         "each occupied slot steps the cascade another 50px",
     );
 }
@@ -1432,18 +1432,18 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 960 × 1045, bounds: 1920 × 1045, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
+        @"size: 960 × 1048, bounds: 1920 × 1048, states: [Activated, TiledTop, TiledBottom, TiledLeft]"
     );
 
     // The client commits the tiled size; the tile sits at the left edge.
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1045);
+    window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 35.),
+        (0., 32.),
         "a left-tiled window must sit at the work-area origin",
     );
 
@@ -1455,7 +1455,7 @@ fn super_left_tiles_and_toggles() {
 
     assert_snapshot!(
         f.client(id).window(&surface).format_recent_configures(),
-        @"size: 800 × 600, bounds: 1920 × 1045, states: [Activated]"
+        @"size: 800 × 600, bounds: 1920 × 1048, states: [Activated]"
     );
 
     let window = f.client(id).window(&surface);
@@ -1565,10 +1565,10 @@ fn oversized_window_auto_maximizes_with_clamped_restore() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
 
-    // Clamped to the work area (top panel insets it to 1920×1045):
-    // scale = min(1920·√0.8/1800, 1045·√0.8/1000) ≈ 0.937 → 1687×937.
+    // Clamped to the work area (the top panel insets it to 1920×1048):
+    // scale = min(1920·√0.8/1800, 1048·√0.8/1000) ≈ 0.939 → 1691×939.
     let factor = 0.8f64.sqrt();
-    let scale = f64::min(1920. * factor / 1800., 1045. * factor / 1000.);
+    let scale = f64::min(1920. * factor / 1800., 1048. * factor / 1000.);
     let expected = format!(
         "size: {} × {}",
         (1800. * scale).round() as i32,
@@ -1690,18 +1690,18 @@ fn drag_to_left_edge_tiles() {
 
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
-        configures.contains("TiledLeft") && configures.contains("size: 960 × 1045"),
+        configures.contains("TiledLeft") && configures.contains("size: 960 × 1048"),
         "dropping in the left edge band must tile left, got: {configures}"
     );
 
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1045);
+    window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 35.),
+        (0., 32.),
         "the tiled window must sit at the left work-area edge",
     );
     let _ = f.client(id).window(&surface).recent_configures();
@@ -2163,7 +2163,7 @@ fn overview_picker_slots_clear_both_workspace_edges_evenly() {
     let id = f.add_client();
 
     // A maximized window: the case where the slot comes closest to the edges.
-    let _w = map_window_sized(&mut f, id, (1920, 1045), None);
+    let _w = map_window_sized(&mut f, id, (1920, 1048), None);
     let win = f.niri().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
@@ -2195,7 +2195,7 @@ fn overview_picker_slots_clear_both_workspace_edges_evenly() {
     );
 
     // The cap still decides the size, so nothing was scaled down to buy that room.
-    let want = (1045. * 0.95) / 1080.;
+    let want = (1048. * 0.95) / 1080.;
     assert!(
         (slot.size.h / bg.size.h - want).abs() < 1e-9,
         "the preview must keep its MAXIMUM_SCALE size, got {}",
@@ -2471,28 +2471,28 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     f.niri_complete_animations();
 
     // Two workspaces (active + trailing empty) is at the strip threshold, so no
-    // thumbnails band is reserved. Work area 1045 tall ⇒ spacing round(20.9) = 21,
+    // thumbnails band is reserved. Work area 1048 tall ⇒ spacing round(20.96) = 21,
     // round(21·0.6) = 13 above the (zero-height) band. The search entry floats
     // (approved divergence), so it costs the picker nothing:
-    //   y = 35 + 13                            = 48
-    //   h = 1045 − 112(dash) − 21 − 13        = 899
+    //   y = 32 + 13                            = 45
+    //   h = 1048 − 112(dash) − 21 − 13        = 902
     let controls = overview_controls(&mut f);
-    assert_eq!(controls.workspaces.loc.y, 48.);
-    assert_eq!(controls.workspaces.size.h, 899.);
+    assert_eq!(controls.workspaces.loc.y, 45.);
+    assert_eq!(controls.workspaces.size.h, 902.);
 
     // The row is fit by height into that box, and centered on what width is left.
-    let zoom: f64 = 899. / 1080.;
+    let zoom: f64 = 902. / 1080.;
     let ws_w = (1920. * zoom).ceil(); // 1599
     let offset_x = ((1920. - ws_w) / 2.).round(); // 161
 
     // Workspace-local slot (see expose::tests): 760 × 570 centered in the picker's area,
-    // which is the work area symmetrized about the view — the 35px panel strut is applied
-    // at both edges, giving 1920×1010 at y = 35, so the slot sits at
-    // (580, 35 + (1010−570)/2) = (580, 255), scaled into the picker box at y = 48.
+    // which is the work area symmetrized about the view — the 32px panel strut is applied
+    // at both edges, giving 1920×1016 at y = 32, so the slot sits at
+    // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 45.
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 48. + 255. * zoom),
+        (offset_x + 580. * zoom, 45. + 255. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(
@@ -2688,7 +2688,7 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
         // It costs the strip no vertical space: the band starts within one spacing of
         // the panel, where GNOME would have had the entry's whole row above it.
         assert!(
-            band.loc.y - crate::ui::panel::PANEL_HEIGHT
+            band.loc.y - crate::ui::panel::panel_height()
                 < crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
             "{size:?}: the entry still displaces the strip (band at {})",
             band.loc.y
@@ -2699,7 +2699,7 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
             strip.thumbs[0].size.h,
             crate::ui::overview_layout::small_workspace_height(
                 smithay::utils::Size::from((f64::from(size.0), f64::from(size.1))),
-                crate::ui::panel::PANEL_HEIGHT,
+                crate::ui::panel::panel_height(),
             ),
             "{size:?}: a thumbnail must be the app-grid row's workspace height"
         );
@@ -2803,7 +2803,7 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
         strip.thumbs[0].size.h,
         crate::ui::overview_layout::small_workspace_height(
             smithay::utils::Size::from((1920., 1080.)),
-            crate::ui::panel::PANEL_HEIGHT,
+            crate::ui::panel::panel_height(),
         ),
         "the size must not give way to the workspace count"
     );
@@ -2851,9 +2851,9 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     f.settle_animations();
 
     let band = overview_controls(&mut f).thumbnails;
-    // 35 + round(21 × 0.6) = 48 (the entry floats and takes no row), and the app-grid
-    // row's workspace height, round((1080 - 35) × SMALL_WORKSPACE_RATIO) = 157.
-    assert_eq!((band.loc.y, band.size.h), (48., 157.));
+    // 32 + round(21 × 0.6) = 45 (the entry floats and takes no row), and the app-grid
+    // row's workspace height, round((1080 - 32) × SMALL_WORKSPACE_RATIO) = 157.
+    assert_eq!((band.loc.y, band.size.h), (45., 157.));
 
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     let strip = mon
@@ -2863,7 +2863,7 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     assert_eq!(strip.thumbs[0].loc.y, band.loc.y);
     assert_eq!(strip.thumbs[0].size.h, band.size.h);
     assert!(
-        strip.thumbs[0].loc.y >= crate::ui::panel::PANEL_HEIGHT,
+        strip.thumbs[0].loc.y >= crate::ui::panel::panel_height(),
         "the strip must clear the top panel, got y={}",
         strip.thumbs[0].loc.y
     );
@@ -2891,7 +2891,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
     f.niri().advance_animations();
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (230., 717.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (227., 720.));
 
     // Back to one populated desktop: the emptied workspace is only reaped once the
     // switch settles, and the collapse ease arms on that frame.
@@ -2921,7 +2921,7 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
 
     f.settle_animations();
     let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!((collapsed.loc.y, collapsed.size.h), (48., 899.));
+    assert_eq!((collapsed.loc.y, collapsed.size.h), (45., 902.));
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     assert!(!mon.unwrap().thumbnails_visible());
 }
@@ -2943,7 +2943,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
 
     // Two workspaces: no band, so the picker has the whole space.
     let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!(collapsed.size.h, 899.);
+    assert_eq!(collapsed.size.h, 902.);
 
     // Populate a second desktop, which brings the strip in. The ease starts on
     // the next frame, so advance once to arm it and once more to sample it.
@@ -2969,7 +2969,7 @@ fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
     // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
     f.settle_animations();
     let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (230., 717.));
+    assert_eq!((expanded.loc.y, expanded.size.h), (227., 720.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a
@@ -3904,7 +3904,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.set_size(1920, 1045);
+    window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
@@ -3937,7 +3937,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     for configure in f.client(id).window(&surface).recent_configures() {
         assert_eq!(
             configure.size,
-            (1920, 1045),
+            (1920, 1048),
             "an overview drag must never resize the maximized window, got: {configure}"
         );
         assert!(
@@ -4123,18 +4123,18 @@ fn panel_reserves_top_strut() {
 
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
-        configures.contains("size: 1920 × 1045"),
+        configures.contains("size: 1920 × 1048"),
         "a maximized window must fill the work area below the panel, got: {configures}"
     );
 
     let window = f.client(id).window(&surface);
-    window.set_size(1920, 1045);
+    window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.niri_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 35.),
+        (0., 32.),
         "the maximized window must start below the panel strut",
     );
 }
@@ -4404,9 +4404,9 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
     // DND tile center (row 1, col 0), menu-local: x = PAD + TILE_W/2; y = PAD + SYS_H
     // + TILE_GAP + (TILE_H + TILE_GAP) [second row] + TILE_H/2. Plus the popover
-    // origin (menu y = PANEL_HEIGHT + margin).
+    // origin (menu y = panel_height() + margin).
     let tile_x = origin_x + 12. + 75.;
-    let tile_y = (35. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
     pointer_motion_to(&mut f, tile_x, tile_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -4465,7 +4465,7 @@ fn messages_indicator_toggles_with_dnd_tile() {
     let center_x = anchor.loc.x + anchor.size.w / 2.;
     let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
     let tile_x = origin_x + 12. + 75.;
-    let tile_y = (35. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
     let open_qs = |f: &mut Fixture| {
         pointer_motion_to(f, 1906., 10.);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -8774,9 +8774,11 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
     // divergence) the picker got its 58px row back, so the preview on this canvas is
     // taller than the 520px the flat 30 is written for. The rule is unchanged — it just
     // bites lower down now.
-    assert_eq!(
-        s_radius, radius,
-        "the preview is big enough to keep GNOME's corner"
+    // Compared with a tolerance: `radius` is a ratio of the canvas, so it is exact only when
+    // the panel strut divides evenly — at the default font it lands on 30.000000000000004.
+    assert!(
+        (s_radius - radius).abs() < 1e-9,
+        "the preview is big enough to keep GNOME's corner: {s_radius} vs {radius}"
     );
 
     // 900x600, where the preview finally is smaller than that reference.

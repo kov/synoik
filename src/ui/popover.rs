@@ -65,7 +65,7 @@ use crate::ui::app_menu::AppMenu;
 use crate::ui::calendar::DateMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
-use crate::ui::panel::PANEL_HEIGHT;
+use crate::ui::panel::panel_height;
 use crate::ui::quick_settings::QuickSettings;
 use crate::ui::widget;
 use crate::utils::output_size;
@@ -421,7 +421,7 @@ impl PanelPopover {
         // `js/ui/boxpointer.js:117-137`): output height minus the panel and both
         // margins. Past this the message list scrolls.
         let available_h =
-            (output_size(&output).h - PANEL_HEIGHT - 2. * POPOVER_MARGIN).max(POPOVER_MARGIN);
+            (output_size(&output).h - panel_height() - 2. * POPOVER_MARGIN).max(POPOVER_MARGIN);
         date_menu.set_available_height(available_h);
         self.output = Some(output);
         self.content = Some(PopoverContent::Calendar(Box::new(date_menu)));
@@ -1033,7 +1033,7 @@ impl PanelPopover {
             // gnome-shell would place this off the anchor like the others; ours predates
             // the anchored path and the panel is the only Top user, so it stays literal
             // until there is a second one to generalize against.
-            PopoverSide::Top => Point::from((centered_x, PANEL_HEIGHT + POPOVER_MARGIN)),
+            PopoverSide::Top => Point::from((centered_x, panel_height() + POPOVER_MARGIN)),
             PopoverSide::Bottom => Point::from((
                 centered_x,
                 (self.anchor.loc.y - POPOVER_MARGIN - size.h).clamp(POPOVER_MARGIN, max_y),

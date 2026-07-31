@@ -2121,7 +2121,7 @@ fn vulkan_renders_the_top_panel() {
     let output = f.niri_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let width = to_physical_precise_round(scale.x, output_size(&output).w);
-    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
     let state = f.niri_state();
     let opaque = state
@@ -2169,7 +2169,7 @@ fn vulkan_renders_the_messages_indicator_dot() {
     let scale = Scale::from(output.current_scale().fractional_scale());
     let ow = output_size(&output).w;
     let width = to_physical_precise_round(scale.x, ow);
-    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
     // The dot's center, in physical pixels: 2px right of the clock PILL edge
     // (the clock rect inset by BTN_MARGIN_X = 4), then half the 16px icon.
@@ -2247,7 +2247,7 @@ fn vulkan_composites_the_workspace_dots() {
     let scale = Scale::from(output.current_scale().fractional_scale());
     let ow = output_size(&output).w;
     let width = to_physical_precise_round(scale.x, ow);
-    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
     // The dots live inside the left indicator button, far from the centered clock.
     let ws = crate::ui::panel::WorkspaceState {
@@ -3280,7 +3280,7 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     let output = f.niri_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let width = to_physical_precise_round(scale.x, output_size(&output).w);
-    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::PANEL_HEIGHT);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
     let render_panel = |f: &mut Fixture| {
         let ws = f.niri().workspace_state_for(&output);
@@ -7140,7 +7140,7 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
     // leaves the workspace rectangle sitting opaque under the results. Measured
     // against a corner that is backdrop in any case, so a retuned backdrop colour
     // keeps this honest.
-    let corner = px(&pixels, w, 8, 8 + crate::ui::panel::PANEL_HEIGHT as i32);
+    let corner = px(&pixels, w, 8, 8 + crate::ui::panel::panel_height() as i32);
     for c in 0..4 {
         assert!(
             b[c].abs_diff(corner[c]) <= 1,
@@ -7200,8 +7200,8 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
     // — a uniform fill, which is why sampling it in a different column is still a fair
     // comparison against the bar.
     let backdrop_x = 80;
-    let bar_y = (crate::ui::panel::PANEL_HEIGHT / 2.) as i32;
-    let below_y = (crate::ui::panel::PANEL_HEIGHT + 8.) as i32;
+    let bar_y = (crate::ui::panel::panel_height() / 2.) as i32;
+    let below_y = (crate::ui::panel::panel_height() + 8.) as i32;
 
     let (pixels, w, _) = render_output_vulkan(&mut f, &output);
     let desktop = px(&pixels, w, x, bar_y);

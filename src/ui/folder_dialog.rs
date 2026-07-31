@@ -41,7 +41,7 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::app_grid::{
     AppGrid, AppGridEntry, FocusDir, GridDropTarget, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
 };
-use crate::ui::panel::PANEL_HEIGHT;
+use crate::ui::panel::panel_height;
 use crate::ui::widget::{self, style, Align, Painter};
 
 /// `$app_folder_size` (`_app-grid.scss:4,60-61`) — the panel is a fixed square.
@@ -134,8 +134,8 @@ pub struct DialogLayout {
 pub fn layout(view: Rectangle<f64, Logical>) -> DialogLayout {
     // `.app-folder-dialog-container` pads the top by the panel height, so the panel is
     // centered in the work area rather than the screen (`_app-grid.scss:53-56`).
-    let avail_y = view.loc.y + PANEL_HEIGHT;
-    let avail_h = (view.size.h - PANEL_HEIGHT).max(0.);
+    let avail_y = view.loc.y + panel_height();
+    let avail_h = (view.size.h - panel_height()).max(0.);
 
     let w = SIZE.min(view.size.w);
     let h = SIZE.min(avail_h);
@@ -1671,8 +1671,8 @@ mod tests {
 
         assert_eq!(l.panel.size, Size::from((720., 720.)));
         assert_eq!(l.panel.loc.x, (1920. - 720.) / 2.);
-        // 35 + (1045 − 720)/2 = 35 + 162.5, rounded.
-        assert_eq!(l.panel.loc.y, f64::round(35. + (1045. - 720.) / 2.));
+        // 32 + (1048 − 720)/2 = 32 + 164.
+        assert_eq!(l.panel.loc.y, f64::round(32. + (1048. - 720.) / 2.));
     }
 
     /// The name band sits inside the horizontal padding, at the container's top padding, and
@@ -1718,8 +1718,8 @@ mod tests {
 
         // Each axis clamps on its own — `width`/`height` are separate declarations, so a
         // screen short in one direction only does not shrink the other.
-        assert_eq!(l.panel.size, Size::from((720., 600. - 35.)));
-        assert_eq!(l.panel.loc.y, 35.);
+        assert_eq!(l.panel.size, Size::from((720., 600. - 32.)));
+        assert_eq!(l.panel.loc.y, 32.);
         assert!(l.panel.loc.y + l.panel.size.h <= 600.);
     }
 

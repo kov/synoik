@@ -2661,7 +2661,7 @@ pub(super) fn compute_working_area(output: &Output, options: &Options) -> Rectan
     // at the single working-area chokepoint, means maximize, edge-tiling,
     // floating placement and the overview picker slots all inset uniformly.
     if options.layout.windowing_mode == WindowingMode::Floating {
-        let inset = crate::ui::panel::PANEL_HEIGHT.min(area.size.h);
+        let inset = crate::ui::panel::panel_height().min(area.size.h);
         area.loc.y += inset;
         area.size.h -= inset;
     }
