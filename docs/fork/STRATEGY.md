@@ -536,6 +536,18 @@ The milestone also covers the MPRIS model and the media card in the message list
 ScreenCast (PipeWire producer) → RemoteDesktop/InputCapture → Screenshot/portal backend →
 notifications/calendar clients → OSK → IBus candidate UI.
 
+**Hardware video is its own milestone here, tracked in `docs/fork/renderer-gaps.md` §1** — the
+Vulkan importer takes only single-plane LINEAR 8888 buffers, so a decoder-produced NV12/P010 dmabuf
+has to round-trip through a CPU conversion. This was parked as "the gap that matters first" while
+nothing on this machine could produce such a buffer; **the VMM side is now adding VA-API and Vulkan
+Video, which makes it a dated dependency rather than a someday-item.** Two halves, and the guest one
+does not wait on the host: multi-planar sampling (per-plane `VkImage` +
+`VK_KHR_sampler_ycbcr_conversion`, or manual plane sampling) is ours and is needed whether or not a
+frame ever reaches a hardware plane; non-LINEAR modifier import depends on what Venus/KosmicKrisp can
+expose on a Metal host and may stay moot here. Sequence it *before* multi-GPU, and start the
+multi-planar half ahead of the VMM landing rather than discovering it afterwards. Related: overlay
+planes for video scanout are a VMM ask, not a prerequisite — see `present-misses.md` §31.
+
 **Accessibility is its own milestone here, tracked in `docs/fork/a11y-port.md`** — chrome
 scale ends at the toggle menu (done); behind it sit high-contrast/text-scaling in our own
 chrome, the magnifier, the keyboard filters, the visual bell, the a11y D-Bus surface, and

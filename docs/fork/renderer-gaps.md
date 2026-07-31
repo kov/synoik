@@ -33,6 +33,15 @@ modifier half may stay moot on this VM while the multi-planar half does not.
 
 **This should come before multi-GPU on the roadmap.**
 
+**PROMOTED TO A DATED MILESTONE 2026-07-30.** Gustavo is adding **VA-API and Vulkan Video to the
+VMM**, so the "nothing on this machine can produce an NV12 dmabuf" excuse that kept this parked is
+expiring. Scheduled in `STRATEGY.md` §6 Phase 3. Split the two halves and start the guest one now:
+**multi-planar sampling is ours and is needed regardless** of hardware planes or host modifier
+support, while the non-LINEAR modifier half is gated on what KosmicKrisp can expose on Metal.
+Second-order consequence worth planning for: video clients will be **dmabuf**, which puts
+minified-LINEAR-texture sampling back on the suspect list for GPU frame cost — the current
+`present-misses.md` §30 baseline is shm-only and structurally blind to it.
+
 ---
 
 ## 2. Multi-GPU (render on GPU A, scan out on GPU B) — deferred, and cheap to defer

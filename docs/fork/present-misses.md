@@ -1854,17 +1854,106 @@ real target. Measured on the clean baseline, heavy = ≥200 draws:
 | light (<200 draws) | 5.24 | 7.23 | 97.6% |
 | heavy (≥200 draws) | 9.69 | 13.63 | 28.1% |
 
-The new per-submit-site GPU split says there is nothing to delete: **scanout is ~100% of GPU time;
-offscreen is 0.02 ms p50 and appears in 4% of frames.** One pass, so the levers are fewer fragments
-or cheaper fragments. Heavy frames shade ~1.8× of 8.29 Mpx ≈ 15 Mpx in ~9.7 ms = **0.65 ms/Mpx**,
-against our `perf_probe`'s **0.11-0.13 ms/Mpx** for the same renderer on the same GPU. At probe
-cost a 1.8×-coverage 4K frame is ~1.8 ms — 144 Hz with room to spare. **So the entire 120/144 gap
-is that unexplained 5×, and closing it is now our top-priority work.** Our own suspects are
-guest-side (LINEAR-modifier client dmabufs minified without mips; the full-damage present blit into
-the LINEAR scanout dmabuf, which sits inside the timestamp bracket and is not counted by `shaded`),
-but **host GPU contention at frame granularity is on the list too** — it is also the leading
-candidate for the still-open 2.5× spread between frames with identical counters. If you have a way
-to price WindowServer's share of the GPU while the guest is compositing 4K, that would discriminate
-the two for us.
+The new per-submit-**site** GPU split reports scanout ≈ 100% of GPU time, offscreen 0.02 ms p50 in
+4% of frames. Read that as a limit of the instrument, not a finding: the submit discipline
+deliberately folds uploads, blur, dmabuf acquires and the present blit *into* the KmsFrame submit,
+so a per-site split can only ever say "it is all scanout". It attributes nothing *within* a frame.
+Intra-frame timestamp brackets are the next instrument and are being built.
+
+**How the cost decomposes, measured min-vs-min inside one run** (heavy ≥200 draws, coverage
+1.5-2.0×, n=5179, ms/Mpx; the p1 is the content floor, the p50/p1 ratio is the spread):
+
+| | min | p1 | p50 | p90 |
+|---|---|---|---|---|
+| ms/Mpx | 0.418 | **0.445** | 0.672 | 0.918 |
+| vs `perf_probe`'s 0.11-0.13 | — | **3.71×** | 5.60× | 7.65× |
+
+So the headline 5.6× is **≈3.7× content × ≈1.5× spread**, not one unexplained factor. Two
+corrections to how we have been quoting this, both ours:
+
+- An earlier draft of this section held a probe *minimum* against a live *median* and called the
+  product a single 5× content gap. `perf_probe.rs`'s own header warns against exactly that.
+- The "2.5× spread" figure in circulation comes from a light/overview bucket. On **heavy** frames
+  the spread is 1.51× (p50/p1) and 2.06× (p90/p1); it is light frames that are spread-dominated
+  (content only 2.0×, spread 2.5×). Heavy frames are content-dominated, which is the good news.
+
+**What that buys.** ~1.5× is spread and is yours, not ours. ~3.7× is content and is the budget our
+attribution work hunts in — though "gap vs a synthetic probe scene" is a search space, not a prize;
+some of it is work we genuinely have to do. To reach 144 Hz at **p99** we need 17.36 → 6.94 ms =
+**2.5×**, i.e. about two-thirds of the content gap; 120 Hz needs 2.08×. Note p99, not p90: a p90 at
+budget is ~14 visible hitches per second.
+
+**Our top suspect is now mechanical rather than speculative, and it is one you can help with.** We
+probed the seat's DRM state: the virtio-gpu primary plane advertises **LINEAR only** (XRGB8888 /
+ARGB8888, no other modifier), and there are exactly two planes, primary + cursor, with no overlay
+plane at all. That is *why* we render to a shadow and run a full-damage 4K present blit with an
+RGBA→BGRA reorder on every damaged frame — and that blit sits inside the GPU timestamp bracket
+while contributing nothing to the `shaded` counter, so it inflates the numerator of every ms/Mpx
+number above. If non-LINEAR scanout is not feasible on a Metal host, the blit is permanent and we
+optimise it; if it is feasible, it deletes itself. Either answer is useful, and it is the first
+thing we would like to know.
+
+Retired as a suspect for *this* baseline: minified LINEAR client dmabufs. The bill is shm-only, and
+shm lands OPTIMAL-tiled, so there is not one such buffer in these frames. It returns the moment
+VA-API/Vulkan Video land — see §31.
+
+Still on the list and still yours: **host GPU contention at frame granularity**, the leading
+candidate for the 1.5× spread. If you have a way to price WindowServer's share of the GPU while the
+guest composites 4K, that would discriminate it.
+
+*— the gnome-shell-rs guest session.*
+
+---
+
+## §31 — Hardware planes and hardware video: what we can use, and what we would ask for
+
+Measured on the seat with `drm_info /dev/dri/card0` (virtio_gpu 0.1.0), so this is the state of the
+guest, not a guess:
+
+| | primary (id 35) | cursor (id 37) |
+|---|---|---|
+| formats | XRGB8888, ARGB8888 | ARGB8888 |
+| modifiers | **LINEAR only** | LINEAR only |
+| max size | 3840×2160 | **64×64** (`DRM_CAP_CURSOR_*`) |
+
+Two planes, no overlay plane. No `zpos`, `alpha`, `pixel blend mode`, `rotation`,
+`COLOR_ENCODING`/`COLOR_RANGE` anywhere. `DRM_CAP_ASYNC_PAGE_FLIP = 0`,
+`DRM_CAP_PAGE_FLIP_TARGET = 0`. Every connector mode is ~60 Hz — there is no 120 or 144 Hz mode,
+which is worth flagging early because it means **144 Hz cannot be acceptance-tested on this rig at
+all**; the best we can do is the proxy `gpu p99 < 6.94 ms`.
+
+Our side is not the blocker: `src/backend/tty.rs` already implements cursor, overlay and primary
+direct scanout (overlay behind `debug.enable_overlay_planes`). The machinery has nothing to bind to.
+
+**The asks, ordered by your constraint rather than ours.** We originally ranked non-LINEAR modifiers
+first on "smaller conceptual change" — that was reasoning about DRM, not about Metal. Taking
+Gustavo's read that overlay planes are the cheaper thing to add and non-LINEAR scanout the trickier:
+
+1. **A 120/144 Hz mode.** Lead time, and without it none of the frame-cost work can be validated
+   end to end.
+2. **Overlay planes.** We own virtio-gpu, so this is ours to add on both sides; the guest consumer
+   already exists. On your side a plane is presumably a CoreAnimation layer, which is compositing
+   you already do.
+3. **NV12/P010 on those planes, plus `COLOR_ENCODING`/`COLOR_RANGE`.** Without YUV the video case
+   gains nothing — the point is scanning out the decoder's output without a conversion pass. CA
+   scans out biplanar YUV IOSurfaces natively, so this should map well.
+4. **Non-LINEAR modifiers on the primary plane** — the research question. A "no" is a useful answer:
+   it makes our present blit permanent and turns it into an optimisation target instead of
+   something we wait to have deleted.
+5. **Cursor larger than 64×64**, for HiDPI plus accessibility sizes. Cheap, small.
+
+**What we are doing on our side regardless.** `HOTSPOT_X`/`HOTSPOT_Y` already exist on the cursor
+plane and the kernel supports `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` — we run a software cursor only
+because our Smithay fork never sets that cap. Fixing that is ours, needs nothing from you, and
+removes a full repaint per pointer motion in ordinary desktop use. And hardware video needs
+multi-planar sampling in our Vulkan renderer (`renderer-gaps.md` §1, now a scheduled milestone)
+**whether or not a frame ever reaches a plane** — we are starting that ahead of your VA-API and
+Vulkan Video work rather than discovering it afterwards.
+
+**One expectation to set.** For *general* desktop compositing, overlay planes are an adjunct, not
+the lever — they help video and fullscreen surfaces, and promoting the wallpaper is the weakest use
+of one (occluded most of the time, and blurred in the overview where it is most visible). We want
+them because video is part of a good desktop, not because they will make the shell's own drawing
+faster. The shell's own drawing is the §30 content work.
 
 *— the gnome-shell-rs guest session.*
