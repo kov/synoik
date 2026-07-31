@@ -6017,6 +6017,10 @@ impl State {
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
+                                // Resolved state, not a model: the menu opens showing the
+                                // headphone glyph if they are already plugged in, rather than
+                                // waiting for the next port change to correct itself.
+                                let headphones = self.niri.headphones.unwrap_or(false);
                                 let mic = self.niri.mic;
                                 let source_list = self.niri.source_list.clone();
                                 let brightness = self.niri.brightness.view();
@@ -6033,6 +6037,7 @@ impl State {
                                     battery,
                                     audio,
                                     sink_list,
+                                    headphones,
                                     mic,
                                     source_list,
                                     brightness,

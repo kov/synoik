@@ -595,6 +595,7 @@ impl PanelPopover {
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
+        headphones: bool,
         mic: crate::audio::MicStatus,
         source_list: crate::audio::SourceList,
         brightness: crate::brightness::BrightnessView,
@@ -619,6 +620,7 @@ impl PanelPopover {
             battery,
             audio,
             sink_list,
+            headphones,
             mic,
             source_list,
             brightness,
@@ -645,6 +647,17 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_sink_list(sink_list)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push the headphone state to an open quick-settings popover, so its volume-slider icon swaps
+    /// to `audio-headphones-symbolic`. Returns whether it changed anything.
+    pub fn set_headphones(&mut self, headphones: bool) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_headphones(headphones)
             }
             _ => false,
         }

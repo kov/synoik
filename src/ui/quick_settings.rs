@@ -1202,6 +1202,10 @@ pub struct QuickSettings {
     /// The output sinks + current default, for the output slider's device picker (empty → no
     /// picker arrow).
     sink_list: SinkList,
+    /// Whether the default sink is headphones, which swaps **this slider's icon only** (never the
+    /// panel indicator, never the OSD — see [`crate::audio::output_slider_icon`]). Resolved by the
+    /// compositor from the card/route model, since that lives outside this widget.
+    headphones: bool,
     /// Microphone state (level/mute + recording/source-present visibility) for the mic slider.
     mic: MicStatus,
     /// The input sources + current default, for the mic slider's device picker.
@@ -1257,6 +1261,7 @@ impl QuickSettings {
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
+        headphones: bool,
         mic: MicStatus,
         source_list: SourceList,
         brightness: crate::brightness::BrightnessView,
@@ -1275,6 +1280,7 @@ impl QuickSettings {
             battery,
             audio,
             sink_list,
+            headphones,
             mic,
             source_list,
             sliding: None,
@@ -1511,6 +1517,13 @@ impl QuickSettings {
             self.content_bumped();
         }
         changed |= self.normalize_expanded();
+        changed
+    }
+
+    /// Adopt the headphone state resolved from the card/route model. Returns whether it changed.
+    pub fn set_headphones(&mut self, headphones: bool) -> bool {
+        let changed = self.headphones != headphones;
+        self.headphones = headphones;
         changed
     }
 
@@ -2201,7 +2214,10 @@ impl QuickSettings {
             let center =
                 Point::from((disc.loc.x + disc.size.w / 2., disc.loc.y + disc.size.h / 2.));
             let name = match slider {
-                Slider::Output => crate::audio::volume_icon(&self.audio.unwrap_or_default()),
+                Slider::Output => crate::audio::output_slider_icon(
+                    &self.audio.unwrap_or_default(),
+                    self.headphones,
+                ),
                 Slider::Mic => crate::audio::mic_volume_icon(&self.mic),
                 // A single icon, not sensitivity-graded like the volume ones (`brightness.js:41`).
                 Slider::Brightness => "display-brightness-symbolic",
@@ -2986,6 +3002,7 @@ mod tests {
                 None,
                 audio,
                 SinkList::default(),
+                false,
                 MicStatus::default(),
                 SourceList::default(),
                 crate::brightness::BrightnessView::default(),
@@ -3040,6 +3057,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3068,6 +3086,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3140,6 +3159,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3169,6 +3189,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3201,6 +3222,7 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3231,6 +3253,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3271,6 +3294,7 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3346,6 +3370,7 @@ mod tests {
             None,
             audio,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -3975,6 +4000,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -4045,6 +4071,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -4108,6 +4135,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),
@@ -4747,6 +4775,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            false,
             MicStatus::default(),
             SourceList::default(),
             crate::brightness::BrightnessView::default(),

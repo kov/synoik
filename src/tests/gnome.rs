@@ -12668,6 +12668,110 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     );
 }
 
+/// Plugging headphones in: `OutputStreamSlider._portChanged` (`js/ui/status/volume.js:347-358`).
+///
+/// The suppression rule is the whole point. `initializing = this._hasHeadphones === undefined` is
+/// once per shell lifetime — so the first answer sets the icon silently, and every change after it
+/// shows the OSD. And `_hasHeadphones` survives a default-sink swap, so moving from a headphone
+/// sink to a speaker sink is a change that *does* speak up.
+#[test]
+fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
+    use crate::audio::{AudioCard, AudioCards, BoundSinkInfo, PortDirection, RouteInfo, SinkCard};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+    f.install_stub_audio(0.5);
+
+    // One card whose active output route is `port`.
+    let cards = |port: &str| AudioCards {
+        cards: vec![AudioCard {
+            id: 42,
+            description: "Built-in Audio".to_owned(),
+            icon_name: Some("audio-card-analog".to_owned()),
+            ports: vec![],
+            active: vec![RouteInfo {
+                index: 0,
+                direction: Some(PortDirection::Output),
+                name: port.to_owned(),
+                device: Some(1),
+                ..RouteInfo::default()
+            }],
+        }],
+    };
+    let sinks = crate::audio::SinkList {
+        sinks: vec![],
+        default_name: Some("sink".to_owned()),
+        bound: Some(BoundSinkInfo {
+            card: Some(SinkCard {
+                card_id: 42,
+                device: Some(1),
+            }),
+            form_factor: None,
+        }),
+    };
+
+    // FIRST answer — speakers. The state is recorded, and NOTHING is shown.
+    f.niri_state().on_sink_list(sinks.clone());
+    f.niri_state().on_audio_cards(cards("analog-output"));
+    assert_eq!(f.niri().headphones, Some(false));
+    assert!(
+        !f.niri().osd.is_visible(),
+        "the initial sync must not raise an OSD (`initializing`)"
+    );
+
+    // Plug headphones in: a change, so the OSD comes up — showing the LEVEL glyph, never the
+    // headphone one (`showOSD` uses `getIcon()`, `volume.js:283-288`).
+    f.niri_state()
+        .on_audio_cards(cards("analog-output-headphones"));
+    assert_eq!(f.niri().headphones, Some(true));
+    let content = f
+        .niri()
+        .osd
+        .content(&output)
+        .expect("plugging headphones in shows the volume OSD");
+    assert_eq!(
+        content.icon,
+        vec!["audio-volume-medium-symbolic"],
+        "the OSD shows the level, not the headphone glyph"
+    );
+    assert_eq!(content.level, Some(0.5));
+
+    // Re-publishing the same port is not a change: no second OSD.
+    f.niri().osd.hide_all();
+    f.settle_animations();
+    f.niri_state()
+        .on_audio_cards(cards("analog-output-headphones"));
+    assert!(
+        !f.niri().osd.is_visible(),
+        "an unchanged port must not re-arm the OSD"
+    );
+
+    // Unplugging is a change too, and the first answer's silence is long spent.
+    f.niri_state().on_audio_cards(cards("analog-output"));
+    assert_eq!(f.niri().headphones, Some(false));
+    assert!(f.niri().osd.is_visible(), "unplugging speaks up as well");
+
+    // A bluetooth headset arriving as the new default: no card, but a form factor. GNOME does not
+    // reset `_hasHeadphones` across a stream swap, so this is a change and shows the OSD.
+    f.niri().osd.hide_all();
+    f.settle_animations();
+    f.niri_state().on_sink_list(crate::audio::SinkList {
+        sinks: vec![],
+        default_name: Some("bluez".to_owned()),
+        bound: Some(BoundSinkInfo {
+            card: None,
+            form_factor: Some("headset".to_owned()),
+        }),
+    });
+    assert_eq!(f.niri().headphones, Some(true));
+    assert!(
+        f.niri().osd.is_visible(),
+        "a default-sink swap that changes the answer shows the OSD -- \
+         `_hasHeadphones` is not reset per stream"
+    );
+}
+
 /// The quick-settings audio controls reach the backend: the sliders write volume, the icons toggle
 /// mute, and the device pickers set the default by `node.name`.
 ///

@@ -549,6 +549,9 @@ pub struct Niri {
     /// pickers and the headphone detection will resolve from. Empty where there is no card, or no
     /// backend at all.
     pub audio_cards: crate::audio::AudioCards,
+    /// Whether the default sink is headphones, GNOME's `_hasHeadphones`. `None` = no answer yet,
+    /// which is what suppresses the very first OSD — see `State::refresh_headphones`.
+    pub headphones: Option<bool>,
     /// Whatever the compositor asks audio to *do* — volume, mute, default device. Live sessions
     /// get `PwAudio` (feature `pipewire`), whose loop is driven on the compositor's calloop;
     /// tests get `StubAudio`. `None` when the connection failed, is disabled, or the run is
@@ -3558,6 +3561,9 @@ impl State {
         if self.niri.panel_popover.set_sink_list(list) {
             self.niri.queue_redraw_all();
         }
+        // The bound sink's form factor and card membership ride along, so a new list can change the
+        // answer — and a default-sink swap comes through here.
+        self.refresh_headphones();
     }
 
     /// Adopt a fresh input-source list (+ current default) from the PipeWire watcher, for the
@@ -3574,6 +3580,44 @@ impl State {
     /// so there is no redraw to queue.
     pub fn on_audio_cards(&mut self, cards: crate::audio::AudioCards) {
         self.niri.audio_cards = cards;
+        self.refresh_headphones();
+    }
+
+    /// GNOME's `OutputStreamSlider._portChanged` (`js/ui/status/volume.js:347-358`): when the
+    /// default sink's headphone-ness changes, swap the quick-settings slider's icon and show the
+    /// volume OSD — *except* on the very first answer.
+    ///
+    /// Three details that are easy to get wrong, all load-bearing:
+    ///
+    /// 1. The suppression is `initializing = this._hasHeadphones === undefined` — once per shell
+    ///    lifetime, not once per stream. Hence `Option<bool>`: `None` is "no answer yet", and only
+    ///    the transition out of it is silent.
+    /// 2. `_hasHeadphones` is **not** reset when the default sink changes (`_connectStream` just
+    ///    calls `_portChanged` again), so switching from a headphone sink to a speaker sink is a
+    ///    change and *does* show the OSD. Keeping the last answer across sink swaps is deliberate.
+    /// 3. The OSD's icon is the plain level glyph, never the headphone one — `showOSD` builds it
+    ///    from `getIcon()` (`volume.js:283-288`). Only the slider's own button takes the override.
+    fn refresh_headphones(&mut self) {
+        let Some(headphones) =
+            crate::audio::default_sink_has_headphones(&self.niri.sink_list, &self.niri.audio_cards)
+        else {
+            // No sink bound: no answer, and — importantly — the initial suppression is left
+            // unspent.
+            return;
+        };
+        if self.niri.headphones == Some(headphones) {
+            return;
+        }
+        let initializing = self.niri.headphones.is_none();
+        self.niri.headphones = Some(headphones);
+        if self.niri.panel_popover.set_headphones(headphones) {
+            self.niri.queue_redraw_all();
+        }
+        if !initializing {
+            if let Some(status) = self.niri.audio {
+                self.show_volume_osd(&status);
+            }
+        }
     }
 
     #[cfg(feature = "dbus")]
@@ -4276,6 +4320,7 @@ impl Niri {
             sink_list: crate::audio::SinkList::default(),
             source_list: crate::audio::SourceList::default(),
             audio_cards: crate::audio::AudioCards::default(),
+            headphones: None,
             audio_backend: None,
             system_status: SystemStatus::default(),
             notifications: crate::notifications::NotificationStore::default(),

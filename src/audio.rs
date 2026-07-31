@@ -470,6 +470,62 @@ impl AudioBackend for StubAudio {
     }
 }
 
+/// Whether the sink is headphones, GNOME's `_findHeadphones` (`js/ui/status/volume.js:332-345`):
+///
+/// ```js
+/// if (sink.get_form_factor() === 'headset' || sink.get_form_factor() === 'headphone')
+///     return true;
+/// if (sink.get_ports().length > 0)
+///     return sink.get_port().port.toLowerCase().includes('headphone');
+/// return false;
+/// ```
+///
+/// Note the middle branch **returns** rather than falling through: once a sink has ports, the
+/// answer is the active port's name and nothing else. `active_port: None` is the no-ports case.
+/// The substring match is GNOME's own admitted hack ("ALSA/PulseAudio have a number of different
+/// identifiers for headphones, and I could not find the complete list") — kept verbatim rather
+/// than improved, so we are wrong in exactly the places GNOME is.
+pub fn has_headphones(form_factor: Option<&str>, active_port: Option<&str>) -> bool {
+    if matches!(form_factor, Some("headset") | Some("headphone")) {
+        return true;
+    }
+    match active_port {
+        Some(port) => port.to_lowercase().contains("headphone"),
+        None => false,
+    }
+}
+
+/// [`has_headphones`] resolved against the live models: the bound default sink's form factor, and
+/// the active output route of the card it belongs to.
+///
+/// `None` means "no sink bound, so do not know" — distinct from `Some(false)`, "bound, not
+/// headphones". The caller must not treat the two alike: GNOME suppresses its OSD only on the very
+/// first *answer*, so an unbound period must not consume that suppression.
+pub fn default_sink_has_headphones(sinks: &SinkList, cards: &AudioCards) -> Option<bool> {
+    let bound = sinks.bound.as_ref()?;
+    let port = bound
+        .card
+        .and_then(|card| cards.active_route(card.card_id, card.device, PortDirection::Output))
+        .map(|route| route.name.as_str());
+    Some(has_headphones(bound.form_factor.as_deref(), port))
+}
+
+/// The icon on the **quick-settings volume slider's** button — the one surface that shows the
+/// headphone glyph (`OutputStreamSlider._updateIcon`, `js/ui/status/volume.js:359-363`).
+///
+/// Deliberately *not* used for the panel indicator or the OSD. Both of those read `getIcon()`, the
+/// plain level icon: the panel indicator is assigned from `this._output.getIcon()` in the
+/// `stream-updated` handler (`volume.js:484-490`), and `showOSD` builds its gicon from
+/// `this.getIcon()` (`volume.js:283-288`). Only `iconName`, the slider's own button, takes the
+/// override — so plugging headphones in changes the quick-settings slider and nothing else.
+pub fn output_slider_icon(status: &AudioStatus, headphones: bool) -> &'static str {
+    if headphones {
+        // Beats muted: `_updateIcon` consults `getIcon()` only in the else branch.
+        return "audio-headphones-symbolic";
+    }
+    volume_icon(status)
+}
+
 /// PipeWire node `channelVolumes` are **linear** amplitude; GNOME/PulseAudio present
 /// a **perceptual (cubic)** value — e.g. `pactl` "40%" is `0.4³ ≈ 0.064` linear
 /// (−23.88 dB). Convert a linear channel volume to the perceptual value the slider
@@ -719,6 +775,139 @@ mod tests {
         // card is speakers by both of `_findHeadphones`' branches.
         assert_eq!(bound.form_factor, None);
         assert!(!route.name.to_lowercase().contains("headphone"));
+    }
+
+    /// `_findHeadphones` (`js/ui/status/volume.js:332-345`), branch by branch.
+    #[test]
+    fn headphone_detection_follows_form_factor_then_port_name() {
+        // Branch 1: the form factor wins outright, whatever the port says.
+        assert!(has_headphones(Some("headset"), None));
+        assert!(has_headphones(Some("headphone"), None));
+        assert!(has_headphones(
+            Some("headset"),
+            Some("analog-output-speaker")
+        ));
+        // ...and only those two values. "internal", "speaker", "hands-free" are not headphones.
+        assert!(!has_headphones(Some("internal"), None));
+        assert!(!has_headphones(Some("speaker"), None));
+        assert!(!has_headphones(Some("hands-free"), None));
+
+        // Branch 2: with a port, the answer is its name and nothing else — a substring match,
+        // GNOME's own hack. Case-insensitive.
+        assert!(has_headphones(None, Some("analog-output-headphones")));
+        assert!(has_headphones(None, Some("Analog-Output-Headphones")));
+        assert!(has_headphones(None, Some("headphone")));
+        assert!(!has_headphones(None, Some("analog-output")));
+        assert!(!has_headphones(None, Some("hdmi-output-0")));
+        // A non-headphone form factor does NOT veto a headphone port: branch 1 only returns early
+        // when it matches, so an "internal" card with a headphone port still counts.
+        assert!(has_headphones(
+            Some("internal"),
+            Some("analog-output-headphones")
+        ));
+
+        // Branch 3: no ports at all → false.
+        assert!(!has_headphones(None, None));
+    }
+
+    /// Resolved against the models, including the "no sink bound" case that must stay distinct from
+    /// "bound, not headphones" — the OSD's one-time suppression hangs on that distinction.
+    #[test]
+    fn headphones_resolve_through_the_card_model() {
+        let card = |name: &str| AudioCards {
+            cards: vec![AudioCard {
+                id: 42,
+                description: "Built-in Audio".to_owned(),
+                icon_name: None,
+                ports: vec![],
+                active: vec![RouteInfo {
+                    index: 0,
+                    direction: Some(PortDirection::Output),
+                    name: name.to_owned(),
+                    device: Some(1),
+                    ..RouteInfo::default()
+                }],
+            }],
+        };
+        let sinks = |bound: Option<BoundSinkInfo>| SinkList {
+            sinks: vec![],
+            default_name: None,
+            bound,
+        };
+        let on_card = Some(BoundSinkInfo {
+            card: Some(SinkCard {
+                card_id: 42,
+                device: Some(1),
+            }),
+            form_factor: None,
+        });
+
+        assert_eq!(
+            default_sink_has_headphones(&sinks(on_card.clone()), &card("analog-output-headphones")),
+            Some(true)
+        );
+        assert_eq!(
+            default_sink_has_headphones(&sinks(on_card.clone()), &card("analog-output")),
+            Some(false)
+        );
+        // A bluetooth headset: no card at all, but a form factor.
+        assert_eq!(
+            default_sink_has_headphones(
+                &sinks(Some(BoundSinkInfo {
+                    card: None,
+                    form_factor: Some("headset".to_owned()),
+                })),
+                &AudioCards::default()
+            ),
+            Some(true)
+        );
+        // Bound to a card whose routes we have not seen yet: no port, so not headphones — but an
+        // ANSWER, unlike the unbound case below.
+        assert_eq!(
+            default_sink_has_headphones(&sinks(on_card), &AudioCards::default()),
+            Some(false)
+        );
+        // Nothing bound: no answer at all.
+        assert_eq!(
+            default_sink_has_headphones(&sinks(None), &card("analog-output-headphones")),
+            None
+        );
+    }
+
+    /// Only the quick-settings slider's button takes the headphone glyph. The panel indicator and
+    /// the OSD both read `getIcon()` — the level icon — so they must keep reporting the level.
+    #[test]
+    fn the_headphone_glyph_is_the_sliders_alone() {
+        let status = AudioStatus {
+            volume: 0.5,
+            muted: false,
+        };
+        assert_eq!(
+            output_slider_icon(&status, true),
+            "audio-headphones-symbolic"
+        );
+        assert_eq!(
+            output_slider_icon(&status, false),
+            "audio-volume-medium-symbolic"
+        );
+        // The level function is untouched by headphones — this is what the panel and OSD call.
+        assert_eq!(volume_icon(&status), "audio-volume-medium-symbolic");
+
+        // Headphones beat muted on the slider: `_updateIcon` consults `getIcon()` only in its else
+        // branch, so the mute glyph never appears while headphones are plugged in.
+        let muted = AudioStatus {
+            volume: 0.5,
+            muted: true,
+        };
+        assert_eq!(
+            output_slider_icon(&muted, true),
+            "audio-headphones-symbolic"
+        );
+        assert_eq!(
+            volume_icon(&muted),
+            "audio-volume-muted-symbolic",
+            "...but the panel indicator and OSD still show muted"
+        );
     }
 
     #[test]
