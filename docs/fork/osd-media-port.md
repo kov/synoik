@@ -239,8 +239,14 @@ the content. So a decode landing has to bump the list revision (`note_art_decode
 `IconDecoded` handler); without it the first frame's fallback stays baked in until something
 unrelated moves the revision.
 
-**Remote art: LANDED 2026-07-31.** `mpris:artUrl` is no longer `file://`-only — `http(s)` covers
-are fetched, as GNOME does by handing the URI to gvfs. Notes worth keeping:
+**Remote art: LANDED 2026-07-31, but OFF BY DEFAULT** (`NIRI_REMOTE_ART=1` to enable). `http(s)`
+covers can be fetched, as GNOME does by handing the URI to gvfs — but nothing we have found needs
+it: both browsers on this machine download the artwork themselves and publish a `file://` path (see
+the table below). Fetching means the shell issues a request an arbitrary app chose the target of,
+and the address guard is best-effort because gvfs owns redirects, so it is not worth carrying on by
+default for a capability with no known consumer. Deliberately an env var, not a config or gsettings
+key: GNOME has no such setting, and this is a developer switch rather than a supported surface.
+Notes worth keeping:
 
 - **Zero new dependencies.** We already depend on `gio`, so the transport is `gio::File::for_uri`,
   the same call GNOME makes — which also inherits its proxy and authentication integration. The

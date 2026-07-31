@@ -39,7 +39,9 @@ use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Scale, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::image_source::{remote_is_permitted, ImageSource, FETCH_TIMEOUT, MAX_IMAGE_BYTES};
+use crate::image_source::{
+    remote_fetch_enabled, remote_is_permitted, ImageSource, FETCH_TIMEOUT, MAX_IMAGE_BYTES,
+};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1138,6 +1140,9 @@ fn read_capped(path: &Path) -> anyhow::Result<Vec<u8>> {
 fn fetch_remote(source: &ImageSource, url: &str) -> anyhow::Result<Vec<u8>> {
     use gio::prelude::*;
 
+    if !remote_fetch_enabled() {
+        anyhow::bail!("remote art is disabled (set NIRI_REMOTE_ART=1 to allow fetching {url})");
+    }
     if !remote_is_permitted(source) {
         anyhow::bail!("refusing to fetch {url}: it does not resolve to a public address");
     }
@@ -1518,6 +1523,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Remote art is off unless `NIRI_REMOTE_ART=1`, so by default a remote source never reaches
+    /// the transport at all — no DNS, no connection. The negative is still cached, so a player
+    /// publishing http(s) art cannot make the shell retry it every frame.
+    #[test]
+    fn remote_art_is_refused_while_the_switch_is_off() {
+        if crate::image_source::remote_fetch_enabled() {
+            eprintln!("skipping: NIRI_REMOTE_ART=1 is set");
+            return;
+        }
+        let cache = ImageCache::new();
+        // A public address, so only the switch can be what refuses this.
+        let source = ImageSource::Remote("https://example.com/cover.png".to_owned());
+        assert!(cache.buffer(&source, 48., 1.0).is_none());
+        assert_eq!(cache.len(), 1, "the refusal is cached, not retried");
+    }
+
     /// The address guard runs *before* the transport, so a refused URL costs no connection at all.
     /// Deterministic and network-free: a loopback address is refused by the rule, not by failing to
     /// connect (port 1 would also fail, which is exactly the confound this avoids — the assertion
@@ -1543,8 +1564,12 @@ mod tests {
     /// cargo test --workspace remote_image -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "needs the network"]
+    #[ignore = "needs the network, and NIRI_REMOTE_ART=1"]
     fn remote_image_fetches_and_decodes() {
+        if !crate::image_source::remote_fetch_enabled() {
+            eprintln!("skipping: set NIRI_REMOTE_ART=1 to exercise the fetch");
+            return;
+        }
         let cache = ImageCache::new();
         let source = ImageSource::Remote("https://picsum.photos/200.jpg".to_owned());
         let buffer = cache

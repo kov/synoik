@@ -12,6 +12,14 @@
 //! worker thread through gvfs, and the intended endgame is our own Rust transport. Neither side of
 //! this module has to know which.
 //!
+//! **Remote art is off by default.** [`remote_fetch_enabled`] gates it, and nothing we have found
+//! yet needs it: both browsers on this machine download the artwork themselves and publish a
+//! `file://` path (see `docs/fork/osd-media-port.md`). Fetching means the shell issues a request an
+//! arbitrary app on the bus chose the target of — a tracking beacon carrying the user's IP, a
+//! channel out of a sandbox with no network permission of its own — and the guards below are
+//! best-effort, since gvfs owns the redirect handling. Not worth carrying that on by default for a
+//! capability with no known consumer. The code stays, ready for the player that needs it.
+//!
 //! **What is refused, and why:**
 //!
 //! - **Any scheme but `file`, `http`, `https`.** GNOME accepts whatever gvfs mounts, which includes
@@ -42,6 +50,19 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// It applies to local files as much as to fetches: the path is chosen by an app just as freely as
 /// the URL is, and `file:///dev/zero` is a URI a player is perfectly able to publish.
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether remote art may actually be fetched — **off unless `NIRI_REMOTE_ART=1`**.
+///
+/// Deliberately *not* a config or gsettings knob: GNOME has no such setting, and the fork's model
+/// is GNOME's rather than a new surface of our own. An env var is the same shape as
+/// `NIRI_VK_VALIDATION` — a developer switch for a capability that is not on the supported path.
+///
+/// Checked in the loader rather than in [`ImageSource::from_uri`] so the URI vocabulary stays pure
+/// and testable: a remote URL still parses into [`ImageSource::Remote`], it just does not load.
+pub fn remote_fetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NIRI_REMOTE_ART").is_some_and(|value| value == "1"))
+}
 
 /// A place an image can be loaded from, after validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
