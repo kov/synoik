@@ -22,6 +22,9 @@
 //!   syscall boundary and open a prefix of what was named.
 //! - **Remote hosts that resolve to loopback, private, link-local or unspecified addresses**
 //!   ([`remote_is_permitted`]) — see its docs for the limit of that check.
+//! - **Anything that is not a regular file, and anything over [`MAX_IMAGE_BYTES`]** — a local path
+//!   is chosen by an app exactly as freely as a URL is, so `file:///dev/zero` has to be refused for
+//!   the same reason a hostile server's endless response is.
 
 use std::net::{IpAddr, ToSocketAddrs as _};
 use std::path::PathBuf;
@@ -32,10 +35,13 @@ pub const MAX_URI_BYTES: usize = 4096;
 /// How long a remote fetch may take before it is abandoned.
 pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Cap on a fetched image, in bytes. Album art is tens to hundreds of KB; this is generous enough
-/// not to reject real covers and small enough that a hostile server cannot make the shell buy an
-/// arbitrary amount of memory.
-pub const MAX_FETCH_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on an image we will load, in bytes. Album art is tens to hundreds of KB; this is generous
+/// enough not to reject real covers and small enough that neither a hostile server nor a hostile
+/// **path** can make the shell buy an arbitrary amount of memory.
+///
+/// It applies to local files as much as to fetches: the path is chosen by an app just as freely as
+/// the URL is, and `file:///dev/zero` is a URI a player is perfectly able to publish.
+pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A place an image can be loaded from, after validation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

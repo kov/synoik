@@ -260,6 +260,23 @@ are fetched, as GNOME does by handing the URI to gvfs. Notes worth keeping:
   cap, no credentials in the authority, an 8 MB streamed response cap, a 15 s watchdog, and a
   refusal to fetch anything resolving to a loopback/private/link-local address.
 
+**What real browsers actually do (measured on the gsrs seat, 2026-07-31): they hand us a local
+file, not a URL.** Both download the artwork themselves:
+
+| | `mpris:artUrl` | the file |
+|---|---|---|
+| Firefox 145 | `file:///home/gsrs/.config/mozilla/firefox/firefox-mpris/657400_7.png` | PNG 336×188 RGBA, 0600 |
+| Chromium | `file:///tmp/.org.chromium.Chromium.rIWTt1` | PNG 150×83 RGB, 0600, **no extension** |
+
+Two things fall out. Chromium's file has **no extension**, so the format has to be decided by
+sniffing the bytes — the filename hint is only a hint (pinned by
+`browser_art_decodes_regardless_of_the_filename`). And both are 16:9 video thumbnails rather than
+square covers, so both letterbox in the 48px slot: the plate-suppression is on the common path for
+browser media, not an edge case.
+
+It also means remote fetching is *not* what makes browser art work — that was already working
+before it. The fetch is for players that publish `http(s)` directly.
+
 **Known gaps, both arguing for the own-transport work rather than against this one:**
 
 - **Redirects are gvfs's, so the address guard is best-effort.** A public URL that redirects to a

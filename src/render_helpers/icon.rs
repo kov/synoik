@@ -39,7 +39,7 @@ use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Scale, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::image_source::{remote_is_permitted, ImageSource, FETCH_TIMEOUT, MAX_FETCH_BYTES};
+use crate::image_source::{remote_is_permitted, ImageSource, FETCH_TIMEOUT, MAX_IMAGE_BYTES};
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1068,13 +1068,16 @@ impl ImageCache {
 fn load_image(source: &ImageSource, px: u32, scale: f64) -> Option<MemoryBuffer> {
     let (data, is_svg) = match source {
         ImageSource::File(path) => {
-            let data = match std::fs::read(path) {
+            let data = match read_capped(path) {
                 Ok(data) => data,
                 Err(err) => {
-                    tracing::warn!("could not read image {}: {err}", path.display());
+                    tracing::warn!("could not read image {}: {err:#}", path.display());
                     return None;
                 }
             };
+            // Only a hint: Chromium publishes its art as an extensionless temp file
+            // (`/tmp/.org.chromium.Chromium.XXXXXX`), so the sniff in `decode_image_bytes` is what
+            // actually decides for most real players.
             let is_svg = path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
@@ -1095,6 +1098,35 @@ fn load_image(source: &ImageSource, px: u32, scale: f64) -> Option<MemoryBuffer>
             None
         }
     }
+}
+
+/// Read a local image, refusing what a media player has no business pointing us at.
+///
+/// The path comes from an app, so it gets the same two limits the network path has: it must be a
+/// **regular file** — `file:///dev/zero` is a URI a player can publish, and `std::fs::read` on it
+/// returns when the machine runs out of memory — and it must fit [`MAX_IMAGE_BYTES`]. The length is
+/// re-checked while reading rather than trusted from the metadata, since a file can grow between
+/// the two.
+fn read_capped(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).context("opening")?;
+    let meta = file.metadata().context("stat")?;
+    if !meta.is_file() {
+        anyhow::bail!("not a regular file");
+    }
+    if meta.len() > MAX_IMAGE_BYTES as u64 {
+        anyhow::bail!("larger than the {MAX_IMAGE_BYTES} byte cap");
+    }
+    let mut data = Vec::with_capacity(meta.len() as usize);
+    // `take` one past the cap so hitting it is distinguishable from a file that merely ends there.
+    file.take(MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut data)
+        .context("reading")?;
+    if data.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("grew past the {MAX_IMAGE_BYTES} byte cap while reading");
+    }
+    Ok(data)
 }
 
 /// Fetch a remote image. **The one place the transport lives** — swapping gvfs for an owned
@@ -1137,8 +1169,8 @@ fn fetch_remote(source: &ImageSource, url: &str) -> anyhow::Result<Vec<u8>> {
         }
         // Cap the response, not just the buffer: `load_contents` would let a hostile server decide
         // how much memory the shell buys.
-        if out.len() + read > MAX_FETCH_BYTES {
-            anyhow::bail!("larger than the {MAX_FETCH_BYTES} byte cap");
+        if out.len() + read > MAX_IMAGE_BYTES {
+            anyhow::bail!("larger than the {MAX_IMAGE_BYTES} byte cap");
         }
         out.extend_from_slice(&chunk[..read]);
     }
@@ -1414,6 +1446,74 @@ mod tests {
         assert!(cache
             .buffer(&ImageSource::File(missing), 48., 1.0)
             .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two shapes real browsers actually hand us, captured from a live session: Firefox writes
+    /// a `.png` under `~/.config/mozilla/firefox/firefox-mpris/`, Chromium an **extensionless**
+    /// temp file (`/tmp/.org.chromium.Chromium.XXXXXX`). The extensionless one is why the format
+    /// must be decided by sniffing the bytes and not by the filename.
+    ///
+    /// Both are 16:9 video thumbnails rather than square covers, so both letterbox in the 48px
+    /// slot — which is exactly the case where the themed plate must not be painted behind them.
+    #[test]
+    fn browser_art_decodes_regardless_of_the_filename() {
+        let dir = std::env::temp_dir().join(format!("gsrs-browser-art-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // A 16:9 PNG, written once with an extension and once without.
+        let png = {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(336, 188, image::Rgba([20, 90, 160, 255]))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .expect("encode");
+            bytes.into_inner()
+        };
+        let named = dir.join("657400_7.png");
+        let anonymous = dir.join(".org.chromium.Chromium.rIWTt1");
+        std::fs::write(&named, &png).expect("write");
+        std::fs::write(&anonymous, &png).expect("write");
+
+        let cache = ImageCache::new();
+        for path in [named, anonymous] {
+            let buffer = cache
+                .buffer(&ImageSource::File(path.clone()), 48., 1.0)
+                .unwrap_or_else(|| panic!("{} must decode", path.display()));
+            // Square, because the fit-and-centre happens in the decode: a 16:9 source becomes a
+            // 48x48 buffer with transparent bands, which is what reproduces St's RESIZE_ASPECT.
+            assert_eq!(buffer.size().w, 48);
+            assert_eq!(buffer.size().h, 48);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A local path is chosen by an app exactly as freely as a URL is, so it gets the same limits.
+    /// `/dev/zero` is the case that motivates the file-type check: it is a perfectly valid
+    /// `file://` URI for a player to publish, and an uncapped `std::fs::read` of it returns when
+    /// the machine runs out of memory.
+    #[test]
+    fn a_local_image_must_be_a_regular_file_within_the_cap() {
+        let cache = ImageCache::new();
+
+        let zero = ImageSource::File(PathBuf::from("/dev/zero"));
+        let started = std::time::Instant::now();
+        assert!(cache.buffer(&zero, 48., 1.0).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "refusing a character device must be immediate, not an out-of-memory race"
+        );
+
+        // Over the cap: a sparse file, so this costs no disk.
+        let dir = std::env::temp_dir().join(format!("gsrs-image-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let huge = dir.join("huge.png");
+        let f = std::fs::File::create(&huge).expect("create");
+        f.set_len(crate::image_source::MAX_IMAGE_BYTES as u64 + 1)
+            .expect("grow");
+        drop(f);
+        assert!(cache.buffer(&ImageSource::File(huge), 48., 1.0).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
