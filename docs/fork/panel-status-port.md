@@ -25,6 +25,11 @@ service, `PropertiesChanged` → calloop channel → observable model → panel 
 
 ---
 
+> **Missing (found 2026-07-31, panel scroll):** in GNOME an unconsumed scroll anywhere on the
+> panel switches workspaces — `Panel.vfunc_scroll_event` → `Main.wm.handleWorkspaceScroll`
+> (`js/ui/panel.js:244-245`). Ours does that only over the activities indicator, so a wheel over the
+> clock or the status icons does nothing. Small, unscheduled.
+
 ## Working method (one cycle per slice)
 
 Every backlog item is ported as one **advise → implement → adversarial-review** cycle, one commit at

@@ -104,6 +104,42 @@ const DRAG_THRESHOLD: f64 = 8.;
 /// the same constant gnome-shell compares to (`overviewControls.js:433`).
 const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 
+/// Touchpad pixels per scroll step — mutter's `DISCRETE_SCROLL_STEP`
+/// (`src/backends/native/meta-seat-impl.c:62,1139`), which is the factor it divides libinput's
+/// pixel deltas by before handing Clutter a `dy`. GNOME's scroll consumers then read that `dy` as
+/// steps (`volume.js:451`), so the whole chain is 10 px = one notch = one step; matching the
+/// number matters, because it is what makes a two-finger swipe move the volume as far here as it
+/// does on GNOME.
+const SMOOTH_PX_PER_SCROLL_STEP: f64 = 10.;
+
+/// What a scroll over the panel's volume indicator should do. Split out from the handler because
+/// changing the volume needs a live PipeWire connection, which a headless fixture has none of —
+/// this half is the part that can be pinned by a test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VolumeScroll {
+    /// Nothing yet: a high-resolution wheel notch that has not filled the accumulator.
+    Ignore,
+    /// Show the OSD without moving the volume — GNOME's `item.mapped` short-circuit
+    /// (`js/ui/status/volume.js:457`): with the quick-settings menu open its slider is on screen,
+    /// so the scroll reports rather than acts.
+    OsdOnly,
+    /// Step the volume by this many slider steps (then show the OSD, if it moved).
+    Step(f64),
+}
+
+/// The decision behind [`State::adjust_volume_by_scroll`].
+pub fn volume_scroll_action(qs_open: bool, steps: f64) -> VolumeScroll {
+    if qs_open {
+        // `item.mapped ||` short-circuits before `slider.step()`, so this wins even over a scroll
+        // that has not accumulated a notch.
+        VolumeScroll::OsdOnly
+    } else if steps == 0. {
+        VolumeScroll::Ignore
+    } else {
+        VolumeScroll::Step(steps)
+    }
+}
+
 /// A widget of the overview's chrome under the pointer. The overview's controls
 /// are St.Buttons, which act on release rather than press, so a click needs a
 /// press-time target to compare the release against — this is that target.
@@ -1607,6 +1643,61 @@ impl State {
                 false
             }
         }
+    }
+
+    /// Step the default sink's volume by `steps` slider steps and show the OSD — the panel volume
+    /// indicator's scroll (`js/ui/status/volume.js:460-463`, `showOSD` at `:284-289`).
+    ///
+    /// The OSD is *this* path's job, not the audio model's: a quick-settings drag moves a slider
+    /// that is already on screen and stays silent.
+    fn adjust_volume_by_scroll(&mut self, steps: f64) {
+        let qs_open =
+            self.niri.panel_popover.open_role() == Some(crate::ui::panel::ROLE_QUICK_SETTINGS);
+        let action = volume_scroll_action(qs_open, steps);
+
+        #[cfg(feature = "pipewire")]
+        {
+            let steps = match action {
+                VolumeScroll::Ignore => return,
+                // The slider is on screen: say what the volume is, change nothing.
+                VolumeScroll::OsdOnly => {
+                    if let Some(status) = self.niri.audio {
+                        self.show_volume_osd(&status);
+                    }
+                    return;
+                }
+                VolumeScroll::Step(steps) => steps,
+            };
+
+            let before = self.niri.audio.map(|status| status.volume);
+            let delta = steps * crate::audio::SCROLL_STEP;
+            let Some(status) = self
+                .niri
+                .pw_audio
+                .as_ref()
+                .and_then(|pw| pw.adjust_volume(delta))
+            else {
+                return;
+            };
+            self.on_audio_status(Some(status));
+            // `slider.step()` reports whether the value moved, and the OSD is gated on it
+            // (`volume.js:457`, `slider.js:134-147`): scrolling up at 100% must not keep
+            // re-arming an OSD that says the same thing.
+            if before != Some(status.volume) {
+                self.show_volume_osd(&status);
+            }
+        }
+        #[cfg(not(feature = "pipewire"))]
+        let _ = action;
+    }
+
+    /// `StreamSlider.showOSD` (`js/ui/status/volume.js:284-289`): the level bar on **every**
+    /// monitor (`showAll`), no label, and the icon the indicator itself would show.
+    pub fn show_volume_osd(&mut self, status: &crate::audio::AudioStatus) {
+        let icon = crate::audio::volume_icon(status);
+        let level = crate::ui::osd::OsdLevel::new(status.volume, crate::audio::MAX_VOLUME);
+        self.niri.osd.show_all(&[icon], None, level);
+        self.niri.queue_redraw_all();
     }
 
     /// Start recording the active output, or stop if one is already running (the
@@ -6320,7 +6411,10 @@ impl State {
         pointer.frame(self);
     }
 
-    fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
+    fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent)
+    where
+        I::Device: 'static, // Needed for downcasting, to read natural-scroll off the device.
+    {
         let pointer = &self.niri.seat.get_pointer().unwrap();
 
         let source = event.source();
@@ -6513,37 +6607,62 @@ impl State {
                 }
                 return;
             }
+        }
 
-            // Scroll over the quick-settings indicator adjusts the default sink's
-            // volume, like gnome-shell's output indicator (±2% per tick, up = louder).
-            #[cfg(feature = "pipewire")]
-            {
-                let over_qs = self
-                    .niri
-                    .output_under(location)
-                    .map(|(output, pos)| {
-                        let ws = self.niri.workspace_state_for(output);
-                        let output_w = output_size(output).w;
-                        self.niri.panel.hit_test(pos, output_w, ws)
-                            == Some(crate::ui::panel::ROLE_QUICK_SETTINGS)
-                    })
-                    .unwrap_or(false);
-                if over_qs {
-                    let vertical = vertical_amount_v120.unwrap_or(0.);
-                    let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
-                    if ticks != 0 {
-                        let delta = -(ticks as f64) * crate::audio::SCROLL_STEP;
-                        let new = self
-                            .niri
-                            .pw_audio
-                            .as_ref()
-                            .and_then(|pw| pw.adjust_volume(delta));
-                        if let Some(status) = new {
-                            self.on_audio_status(Some(status));
-                        }
+        // Scroll over the VOLUME icon adjusts the default sink's volume and shows the OSD, like
+        // gnome-shell's output indicator (`js/ui/status/volume.js:440-467`). Not the whole status
+        // cluster: GNOME's handler is on that one indicator's actor. (Its neighbours are not inert
+        // in GNOME — an unconsumed scroll propagates to the panel, which switches workspaces
+        // (`js/ui/panel.js:244-245`); we only do that over the activities indicator. Recorded in
+        // `docs/fork/panel-status-port.md`.)
+        //
+        // Locked or under the screenshot UI there is no reachable indicator in GNOME — the lock
+        // screen has no status area and the screenshot UI is a modal grab — so neither may steer
+        // the volume here.
+        if self.niri.layout.is_gnome_mode()
+            && !self.niri.is_locked()
+            && !self.niri.screenshot_ui.is_open()
+        {
+            let location = pointer.current_location();
+            let over_volume = self
+                .niri
+                .output_under(location)
+                .and_then(|(output, pos)| {
+                    let output_w = output_size(output).w;
+                    self.niri
+                        .panel
+                        .volume_indicator_rect(output_w)?
+                        .contains(pos)
+                        .then_some(())
+                })
+                .is_some();
+            if over_volume {
+                // A wheel notch is one step; a touchpad's smooth delta is proportional, as
+                // `nSteps = -dy` is for GNOME's SMOOTH branch (`volume.js:452-458`). Wheels are
+                // accumulated in v120 units so a high-resolution wheel does not over-step.
+                let steps = match vertical_amount_v120 {
+                    Some(v120) => f64::from(self.niri.vertical_wheel_tracker.accumulate(v120)),
+                    None => {
+                        // GNOME un-inverts smooth deltas to "match physical direction"
+                        // (`volume.js:452-454`: mutter tags the event `CLUTTER_SCROLL_INVERTED`
+                        // when the device has natural scrolling on, and the handler flips it
+                        // back). libinput has already applied the inversion and does not tag it,
+                        // so ask the device, the way the swipe-gesture path does.
+                        let natural = {
+                            let device = event.device();
+                            (&device as &dyn Any)
+                                .downcast_ref::<input::Device>()
+                                .is_some_and(|d| d.config_scroll_natural_scroll_enabled())
+                        };
+                        let px = event.amount(Axis::Vertical).unwrap_or(0.);
+                        let px = if natural { -px } else { px };
+                        px / SMOOTH_PX_PER_SCROLL_STEP
                     }
-                    return;
-                }
+                };
+                self.adjust_volume_by_scroll(-steps);
+                // Consumed either way: a notch that only part-filled the accumulator must not fall
+                // through to a workspace switch.
+                return;
             }
         }
 

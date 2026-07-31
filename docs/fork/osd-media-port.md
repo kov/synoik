@@ -217,6 +217,22 @@ since `a3e7c9d9`. A wheel tick over the status area already runs `pw.adjust_volu
 (`src/input/mod.rs:6518-6546`), so there is no input seam to grow. What is actually left splits into
 three pieces of very different size:
 
+**(1) and (2) landed 2026-07-31.** What the Fable review caught, all fixed in the same change:
+the touchpad step was **6x too coarse** (mutter divides libinput pixels by `DISCRETE_SCROLL_STEP`
+= 10, `meta-seat-impl.c:62,1139`, and GNOME reads that `dy` as steps — so 10 px is one step, not
+60); the **natural-scroll un-inversion** was missing (mutter tags the event `CLUTTER_SCROLL_INVERTED`
+and `volume.js:452-454` flips it back to physical direction, while libinput hands us the inverted
+delta untagged); the `item.mapped` short-circuit was missing (with the quick-settings menu open its
+slider is on screen, so GNOME shows the OSD and does **not** step, `volume.js:457`); and the OSD
+fired even when the volume did not move (at 100%, `slider.step()` returns false and GNOME shows
+nothing). A lock-screen/screenshot-UI guard went in too — GNOME has no reachable indicator there.
+
+**Test gap, recorded rather than papered over:** headless has no PipeWire, so nothing pins the
+scroll→OSD *wiring* — deleting the `show_volume_osd` call inside `adjust_volume_by_scroll` leaves
+the suite green. The decision half is split into a pure `volume_scroll_action` and tested; closing
+the rest wants a stub audio backend behind a seam, which is the same refactor the port of the
+port-level model (below) will want.
+
 1. **The OSD on our own volume change** — small. Nothing shows one for a change *we* make;
    `on_audio_status` (`src/niri.rs:3527`) only refreshes the panel and popover. `show_osd` is
    reachable from the same `&mut self`, and `audio::volume_icon` already picks the icon. Follow

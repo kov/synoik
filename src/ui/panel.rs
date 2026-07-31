@@ -371,6 +371,13 @@ fn qs_indicator_icons(
     v
 }
 
+/// The x of the `i`-th quick-settings status icon, from the indicator rect's left edge. The single
+/// source of truth for the cluster's spacing: the render loop and the per-icon hit test must agree,
+/// or a scroll lands on a neighbour of the icon it looks like it is over.
+fn qs_icon_x(rect_x: f64, i: usize) -> f64 {
+    rect_x + INDICATOR_H_PADDING + QS_ICON_MARGIN + i as f64 * (QS_ICON + QS_ICON_GAP)
+}
+
 /// Logical width of the right-box quick-settings indicator (padding + icons +
 /// gaps). Depends on how many status icons are currently shown.
 fn qs_indicator_width(
@@ -1152,6 +1159,28 @@ impl Panel {
         items
     }
 
+    /// The volume icon's own rect inside the quick-settings cluster, or `None` when there is no
+    /// audio to show. GNOME puts the scroll handler on the volume indicator's actor, not on the
+    /// whole status area (`js/ui/status/volume.js:434-437,470-472`), so this is what a
+    /// scroll-to-change-volume must hit-test against.
+    ///
+    /// The box is the icon plus its `.system-status-icon` side margins, and the full panel height:
+    /// an indicator is as tall as the bar it sits in.
+    pub fn volume_indicator_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        let audio = self.audio?;
+        let want = crate::audio::volume_icon(&audio);
+        let index = qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
+            .iter()
+            .position(|(candidates, _)| candidates.first().is_some_and(|name| name == want))?;
+
+        let rect = self.quick_settings_rect(output_width);
+        let x = qs_icon_x(rect.loc.x, index) - QS_ICON_MARGIN;
+        Some(Rectangle::new(
+            Point::from((x, 0.)),
+            Size::from((QS_ICON + 2. * QS_ICON_MARGIN, PANEL_HEIGHT)),
+        ))
+    }
+
     /// Which panel *role*, if any, sits at an output-local logical position.
     /// `output_width` is needed to place the centered dateMenu and the
     /// right-anchored quick-settings indicator.
@@ -1426,7 +1455,7 @@ impl Panel {
     ) {
         let rect = self.quick_settings_rect(output_width);
         // The first icon carries the box's leading `.system-status-icon` left margin.
-        let mut x = rect.loc.x + INDICATOR_H_PADDING + QS_ICON_MARGIN;
+        let mut x = qs_icon_x(rect.loc.x, 0);
         for (candidates, color) in
             qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
         {
@@ -1767,6 +1796,76 @@ mod tests {
     /// exercise the container fades.
     fn test_panel() -> Panel {
         Panel::new(Clock::default(), Rc::new(RefCell::new(Config::default())))
+    }
+
+    /// The volume icon has its OWN reactive box inside the status cluster: gnome-shell puts the
+    /// scroll handler on that indicator's actor (`js/ui/status/volume.js:434-437,470-472`), not on
+    /// the cluster. Its neighbours must fall outside it, or a scroll aimed at the network icon
+    /// would change the volume.
+    #[test]
+    fn the_volume_icon_has_its_own_hit_box() {
+        use crate::system_status::{BatteryStatus, NetworkStatus, SystemStatus};
+
+        let mut panel = test_panel();
+        let output_width = 1920.;
+        // No audio at all -> nothing to scroll on.
+        assert!(panel.volume_indicator_rect(output_width).is_none());
+
+        panel.set_system_status(SystemStatus {
+            network: NetworkStatus::Wired,
+            battery: Some(BatteryStatus {
+                icon_name: "battery-level-90-symbolic".to_string(),
+                percentage: 90.,
+            }),
+            ..Default::default()
+        });
+        panel.set_audio(Some(AudioStatus {
+            volume: 0.5,
+            muted: false,
+        }));
+
+        // The cluster is network, volume, battery: the volume box must sit strictly between the
+        // other two icons, and inside the cluster.
+        let cluster = panel.quick_settings_rect(output_width);
+        let rect = panel.volume_indicator_rect(output_width).unwrap();
+        assert!(
+            cluster.loc.x <= rect.loc.x
+                && rect.loc.x + rect.size.w <= cluster.loc.x + cluster.size.w,
+            "the volume box must be inside the cluster: {rect:?} vs {cluster:?}"
+        );
+        assert_eq!(
+            rect.size.h, PANEL_HEIGHT,
+            "an indicator is as tall as the bar"
+        );
+
+        // The icon centres either side of it -- the neighbours -- are NOT in the box.
+        let centre = |i: usize| Point::from((qs_icon_x(cluster.loc.x, i) + QS_ICON / 2., 10.));
+        assert!(
+            rect.contains(centre(1)),
+            "the volume icon is the second of three"
+        );
+        assert!(
+            !rect.contains(centre(0)),
+            "the network icon must not scroll volume"
+        );
+        assert!(
+            !rect.contains(centre(2)),
+            "the battery icon must not scroll volume"
+        );
+
+        // It tracks the icon set: muting swaps the glyph but keeps the same slot, while dropping
+        // the battery leaves the volume icon last and moves its box.
+        panel.set_audio(Some(AudioStatus {
+            volume: 0.,
+            muted: true,
+        }));
+        assert_eq!(panel.volume_indicator_rect(output_width), Some(rect));
+        panel.set_system_status(SystemStatus {
+            network: NetworkStatus::Wired,
+            ..Default::default()
+        });
+        let moved = panel.volume_indicator_rect(output_width).unwrap();
+        assert_ne!(moved, rect, "a shorter cluster re-places the volume icon");
     }
 
     /// The indicator button widens as workspaces are added (structural — no GPU).

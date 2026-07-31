@@ -12415,3 +12415,168 @@ fn media_card_controls_drive_the_player() {
     f.settle_animations();
     assert!(!f.niri().panel_popover.is_open());
 }
+
+/// Only the VOLUME icon takes the scroll. gnome-shell connects `scroll-event` to that one
+/// indicator's actor (`js/ui/status/volume.js:434-437,470-472`), so its neighbours in the status
+/// cluster have no scroll behavior and a wheel notch over them falls through to whatever else
+/// wants it — here, a plain wheel bind.
+#[test]
+fn only_the_volume_icon_consumes_a_panel_scroll() {
+    use niri_config::binds::{Bind, Binds, Key, Modifiers, Trigger};
+
+    let mut config = Config::default();
+    // A no-modifier wheel bind, so "was the event consumed?" is observable without PipeWire.
+    let bind = |trigger, action| Bind {
+        key: Key {
+            trigger,
+            modifiers: Modifiers::empty(),
+        },
+        action,
+        repeat: true,
+        cooldown: None,
+        allow_when_locked: false,
+        allow_inhibiting: true,
+        hotkey_overlay_title: None,
+    };
+    config.binds = Binds(vec![
+        bind(Trigger::WheelScrollDown, Action::FocusWorkspaceDown),
+        // Up, so it is observable from where the wheel bind leaves us: with one window there are
+        // only two workspaces, and workspace 1 is the last.
+        bind(Trigger::TouchpadScrollDown, Action::FocusWorkspaceUp),
+    ]);
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    // Two workspaces to move between, and a volume icon in the cluster to aim at.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.niri_state()
+        .on_audio_status(Some(crate::audio::AudioStatus {
+            volume: 0.5,
+            muted: false,
+        }));
+    let active = |f: &mut Fixture| {
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    assert_eq!(active(&mut f), 0);
+
+    let volume = f.niri().panel.volume_indicator_rect(1920.).unwrap();
+    let centre_x = volume.loc.x + volume.size.w / 2.;
+
+    // Over the volume icon: consumed, so the bind never runs. (Changing the volume itself needs a
+    // PipeWire connection, which a headless fixture has none of -- see the OSD test below.)
+    pointer_motion_to(&mut f, centre_x, 10.);
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        active(&mut f),
+        0,
+        "a scroll over the volume icon belongs to the volume, not to the wheel bind"
+    );
+
+    // Just outside it -- still on the panel, still on the status cluster -- the bind fires.
+    pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        active(&mut f),
+        1,
+        "the icons beside the volume one have no scroll behavior of their own"
+    );
+
+    // A TOUCHPAD scroll over the icon is the volume's too: GNOME's SMOOTH branch turns the delta
+    // into fractional steps (`volume.js:452-458`), where ours used to ignore anything but a wheel.
+    pointer_motion_to(&mut f, centre_x, 10.);
+    f.scroll_finger(0., 120.);
+    f.niri_complete_animations();
+    assert_eq!(
+        active(&mut f),
+        1,
+        "a touchpad scroll over the volume icon must be consumed too"
+    );
+
+    // ... and off the icon it reaches the touchpad bind, proving the fixture's finger scroll does
+    // fire it and the assertion above is not vacuous.
+    pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
+    f.scroll_finger(0., 120.);
+    f.niri_complete_animations();
+    assert_eq!(active(&mut f), 0, "off the icon, the touchpad bind runs");
+}
+
+/// What a scroll over the indicator decides to do, which is the half of the handler that does not
+/// need a PipeWire connection. GNOME's `if (item.mapped || item.slider.step(nSteps))
+/// item.showOSD()` (`js/ui/status/volume.js:457`) short-circuits on `mapped`: with the
+/// quick-settings menu open its slider is on screen, so the scroll reports the volume instead of
+/// changing it.
+#[test]
+fn a_scroll_with_the_quick_settings_open_reports_instead_of_stepping() {
+    use crate::input::{volume_scroll_action, VolumeScroll};
+
+    // Menu closed: a filled notch steps, an unfilled one does nothing at all.
+    assert_eq!(volume_scroll_action(false, 1.), VolumeScroll::Step(1.));
+    assert_eq!(
+        volume_scroll_action(false, -0.25),
+        VolumeScroll::Step(-0.25)
+    );
+    assert_eq!(volume_scroll_action(false, 0.), VolumeScroll::Ignore);
+
+    // Menu open: never a step, and the OSD comes up even for a scroll too small to have moved
+    // anything -- `mapped` short-circuits before `step()` is ever called.
+    assert_eq!(volume_scroll_action(true, 1.), VolumeScroll::OsdOnly);
+    assert_eq!(volume_scroll_action(true, 0.), VolumeScroll::OsdOnly);
+}
+
+/// `StreamSlider.showOSD` (`js/ui/status/volume.js:284-289`): a volume change made from the panel
+/// shows the level bar on EVERY monitor, with no label and the icon the indicator itself shows.
+/// The quick-settings drag deliberately shows none — the slider is on screen to speak for itself.
+#[test]
+fn a_panel_volume_change_shows_the_osd_everywhere() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let one = f.niri_output(1);
+    let two = f.niri_output(2);
+
+    f.niri_state().show_volume_osd(&crate::audio::AudioStatus {
+        volume: 0.5,
+        muted: false,
+    });
+    let content = f.niri().osd.content(&one).expect("output 1 shows the OSD");
+    assert_eq!(content.icon, vec!["audio-volume-medium-symbolic"]);
+    assert_eq!(content.label, None);
+    assert_eq!(content.level, Some(0.5));
+    assert_eq!(
+        content.max_level,
+        crate::audio::MAX_VOLUME,
+        "the bar is scaled to the volume ceiling, not to 1.0 by accident"
+    );
+    assert!(
+        f.niri().osd.content(&two).is_some(),
+        "showAll, not showOne: every monitor gets it"
+    );
+
+    // Muting swaps the glyph, as the indicator's own icon does.
+    f.niri_state().show_volume_osd(&crate::audio::AudioStatus {
+        volume: 0.5,
+        muted: true,
+    });
+    assert_eq!(
+        f.niri().osd.content(&one).unwrap().icon,
+        vec!["audio-volume-muted-symbolic"]
+    );
+
+    // The QS slider path is silent: it goes through `apply_popover_action`, which never asks for
+    // an OSD.
+    f.niri().osd.hide_all();
+    f.settle_animations();
+    f.niri_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::SetVolume(0.8));
+    assert!(
+        !f.niri().osd.is_visible(),
+        "dragging the visible slider must not also raise an OSD"
+    );
+}
