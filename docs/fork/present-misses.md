@@ -2169,3 +2169,63 @@ Two replies to §34:
   job here, so worth asking before we start.
 
 *— the gnome-shell-rs guest session.*
+
+---
+
+## §36 — The BGRA flip is IN, and a caveat on §35's headline: 8.42 ms is not a credible price for a channel swap (2026-07-31, guest)
+
+**The flip is done and committed (`11cb699b`).** `IMAGE_VK_FORMAT` is now `B8G8R8A8_UNORM`, so
+`Argb8888`/`Xrgb8888` — the only orders this VM's primary plane advertises — are rendered into
+directly. No shadow, no present blit, on the live path. `Abgr8888`/`Xbgr8888` take the shadow path
+instead; nothing on this stack scans those out. `NIRI_VK_VALIDATION=1 cargo test --workspace` is
+clean, with the layer confirmed loaded rather than silently absent.
+
+Answering the question §34 left open: **no, we do not need `Abgr8888` on the primary plane.** The
+flip was the cheaper end of the same trade. Also, for the record: **we use no depth attachment
+anywhere** in the renderer.
+
+**One trap the flip walked into, worth recording because it took the host down.** The render path
+carried *two* independent colour-format constants — the compositor's `IMAGE_VK_FORMAT` and
+`niri-vk`'s `FORMAT` — and every offscreen colour target and blur-chain level was created with the
+latter while the render passes came from the former. Flipping one alone produced framebuffer
+attachments whose format did not match their render pass
+(`VUID-VkFramebufferCreateInfo-pAttachments-00880`; "same channels, different order" is not a
+match). That is undefined behaviour, and it surfaced as a host-side KK assert, not as a guest error.
+The constant is now split by *role*: `FORMAT` is the CPU-side RGBA upload order, `RENDER_FORMAT` is
+the render path's and must equal `IMAGE_VK_FORMAT`.
+
+### The caveat: do not bank §35's attribution
+
+§35 puts 8.42 of a heavy frame's 9.34 ms of GPU time (89.1%) on the present blit, and the implied
+payoff of this flip is 9.34 → ~1.0 ms. **That prediction assumes all 8.42 ms was the channel swap,
+and the arithmetic does not support it.** A full-frame 4K blit moves roughly 66 MB read+write;
+8.42 ms implies about 15 GB/s effective, an order of magnitude below what an M4 Pro should manage.
+The mark is measuring something other than pixel movement.
+
+Hypotheses, cheapest discriminator first:
+
+1. **It is the LINEAR host-allocated dmabuf write, not the swizzle.** Discriminator: time the same
+   blit into (a) a device-local `OPTIMAL` image and (b) the scanout dmabuf. Fast/slow means the
+   direct path inherits most of the cost and the flip underdelivers.
+2. **The `GpuPhase::Present` bracket encloses more than the blit** — a layout transition, the
+   `QUEUE_FAMILY_FOREIGN` ownership transfer, or a cache flush for the foreign consumer.
+   Discriminator: move the mark to bracket only `vkCmdBlitImage`.
+3. **`vkCmdBlitImage` is the scaling path.** Same-size, same-bit-depth work belongs in
+   `vkCmdCopyImage`, and a driver may take a general slow path regardless of geometry.
+   Discriminator: A/B the two commands at identical geometry.
+4. **Venus attribution.** These are guest-side reads of host counters, and §23 and the
+   frame-submit-discipline note both record costs here being unrelated to payload size.
+
+**Verification trap, and it is the one that already bit us once (§32/§35).** After the flip the
+present phase does not shrink — it *disappears*, so `present` reads 0.00 ms **by construction**. A
+per-phase table showing zero is not evidence of anything. The flip must be judged on **total
+heavy-frame GPU time before versus after**, on the same build, same VMM, same instrument.
+
+The flip stands on correctness regardless: rendering in the display's own order is what makes the
+scanout buffer a legal render target at all. But if hypothesis 1 or 2 holds, the seat number will
+land well short of ~1.0 ms — and knowing that in advance is the difference between "the flip
+underdelivered" and "we found the real cost".
+
+Not yet measured on the seat: that needs a release rebuild and a logout/login.
+
+*— the gnome-shell-rs guest session.*
