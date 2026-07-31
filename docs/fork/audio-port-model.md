@@ -1,0 +1,207 @@
+# Port-level audio model — scope + plan
+
+Status: **plan only, no code** (agreed 2026-07-31). This is item 3 of what was left of slice F in
+`docs/fork/osd-media-port.md`.
+
+References read for this plan (gnome-shell 50.3 checkout, `~/Projects/gnome-shell`):
+`js/ui/status/volume.js`, `subprojects/gvc/gvc-mixer-control.c`,
+`subprojects/gvc/gvc-mixer-ui-device.{c,h}`.
+
+## 1. Where we are
+
+Our audio model is **sink/source-level**:
+
+- `AudioStatus { volume, muted }` (`src/audio.rs:25-30`), `MicStatus` (`src/audio.rs:46-63`).
+- `SinkInfo { name, description }` / `SourceInfo` (`src/audio.rs:93-125`), where `name` is the
+  PipeWire `node.name` and doubles as the key we write to `default.configured.audio.sink`.
+- `src/pipewire_audio.rs` tracks `Audio/Sink` and `Audio/Source*` **nodes** and the `default`
+  metadata. It contains no concept of a port: grep for "port" → 0 hits. It never binds an
+  `ObjectType::Device`.
+- The QS pickers render one row per node, label = `description`, no icon
+  (`src/ui/quick_settings.rs:631-653` and `:669-694`, `icons: Vec::new()`).
+
+## 2. What GNOME actually does
+
+GNOME's list is **port-level**, built by gvc, not stream-level:
+
+- `create_ui_device_from_port` (`gvc-mixer-control.c:1973-2006`) makes one `GvcMixerUIDevice` per
+  **card port**, with `description` = the port's human description ("Headphones"), `origin` = the
+  card name ("Built-in Audio"), `port-available` = `port->available != PA_PORT_AVAILABLE_NO`.
+- Ports that are unavailable are not offered: `output-added` / `output-removed` are emitted purely
+  off the availability flip (`gvc-mixer-control.c:2019-2047`), so unplugging headphones *removes*
+  the row rather than leaving a dead one.
+- Streams with no ports still get a device, via a fallback in `sync_devices`
+  (`gvc-mixer-control.c:1354-1377`): `description` = the stream description, `origin` = `""`,
+  `port-available` = TRUE. This is what keeps a null sink or a portless bluetooth sink listed.
+- The shell renders `description – origin` when `origin` is non-empty, else `description`, as a
+  `PopupImageMenuItem` carrying `device.get_gicon()` (`volume.js:126-137`). The icon is the
+  device's `icon_name`, falling back to the **card's** icon (`gvc-mixer-ui-device.c:632-643`).
+- The menu is only enabled with **more than one** device (`volume.js:171-175`,
+  `menuEnabled = this._deviceItems.size > 1`) — which we already mirror per-list
+  (`src/ui/quick_settings.rs:1486-1489`).
+
+And the headphone behaviour hangs off the *active* port of the current sink:
+
+```js
+_findHeadphones(sink) {                                    // volume.js:332-345
+    if (sink.get_form_factor() === 'headset' ||
+        sink.get_form_factor() === 'headphone')
+        return true;
+    if (sink.get_ports().length > 0)
+        return sink.get_port().port.toLowerCase().includes('headphone');
+    return false;
+}
+
+_portChanged() {                                           // volume.js:347-358
+    const hasHeadphones = this._findHeadphones(this._stream);
+    if (hasHeadphones === this._hasHeadphones)
+        return;
+    const initializing = this._hasHeadphones === undefined;
+    this._hasHeadphones = hasHeadphones;
+    this._updateIcon();
+    if (!initializing)
+        this.showOSD();
+}
+```
+
+Three details worth pinning, because all three are easy to get wrong:
+
+1. **The OSD is suppressed on the first sync only** — `initializing` is `_hasHeadphones ===
+   undefined`, i.e. exactly once per shell lifetime, *not* once per stream.
+2. **`_hasHeadphones` is not reset when the default sink changes.** `_connectStream` calls
+   `_portChanged()` (`volume.js:315-322`), so switching the default from a headphone sink to a
+   speaker sink is a change and **does** show the OSD.
+3. **The headphone glyph beats the level glyph, including muted** — `_updateIcon` is
+   `hasHeadphones ? 'audio-headphones-symbolic' : this.getIcon()` (`volume.js:359-363`), and
+   `getIcon()` is the only thing that consults mute.
+
+## 3. Divergences this closes
+
+| # | Divergence | Recorded at |
+|---|---|---|
+| D1 | No headphone-plug OSD, and the indicator never becomes `audio-headphones-symbolic` | new |
+| D2 | Device lists are node-level, not port-level — a multi-port card shows one row where GNOME shows "Speakers" and "Headphones" | `src/audio.rs:92-93`, `docs/fork/panel-status-port.md` Q3 |
+| D3 | Device rows carry no icon and no ` – origin` suffix | new, found writing this plan |
+
+## 4. The PipeWire mapping
+
+gvc's card/port pair maps onto PipeWire's **Device** object and its route params. Everything needed
+exists in the crates we already have (`pipewire` 0.9.2):
+
+- `pipewire::device::Device` is a bindable proxy with `subscribe_params` / a `param` listener /
+  `set_param` (`device.rs:17-81`), the same shape `bind_default` already uses for nodes.
+- `ParamType::EnumRoute` / `ParamType::Route` exist (`libspa-0.9.2/src/param/mod.rs:44-47`).
+- The route object fields are all in the generated bindings: `SPA_PARAM_ROUTE_{index, direction,
+  device, name, description, priority, available, profiles, props, devices, profile, save}`, and
+  `SPA_PARAM_AVAILABILITY_{unknown, no, yes}`.
+
+So: `EnumRoute` enumerates every port on the card (gvc's port list), `Route` reports the **active**
+route per direction, and writing `Route` selects one (what `wpctl set-route` / pavucontrol do).
+
+**Join key — the one thing this plan does not know.** To attribute an active route to the default
+*sink node* we need the node→device link, which is conventionally the node props `device.id` (the
+Device global id, `PW_KEY_DEVICE_ID`, `/usr/include/pipewire-0.3/pipewire/keys.h:271`) plus
+`card.profile.device` (the SPA device index inside the card, matched against
+`SPA_PARAM_ROUTE_device`). `card.profile.device` is a WirePlumber/pipewire-pulse convention and is
+**not** in the installed spa headers, so it must be confirmed against a real card before slice 2 is
+written — see §7.
+
+`device.form_factor` (gvc's `sink.get_form_factor()`) rides on the node props and can be captured in
+`on_global` exactly like `node.description` is today.
+
+## 5. Slices
+
+### Slice 0 — the audio seam (do this first)
+
+`Niri::pw_audio` is a concrete `Option<PwAudio>` behind `#[cfg(feature = "pipewire")]`
+(`src/niri.rs:549-551`), so a headless fixture has no audio at all and **nothing** about the audio
+wiring is testable. The gap is already recorded and real: deleting the `show_volume_osd` call inside
+`adjust_volume_by_scroll` leaves the whole suite green.
+
+- Introduce `trait AudioBackend` in `src/audio.rs` (unconditional, no PipeWire types in the
+  signature) covering the surface the compositor actually calls today: `status`, `mic_status`,
+  `set_volume`, `adjust_volume`, `set_muted`, `toggle_muted`, `set_input_volume`, `set_input_muted`,
+  `toggle_input_muted`, `set_default_sink`, `set_default_source`.
+- `PwAudio` implements it; `Niri::audio_backend: Option<Box<dyn AudioBackend>>` replaces the cfg'd
+  field, which deletes the six `#[cfg(feature = "pipewire")]` arms and the
+  `#[cfg(not(feature = "pipewire"))]` catch-all in `src/input/mod.rs:1204-1266`.
+- Add a `StubAudio` for the fixture: holds an `AudioStatus`/`MicStatus`, records writes, and lets a
+  test *drive* the real entry points (`State::on_audio_status`, `on_sink_list`, …) — per
+  "test the code, not a reimplementation", the seam goes at the real entry point.
+- **Pins immediately, before any new behaviour:** panel scroll → volume step → OSD; QS slider →
+  `set_volume`; picker row → `set_default_sink`; the mic slider's visibility rule.
+
+Small and mechanical, and it is the difference between slices 2–3 landing tested or landing blind.
+
+### Slice 1 — Device + route watcher (read-only)
+
+- Track `ObjectType::Device` globals whose `media.class` starts with `Audio/`; capture
+  `device.description`, `device.icon-name`, and the id, the same way sinks are captured today.
+- Bind each and `subscribe_params(&[ParamType::EnumRoute, ParamType::Route])`.
+- Parse routes into a plain model in `src/audio.rs` (no PipeWire types), e.g.
+  `CardPort { card_id, index, device, direction, name, description, priority, available }` plus the
+  active `(direction, device) -> index` map per card.
+- Capture `device.form_factor` on sink nodes in `on_global`.
+- Publish on change with the same dirty/last dedup shape as `publish_sinks`.
+- Tests: the pod→model parse is a pure function over a serialized `Route`/`EnumRoute` object, so it
+  unit-tests without PipeWire (build the pod with `PodSerializer`, same trick as
+  `sink_default_json_round_trips_through_the_parser`).
+
+### Slice 2 — headphones: icon + OSD (the user-visible payoff)
+
+- `audio::has_headphones(form_factor: Option<&str>, active_port: Option<&str>) -> bool` — a direct,
+  pure port of `_findHeadphones`, with its "no ports at all → false" branch.
+- `AudioStatus` gains `headphones: bool`, so `volume_icon` stays a pure function of the status and
+  both the panel and the QS slider pick it up for free. `volume_icon` returns
+  `audio-headphones-symbolic` **before** the mute check (detail 3 above).
+- Port-change OSD with the initial-sync suppression: the watcher keeps `Option<bool>`, and emits an
+  OSD request only when the previous value is `Some(_)` and differs — never reset across a
+  default-sink change (detail 2). Return it as data the way `BrightnessUpdate` carries `OsdRequest`
+  (`src/brightness.rs`), rather than reaching into the OSD manager from the algebra; the compositor
+  side reuses `show_volume_osd` / `osd.show_all`.
+- Tests (now possible because of slice 0): plug headphones → icon flips and an OSD appears; the
+  *first* sync flips the icon and shows **no** OSD; muted + headphones still shows the headphone
+  glyph; default-sink swap from a headphone sink to a speaker sink shows an OSD.
+
+### Slice 3 — port-level device lists
+
+- Replace `SinkInfo`/`SourceInfo` with a shared `AudioDevice { key, description, origin, icon,
+  available }`, keyed by `(card global id, direction, route index)` for port-backed devices and by
+  `node.name` for the portless fallback.
+- Build the list from ports, filtering `available == SPA_PARAM_AVAILABILITY_no` out
+  (`gvc-mixer-control.c:1973,1995`), and add the portless-stream fallback (`:1354-1377`) so a null
+  sink or a portless bluetooth sink stays listed.
+- Row label `description – origin` (en dash, `volume.js:130-133`); row icon from the device icon
+  falling back to the card icon (`gvc-mixer-ui-device.c:632-643`) into the existing `ItemRow.icons`.
+  Closes D3.
+- Activation writes the `Route` param to select the port, then sets the default node.
+  **Explicitly out of scope: card-profile switching.** gvc will swap a card's profile to reach a
+  port (`profile_swapping_device_id`, `gvc-mixer-control.c:1590-1600`); we will select routes within
+  the current profile only, and note the gap. Choosing e.g. bluetooth HSP from HFP will not work
+  until a follow-up.
+
+## 6. Risk: this cannot be live-validated here
+
+`pw-dump` on this VM lists exactly one audio node — `auto_null`, with no `device.id`, no
+`card.profile.device`, no form factor — and no `Audio/Device` object at all. There is no card to
+enumerate routes from, so:
+
+- slice 1's route parsing cannot be checked against real data here;
+- slice 2 cannot be exercised end to end (nothing to plug in);
+- slice 3's list will render one fallback row, exactly as it does today.
+
+Consequences for the plan: the pod-parsing must be unit-tested against **hand-built pods** rather
+than trusted from a live read, and the whole port model goes on the pending-live-validation list to
+be run on hardware with a real card (a laptop with a headphone jack is the ideal check — it exercises
+availability flips, the OSD, and the icon in one gesture).
+
+## 7. Open questions to settle before slice 2
+
+1. Confirm `card.profile.device` on sink nodes and its correspondence to `SPA_PARAM_ROUTE_device` on
+   a machine with a real card. If it is absent, fall back to joining on `device.id` alone and taking
+   the single active output route.
+2. Do we want per-port volume? PulseAudio stores volume per port, and PipeWire exposes it in
+   `SPA_PARAM_ROUTE_props`. Proposal: **no** — the node `Props` stay the single volume authority;
+   the node echo will report whatever the port switch did to the volume.
+3. `MAX_DEVICE_ROWS` (`src/ui/quick_settings.rs`) becomes more likely to bite once rows are
+   per-port rather than per-card. Worth re-checking the cap against GNOME (which has none).
