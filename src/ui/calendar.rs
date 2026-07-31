@@ -72,18 +72,51 @@ use crate::ui::theme_node::{Edges, ThemeNode};
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
-// Geometry, logical px (grounded in gnome-shell-sass `_calendar.scss` proportions).
-const PAD: f64 = 8.;
-const HEADER_H: f64 = 36.;
-const WEEKDAY_H: f64 = 22.;
-/// Day-cell pitch. GNOME's `.calendar-day` is `3em` (`_calendar.scss:75-76`), which renders as
-/// ~44px at the 11pt base em — measured 43px logical against a real 50.1 popover (ours was a
-/// cramped 34). `em(3.0)` tracks the base font so the grid can't drift from it.
-fn cell() -> f64 {
-    crate::ui::em(3.0)
+// Geometry, logical px. Derived from `_calendar.scss` and pinned against a mapped actor dump of
+// a live GNOME 50.3 date menu at the default font — see `calendar_matches_the_live_shell`.
+//
+// What this column *is*, in GNOME: two sibling cards inside `.datemenu-calendar-column`, each
+// with its own 1px border and `$base_margin`, separated by the column's `spacing`. We bake both
+// into one texture, so every offset below has to reproduce that two-box structure by hand.
+
+/// `%card`/`%card_flat` margin (`$base_margin`, `_common.scss:141`) — column edge to card box.
+const CARD_MARGIN: f64 = 4.;
+/// `.datemenu-calendar-column { spacing: $base_padding }` (`_calendar.scss:14`).
+const COLUMN_SPACING: f64 = 6.;
+/// The `%card` border: 1px of `$card_shadow_border_color`, which is **transparent** in the dark
+/// theme. Never drawn, always reserved — St is border-box. See `display_card_node`.
+const CARD_BORDER: f64 = 1.;
+
+/// `.calendar-month-header`'s height, set by its `.pager-button { height: 2.6em }`
+/// (`_calendar.scss:65-69`) — taller than the month label, so it wins. Rounded because St
+/// allocates in whole logical px; 38 live.
+fn header_h() -> f64 {
+    crate::ui::em(2.6).round()
 }
-/// Week-number column width, scaled with the cell (only shown when week numbers are enabled).
-const WEEKCOL_W: f64 = 34.;
+
+/// The weekday-initials band: a `.calendar-day-heading` line box plus its `padding: 3px 6px` and
+/// `margin: 4px` (`_calendar.scss`). 15 + 6 + 8 = 29 live.
+fn weekday_h() -> f64 {
+    crate::ui::line_height_px(WEEKDAY_PT) + 2. * DAY_HEADING_PAD_V + 2. * DAY_HEADING_MARGIN
+}
+const DAY_HEADING_PAD_V: f64 = 3.;
+const DAY_HEADING_MARGIN: f64 = 4.;
+
+/// Day-cell pitch: `.calendar-day` is `3em` **of its own `%smaller` 9pt font**
+/// (`_calendar.scss:75`, `_common.scss:281-284`), plus its `margin: 2px`. 36 + 4 = 40 live.
+///
+/// This was `em(3.0)` against the *base* 11pt font, giving 44 — the same "right rule, wrong
+/// specificity" trap as `.quick-settings .icon-button`. An `em` is only meaningful with the font it
+/// is resolved against, and a day cell is not set in the base font.
+fn cell() -> f64 {
+    3. * crate::ui::pt_to_px(WEEKDAY_PT) + 2. * DAY_MARGIN
+}
+const DAY_MARGIN: f64 = 2.;
+
+/// Week-number column width (only shown when week numbers are enabled): the
+/// `.calendar-week-number` label plus its `padding: 0 6px` and `margin: 6px`. Measured 39 live
+/// (27 + 12); the label itself is content-derived from a two-digit week at 9pt.
+const WEEKCOL_W: f64 = 39.;
 const GRID_ROWS: usize = 6;
 const GRID_COLS: usize = 7;
 
@@ -160,11 +193,23 @@ fn day_row() -> f64 {
 fn date_row() -> f64 {
     crate::ui::line_height_px(DATE_LABEL_PT)
 }
-fn today_card_h() -> f64 {
-    TODAY_PAD + day_row() + date_row() + TODAY_PAD
+/// `.datemenu-today-button` is `%card_flat` with `padding: $base_padding * 1.5`
+/// (`_calendar.scss:23-25`) — so it reserves the same transparent 1px border every card does.
+fn today_card_node() -> ThemeNode {
+    ThemeNode {
+        padding: Edges::uniform(TODAY_PAD),
+        border: Edges::uniform(CARD_BORDER),
+        border_radius: TODAY_RADIUS,
+        ..ThemeNode::EMPTY
+    }
 }
-/// Gap between the today card and the month-nav header below it.
-const TODAY_GAP: f64 = 6.;
+
+/// 64 live: 1 + 9 + 19 + 25 + 9 + 1.
+fn today_card_h() -> f64 {
+    today_card_node()
+        .allocation_for(Size::from((0., day_row() + date_row())))
+        .h
+}
 const TODAY_RADIUS: f64 = 12.;
 /// `.day-label` (weekday name) and `.date-label` (full date) point sizes. GNOME's date label is
 /// heavier (800) but the rasterizer tops out at bold (700); both draw bold here.
@@ -256,11 +301,9 @@ impl Calendar {
         self.selected
     }
 
-    /// The calendar's logical size (depends only on whether the week column shows).
+    /// The calendar column's logical size (depends only on whether the week column shows).
     pub fn logical_size(&self) -> Size<f64, Logical> {
-        let w = grid_left(self.show_week_numbers) + GRID_COLS as f64 * cell() + PAD;
-        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD;
-        Size::from((w, h))
+        Layout::new(self.show_week_numbers).bounds().size
     }
 
     /// Step the displayed month by `delta` (keeping the selection where it is).
@@ -449,48 +492,89 @@ impl Layout {
         }
     }
 
+    /// The whole column: both card boxes plus their margins. 329x391 live.
     fn bounds(&self) -> Rectangle<f64, Logical> {
-        let w = grid_left(self.week) + GRID_COLS as f64 * cell() + PAD;
-        let h = grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD;
+        let card = self.calendar_card();
+        let w = card.size.w + 2. * CARD_MARGIN;
+        let h = card.loc.y + card.size.h + CARD_MARGIN;
         Rectangle::new(Point::from((0., 0.)), Size::from((w, h)))
     }
 
-    /// The today-header card, spanning the full inner width above the month-nav header.
+    /// The `.datemenu-today-button` card box, inset from the column by its margin. 321x64 live.
     fn today_button(&self) -> Rectangle<f64, Logical> {
-        let w = self.bounds().size.w - 2. * PAD;
-        Rectangle::new(Point::from((PAD, PAD)), Size::from((w, today_card_h())))
-    }
-
-    fn prev_arrow(&self) -> Rectangle<f64, Logical> {
         Rectangle::new(
-            Point::from((PAD, grid_top())),
-            Size::from((HEADER_H, HEADER_H)),
+            Point::from((CARD_MARGIN, CARD_MARGIN)),
+            Size::from((self.calendar_card().size.w, today_card_h())),
         )
     }
 
-    fn next_arrow(&self) -> Rectangle<f64, Logical> {
-        let x = self.bounds().size.w - PAD - HEADER_H;
+    /// The `.calendar` card box — the *bordered* box, not its content. 321x309 live.
+    ///
+    /// Its top is the today card's box plus that card's bottom margin plus the column spacing;
+    /// `.calendar` itself has `margin-top: 0` (`_calendar.scss:40`), which is why the gap is 10
+    /// and not 14.
+    fn calendar_card(&self) -> Rectangle<f64, Logical> {
+        let inner_w = self.weekcol_w() + GRID_COLS as f64 * cell();
+        let inner_h = header_h() + weekday_h() + GRID_ROWS as f64 * cell();
+        let top = CARD_MARGIN + today_card_h() + CARD_MARGIN + COLUMN_SPACING;
         Rectangle::new(
-            Point::from((x, grid_top())),
-            Size::from((HEADER_H, HEADER_H)),
+            Point::from((CARD_MARGIN, top)),
+            Size::from((inner_w + 2. * CARD_BORDER, inner_h + 2. * CARD_BORDER)),
+        )
+    }
+
+    /// The `.calendar` card's content box — inside the reserved border. `.calendar` has
+    /// `padding: 0` (`_calendar.scss:41`), so the border is the whole inset.
+    fn calendar_content(&self) -> Rectangle<f64, Logical> {
+        calendar_card_node().content_box(self.calendar_card())
+    }
+
+    fn weekcol_w(&self) -> f64 {
+        if self.week {
+            WEEKCOL_W
+        } else {
+            0.
+        }
+    }
+
+    fn prev_arrow(&self) -> Rectangle<f64, Logical> {
+        let content = self.calendar_content();
+        Rectangle::new(content.loc, Size::from((header_h(), header_h())))
+    }
+
+    fn next_arrow(&self) -> Rectangle<f64, Logical> {
+        let content = self.calendar_content();
+        let x = content.loc.x + content.size.w - header_h();
+        Rectangle::new(
+            Point::from((x, content.loc.y)),
+            Size::from((header_h(), header_h())),
         )
     }
 
     fn cell(&self, row: usize, col: usize) -> Rectangle<f64, Logical> {
-        let x = grid_left(self.week) + col as f64 * cell();
-        let y = grid_top() + HEADER_H + WEEKDAY_H + row as f64 * cell();
+        let x = self.grid_left() + col as f64 * cell();
+        let y = self.grid_top() + row as f64 * cell();
         Rectangle::new(Point::from((x, y)), Size::from((cell(), cell())))
+    }
+
+    /// Left edge of the day columns: inside the card's border, past the week column.
+    fn grid_left(&self) -> f64 {
+        self.calendar_content().loc.x + self.weekcol_w()
+    }
+
+    /// Top edge of the day rows: inside the card's border, below the header and weekday band.
+    fn grid_top(&self) -> f64 {
+        self.calendar_content().loc.y + header_h() + weekday_h()
     }
 }
 
-fn grid_left(show_week_numbers: bool) -> f64 {
-    PAD + if show_week_numbers { WEEKCOL_W } else { 0. }
-}
-
-/// Top y (logical px) of the month-nav header, below the today card. Everything under the header
-/// (arrows, weekday row, day grid) is offset by this instead of the bare leading `PAD`.
-fn grid_top() -> f64 {
-    PAD + today_card_h() + TODAY_GAP
+/// `.calendar` is `%card_flat` with `padding: 0` and `margin-top: 0` (`_calendar.scss:38-41`).
+fn calendar_card_node() -> ThemeNode {
+    ThemeNode {
+        border: Edges::uniform(CARD_BORDER),
+        border_radius: TODAY_RADIUS,
+        ..ThemeNode::EMPTY
+    }
 }
 
 impl Calendar {
@@ -633,16 +717,19 @@ impl Calendar {
             if self.hovered == Some(CalHover::Today) {
                 p.fill_rounded(card, TODAY_RADIUS, HOVER_WASH)?;
             }
-            let label_x = PAD + TODAY_PAD;
+            // Inside the card's own border+padding, via `content_box` — so the labels follow the
+            // reserved border rather than being placed at a hand-added inset.
+            let today_content = today_card_node().content_box(card);
+            let label_x = today_content.loc.x;
             p.text(
                 &day_label_run,
-                Point::from((label_x, PAD + TODAY_PAD + day_row() / 2.)),
+                Point::from((label_x, today_content.loc.y + day_row() / 2.)),
                 Align::LEFT_MIDDLE,
                 MUTED,
             )?;
             p.text(
                 &date_label_run,
-                Point::from((label_x, PAD + TODAY_PAD + day_row() + date_row() / 2.)),
+                Point::from((label_x, today_content.loc.y + day_row() + date_row() / 2.)),
                 Align::LEFT_MIDDLE,
                 // GNOME's `.date-label` and `.day-label` share `$fg_color` — no per-label
                 // override (`_calendar.scss:28,33`); measured equal (~#909091) in the 50.1
@@ -665,22 +752,25 @@ impl Calendar {
             p.text(&next_run, next_c, Align::CENTER, MUTED)?;
             p.text(
                 &title_run,
-                Point::from((size.w / 2., grid_top() + HEADER_H / 2.)),
+                Point::from((
+                    size.w / 2.,
+                    layout.calendar_content().loc.y + header_h() / 2.,
+                )),
                 Align::CENTER,
                 TEXT,
             )?;
 
             // Weekday header row.
-            let wd_cy = grid_top() + HEADER_H + WEEKDAY_H / 2.;
+            let wd_cy = layout.calendar_content().loc.y + header_h() + weekday_h() / 2.;
             for (c, run) in weekday_runs.iter().enumerate() {
-                let cx = grid_left(self.show_week_numbers) + (c as f64 + 0.5) * cell();
+                let cx = layout.grid_left() + (c as f64 + 0.5) * cell();
                 p.text(run, Point::from((cx, wd_cy)), Align::CENTER, MUTED)?;
             }
 
             // Week-number column: a rounded `.calendar-week-number` pill behind each number.
             for (r, run) in week_runs.iter().enumerate() {
-                let cx = PAD + WEEKCOL_W / 2.;
-                let cy = grid_top() + HEADER_H + WEEKDAY_H + (r as f64 + 0.5) * cell();
+                let cx = layout.calendar_content().loc.x + WEEKCOL_W / 2.;
+                let cy = layout.grid_top() + (r as f64 + 0.5) * cell();
                 // `ink_bounds` is physical px; back to logical for the Painter (× scale
                 // internally).
                 let (_ix, _iy, iw, ih) = run.ink_bounds();
@@ -3794,16 +3884,54 @@ mod tests {
         assert!(cal.revision > before);
     }
 
+    /// The calendar column matches what a live GNOME 50.3 shell allocates, box for box.
+    ///
+    /// From a mapped actor dump at the default font: `.datemenu-today-button` 321x64 and
+    /// `.calendar` 321x309, each a `%card` with its own transparent 1px border and 4px margin,
+    /// separated by 10 (the today card's bottom margin plus the column's 6px spacing — `.calendar`
+    /// has `margin-top: 0`). The column that contains them is 329 wide, 391 tall.
+    ///
+    /// Ours was 358x406: the day cell was `em(3.0)` of the *base* 11pt font (44) where GNOME's
+    /// `3em` is of the cell's own 9pt font (36 + 2px margins = 40), and the header, weekday band
+    /// and week column were each short as well. Every number here is an allocation read off the
+    /// shell, not a re-derivation of our own constants — the assertion this replaced rebuilt
+    /// `logical_size` from the same constants it was checking, so it could not fail.
     #[test]
-    fn today_button_returns_to_today_only_when_off_today() {
-        // The today card adds exactly its height + gap above the grid.
-        assert_eq!(grid_top() - PAD, today_card_h() + TODAY_GAP);
-        let cal = Calendar::new(0, false, [0, 0, 0]);
+    fn calendar_matches_the_live_shell() {
+        let layout = Layout::new(true);
+
         assert_eq!(
-            cal.logical_size().h,
-            grid_top() + HEADER_H + WEEKDAY_H + GRID_ROWS as f64 * cell() + PAD
+            layout.today_button().size,
+            Size::from((321., 64.)),
+            ".datemenu-today-button is 321x64 (1 + 9 + 19 + 25 + 9 + 1 tall)"
         );
 
+        let card = layout.calendar_card();
+        assert_eq!(
+            card.size,
+            Size::from((321., 309.)),
+            ".calendar is 321x309 (1 + 38 + 29 + 6*40 + 1 tall, 1 + 39 + 7*40 + 1 wide)"
+        );
+        assert_eq!(
+            card.loc.y - (layout.today_button().loc.y + layout.today_button().size.h),
+            10.,
+            "the cards are 10 apart: the today card's 4px bottom margin plus 6px column spacing"
+        );
+
+        assert_eq!(
+            cell(),
+            40.,
+            "day-cell pitch is 3em at 9pt (36) plus 2px margins"
+        );
+        assert_eq!(
+            Calendar::new(0, true, [0, 0, 0]).logical_size(),
+            Size::from((329., 391.)),
+            "the column is both card boxes plus their margins"
+        );
+    }
+
+    #[test]
+    fn today_button_returns_to_today_only_when_off_today() {
         // A fresh calendar is already on today: clicking the card is a no-op (no revision bump).
         let mut cal = Calendar::new(0, false, [0, 0, 0]);
         cal.revision = 0;
