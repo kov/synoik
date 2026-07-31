@@ -72,6 +72,14 @@ way" vs. a capability worth keeping, ask.
   fold. The catch is the other side: anything sampling a queued resource *outside* a frame must
   drain first (`flush_pending_texture_uploads`), so each such consumer is a stall you are adding.
   Read `docs/fork/frame-submit-discipline.md` before touching this.
+- **A hazard you can describe, you can fix — do it now.** If you're about to write a comment saying
+  something is a footgun, a flake generator, or "careful, this can X", that is the moment to fix it,
+  not document it. Then check the neighbours for the same shape, because the pattern rarely has one
+  instance. If it genuinely can't be fixed here, say *why* and what would fix it — a hazard note with
+  no owner is a bug with better manners. (`dump_dir_from` was split out of the env precisely because
+  "env mutation in a parallel test binary is a flake generator", and said so in a comment — while
+  `dump_path`, one function above, kept reading the env on every call. That was a 1-in-6 suite flake
+  until `453ffe7e`, blamed on the renderer twice on the way.)
 
 ## Git
 **Hard fork (2026-07):** `main` is the only living branch (ours, to push later). We no longer
