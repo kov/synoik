@@ -143,6 +143,15 @@ function themeOf(actor) {
         height: length('height'),
         icon_size: guarded(() => node.get_icon_size()),
         background_color: guarded(() => colorOf(node.get_background_color())),
+        // Per-side, because a border can differ by edge (`.message-list` borders only its right).
+        // Without this a dump proves a border EXISTS but not what colour to draw it, which leaves
+        // the reader deriving from the stylesheet — the thing the tool exists to avoid.
+        border_color: guarded(() => [
+            colorOf(node.get_border_color(St.Side.TOP)),
+            colorOf(node.get_border_color(St.Side.RIGHT)),
+            colorOf(node.get_border_color(St.Side.BOTTOM)),
+            colorOf(node.get_border_color(St.Side.LEFT)),
+        ]),
         color: guarded(() => colorOf(node.get_foreground_color())),
         font: guarded(() => node.get_font()?.to_string() ?? null),
     };

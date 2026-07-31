@@ -86,7 +86,9 @@ and `theme` with
 - `spacing` — the theme length St hands the layout manager. **This is the one that catches people:**
   a box's `spacing` and a child's own `margin` both apply, so a gap is often the sum of two values
   that live in different rules.
-- `icon_size`, `min_width`/`min_height`, `width`/`height`, `background_color`, `color`, `font`.
+- `icon_size`, `min_width`/`min_height`, `width`/`height`, `background_color`, `border_color`
+  (per side, since a border can differ by edge — `.message-list` borders only its right), `color`,
+  `font`.
 
 Colors are emitted as `{raw: [r,g,b,a], string}` because Cogl has used both 0-255 integers and 0-1
 floats across versions — read the raw numbers rather than trusting a guess.
