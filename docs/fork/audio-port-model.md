@@ -126,7 +126,7 @@ output would vanish from the list.
 
 ## 5. Slices
 
-### Slice 0 — the audio seam (do this first)
+### Slice 0 — the audio seam — **LANDED** (`906cb2de`)
 
 `Niri::pw_audio` is a concrete `Option<PwAudio>` behind `#[cfg(feature = "pipewire")]`
 (`src/niri.rs:549-551`), so a headless fixture has no audio at all and **nothing** about the audio
@@ -147,6 +147,23 @@ wiring is testable. The gap is already recorded and real: deleting the `show_vol
   `set_volume`; picker row → `set_default_sink`; the mic slider's visibility rule.
 
 Small and mechanical, and it is the difference between slices 2–3 landing tested or landing blind.
+
+**As landed**, all of the above plus:
+
+- `Fixture::install_stub_audio(volume)` seeds the backend *through* `State::on_audio_status` rather
+  than assigning `niri.audio` — that call is also what puts the volume icon in the panel cluster, so
+  a test that sets the field directly has nothing to aim a scroll at.
+- Two new tests: `a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd` (wheel notch →
+  one `SCROLL_STEP` write → OSD; the ceiling case writes but shows nothing; with QS open it writes
+  nothing and shows the OSD) and `the_quick_settings_audio_controls_reach_the_backend` (sliders,
+  mute toggles, both pickers, and the no-source-bound path).
+- Both are **mutation-checked**, not just green: deleting the `show_volume_osd` call fails "the
+  scroll shows an OSD", and dropping the did-it-move gate fails "scrolling up at the ceiling must
+  not keep re-arming the OSD". Worth repeating for slices 2–3 — the recorded gap existed precisely
+  because a green suite proved nothing here.
+- Note the trait made `--no-default-features --features dbus,systemd` *better*, not worse: the audio
+  call sites no longer need a cfg at all. (That build still fails on two pre-existing
+  screen-recording errors unrelated to audio.)
 
 ### Slice 1 — Device + route watcher (read-only)
 
