@@ -6585,18 +6585,23 @@ impl Niri {
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
             // bar; the quick-settings menu composites several elements (chrome + icons).
-            for element in
-                self.panel_popover
-                    .render(ctx.renderer, &self.icon_cache, &self.image_cache, output)
-            {
+            for element in self.panel_popover.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.app_icon_cache,
+                &self.image_cache,
+                output,
+            ) {
                 push(element.into());
             }
             // The notification banner slides out from under the bar (pushed after
             // the panel = below it in z, like gnome-shell's tray behind the panel).
-            for element in self
-                .notification_banner
-                .render(ctx.renderer, &self.icon_cache, output)
-            {
+            for element in self.notification_banner.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.app_icon_cache,
+                output,
+            ) {
                 push(element.into());
             }
             // The overview dash (favorites) fades in with the overview — above the

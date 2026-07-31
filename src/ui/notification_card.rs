@@ -22,8 +22,9 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Point, Rectangle, Size, Transform};
 
+use crate::app_system::AppIconRef;
 use crate::notifications::{Notification, NotificationIcon, NotificationStore, Source, Urgency};
-use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
@@ -598,6 +599,13 @@ pub struct CardCache {
     /// content, these are fetched behind the content's back, so a card whose key survived a change
     /// of image must not be served the previous one.
     images: crate::ui::widget::ImageUploads,
+    /// Uploads of full-colour source icons.
+    ///
+    /// Deliberately *not* wired to the shell-wide [`widget::SharedAppIconUploads`], unlike the
+    /// dash/grid/search: that map is keyed by size, and those draw at 64 and 96 while a header
+    /// icon is 16, so there is nothing to reuse. It needs no pruning either — the key space is one
+    /// entry per notification *source*, not per notification.
+    app_icons: crate::ui::widget::SharedAppIconUploads,
 }
 
 impl CardCache {
@@ -607,6 +615,7 @@ impl CardCache {
             cards: HashMap::new(),
             pixels: HashMap::new(),
             images: HashMap::new(),
+            app_icons: Default::default(),
         }
     }
 
@@ -674,27 +683,44 @@ const SOURCE_FALLBACK: &str = "application-x-executable-symbolic";
 /// `dialog-information-symbolic.svg`). The old code then used the fallback *only* when there was
 /// no name at all, so a name that failed to resolve drew nothing and left the reserved 16px empty.
 ///
-/// **Known divergence:** St's second pass — the bare, non-symbolic name — needs full-color theme
-/// lookup (real `index.theme` inheritance and size dirs, PNG decode), which is [`AppIconCache`]'s
-/// job, not this cache's. So where GNOME shows e.g. Firefox's own logo we show the generic
-/// fallback. Closing that means threading the app-icon cache into the card; the blank is fixed
-/// either way.
-fn source_icon_name(icons: &IconCache, content: &CardContent) -> String {
+/// St's second pass — the bare, non-symbolic name — needs full-colour theme lookup (real
+/// `index.theme` inheritance, size dirs, PNG decode), which is [`AppIconCache`]'s job rather than
+/// the symbolic cache's. That is [`SourceIcon::Color`]: Firefox and Chromium ship only
+/// `firefox.png` / `chromium.png`, so before it they both landed on the executable glyph.
+enum SourceIcon {
+    /// A symbolic icon, recoloured to the header foreground.
+    Symbolic(String),
+    /// The app's own icon, in its own colours.
+    Color(AppIconRef),
+}
+
+fn source_icon(
+    icons: &IconCache,
+    app_icons: &AppIconCache,
+    content: &CardContent,
+    scale: f64,
+) -> SourceIcon {
+    let fallback = || SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned());
     let Some(NotificationIcon::Themed(name)) = &content.source_icon else {
-        return SOURCE_FALLBACK.to_owned();
+        return fallback();
     };
-    // `provides`, not a texture probe: see `IconCache::provides` — picking a candidate by whether
-    // its texture is ready would swap icons on the frame the first one finishes uploading.
+    // Both probes are `provides`, never a texture/buffer probe: a texture miss also means "queued"
+    // (`IconCache::provides`), and `AppIconCache::buffer` never misses at all — it substitutes its
+    // own full-colour fallback, which is not the symbolic one St would use here.
     if !name.ends_with("-symbolic") {
         let symbolic = format!("{name}-symbolic");
         if icons.provides(&symbolic) {
-            return symbolic;
+            return SourceIcon::Symbolic(symbolic);
         }
     }
     if icons.provides(name) {
-        return name.clone();
+        return SourceIcon::Symbolic(name.clone());
     }
-    SOURCE_FALLBACK.to_owned()
+    let themed = AppIconRef::Themed(vec![name.clone()]);
+    if app_icons.provides(&themed, SMALL_ICON, scale) {
+        return SourceIcon::Color(themed);
+    }
+    fallback()
 }
 
 /// The render elements of one card at `origin`: the (cached) card texture plus
@@ -704,6 +730,7 @@ fn source_icon_name(icons: &IconCache, content: &CardContent) -> String {
 pub fn card_elements(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
+    app_icons: &AppIconCache,
     cache: &mut CardCache,
     key: u64,
     content: &CardContent,
@@ -751,9 +778,27 @@ pub fn card_elements(
         layout.source_icon.loc.x + layout.source_icon.size.w / 2.,
         layout.source_icon.loc.y + layout.source_icon.size.h / 2.,
     ));
-    let source_name = source_icon_name(icons, content);
-    if let Some(elem) = icon_at(renderer, &source_name, SMALL_ICON, HEADER_FG, source_center) {
-        elements.push(elem);
+    match source_icon(icons, app_icons, content, scale) {
+        SourceIcon::Symbolic(name) => {
+            if let Some(elem) = icon_at(renderer, &name, SMALL_ICON, HEADER_FG, source_center) {
+                elements.push(elem);
+            }
+        }
+        SourceIcon::Color(icon) => {
+            if let Some(elem) = widget::app_icon_element(
+                renderer,
+                &mut cache.app_icons.borrow_mut(),
+                app_icons,
+                &icon,
+                SMALL_ICON,
+                scale,
+                origin,
+                source_center,
+                alpha,
+            ) {
+                elements.push(elem);
+            }
+        }
     }
 
     // Close button glyph.
@@ -1170,6 +1215,7 @@ mod live_shell_tests {
     #[test]
     fn the_source_icon_resolves_like_a_symbolic_styled_st_icon() {
         let icons = IconCache::new("Adwaita");
+        let app_icons = AppIconCache::new("Adwaita");
         let with = |icon: Option<&str>| {
             let content = CardContent {
                 id: 1,
@@ -1183,7 +1229,10 @@ mod live_shell_tests {
                 critical: false,
                 time_text: "now".into(),
             };
-            source_icon_name(&icons, &content)
+            match source_icon(&icons, &app_icons, &content, 1.) {
+                SourceIcon::Symbolic(name) => name,
+                SourceIcon::Color(icon) => format!("color:{icon:?}"),
+            }
         };
 
         // The bug: a plain name is rewritten to its symbolic variant, which is what exists.
@@ -1193,8 +1242,13 @@ mod live_shell_tests {
             with(Some("no-notifications-symbolic")),
             "no-notifications-symbolic"
         );
-        // Nothing resolves either way, and no name at all: both reach St's fallback.
+        // No symbolic either way, and nothing full-colour either: St's fallback.
         assert_eq!(with(Some("gnome-shell-rs-no-such-icon")), SOURCE_FALLBACK);
         assert_eq!(with(None), SOURCE_FALLBACK);
+
+        // Not asserted: the `SourceIcon::Color` branch. Reaching it needs a name with a
+        // non-symbolic file and NO symbolic one — `firefox` here — which is a property of the
+        // machine's installed themes, not of this code. Live-verified instead (the Firefox logo
+        // draws in the header); the deterministic half is the ordering above.
     }
 }

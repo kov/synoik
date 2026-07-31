@@ -25,7 +25,7 @@ use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock};
 use crate::image_source::ImageSource;
-use crate::render_helpers::icon::{IconCache, ImageCache};
+use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
 
 /// How far the popover slides in (logical px) as it fades open — gnome-shell's
 /// `BoxPointer` `-arrow-rise` (`$base_padding` = 6px). It emerges from `rise` above
@@ -1056,6 +1056,7 @@ impl PanelPopover {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         images: &ImageCache,
         output: &Output,
     ) -> Vec<TextureRenderElement<VkTexture>> {
@@ -1074,7 +1075,9 @@ impl PanelPopover {
         origin.y -= POPOVER_RISE * (1. - f64::from(progress));
 
         let mut elements = match self.content.as_ref() {
-            Some(PopoverContent::Calendar(dm)) => dm.render(renderer, icons, images, scale, origin),
+            Some(PopoverContent::Calendar(dm)) => {
+                dm.render(renderer, icons, app_icons, images, scale, origin)
+            }
             Some(PopoverContent::QuickSettings(qs)) => qs.render(renderer, icons, scale, origin),
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),

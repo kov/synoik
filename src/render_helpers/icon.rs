@@ -652,6 +652,10 @@ pub struct AppIconCache {
     /// Requests currently on the worker, so a miss isn't re-queued every frame.
     /// Cleared on invalidation (else a key stuck here would never re-resolve).
     in_flight: RefCell<HashSet<IconKey>>,
+    /// Memoized [`provides`](Self::provides) answers. The probe walks the theme's size
+    /// directories, so a per-frame caller (the notification header picks its icon on every
+    /// card's every render) must not repeat it. Invalidated with everything else.
+    provided: RefCell<HashMap<(AppIconRef, u16), bool>>,
     /// Request sink to the decode worker; `None` before [`spawn_worker`] (headless
     /// tests), where decoding falls back to synchronous.
     ///
@@ -667,6 +671,7 @@ impl AppIconCache {
             stale: RefCell::new(HashMap::new()),
             generation: 0,
             in_flight: RefCell::new(HashSet::new()),
+            provided: RefCell::new(HashMap::new()),
             decode_tx: None,
         }
     }
@@ -739,6 +744,7 @@ impl AppIconCache {
         let outgoing = std::mem::take(self.buffers.get_mut());
         self.stale.get_mut().extend(outgoing);
         self.in_flight.get_mut().clear();
+        self.provided.get_mut().clear();
     }
 
     /// Swap the icon theme, clearing the cache if it actually changed.
@@ -773,6 +779,26 @@ impl AppIconCache {
     /// rasterize from a shared `&`.
     pub fn buffer(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
         self.decode(icon, logical_px, scale)
+    }
+
+    /// Whether the theme provides `icon` **itself** — i.e. [`buffer`](Self::buffer) would draw it
+    /// rather than silently substituting `application-x-executable`.
+    ///
+    /// [`buffer`] never returns `None` for a missing themed name (that is the point of the
+    /// fallback), so a caller that wants to know "did this app's own icon resolve?" cannot learn
+    /// it from the buffer. The notification header needs exactly that: St tries the bare name and
+    /// only then its own *symbolic* fallback, which is a different glyph from this cache's
+    /// full-colour one.
+    ///
+    /// Memoized — the underlying probe walks the theme's size directories.
+    pub fn provides(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> bool {
+        let key = (icon.clone(), (logical_px.round() as u16).max(1));
+        if let Some(hit) = self.provided.borrow().get(&key) {
+            return *hit;
+        }
+        let found = resolve_icon(&self.theme, icon, logical_px, scale).is_some();
+        self.provided.borrow_mut().insert(key, found);
+        found
     }
 
     fn decode(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {

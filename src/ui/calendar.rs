@@ -60,7 +60,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use crate::calendar_events::CalendarEventStore;
 use crate::image_source::ImageSource;
 use crate::notifications::SourceKey;
-use crate::render_helpers::icon::{IconCache, ImageCache};
+use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1750,10 +1750,12 @@ impl CalendarMessageList {
     /// the whole content is baked into one texture and a scrolled, clipped
     /// window of it is presented, with an overlay scrollbar thumb on top
     /// (gnome-shell's `St.ScrollView`, `js/ui/calendar.js:816`).
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         images: &ImageCache,
         scale: f64,
         origin: Point<f64, Logical>,
@@ -1764,7 +1766,9 @@ impl CalendarMessageList {
             // Everything fits: place the groups directly (scroll is 0, so
             // `off_y == LIST_PAD`).
             let base = origin + Point::from((0., p.off_y));
-            return self.render_groups(renderer, icons, images, scale, base, &p.media, &p.layouts);
+            return self.render_groups(
+                renderer, icons, app_icons, images, scale, base, &p.media, &p.layouts,
+            );
         }
 
         // Overflow: bake just the visible window (a viewport-sized texture, so
@@ -1773,7 +1777,7 @@ impl CalendarMessageList {
         // topmost). On a bake failure, draw nothing — never a lone thumb over
         // an empty column.
         let mut elements = Vec::new();
-        match self.content_texture(renderer, icons, images, scale, &p) {
+        match self.content_texture(renderer, icons, app_icons, images, scale, &p) {
             Ok(tex) => {
                 if let Some(thumb) = self.scrollbar_thumb(renderer, scale, origin, &p) {
                     elements.push(thumb);
@@ -1807,6 +1811,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         images: &ImageCache,
         scale: f64,
         base: Point<f64, Logical>,
@@ -1852,6 +1857,7 @@ impl CalendarMessageList {
                     elements.extend(notification_card::card_elements(
                         renderer,
                         icons,
+                        app_icons,
                         &mut cache,
                         key(),
                         &group.cards[0],
@@ -1875,6 +1881,7 @@ impl CalendarMessageList {
                     elements.extend(notification_card::card_elements(
                         renderer,
                         icons,
+                        app_icons,
                         &mut cache,
                         key(),
                         &group.cards[0],
@@ -1924,6 +1931,7 @@ impl CalendarMessageList {
                         elements.extend(notification_card::card_elements(
                             renderer,
                             icons,
+                            app_icons,
                             &mut cache,
                             key(),
                             &group.cards[*ci],
@@ -1953,6 +1961,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         images: &ImageCache,
         scale: f64,
         p: &Placed,
@@ -1977,8 +1986,9 @@ impl CalendarMessageList {
         // Content y=scroll lands at the texture top; everything above/below the
         // window falls outside the buffer and is clipped.
         let base = Point::from((0., -p.scroll));
-        let elements =
-            self.render_groups(renderer, icons, images, scale, base, &p.media, &p.layouts);
+        let elements = self.render_groups(
+            renderer, icons, app_icons, images, scale, base, &p.media, &p.layouts,
+        );
         // `render_groups` returns FIRST = topmost (the compositor's convention,
         // `notification_card.rs:604`), but `render_to_texture` paints in
         // iteration order (first = backmost). Reverse so the bake matches what
@@ -3393,6 +3403,7 @@ impl DateMenu {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         images: &ImageCache,
         scale: f64,
         origin: Point<f64, Logical>,
@@ -3425,7 +3436,7 @@ impl DateMenu {
         } else {
             elements.extend(
                 self.list
-                    .render(renderer, icons, images, scale, origin, size.h),
+                    .render(renderer, icons, app_icons, images, scale, origin, size.h),
             );
         }
 

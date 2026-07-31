@@ -42,7 +42,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Transform};
 
 use crate::animation::{Animation, Clock};
-use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{card_elements, layout, CardCache, CardContent, CardLayout};
@@ -539,6 +539,7 @@ impl NotificationBanner {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        app_icons: &AppIconCache,
         output: &Output,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         if matches!(self.state, State::Hidden) || self.output.as_ref() != Some(output) {
@@ -573,6 +574,7 @@ impl NotificationBanner {
             card_elements(
                 renderer,
                 icons,
+                app_icons,
                 &mut cache,
                 self.revision,
                 content,

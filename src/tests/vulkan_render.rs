@@ -2411,6 +2411,7 @@ fn vulkan_renders_the_calendar_popover() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -2493,6 +2494,7 @@ fn vulkan_renders_the_message_list_card() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -2619,6 +2621,7 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
                 let elems = state.niri.panel_popover.render(
                     vk,
                     &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
                     &state.niri.image_cache,
                     &output,
                 );
@@ -2733,6 +2736,7 @@ fn vulkan_renders_the_expanded_card_body() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -2839,6 +2843,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
                 let elems = state.niri.panel_popover.render(
                     vk,
                     &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
                     &state.niri.image_cache,
                     &output,
                 );
@@ -2990,6 +2995,7 @@ fn vulkan_renders_the_scrolled_message_list() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -3109,6 +3115,7 @@ fn vulkan_renders_the_quick_settings_popover() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -3170,6 +3177,7 @@ fn vulkan_renders_the_brightness_slider() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -3229,6 +3237,7 @@ fn vulkan_renders_the_a11y_switches() {
                 let elems = state.niri.panel_popover.render(
                     vk,
                     &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
                     &state.niri.image_cache,
                     &out,
                 );
@@ -10923,6 +10932,7 @@ fn vulkan_renders_the_media_card() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
@@ -11057,6 +11067,7 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
             let elems = state.niri.panel_popover.render(
                 vk,
                 &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
                 &state.niri.image_cache,
                 &output,
             );
