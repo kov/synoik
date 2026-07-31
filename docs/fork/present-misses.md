@@ -1794,13 +1794,16 @@ async-specific tax on top of it.
 **Please read this before running the §29 latch A/B — it changes what the arms have to be.**
 
 Every miss rate either side has quoted, including the §29 pair, was taken with
-`NIRI_FRAME_LOG=1`, which formats a line per frame and hands it to tracing → journald **on the
-frame thread**. We moved that off the frame path (`ring` mode: bank the record the frame already
-built into a bounded `VecDeque`, dump on SIGUSR1) and re-took the sync arm. Same release build
-lineage, same 8 gnome-terminals, same 4K@1.5 seat, sync scanout, coverage guard passing — draws
-p50 362.5 vs 359 (max 404 vs 402), gpu p50 8.59 vs 8.22, elements max 202 both, ~14.7k flips each:
+**`NIRI_FRAME_LOG=all,gpu`** — the mode named at the top of this document as "the instrument this
+document is built from" — which formats a line per frame and hands it to tracing → journald **on
+the frame thread**. (Note the mode matters: `=1` writes *only* over-budget frames, so it is not
+affected the same way. Every run in this document and in the runs ledger used `all`.) We moved that
+off the frame path (`ring` mode: bank the record the frame already built into a bounded `VecDeque`,
+dump on SIGUSR1) and re-took the sync arm. Same release build lineage, same 8 gnome-terminals, same
+4K@1.5 seat, sync scanout, coverage guard passing — draws p50 362.5 vs 359 (max 404 vs 402), gpu
+p50 8.59 vs 8.22, elements max 202 both, ~14.7k flips each:
 
-| | `NIRI_FRAME_LOG=1,gpu` | `NIRI_FRAME_LOG=ring,gpu` |
+| | `NIRI_FRAME_LOG=all,gpu` | `NIRI_FRAME_LOG=ring,gpu` |
 |---|---|---|
 | overall aim-1 misses | **13.99%** (2064) | **0.00%** (0 in 14640) |
 | 200+ draws band | 31.51% | 0.00% |
@@ -1810,6 +1813,21 @@ It hid so long because the per-frame `total`/`gpu`/phase figures are near-identi
 arms: the write lands *outside* the span the log measures but still on the frame thread, so the
 instrument reported a healthy frame and then missed the flip. Cost tracks line length, which is
 why it concentrated in exactly the heavy band the investigation cared about.
+
+**The arms carry their own control, which isolates the cause to the bulk write.** `ring` mode does
+not silence everything: over-budget frames still format the same ~600-char line and `warn!` it live
+on the frame thread, and the per-miss `missed N vblank(s)` warn is identical in both modes. Those
+volumes are essentially matched across the two arms — **2141 over-budget frames in the ring run vs
+1938 in the `all` run** — so the tail-selective warn is *held constant*, and the only thing that
+differs is the ~12.9k healthy frames the `all` arm additionally formatted and wrote at DEBUG. The
+ring arm paid the warn on 2141 frames and missed **zero** flips. That rules out the warn path and
+leaves the per-frame bulk write as the cause. (Credit where due: this control was proposed by an
+adversarial reviewer of the instrumentation as the way to falsify the claim; it confirmed it.)
+
+**Residual, and we will fix it:** the surviving over-budget `warn!` still taxes exactly the frames
+under study, so the heavy band's own cost carries a small self-inflicted component in *both* arms.
+It biases toward making heavy frames look worse, i.e. against us, so it does not threaten the
+0.00% result — but ring mode should bank that line like any other rather than format it live.
 
 **Consequences for the shared record:**
 
