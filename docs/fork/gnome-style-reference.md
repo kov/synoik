@@ -193,6 +193,30 @@ section below for the full per-state table; the short version:
 
 ---
 
+## 1.9 Two padding families: fixed px vs em-scaled
+
+Not every "6px" in the theme is 6px. Two different tokens are in play, and they behave differently
+when the user changes their font size:
+
+- **`$base_padding: 6px`** and friends are literal px. `.message`'s padding, `.message-box`'s
+  padding, `.message-header-content`'s `padding-bottom` — all fixed.
+- **`$scaled_padding: to_em(6px)`** is `0.409em` (`_drawing.scss:6-10`; the `1.091` factor is
+  tuned so it *equals* 6px at the default `$base_font_size: 11pt`). `%card_common`'s
+  `padding: $scaled_padding * 2` therefore renders **12px at 11pt and 13px at 12pt**.
+
+**Measured, not derived** (`tools/gnome-ui-dump` against a live 50.3 session running Cantarell 12):
+`.world-clocks-button` and `.events-button` report `padding: [13,13,13,13]`, while
+`.datemenu-today-button` — which overrides with the fixed `$base_padding * 1.5` — reports `[9,9,9,9]`
+regardless.
+
+**Our divergence:** we hardcode these as px at the 11pt value (`EVENTS_CARD_PAD = 12`), so we are
+correct at the default font and drift under any other. Fixing it properly means threading the font
+size into the card metrics the way `ui::pt_to_px` already does for text. Not yet done; recorded here
+so a future "the bubbles look tight at large text" report has an explanation waiting.
+
+Note this is also why the *outer* radius is a different kind of value: `.datemenu-popover`'s
+`border-radius: $base_border_radius * 1.5 + $base_padding * 3` = 30px is plain px and does not move.
+
 ## 2. Components
 
 Organized to mirror `data/theme/gnome-shell-sass/widgets/*.scss` — one subsection per widget file, so

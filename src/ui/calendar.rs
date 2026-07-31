@@ -104,10 +104,16 @@ const DISC_DIAM: f64 = 39.;
 
 /// Fully transparent — the buffer is cleared to this so the rounded outer corners stay see-through.
 const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
-/// The popover's outer corner radius: gnome-shell's `.popup-menu-content` is
-/// `$modal_radius * 1.25` (`$modal_radius` = 16px → 20px, `_popovers.scss:30`) — the standard
-/// popup radius, smaller than the quick-settings menu's 2.25× modal radius.
-pub const BOX_RADIUS: f64 = 20.;
+/// The popover's outer corner radius. **The date menu overrides the standard popup radius**:
+/// `.popup-menu-content` is `$modal_radius * 1.25` = 20px (`_popovers.scss:30`), but
+/// `.datemenu-popover` sets `$base_border_radius * 1.5 + $base_padding * 3` = 12 + 18 = 30px
+/// (`_calendar.scss:8-10`), which is what actually applies here.
+///
+/// We used 20 — the base rule, missing the override — until the live shell was asked:
+/// `DumpName calendarArea` reports `border_radius: [30, 30, 30, 30]` on the
+/// `popup-menu-content datemenu-popover` ancestor (`tools/gnome-ui-dump`). Unlike the paddings
+/// around it, this one is plain px, so it does not move with the font size.
+pub const BOX_RADIUS: f64 = 30.;
 const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// The selected (non-today) day's subtle filled circle — gnome-shell's flat-button
 /// selected state (a faint light fill), vs today's accent fill.
