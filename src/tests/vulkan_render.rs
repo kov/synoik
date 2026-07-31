@@ -23,7 +23,7 @@ use super::client::ClientId;
 use super::fixture::Fixture;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
-use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
+use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget, NATIVE_FOURCC};
 use crate::ui::mru::WindowMruUiRenderElement;
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -1475,6 +1475,10 @@ fn vulkan_output_transform_follows_the_transform_spec() {
 /// read it back from the dmabuf's own memory. This proves the whole GPU half of Stage 3 Brick B —
 /// `Niri::render` (Brick 3) → owned Vulkan renderer → scanout buffer (Brick A) — is correct; only
 /// the DRM framebuffer export + atomic page-flip remain (live-validated). Venus-only (needs GBM).
+///
+/// The target is `Abgr8888`, which since 2026-07-31 is the order the render pass does *not* declare
+/// — so this is the **present-blit** half of the pair, and
+/// `vulkan_composites_a_scene_into_an_argb_scanout_dmabuf` is the direct one.
 #[test]
 fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
     use std::fs::File;
@@ -1618,12 +1622,13 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
     );
 }
 
-/// The present-blit scanout path (KMS planes that want `Argb8888`/`Xrgb8888`): composite the live
-/// scene into a GBM `Argb8888` scanout dmabuf via `Bind<Dmabuf>` — which renders into an R8G8B8A8
-/// shadow and blits it into the dmabuf, reordering RGBA→BGRA — then read the dmabuf back (through
-/// Vulkan, `ExportMem`, which now targets the scanout buffer) and prove an opaque-**red** window
-/// landed as the BGRA bytes `[0,0,255,255]`. This is the exact path the virtio-gpu tty target takes
-/// (its primary plane advertises only XR24/AR24). Venus-only (needs GBM).
+/// The **direct** scanout path: composite the live scene into a GBM `Argb8888` scanout dmabuf via
+/// `Bind<Dmabuf>` — which since 2026-07-31 renders straight into it, no shadow and no present blit,
+/// because `Argb8888` is the renderer's own byte order — then read the dmabuf back (through Vulkan,
+/// `ExportMem`) and prove an opaque-**red** window landed as the BGRA bytes `[0,0,255,255]`. This
+/// is the exact path the virtio-gpu tty target takes (its primary plane advertises only XR24/AR24).
+/// Its sibling `vulkan_composites_a_scene_into_a_scanout_dmabuf` covers the shadow path with an
+/// `Abgr8888` target. Venus-only (needs GBM).
 #[test]
 fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
     use std::fs::File;
@@ -1814,7 +1819,7 @@ fn vulkan_reuses_present_blit_shadow_across_frames() {
     };
     const S: i32 = 128;
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Argb8888, &[Modifier::Linear]) {
+    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping vulkan_reuses_present_blit_shadow_across_frames: GBM alloc ({e})");
@@ -1910,7 +1915,7 @@ fn vulkan_preserves_undamaged_regions_across_frames() {
     };
     const S: i32 = 128;
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Argb8888, &[Modifier::Linear]) {
+    let bo = match alloc.create_buffer(S as u32, S as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping vulkan_preserves_undamaged_regions_across_frames: GBM alloc ({e})");
@@ -4680,10 +4685,10 @@ fn vulkan_capture_region_splits_the_render_pass() {
 
     // The capture destination (a SAMPLED | TRANSFER_DST offscreen) and the render target.
     let mut dest = vk
-        .create_buffer(Fourcc::Abgr8888, buf_size)
+        .create_buffer(NATIVE_FOURCC, buf_size)
         .expect("create capture dest");
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, buf_size)
+        .create_buffer(NATIVE_FOURCC, buf_size)
         .expect("create target");
 
     {
@@ -4769,7 +4774,7 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     const S: i32 = 64;
     let size = Size::<i32, Physical>::from((S, S));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+        .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
         .expect("create target");
 
     // A whole-output framebuffer effect with blur on (no clip, no rounding, no desaturation).
@@ -4899,7 +4904,7 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
     const S: i32 = 64;
     let size = Size::<i32, Physical>::from((S, S));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+        .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
         .expect("create target");
 
     let effect = FramebufferEffect::new();
@@ -5061,7 +5066,7 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
      -> Vec<u8> {
         let size = Size::<i32, Physical>::from((s, s));
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((s, s)))
+            .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((s, s)))
             .expect("create sample target");
         {
             let mut fb = vk.bind(&mut target).expect("bind sample target");
@@ -5441,7 +5446,7 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                             subregion: Option<crate::utils::region::TransformedRegion>|
      -> Vec<u8> {
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::from((S, S)))
+            .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
             .expect("create target");
         {
             let mut fb = vk.bind(&mut target).expect("bind");
@@ -9184,7 +9189,7 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
                 size,
                 scale,
                 Transform::Normal,
-                Fourcc::Abgr8888,
+                NATIVE_FOURCC,
                 elements.iter().rev(),
             )?;
             Ok((

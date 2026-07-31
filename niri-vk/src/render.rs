@@ -9,7 +9,22 @@ use ash::vk;
 
 use crate::gpu::Gpu;
 
+/// The byte order of RGBA8 pixel data handed to this crate from the CPU — [`Texture::from_rgba`]
+/// and the spike [`RenderTarget`], whose `read_back` callers expect RGBA out. Nothing that takes
+/// part in a compositor frame uses it; see [`RENDER_FORMAT`].
 pub const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// The one color format every image in the compositor's render path is created with: render
+/// targets, the offscreens they are lifted into, and the blur chain's levels.
+///
+/// **This must equal the compositor's `IMAGE_VK_FORMAT`** — it is the same constant, re-exported
+/// here so the two crates cannot drift. A framebuffer attachment's format has to match its render
+/// pass's `VkAttachmentDescription::format` *exactly*
+/// (`VUID-VkFramebufferCreateInfo-pAttachments-00880`); "same channels, different order" is not a
+/// match, and the failure mode is undefined behavior, not a clean error. `Blur::copy_output_to`
+/// raises the bar further: it is a raw `vkCmdCopyImage`, so a level and its destination disagreeing
+/// on order silently swaps red and blue.
+pub const RENDER_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 pub const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     aspect_mask: vk::ImageAspectFlags::COLOR,

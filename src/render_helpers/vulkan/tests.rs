@@ -22,7 +22,7 @@ use smithay::utils::{
 };
 
 use super::custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
-use super::{VkTexture, VulkanRenderer};
+use super::{VkTexture, VulkanRenderer, NATIVE_FOURCC};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
@@ -268,7 +268,7 @@ fn vulkan_output_render_elements_match_pixman() {
         .map(OutputRenderElements::SolidColor)
         .collect();
     let mut vk_target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let vk_pixels = render_elements_into(&mut vk, &mut vk_target, &vk_elements);
 
@@ -278,7 +278,7 @@ fn vulkan_output_render_elements_match_pixman() {
     let px_elements = solid_scene();
     let mut px = PixmanRenderer::new().expect("pixman renderer");
     let mut px_target = px
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("pixman offscreen");
     let px_pixels = render_elements_into(&mut px, &mut px_target, &px_elements);
 
@@ -297,13 +297,13 @@ fn vulkan_matches_pixman() {
     eprintln!("vulkan A/B against pixman on device: {}", vk.device_name());
 
     let mut vk_target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let vk_pixels = render_into(&mut vk, &mut vk_target);
 
     let mut px = PixmanRenderer::new().expect("pixman renderer");
     let mut px_target = px
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("pixman offscreen");
     let px_pixels = render_into(&mut px, &mut px_target);
 
@@ -336,7 +336,7 @@ fn vulkan_render_glyphs_rasterizes_coverage() {
 
     let size = Size::<i32, Physical>::from((TWIDE, THIGH));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((TWIDE, THIGH)))
+        .create_buffer(NATIVE_FOURCC, Size::from((TWIDE, THIGH)))
         .expect("vulkan offscreen");
     let origin = Point::<i32, Physical>::from((10, 10));
     let full = Rectangle::from_size(size);
@@ -447,7 +447,7 @@ fn render_rounded_src(
     let elem = RoundedTextureRenderElement::new(inner, corner_radius, Scale::from(1.0));
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     render_elements_into(vk, &mut target, std::slice::from_ref(&elem))
 }
@@ -586,7 +586,7 @@ fn vulkan_rounded_rect_fills_and_cuts_corners() {
     let size = Size::<i32, Physical>::from((W, H));
     let full = Rectangle::from_size(size);
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -691,7 +691,7 @@ fn vulkan_gradient_fade_clipped_texture() {
     let elem = GradientFadeTextureRenderElement::new(inner);
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
 
@@ -755,7 +755,7 @@ fn vulkan_border_ring_gradient_and_rounding() {
     );
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
 
@@ -825,7 +825,7 @@ fn vulkan_shadow_gaussian_falloff() {
     );
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let pixels = render_elements_into(&mut vk, &mut target, std::slice::from_ref(&elem));
 
@@ -893,7 +893,7 @@ fn vulkan_shadow_with_alpha_fades_the_draw() {
 
     let render = |vk: &mut VulkanRenderer, elem: ShadowRenderElement| {
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+            .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
             .expect("vulkan offscreen");
         render_elements_into(vk, &mut target, std::slice::from_ref(&elem))
     };
@@ -962,7 +962,7 @@ fn vulkan_offscreen_sampleable_roundtrip() {
     // `render_elements_into` leaves A holding the scene and returns its readback — our reference
     // for what a correct re-sample must reproduce.
     let mut a = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen A");
     let a_elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
@@ -976,7 +976,7 @@ fn vulkan_offscreen_sampleable_roundtrip() {
 
     // Destination offscreen B: clear, then sample all of A 1:1 over the whole quad.
     let mut b = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen B");
     {
         let mut fb = vk.bind(&mut b).expect("bind B");
@@ -1033,7 +1033,7 @@ fn vulkan_offscreen_snapshot() {
 
     // Reference: the two-solid scene rendered directly into an offscreen (cleared to CLEAR).
     let mut ref_target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("reference offscreen");
     let direct = render_elements_into(&mut vk, &mut ref_target, &solid_scene());
 
@@ -1045,7 +1045,7 @@ fn vulkan_offscreen_snapshot() {
         .expect("offscreen snapshot render");
 
     let mut snap_target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("snapshot offscreen");
     let snapshot = render_elements_into(&mut vk, &mut snap_target, std::slice::from_ref(&elem));
 
@@ -1158,7 +1158,7 @@ fn vulkan_postprocess_clips_and_desaturates() {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -1273,7 +1273,7 @@ fn vulkan_resize_crossfades() {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -1732,7 +1732,7 @@ vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -1834,7 +1834,7 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -1940,7 +1940,7 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
     for (transform, swaps) in transforms {
         let size = Size::<i32, Physical>::from((W, H));
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+            .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
             .expect("offscreen");
         {
             let mut fb = vk.bind(&mut target).expect("bind");
@@ -2038,7 +2038,7 @@ vec4 open_color(vec3 coords_geo, vec3 size_geo) {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -2121,7 +2121,7 @@ fn vulkan_custom_bad_snippet_degrades() {
         .expect("import");
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -2187,7 +2187,7 @@ fn import_and_draw(
     );
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -2373,7 +2373,7 @@ fn vulkan_renders_into_a_gbm_dmabuf() {
         }
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
-    let bo = match alloc.create_buffer(W as u32, H as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
+    let bo = match alloc.create_buffer(W as u32, H as u32, NATIVE_FOURCC, &[Modifier::Linear]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -2499,7 +2499,7 @@ fn vulkan_dmabuf_import_cache_reuses_and_evicts() {
         }
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
-    let d1 = match alloc.create_buffer(W as u32, H as u32, Fourcc::Abgr8888, &[Modifier::Linear]) {
+    let d1 = match alloc.create_buffer(W as u32, H as u32, NATIVE_FOURCC, &[Modifier::Linear]) {
         Ok(bo) => bo.export().expect("export d1"),
         Err(e) => {
             eprintln!(
@@ -2917,7 +2917,7 @@ fn vulkan_shm_reupload_overwrites_in_place() {
     // Sample the re-uploaded texture 1:1 into an offscreen and read it back.
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -3079,7 +3079,7 @@ fn vulkan_repeated_commits_do_not_grow_the_staging_pool() {
 
     let size = Size::<i32, Physical>::from((SIDE, SIDE));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((SIDE, SIDE)))
+        .create_buffer(NATIVE_FOURCC, Size::from((SIDE, SIDE)))
         .expect("offscreen");
     for round in 0..40u8 {
         // A client commit: new pixels into the image it already has.
@@ -3141,7 +3141,7 @@ fn vulkan_queued_upload_holds_its_destination_alive() {
     // A frame that draws nothing still drains the queue — and that is where the copy is recorded.
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -3158,8 +3158,8 @@ fn vulkan_queued_upload_holds_its_destination_alive() {
     );
 }
 
-/// Binding two **differently-sized** `Argb8888` targets in the same frame must not reallocate the
-/// present-blit shadow each time. Argb/Xrgb targets do not match the R8G8B8A8 render pass, so they
+/// Binding two **differently-sized** present-blit targets in the same frame must not reallocate
+/// the shadow each time. `Abgr8888`/`Xbgr8888` targets do not match the render pass, so they
 /// render into a shadow that is blitted into the dmabuf on `finish`; the shadow used to live in a
 /// single size-keyed slot, which is only safe while exactly one such size is ever bound.
 ///
@@ -3211,7 +3211,7 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
     // KMS primary-plane byte order) is what takes the present-blit path.
     let mut make = |w: i32, h: i32| {
         alloc
-            .create_buffer(w as u32, h as u32, Fourcc::Argb8888, &[Modifier::Linear])
+            .create_buffer(w as u32, h as u32, Fourcc::Abgr8888, &[Modifier::Linear])
             .map(|bo| bo.export().expect("export dmabuf"))
     };
     let (big, small) = match (make(256, 128), make(96, 64)) {
@@ -3254,18 +3254,22 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
     }
 }
 
-/// The `Xrgb8888` shm pool that `render_to_shm` fills wants BGRA-order bytes, but the owned
-/// renderer renders `R8G8B8A8` and cannot produce a BGRA-order offscreen at all — the render pass
-/// is hard-wired to that format, so a BGRA attachment is not a legal framebuffer.
+/// The renderer has exactly one render-pass format ([`NATIVE_FOURCC`]'s BGRA order), so an
+/// offscreen in the *other* byte order is not a legal framebuffer attachment and `create_buffer`
+/// must reject it — a mismatched attachment is undefined behavior, not a wrong picture.
 ///
-/// The conversion therefore happens on the way *out*: `copy_framebuffer` blits through a staging
-/// image of the requested format and `vkCmdBlitImage` reorders the channels on the GPU. Pin both
-/// halves: that a BGRA offscreen really is still rejected (so nobody "fixes" it the wrong way), and
-/// that asking for BGRA bytes yields them — with no CPU pass over the pixels.
+/// A consumer wanting the other order is served on the way *out*: `copy_framebuffer` blits through
+/// a staging image of the requested format and `vkCmdBlitImage` reorders the channels on the GPU.
+/// Pin both halves: that an RGBA-order offscreen really is rejected (so nobody "fixes" it the wrong
+/// way), and that asking for RGBA bytes yields them — with no CPU pass over the pixels.
+///
+/// Since 2026-07-31 this runs the opposite way round from when it was written: BGRA is now the
+/// render order, so the `Xrgb8888` shm pool `render_to_shm` fills needs no conversion at all and it
+/// is `Abgr8888` that pays for one.
 ///
 /// Red is the discriminator: it is the channel a red/blue swap moves.
 #[test]
-fn vulkan_shm_readback_converts_to_bgra() {
+fn vulkan_offscreen_rejects_the_other_byte_order_and_readback_converts() {
     use crate::render_helpers::create_texture;
 
     let mut vk = match VulkanRenderer::new() {
@@ -3277,21 +3281,22 @@ fn vulkan_shm_readback_converts_to_bgra() {
     };
     let size = Size::<i32, Physical>::from((W, H));
 
-    // The BGRA-order offscreen the shm pool's format would ask for: unsupported, by construction.
+    // An offscreen in the order the render pass does *not* declare: unsupported, by construction.
     assert!(
         Offscreen::<VkTexture>::create_buffer(
             &mut vk,
-            Fourcc::Xrgb8888,
+            Fourcc::Xbgr8888,
             size.to_logical(1).to_buffer(1, Transform::Normal),
         )
         .is_err(),
-        "a BGRA-order offscreen must stay rejected: the shared render pass is R8G8B8A8, so such an \
-         attachment is not legal. The conversion belongs in the readback, not the render target.",
+        "an offscreen in the non-render byte order must stay rejected: the shared render pass \
+         declares one format, so such an attachment is not legal. The conversion belongs in the \
+         readback, not the render target.",
     );
 
-    // The RGBA-order one we actually use. Clear it red: red is what a red/blue swap moves.
+    // The order we actually render. Clear it red: red is what a red/blue swap moves.
     let mut texture: VkTexture =
-        create_texture(&mut vk, size, Fourcc::Abgr8888).expect("Abgr8888 offscreen");
+        create_texture(&mut vk, size, NATIVE_FOURCC).expect("native-order offscreen");
     {
         let mut fb = vk.bind(&mut texture).expect("bind");
         let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
@@ -3306,25 +3311,26 @@ fn vulkan_shm_readback_converts_to_bgra() {
     let fb = vk.bind(&mut texture).expect("rebind for readback");
 
     // Negative control for the conversion: asking for the source's own order must NOT convert.
-    let mapping = vk
-        .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Abgr8888)
-        .expect("copy_framebuffer");
-    let rgba = vk.map_texture(&mapping).expect("map_texture").to_vec();
-    assert_eq!(
-        &rgba[..4],
-        &[255, 0, 0, 255],
-        "reading the source's own order must come back raw, not double-swapped",
-    );
-
-    // ...and asking for the shm pool's order converts, on the GPU.
+    // Red in BGRA byte order is [B, G, R, A] = [0, 0, 255, 255].
     let mapping = vk
         .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Xrgb8888)
-        .expect("copy_framebuffer as Xrgb8888");
+        .expect("copy_framebuffer");
     let bgra = vk.map_texture(&mapping).expect("map_texture").to_vec();
     assert_eq!(
         &bgra[..4],
         &[0, 0, 255, 255],
-        "a BGRA-order readback of red must have red in the third byte",
+        "reading the source's own order must come back raw, not double-swapped",
+    );
+
+    // ...and asking for the other order converts, on the GPU.
+    let mapping = vk
+        .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Abgr8888)
+        .expect("copy_framebuffer as Abgr8888");
+    let rgba = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    assert_eq!(
+        &rgba[..4],
+        &[255, 0, 0, 255],
+        "an RGBA-order readback of red must have red in the first byte",
     );
 }
 
@@ -3349,12 +3355,12 @@ fn vulkan_repeated_converting_readbacks_reuse_staging() {
     };
     let size = Size::<i32, Physical>::from((W, H));
     let mut texture: VkTexture =
-        create_texture(&mut vk, size, Fourcc::Abgr8888).expect("Abgr8888 offscreen");
+        create_texture(&mut vk, size, NATIVE_FOURCC).expect("native-order offscreen");
 
     for _ in 0..8 {
         let fb = vk.bind(&mut texture).expect("bind");
         let mapping = vk
-            .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Xrgb8888)
+            .copy_framebuffer(&fb, Rectangle::from_size((W, H).into()), Fourcc::Abgr8888)
             .expect("converting copy_framebuffer");
         let _ = vk.map_texture(&mapping).expect("map_texture");
     }
@@ -3392,7 +3398,7 @@ fn vulkan_readback_host_buffer_grows_then_reuses() {
 
     let read = |vk: &mut VulkanRenderer, w: i32, h: i32| {
         let size = Size::<i32, Physical>::from((w, h));
-        let mut texture: VkTexture = create_texture(vk, size, Fourcc::Abgr8888).expect("offscreen");
+        let mut texture: VkTexture = create_texture(vk, size, NATIVE_FOURCC).expect("offscreen");
         let fb = vk.bind(&mut texture).expect("bind");
         let mapping = vk
             .copy_framebuffer(&fb, Rectangle::from_size((w, h).into()), Fourcc::Abgr8888)
@@ -3462,7 +3468,7 @@ fn vulkan_gpu_timing_reports_a_plausible_duration() {
         .map(OutputRenderElements::SolidColor)
         .collect();
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let _ = render_elements_into(&mut vk, &mut target, &elements);
 
@@ -3635,7 +3641,7 @@ fn text_of_resident_glyphs_costs_no_submit() {
     );
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((16, 16)))
         .expect("target");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -3778,7 +3784,7 @@ fn runs_survive_an_atlas_growth() {
     let size = Size::<i32, Physical>::from((200, 48));
     let full = Rectangle::from_size(size);
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((200, 48)))
+        .create_buffer(NATIVE_FOURCC, Size::from((200, 48)))
         .expect("vulkan offscreen");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -3839,7 +3845,7 @@ fn every_submit_is_chained_on_the_queue_timeline() {
     // pass (`VulkanFrame::finish`).
     vk.build_glyph_run("chained", 20.0).expect("glyph run");
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((16, 16)))
         .expect("target");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -3913,7 +3919,7 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
     // One frame, one flush — and draw every run, so "coalesced" cannot mean "dropped".
     let size = Size::<i32, Physical>::from((64, 320));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 320)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((64, 320)))
         .expect("target");
     let full = Rectangle::from_size(size);
     {
@@ -4000,7 +4006,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
     // copy is recorded into the frame's own command buffer.
     {
         let mut warm = vk
-            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+            .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((16, 16)))
             .expect("target");
         let mut fb = vk.bind(&mut warm).expect("bind");
         let _frame = vk
@@ -4025,7 +4031,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
 
     // An offscreen render: a frame, but not one anybody scans out.
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((16, 16)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((16, 16)))
         .expect("target");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -4057,7 +4063,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
     // and keying on the target alone counted it as scanout — so "N to scanout" meant "N
     // non-offscreen frames", and the one submit worth naming was buried among them. What tells
     // them apart is whether the tty backend is asking for this frame, which it is not here.
-    let Some(mut dmabuf) = gbm_scanout_dmabuf(Fourcc::Abgr8888) else {
+    let Some(mut dmabuf) = gbm_scanout_dmabuf(NATIVE_FOURCC) else {
         eprintln!("a_submit_is_counted_at_the_site_that_made_it: no GBM, skipping the dmabuf half");
         return;
     };
@@ -4151,7 +4157,7 @@ fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
         return skip("no GBM");
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+    let Ok(bo) = alloc.create_buffer(64, 64, NATIVE_FOURCC, &[Modifier::Linear]) else {
         return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
     };
     let mut dmabuf = bo.export().expect("export scanout dmabuf");
@@ -4262,7 +4268,7 @@ fn teardown_waits_for_the_scanout_fences_kms_holds() {
         return skip("no GBM");
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+    let Ok(bo) = alloc.create_buffer(64, 64, NATIVE_FOURCC, &[Modifier::Linear]) else {
         return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
     };
     let mut dmabuf = bo.export().expect("export scanout dmabuf");
@@ -4347,10 +4353,10 @@ fn a_deferred_present_blit_holds_both_the_shadow_and_the_scanout_buffer() {
         return skip("no GBM");
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    // Xrgb8888 is a present-blit format: its byte order differs from the render pass, so the
-    // renderer binds an R8G8B8A8 shadow and blits into the dmabuf on finish.
-    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Xrgb8888, &[Modifier::Linear]) else {
-        return skip("GBM cannot allocate an Xrgb8888 LINEAR scanout buffer");
+    // Xbgr8888 is a present-blit format: its byte order differs from the render pass, so the
+    // renderer binds a shadow and blits into the dmabuf on finish.
+    let Ok(bo) = alloc.create_buffer(64, 64, Fourcc::Xbgr8888, &[Modifier::Linear]) else {
+        return skip("GBM cannot allocate an Xbgr8888 LINEAR scanout buffer");
     };
     let mut dmabuf = bo.export().expect("export scanout dmabuf");
 
@@ -4426,7 +4432,7 @@ fn a_deferred_frames_glyph_staging_outlives_it() {
         return skip("no GBM");
     };
     let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-    let Ok(bo) = alloc.create_buffer(256, 64, Fourcc::Abgr8888, &[Modifier::Linear]) else {
+    let Ok(bo) = alloc.create_buffer(256, 64, NATIVE_FOURCC, &[Modifier::Linear]) else {
         return skip("GBM cannot allocate an Abgr8888 LINEAR scanout buffer");
     };
     let mut dmabuf = bo.export().expect("export scanout dmabuf");
@@ -4504,7 +4510,7 @@ fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
     let size = Size::<i32, BufferCoord>::from((32, 32));
 
     let _ = niri_vk::stats::take_creates();
-    let mut target = vk.create_buffer(Fourcc::Abgr8888, size).expect("target");
+    let mut target = vk.create_buffer(NATIVE_FOURCC, size).expect("target");
     let (n, _) = niri_vk::stats::take_creates();
     assert_eq!(n, 1, "creating an offscreen render target went uncounted");
 
@@ -4601,7 +4607,7 @@ fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
     for (i, (tex, (w, h, want))) in textures.iter().zip(specs.iter()).enumerate() {
         let size = Size::<i32, Physical>::from((*w, *h));
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((*w, *h)))
+            .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((*w, *h)))
             .expect("target");
         {
             let mut fb = vk.bind(&mut target).expect("bind");
@@ -4685,7 +4691,7 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
 
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((W, H)))
         .expect("target");
     {
         let mut fb = vk.bind(&mut target).expect("bind");
@@ -4775,7 +4781,7 @@ fn an_offscreen_finish_defers_without_the_kms_bracket() {
     // rule that needs it is a rule that never fires.
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((64, 64)))
         .expect("offscreen target");
     let mut fb = vk.bind(&mut target).expect("bind offscreen");
     let sync = {
@@ -4856,7 +4862,7 @@ fn gpu_timing_does_not_push_the_frame_back_onto_the_synchronous_path() {
     let _ = crate::frame_log::take_gpu_samples();
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((64, 64)))
         .expect("offscreen target");
     let mut fb = vk.bind(&mut target).expect("bind offscreen");
     let sync = {
@@ -4948,7 +4954,7 @@ fn the_timestamp_ring_runs_out_of_slots_rather_than_clobbering_one() {
     let mut targets = Vec::new();
     for _ in 0..rounds {
         let mut target = vk
-            .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((32, 32)))
+            .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((32, 32)))
             .expect("offscreen target");
         {
             let mut fb = vk.bind(&mut target).expect("bind offscreen");
@@ -5019,7 +5025,7 @@ fn retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated() {
     vk.set_defer_scanout(true);
 
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((64, 64)))
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((64, 64)))
         .expect("offscreen target");
     {
         let mut fb = vk.bind(&mut target).expect("bind offscreen");
@@ -5215,7 +5221,7 @@ fn vulkan_gpu_phases_subdivide_the_frame_they_belong_to() {
         .map(OutputRenderElements::SolidColor)
         .collect();
     let mut target = vk
-        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .create_buffer(NATIVE_FOURCC, Size::from((W, H)))
         .expect("vulkan offscreen");
     let _ = render_elements_into(&mut vk, &mut target, &elements);
 

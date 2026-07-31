@@ -53,7 +53,6 @@ use std::ffi::CStr;
 use std::ptr::null_mut;
 
 use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -61,10 +60,10 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use crate::calendar_events::CalendarEventStore;
 use crate::notifications::SourceKey;
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::render_to_texture;
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::{render_to_texture, NATIVE_FOURCC};
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
@@ -1682,7 +1681,7 @@ impl CalendarMessageList {
             phys,
             Scale::from(scale),
             Transform::Normal,
-            Fourcc::Abgr8888,
+            NATIVE_FOURCC,
             elements.into_iter().rev(),
         )?;
         renderer.make_offscreen_sampleable(&tex)?;
@@ -3289,6 +3288,7 @@ fn weekday_abbrev(w: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use smithay::backend::allocator::Fourcc;
     use smithay::utils::Buffer as BufferCoord;
 
     use super::*;

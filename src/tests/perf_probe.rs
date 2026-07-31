@@ -82,7 +82,7 @@ use smithay::utils::{Physical, Scale, Size, Transform};
 
 use super::fixture::Fixture;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::render_helpers::{render_to_texture, RenderCtx, RenderTarget};
+use crate::render_helpers::{render_to_texture, RenderCtx, RenderTarget, NATIVE_FOURCC};
 
 /// A window big enough that its texture must be minified hard to fit an overview thumbnail.
 const WIN: (i32, i32) = (1600, 1000);
@@ -202,7 +202,7 @@ fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
                 size,
                 scale,
                 Transform::Normal,
-                Fourcc::Abgr8888,
+                NATIVE_FOURCC,
                 elements.iter().rev(),
             )?;
             let elapsed = started.elapsed();
@@ -764,7 +764,7 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
                 size,
                 scale,
                 Transform::Normal,
-                Fourcc::Abgr8888,
+                NATIVE_FOURCC,
                 elements.iter().rev(),
             )?;
             let samples = crate::frame_log::take_gpu_samples();
@@ -885,7 +885,7 @@ where
                     size,
                     scale,
                     Transform::Normal,
-                    Fourcc::Abgr8888,
+                    NATIVE_FOURCC,
                     elements.iter(),
                 )?;
                 let samples = crate::frame_log::take_gpu_samples();

@@ -1,7 +1,6 @@
 use std::mem;
 
 use anyhow::Context as _;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::{Id, RenderElementStates};
 use smithay::backend::renderer::utils::CommitCounter;
@@ -14,6 +13,7 @@ use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::renderer::OffscreenRenderer as _;
 use crate::render_helpers::vulkan::{EffectBlur, VkTexture, VulkanRenderer};
+use crate::render_helpers::NATIVE_FOURCC;
 
 #[derive(Debug)]
 pub struct EffectBuffer {
@@ -237,7 +237,7 @@ impl EffectBuffer {
             span.emit_text(reason);
 
             let texture: VkTexture = renderer
-                .create_buffer(Fourcc::Abgr8888, self.size)
+                .create_buffer(NATIVE_FOURCC, self.size)
                 .context("error creating texture")?;
 
             let buffer_size = self.size.to_logical(1, Transform::Normal).to_physical(1);

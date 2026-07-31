@@ -13,13 +13,12 @@
 use std::sync::Arc;
 
 use ash::vk;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::{Offscreen, Texture as _};
 
 use super::blur_chain::SharedBlurChain;
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
-use super::types::VkTexture;
+use super::types::{VkTexture, NATIVE_FOURCC};
 
 pub(crate) struct EffectBlur {
     passes: usize,
@@ -45,7 +44,7 @@ impl EffectBlur {
         passes: usize,
     ) -> Result<Self, VulkanError> {
         let chain = SharedBlurChain::new(&renderer.gpu, source.niri_texture(), passes)?;
-        let output = renderer.create_buffer(Fourcc::Abgr8888, source.size())?;
+        let output = renderer.create_buffer(NATIVE_FOURCC, source.size())?;
         Ok(Self {
             passes,
             chain,

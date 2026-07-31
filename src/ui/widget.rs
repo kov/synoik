@@ -20,7 +20,6 @@ use std::collections::HashMap;
 
 use anyhow::Context as _;
 use ordered_float::NotNan;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer};
 use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size, Transform};
@@ -29,7 +28,7 @@ use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
-    premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer,
+    premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer, NATIVE_FOURCC,
 };
 use crate::utils::to_physical_precise_round;
 
@@ -1080,7 +1079,7 @@ pub fn bake_uncached_sized(
 
     let (w, h) = (phys.w.max(1), phys.h.max(1));
     let mut target =
-        renderer.create_buffer(Fourcc::Abgr8888, Size::<i32, BufferCoord>::from((w, h)))?;
+        renderer.create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((w, h)))?;
     {
         let mut fb = renderer.bind(&mut target)?;
         let mut frame = renderer.render(&mut fb, phys, Transform::Normal)?;
@@ -2115,6 +2114,7 @@ pub fn assert_scale_correct(
     logical_size: Size<f64, Logical>,
     mut bake_at: impl FnMut(&mut VulkanRenderer, f64) -> VkTexture,
 ) {
+    use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::{ExportMem, Texture};
     use smithay::utils::Rectangle;
 

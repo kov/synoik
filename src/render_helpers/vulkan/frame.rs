@@ -1397,7 +1397,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     }
 
     /// Record the present-blit into `self.cbuf` (already past `cmd_end_render_pass`): transition
-    /// the imported dmabuf to a transfer destination, blit the R8G8B8A8 shadow
+    /// the imported dmabuf to a transfer destination, blit the shadow
     /// (`self.fb.buffer`, left in `TRANSFER_SRC_OPTIMAL` by the render pass) into it —
     /// `vkCmdBlitImage` converts component order, so RGBA lands as the BGRA bytes
     /// `Argb8888`/`Xrgb8888` scanout wants — then leave it in `GENERAL` for the display engine.
@@ -1587,7 +1587,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 niri_vk::stats::GpuPhase::Render,
             );
             // Present-blit scanout (KMS planes wanting `Argb8888`/`Xrgb8888`): the render pass left
-            // the R8G8B8A8 shadow in `TRANSFER_SRC_OPTIMAL` (its subpass→EXTERNAL dependency
+            // the shadow in `TRANSFER_SRC_OPTIMAL` (its subpass→EXTERNAL dependency
             // already makes the writes available to a transfer read), so blit it into
             // the imported dmabuf, reordering RGBA→BGRA, then release the dmabuf to the
             // display engine.

@@ -8,14 +8,13 @@
 use std::sync::Arc;
 
 use ash::vk;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::Offscreen;
 use smithay::utils::{Buffer as BufferCoord, Size};
 
 use super::blur_chain::SharedBlurChain;
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
-use super::types::VkTexture;
+use super::types::{VkTexture, NATIVE_FOURCC};
 
 /// The blur resources, present only when blur is enabled (`BlurOptions` was `Some`).
 struct BlurState {
@@ -49,7 +48,7 @@ impl BackdropBlur {
         size: Size<i32, BufferCoord>,
         passes: Option<usize>,
     ) -> Result<Self, VulkanError> {
-        let capture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+        let capture = renderer.create_buffer(NATIVE_FOURCC, size)?;
         let dims = capture.extent();
         let blur = match passes {
             Some(passes) => {
@@ -57,7 +56,7 @@ impl BackdropBlur {
                 // capture's stable view) — capture_region refills the capture each frame, so a
                 // cached chain stays valid across frames.
                 let chain = SharedBlurChain::new(&renderer.gpu, capture.niri_texture(), passes)?;
-                let output = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+                let output = renderer.create_buffer(NATIVE_FOURCC, size)?;
                 Some(BlurState {
                     passes,
                     chain,

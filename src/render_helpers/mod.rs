@@ -17,6 +17,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use smithay::wayland::shm;
 
 use self::vulkan::VulkanRenderer;
+pub use self::vulkan::NATIVE_FOURCC;
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
@@ -168,15 +169,25 @@ where
     R: Renderer<TextureId = T> + Offscreen<T> + ExportMem,
     R::Error: Send + Sync + 'static,
 {
-    render_and_download_as(renderer, size, scale, transform, fourcc, fourcc, elements)
+    // Render in the renderer's own order (the only one it has a render pass for) and let the
+    // readback convert if `fourcc` is the other one.
+    render_and_download_as(
+        renderer,
+        size,
+        scale,
+        transform,
+        NATIVE_FOURCC,
+        fourcc,
+        elements,
+    )
 }
 
 /// [`render_and_download`], but reading the frame back in a byte order that need not be the one it
 /// was rendered in — the renderer converts on the way out.
 ///
 /// The two are separate because a renderer can only render the orders it has a render pass for (the
-/// owned Vulkan renderer: RGBA only), while a consumer wants whatever order *it* declared.
-/// Rendering RGBA and reading BGRA is one GPU blit, versus a CPU pass over every pixel.
+/// owned Vulkan renderer: [`NATIVE_FOURCC`]'s order only), while a consumer wants whatever order
+/// *it* declared. Converting on the way out is one GPU blit, versus a CPU pass over every pixel.
 pub fn render_and_download_as<R, T>(
     renderer: &mut R,
     size: Size<i32, Physical>,
@@ -267,12 +278,9 @@ pub fn render_to_shm(
     let _span = tracy_client::span!();
 
     // The shm pool wants `Xrgb8888` — BGRA byte order, which is what we read back below, straight
-    // into the pool.
-    //
-    // We must *render* `Abgr8888` regardless: the renderer's render pass is R8G8B8A8 and cannot
-    // target a BGRA-order offscreen. The readback does the conversion — `copy_framebuffer` blits
-    // through a staging image of the requested format, so the channel swap happens on the GPU.
-    let render_fourcc = Fourcc::Abgr8888;
+    // into the pool. That is also the renderer's own order ([`NATIVE_FOURCC`]) since 2026-07-31, so
+    // the readback is a plain copy: no staging image, no conversion blit.
+    let render_fourcc = NATIVE_FOURCC;
 
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();

@@ -34,7 +34,8 @@ use super::error::VulkanError;
 use super::fence::{ExportedFenceRegistry, VkSubmitFence};
 use super::frame::VulkanFrame;
 use super::types::{
-    import_format, is_rgba8888, GlyphRun, VkFramebuffer, VkMapping, VkTexture, IMAGE_VK_FORMAT,
+    import_format, matches_render_order, GlyphRun, VkFramebuffer, VkMapping, VkTexture,
+    IMAGE_VK_FORMAT, NATIVE_FOURCC,
 };
 use crate::render_helpers::blur::BlurOptions;
 
@@ -153,7 +154,7 @@ pub struct VulkanRenderer {
     downscale_filter: TextureFilter,
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
-    /// Reused R8G8B8A8 shadows for the present-blit path, keyed by target size and kept across
+    /// Reused shadows for the present-blit path, keyed by target size and kept across
     /// frames so `bind` does not allocate a full-screen device image every frame (which exhausts
     /// host memory on Venus under sustained rendering).
     ///
@@ -185,7 +186,7 @@ pub struct VulkanRenderer {
     #[cfg(test)]
     present_blit_shadow_allocs: usize,
     /// Staging images for a **converting** readback: when a caller wants bytes in an order the
-    /// source image doesn't hold (an `Xrgb8888` shm pool read off an `R8G8B8A8` offscreen), we
+    /// source image doesn't hold (an `Abgr8888` screencopy read off a BGRA-order offscreen), we
     /// blit through one of these — `vkCmdBlitImage` reorders the channels on the GPU, so no
     /// CPU swizzle.
     ///
@@ -1265,7 +1266,7 @@ impl VulkanRenderer {
     /// The bytes come back in `tex`'s own channel order — unless `via` is given, in which case the
     /// region is first blitted into that staging image and copied out of *it*. Blitting between
     /// images of different formats performs a format conversion (Vulkan spec, "Image Copies with
-    /// Scaling"), so an `R8G8B8A8` source through a `B8G8R8A8` staging image yields BGRA bytes with
+    /// Scaling"), so a `B8G8R8A8` source through an `R8G8B8A8` staging image yields RGBA bytes with
     /// no CPU pass over the pixels. Same-size, `NEAREST`: an exact copy, and it needs no linear
     /// filter support.
     fn download_region(
@@ -1613,7 +1614,7 @@ impl VulkanRenderer {
         self.flush_pending_blurs()?;
         self.flush_pending_sampleable()?;
         let (w, h) = source.extent();
-        let output = self.create_buffer(Fourcc::Abgr8888, Size::from((w as i32, h as i32)))?;
+        let output = self.create_buffer(NATIVE_FOURCC, Size::from((w as i32, h as i32)))?;
 
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
@@ -2566,12 +2567,13 @@ impl Bind<Dmabuf> for VulkanRenderer {
 impl VulkanRenderer {
     /// Import a single-plane dmabuf as a scanout [`VkFramebuffer`]. Two shapes:
     ///
-    /// - `Abgr8888`/`Xbgr8888` ([`is_rgba8888`]) match the owned renderer's `R8G8B8A8`-order render
-    ///   pass, so a frame renders **straight into** the dmabuf.
-    /// - `Argb8888`/`Xrgb8888` (the common KMS primary-plane byte order — `B8G8R8A8`) do not, so we
-    ///   render into an R8G8B8A8 shadow (reusing the render pass + all pipelines) and blit it into
-    ///   the dmabuf on `finish`, the blit reordering RGBA→BGRA. This avoids a whole second
-    ///   `B8G8R8A8` render pass + pipeline set at the cost of one full-frame blit.
+    /// - `Argb8888`/`Xrgb8888` ([`matches_render_order`]) — the common KMS primary-plane byte
+    ///   order, and the renderer's own ([`IMAGE_VK_FORMAT`]) — so a frame renders **straight into**
+    ///   the dmabuf. This is the live seat's path.
+    /// - `Abgr8888`/`Xbgr8888` do not match, so we render into a shadow (reusing the render pass +
+    ///   all pipelines) and blit it into the dmabuf on `finish`, the blit reordering the channels.
+    ///   That avoids a whole second render pass + pipeline set at the cost of one full-frame blit —
+    ///   which is why [`IMAGE_VK_FORMAT`] points at the order this stack actually scans out.
     fn import_dmabuf_target<'a>(
         &mut self,
         dmabuf: &Dmabuf,
@@ -2596,7 +2598,7 @@ impl VulkanRenderer {
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
 
-        if is_rgba8888(fourcc) {
+        if matches_render_order(fourcc) {
             // Direct: the dmabuf's byte order matches the render pass, render into it in place.
             // Reuse the cached import for this buffer if we already made one (re-importing every
             // frame aborts Venus — see `dmabuf_target_cache`).
@@ -2699,9 +2701,9 @@ impl VulkanRenderer {
             }
         };
 
-        // Shadow: an R8G8B8A8 render target (reuses the render pass + every pipeline). Its `format`
-        // is the RGBA byte order the render pass actually writes. Cached across frames — see
-        // `present_blit_shadow_for`.
+        // Shadow: a render target in the renderer's own order (reuses the render pass + every
+        // pipeline), tagged [`NATIVE_FOURCC`] because that is the byte order the render pass
+        // actually writes. Cached across frames — see `present_blit_shadow_for`.
         let shadow = self.present_blit_shadow_for(w, h, filter)?;
 
         Ok(VkFramebuffer::new_with_present(shadow, present))
@@ -2733,7 +2735,7 @@ impl VulkanRenderer {
     /// against it.
     ///
     /// An image with `DRM_FORMAT_MODIFIER_EXT` tiling takes its format features from the modifier,
-    /// and *none* of them are mandated by the spec — so the `BLIT_DST` that `R8G8B8A8_UNORM` is
+    /// and *none* of them are mandated by the spec — so the `BLIT_DST` that an 8888 format is
     /// guaranteed at `OPTIMAL` tiling is only ever a promise the driver chose to make about a
     /// modifier. `required` therefore has to come from the commands (a blit needs `BLIT_DST`, a
     /// copy needs the unrelated `TRANSFER_DST`), never from the image's usage flags, which gate
@@ -3093,7 +3095,7 @@ impl VulkanRenderer {
             framebuffer,
             w,
             h,
-            Fourcc::Abgr8888,
+            NATIVE_FOURCC,
         );
         #[cfg(test)]
         {
@@ -3169,7 +3171,7 @@ impl Offscreen<VkTexture> for VulkanRenderer {
         format: Fourcc,
         size: Size<i32, BufferCoord>,
     ) -> Result<VkTexture, VulkanError> {
-        if !is_rgba8888(format) {
+        if !matches_render_order(format) {
             return Err(VulkanError::UnsupportedFormat(format));
         }
         // `Texture::new_color_target` below counts the image it creates; counting here as well
@@ -3348,7 +3350,7 @@ impl ExportMem for VulkanRenderer {
         }
 
         // On the present-blit path the bytes actually scanned out live in the dmabuf (`present`),
-        // not the R8G8B8A8 shadow — read the real target.
+        // not the shadow — read the real target.
         let source = target.present.as_ref().unwrap_or(&target.buffer);
         let w = region.size.w.max(0) as u32;
         let h = region.size.h.max(0) as u32;
@@ -3357,8 +3359,8 @@ impl ExportMem for VulkanRenderer {
         // caller wants the other order, blit through a staging image of that format on the way out
         // and let the GPU reorder the channels — no CPU pass over the pixels. (Reading the source's
         // own order is the common case and stays a plain copy.)
-        let source_order = source.format().map(is_rgba8888);
-        let want_order = is_rgba8888(format);
+        let source_order = source.format().map(matches_render_order);
+        let want_order = matches_render_order(format);
         let via = match source_order {
             Some(order) if order != want_order => Some(self.readback_staging_for(w, h, format)?),
             _ => None,
@@ -3430,7 +3432,7 @@ fn split_compatible_deps() -> [vk::SubpassDependency; 2] {
     ]
 }
 
-/// The offscreen render pass: one `R8G8B8A8_UNORM` color attachment, contents discarded on load
+/// The offscreen render pass: one [`IMAGE_VK_FORMAT`] color attachment, contents discarded on load
 /// (callers clear explicitly) and left in `TRANSFER_SRC_OPTIMAL` so [`ExportMem`] can read it back.
 fn create_render_pass(dev: &ash::Device) -> Result<vk::RenderPass, VulkanError> {
     let attachment = vk::AttachmentDescription::default()

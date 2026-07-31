@@ -34,4 +34,4 @@ pub use frame::VulkanFrame;
 pub(crate) use frame::{pack_mat3, premultiply, ClipParams};
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;
-pub use types::{VkMapping, VkTexture};
+pub use types::{VkMapping, VkTexture, NATIVE_FOURCC};

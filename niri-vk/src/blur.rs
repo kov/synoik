@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::gpu::Gpu;
-use crate::render::{as_bytes, load_module, FORMAT};
+use crate::render::{as_bytes, load_module, RENDER_FORMAT};
 use crate::texture::Texture;
 
 /// Push constants for the blur taps (matches the GLSL `Push` block; `offset` at 8, 16 bytes).
@@ -565,7 +565,7 @@ fn create_blur_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
     // Contents are fully overwritten each pass, so load is DONT_CARE; final layout is shader-read
     // so the level can immediately serve as the next pass's source.
     let attachment = vk::AttachmentDescription::default()
-        .format(FORMAT)
+        .format(RENDER_FORMAT)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)
@@ -635,7 +635,7 @@ fn create_level(
     let device = &gpu.device;
     let image_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(FORMAT)
+        .format(RENDER_FORMAT)
         .extent(vk::Extent3D {
             width: w,
             height: h,
@@ -660,7 +660,7 @@ fn create_level(
     let view_ci = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
-        .format(FORMAT)
+        .format(RENDER_FORMAT)
         .subresource_range(crate::render::COLOR_RANGE);
     let view = unsafe { device.create_image_view(&view_ci, None) }.context("blur level view")?;
 

@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 
 use anyhow::Context as _;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{
@@ -20,6 +19,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use super::encompassing_geo;
 use super::renderer::OffscreenRenderer;
 use crate::render_helpers::vulkan::{VkTexture, VulkanError, VulkanFrame, VulkanRenderer};
+use crate::render_helpers::NATIVE_FOURCC;
 
 /// Buffer for offscreen rendering.
 #[derive(Debug)]
@@ -131,7 +131,7 @@ impl OffscreenBuffer {
             span.emit_text(reason);
 
             let texture: VkTexture = renderer
-                .create_buffer(Fourcc::Abgr8888, src_size)
+                .create_buffer(NATIVE_FOURCC, src_size)
                 .context("error creating texture")?;
 
             let buffer_size = src_size.to_logical(1, Transform::Normal).to_physical(1);

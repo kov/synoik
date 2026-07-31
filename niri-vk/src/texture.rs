@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::gpu::Gpu;
-use crate::render::{COLOR_RANGE, FORMAT};
+use crate::render::{COLOR_RANGE, FORMAT, RENDER_FORMAT};
 use crate::staging::{HostStaging, StagingChunk, StagingPool};
 
 pub struct Texture {
@@ -475,7 +475,7 @@ impl Texture {
 
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(FORMAT)
+            .format(RENDER_FORMAT)
             .extent(vk::Extent3D {
                 width,
                 height,
@@ -507,7 +507,7 @@ impl Texture {
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(FORMAT)
+            .format(RENDER_FORMAT)
             .subresource_range(COLOR_RANGE);
         let view =
             unsafe { device.create_image_view(&view_ci, None) }.context("color-target view")?;

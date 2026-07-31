@@ -251,7 +251,13 @@ fn render_blur(gpu: &Gpu) -> Result<Vec<u8>> {
 /// Far from the edge the colors survive; at the edge they mix; the hard step is gone.
 fn assert_blur(out: &[u8]) -> Result<()> {
     let (ow, oh) = (SRC_W, SRC_H);
-    let at = |x: u32, y: u32| sample_at(out, ow, x, y);
+    // `Blur::read_output` hands back level 0's raw bytes, and the chain's levels are
+    // `render::RENDER_FORMAT` — BGRA order. Reorder to RGBA so the channel assertions below read
+    // the way they are written.
+    let at = |x: u32, y: u32| {
+        let [b, g, r, a] = sample_at(out, ow, x, y);
+        [r, g, b, a]
+    };
     let cy = oh / 2;
     let left = at(8, cy);
     let right = at(ow - 8, cy);
